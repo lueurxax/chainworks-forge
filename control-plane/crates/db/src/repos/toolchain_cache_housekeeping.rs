@@ -23,23 +23,25 @@ pub async fn insert(
     pool: &SqlitePool,
     readback: &ToolchainCacheHousekeepingReadback,
 ) -> Result<()> {
-    sqlx::query(
-        r#"INSERT INTO toolchain_cache_housekeeping_readbacks
+    crate::execute_repository_write!(
+        pool,
+        "toolchain_cache_housekeeping.insert",
+        sqlx::query(
+            r#"INSERT INTO toolchain_cache_housekeeping_readbacks
            (id, last_sweep_started_at, run_scoped_roots_pruned, run_scoped_prune_failures,
             oldest_eligible_root_age_days, disk_pressure_blocks, quarantined_roots_created,
             created_at)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(&readback.id)
+        .bind(readback.last_sweep_started_at.to_rfc3339())
+        .bind(readback.run_scoped_roots_pruned)
+        .bind(readback.run_scoped_prune_failures)
+        .bind(readback.oldest_eligible_root_age_days)
+        .bind(readback.disk_pressure_blocks)
+        .bind(readback.quarantined_roots_created)
+        .bind(readback.created_at.to_rfc3339())
     )
-    .bind(&readback.id)
-    .bind(readback.last_sweep_started_at.to_rfc3339())
-    .bind(readback.run_scoped_roots_pruned)
-    .bind(readback.run_scoped_prune_failures)
-    .bind(readback.oldest_eligible_root_age_days)
-    .bind(readback.disk_pressure_blocks)
-    .bind(readback.quarantined_roots_created)
-    .bind(readback.created_at.to_rfc3339())
-    .execute(pool)
-    .await
     .context("insert toolchain_cache_housekeeping_readback")?;
     Ok(())
 }

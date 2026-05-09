@@ -1,0 +1,38 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "gate_aliases": [
+    "proposal-078",
+    "p078"
+  ],
+  "commands": {
+    "allowlist": [
+      "./scripts/test-gate.sh proposal-078"
+    ]
+  },
+  "migrations": {
+    "not_applicable": false,
+    "description": "Side-effect ledger migration evidence is required."
+  },
+  "metrics": {
+    "adoption_metric": "p078_release_side_effects_with_durable_intent_percent"
+  },
+  "readback_lanes": [
+    "run_report"
+  ],
+  "readback_fields": [
+    "rollout_contract_status"
+  ],
+  "operator_report_fields": [
+    "rollout_contract_status"
+  ],
+  "hold_conditions": [],
+  "rollback_disposition": {
+    "mode": "disable_new_release_side_effect_execution_keep_ledger_readonly",
+    "data_loss_risk": "low"
+  },
+  "decision_vocabulary": [
+    "pass",
+    "fail"
+  ]
+}

@@ -7,7 +7,8 @@ use domain::session::{
 };
 
 pub async fn insert_lineage(pool: &SqlitePool, lineage: &SessionLineage) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "sessions.insert_lineage").await?;
     insert_lineage_tx(&mut tx, lineage).await?;
     tx.commit().await?;
     Ok(())
@@ -38,7 +39,8 @@ pub async fn insert_lineage_tx(
 }
 
 pub async fn insert_generation(pool: &SqlitePool, generation: &SessionGeneration) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "sessions.insert_generation").await?;
     insert_generation_tx(&mut tx, generation).await?;
     tx.commit().await?;
     Ok(())
@@ -87,7 +89,7 @@ pub async fn insert_generation_tx(
 }
 
 pub async fn insert_event(pool: &SqlitePool, event: &SessionEvent) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(pool, "sessions.insert_event").await?;
     insert_event_tx(&mut tx, event).await?;
     tx.commit().await?;
     Ok(())
@@ -357,7 +359,8 @@ pub async fn set_active_generation(
     lineage_id: &str,
     generation_id: Option<&str>,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "sessions.set_active_generation").await?;
     set_active_generation_tx(&mut tx, lineage_id, generation_id).await?;
     tx.commit().await?;
     Ok(())
@@ -384,7 +387,8 @@ pub async fn end_generation(
     end_reason: &str,
     ended_at: DateTime<Utc>,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "sessions.end_generation").await?;
     end_generation_tx(&mut tx, generation_id, status, end_reason, ended_at).await?;
     tx.commit().await?;
     Ok(())
@@ -425,8 +429,11 @@ pub async fn update_generation_usage(
     latest_model_context_window: Option<i64>,
     last_activity_at: DateTime<Utc>,
 ) -> Result<()> {
-    sqlx::query(
-        r#"UPDATE session_generations
+    crate::execute_repository_write!(
+        pool,
+        "sessions.update_generation_usage",
+        sqlx::query(
+            r#"UPDATE session_generations
            SET provider_session_id = ?1,
                turn_count = ?2,
                estimated_input_tokens = ?3,
@@ -437,19 +444,18 @@ pub async fn update_generation_usage(
                cumulative_cost_cents = cumulative_cost_cents + ?8,
                last_activity_at = ?9
            WHERE id = ?10"#,
+        )
+        .bind(provider_session_id)
+        .bind(turn_count)
+        .bind(estimated_input_tokens)
+        .bind(latest_cached_input_tokens)
+        .bind(latest_output_tokens)
+        .bind(latest_model_context_window)
+        .bind(prompt_tokens_increment)
+        .bind(cost_cents_increment)
+        .bind(last_activity_at.to_rfc3339())
+        .bind(generation_id)
     )
-    .bind(provider_session_id)
-    .bind(turn_count)
-    .bind(estimated_input_tokens)
-    .bind(latest_cached_input_tokens)
-    .bind(latest_output_tokens)
-    .bind(latest_model_context_window)
-    .bind(prompt_tokens_increment)
-    .bind(cost_cents_increment)
-    .bind(last_activity_at.to_rfc3339())
-    .bind(generation_id)
-    .execute(pool)
-    .await
     .context("update session generation usage")?;
     Ok(())
 }
@@ -459,16 +465,18 @@ pub async fn touch_generation_activity(
     generation_id: &str,
     last_activity_at: DateTime<Utc>,
 ) -> Result<()> {
-    sqlx::query(
-        r#"UPDATE session_generations
+    crate::execute_repository_write!(
+        pool,
+        "sessions.touch_generation_activity",
+        sqlx::query(
+            r#"UPDATE session_generations
            SET last_activity_at = ?1
            WHERE id = ?2
              AND status = 'active'"#,
+        )
+        .bind(last_activity_at.to_rfc3339())
+        .bind(generation_id)
     )
-    .bind(last_activity_at.to_rfc3339())
-    .bind(generation_id)
-    .execute(pool)
-    .await
     .context("touch session generation activity")?;
     Ok(())
 }
@@ -517,16 +525,18 @@ pub async fn update_generation_runtime_session(
     provider_session_id: &str,
     turn_count: i64,
 ) -> Result<()> {
-    sqlx::query(
-        r#"UPDATE session_generations
+    crate::execute_repository_write!(
+        pool,
+        "sessions.update_generation_runtime_session",
+        sqlx::query(
+            r#"UPDATE session_generations
            SET provider_session_id = ?1, turn_count = ?2
            WHERE id = ?3"#,
+        )
+        .bind(provider_session_id)
+        .bind(turn_count)
+        .bind(generation_id)
     )
-    .bind(provider_session_id)
-    .bind(turn_count)
-    .bind(generation_id)
-    .execute(pool)
-    .await
     .context("update session generation runtime session")?;
     Ok(())
 }

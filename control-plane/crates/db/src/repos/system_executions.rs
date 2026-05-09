@@ -32,7 +32,16 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, exec: &SystemExecution)
 }
 
 pub async fn insert(pool: &SqlitePool, exec: &SystemExecution) -> Result<()> {
-    let mut tx = crate::pool::begin_immediate_with_retry(pool, "system_executions.insert").await?;
+    let mut tx = crate::writer::begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "system_executions.insert",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "system_executions.insert",
+        ),
+        "system_executions.insert",
+    )
+    .await?;
     insert_tx(&mut tx, exec).await?;
     tx.commit()
         .await

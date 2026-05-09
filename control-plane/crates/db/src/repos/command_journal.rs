@@ -24,22 +24,24 @@ pub async fn record(
     caller_tool: Option<&str>,
     request_id: Option<&str>,
 ) -> Result<()> {
-    sqlx::query(
+    crate::execute_repository_write!(
+        pool,
+        "command_journal.record",
+        sqlx::query(
         r#"INSERT INTO command_journal (id, command_type, payload_json, result_status, run_id, created_at, caller_surface, caller_principal_id, caller_principal_class, caller_tool, request_id)
            VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
     )
-    .bind(id)
-    .bind(command_type)
-    .bind(payload_json)
-    .bind(run_id)
-    .bind(created_at.to_rfc3339())
-    .bind(caller_surface)
-    .bind(caller_principal_id)
-    .bind(caller_principal_class)
-    .bind(caller_tool)
-    .bind(request_id)
-    .execute(pool)
-    .await
+        .bind(id)
+        .bind(command_type)
+        .bind(payload_json)
+        .bind(run_id)
+        .bind(created_at.to_rfc3339())
+        .bind(caller_surface)
+        .bind(caller_principal_id)
+        .bind(caller_principal_class)
+        .bind(caller_tool)
+        .bind(request_id)
+    )
     .context("record command journal entry")?;
     Ok(())
 }
@@ -95,13 +97,15 @@ pub async fn complete_entry(
     id: &str,
     completed_at: DateTime<Utc>,
 ) -> Result<()> {
-    sqlx::query(
+    crate::execute_repository_write!(
+        pool,
+        "command_journal.complete_entry",
+        sqlx::query(
         "UPDATE command_journal SET result_status = 'completed', completed_at = ?1 WHERE id = ?2",
     )
-    .bind(completed_at.to_rfc3339())
-    .bind(id)
-    .execute(pool)
-    .await
+        .bind(completed_at.to_rfc3339())
+        .bind(id)
+    )
     .context("complete command journal entry")?;
     Ok(())
 }
@@ -129,14 +133,16 @@ pub async fn fail_entry(
     completed_at: DateTime<Utc>,
     error: &str,
 ) -> Result<()> {
-    sqlx::query(
+    crate::execute_repository_write!(
+        pool,
+        "command_journal.fail_entry",
+        sqlx::query(
         "UPDATE command_journal SET result_status = 'failed', completed_at = ?1, error = ?2 WHERE id = ?3",
     )
-    .bind(completed_at.to_rfc3339())
-    .bind(error)
-    .bind(id)
-    .execute(pool)
-    .await
+        .bind(completed_at.to_rfc3339())
+        .bind(error)
+        .bind(id)
+    )
     .context("fail command journal entry")?;
     Ok(())
 }

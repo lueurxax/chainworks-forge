@@ -4,6 +4,7 @@ pub mod log_redaction;
 pub mod log_retention;
 pub mod packaging;
 pub mod steward_runtime;
+pub mod storage_startup;
 pub mod supervisor;
 pub mod xcode_broker_http;
 pub mod xcode_shim_socket;

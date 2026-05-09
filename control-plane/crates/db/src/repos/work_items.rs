@@ -8,14 +8,24 @@ use domain::artifact_contracts::ArtifactSourceGenerationClaimKey;
 use domain::ids::{RunId, StageExecutionId};
 use domain::provider::InvokeAgentCapacityConfig;
 
-use crate::pool::{begin_immediate_with_retry, log_write_transaction};
+use crate::pool::log_write_transaction;
 use crate::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
+use crate::writer::begin_registered_immediate_transaction;
 
 use super::scheduler;
 
 pub async fn enqueue(pool: &SqlitePool, item: &WorkItem) -> Result<()> {
     let tx_started = Instant::now();
-    let mut tx = begin_immediate_with_retry(pool, "work_items.enqueue").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.enqueue",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.enqueue",
+        ),
+        "work_items.enqueue",
+    )
+    .await?;
     enqueue_tx(&mut tx, item).await?;
     tx.commit().await?;
     log_write_transaction("work_items.enqueue", tx_started);
@@ -62,9 +72,17 @@ pub async fn claim_next_non_invoke(pool: &SqlitePool) -> Result<Option<WorkItem>
 async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Option<WorkItem>> {
     // Use a transaction to atomically select and update the next pending item.
     let tx_started = Instant::now();
-    let mut tx = begin_immediate_with_retry(pool, "work_items.claim_next")
-        .await
-        .context("begin claim_next transaction")?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.claim_next",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.claim_next",
+        ),
+        "work_items.claim_next",
+    )
+    .await
+    .context("begin claim_next transaction")?;
 
     let now = Utc::now().to_rfc3339();
     let pending_status = WorkItemStatus::Pending.to_string();
@@ -85,7 +103,7 @@ async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Opt
     let row = sqlx::query(&query)
         .bind(&pending_status)
         .bind(&now)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .context("select next work item")?;
 
@@ -107,7 +125,7 @@ async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Opt
     .bind(&now)
     .bind(&item_id)
     .bind(&pending_status)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("mark work item running")?
     .rows_affected();
@@ -298,7 +316,16 @@ pub async fn requeue_running_preclaimed_invoke_for_stage(
     stage_id: &str,
 ) -> Result<usize> {
     let stage_execution_id = stage_execution_id.to_string();
-    let mut tx = begin_immediate_with_retry(pool, "work_items.requeue_preclaimed_invoke").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.requeue_preclaimed_invoke",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.requeue_preclaimed_invoke",
+        ),
+        "work_items.requeue_preclaimed_invoke",
+    )
+    .await?;
     let requeued = requeue_running_preclaimed_invoke_for_stage_tx(
         &mut tx,
         run_id,
@@ -408,8 +435,13 @@ pub async fn settle_terminal_preclaimed_invoke_agent_executions(
     fallback_completed_at: DateTime<Utc>,
 ) -> Result<u64> {
     let tx_started = Instant::now();
-    let mut tx = begin_immediate_with_retry(
+    let mut tx = begin_registered_immediate_transaction(
         pool,
+        crate::writer::class_a_operation(
+            "work_items.settle_terminal_preclaimed_invoke_agent_executions",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.settle_terminal_preclaimed_invoke_agent_executions",
+        ),
         "work_items.settle_terminal_preclaimed_invoke_agent_executions",
     )
     .await?;
@@ -585,8 +617,16 @@ pub async fn requeue_running_advance_by_run(
     reason: &str,
 ) -> Result<u64> {
     let tx_started = Instant::now();
-    let mut tx =
-        begin_immediate_with_retry(pool, "work_items.requeue_running_advance_by_run").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.requeue_running_advance_by_run",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.requeue_running_advance_by_run",
+        ),
+        "work_items.requeue_running_advance_by_run",
+    )
+    .await?;
     let requeued = requeue_running_advance_by_run_tx(&mut tx, run_id, scheduled_at, reason).await?;
     tx.commit()
         .await
@@ -631,8 +671,13 @@ pub async fn requeue_running_steward_analysis_on_startup(
     reason: &str,
 ) -> Result<u64> {
     let tx_started = Instant::now();
-    let mut tx = begin_immediate_with_retry(
+    let mut tx = begin_registered_immediate_transaction(
         pool,
+        crate::writer::class_a_operation(
+            "work_items.requeue_running_steward_analysis_on_startup",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.requeue_running_steward_analysis_on_startup",
+        ),
         "work_items.requeue_running_steward_analysis_on_startup",
     )
     .await?;
@@ -684,8 +729,16 @@ pub async fn requeue_running_invoke_agent_on_startup(
     reason: &str,
 ) -> Result<u64> {
     let tx_started = Instant::now();
-    let mut tx =
-        begin_immediate_with_retry(pool, "work_items.requeue_running_invoke_on_startup").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.requeue_running_invoke_on_startup",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.requeue_running_invoke_on_startup",
+        ),
+        "work_items.requeue_running_invoke_on_startup",
+    )
+    .await?;
     let requeued =
         requeue_running_invoke_agent_on_startup_tx(&mut tx, scheduled_at, reason).await?;
     tx.commit()
@@ -764,8 +817,13 @@ pub async fn requeue_stale_starting_invoke_agent_sessions(
     reason: &str,
 ) -> Result<u64> {
     let tx_started = Instant::now();
-    let mut tx = begin_immediate_with_retry(
+    let mut tx = begin_registered_immediate_transaction(
         pool,
+        crate::writer::class_a_operation(
+            "work_items.requeue_stale_starting_invoke_agent_sessions",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.requeue_stale_starting_invoke_agent_sessions",
+        ),
         "work_items.requeue_stale_starting_invoke_agent_sessions",
     )
     .await?;
@@ -795,9 +853,16 @@ pub async fn requeue_stale_pre_session_invoke_agents(
     reason: &str,
 ) -> Result<u64> {
     let tx_started = Instant::now();
-    let mut tx =
-        begin_immediate_with_retry(pool, "work_items.requeue_stale_pre_session_invoke_agents")
-            .await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.requeue_stale_pre_session_invoke_agents",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.requeue_stale_pre_session_invoke_agents",
+        ),
+        "work_items.requeue_stale_pre_session_invoke_agents",
+    )
+    .await?;
     let requeued = requeue_stale_pre_session_invoke_agents_tx(
         &mut tx,
         scheduled_at,
@@ -1079,8 +1144,16 @@ pub async fn cancel_pending_or_running_advance_by_run(
     reason: &str,
 ) -> Result<u64> {
     let tx_started = Instant::now();
-    let mut tx =
-        begin_immediate_with_retry(pool, "work_items.cancel_advance_for_parked_cursor").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.cancel_advance_for_parked_cursor",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.cancel_advance_for_parked_cursor",
+        ),
+        "work_items.cancel_advance_for_parked_cursor",
+    )
+    .await?;
     let cancelled =
         cancel_pending_or_running_advance_by_run_tx(&mut tx, run_id, completed_at, reason).await?;
     tx.commit()
@@ -1127,8 +1200,16 @@ pub async fn requeue_running_invoke_agent_by_stage_for_host_interruption(
     scheduled_at: DateTime<Utc>,
 ) -> Result<Vec<String>> {
     let tx_started = Instant::now();
-    let mut tx =
-        begin_immediate_with_retry(pool, "work_items.requeue_host_interruption_invoke").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.requeue_host_interruption_invoke",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.requeue_host_interruption_invoke",
+        ),
+        "work_items.requeue_host_interruption_invoke",
+    )
+    .await?;
     let requeued = requeue_running_invoke_agent_by_stage_for_host_interruption_tx(
         &mut tx,
         run_id,
@@ -1235,8 +1316,16 @@ pub async fn requeue_running_invoke_agent_after_active_prompt_close(
     reason: &str,
 ) -> Result<bool> {
     let tx_started = Instant::now();
-    let mut tx =
-        begin_immediate_with_retry(pool, "work_items.requeue_active_prompt_closed_invoke").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.requeue_active_prompt_closed_invoke",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.requeue_active_prompt_closed_invoke",
+        ),
+        "work_items.requeue_active_prompt_closed_invoke",
+    )
+    .await?;
     let requeued = requeue_running_invoke_agent_after_active_prompt_close_tx(
         &mut tx,
         work_item_id,
@@ -1358,14 +1447,23 @@ pub async fn complete_with_capacity(
     capacity: &InvokeAgentCapacityConfig,
 ) -> Result<scheduler::RefreshQueueSummariesResult> {
     let tx_started = Instant::now();
-    let mut tx = begin_immediate_with_retry(pool, "work_items.complete").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.complete",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.complete",
+        ),
+        "work_items.complete",
+    )
+    .await?;
     let now = Utc::now().to_rfc3339();
     let status = WorkItemStatus::Completed.to_string();
     let mut refresh_scheduler = false;
     let existing =
         sqlx::query(r#"SELECT kind, run_id, status, payload_json FROM work_items WHERE id = ?1"#)
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .context("select work item before complete")?;
     if let Some(row) = existing {
@@ -1385,7 +1483,7 @@ pub async fn complete_with_capacity(
             .bind(id)
             .bind(WorkItemStatus::Pending.to_string())
             .bind(WorkItemStatus::Running.to_string())
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .context("complete work item")?;
         if kind == WorkItemKind::InvokeAgent.to_string()
@@ -1407,7 +1505,7 @@ pub async fn complete_with_capacity(
                     .bind(&now)
                     .bind(agent_execution_id)
                     .bind(AgentStatus::Running.to_string())
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await
                     .context("settle preclaimed InvokeAgent execution on work item complete")?;
                     sqlx::query(
@@ -1424,7 +1522,7 @@ pub async fn complete_with_capacity(
                     .bind(id)
                     .bind(agent_execution_id)
                     .bind("active")
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await
                     .context("close active source-generation claim on work item complete")?;
                 }
@@ -1452,7 +1550,7 @@ pub async fn complete_with_capacity(
                 .bind(pending_status)
                 .bind(run_id)
                 .bind(&now)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .context("enqueue post-completion AdvanceRun for InvokeAgent")?;
             }
@@ -1495,12 +1593,21 @@ pub async fn fail_with_capacity(
     capacity: &InvokeAgentCapacityConfig,
 ) -> Result<scheduler::RefreshQueueSummariesResult> {
     let tx_started = Instant::now();
-    let mut tx = begin_immediate_with_retry(pool, "work_items.fail").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.fail",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.fail",
+        ),
+        "work_items.fail",
+    )
+    .await?;
     let now = Utc::now().to_rfc3339();
     let status = WorkItemStatus::Failed.to_string();
     let existing = sqlx::query(r#"SELECT kind, run_id, status FROM work_items WHERE id = ?1"#)
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .context("select work item before fail")?;
     let refresh = if let Some(row) = existing {
@@ -1523,7 +1630,7 @@ pub async fn fail_with_capacity(
         .bind(id)
         .bind(WorkItemStatus::Pending.to_string())
         .bind(WorkItemStatus::Running.to_string())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("fail work item")?;
         if kind == WorkItemKind::InvokeAgent.to_string()
@@ -1552,7 +1659,7 @@ pub async fn fail_with_capacity(
                 .bind(pending_status)
                 .bind(run_id)
                 .bind(&now)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .context("enqueue post-failure AdvanceRun for InvokeAgent")?;
             }
@@ -1606,13 +1713,20 @@ pub async fn requeue_running_after_transient_persistence_contention(
     error: &str,
 ) -> Result<bool> {
     let tx_started = Instant::now();
-    let mut tx =
-        begin_immediate_with_retry(pool, "work_items.requeue_transient_persistence_contention")
-            .await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.requeue_transient_persistence_contention",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.requeue_transient_persistence_contention",
+        ),
+        "work_items.requeue_transient_persistence_contention",
+    )
+    .await?;
     let row = sqlx::query(r#"SELECT attempt_count FROM work_items WHERE id = ?1 AND status = ?2"#)
         .bind(id)
         .bind(WorkItemStatus::Running.to_string())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .context("load running work item for transient persistence requeue")?;
 
@@ -1645,7 +1759,7 @@ pub async fn requeue_running_after_transient_persistence_contention(
     .bind(last_error)
     .bind(id)
     .bind(WorkItemStatus::Running.to_string())
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("requeue work item after transient persistence contention")?
     .rows_affected();
@@ -1662,7 +1776,16 @@ pub async fn requeue_running_after_transient_persistence_contention(
 
 pub async fn cancel_running_by_run(pool: &SqlitePool, run_id: RunId) -> Result<()> {
     let tx_started = Instant::now();
-    let mut tx = begin_immediate_with_retry(pool, "work_items.cancel_running_by_run").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.cancel_running_by_run",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.cancel_running_by_run",
+        ),
+        "work_items.cancel_running_by_run",
+    )
+    .await?;
     cancel_running_by_run_tx(&mut tx, run_id, Utc::now()).await?;
     tx.commit()
         .await
