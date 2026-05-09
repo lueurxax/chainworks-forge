@@ -59,7 +59,10 @@ struct Proposal022ScaffoldingTests {
         let object = try #require(try JSONSerialization.jsonObject(with: generated.data) as? [String: Any])
         #expect(object["proposal_revision_id"] is String)
         #expect(object["source_review_pass_id"] is String)
-        #expect(object["backlog_items_addressed"] is [[String: Any]])
+        #expect(object["backlog_items_addressed"] is [String])
+        #expect(object["backlog_items_unresolved"] is [String])
+        #expect(object["backlog_items_deferred"] is [String])
+        #expect(object["backlog_items_disputed"] is [String])
         #expect(object["sections_changed"] is [String])
     }
 

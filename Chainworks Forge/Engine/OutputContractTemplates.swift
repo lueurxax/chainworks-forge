@@ -219,15 +219,10 @@ struct OutputContractTemplates {
         let json: [String: Any] = [
             "proposal_revision_id": "proposal-revision-2",
             "source_review_pass_id": "review-pass-1",
-            "backlog_items_addressed": [
-                [
-                    "id": "issue-1",
-                    "resolution": "Clarified the release scope and added a dedicated section on first-release boundaries."
-                ]
-            ],
-            "backlog_items_unresolved": [] as [[String: Any]],
-            "backlog_items_deferred": [] as [[String: Any]],
-            "backlog_items_disputed": [] as [[String: Any]],
+            "backlog_items_addressed": ["issue-1"],
+            "backlog_items_unresolved": [] as [String],
+            "backlog_items_deferred": [] as [String],
+            "backlog_items_disputed": [] as [String],
             "sections_changed": ["Scope", "Rollout Plan"],
             "factual_claims_added_or_corrected": [] as [String],
             "notes": "Coverage is complete for the current refine pass."

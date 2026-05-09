@@ -525,4 +525,49 @@ struct Proposal022Tests {
         #expect(payload.proposalLoopSummary?.growthGuardRecommendation == "replan_or_split_required")
         #expect(payload.proposalLoopSummary?.boundedNextAction == "targeted_rereview")
     }
+
+    @Test("Proposal feedback coverage fails closed for legacy object-shaped backlog arrays")
+    func proposalFeedbackCoverageFailsClosedForLegacyObjectArrays() throws {
+        let artifactRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Proposal022CoverageStrict-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let coveragePath = artifactRoot.appendingPathComponent("proposal_feedback_coverage.json")
+        let legacyCoverageJSON = """
+        {
+          "proposal_revision_id": "proposal-revision-legacy",
+          "source_review_pass_id": "review-pass-3",
+          "backlog_items_addressed": [
+            {
+              "id": "ui-1",
+              "resolution": "legacy object shape"
+            }
+          ],
+          "backlog_items_unresolved": [],
+          "backlog_items_deferred": [],
+          "backlog_items_disputed": [],
+          "sections_changed": ["UI states"],
+          "factual_claims_added_or_corrected": [],
+          "notes": "legacy object arrays should no longer count as valid coverage"
+        }
+        """
+        try legacyCoverageJSON.write(to: coveragePath, atomically: true, encoding: .utf8)
+
+        let artifact = Artifact(
+            name: ProposalLoopFeedbackArtifactName.proposalFeedbackCoverage,
+            contractID: "proposal_feedback_coverage_v1",
+            format: .json,
+            filePath: coveragePath.path,
+            runID: UUID(),
+            stageID: "state_4_proposal_refined",
+            agentID: "proposal_writer",
+            provider: "system"
+        )
+
+        let summary = ProposalLoopFeedbackParser.parseSummary(from: [artifact])
+
+        #expect(summary != nil)
+        #expect(summary?.addressedItemCount == 0)
+        #expect(summary?.coverageStatusSummary == "coverage unavailable")
+    }
 }

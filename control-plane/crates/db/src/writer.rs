@@ -315,6 +315,82 @@ pub async fn begin_repository_transaction<'pool>(
     .await
 }
 
+pub async fn execute_repository_unit_operation(
+    pool: &SqlitePool,
+    op: WriteOperation,
+    context: &'static str,
+    work: WriteWork,
+) -> anyhow::Result<()> {
+    if let Err(rejected) = op.validate() {
+        anyhow::bail!(
+            "DbWriter rejected {context} before submit: {}",
+            rejected.as_str()
+        );
+    }
+    let result = if let Some(writer) = shared_writer_for(pool).await {
+        writer.submit_work(op, work).await
+    } else {
+        let Some((_key, file_backed)) = pool_registry_key(pool).await else {
+            anyhow::bail!("P075 shared DbWriter registry key unavailable for {context}");
+        };
+        if file_backed {
+            anyhow::bail!("P075 shared DbWriter is not registered for {context}");
+        }
+        let writer = Arc::new(DbWriter::new(pool.clone()));
+        let result = writer.submit_work(op, work).await;
+        writer.shutdown().await;
+        result
+    };
+    match result {
+        WriteResult::Committed | WriteResult::Coalesced | WriteResult::DroppedTelemetry => Ok(()),
+        WriteResult::WriteRejected { reason, .. } => {
+            anyhow::bail!("DbWriter rejected {context}: {reason}")
+        }
+        other => anyhow::bail!("DbWriter {context} did not commit: {}", other.as_str()),
+    }
+}
+
+pub async fn execute_repository_unit_write(
+    pool: &SqlitePool,
+    operation_name: &'static str,
+    work: WriteWork,
+) -> anyhow::Result<()> {
+    execute_repository_unit_operation(
+        pool,
+        repository_transaction_operation(operation_name),
+        operation_name,
+        work,
+    )
+    .await
+}
+
+pub async fn execute_repository_transaction_operation(
+    pool: &SqlitePool,
+    op: WriteOperation,
+    context: &'static str,
+    work: TransactionWork<()>,
+) -> anyhow::Result<()> {
+    if let Err(rejected) = op.validate() {
+        anyhow::bail!(
+            "DbWriter rejected {context} before transaction submit: {}",
+            rejected.as_str()
+        );
+    }
+    if let Some(writer) = shared_writer_for(pool).await {
+        return writer.submit_unit_transaction(op, context, work).await;
+    }
+    let Some((_key, file_backed)) = pool_registry_key(pool).await else {
+        anyhow::bail!("P075 shared DbWriter registry key unavailable for {context}");
+    };
+    if file_backed {
+        anyhow::bail!("P075 shared DbWriter is not registered for {context}");
+    }
+    let writer = Arc::new(DbWriter::new(pool.clone()));
+    let result = writer.submit_unit_transaction(op, context, work).await;
+    writer.shutdown().await;
+    result
+}
+
 #[macro_export]
 macro_rules! execute_repository_write {
     ($pool:expr, $operation_name:expr, $query:expr) => {{
@@ -523,6 +599,9 @@ pub const TELEMETRY_FLUSH_CADENCE_MS: u64 = 5_000;
 /// Telemetry snapshot TTL in hours.
 pub const TELEMETRY_SNAPSHOT_TTL_HOURS: u64 = 24;
 
+/// Maximum retained Class D rollup windows.
+pub const TELEMETRY_SNAPSHOT_RETAIN_LATEST: i64 = 288;
+
 // ---------------------------------------------------------------------------
 // Lane priority ordering
 // ---------------------------------------------------------------------------
@@ -673,6 +752,10 @@ pub struct DbWriterHeartbeat {
     pub lane_pending_count: [AtomicI64; 6],
     /// Cumulative Class B coalescing rejections due to map saturation (COALESCE_MAX_KEYS).
     pub coalesced_rejected_total: AtomicU64,
+    /// Cumulative Class B writes merged into an existing coalescing key.
+    pub coalesced_merged_total: AtomicU64,
+    /// Cumulative Class D telemetry writes dropped under queue pressure.
+    pub telemetry_dropped_total: AtomicU64,
     /// Rolling committed transaction duration samples in milliseconds.
     transaction_duration_ms: Mutex<VecDeque<u64>>,
     /// Reference instant for ns offsets (process-start-relative).
@@ -696,9 +779,12 @@ pub struct DbWriterHealthSnapshot {
     pub last_drain_age_ms: Option<u64>,
     pub transaction_duration_p50_ms: Option<u64>,
     pub transaction_duration_p95_ms: Option<u64>,
+    pub transaction_duration_sample_count: usize,
     pub total_queued: i64,
     pub lanes: Vec<DbWriterLaneSnapshot>,
     pub coalesced_rejected_total: u64,
+    pub coalesced_merged_total: u64,
+    pub telemetry_dropped_total: u64,
     pub starvation_total: u64,
 }
 
@@ -716,6 +802,8 @@ impl DbWriterHeartbeat {
             lane_oldest_enqueued_ns: [ZERO_U64; 6],
             lane_pending_count: [ZERO_I64; 6],
             coalesced_rejected_total: AtomicU64::new(0),
+            coalesced_merged_total: AtomicU64::new(0),
+            telemetry_dropped_total: AtomicU64::new(0),
             transaction_duration_ms: Mutex::new(VecDeque::new()),
             origin: Instant::now(),
         }
@@ -813,6 +901,7 @@ impl DbWriterHeartbeat {
             .copied()
             .collect::<Vec<_>>();
         let transaction_duration_p50_ms = percentile(transaction_duration_samples.clone(), 50);
+        let transaction_duration_sample_count = transaction_duration_samples.len();
         let transaction_duration_p95_ms = percentile(transaction_duration_samples, 95);
         DbWriterHealthSnapshot {
             alive: self.is_alive(),
@@ -822,9 +911,12 @@ impl DbWriterHeartbeat {
             last_drain_age_ms,
             transaction_duration_p50_ms,
             transaction_duration_p95_ms,
+            transaction_duration_sample_count,
             total_queued,
             lanes,
             coalesced_rejected_total: self.coalesced_rejected_total.load(Ordering::Relaxed),
+            coalesced_merged_total: self.coalesced_merged_total.load(Ordering::Relaxed),
+            telemetry_dropped_total: self.telemetry_dropped_total.load(Ordering::Relaxed),
             starvation_total: self.starvation_total.load(Ordering::Relaxed),
         }
     }
@@ -966,6 +1058,10 @@ impl DbWriter {
         W: FnOnce(SqlitePool) -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<u32>> + Send + 'static,
     {
+        self.submit_work(op, make_work(work)).await
+    }
+
+    pub async fn submit_work(&self, op: WriteOperation, work: WriteWork) -> WriteResult {
         if let Err(rejected) = op.validate() {
             return rejected;
         }
@@ -992,7 +1088,7 @@ impl DbWriter {
 
         // Class B: route through coalescing buffer (last-writer-wins, LIFT-REL-08).
         if op.class == WriteClass::B {
-            return self.submit_class_b(op, make_work(work)).await;
+            return self.submit_class_b(op, work).await;
         }
 
         tracing::debug!(
@@ -1017,6 +1113,20 @@ impl DbWriter {
         };
 
         let lane_tx = self.lane_sender(op.lane);
+        if op.class == WriteClass::D && lane_tx.capacity() == 0 {
+            let dropped_total = self
+                .heartbeat
+                .telemetry_dropped_total
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            tracing::warn!(
+                operation_name = op.operation_name,
+                lane = op.lane.as_str(),
+                telemetry_dropped_total = dropped_total,
+                "DbWriter: dropping Class D telemetry because lane is full"
+            );
+            return WriteResult::DroppedTelemetry;
+        }
 
         // Enqueue within deadline (admission wait counts against deadline).
         match tokio::time::timeout(deadline, lane_tx.send(msg)).await {
@@ -1202,6 +1312,37 @@ impl DbWriter {
         }
     }
 
+    pub async fn submit_unit_transaction(
+        &self,
+        op: WriteOperation,
+        context: &'static str,
+        work: TransactionWork<()>,
+    ) -> anyhow::Result<()> {
+        let result = self
+            .submit_work(
+                op,
+                make_work(move |pool| async move {
+                    let mut tx = crate::pool::begin_immediate_with_retry(&pool, context).await?;
+                    let ((), rows) = work(&mut tx).await?;
+                    tx.commit().await?;
+                    Ok(rows)
+                }),
+            )
+            .await;
+        match result {
+            WriteResult::Committed | WriteResult::Coalesced | WriteResult::DroppedTelemetry => {
+                Ok(())
+            }
+            WriteResult::WriteRejected { reason, .. } => {
+                anyhow::bail!("DbWriter rejected {context}: {reason}")
+            }
+            other => anyhow::bail!(
+                "DbWriter transaction {context} did not commit: {}",
+                other.as_str()
+            ),
+        }
+    }
+
     /// Initiate graceful shutdown: reject new B/C/D writes, drain Class A
     /// within the shutdown budget, then stop the executor.
     ///
@@ -1289,6 +1430,9 @@ impl DbWriter {
                     let _ = old.result_tx.send(WriteResult::Coalesced);
                     buf.merge_count += 1;
                     buf.total_merged += 1;
+                    self.heartbeat
+                        .coalesced_merged_total
+                        .fetch_add(1, Ordering::Relaxed);
                     buf.entries.insert(
                         key,
                         CoalescedEntry {
@@ -1302,6 +1446,11 @@ impl DbWriter {
                 } else {
                     // New entry is stale; evict it immediately.
                     let _ = result_tx.send(WriteResult::Coalesced);
+                    buf.merge_count += 1;
+                    buf.total_merged += 1;
+                    self.heartbeat
+                        .coalesced_merged_total
+                        .fetch_add(1, Ordering::Relaxed);
                     // result_rx will return Coalesced on the await below.
                 }
             } else if buf.entries.len() >= COALESCE_MAX_KEYS {
@@ -1410,6 +1559,9 @@ async fn run_coalescing_flush(
     use tokio::time::{interval, Duration};
     let mut tick = interval(Duration::from_millis(COALESCE_FLUSH_INTERVAL_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `tokio::interval` ticks immediately on first poll. Consume that initial
+    // tick so Class B writes get the documented 500 ms coalescing window.
+    tick.tick().await;
 
     loop {
         tokio::select! {

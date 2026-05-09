@@ -6,6 +6,21 @@ use sqlx::{Row, SqlitePool};
 use tracing::info;
 
 use super::artifact_contracts;
+use crate::writer::{
+    execute_repository_transaction_operation, repository_transaction_operation, TransactionWork,
+};
+
+async fn execute_projection_write(
+    pool: &SqlitePool,
+    operation_name: &'static str,
+    idempotency_key: impl Into<String>,
+    work: TransactionWork<()>,
+) -> Result<()> {
+    let mut op = repository_transaction_operation(operation_name);
+    op.idempotency_key = idempotency_key.into();
+    op.observed_at = Some(Utc::now().timestamp_millis().max(0) as u64);
+    execute_repository_transaction_operation(pool, op, operation_name, work).await
+}
 
 // ---------------------------------------------------------------------------
 // Projection read types (ARCH-002 fix)
@@ -322,48 +337,80 @@ pub async fn find_run_projection(
 /// Rebuild run_summary for a single run from canonical tables.
 pub async fn rebuild_run_summary(pool: &SqlitePool, run_id: RunId) -> Result<()> {
     let now = Utc::now().to_rfc3339();
+    let run_id_string = run_id.to_string();
 
     // Upsert run_summaries by computing counts from canonical tables
-    crate::execute_repository_write!(pool, "projections.rebuild_run_summary", sqlx::query(
-        r#"INSERT OR REPLACE INTO run_summaries
-           (run_id, idea_id, workflow_title, status, total_stages, completed_stages, failed_stages, pending_approvals, started_at, updated_at)
-           SELECT
-             r.id,
-             r.idea_id,
-             r.workflow_title,
-             r.status,
-             COUNT(DISTINCT se.id),
-             COUNT(DISTINCT CASE WHEN se.status = 'completed' THEN se.id END),
-             COUNT(DISTINCT CASE WHEN se.status = 'failed' THEN se.id END),
-             COUNT(DISTINCT CASE WHEN a.decision IN ('pending','requested') THEN a.id END),
-             r.started_at,
-             ?
-           FROM runs r
-           LEFT JOIN stage_executions se ON se.run_id = r.id
-           LEFT JOIN approvals a ON a.run_id = r.id
-           WHERE r.id = ?
-           GROUP BY r.id"#,
+    execute_projection_write(
+        pool,
+        "projections.rebuild_run_summary",
+        format!("run:{run_id_string}:projection:run_summary:upsert"),
+        {
+            let now = now.clone();
+            let run_id_string = run_id_string.clone();
+            Box::new(move |tx| {
+                Box::pin(async move {
+                let rows = sqlx::query(
+                    r#"INSERT OR REPLACE INTO run_summaries
+                       (run_id, idea_id, workflow_title, status, total_stages, completed_stages, failed_stages, pending_approvals, started_at, updated_at)
+                       SELECT
+                         r.id,
+                         r.idea_id,
+                         r.workflow_title,
+                         r.status,
+                         COUNT(DISTINCT se.id),
+                         COUNT(DISTINCT CASE WHEN se.status = 'completed' THEN se.id END),
+                         COUNT(DISTINCT CASE WHEN se.status = 'failed' THEN se.id END),
+                         COUNT(DISTINCT CASE WHEN a.decision IN ('pending','requested') THEN a.id END),
+                         r.started_at,
+                         ?
+                       FROM runs r
+                       LEFT JOIN stage_executions se ON se.run_id = r.id
+                       LEFT JOIN approvals a ON a.run_id = r.id
+                       WHERE r.id = ?
+                       GROUP BY r.id"#,
+                )
+                .bind(now)
+                .bind(run_id_string)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected() as u32;
+                Ok(((), rows))
+                })
+            })
+        },
     )
-    .bind(&now)
-    .bind(run_id.to_string()))?;
+    .await?;
 
     let settlement_summary = sqlx::query_scalar::<_, Option<String>>(
         "SELECT cancellation_settlement_log FROM runs WHERE id = ?",
     )
-    .bind(run_id.to_string())
+    .bind(&run_id_string)
     .fetch_one(pool)
     .await?
     .and_then(|log| build_cancellation_settlement_summary(&log));
 
-    crate::execute_repository_write!(
+    execute_projection_write(
         pool,
         "projections.rebuild_run_summary",
-        sqlx::query(
-            "UPDATE run_summaries SET cancellation_settlement_summary = ?1 WHERE run_id = ?2"
-        )
-        .bind(settlement_summary)
-        .bind(run_id.to_string())
-    )?;
+        format!("run:{run_id_string}:projection:run_summary:cancellation"),
+        {
+            let run_id_string = run_id_string.clone();
+            Box::new(move |tx| {
+                Box::pin(async move {
+                let rows = sqlx::query(
+                    "UPDATE run_summaries SET cancellation_settlement_summary = ?1 WHERE run_id = ?2",
+                )
+                .bind(settlement_summary)
+                .bind(run_id_string)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected() as u32;
+                Ok(((), rows))
+                })
+            })
+        },
+    )
+    .await?;
 
     info!(run_id = %run_id, "Rebuilt run_summary projection");
     Ok(())
@@ -398,26 +445,41 @@ fn build_cancellation_settlement_summary(raw: &str) -> Option<String> {
 /// Rebuild stage_summaries for all stages in a run.
 pub async fn rebuild_stage_summaries(pool: &SqlitePool, run_id: RunId) -> Result<()> {
     let now = Utc::now().to_rfc3339();
+    let run_id_string = run_id.to_string();
 
-    crate::execute_repository_write!(pool, "projections.rebuild_stage_summaries", sqlx::query(
-        r#"INSERT OR REPLACE INTO stage_summaries
-           (stage_execution_id, run_id, stage_id, label, status, attempt_number, has_artifacts, has_pending_approval, has_validation_failure, updated_at)
-           SELECT
-             se.id,
-             se.run_id,
-             se.stage_id,
-             se.label,
-             se.status,
-             se.attempt_number,
-             EXISTS(SELECT 1 FROM artifacts art WHERE art.run_id = se.run_id AND art.stage_id = se.stage_id),
-             EXISTS(SELECT 1 FROM approvals ap WHERE ap.run_id = se.run_id AND ap.stage_id = se.stage_id AND ap.decision IN ('pending','requested')),
-             EXISTS(SELECT 1 FROM validation_failure_records vfr WHERE vfr.run_id = se.run_id AND vfr.stage_execution_id = se.id),
-             ?
-           FROM stage_executions se
-           WHERE se.run_id = ?"#,
+    execute_projection_write(
+        pool,
+        "projections.rebuild_stage_summaries",
+        format!("run:{run_id_string}:projection:stage_summaries"),
+        Box::new(move |tx| {
+            Box::pin(async move {
+            let rows = sqlx::query(
+                r#"INSERT OR REPLACE INTO stage_summaries
+                   (stage_execution_id, run_id, stage_id, label, status, attempt_number, has_artifacts, has_pending_approval, has_validation_failure, updated_at)
+                   SELECT
+                     se.id,
+                     se.run_id,
+                     se.stage_id,
+                     se.label,
+                     se.status,
+                     se.attempt_number,
+                     EXISTS(SELECT 1 FROM artifacts art WHERE art.run_id = se.run_id AND art.stage_id = se.stage_id),
+                     EXISTS(SELECT 1 FROM approvals ap WHERE ap.run_id = se.run_id AND ap.stage_id = se.stage_id AND ap.decision IN ('pending','requested')),
+                     EXISTS(SELECT 1 FROM validation_failure_records vfr WHERE vfr.run_id = se.run_id AND vfr.stage_execution_id = se.id),
+                     ?
+                   FROM stage_executions se
+                   WHERE se.run_id = ?"#,
+            )
+            .bind(now)
+            .bind(run_id_string)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected() as u32;
+            Ok(((), rows))
+            })
+        }),
     )
-    .bind(&now)
-    .bind(run_id.to_string()))?;
+    .await?;
 
     Ok(())
 }
@@ -425,59 +487,79 @@ pub async fn rebuild_stage_summaries(pool: &SqlitePool, run_id: RunId) -> Result
 /// Rebuild approval_inbox for a run.
 pub async fn rebuild_approval_inbox(pool: &SqlitePool, run_id: RunId) -> Result<()> {
     let now = Utc::now().to_rfc3339();
+    let run_id_string = run_id.to_string();
 
-    // Remove stale entries for this run
-    crate::execute_repository_write!(
+    execute_projection_write(
         pool,
         "projections.rebuild_approval_inbox",
-        sqlx::query("DELETE FROM approval_inbox WHERE run_id = ?").bind(run_id.to_string())
-    )?;
-
-    // Insert pending/requested approvals
-    crate::execute_repository_write!(
-        pool,
-        "projections.rebuild_approval_inbox",
-        sqlx::query(
-            r#"INSERT OR IGNORE INTO approval_inbox
-           (approval_id, run_id, stage_id, workflow_title, requested_at, expires_at, updated_at)
-           SELECT
-             a.id,
-             a.run_id,
-             a.stage_id,
-             r.workflow_title,
-             a.requested_at,
-             a.expires_at,
-             ?
-           FROM approvals a
-           JOIN runs r ON r.id = a.run_id
-           WHERE a.run_id = ? AND a.decision IN ('pending','requested')"#,
-        )
-        .bind(&now)
-        .bind(run_id.to_string())
-    )?;
+        format!("run:{run_id_string}:projection:approval_inbox"),
+        Box::new(move |tx| {
+            Box::pin(async move {
+            let mut rows = sqlx::query("DELETE FROM approval_inbox WHERE run_id = ?")
+                .bind(&run_id_string)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected() as u32;
+            rows += sqlx::query(
+                r#"INSERT OR IGNORE INTO approval_inbox
+                   (approval_id, run_id, stage_id, workflow_title, requested_at, expires_at, updated_at)
+                   SELECT
+                     a.id,
+                     a.run_id,
+                     a.stage_id,
+                     r.workflow_title,
+                     a.requested_at,
+                     a.expires_at,
+                     ?
+                   FROM approvals a
+                   JOIN runs r ON r.id = a.run_id
+                   WHERE a.run_id = ? AND a.decision IN ('pending','requested')"#,
+            )
+            .bind(now)
+            .bind(run_id_string)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected() as u32;
+            Ok(((), rows))
+            })
+        }),
+    )
+    .await?;
 
     Ok(())
 }
 
 /// Rebuild artifact_index entries for new artifacts in a run.
 pub async fn upsert_artifact_index_entry(pool: &SqlitePool, run_id: RunId) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
-
-    crate::execute_repository_write!(pool, "projections.upsert_artifact_index_entry", sqlx::query(
-        r#"INSERT OR IGNORE INTO artifact_index
-           (artifact_id, run_id, stage_id, name, format, file_path, is_pinned, report_kind, created_at)
-           SELECT id, run_id, stage_id, name, format, file_path, is_pinned, report_kind, created_at
-           FROM artifacts WHERE run_id = ?"#,
+    let run_id_string = run_id.to_string();
+    execute_projection_write(
+        pool,
+        "projections.upsert_artifact_index_entry",
+        format!("run:{run_id_string}:projection:artifact_index"),
+        Box::new(move |tx| {
+            Box::pin(async move {
+            let mut rows = sqlx::query(
+                r#"INSERT OR IGNORE INTO artifact_index
+                   (artifact_id, run_id, stage_id, name, format, file_path, is_pinned, report_kind, created_at)
+                   SELECT id, run_id, stage_id, name, format, file_path, is_pinned, report_kind, created_at
+                   FROM artifacts WHERE run_id = ?"#,
+            )
+            .bind(&run_id_string)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected() as u32;
+            rows += sqlx::query(
+                "UPDATE artifact_index SET is_pinned = (SELECT is_pinned FROM artifacts WHERE artifacts.id = artifact_index.artifact_id) WHERE run_id = ?",
+            )
+            .bind(run_id_string)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected() as u32;
+            Ok(((), rows))
+            })
+        }),
     )
-    .bind(run_id.to_string()))?;
-
-    // Update is_pinned from source
-    crate::execute_repository_write!(pool, "projections.upsert_artifact_index_entry", sqlx::query(
-        "UPDATE artifact_index SET is_pinned = (SELECT is_pinned FROM artifacts WHERE artifacts.id = artifact_index.artifact_id) WHERE run_id = ?"
-    )
-    .bind(run_id.to_string()))?;
-
-    let _ = now; // suppress unused warning
+    .await?;
     Ok(())
 }
 

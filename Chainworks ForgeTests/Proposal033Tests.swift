@@ -191,7 +191,7 @@ struct Proposal033Tests {
               "displayName": "Custom Gemini",
               "transport": "goose_server",
               "authMode": "sessionToken",
-              "defaultModel": "gemini-2.5-pro",
+              "defaultModel": "gemini-3.1-pro-preview",
               "capabilities": {
                 "supportsStreaming": false,
                 "supportsTools": false,
