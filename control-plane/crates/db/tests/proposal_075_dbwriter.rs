@@ -15,6 +15,7 @@ use db::repos::evidence_spool_refs::{
     find_by_run_and_path, insert_idempotent_via_dbwriter, list_by_run_id, EvidenceKind,
     EvidenceSpoolRef, EvidenceSpoolRefStatus,
 };
+use db::repos::storage_health;
 use db::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
 use db::writer::{make_work, DbWriter, HIGH_PRIORITY_LANES, LANE_DRAIN_ORDER};
 use std::sync::{Arc, Mutex};
@@ -146,6 +147,160 @@ async fn dbwriter_class_a_processed_before_class_d_when_both_queued() {
         );
     }
     // If Class D timed out, it won't appear in the order vec — that's acceptable.
+
+    writer.shutdown().await;
+}
+
+#[tokio::test]
+async fn class_d_telemetry_drop_counter_is_observable_via_storage_health() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = Arc::new(DbWriter::new(pool.clone()));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+
+    let gate1 = gate.clone();
+    let w1 = writer.clone();
+    let gatekeeper = tokio::spawn(async move {
+        w1.submit(class_d_op("gatekeeper"), move |_pool| async move {
+            let _permit = gate1.acquire().await.unwrap();
+            Ok(1u32)
+        })
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let capacity = WriteLane::TelemetryRollup.capacity();
+    let mut handles = Vec::with_capacity(capacity);
+    for _ in 0..capacity {
+        let writer = writer.clone();
+        handles.push(tokio::spawn(async move {
+            writer
+                .submit(class_d_op("queued"), |_pool| async move { Ok(1u32) })
+                .await
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let queued = writer
+                .heartbeat
+                .snapshot()
+                .lanes
+                .iter()
+                .find(|lane| lane.lane == WriteLane::TelemetryRollup)
+                .map(|lane| lane.queued_depth)
+                .unwrap_or(0);
+            if queued >= capacity as i64 + 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("telemetry lane did not fill");
+
+    let overflow = writer
+        .submit(class_d_op("overflow"), |_pool| async move { Ok(1u32) })
+        .await;
+    assert!(
+        matches!(overflow, WriteResult::DroppedTelemetry),
+        "full Class D lane should drop telemetry instead of blocking; got {overflow:?}"
+    );
+
+    let health = storage_health::storage_health_with_writer(&pool, Some(&writer.heartbeat))
+        .await
+        .unwrap();
+    assert_eq!(health["writer"]["droppedTelemetryTotal"].as_u64(), Some(1));
+    let telemetry_lane = health["writer"]["lanes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|lane| lane["lane"].as_str() == Some("telemetry_rollup"))
+        .expect("telemetry lane health missing");
+    assert_eq!(telemetry_lane["droppedTotal"].as_u64(), Some(1));
+    assert_eq!(
+        health["writePressure"]["latestSnapshot"]["payload"]["telemetryDroppedTotal"].as_u64(),
+        Some(1)
+    );
+
+    gate.add_permits(1);
+    let _ = gatekeeper.await.unwrap();
+    for handle in handles {
+        let _ = handle.await.unwrap();
+    }
+    writer.shutdown().await;
+}
+
+#[tokio::test]
+async fn class_d_rollup_producer_persists_bounded_snapshot_and_purges_retention() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = Arc::new(DbWriter::new(pool.clone()));
+
+    let committed = writer
+        .submit(class_a_op("rollup_probe"), |pool| async move {
+            let tx = begin_immediate_with_retry(&pool, "rollup_probe").await?;
+            tx.commit().await?;
+            Ok(1)
+        })
+        .await;
+    assert_eq!(committed, WriteResult::Committed);
+
+    for idx in 0..300 {
+        let old = chrono::Utc::now() - chrono::Duration::hours(25) + chrono::Duration::seconds(idx);
+        sqlx::query(
+            r#"INSERT INTO storage_write_pressure_snapshots
+               (id, window_start, window_end, payload_json, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        )
+        .bind(format!("old-pressure-{idx}"))
+        .bind((old - chrono::Duration::minutes(5)).to_rfc3339())
+        .bind(old.to_rfc3339())
+        .bind(serde_json::json!({"legacy": idx}).to_string())
+        .bind(old.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let snapshot = storage_health::record_live_write_pressure_rollup(&pool, &writer.heartbeat)
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.payload_json["source"], "dbwriter_telemetry_rollup");
+    assert_eq!(
+        snapshot.payload_json["limits"]["memoryCapBytes"].as_u64(),
+        Some(db::writer::TELEMETRY_MEMORY_CAP_BYTES as u64)
+    );
+    assert_eq!(
+        snapshot.payload_json["limits"]["maxSamples"].as_u64(),
+        Some(db::writer::TELEMETRY_MAX_SAMPLES as u64)
+    );
+    assert!(
+        snapshot.payload_json["rollup"]["sampleCount"]
+            .as_u64()
+            .unwrap()
+            <= db::writer::TELEMETRY_MAX_SAMPLES as u64
+    );
+    assert_eq!(
+        snapshot.payload_json["retention"]["latestWindowLimit"].as_u64(),
+        Some(288)
+    );
+
+    let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_write_pressure_snapshots")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        retained <= 288,
+        "Class D rollup retention must keep at most latest 288 windows, got {retained}"
+    );
+
+    let latest = storage_health::latest_write_pressure_snapshot(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.id, snapshot.id);
+    assert_eq!(latest.payload_json["source"], "dbwriter_telemetry_rollup");
 
     writer.shutdown().await;
 }

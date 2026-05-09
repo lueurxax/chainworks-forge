@@ -59,7 +59,7 @@ enum PreviewSupport {
             displayName: "Gemini ACP",
             transport: .cli,
             authMode: .none,
-            defaultModel: "gemini-2.5-pro"
+            defaultModel: "gemini-3.1-pro-preview"
         )
 
         return ProviderSettingsStore(
@@ -162,7 +162,7 @@ enum PreviewSupport {
             stageLabel: "Workflow complete",
             agentTitle: "Proposal Writer",
             provider: "gemini",
-            model: "gemini-2.5-pro"
+            model: "gemini-3.1-pro-preview"
         )
 
         let archivedIdea = Idea(
@@ -538,7 +538,7 @@ enum PreviewSupport {
             provider: "gemini",
             effort: "medium"
         )
-        reviewerUX.resolvedModel = "gemini-2.5-pro"
+        reviewerUX.resolvedModel = "gemini-3.1-pro-preview"
         reviewerUX.logSnippet = "Assessing workflow topology and operator clarity."
         reviewerUX.stageExecution = stage3
         stage3.agentExecutions.append(reviewerUX)

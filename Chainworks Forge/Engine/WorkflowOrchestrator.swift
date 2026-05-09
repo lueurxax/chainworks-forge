@@ -5363,13 +5363,13 @@ final class WorkflowOrchestrator {
             if lowercasedModel == "gemini-2.5-flash" {
                 return nil
             }
-            if lowercasedModel == "gemini-2.5-pro" {
+            if lowercasedModel == "gemini-3.1-pro-preview" {
                 return "gemini-2.5-flash"
             }
             if lowercasedModel.contains("preview") || lowercasedModel.hasPrefix("gemini-3") {
-                return "gemini-2.5-pro"
+                return "gemini-3.1-pro-preview"
             }
-            return "gemini-2.5-pro"
+            return "gemini-3.1-pro-preview"
         default:
             return nil
         }
@@ -5405,7 +5405,7 @@ final class WorkflowOrchestrator {
         case (.geminiACP?, "fast"):
             return "gemini-2.5-flash"
         case (.geminiACP?, "frontier"):
-            return "gemini-2.5-pro"
+            return "gemini-3.1-pro-preview"
         default:
             return baseBinding?.model ?? agent.model
         }

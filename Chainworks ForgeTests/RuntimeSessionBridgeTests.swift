@@ -1788,7 +1788,7 @@ struct RuntimeSessionBridgeTests {
                 configuredProviderID: UUID(),
                 providerFamily: "gemini",
                 providerIdentifier: "gemini",
-                model: "gemini-2.5-pro",
+                model: "gemini-3.1-pro-preview",
                 effort: "medium",
                 transport: "acp_stdio",
                 adapterVersion: "test",
@@ -1814,7 +1814,7 @@ struct RuntimeSessionBridgeTests {
 
         let lastRequest = try #require(await transport.lastSessionRequest)
         #expect(lastRequest.provider == "gemini")
-        #expect(lastRequest.model == "gemini-2.5-pro")
+        #expect(lastRequest.model == "gemini-3.1-pro-preview")
     }
 
     @Test("LiveExecutionOverride encoding round-trips")

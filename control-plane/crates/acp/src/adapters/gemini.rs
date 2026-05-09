@@ -79,9 +79,9 @@ impl AcpAdapter for GeminiCliAdapter {
 
     fn prepare_session_new_spec(&self, req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
         // Gemini uses bypassPermissions mode; no _meta block needed.
-        // Pass the model from YAML backend_profile; Gemini CLI accepts
-        // its own catalog (e.g. gemini-2.5-pro, gemini-3-pro) and falls
-        // back to auto-selection if unrecognized.
+        // Gemini CLI currently applies model selection from the launch
+        // `--model` flag, not from session/new. Keep the session/new model
+        // populated for ACP readback parity.
         let model_str = req.model.as_deref().unwrap_or("default").to_string();
         let config = AcpSessionConfig {
             model: &model_str,
@@ -97,6 +97,15 @@ impl AcpAdapter for GeminiCliAdapter {
 
 fn gemini_args_for_request(req: &ExecutionRequest) -> Vec<String> {
     let mut args = vec!["--acp".to_string()];
+    if let Some(model) = req
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
     if let Some(meta_root) = absolute_meta_root(req) {
         args.push("--include-directories".to_string());
         args.push(meta_root);
@@ -169,6 +178,28 @@ mod tests {
         assert_eq!(
             args[2],
             "/workspace/.chainworks/runs/9318de0d-9c75-40ad-9d0a-74c3610b021d"
+        );
+    }
+
+    #[test]
+    fn gemini_args_pin_requested_model_at_process_launch() {
+        let mut req = request_with_meta_root(
+            "/workspace",
+            Some(".chainworks/runs/9318de0d-9c75-40ad-9d0a-74c3610b021d"),
+        );
+        req.model = Some("gemini-3.1-pro-preview".to_string());
+
+        let args = gemini_args_for_request(&req);
+
+        assert_eq!(
+            args,
+            vec![
+                "--acp".to_string(),
+                "--model".to_string(),
+                "gemini-3.1-pro-preview".to_string(),
+                "--include-directories".to_string(),
+                "/workspace/.chainworks/runs/9318de0d-9c75-40ad-9d0a-74c3610b021d".to_string(),
+            ]
         );
     }
 

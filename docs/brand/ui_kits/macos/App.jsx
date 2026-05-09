@@ -115,7 +115,7 @@ const CatalogView = () => (
       ["intake","Captures ideas into structured run inputs","Codex","gpt-5"],
       ["planner","Produces frozen plan proposals","Claude Code","claude-sonnet-4-5"],
       ["implementor","Executes the plan against the worktree","Claude Code","claude-sonnet-4-5"],
-      ["reviewer","Reads diffs · returns review report","Gemini","gemini-2.5-pro"],
+      ["reviewer","Reads diffs · returns review report","Gemini","gemini-3.1-pro-preview"],
       ["lead","Mediates workflow conflict & rejection","Codex","gpt-5"],
       ["reporter","Seals the run report at completion","Claude Code","claude-haiku-4-5"],
     ].map(([n,d,p,m])=>(
@@ -201,7 +201,7 @@ const SettingsView = () => (
     {[
       ["Claude Code","ACP","claude-sonnet-4-5","Connected","completed"],
       ["Codex","ACP","gpt-5","Connected","completed"],
-      ["Gemini","ACP","gemini-2.5-pro","Connected","completed"],
+      ["Gemini","ACP","gemini-3.1-pro-preview","Connected","completed"],
       ["Goose","compat","legacy","Daemon not ready","blocked"],
     ].map(([p,t,m,s,st])=>(
       <div key={p} className="fg-card" style={{display:"flex",alignItems:"center",gap:14}}>

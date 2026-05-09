@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1711,6 +1711,7 @@ fn runtime_facts_for_acp_error(
     facts.failure_kind = Some(classification.failure_kind);
     facts.operator_action_hint = Some(classification.operator_action_hint);
     facts.retry_after = classification.retry_after;
+    facts.failure_kind_raw_debug = Some(redact_runtime_message(&format!("{error:#}")));
     facts.failure_message_redacted = Some(redact_runtime_message(&message));
     facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
     facts.transport_error_code = classification.transport_error_code;
@@ -1961,6 +1962,248 @@ fn proposal_writer_conflict_resolution_is_acknowledged(
             .get("applied_changes")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|changes| !changes.is_empty())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProposalWriterBacklogContext {
+    review_pass_id: String,
+    item_ids: HashSet<String>,
+    item_families: HashSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProposalWriterBacklogValidationIssue {
+    output_name: String,
+    validation_error: String,
+}
+
+fn parse_proposal_writer_backlog_context(bytes: &[u8]) -> Option<ProposalWriterBacklogContext> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    let review_pass_id = value
+        .get("review_pass_id")
+        .and_then(serde_json::Value::as_str)?
+        .trim()
+        .to_string();
+    if review_pass_id.is_empty() {
+        return None;
+    }
+
+    let item_ids: HashSet<String> = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if item_ids.is_empty() {
+        return None;
+    }
+
+    let item_families = item_ids
+        .iter()
+        .filter_map(|id| backlog_id_family(id))
+        .collect();
+
+    Some(ProposalWriterBacklogContext {
+        review_pass_id,
+        item_ids,
+        item_families,
+    })
+}
+
+fn backlog_id_family(id: &str) -> Option<String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let family = trimmed.trim_end_matches(|ch: char| ch.is_ascii_digit());
+    (family != trimmed).then(|| family.to_string())
+}
+
+fn captured_output_json<'a>(
+    captured_outputs: &'a [CapturedOutput],
+    output_name: &str,
+) -> Option<serde_json::Value> {
+    let bytes = captured_outputs
+        .iter()
+        .find(|output| output.declared.output_name == output_name)
+        .and_then(|output| output.machine_bytes.as_deref())?;
+    serde_json::from_slice::<serde_json::Value>(bytes).ok()
+}
+
+fn collect_backlog_item_ids(value: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(serde_json::Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| match item {
+            serde_json::Value::String(id) => Some(id.trim().to_string()),
+            serde_json::Value::Object(map) => map
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .map(ToOwned::to_owned),
+            _ => None,
+        })
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+fn candidate_blocker_ids_from_text(text: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-' {
+            current.push(ch);
+            continue;
+        }
+        if current.contains('-') && current.chars().any(|c| c.is_ascii_digit()) {
+            ids.push(std::mem::take(&mut current));
+        } else {
+            current.clear();
+        }
+    }
+    if current.contains('-') && current.chars().any(|c| c.is_ascii_digit()) {
+        ids.push(current);
+    }
+    ids
+}
+
+fn stale_backlog_ids_in_strings<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    context: &ProposalWriterBacklogContext,
+) -> Vec<String> {
+    let mut stale = HashSet::new();
+    for line in lines {
+        for candidate in candidate_blocker_ids_from_text(line) {
+            let Some(family) = backlog_id_family(&candidate) else {
+                continue;
+            };
+            if context.item_families.contains(&family) && !context.item_ids.contains(&candidate) {
+                stale.insert(candidate);
+            }
+        }
+    }
+    let mut ids: Vec<String> = stale.into_iter().collect();
+    ids.sort();
+    ids
+}
+
+fn proposal_writer_backlog_alignment_issues_from_outputs(
+    captured_outputs: &[CapturedOutput],
+    backlog: &ProposalWriterBacklogContext,
+) -> Vec<ProposalWriterBacklogValidationIssue> {
+    let mut issues = Vec::new();
+
+    if let Some(coverage) = captured_output_json(captured_outputs, "proposal_feedback_coverage") {
+        let source_review_pass_id = coverage
+            .get("source_review_pass_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if !source_review_pass_id.is_empty() && source_review_pass_id != backlog.review_pass_id {
+            issues.push(ProposalWriterBacklogValidationIssue {
+                output_name: "proposal_feedback_coverage".to_string(),
+                validation_error: format!(
+                    "proposal_feedback_coverage.source_review_pass_id={} must match current score_lift_backlog.review_pass_id={}",
+                    source_review_pass_id, backlog.review_pass_id
+                ),
+            });
+        }
+
+        for field in [
+            "backlog_items_addressed",
+            "backlog_items_unresolved",
+            "backlog_items_deferred",
+            "backlog_items_disputed",
+        ] {
+            let mut unknown: Vec<String> = collect_backlog_item_ids(coverage.get(field))
+                .into_iter()
+                .filter(|id| !backlog.item_ids.contains(id))
+                .collect();
+            if unknown.is_empty() {
+                continue;
+            }
+            unknown.sort();
+            unknown.dedup();
+            issues.push(ProposalWriterBacklogValidationIssue {
+                output_name: "proposal_feedback_coverage".to_string(),
+                validation_error: format!(
+                    "proposal_feedback_coverage.{} references ids outside current score_lift_backlog {}: {}",
+                    field,
+                    backlog.review_pass_id,
+                    unknown.join(", ")
+                ),
+            });
+        }
+    }
+
+    if let Some(summary) = captured_output_json(captured_outputs, "proposal_revision_summary") {
+        let source_review_pass_id = summary
+            .get("source_review_pass_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if !source_review_pass_id.is_empty() && source_review_pass_id != backlog.review_pass_id {
+            issues.push(ProposalWriterBacklogValidationIssue {
+                output_name: "proposal_revision_summary".to_string(),
+                validation_error: format!(
+                    "proposal_revision_summary.source_review_pass_id={} must match current score_lift_backlog.review_pass_id={}",
+                    source_review_pass_id, backlog.review_pass_id
+                ),
+            });
+        }
+
+        let stale_ids = stale_backlog_ids_in_strings(
+            summary
+                .get("blocking_changes_resolved")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str),
+            backlog,
+        );
+        if !stale_ids.is_empty() {
+            issues.push(ProposalWriterBacklogValidationIssue {
+                output_name: "proposal_revision_summary".to_string(),
+                validation_error: format!(
+                    "proposal_revision_summary.blocking_changes_resolved references stale blocker ids outside current score_lift_backlog {}: {}",
+                    backlog.review_pass_id,
+                    stale_ids.join(", ")
+                ),
+            });
+        }
+    }
+
+    if let Some(proposal) = captured_output_json(captured_outputs, "proposal_current") {
+        let stale_ids = stale_backlog_ids_in_strings(
+            proposal
+                .get("reviewer_feedback_resolution")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|resolution| resolution.get("addressed_blockers"))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str),
+            backlog,
+        );
+        if !stale_ids.is_empty() {
+            issues.push(ProposalWriterBacklogValidationIssue {
+                output_name: "proposal_current".to_string(),
+                validation_error: format!(
+                    "proposal_current.reviewer_feedback_resolution.addressed_blockers references stale blocker ids outside current score_lift_backlog {}: {}",
+                    backlog.review_pass_id,
+                    stale_ids.join(", ")
+                ),
+            });
+        }
+    }
+
+    issues
 }
 
 struct ExecutionDiscoveryMetrics {
@@ -6160,50 +6403,93 @@ impl BackgroundExecutor {
         captured_outputs: &[CapturedOutput],
     ) -> Result<TaskValidationSummary> {
         let mut summary = validate_task_outputs(captured_outputs);
-        let Some(required) = self
+        if let Some(required) = self
             .required_workflow_conflict_resolution_for_proposal_writer(run_id, stage_id, agent_id)
             .await?
-        else {
-            return Ok(summary);
-        };
+        {
+            if !proposal_writer_conflict_resolution_is_acknowledged(captured_outputs, &required) {
+                let output_name = "proposal_revision_summary".to_string();
+                summary.raw_output_exists = captured_outputs.iter().any(|output| {
+                    output.declared.output_name == output_name && output.machine_bytes.is_some()
+                });
+                summary.failure_class =
+                    Some(domain::validation::ValidationFailureClass::OutputContractMismatch);
+                summary.failure_summary = Some(format!(
+                    "proposal_writer output did not acknowledge resolved workflow conflict {}",
+                    required.conflict_id
+                ));
+                if let Some(result) = summary
+                    .output_results
+                    .iter_mut()
+                    .find(|result| result.output_name == output_name)
+                {
+                    result.status = domain::validation::ValidationStatus::Failed;
+                    result.validation_error =
+                        Some(workflow_conflict_resolution_validation_message(&required));
+                } else {
+                    summary
+                        .output_results
+                        .push(domain::validation::OutputValidationResult {
+                            output_name,
+                            contract_id: Some(
+                                "proposal_revision_summary_conflict_resolution_v1".to_string(),
+                            ),
+                            status: domain::validation::ValidationStatus::Failed,
+                            missing_fields: vec!["workflow_conflict_resolution".to_string()],
+                            validation_error: Some(
+                                workflow_conflict_resolution_validation_message(&required),
+                            ),
+                            raw_payload_size: 0,
+                        });
+                }
+                return Ok(summary);
+            }
+        }
 
-        if proposal_writer_conflict_resolution_is_acknowledged(captured_outputs, &required) {
+        let backlog_issues = self
+            .proposal_writer_backlog_alignment_issues(run_id, agent_id, captured_outputs)
+            .await?;
+        if backlog_issues.is_empty() {
             return Ok(summary);
         }
 
-        let output_name = "proposal_revision_summary".to_string();
-        summary.raw_output_exists = captured_outputs.iter().any(|output| {
-            output.declared.output_name == output_name && output.machine_bytes.is_some()
-        });
         summary.failure_class =
             Some(domain::validation::ValidationFailureClass::OutputContractMismatch);
-        summary.failure_summary = Some(format!(
-            "proposal_writer output did not acknowledge resolved workflow conflict {}",
-            required.conflict_id
-        ));
-        if let Some(result) = summary
-            .output_results
-            .iter_mut()
-            .find(|result| result.output_name == output_name)
-        {
-            result.status = domain::validation::ValidationStatus::Failed;
-            result.validation_error =
-                Some(workflow_conflict_resolution_validation_message(&required));
-        } else {
-            summary
+        summary.failure_summary = Some(
+            backlog_issues
+                .iter()
+                .map(|issue| issue.validation_error.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+        summary.raw_output_exists = backlog_issues.iter().any(|issue| {
+            captured_outputs.iter().any(|output| {
+                output.declared.output_name == issue.output_name && output.machine_bytes.is_some()
+            })
+        });
+        for issue in backlog_issues {
+            if let Some(result) = summary
                 .output_results
-                .push(domain::validation::OutputValidationResult {
-                    output_name,
-                    contract_id: Some(
-                        "proposal_revision_summary_conflict_resolution_v1".to_string(),
-                    ),
-                    status: domain::validation::ValidationStatus::Failed,
-                    missing_fields: vec!["workflow_conflict_resolution".to_string()],
-                    validation_error: Some(workflow_conflict_resolution_validation_message(
-                        &required,
-                    )),
-                    raw_payload_size: 0,
-                });
+                .iter_mut()
+                .find(|result| result.output_name == issue.output_name)
+            {
+                result.status = domain::validation::ValidationStatus::Failed;
+                if result.contract_id.is_none() {
+                    result.contract_id = Some("proposal_writer_backlog_alignment_v1".to_string());
+                }
+                result.validation_error = Some(issue.validation_error);
+            } else {
+                summary
+                    .output_results
+                    .push(domain::validation::OutputValidationResult {
+                        output_name: issue.output_name,
+                        contract_id: Some("proposal_writer_backlog_alignment_v1".to_string()),
+                        status: domain::validation::ValidationStatus::Failed,
+                        missing_fields: Vec::new(),
+                        validation_error: Some(issue.validation_error),
+                        raw_payload_size: 0,
+                    });
+            }
         }
         Ok(summary)
     }
@@ -6259,6 +6545,44 @@ impl BackgroundExecutor {
             selected_next_state_id: cursor.selected_next_state_id.clone(),
             resolution_reason,
         }))
+    }
+
+    async fn proposal_writer_backlog_alignment_issues(
+        &self,
+        run_id: RunId,
+        agent_id: &str,
+        captured_outputs: &[CapturedOutput],
+    ) -> Result<Vec<ProposalWriterBacklogValidationIssue>> {
+        if agent_id != "proposal_writer" {
+            return Ok(Vec::new());
+        }
+        let Some(backlog_artifact) = artifacts::list_by_run(&self.pool, run_id)
+            .await?
+            .into_iter()
+            .filter(|artifact| artifact.name == "score_lift_backlog")
+            .max_by_key(|artifact| artifact.created_at)
+        else {
+            return Ok(Vec::new());
+        };
+        let backlog_bytes = match std::fs::read(&backlog_artifact.file_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(
+                    run_id = %run_id,
+                    path = %backlog_artifact.file_path,
+                    error = %error,
+                    "proposal_writer backlog alignment validation skipped: unable to read score_lift_backlog"
+                );
+                return Ok(Vec::new());
+            }
+        };
+        let Some(backlog) = parse_proposal_writer_backlog_context(&backlog_bytes) else {
+            return Ok(Vec::new());
+        };
+        Ok(proposal_writer_backlog_alignment_issues_from_outputs(
+            captured_outputs,
+            &backlog,
+        ))
     }
 
     async fn persist_undeclared_envelope_artifacts(
@@ -7925,6 +8249,217 @@ mod tests {
     }
 
     #[test]
+    fn proposal_writer_backlog_alignment_rejects_stale_blocker_ids() {
+        let backlog = parse_proposal_writer_backlog_context(
+            serde_json::json!({
+                "review_pass_id": "pass-2",
+                "items": [
+                    {"id": "API-BLOCK-001"},
+                    {"id": "API-BLOCK-002"},
+                    {"id": "API-BLOCK-003"},
+                    {"id": "API-BLOCK-004"}
+                ]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("backlog context");
+        let declared = |output_name: &str| DeclaredOutput {
+            output_name: output_name.to_string(),
+            target_path: format!("/workspace/.chainworks/{output_name}.json"),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let captured = vec![
+            CapturedOutput {
+                declared: declared("proposal_revision_summary"),
+                machine_bytes: Some(
+                    serde_json::json!({
+                        "proposal_revision_id": "p086-v19",
+                        "source_review_pass_id": "pass-2",
+                        "blocking_changes_resolved": [
+                            "API-BLOCK-001: closed",
+                            "API-BLOCK-005: stale"
+                        ]
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ),
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: declared("proposal_current"),
+                machine_bytes: Some(
+                    serde_json::json!({
+                        "reviewer_feedback_resolution": {
+                            "addressed_blockers": [
+                                "API-BLOCK-002: current",
+                                "API-BLOCK-005: stale"
+                            ]
+                        }
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ),
+                companion_bytes: None,
+            },
+        ];
+
+        let issues = proposal_writer_backlog_alignment_issues_from_outputs(&captured, &backlog);
+
+        assert_eq!(issues.len(), 2);
+        assert!(issues.iter().any(|issue| {
+            issue.output_name == "proposal_revision_summary"
+                && issue.validation_error.contains("API-BLOCK-005")
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.output_name == "proposal_current"
+                && issue.validation_error.contains("API-BLOCK-005")
+        }));
+    }
+
+    #[test]
+    fn proposal_writer_backlog_alignment_rejects_out_of_pass_coverage_ids() {
+        let backlog = parse_proposal_writer_backlog_context(
+            serde_json::json!({
+                "review_pass_id": "pass-7",
+                "items": [
+                    {"id": "API-BLOCK-001"},
+                    {"id": "API-BLOCK-002"}
+                ]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("backlog context");
+        let captured = vec![CapturedOutput {
+            declared: DeclaredOutput {
+                output_name: "proposal_feedback_coverage".to_string(),
+                target_path: "/workspace/.chainworks/feedback-coverage.json".to_string(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            machine_bytes: Some(
+                serde_json::json!({
+                    "proposal_revision_id": "p086-v19",
+                    "source_review_pass_id": "pass-6",
+                    "backlog_items_addressed": ["API-BLOCK-003"],
+                    "backlog_items_unresolved": [],
+                    "backlog_items_deferred": [],
+                    "backlog_items_disputed": [],
+                    "sections_changed": ["architecture"],
+                    "factual_claims_added_or_corrected": [],
+                    "notes": "done"
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+            companion_bytes: None,
+        }];
+
+        let issues = proposal_writer_backlog_alignment_issues_from_outputs(&captured, &backlog);
+
+        assert_eq!(issues.len(), 2);
+        assert!(issues.iter().any(|issue| {
+            issue
+                .validation_error
+                .contains("source_review_pass_id=pass-6")
+                && issue.validation_error.contains("pass-7")
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.validation_error.contains("backlog_items_addressed")
+                && issue.validation_error.contains("API-BLOCK-003")
+        }));
+    }
+
+    #[test]
+    fn proposal_writer_backlog_alignment_accepts_current_backlog_ids() {
+        let backlog = parse_proposal_writer_backlog_context(
+            serde_json::json!({
+                "review_pass_id": "pass-9",
+                "items": [
+                    {"id": "API-BLOCK-001"},
+                    {"id": "API-BLOCK-002"},
+                    {"id": "API-BLOCK-003"},
+                    {"id": "API-BLOCK-004"}
+                ]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("backlog context");
+        let declared = |output_name: &str| DeclaredOutput {
+            output_name: output_name.to_string(),
+            target_path: format!("/workspace/.chainworks/{output_name}.json"),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let captured = vec![
+            CapturedOutput {
+                declared: declared("proposal_feedback_coverage"),
+                machine_bytes: Some(
+                    serde_json::json!({
+                        "proposal_revision_id": "p086-v19",
+                        "source_review_pass_id": "pass-9",
+                        "backlog_items_addressed": ["API-BLOCK-001", "API-BLOCK-002"],
+                        "backlog_items_unresolved": ["API-BLOCK-003", "API-BLOCK-004"],
+                        "backlog_items_deferred": [],
+                        "backlog_items_disputed": [],
+                        "sections_changed": ["architecture"],
+                        "factual_claims_added_or_corrected": [],
+                        "notes": "done"
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ),
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: declared("proposal_revision_summary"),
+                machine_bytes: Some(
+                    serde_json::json!({
+                        "proposal_revision_id": "p086-v19",
+                        "source_review_pass_id": "pass-9",
+                        "blocking_changes_resolved": [
+                            "API-BLOCK-001: closed",
+                            "API-BLOCK-004: closed"
+                        ]
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ),
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: declared("proposal_current"),
+                machine_bytes: Some(
+                    serde_json::json!({
+                        "reviewer_feedback_resolution": {
+                            "addressed_blockers": [
+                                "API-BLOCK-001: closed",
+                                "API-BLOCK-002: closed"
+                            ]
+                        }
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ),
+                companion_bytes: None,
+            },
+        ];
+
+        assert!(
+            proposal_writer_backlog_alignment_issues_from_outputs(&captured, &backlog).is_empty()
+        );
+    }
+
+    #[test]
     fn runtime_invocation_contract_does_not_mutate_session_fingerprint_prompt() {
         let base_prompt = "Base stable prompt".to_string();
         let declared_outputs = Vec::new();
@@ -8283,6 +8818,33 @@ mod tests {
             facts.output_settlement,
             AgentOutputSettlement::MissingRequiredOutputs
         );
+    }
+
+    #[test]
+    fn acp_initialize_runtime_facts_keep_redacted_error_chain_detail() {
+        let error = anyhow::anyhow!(
+            "JsonRpc error -32000: Directory does not exist: /workspace/.chainworks/runs/run-1 token=abc123"
+        )
+        .context("ACP: initialize handshake");
+
+        let facts = runtime_facts_for_acp_error(
+            domain::ids::AgentExecutionId::new(),
+            &error,
+            chrono::Utc::now(),
+        );
+
+        assert_eq!(
+            facts.failure_message_redacted.as_deref(),
+            Some("ACP: initialize handshake")
+        );
+        let raw_debug = facts
+            .failure_kind_raw_debug
+            .as_deref()
+            .expect("initialize failure should retain redacted operator detail");
+        assert!(raw_debug.contains("ACP: initialize handshake"));
+        assert!(raw_debug.contains("Directory does not exist"));
+        assert!(raw_debug.contains("/workspace/.chainworks/runs/run-1"));
+        assert!(!raw_debug.contains("abc123"));
     }
 
     #[test]

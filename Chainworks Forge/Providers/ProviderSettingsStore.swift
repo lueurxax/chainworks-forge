@@ -300,7 +300,7 @@ final class ProviderSettingsStore {
                 displayName: "Gemini ACP",
                 transport: .cli,
                 authMode: .apiKey,
-                defaultModel: "gemini-2.5-pro"
+                defaultModel: "gemini-3.1-pro-preview"
             ),
             ConfiguredProvider(
                 family: .auggie,
