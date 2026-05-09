@@ -272,6 +272,7 @@ Implemented-system references:
 - [`docs/reference/full-mvp-delivery.md`](docs/reference/full-mvp-delivery.md)
 - [`docs/reference/mvp-sign-off.md`](docs/reference/mvp-sign-off.md)
 - [`docs/reference/test-gates.md`](docs/reference/test-gates.md)
+- [`docs/reference/boundary-first-api-auth-contract.md`](docs/reference/boundary-first-api-auth-contract.md)
 
 Examples:
 

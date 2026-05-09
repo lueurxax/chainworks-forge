@@ -6,6 +6,9 @@ use std::path::Path;
 // Re-export here so downstream crates that use auth::PrincipalClass keep working.
 pub use domain::{CapabilityToolId, PrincipalClass, ResourceTemplateId};
 
+/// P081 Phase 1: boundary matrix fixture loading and validation.
+pub mod boundary;
+
 // ── Principal types ─────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

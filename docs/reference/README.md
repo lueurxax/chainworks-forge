@@ -37,6 +37,9 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [ui-action-boundary.md](ui-action-boundary.md) — Governed SwiftUI action boundary: GraphQL reads/subscriptions plus approval mutations; non-approval operations are MCP-only
 - [per-run-workspace-isolation.md](per-run-workspace-isolation.md) — Per-run meta-root derivation, path resolution, ACP env handoff, worktree exemption, transition/normalization isolation, and legacy fallback semantics
 - [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) — Canonical GraphQL projection read contract for the thin macOS client: implemented surfaces, projection freshness, freshness budgets, subscriptions, backpressure, and downstream UI consumption rules
+- [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md) — Boundary-First API and Auth Contract Matrix: P081 architectural overview, caller classification, policy evaluation, audit, idempotency, and macOS native boundary contracts
+- [boundary-first-api-auth-contract.json](boundary-first-api-auth-contract.json) — Boundary-First API and Auth Contract Matrix: executable fixture schema and contract
+
 
 ## Live Execution
 

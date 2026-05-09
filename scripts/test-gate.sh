@@ -2218,6 +2218,7 @@ Available gates:
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
+  proposal-081|p081  Proposal 081 Phase 1 boundary-first API and auth contract matrix gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -6125,6 +6126,79 @@ PY
     fi
     run_targeted_tests "proposal-077-ui" "${P077_UI_TESTS[@]}"
     log "Proposal 077 remote macOS closeout-readiness UI gate passed"
+    ;;
+  proposal-081|p081)
+    log "Proposal 081 gate: boundary-first API and auth contract matrix (Phase 1)"
+
+    log "P081: boundary coverage guardrail"
+    "$ROOT_DIR/scripts/check-boundary-coverage.sh"
+
+    log "P081: fixture JSON validity — verify boundary-first-api-auth-contract.json exists and is valid JSON"
+    python3 - <<'PY'
+import json, sys, pathlib
+root = pathlib.Path(sys.argv[0]).parent.parent if sys.argv[0] != "-" else pathlib.Path(".")
+# Resolve from script location fallback
+import os
+root = pathlib.Path(os.environ.get("ROOT_DIR", "."))
+fixture_path = root / "docs/reference/boundary-first-api-auth-contract.json"
+if not fixture_path.exists():
+    raise SystemExit("P081: missing docs/reference/boundary-first-api-auth-contract.json")
+try:
+    fixture = json.loads(fixture_path.read_text())
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"P081: invalid JSON in boundary-first-api-auth-contract.json: {exc}") from exc
+if fixture.get("schema_version") != 1:
+    raise SystemExit(f"P081: expected schema_version 1, got {fixture.get('schema_version')}")
+if "matrix_id" not in fixture:
+    raise SystemExit("P081: boundary fixture missing matrix_id")
+if not fixture.get("rows"):
+    raise SystemExit("P081: boundary fixture rows array is empty")
+REQUIRED_ROW_IDS = [
+    "p081.ui_operator.graphql_query.read",
+    "p081.ui_operator.graphql_subscription.subscribe",
+    "p081.ui_operator.graphql_mutation.approval_action",
+    "p081.agent_operator.mcp_initialize.capability",
+    "p081.agent_operator.mcp_tools_list.discovery",
+    "p081.agent_operator.mcp_tools_call.command",
+    "p081.automation.mcp_tools_list.discovery",
+    "p081.automation.mcp_tools_call.command",
+    "p081.observer.mcp_tools_call.compact_read",
+    "p081.observer.graphql_query.read_only_opt_in",
+    "p081.developer_break_glass.debug_endpoint.disabled",
+]
+present_ids = {row["row_id"] for row in fixture["rows"]}
+for required in REQUIRED_ROW_IDS:
+    if required not in present_ids:
+        raise SystemExit(f"P081: required row '{required}' missing from fixture")
+print(f"P081: fixture valid — {len(fixture['rows'])} rows, all {len(REQUIRED_ROW_IDS)} required rows present")
+PY
+
+    log "P081: doc exists — verify boundary-first-api-auth-contract.md exists"
+    if [[ ! -f "$ROOT_DIR/docs/reference/boundary-first-api-auth-contract.md" ]]; then
+      die "P081: missing docs/reference/boundary-first-api-auth-contract.md"
+    fi
+
+    log "P081: auth crate boundary module unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p auth boundary:: -- --nocapture
+    )
+
+    log "P081: db crate audit_log repo unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p db repos::audit_log:: -- --nocapture
+    )
+
+    log "P081: migration compile check — audit_log and audit_log_checkpoints migrations exist"
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/049_p081_audit_log.sql" ]]; then
+      die "P081: missing migration 049_p081_audit_log.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/050_p081_audit_log_checkpoints.sql" ]]; then
+      die "P081: missing migration 050_p081_audit_log_checkpoints.sql"
+    fi
+
+    log "Proposal 081 Phase 1 gate passed"
     ;;
   *)
     print_usage >&2
