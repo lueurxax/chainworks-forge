@@ -4615,17 +4615,9 @@ impl CommandHandler {
             }
         };
 
-        let workflow_path = match run.workflow_yaml_path.as_deref() {
-            Some(p) => p,
-            None => return false,
-        };
-        let catalog_path = match run.agent_catalog_yaml_path.as_deref() {
-            Some(p) => p,
-            None => return false,
-        };
-
-        let plan = match workflow::compiler::compile(workflow_path, catalog_path) {
-            Ok(p) => p,
+        let plan = match compile_run_plan_for_run(&run) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return false,
             Err(e) => {
                 warn!(
                     run_id = %run_id,
@@ -4965,6 +4957,7 @@ fn validate_accepted_risk_lineage(c: &SettleProposalGateCmd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::ids::{IdeaId, RunId};
 
     #[test]
     fn p060_idea_body_review_mode_and_reviewer_override_are_canonicalized() {
@@ -5189,6 +5182,63 @@ reviewer_override:
         assert_eq!(
             snapshot.evidence_source,
             "p017-phase-b-dogfood-exit-2026-04-26"
+        );
+    }
+
+    #[test]
+    fn compile_run_plan_prefers_frozen_snapshots_over_yaml_paths() {
+        let workflow_path =
+            "/Users/user/Documents/Chainworks Forge/examples/workflows/full-mvp-live.yaml";
+        let catalog_path = "/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml";
+        let frozen = workflow::compiler::compile(workflow_path, catalog_path)
+            .expect("example workflow should compile for snapshot fixture");
+
+        let run = Run {
+            id: RunId(1),
+            idea_id: IdeaId(1),
+            status: RunStatus::Running,
+            workflow_id: "full-mvp-live".into(),
+            workflow_title: "Full MVP Live".into(),
+            workspace_root: "/tmp".into(),
+            artifact_root: "/tmp".into(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("state_11_manual_release".into()),
+            workflow_yaml_path: Some("/definitely/missing/workflow.yaml".into()),
+            agent_catalog_yaml_path: Some("/definitely/missing/agents.yaml".into()),
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: Some(frozen.workflow_snapshot_hash.clone()),
+            catalog_snapshot_hash: Some(frozen.catalog_snapshot_hash.clone()),
+            workflow_snapshot_json: Some(frozen.workflow_snapshot_json.clone()),
+            catalog_snapshot_json: Some(frozen.catalog_snapshot_json.clone()),
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: None,
+            review_routing_json: None,
+            closeout_readiness_mode: None,
+        };
+
+        let plan = compile_run_plan_for_run(&run)
+            .expect("snapshot-backed run should compile")
+            .expect("plan should exist");
+
+        assert!(
+            plan.states
+                .get("state_11_manual_release")
+                .is_some_and(|state| !state.post_approval_tasks.is_empty()),
+            "snapshot-backed compile should not depend on YAML paths once the run is frozen"
         );
     }
 

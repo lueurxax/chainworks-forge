@@ -2,8 +2,9 @@
 
 **Contract schema:** `thin_client_affordance_contract_v1`  
 **Status:** Implemented  
-**Proposal:** P085 — Thin-Client Read-Model Parity and Affordance Contract  
-**Revision:** p085-r2-2026-05-08
+**Contract version:** `p085-r2-2026-05-08`
+
+**Retained gate/test alias:** `proposal-085` / `p085` / `P085`
 
 ---
 
@@ -30,7 +31,7 @@ Sendable DTOs. SwiftUI views consume tested affordance states rather than raw Gr
 | Enum value additions | Allowed when Swift has unknown-case handling that fails closed to diagnostic/unknown and never maps to optimistic actionability |
 | Fallback copy changes | Allowed when disabled reason codes remain stable; copy-only changes must update presenter snapshot/render tests and accessibility help text tests |
 | Persisted projection state | If implementation needs stored fields for payload deadlines, stall reasons, or typed action availability, the rollout contract migrations section must be revised before implementation freeze |
-| Removed or retyped fields | Breaking change — requires explicit proposal revision, gate update, and migration-contract update if persisted projection shape changes |
+| Removed or retyped fields | Breaking change — requires explicit contract revision, gate update, and migration-contract update if persisted projection shape changes |
 | Renamed affordance IDs | Breaking change — must retain old id as deprecated alias for one contract version or update all tests, accessibility identifiers, P036 citations, and negative fixtures before freeze |
 
 ---
@@ -318,24 +319,21 @@ typed `conflictResultCode` readback with a real failed `command_journal` id.
 
 ---
 
-## Open Questions Resolution
+## Contract Decisions
 
-**Q: Does implementation introduce new persisted projection fields for `stalenessDeadlineAt`
-or stalled reason codes?**  
-A: No new persisted projection fields are introduced by P085. Stalled/deadline semantics are
-server-owned in existing projection shape. The rollout contract migrations section remains
-not_applicable.
+The implemented contract does not add persisted projection fields for `stalenessDeadlineAt`
+or stalled reason codes. Stalled/deadline semantics are server-owned in the existing
+projection shape, and the rollout contract migrations section remains `not_applicable`.
 
-**Q: Will approval action availability use a new typed GraphQL enum or freeze existing
-`availableActions` values?**  
-A: Existing `availableActions: [String]` is used. The contract row (`approval.resolve.approve`,
-`approval.resolve.reject`) names the string values `"approve"` and `"reject"` as the typed
-vocabulary. Unknown action strings are treated as unavailable.
+Approval action availability uses existing `availableActions: [String]`. The approval
+contract rows (`approval.resolve.approve`, `approval.resolve.reject`) define `"approve"`
+and `"reject"` as the recognized action vocabulary. Unknown action strings are treated as
+unavailable.
 
-**Q: What exact artifact detail entrypoint carries authorized `payloadText`?**  
-A: `P031ArtifactReadModel.payloadText` (from `artifact(id:)` detail entrypoint) carries the
-authorized payload. The list entrypoint (`artifacts(runId:)`) may omit `payloadText`; the
-detail affordance may upgrade `.deferred` to `.available(payloadText:)` for the selected artifact.
+`P031ArtifactReadModel.payloadText` from the `artifact(id:)` detail entrypoint carries
+authorized payload text. The list entrypoint (`artifacts(runId:)`) may omit `payloadText`;
+the detail affordance may upgrade `.deferred` to `.available(payloadText:)` for the
+selected artifact.
 
 ---
 

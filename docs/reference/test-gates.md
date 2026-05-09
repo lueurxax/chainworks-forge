@@ -1854,6 +1854,10 @@ Important:
 
 Thin-client read-model parity and affordance contract gate.
 
+The original proposal document is retired after implementation. Operational truth lives in
+[thin-client-read-model-affordance-contract.md](thin-client-read-model-affordance-contract.md);
+the `proposal-085` and `p085` names remain as retained proof aliases.
+
 Scope:
 
 - `docs/reference/thin-client-read-model-affordance-contract.md` exists and contains `thin_client_affordance_contract_v1` with all required affordance rows (`artifact.preview.listLabel`, `artifact.preview.detail`, `report.payload.metadata`, `freshness.badge.run/stage/approval/artifact`, `approval.resolve.approve/reject`, `diagnostic.copy`, `external.command.placeholder`)
