@@ -90,6 +90,7 @@ pub async fn storage_health_with_writer(
     let evidence = evidence_spool_summary(pool).await?;
     let latest_pressure = latest_write_pressure_snapshot(pool).await?;
     let updated_at = Utc::now();
+    let writer_snapshot = writer_heartbeat.map(DbWriterHeartbeat::snapshot);
     let is_pressure_stale = latest_pressure
         .as_ref()
         .map(|snapshot| {
@@ -99,26 +100,13 @@ pub async fn storage_health_with_writer(
     let pressure_json = latest_pressure
         .as_ref()
         .map(write_pressure_snapshot_json)
-        .unwrap_or_else(|| {
-            json!({
-                "state": "missing",
-                "latestSnapshot": null,
-                "freshness": {
-                    "state": "missing",
-                    "observedAt": null,
-                    "ageMs": null,
-                    "staleAfterMs": PRESSURE_STALE_AFTER_MS
-                },
-                "units": {
-                    "queueDepth": "count",
-                    "oldestQueuedMs": "milliseconds",
-                    "dbWriterWaitP95Ms": "milliseconds",
-                    "walSizeBytes": "bytes"
-                }
-            })
-        });
+        .or_else(|| {
+            writer_snapshot
+                .as_ref()
+                .map(|snapshot| live_write_pressure_json(updated_at, snapshot))
+        })
+        .unwrap_or_else(missing_write_pressure_json);
 
-    let writer_snapshot = writer_heartbeat.map(DbWriterHeartbeat::snapshot);
     // Fail-closed when no live DbWriter heartbeat is supplied. Daemon-owned
     // GraphQL/MCP paths inject the shared writer heartbeat; tests and static
     // helpers that omit it must not claim storage is healthy from placeholders.
@@ -304,6 +292,78 @@ fn write_pressure_snapshot_json(snapshot: &StorageWritePressureSnapshot) -> Valu
     })
 }
 
+fn live_write_pressure_json(updated_at: DateTime<Utc>, snapshot: &DbWriterHealthSnapshot) -> Value {
+    let lanes = snapshot
+        .lanes
+        .iter()
+        .map(|lane| {
+            (
+                lane.lane.as_str().to_string(),
+                json!({
+                    "queueDepth": lane.queued_depth,
+                    "capacity": lane.capacity,
+                    "queuedDepthRatio": if lane.capacity == 0 {
+                        0.0
+                    } else {
+                        lane.queued_depth as f64 / lane.capacity as f64
+                    },
+                    "oldestQueuedMs": lane.oldest_queued_age_ms,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>();
+    json!({
+        "state": "available",
+        "latestSnapshot": {
+            "id": "live-dbwriter-heartbeat",
+            "windowStart": updated_at.to_rfc3339(),
+            "windowEnd": updated_at.to_rfc3339(),
+            "createdAt": updated_at.to_rfc3339(),
+            "payload": {
+                "source": "dbwriter_heartbeat",
+                "writerAlive": snapshot.alive,
+                "totalQueued": snapshot.total_queued,
+                "lastHeartbeatAgeMs": snapshot.last_heartbeat_age_ms,
+                "lastDrainAgeMs": snapshot.last_drain_age_ms,
+                "coalescedRejectedTotal": snapshot.coalesced_rejected_total,
+                "starvationTotal": snapshot.starvation_total,
+                "lanes": lanes
+            }
+        },
+        "freshness": {
+            "state": if snapshot.alive { "fresh" } else { "stale" },
+            "observedAt": updated_at.to_rfc3339(),
+            "ageMs": 0,
+            "staleAfterMs": PRESSURE_STALE_AFTER_MS
+        },
+        "units": {
+            "queueDepth": "count",
+            "oldestQueuedMs": "milliseconds",
+            "dbWriterWaitP95Ms": "milliseconds",
+            "walSizeBytes": "bytes"
+        }
+    })
+}
+
+fn missing_write_pressure_json() -> Value {
+    json!({
+        "state": "missing",
+        "latestSnapshot": null,
+        "freshness": {
+            "state": "missing",
+            "observedAt": null,
+            "ageMs": null,
+            "staleAfterMs": PRESSURE_STALE_AFTER_MS
+        },
+        "units": {
+            "queueDepth": "count",
+            "oldestQueuedMs": "milliseconds",
+            "dbWriterWaitP95Ms": "milliseconds",
+            "walSizeBytes": "bytes"
+        }
+    })
+}
+
 fn lane_health(writer_snapshot: Option<&DbWriterHealthSnapshot>) -> Value {
     if let Some(snapshot) = writer_snapshot {
         return Value::Array(
@@ -411,6 +471,15 @@ mod tests {
             .as_array()
             .is_some_and(|lanes| lanes.len() == 6));
         assert_eq!(health["isStale"], false);
+        assert_eq!(health["writePressure"]["state"], "available");
+        assert_eq!(
+            health["writePressure"]["latestSnapshot"]["payload"]["source"],
+            "dbwriter_heartbeat"
+        );
+        assert_eq!(
+            health["writePressure"]["latestSnapshot"]["payload"]["writerAlive"],
+            true
+        );
     }
 
     #[tokio::test]
