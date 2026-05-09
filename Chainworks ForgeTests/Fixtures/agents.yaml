@@ -168,7 +168,7 @@ contracts:
       - requires_operator_confirmation
       - recommended_action
       - rationale_summary
-  proposal_review_summary_v1:
+  proposal_review_summary_v2:
     format: json
     machine_format: json
     validation_mode: strict_structured
@@ -180,8 +180,10 @@ contracts:
       - aggregate_score
       - min_individual_score
       - blocker_count
+      - blocking_issues
       - summary
-      - required_changes
+      - blocking_required_changes
+      - advisory_follow_ups
       - recurring_themes
       - decision
   review_corpus_bundle_v1:

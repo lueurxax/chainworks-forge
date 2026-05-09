@@ -684,7 +684,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 iteration: 11,
                 attempt: 1,
                 title: "proposal_review_summary",
-                contractID: "proposal_review_summary_v1",
+                contractID: "proposal_review_summary_v2",
                 content: "# Review summary\n\nSkipped attempt retained its artifact set for audit history.",
                 freshness: freshness
             ),
@@ -695,7 +695,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 iteration: 11,
                 attempt: 6,
                 title: "proposal_review_summary",
-                contractID: "proposal_review_summary_v1",
+                contractID: "proposal_review_summary_v2",
                 content: "# Review summary\n\nThe latest completed attempt includes validation and closeout notes.",
                 freshness: freshness
             ),
@@ -717,7 +717,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 iteration: 13,
                 attempt: 1,
                 title: "proposal_review_summary",
-                contractID: "proposal_review_summary_v1",
+                contractID: "proposal_review_summary_v2",
                 content: "# Running review\n\nThis attempt is still collecting artifacts.",
                 freshness: freshness
             ),

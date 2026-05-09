@@ -5194,8 +5194,8 @@ reviewer_override:
             .expect("example workflow should compile for snapshot fixture");
 
         let run = Run {
-            id: RunId(1),
-            idea_id: IdeaId(1),
+            id: RunId::new(),
+            idea_id: IdeaId::new(),
             status: RunStatus::Running,
             workflow_id: "full-mvp-live".into(),
             workflow_title: "Full MVP Live".into(),

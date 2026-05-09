@@ -6561,8 +6561,14 @@ mod tests {
             payload["conflictResultCode"],
             serde_json::json!("already_resolved")
         );
-        assert_eq!(payload["approval"]["decision"], serde_json::json!("granted"));
-        assert_eq!(payload["approval"]["availableActions"], serde_json::json!([]));
+        assert_eq!(
+            payload["approval"]["decision"],
+            serde_json::json!("granted")
+        );
+        assert_eq!(
+            payload["approval"]["availableActions"],
+            serde_json::json!([])
+        );
         assert_eq!(
             payload["approval"]["disabledReasonCode"],
             serde_json::json!("UNSUPPORTED_ACTION")
@@ -6616,7 +6622,10 @@ mod tests {
                 name: "release-report".into(),
                 contract_id: "release_report_v1".into(),
                 format: ArtifactFormat::Json,
-                file_path: artifact_root.join("report.json").to_string_lossy().into_owned(),
+                file_path: artifact_root
+                    .join("report.json")
+                    .to_string_lossy()
+                    .into_owned(),
                 checksum_sha256: None,
                 size_bytes: Some(64),
                 provider: "test".into(),
@@ -6781,11 +6790,9 @@ mod tests {
             serde_json::json!("NOT_AVAILABLE")
         );
         assert!(artifact["payloadText"].is_null());
-        assert!(
-            artifact["serverDebugDetail"]
-                .as_str()
-                .is_some_and(|detail| detail.contains("outside the selected run"))
-        );
+        assert!(artifact["serverDebugDetail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("outside the selected run")));
 
         let _ = fs::remove_dir_all(&artifact_root);
         let _ = fs::remove_dir_all(&outside_root);

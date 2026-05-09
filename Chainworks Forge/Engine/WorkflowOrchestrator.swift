@@ -3954,6 +3954,52 @@ final class WorkflowOrchestrator {
             try requireString(
                 json["decision"], field: "decision", agentID: agentID, contractID: contractID,
                 outputName: outputName)
+        case "proposal_review_summary_v2":
+            try requireBool(
+                json["pass"], field: "pass", agentID: agentID, contractID: contractID,
+                outputName: outputName)
+            try requireNumber(
+                json["average_score"], field: "average_score", agentID: agentID,
+                contractID: contractID,
+                outputName: outputName)
+            try requireNumber(
+                json["aggregate_score"], field: "aggregate_score", agentID: agentID,
+                contractID: contractID,
+                outputName: outputName)
+            try requireNumber(
+                json["min_individual_score"], field: "min_individual_score", agentID: agentID,
+                contractID: contractID, outputName: outputName)
+            try requireInt(
+                json["blocker_count"], field: "blocker_count", agentID: agentID,
+                contractID: contractID,
+                outputName: outputName)
+            try requireArray(
+                json["blocking_issues"], field: "blocking_issues", agentID: agentID,
+                contractID: contractID, outputName: outputName)
+            try requireString(
+                json["summary"], field: "summary", agentID: agentID, contractID: contractID,
+                outputName: outputName)
+            try requireArray(
+                json["blocking_required_changes"], field: "blocking_required_changes",
+                agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireArray(
+                json["advisory_follow_ups"], field: "advisory_follow_ups",
+                agentID: agentID, contractID: contractID, outputName: outputName)
+            try requireArray(
+                json["recurring_themes"], field: "recurring_themes", agentID: agentID,
+                contractID: contractID, outputName: outputName)
+            try requireString(
+                json["decision"], field: "decision", agentID: agentID, contractID: contractID,
+                outputName: outputName)
+            if let validationError =
+                OutputContractResolverV2.proposalReviewSummaryV2ValidationError(in: json)
+            {
+                throw ExecutionError.outputContractViolation(
+                    agentID: agentID,
+                    contractID: contractID,
+                    details: "'\(outputName)' \(validationError)"
+                )
+            }
         case "implementation_self_assessment_v2":
             if let validationError =
                 OutputContractResolverV2.implementationSelfAssessmentV2ValidationError(in: json)
