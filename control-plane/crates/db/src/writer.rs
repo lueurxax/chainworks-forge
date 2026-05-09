@@ -599,6 +599,9 @@ pub const TELEMETRY_FLUSH_CADENCE_MS: u64 = 5_000;
 /// Telemetry snapshot TTL in hours.
 pub const TELEMETRY_SNAPSHOT_TTL_HOURS: u64 = 24;
 
+/// Maximum retained Class D rollup windows.
+pub const TELEMETRY_SNAPSHOT_RETAIN_LATEST: i64 = 288;
+
 // ---------------------------------------------------------------------------
 // Lane priority ordering
 // ---------------------------------------------------------------------------
@@ -776,6 +779,7 @@ pub struct DbWriterHealthSnapshot {
     pub last_drain_age_ms: Option<u64>,
     pub transaction_duration_p50_ms: Option<u64>,
     pub transaction_duration_p95_ms: Option<u64>,
+    pub transaction_duration_sample_count: usize,
     pub total_queued: i64,
     pub lanes: Vec<DbWriterLaneSnapshot>,
     pub coalesced_rejected_total: u64,
@@ -897,6 +901,7 @@ impl DbWriterHeartbeat {
             .copied()
             .collect::<Vec<_>>();
         let transaction_duration_p50_ms = percentile(transaction_duration_samples.clone(), 50);
+        let transaction_duration_sample_count = transaction_duration_samples.len();
         let transaction_duration_p95_ms = percentile(transaction_duration_samples, 95);
         DbWriterHealthSnapshot {
             alive: self.is_alive(),
@@ -906,6 +911,7 @@ impl DbWriterHeartbeat {
             last_drain_age_ms,
             transaction_duration_p50_ms,
             transaction_duration_p95_ms,
+            transaction_duration_sample_count,
             total_queued,
             lanes,
             coalesced_rejected_total: self.coalesced_rejected_total.load(Ordering::Relaxed),
