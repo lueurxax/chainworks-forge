@@ -34,6 +34,13 @@ async fn test_pool() -> sqlx::SqlitePool {
         .expect("in-memory pool failed")
 }
 
+async fn register_test_shared_writer(pool: &sqlx::SqlitePool) {
+    let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+    db::writer::register_shared_writer(pool, writer)
+        .await
+        .expect("test shared DbWriter registration failed");
+}
+
 async fn insert_p017_run(pool: &sqlx::SqlitePool) -> RunId {
     let idea = Idea {
         id: IdeaId::new(),
@@ -1404,6 +1411,7 @@ async fn proposal_051_xcode_runtime_observation_append_serializes_parallel_write
     let db_file = tmp.path().join("p051-observation-contention.db");
     let db_url = format!("sqlite://{}", db_file.display());
     let pool = create_pool(&db_url).await.unwrap();
+    register_test_shared_writer(&pool).await;
     let execution_id = insert_p051_test_agent_execution(&pool).await;
     let writer_count = 12usize;
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(writer_count));
@@ -2333,6 +2341,7 @@ async fn test_file_backed_sqlite_durability_across_restart() {
     // ── Write phase (simulates first daemon boot) ─────────────────────────────
     {
         let pool = create_pool(&db_url).await.expect("first open failed");
+        register_test_shared_writer(&pool).await;
 
         let idea = Idea {
             id: idea_id,

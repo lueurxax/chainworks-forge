@@ -21,11 +21,13 @@ use crate::release::{
 use acp::AcpRuntimeManager;
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
-    agent_retry_budget_ledger, artifact_contracts, artifacts, ideas, legacy_discovery_overrides,
-    projections, rollout_contract_checks, scheduler, sessions, stages, validation, work_items,
-    workflow_conflicts,
+    agent_retry_budget_ledger, artifact_contracts, artifacts, evidence_spool_refs, ideas,
+    legacy_discovery_overrides, projections, rollout_contract_checks, scheduler, sessions, stages,
+    validation, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
+use db::write_class::{WriteLane, WriteResult};
+use db::writer::{class_a_operation, DbWriter};
 use domain::agent::{
     AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement, AgentStatus,
     OperatorActionHint,
@@ -271,20 +273,24 @@ fn invoke_agent_start_capacity_from_domain(
 pub async fn claim_next_invoke_agent_with_start(
     pool: &SqlitePool,
 ) -> Result<Option<ClaimedInvokeAgentStart>> {
-    Ok(
-        claim_next_invoke_agent_with_start_internal(pool, &InvokeAgentCapacityConfig::unbounded())
-            .await?
-            .map(|(claimed, _)| claimed),
+    Ok(claim_next_invoke_agent_with_start_internal(
+        pool,
+        &InvokeAgentCapacityConfig::unbounded(),
+        None,
     )
+    .await?
+    .map(|(claimed, _)| claimed))
 }
 
 pub async fn claim_next_invoke_agent_with_start_with_capacity(
     pool: &SqlitePool,
     capacity: &InvokeAgentCapacityConfig,
 ) -> Result<Option<ClaimedInvokeAgentStart>> {
-    Ok(claim_next_invoke_agent_with_start_internal(pool, capacity)
-        .await?
-        .map(|(claimed, _)| claimed))
+    Ok(
+        claim_next_invoke_agent_with_start_internal(pool, capacity, None)
+            .await?
+            .map(|(claimed, _)| claimed),
+    )
 }
 
 pub async fn has_capacity_eligible_pending_invoke_agent_for_start(
@@ -304,6 +310,7 @@ pub async fn has_capacity_eligible_pending_invoke_agent_for_start(
 async fn claim_next_invoke_agent_with_start_internal(
     pool: &SqlitePool,
     capacity: &InvokeAgentCapacityConfig,
+    db_writer: Option<&DbWriter>,
 ) -> Result<Option<(ClaimedInvokeAgentStart, WorkItem)>> {
     let candidates =
         work_items::select_pending_invoke_agents_for_start(pool, chrono::Utc::now(), 128).await?;
@@ -335,7 +342,9 @@ async fn claim_next_invoke_agent_with_start_internal(
         if !invoke_item_has_start_capacity(pool, &item, capacity).await? {
             continue;
         }
-        if let Some(claimed) = claim_invoke_agent_work_item_with_start(pool, item).await? {
+        if let Some(claimed) =
+            claim_invoke_agent_work_item_with_start(pool, item, db_writer).await?
+        {
             if let Some(run_id) = claimed.1.run_id {
                 let now = chrono::Utc::now();
                 scheduler::upsert_service_state(
@@ -494,7 +503,17 @@ fn scheduler_capacity_config_from_start_capacity(
 async fn claim_invoke_agent_work_item_with_start(
     pool: &SqlitePool,
     item: WorkItem,
+    db_writer: Option<&DbWriter>,
 ) -> Result<Option<(ClaimedInvokeAgentStart, WorkItem)>> {
+    let shared_writer;
+    let writer = if let Some(writer) = db_writer {
+        writer
+    } else {
+        shared_writer = db::writer::shared_writer_for(pool)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("P075 shared DbWriter is not registered"))?;
+        shared_writer.as_ref()
+    };
     let mut payload: serde_json::Value = serde_json::from_str(&item.payload_json)?;
     if !payload
         .as_object()
@@ -540,7 +559,7 @@ async fn claim_invoke_agent_work_item_with_start(
             }
             let payload_json = serde_json::to_string(&payload)?;
             update_invoke_work_item_claimed_payload_and_running(
-                pool,
+                writer,
                 &running_item.id,
                 &payload_json,
             )
@@ -564,7 +583,7 @@ async fn claim_invoke_agent_work_item_with_start(
             .await?;
             running_item.payload_json = payload_json;
         } else {
-            mark_invoke_work_item_running(pool, &running_item.id).await?;
+            mark_invoke_work_item_running(writer, &running_item.id).await?;
         }
         return Ok(Some((claimed, running_item)));
     }
@@ -727,7 +746,7 @@ async fn claim_invoke_agent_work_item_with_start(
     }
     payload["p058_claimed"] = claimed_payload;
     let payload_json = serde_json::to_string(&payload)?;
-    update_invoke_work_item_claimed_payload_and_running(pool, &item.id, &payload_json).await?;
+    update_invoke_work_item_claimed_payload_and_running(writer, &item.id, &payload_json).await?;
     let mut running_item = item;
     running_item.status = WorkItemStatus::Running;
     running_item.payload_json = payload_json;
@@ -770,8 +789,18 @@ fn claimed_invoke_agent_start_from_payload(
     })
 }
 
-async fn mark_invoke_work_item_running(pool: &SqlitePool, work_item_id: &str) -> Result<()> {
+async fn mark_invoke_work_item_running(db_writer: &DbWriter, work_item_id: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = db_writer
+        .begin_immediate_transaction(
+            class_a_operation(
+                "executor.mark_invoke_work_item_running",
+                WriteLane::CriticalBarrier,
+                format!("executor.mark_invoke_work_item_running:{work_item_id}"),
+            ),
+            "executor.mark_invoke_work_item_running",
+        )
+        .await?;
     let updated = sqlx::query(
         "UPDATE work_items SET status = ?1, started_at = ?2, failed_at = NULL, last_error = NULL, attempt_count = attempt_count + 1 WHERE id = ?3 AND status = ?4",
     )
@@ -779,21 +808,34 @@ async fn mark_invoke_work_item_running(pool: &SqlitePool, work_item_id: &str) ->
     .bind(now)
     .bind(work_item_id)
     .bind(WorkItemStatus::Pending.to_string())
-    .execute(pool)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if updated != 1 {
         anyhow::bail!("claim/start CAS failed for InvokeAgent work item {work_item_id}");
     }
+    tx.commit().await?;
     Ok(())
 }
 
 async fn update_invoke_work_item_claimed_payload_and_running(
-    pool: &SqlitePool,
+    db_writer: &DbWriter,
     work_item_id: &str,
     payload_json: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = db_writer
+        .begin_immediate_transaction(
+            class_a_operation(
+                "executor.update_invoke_work_item_claimed_payload_and_running",
+                WriteLane::CriticalBarrier,
+                format!(
+                    "executor.update_invoke_work_item_claimed_payload_and_running:{work_item_id}"
+                ),
+            ),
+            "executor.update_invoke_work_item_claimed_payload_and_running",
+        )
+        .await?;
     let updated = sqlx::query(
         "UPDATE work_items SET payload_json = ?1, status = ?2, started_at = ?3, failed_at = NULL, last_error = NULL, attempt_count = attempt_count + 1 WHERE id = ?4 AND status = ?5",
     )
@@ -802,12 +844,13 @@ async fn update_invoke_work_item_claimed_payload_and_running(
     .bind(now)
     .bind(work_item_id)
     .bind(WorkItemStatus::Pending.to_string())
-    .execute(pool)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if updated != 1 {
         anyhow::bail!("claim/start CAS failed for InvokeAgent work item {work_item_id}");
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -818,6 +861,7 @@ pub struct BackgroundExecutor {
     acp: Arc<AcpRuntimeManager>,
     events: EventSender,
     steward_runtime_inputs: Option<Arc<crate::steward::config::StewardRuntimeInputs>>,
+    db_writer: Arc<DbWriter>,
 }
 
 struct BackgroundStewardAgentExecutor {
@@ -2398,6 +2442,19 @@ fn build_steward_agent_prompt(
 }
 
 impl BackgroundExecutor {
+    async fn begin_executor_transaction(
+        &self,
+        operation_name: &'static str,
+        idempotency_key: impl Into<String>,
+    ) -> Result<db::writer::QueuedTransaction> {
+        self.db_writer
+            .begin_immediate_transaction(
+                class_a_operation(operation_name, WriteLane::CriticalBarrier, idempotency_key),
+                operation_name,
+            )
+            .await
+    }
+
     pub fn new(
         pool: SqlitePool,
         work_queue: WorkQueue,
@@ -2413,6 +2470,7 @@ impl BackgroundExecutor {
             pool: pool.clone(),
             events: events.clone(),
         }));
+        let db_writer = Arc::new(DbWriter::new(pool.clone()));
         Self {
             pool,
             work_queue,
@@ -2420,6 +2478,7 @@ impl BackgroundExecutor {
             acp,
             events,
             steward_runtime_inputs: None,
+            db_writer,
         }
     }
 
@@ -2431,6 +2490,26 @@ impl BackgroundExecutor {
         events: EventSender,
         steward_runtime_inputs: Arc<crate::steward::config::StewardRuntimeInputs>,
     ) -> Self {
+        Self::new_with_steward_runtime_inputs_and_db_writer(
+            pool,
+            work_queue,
+            orchestrator,
+            acp,
+            events,
+            steward_runtime_inputs,
+            None,
+        )
+    }
+
+    pub fn new_with_steward_runtime_inputs_and_db_writer(
+        pool: SqlitePool,
+        work_queue: WorkQueue,
+        orchestrator: Arc<Orchestrator>,
+        acp: Arc<AcpRuntimeManager>,
+        events: EventSender,
+        steward_runtime_inputs: Arc<crate::steward::config::StewardRuntimeInputs>,
+        db_writer: Option<Arc<DbWriter>>,
+    ) -> Self {
         acp.set_xcode_runtime_observation_sink(Arc::new(DbXcodeRuntimeObservationSink {
             pool: pool.clone(),
             events: events.clone(),
@@ -2439,6 +2518,7 @@ impl BackgroundExecutor {
             pool: pool.clone(),
             events: events.clone(),
         }));
+        let db_writer = db_writer.unwrap_or_else(|| Arc::new(DbWriter::new(pool.clone())));
         Self {
             pool,
             work_queue,
@@ -2446,6 +2526,7 @@ impl BackgroundExecutor {
             acp,
             events,
             steward_runtime_inputs: Some(steward_runtime_inputs),
+            db_writer,
         }
     }
 
@@ -2620,11 +2701,12 @@ impl BackgroundExecutor {
                     let mut settled_count = 0u64;
                     for candidate in &candidates {
                         let now = chrono::Utc::now();
-                        match db::pool::begin_immediate_with_retry(
-                            &self.pool,
-                            "mediation.expire_and_settle",
-                        )
-                        .await
+                        match self
+                            .begin_executor_transaction(
+                                "mediation.expire_and_settle",
+                                format!("mediation.expire_and_settle:{}", candidate.id),
+                            )
+                            .await
                         {
                             Ok(mut tx) => {
                                 // Expire the confirmation within the tx (CAS: only if still pending).
@@ -2816,11 +2898,13 @@ impl BackgroundExecutor {
         let capacity = invoke_agent_start_capacity_from_domain(
             &self.work_queue.invoke_agent_capacity_config(),
         );
-        Ok(
-            claim_next_invoke_agent_with_start_internal(&self.pool, &capacity)
-                .await?
-                .map(|(_, item)| item),
+        Ok(claim_next_invoke_agent_with_start_internal(
+            &self.pool,
+            &capacity,
+            Some(self.db_writer.as_ref()),
         )
+        .await?
+        .map(|(_, item)| item))
     }
 
     async fn auto_requeue_active_prompt_close(
@@ -3615,11 +3699,12 @@ impl BackgroundExecutor {
                     .await?;
                     let Some(stage_execution_id) = stage_execution_id else {
                         if let Some(med_id) = mediation_record_id.as_deref() {
-                            let mut tx = db::pool::begin_immediate_with_retry(
-                                &self.pool,
-                                "mediation.mcp_resolution_blocked",
-                            )
-                            .await?;
+                            let mut tx = self
+                                .begin_executor_transaction(
+                                    "mediation.mcp_resolution_blocked",
+                                    format!("mediation.mcp_resolution_blocked:{med_id}"),
+                                )
+                                .await?;
                             let _ = db::repos::lead_conflict_mediations::update_status_tx(
                                 &mut tx,
                                 med_id,
@@ -3652,6 +3737,7 @@ impl BackgroundExecutor {
                                 provider: &provider,
                                 model: model.clone(),
                                 failed_at: completed_at,
+                                db_writer: Some(self.db_writer.as_ref()),
                             },
                         )
                         .await?;
@@ -3745,11 +3831,14 @@ impl BackgroundExecutor {
                     && stage_execution_id.is_some()
                 {
                     let stage_execution_id = stage_execution_id.expect("checked is_some");
-                    let mut tx = db::pool::begin_immediate_with_retry(
-                        &self.pool,
-                        "executor.consume_legacy_discovery_override",
-                    )
-                    .await?;
+                    let mut tx = self
+                        .begin_executor_transaction(
+                            "executor.consume_legacy_discovery_override",
+                            format!(
+                                "executor.consume_legacy_discovery_override:{stage_execution_id}"
+                            ),
+                        )
+                        .await?;
                     if let Some(override_row) =
                         legacy_discovery_overrides::consume_pending_for_stage_tx(
                             &mut tx,
@@ -4057,7 +4146,12 @@ impl BackgroundExecutor {
                     // unexpected provider lag against superseded/canceled
                     // mediations.
                     if let Some(ref med_id) = mediation_record_id {
-                        let mut metric_tx = self.pool.begin().await?;
+                        let mut metric_tx = self
+                            .begin_executor_transaction(
+                                "executor.record_mediation_late_output_ignored",
+                                format!("executor.record_mediation_late_output_ignored:{med_id}"),
+                            )
+                            .await?;
                         let _ =
                             db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
                                 &mut metric_tx,
@@ -4136,7 +4230,12 @@ impl BackgroundExecutor {
                     // unexpected provider lag against superseded/canceled
                     // mediations.
                     if let Some(ref med_id) = mediation_record_id {
-                        let mut metric_tx = self.pool.begin().await?;
+                        let mut metric_tx = self
+                            .begin_executor_transaction(
+                                "executor.record_mediation_late_output_ignored",
+                                format!("executor.record_mediation_late_output_ignored:{med_id}"),
+                            )
+                            .await?;
                         let _ =
                             db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
                                 &mut metric_tx,
@@ -4622,11 +4721,12 @@ impl BackgroundExecutor {
                     let usage_output_tokens = result.usage.as_ref().and_then(|u| u.output_tokens);
                     let usage_cached_input_tokens =
                         result.usage.as_ref().and_then(|u| u.cached_input_tokens);
-                    let mut completion_tx = db::pool::begin_immediate_with_retry(
-                        &self.pool,
-                        "mediation.complete_with_attribution",
-                    )
-                    .await?;
+                    let mut completion_tx = self
+                        .begin_executor_transaction(
+                            "mediation.complete_with_attribution",
+                            format!("mediation.complete_with_attribution:{agent_exec_id}"),
+                        )
+                        .await?;
                     if let Some(artifact) = mediation_transcript_artifact.as_ref() {
                         artifacts::insert_tx(&mut completion_tx, artifact).await?;
                     }
@@ -4657,11 +4757,12 @@ impl BackgroundExecutor {
                             });
                     }
                     if let Some(med_id) = mediation_record_id.as_deref() {
-                        let mut tx = db::pool::begin_immediate_with_retry(
-                            &self.pool,
-                            "mediation.agent_execution_completed",
-                        )
-                        .await?;
+                        let mut tx = self
+                            .begin_executor_transaction(
+                                "mediation.agent_execution_completed",
+                                format!("mediation.agent_execution_completed:{med_id}"),
+                            )
+                            .await?;
                         if let Some(mediation) =
                             db::repos::lead_conflict_mediations::find_by_id_tx(&mut tx, med_id)
                                 .await?
@@ -4851,7 +4952,7 @@ impl BackgroundExecutor {
                                    AND lead_mediation_record_id = ?",
                             )
                             .bind(med_id)
-                            .fetch_one(&mut *tx)
+                            .fetch_one(&mut **tx)
                             .await
                             .unwrap_or(1);
                             let attempt_result = match result.status {
@@ -5179,6 +5280,7 @@ impl BackgroundExecutor {
                                 provider: &provider,
                                 model: model.clone(),
                                 failed_at: completed_at,
+                                db_writer: Some(self.db_writer.as_ref()),
                             },
                         )
                         .await?;
@@ -5276,10 +5378,11 @@ impl BackgroundExecutor {
             }
 
             WorkItemKind::StartupRepair => {
-                let recovery = RecoveryService::new(
+                let recovery = RecoveryService::new_with_db_writer(
                     self.pool.clone(),
                     self.work_queue.clone(),
                     self.events.clone(),
+                    self.db_writer.clone(),
                 );
                 recovery.run_startup_repair().await?;
             }
@@ -5952,9 +6055,12 @@ impl BackgroundExecutor {
         }
 
         let tx_started = Instant::now();
-        let mut tx =
-            db::pool::begin_immediate_with_retry(&self.pool, "executor.import_declared_outputs")
-                .await?;
+        let mut tx = self
+            .begin_executor_transaction(
+                "executor.import_declared_outputs",
+                format!("executor.import_declared_outputs:{agent_exec_id}"),
+            )
+            .await?;
         for artifact in declared_artifacts_to_insert {
             artifacts::insert_tx(&mut tx, artifact).await?;
         }
@@ -6314,17 +6420,53 @@ impl BackgroundExecutor {
         }
 
         let artifact_id = domain::ids::ArtifactId::new();
-        let path = std::path::Path::new(&run.artifact_root)
-            .join("session_transcripts")
-            .join(stage_id)
-            .join(format!("{agent_id}-{agent_execution_id}.md"));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!("create transcript artifact dir {}: {}", parent.display(), e)
-            })?;
+        let relative_path = format!(
+            "evidence/runs/{}/stages/{}/agents/{}/transcripts/{}-{}.md",
+            run.id, stage_id, agent_id, agent_id, agent_execution_id
+        );
+        let spool = db::evidence_spool::write_spool_file(
+            std::path::Path::new(&run.artifact_root),
+            &run.id.to_string(),
+            &relative_path,
+            transcript_text.as_bytes(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("write transcript evidence spool: {e}"))?;
+        let summary_json = serde_json::json!({
+            "line_count": transcript_text.lines().count(),
+            "byte_count": spool.size_bytes,
+            "producer_label": agent_id
+        })
+        .to_string();
+        let spool_ref = evidence_spool_refs::EvidenceSpoolRef {
+            id: format!("evsp_transcript_{agent_execution_id}"),
+            metadata_version: 1,
+            run_id: run.id.to_string(),
+            stage_execution_id: None,
+            stage_id: Some(stage_id.to_string()),
+            agent_execution_id: Some(agent_execution_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            kind: evidence_spool_refs::EvidenceKind::Transcript,
+            relative_path: spool.relative_path.clone(),
+            size_bytes: spool.size_bytes as i64,
+            checksum_algorithm: "sha256".to_string(),
+            checksum: spool.checksum.clone(),
+            producer_operation: "p075_acp_transcript_spool_ref_insert".to_string(),
+            content_type: Some("text/markdown; charset=utf-8".to_string()),
+            summary_json: Some(summary_json),
+            created_at,
+            status: evidence_spool_refs::EvidenceSpoolRefStatus::Available,
+        };
+        match evidence_spool_refs::insert_idempotent_via_dbwriter(&self.db_writer, spool_ref).await
+        {
+            WriteResult::Committed | WriteResult::Coalesced => {}
+            other => {
+                return Err(anyhow::anyhow!(
+                    "transcript evidence spool metadata was not committed: {other:?}"
+                ));
+            }
         }
-        std::fs::write(&path, transcript_text)
-            .map_err(|e| anyhow::anyhow!("write transcript artifact {}: {}", path.display(), e))?;
+        let path = std::path::Path::new(&run.artifact_root).join(&spool.relative_path);
 
         let artifact = domain::artifact::Artifact {
             id: artifact_id,
@@ -6335,8 +6477,8 @@ impl BackgroundExecutor {
             contract_id: "acp_transcript_v1".to_string(),
             format: ArtifactFormat::Markdown,
             file_path: path.to_string_lossy().into_owned(),
-            checksum_sha256: None,
-            size_bytes: Some(path.metadata().map(|meta| meta.len() as i64).unwrap_or(0)),
+            checksum_sha256: Some(spool.checksum),
+            size_bytes: Some(spool.size_bytes as i64),
             provider: provider.to_string(),
             model,
             created_at,

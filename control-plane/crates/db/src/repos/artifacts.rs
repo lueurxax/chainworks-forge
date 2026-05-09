@@ -6,7 +6,9 @@ use domain::artifact::{Artifact, ArtifactFormat};
 use domain::ids::{ArtifactId, RunId};
 
 pub async fn insert(pool: &SqlitePool, artifact: &Artifact) -> Result<()> {
-    let mut tx = pool.begin().await.context("begin insert artifact")?;
+    let mut tx = crate::writer::begin_repository_transaction(pool, "artifacts.insert")
+        .await
+        .context("begin insert artifact")?;
     insert_tx(&mut tx, artifact).await?;
     tx.commit().await.context("commit insert artifact")?;
     Ok(())

@@ -154,8 +154,11 @@ pub async fn record_startup_recovery_readback(
     pool: &SqlitePool,
     readback: &StartupRecoveryReadback,
 ) -> Result<()> {
-    sqlx::query(
-        r#"INSERT INTO startup_recovery_readbacks
+    crate::execute_repository_write!(
+        pool,
+        "startup_repairs.record_startup_recovery_readback",
+        sqlx::query(
+            r#"INSERT INTO startup_recovery_readbacks
            (id, recovered_item_count, queued_under_startup_recovery_backpressure_count,
             oldest_recovered_queued_age_ms, affected_run_count, next_retry_or_backoff_time,
             stale_after_ms, updated_at,
@@ -165,31 +168,30 @@ pub async fn record_startup_recovery_readback(
             toolchain_orphan_threshold_minutes,
             toolchain_last_sweep_started_at)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+        )
+        .bind(&readback.id)
+        .bind(readback.recovered_item_count)
+        .bind(readback.queued_under_startup_recovery_backpressure_count)
+        .bind(readback.oldest_recovered_queued_age_ms)
+        .bind(readback.affected_run_count)
+        .bind(
+            readback
+                .next_retry_or_backoff_time
+                .map(|value| value.to_rfc3339()),
+        )
+        .bind(readback.stale_after_ms)
+        .bind(readback.updated_at.to_rfc3339())
+        .bind(readback.toolchain_cache.session_scoped_roots_seen)
+        .bind(readback.toolchain_cache.session_scoped_roots_reclaimed)
+        .bind(readback.toolchain_cache.session_scoped_cleanup_failures)
+        .bind(readback.toolchain_cache.orphan_threshold_minutes)
+        .bind(
+            readback
+                .toolchain_cache
+                .last_sweep_started_at
+                .map(|t| t.to_rfc3339()),
+        )
     )
-    .bind(&readback.id)
-    .bind(readback.recovered_item_count)
-    .bind(readback.queued_under_startup_recovery_backpressure_count)
-    .bind(readback.oldest_recovered_queued_age_ms)
-    .bind(readback.affected_run_count)
-    .bind(
-        readback
-            .next_retry_or_backoff_time
-            .map(|value| value.to_rfc3339()),
-    )
-    .bind(readback.stale_after_ms)
-    .bind(readback.updated_at.to_rfc3339())
-    .bind(readback.toolchain_cache.session_scoped_roots_seen)
-    .bind(readback.toolchain_cache.session_scoped_roots_reclaimed)
-    .bind(readback.toolchain_cache.session_scoped_cleanup_failures)
-    .bind(readback.toolchain_cache.orphan_threshold_minutes)
-    .bind(
-        readback
-            .toolchain_cache
-            .last_sweep_started_at
-            .map(|t| t.to_rfc3339()),
-    )
-    .execute(pool)
-    .await
     .context("record startup recovery readback")?;
     Ok(())
 }

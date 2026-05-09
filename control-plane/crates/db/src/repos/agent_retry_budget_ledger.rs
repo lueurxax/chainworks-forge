@@ -31,7 +31,11 @@ pub async fn upsert_quota_failure(
     agent_execution_id: AgentExecutionId,
     retry_after: Option<DateTime<Utc>>,
 ) -> Result<AgentRetryBudgetLedgerRow> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "agent_retry_budget_ledger.upsert_quota_failure",
+    )
+    .await?;
     let row = upsert_quota_failure_tx(
         &mut tx,
         run_id,

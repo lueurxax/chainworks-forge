@@ -8,7 +8,9 @@ use domain::agent::{
 use domain::ids::{AgentExecutionId, RunId};
 
 pub async fn upsert(pool: &SqlitePool, facts: &AgentExecutionRuntimeFacts) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "agent_execution_runtime_facts.upsert")
+            .await?;
     upsert_tx(&mut tx, facts).await?;
     tx.commit().await?;
     Ok(())

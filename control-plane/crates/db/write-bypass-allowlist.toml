@@ -1,0 +1,67 @@
+# P075 permanent direct-write bypass allowlist.
+#
+# Phase 8 has retired all temporary_rollout entries. Non-test runtime writes enter
+# through DbWriter-owned APIs; begin_immediate_with_retry is an internal P061 pool
+# primitive used by DbWriter, migrations/startup repair, and tests. This file is
+# now limited to write paths that exist before normal runtime write ownership is
+# available, or to test-only setup.
+#
+# Required fields for every entry:
+#   id                  - stable identifier, never reused
+#   owner               - crate::module::fn or qualified path owning the bypass
+#   reason              - short rationale for the bypass
+#   scope               - "migrations", "tests", or "startup_repair"
+#   path_pattern        - glob-style path fragment matching call sites
+#   allowed_context     - when this bypass is permitted
+#   retirement_criteria - observable condition for future retirement, or permanent rationale
+#   expires_after_phase - phase number (1-8); the gate fails if current phase exceeds this
+
+[[bypasses]]
+id = "bypass-001"
+owner = "db::migrate"
+reason = "Schema migrations run before DbWriter is available; they own the schema write path."
+scope = "migrations"
+path_pattern = "crates/db/src/migrate.rs"
+allowed_context = "Schema migration execution only, before normal runtime write ownership."
+retirement_criteria = "Never retire; migrations are a permanent allowed infrastructure category."
+expires_after_phase = 8
+
+[[bypasses]]
+id = "bypass-002"
+owner = "db::pool::create_pool"
+reason = "Pool creation and preflight checks are infrastructure; they precede DbWriter construction."
+scope = "migrations"
+path_pattern = "crates/db/src/pool.rs"
+allowed_context = "Pool initialisation and migration preflight only."
+retirement_criteria = "Never retire; pool setup is a permanent allowed infrastructure category."
+expires_after_phase = 8
+
+[[bypasses]]
+id = "bypass-004"
+owner = "db::tests"
+reason = "Isolated test and fixture code may write directly to construct known state."
+scope = "tests"
+path_pattern = "crates/db/src/**/*tests*"
+allowed_context = "#[cfg(test)] blocks and test helper functions only."
+retirement_criteria = "Never retire; tests are a permanent allowed category."
+expires_after_phase = 8
+
+[[bypasses]]
+id = "bypass-005"
+owner = "db::repos::startup_repairs"
+reason = "Startup repair and orphan-sweep recovery code can run before normal write path readiness."
+scope = "startup_repair"
+path_pattern = "crates/db/src/repos/startup_repairs.rs"
+allowed_context = "Startup repair execution and orphan recovery sweep only."
+retirement_criteria = "Never retire; startup repair is a permanent allowed recovery category."
+expires_after_phase = 8
+
+[[bypasses]]
+id = "bypass-006"
+owner = "db::repos::evidence_spool_refs"
+reason = "Direct metadata functions are retained for startup orphan repair and focused repository tests; runtime producers must use *_via_dbwriter helpers."
+scope = "startup_repair"
+path_pattern = "crates/db/src/repos/evidence_spool_refs.rs"
+allowed_context = "Startup orphan repair and repository tests only. Runtime producers use insert_via_dbwriter, insert_idempotent_via_dbwriter, or update_status_via_dbwriter."
+retirement_criteria = "Runtime producer call sites reference only *_via_dbwriter helpers; direct insert/update functions remain startup_repair/test-only."
+expires_after_phase = 8

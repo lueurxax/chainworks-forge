@@ -12,6 +12,7 @@ use db::repos::{
     approvals, artifact_contracts, artifacts, closeout, ideas, projections,
     rollout_contract_checks, runs, steward as steward_repo, workflow_conflicts,
 };
+use db::writer::DbWriterHeartbeat;
 use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, ResolveApprovalCmd};
 use domain::events::DomainEvent;
 use domain::ids::{ArtifactId, IdeaId, RunId};
@@ -40,13 +41,45 @@ pub fn build_schema(
     principal_table: auth::PrincipalTable,
     reporter: LifecycleReporter,
 ) -> AppSchema {
-    Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+    build_schema_inner(pool, cmd_handler, events, principal_table, reporter, None)
+}
+
+pub fn build_schema_with_storage_writer(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
+) -> AppSchema {
+    build_schema_inner(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        Some(storage_writer_heartbeat),
+    )
+}
+
+fn build_schema_inner(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
+) -> AppSchema {
+    let mut builder = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .data(pool)
         .data(cmd_handler)
         .data(events)
         .data(principal_table)
-        .data(reporter)
-        .finish()
+        .data(reporter);
+    if let Some(heartbeat) = storage_writer_heartbeat {
+        builder = builder.data(heartbeat);
+    }
+    builder.finish()
 }
 
 pub struct QueryRoot;
@@ -537,6 +570,24 @@ impl QueryRoot {
         require_operator_read(ctx)?;
         let reporter = ctx.data::<LifecycleReporter>()?;
         Ok(GqlDaemonStatus::from(reporter.snapshot()))
+    }
+
+    /// P075: Storage health readback for write pressure, evidence spooling,
+    /// units, freshness, thresholds, and kill-switch state.
+    async fn storage_health(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::types::storage::GqlStorageHealth> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let heartbeat = ctx.data_opt::<Arc<DbWriterHeartbeat>>();
+        let json = db::repos::storage_health::storage_health_with_writer(
+            pool,
+            heartbeat.map(|heartbeat| heartbeat.as_ref()),
+        )
+        .await?;
+        crate::types::storage::GqlStorageHealth::from_storage_health_json(json)
+            .map_err(|e| Error::new(e.to_string()))
     }
 
     /// P066 T17: Latest startup recovery summary including toolchainCache fields.
@@ -1712,6 +1763,7 @@ mod tests {
         artifact_contracts, artifacts, ideas, projections, rollout_contract_checks, runs, stages,
         steward, workflow_conflicts,
     };
+    use db::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
         parse_implementation_self_assessment_v2, ContractParseContext,
@@ -3938,6 +3990,178 @@ mod tests {
                 "UNKNOWN",
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_075_storage_health_is_typed_graphql_contract() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let sdl = schema.sdl();
+        assert!(sdl.contains("type StorageHealth"));
+        assert!(sdl.contains("type DbWriterHealth"));
+        assert!(sdl.contains("type EvidenceSpoolSummary"));
+        assert!(sdl.contains("enum StorageDbState"));
+        assert!(!sdl.contains("storageHealth: JSON"));
+
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query P075StorageHealthTyped {
+                      storageHealth {
+                        updatedAt
+                        staleAfterMs
+                        isStale
+                        dbState
+                        writer {
+                          alive
+                          lanes { lane capacity queuedDepth queuedDepthRatio }
+                        }
+                        wal { available warnSizeBytes criticalSizeBytes }
+                        evidenceSpool {
+                          enabled
+                          filesWrittenTotal
+                          bytesWrittenTotal
+                          metadataRowsTotal
+                        }
+                        thresholds { metric warn critical unit action }
+                      }
+                    }
+                    "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P075 typed storageHealth query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["storageHealth"]["staleAfterMs"], 5000);
+        assert!(json["storageHealth"]["writer"]["lanes"]
+            .as_array()
+            .is_some_and(|lanes| lanes.len() >= 6));
+        assert!(json["storageHealth"]["thresholds"]
+            .as_array()
+            .is_some_and(|thresholds| !thresholds.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn proposal_075_storage_health_reads_live_dbwriter_heartbeat() {
+        let pool = test_pool().await;
+        let writer = db::writer::DbWriter::new(pool.clone());
+        let result = writer
+            .submit(
+                WriteOperation {
+                    class: WriteClass::A,
+                    lane: WriteLane::CriticalBarrier,
+                    operation_name: "graphql_storage_health_live_writer_test",
+                    expected_rows: 1,
+                    batchable: false,
+                    barrier: true,
+                    deadline: std::time::Duration::from_secs(5),
+                    deadline_reason: None,
+                    idempotency_key: "graphql-storage-health-live-writer".into(),
+                    replay_policy: ReplayPolicy::NaturalKey,
+                    observed_at: None,
+                },
+                |pool| async move {
+                    let mut tx = db::pool::begin_immediate_with_retry(
+                        &pool,
+                        "graphql_storage_health_live_writer_test",
+                    )
+                    .await?;
+                    sqlx::query(
+                        "CREATE TABLE IF NOT EXISTS p075_graphql_storage_health_probe (id TEXT PRIMARY KEY)",
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT OR REPLACE INTO p075_graphql_storage_health_probe (id) VALUES ('probe')",
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await?;
+                    Ok(1)
+                },
+            )
+            .await;
+        assert_eq!(result, WriteResult::Committed);
+
+        for _ in 0..30 {
+            if writer.is_alive() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(writer.is_alive(), "DbWriter heartbeat should become live");
+
+        let schema = build_schema_with_storage_writer(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+            writer.heartbeat.clone(),
+        );
+
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query P075StorageHealthWriter {
+                      storageHealth {
+                        isStale
+                        writer {
+                          alive
+                          totalQueued
+                          lastHeartbeatAt
+                          lastDrainAt
+                          writeLockWaitP50Ms
+                          writeLockWaitP95Ms
+                          transactionDurationP95Ms
+                          lanes { lane queuedDepth }
+                        }
+                      }
+                    }
+                    "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "P075 live storageHealth query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["storageHealth"]["writer"]["alive"], true);
+        assert_eq!(json["storageHealth"]["isStale"], false);
+        assert!(json["storageHealth"]["writer"]["lastHeartbeatAt"]
+            .as_str()
+            .is_some());
+        assert!(json["storageHealth"]["writer"]["lastDrainAt"]
+            .as_str()
+            .is_some());
+        assert!(json["storageHealth"]["writer"]["writeLockWaitP50Ms"]
+            .as_f64()
+            .is_some());
+        assert!(json["storageHealth"]["writer"]["writeLockWaitP95Ms"]
+            .as_f64()
+            .is_some());
+        assert!(json["storageHealth"]["writer"]["transactionDurationP95Ms"]
+            .as_f64()
+            .is_some());
+        assert!(json["storageHealth"]["writer"]["lanes"]
+            .as_array()
+            .is_some_and(|lanes| lanes.len() == 6));
     }
 
     #[tokio::test]
