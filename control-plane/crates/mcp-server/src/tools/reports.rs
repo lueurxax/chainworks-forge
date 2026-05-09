@@ -7,6 +7,8 @@ use db::repos::{
     artifact_contracts, artifacts, closeout, lead_conflict_mediations, legacy_discovery_overrides,
     rollout_contract_checks, sessions, validation, workflow_conflicts,
 };
+use db::write_class::WriteLane;
+use db::writer::{class_a_operation, DbWriter};
 use domain::agent::{AgentExecution, AgentExecutionRuntimeFacts};
 use domain::artifact::Artifact;
 use domain::ids::RunId;
@@ -190,11 +192,20 @@ pub(crate) async fn workflow_conflict_json(
                 .filter(|key| value.get(*key).map(|v| !v.is_null()).unwrap_or(false))
                 .collect();
             let now = chrono::Utc::now();
-            let mut tx = db::pool::begin_immediate_with_retry(
-                pool,
-                "mcp.reports.record_workflow_conflict_readback_completeness",
-            )
-            .await?;
+            let local_writer = DbWriter::new(pool.clone());
+            let mut tx = local_writer
+                .begin_immediate_transaction(
+                    class_a_operation(
+                        "mcp.reports.record_workflow_conflict_readback_completeness",
+                        WriteLane::CriticalBarrier,
+                        format!(
+                            "mcp.reports.record_workflow_conflict_readback_completeness:{}",
+                            conflict_id
+                        ),
+                    ),
+                    "mcp.reports.record_workflow_conflict_readback_completeness",
+                )
+                .await?;
             let _ = workflow_conflicts::record_report_readback_completeness_tx(
                 &mut tx,
                 &run_id.to_string(),

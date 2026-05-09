@@ -1,9 +1,10 @@
 # P075 permanent direct-write bypass allowlist.
 #
-# Phase 8 has retired all temporary_rollout entries. Non-test runtime writes must
-# use DbWriter or an explicit bounded transaction boundary such as
-# begin_immediate_with_retry. This file is now limited to write paths that exist
-# before normal runtime write ownership is available, or to test-only setup.
+# Phase 8 has retired all temporary_rollout entries. Non-test runtime writes enter
+# through DbWriter-owned APIs; begin_immediate_with_retry is an internal P061 pool
+# primitive used by DbWriter, migrations/startup repair, and tests. This file is
+# now limited to write paths that exist before normal runtime write ownership is
+# available, or to test-only setup.
 #
 # Required fields for every entry:
 #   id                  - stable identifier, never reused

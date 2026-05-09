@@ -59,3 +59,444 @@ class = "C"
 replay_policy = "checksum_idempotent"
 idempotency_key_kind = "(run_id, relative_path) for ACP transcript artifact"
 duplicate_application_test_path = "crates/engine/src/executor.rs::tests::persisted_acp_transcript_uses_evidence_spool"
+
+[[operations]]
+operation_name = "agent_executions.append_xcode_runtime_observation"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "artifact_contract_summaries.persist"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "cancellation.begin_settlement"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "closeout.execute_closeout_transaction"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "executor.mark_invoke_work_item_running"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "executor.update_invoke_work_item_claimed_payload_and_running"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "ideas.update_status"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "mcp.reports.record_workflow_conflict_readback_completeness"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "p077_rollout.record_decision"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "routing_receipts.insert"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "runs.insert"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "runs.mark_cancelling"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "runs.update_cancellation_settlement_log"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "scheduler.refresh_queue_summaries"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "scheduler.upsert_service_state"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "system_executions.insert"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.cancel_advance_for_parked_cursor"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.cancel_running_by_run"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.claim_next"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.complete"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.enqueue"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.fail"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.requeue_active_prompt_closed_invoke"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.requeue_host_interruption_invoke"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.requeue_preclaimed_invoke"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.requeue_running_advance_by_run"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.requeue_running_invoke_on_startup"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.requeue_running_steward_analysis_on_startup"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.requeue_stale_pre_session_invoke_agents"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.requeue_stale_starting_invoke_agent_sessions"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.requeue_transient_persistence_contention"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "work_items.settle_terminal_preclaimed_invoke_agent_executions"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "agent_execution_discovery_diagnostics.upsert"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "agent_execution_runtime_facts.upsert"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "agent_executions.insert"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "agent_executions.list_running_across_interval"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "agent_executions.update_attempt_attribution"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "agent_executions.update_completed"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "agent_retry_budget_ledger.upsert_quota_failure"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "artifact_contracts.close_source_generation_claim"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "artifact_contracts.create_override_and_rebuild"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "artifact_contracts.expire_overrides_for_stage"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "artifact_contracts.finalize_pending_retry_supersession_for_work_item"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "artifact_contracts.mark_claim_superseded_pending_retry"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "artifact_contracts.rebuild_run_state_projection"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "artifacts.insert"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "scheduler.get_service_state"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "scheduler.insert_host_interruption_affected_execution"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "scheduler.insert_host_interruption_epoch"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "sessions.end_generation"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "sessions.insert_event"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "sessions.insert_generation"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "sessions.insert_lineage"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "sessions.set_active_generation"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "stages.insert"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "stages.settle"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "workflow_conflicts.get_current_blocking_conflict"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "workflow_conflicts.insert_advisory_rejection"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "workflow_conflicts.record_phase_c_validation_failure"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "workflow_conflicts.transition_conflict_status"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "workflow_conflicts.update_mediation_pointer"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "workflow_conflicts.upsert_conflict_by_fingerprint"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"
+
+[[operations]]
+operation_name = "workflow_conflicts.upsert_transition_cursor"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repository operation natural key; runtime transaction admission is caller guarded"
+duplicate_application_test_path = "scripts/test-gate.sh::proposal-075_operation_registry_enforcement"

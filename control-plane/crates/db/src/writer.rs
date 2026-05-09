@@ -1,7 +1,6 @@
 //! P075 DbWriter: the single bounded write gateway for the Rust control plane.
 //!
-//! Non-test runtime writes must route through `DbWriter` or an explicit bounded
-//! transaction boundary. The source-controlled bypass allowlist
+//! Non-test runtime writes must enter through `DbWriter`. The source-controlled bypass allowlist
 //! (`write-bypass-allowlist.toml`) is limited to permanent infrastructure scopes
 //! such as migrations, tests, and startup repair.
 //!
@@ -30,7 +29,7 @@
 //!
 //! # Retry primitive (P061 contract)
 //!
-//! DbWriter callers use `pool::begin_immediate_with_retry` from P061.
+//! DbWriter uses `pool::begin_immediate_with_retry` from P061 internally.
 //! **A second retry primitive is explicitly NOT introduced here.**
 //!
 //! # Transaction body rules
@@ -109,10 +108,10 @@ use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
 use sha2::Digest;
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::write_class::{WriteClass, WriteLane, WriteOperation, WriteResult};
+use crate::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
 
 pub const DB_WRITER_LANES: [WriteLane; 6] = [
     WriteLane::CriticalBarrier,
@@ -152,12 +151,21 @@ pub type WriteWork = Box<
         + 'static,
 >;
 
+pub type TransactionWork<T> = Box<
+    dyn for<'tx> FnOnce(
+            &'tx mut Transaction<'_, Sqlite>,
+        )
+            -> Pin<Box<dyn Future<Output = anyhow::Result<(T, u32)>> + Send + 'tx>>
+        + Send
+        + 'static,
+>;
+
 /// Box a generic closure into a [`WriteWork`].
 ///
 /// ```no_run
 /// use db::writer::make_work;
 /// let work = make_work(|pool| async move {
-///     // begin_immediate_with_retry + SQL here
+///     // transactional SQL here
 ///     Ok(1u32)
 /// });
 /// ```
@@ -167,6 +175,56 @@ where
     Fut: Future<Output = anyhow::Result<u32>> + Send + 'static,
 {
     Box::new(move |pool| Box::pin(f(pool)))
+}
+
+pub fn class_a_operation(
+    operation_name: &'static str,
+    lane: WriteLane,
+    idempotency_key: impl Into<String>,
+) -> WriteOperation {
+    WriteOperation {
+        class: WriteClass::A,
+        lane,
+        operation_name,
+        expected_rows: 1,
+        batchable: false,
+        barrier: true,
+        deadline: WriteClass::A.default_deadline(),
+        deadline_reason: None,
+        idempotency_key: idempotency_key.into(),
+        replay_policy: ReplayPolicy::CallerGuarded,
+        observed_at: None,
+    }
+}
+
+pub fn repository_transaction_operation(operation_name: &'static str) -> WriteOperation {
+    class_a_operation(operation_name, WriteLane::CriticalBarrier, operation_name)
+}
+
+pub async fn begin_registered_immediate_transaction<'pool>(
+    pool: &'pool SqlitePool,
+    op: WriteOperation,
+    context: &'static str,
+) -> anyhow::Result<Transaction<'pool, Sqlite>> {
+    if let Err(rejected) = op.validate() {
+        anyhow::bail!(
+            "DbWriter rejected {context} before transaction start: {}",
+            rejected.as_str()
+        );
+    }
+    crate::pool::begin_immediate_with_retry(pool, context).await
+}
+
+pub async fn begin_repository_transaction<'pool>(
+    pool: &'pool SqlitePool,
+    operation_name: &'static str,
+) -> anyhow::Result<Transaction<'pool, Sqlite>> {
+    begin_registered_immediate_transaction(
+        pool,
+        repository_transaction_operation(operation_name),
+        operation_name,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +500,7 @@ pub struct DbWriterHealthSnapshot {
     pub last_heartbeat_age_ms: Option<u64>,
     pub last_drain_at: Option<String>,
     pub last_drain_age_ms: Option<u64>,
+    pub transaction_duration_p50_ms: Option<u64>,
     pub transaction_duration_p95_ms: Option<u64>,
     pub total_queued: i64,
     pub lanes: Vec<DbWriterLaneSnapshot>,
@@ -552,21 +611,22 @@ impl DbWriterHeartbeat {
             })
             .collect::<Vec<_>>();
         let total_queued = lanes.iter().map(|lane| lane.queued_depth).sum();
-        let transaction_duration_p95_ms = percentile(
-            self.transaction_duration_ms
-                .lock()
-                .unwrap()
-                .iter()
-                .copied()
-                .collect(),
-            95,
-        );
+        let transaction_duration_samples = self
+            .transaction_duration_ms
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let transaction_duration_p50_ms = percentile(transaction_duration_samples.clone(), 50);
+        let transaction_duration_p95_ms = percentile(transaction_duration_samples, 95);
         DbWriterHealthSnapshot {
             alive: self.is_alive(),
             last_heartbeat_at,
             last_heartbeat_age_ms,
             last_drain_at,
             last_drain_age_ms,
+            transaction_duration_p50_ms,
             transaction_duration_p95_ms,
             total_queued,
             lanes,
@@ -814,6 +874,64 @@ impl DbWriter {
                     Ok(Ok(result)) => result,
                 }
             }
+        }
+    }
+
+    pub async fn begin_immediate_transaction(
+        &self,
+        op: WriteOperation,
+        context: &'static str,
+    ) -> anyhow::Result<Transaction<'_, Sqlite>> {
+        if self.shutdown_in_progress.load(Ordering::Relaxed) {
+            let admitted = if op.class == WriteClass::A {
+                SHUTDOWN_ADMITTED_OPERATIONS.contains(&op.operation_name)
+            } else {
+                false
+            };
+            if !admitted {
+                anyhow::bail!("DbWriter rejected {context}: shutdown_admission_denied");
+            }
+        }
+        begin_registered_immediate_transaction(&self.pool, op, context).await
+    }
+
+    /// Submit a write that owns a full SQLite transaction inside the DbWriter lane.
+    ///
+    /// This is the migration bridge for existing multi-row repository flows: the
+    /// transaction is opened, executed, committed, and classified by DbWriter, so
+    /// callers do not create runtime write transactions outside the gateway.
+    pub async fn submit_transaction<T>(
+        &self,
+        op: WriteOperation,
+        context: &'static str,
+        work: TransactionWork<T>,
+    ) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+    {
+        let (value_tx, value_rx) = oneshot::channel();
+        let result = self
+            .submit(op, move |pool| async move {
+                let mut tx = crate::pool::begin_immediate_with_retry(&pool, context).await?;
+                let (value, rows) = work(&mut tx).await?;
+                tx.commit().await?;
+                value_tx
+                    .send(value)
+                    .map_err(|_| anyhow::anyhow!("DbWriter transaction result receiver dropped"))?;
+                Ok(rows)
+            })
+            .await;
+        match result {
+            WriteResult::Committed => value_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("DbWriter transaction committed without result")),
+            WriteResult::WriteRejected { reason, .. } => {
+                anyhow::bail!("DbWriter rejected {context}: {reason}")
+            }
+            other => anyhow::bail!(
+                "DbWriter transaction {context} did not commit: {}",
+                other.as_str()
+            ),
         }
     }
 

@@ -34,7 +34,7 @@ use domain::proposal_gate_result::{
 };
 use domain::risk_lineage::RiskAcceptanceLineage;
 
-use crate::pool::begin_immediate_with_retry;
+use crate::writer::begin_registered_immediate_transaction;
 
 /// Inputs for the closeout transaction.
 pub struct CloseoutTransactionInputs<'a> {
@@ -65,7 +65,16 @@ pub async fn execute_closeout_transaction(
     pool: &SqlitePool,
     inputs: CloseoutTransactionInputs<'_>,
 ) -> Result<CloseoutTransactionResult> {
-    let mut tx = begin_immediate_with_retry(pool, "closeout.execute_closeout_transaction").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "closeout.execute_closeout_transaction",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "closeout.execute_closeout_transaction",
+        ),
+        "closeout.execute_closeout_transaction",
+    )
+    .await?;
 
     // Step 1: Deactivate any previous active gate generation for this run.
     deactivate_previous_gate_generation(&mut tx, &inputs.gate_result.run_id).await?;

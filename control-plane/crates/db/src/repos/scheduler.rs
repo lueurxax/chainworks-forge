@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
-use crate::pool::begin_immediate_with_retry;
+use crate::writer::begin_registered_immediate_transaction;
 use domain::provider::{InvokeAgentCapacityConfig, ProviderFamily};
 
 const STALE_AFTER_MS: i64 = 60_000;
@@ -147,7 +147,16 @@ pub struct RefreshQueueSummariesResult {
 }
 
 pub async fn upsert_service_state(pool: &SqlitePool, state: &SchedulerServiceState) -> Result<()> {
-    let mut tx = begin_immediate_with_retry(pool, "scheduler.upsert_service_state").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "scheduler.upsert_service_state",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "scheduler.upsert_service_state",
+        ),
+        "scheduler.upsert_service_state",
+    )
+    .await?;
     upsert_service_state_tx(&mut tx, state).await?;
     tx.commit().await?;
     Ok(())
@@ -182,7 +191,8 @@ pub async fn get_service_state(
     scope: &str,
     scope_id: &str,
 ) -> Result<Option<SchedulerServiceState>> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "scheduler.get_service_state").await?;
     let state = get_service_state_tx(&mut tx, scope, scope_id).await?;
     tx.commit().await?;
     Ok(state)
@@ -465,7 +475,11 @@ pub async fn insert_host_interruption_epoch(
     pool: &SqlitePool,
     epoch: &HostInterruptionEpoch,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "scheduler.insert_host_interruption_epoch",
+    )
+    .await?;
     insert_host_interruption_epoch_tx(&mut tx, epoch).await?;
     tx.commit().await?;
     Ok(())
@@ -498,7 +512,11 @@ pub async fn insert_host_interruption_affected_execution(
     pool: &SqlitePool,
     affected: &HostInterruptionAffectedExecution,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "scheduler.insert_host_interruption_affected_execution",
+    )
+    .await?;
     insert_host_interruption_affected_execution_tx(&mut tx, affected).await?;
     tx.commit().await?;
     Ok(())
@@ -616,9 +634,17 @@ pub async fn refresh_queue_summaries_for_notification(
 ) -> Result<RefreshQueueSummariesResult> {
     let now = Utc::now();
     let writer_wait_started_at = Instant::now();
-    let mut tx = begin_immediate_with_retry(pool, "scheduler.refresh_queue_summaries")
-        .await
-        .context("begin refresh scheduler queue summaries")?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "scheduler.refresh_queue_summaries",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "scheduler.refresh_queue_summaries",
+        ),
+        "scheduler.refresh_queue_summaries",
+    )
+    .await
+    .context("begin refresh scheduler queue summaries")?;
     let writer_wait_ms = elapsed_millis_i64(writer_wait_started_at);
     let result = refresh_queue_summaries_for_notification_tx(
         &mut tx,

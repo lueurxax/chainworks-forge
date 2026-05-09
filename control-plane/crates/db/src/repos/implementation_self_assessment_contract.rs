@@ -39,7 +39,7 @@ pub async fn persist_implementation_self_assessment_summary(
     created_at: DateTime<Utc>,
 ) -> Result<StoredImplementationSelfAssessmentSummary> {
     let tx_started = Instant::now();
-    let mut tx = begin_immediate_with_retry(pool, "artifact_contract_summaries.persist")
+    let mut tx = begin_registered_immediate_transaction(pool, crate::writer::class_a_operation("artifact_contract_summaries.persist", crate::write_class::WriteLane::CriticalBarrier, "artifact_contract_summaries.persist"), "artifact_contract_summaries.persist")
         .await
         .context("begin artifact contract transaction")?;
     let run_id_str = run_id.to_string();

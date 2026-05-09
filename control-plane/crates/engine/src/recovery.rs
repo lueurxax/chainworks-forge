@@ -12,6 +12,8 @@ use db::repos::{
     sessions, stages, startup_repairs, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItemKind, WorkItemStatus};
+use db::write_class::WriteLane;
+use db::writer::{class_a_operation, DbWriter};
 use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::Run;
@@ -25,6 +27,7 @@ pub struct RecoveryService {
     work_queue: WorkQueue,
     #[allow(dead_code)]
     events: EventSender,
+    db_writer: DbWriter,
 }
 
 #[cfg(test)]
@@ -189,10 +192,12 @@ async fn run_has_pending_or_running_work(
 
 impl RecoveryService {
     pub fn new(pool: SqlitePool, work_queue: WorkQueue, events: EventSender) -> Self {
+        let db_writer = DbWriter::new(pool.clone());
         Self {
             pool,
             work_queue,
             events,
+            db_writer,
         }
     }
 
@@ -207,11 +212,26 @@ impl RecoveryService {
             events.clone(),
             invoke_agent_capacity,
         );
+        let db_writer = DbWriter::new(pool.clone());
         Self {
             pool,
             work_queue,
             events,
+            db_writer,
         }
+    }
+
+    async fn begin_transaction(
+        &self,
+        operation_name: &'static str,
+        idempotency_key: impl Into<String>,
+    ) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
+        self.db_writer
+            .begin_immediate_transaction(
+                class_a_operation(operation_name, WriteLane::CriticalBarrier, idempotency_key),
+                operation_name,
+            )
+            .await
     }
 
     pub async fn run_startup_repair(&self) -> Result<RecoverySummary> {
@@ -433,11 +453,12 @@ impl RecoveryService {
             }
 
             let tx_started = std::time::Instant::now();
-            let mut tx = db::pool::begin_immediate_with_retry(
-                &self.pool,
-                "recovery.clear_stale_stage_execution",
-            )
-            .await?;
+            let mut tx = self
+                .begin_transaction(
+                    "recovery.clear_stale_stage_execution",
+                    format!("recovery.clear_stale_stage_execution:{}", stage.id),
+                )
+                .await?;
             let cancelled_executions =
                 agent_executions::cancel_running_by_stage_tx(&mut tx, stage.id, now).await?;
             let cancelled_work_items =

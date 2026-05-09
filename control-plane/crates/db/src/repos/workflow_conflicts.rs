@@ -28,7 +28,11 @@ pub async fn upsert_conflict_by_fingerprint(
     pool: &SqlitePool,
     record: &WorkflowConflictRecord,
 ) -> Result<WorkflowConflictRecord> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "workflow_conflicts.upsert_conflict_by_fingerprint",
+    )
+    .await?;
     let stored = upsert_conflict_by_fingerprint_tx(&mut tx, record).await?;
     tx.commit().await?;
     Ok(stored)
@@ -79,7 +83,11 @@ pub async fn insert_advisory_rejection(
     pool: &SqlitePool,
     record: &WorkflowAdvisoryRejectionRecord,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "workflow_conflicts.insert_advisory_rejection",
+    )
+    .await?;
     sqlx::query(
         r#"INSERT INTO workflow_advisory_rejections
            (rejection_id, run_id, stage_execution_id, lineage_id, current_state_id,
@@ -136,7 +144,11 @@ pub async fn get_current_blocking_conflict(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<Option<WorkflowConflictRecord>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "workflow_conflicts.get_current_blocking_conflict",
+    )
+    .await?;
     let record = get_current_blocking_conflict_tx(&mut tx, run_id).await?;
     tx.commit().await?;
     Ok(record)
@@ -261,7 +273,11 @@ pub async fn upsert_transition_cursor(
     pool: &SqlitePool,
     cursor: &WorkflowTransitionCursorRecord,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "workflow_conflicts.upsert_transition_cursor",
+    )
+    .await?;
     upsert_transition_cursor_tx(&mut tx, cursor).await?;
     tx.commit().await?;
     Ok(())
@@ -530,7 +546,11 @@ pub async fn record_phase_c_validation_failure(
     catalog_path: Option<&str>,
     occurred_at: DateTime<Utc>,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "workflow_conflicts.record_phase_c_validation_failure",
+    )
+    .await?;
     record_phase_c_validation_failure_tx(
         &mut tx,
         failure_kind,
@@ -905,7 +925,11 @@ pub async fn transition_conflict_status(
     terminal_failure_reason: Option<String>,
     superseded_by_conflict_id: Option<String>,
 ) -> Result<WorkflowConflictRecord> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "workflow_conflicts.transition_conflict_status",
+    )
+    .await?;
     let record = transition_conflict_status_tx(
         &mut tx,
         conflict_id,
@@ -1285,7 +1309,11 @@ pub async fn update_mediation_pointer(
     record.status = status;
     record.updated_at = now;
 
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "workflow_conflicts.update_mediation_pointer",
+    )
+    .await?;
     write_conflict_update_tx(&mut tx, &record).await?;
     tx.commit().await?;
     Ok(())

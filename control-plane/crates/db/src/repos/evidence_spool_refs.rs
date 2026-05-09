@@ -27,8 +27,8 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
-use crate::pool::begin_immediate_with_retry;
 use crate::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
+use crate::writer::begin_registered_immediate_transaction;
 use crate::writer::DbWriter;
 
 // P075-LOW-005: field length caps applied at validate_spool_ref_fields.
@@ -585,11 +585,19 @@ pub fn normalize_path(path: &str) -> String {
 pub async fn insert(pool: &SqlitePool, spool_ref: &EvidenceSpoolRef) -> Result<()> {
     validate_relative_path(&spool_ref.relative_path).context("validate relative_path")?;
     validate_spool_ref_fields(spool_ref).context("validate spool_ref fields")?;
-    // FIX-004: use P061 begin_immediate_with_retry instead of pool.begin() (BEGIN DEFERRED)
+    // Use the DbWriter-owned P061 immediate transaction path instead of BEGIN DEFERRED.
     // to align with the single retry primitive mandated by P075 and avoid contention divergence.
-    let mut tx = begin_immediate_with_retry(pool, "p075_evidence_spool_ref_insert")
-        .await
-        .context("begin insert evidence_spool_ref")?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "p075_evidence_spool_ref_insert",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "p075_evidence_spool_ref_insert",
+        ),
+        "p075_evidence_spool_ref_insert",
+    )
+    .await
+    .context("begin insert evidence_spool_ref")?;
     insert_tx(&mut tx, spool_ref).await?;
     tx.commit()
         .await
@@ -678,10 +686,18 @@ pub async fn insert_idempotent(pool: &SqlitePool, spool_ref: &EvidenceSpoolRef) 
         .transpose()
         .context("canonicalize summary_json for insert_idempotent")?;
 
-    // FIX-004: use P061 begin_immediate_with_retry instead of pool.begin() (BEGIN DEFERRED).
-    let mut tx = begin_immediate_with_retry(pool, "p075_evidence_spool_ref_insert_idempotent")
-        .await
-        .context("begin insert_idempotent")?;
+    // Use the DbWriter-owned P061 immediate transaction path instead of BEGIN DEFERRED.
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "p075_evidence_spool_ref_insert_idempotent",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "p075_evidence_spool_ref_insert_idempotent",
+        ),
+        "p075_evidence_spool_ref_insert_idempotent",
+    )
+    .await
+    .context("begin insert_idempotent")?;
 
     // Single atomic statement: insert and skip silently on (run_id, relative_path) conflict.
     let result = sqlx::query(
@@ -832,7 +848,7 @@ pub async fn list_by_run_id(pool: &SqlitePool, run_id: &str) -> Result<Vec<Evide
 
 /// Update status for a spool ref by id.
 ///
-/// FIX-004b: uses P061 begin_immediate_with_retry for consistency with insert paths
+/// Uses the DbWriter-owned P061 immediate transaction path for consistency with insert paths.
 /// and to satisfy the single-retry-primitive contract from P075 (bypass-006 retirement).
 pub async fn update_status(
     pool: &SqlitePool,
@@ -840,9 +856,17 @@ pub async fn update_status(
     status: EvidenceSpoolRefStatus,
 ) -> Result<()> {
     let status_str = status.as_str();
-    let mut tx = begin_immediate_with_retry(pool, "p075_evidence_spool_ref_update_status")
-        .await
-        .context("begin update_status evidence_spool_ref")?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "p075_evidence_spool_ref_update_status",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "p075_evidence_spool_ref_update_status",
+        ),
+        "p075_evidence_spool_ref_update_status",
+    )
+    .await
+    .context("begin update_status evidence_spool_ref")?;
     sqlx::query("UPDATE evidence_spool_refs SET status = ?1 WHERE id = ?2")
         .bind(status_str)
         .bind(id)
@@ -892,8 +916,16 @@ pub async fn insert_via_dbwriter(writer: &DbWriter, spool_ref: EvidenceSpoolRef)
     };
     writer
         .submit(op, move |pool| async move {
-            let mut tx =
-                begin_immediate_with_retry(&pool, "p075_evidence_spool_ref_insert").await?;
+            let mut tx = begin_registered_immediate_transaction(
+                &pool,
+                crate::writer::class_a_operation(
+                    "p075_evidence_spool_ref_insert",
+                    crate::write_class::WriteLane::CriticalBarrier,
+                    "p075_evidence_spool_ref_insert",
+                ),
+                "p075_evidence_spool_ref_insert",
+            )
+            .await?;
             insert_tx(&mut tx, &spool_ref).await?;
             tx.commit().await?;
             Ok(1u32)
@@ -976,8 +1008,16 @@ pub async fn update_status_via_dbwriter(
     };
     writer
         .submit(op, move |pool| async move {
-            let mut tx =
-                begin_immediate_with_retry(&pool, "p075_evidence_spool_ref_update_status").await?;
+            let mut tx = begin_registered_immediate_transaction(
+                &pool,
+                crate::writer::class_a_operation(
+                    "p075_evidence_spool_ref_update_status",
+                    crate::write_class::WriteLane::CriticalBarrier,
+                    "p075_evidence_spool_ref_update_status",
+                ),
+                "p075_evidence_spool_ref_update_status",
+            )
+            .await?;
             sqlx::query("UPDATE evidence_spool_refs SET status = ?1 WHERE id = ?2")
                 .bind(status.as_str())
                 .bind(&id_owned)

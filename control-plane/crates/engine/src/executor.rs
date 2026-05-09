@@ -26,8 +26,8 @@ use db::repos::{
     validation, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
-use db::write_class::WriteResult;
-use db::writer::DbWriter;
+use db::write_class::{WriteLane, WriteResult};
+use db::writer::{class_a_operation, DbWriter};
 use domain::agent::{
     AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement, AgentStatus,
     OperatorActionHint,
@@ -767,9 +767,17 @@ fn claimed_invoke_agent_start_from_payload(
 
 async fn mark_invoke_work_item_running(pool: &SqlitePool, work_item_id: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    let mut tx =
-        db::pool::begin_immediate_with_retry(pool, "executor.mark_invoke_work_item_running")
-            .await?;
+    let local_writer = DbWriter::new(pool.clone());
+    let mut tx = local_writer
+        .begin_immediate_transaction(
+            class_a_operation(
+                "executor.mark_invoke_work_item_running",
+                WriteLane::CriticalBarrier,
+                format!("executor.mark_invoke_work_item_running:{work_item_id}"),
+            ),
+            "executor.mark_invoke_work_item_running",
+        )
+        .await?;
     let updated = sqlx::query(
         "UPDATE work_items SET status = ?1, started_at = ?2, failed_at = NULL, last_error = NULL, attempt_count = attempt_count + 1 WHERE id = ?3 AND status = ?4",
     )
@@ -793,11 +801,19 @@ async fn update_invoke_work_item_claimed_payload_and_running(
     payload_json: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    let mut tx = db::pool::begin_immediate_with_retry(
-        pool,
-        "executor.update_invoke_work_item_claimed_payload_and_running",
-    )
-    .await?;
+    let local_writer = DbWriter::new(pool.clone());
+    let mut tx = local_writer
+        .begin_immediate_transaction(
+            class_a_operation(
+                "executor.update_invoke_work_item_claimed_payload_and_running",
+                WriteLane::CriticalBarrier,
+                format!(
+                    "executor.update_invoke_work_item_claimed_payload_and_running:{work_item_id}"
+                ),
+            ),
+            "executor.update_invoke_work_item_claimed_payload_and_running",
+        )
+        .await?;
     let updated = sqlx::query(
         "UPDATE work_items SET payload_json = ?1, status = ?2, started_at = ?3, failed_at = NULL, last_error = NULL, attempt_count = attempt_count + 1 WHERE id = ?4 AND status = ?5",
     )
@@ -2404,6 +2420,19 @@ fn build_steward_agent_prompt(
 }
 
 impl BackgroundExecutor {
+    async fn begin_executor_transaction(
+        &self,
+        operation_name: &'static str,
+        idempotency_key: impl Into<String>,
+    ) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
+        self.db_writer
+            .begin_immediate_transaction(
+                class_a_operation(operation_name, WriteLane::CriticalBarrier, idempotency_key),
+                operation_name,
+            )
+            .await
+    }
+
     pub fn new(
         pool: SqlitePool,
         work_queue: WorkQueue,
@@ -2650,11 +2679,12 @@ impl BackgroundExecutor {
                     let mut settled_count = 0u64;
                     for candidate in &candidates {
                         let now = chrono::Utc::now();
-                        match db::pool::begin_immediate_with_retry(
-                            &self.pool,
-                            "mediation.expire_and_settle",
-                        )
-                        .await
+                        match self
+                            .begin_executor_transaction(
+                                "mediation.expire_and_settle",
+                                format!("mediation.expire_and_settle:{}", candidate.id),
+                            )
+                            .await
                         {
                             Ok(mut tx) => {
                                 // Expire the confirmation within the tx (CAS: only if still pending).
@@ -3638,11 +3668,12 @@ impl BackgroundExecutor {
                     .await?;
                     let Some(stage_execution_id) = stage_execution_id else {
                         if let Some(med_id) = mediation_record_id.as_deref() {
-                            let mut tx = db::pool::begin_immediate_with_retry(
-                                &self.pool,
-                                "mediation.mcp_resolution_blocked",
-                            )
-                            .await?;
+                            let mut tx = self
+                                .begin_executor_transaction(
+                                    "mediation.mcp_resolution_blocked",
+                                    format!("mediation.mcp_resolution_blocked:{med_id}"),
+                                )
+                                .await?;
                             let _ = db::repos::lead_conflict_mediations::update_status_tx(
                                 &mut tx,
                                 med_id,
@@ -3769,11 +3800,14 @@ impl BackgroundExecutor {
                     && stage_execution_id.is_some()
                 {
                     let stage_execution_id = stage_execution_id.expect("checked is_some");
-                    let mut tx = db::pool::begin_immediate_with_retry(
-                        &self.pool,
-                        "executor.consume_legacy_discovery_override",
-                    )
-                    .await?;
+                    let mut tx = self
+                        .begin_executor_transaction(
+                            "executor.consume_legacy_discovery_override",
+                            format!(
+                                "executor.consume_legacy_discovery_override:{stage_execution_id}"
+                            ),
+                        )
+                        .await?;
                     if let Some(override_row) =
                         legacy_discovery_overrides::consume_pending_for_stage_tx(
                             &mut tx,
@@ -4081,11 +4115,12 @@ impl BackgroundExecutor {
                     // unexpected provider lag against superseded/canceled
                     // mediations.
                     if let Some(ref med_id) = mediation_record_id {
-                        let mut metric_tx = db::pool::begin_immediate_with_retry(
-                            &self.pool,
-                            "executor.record_mediation_late_output_ignored",
-                        )
-                        .await?;
+                        let mut metric_tx = self
+                            .begin_executor_transaction(
+                                "executor.record_mediation_late_output_ignored",
+                                format!("executor.record_mediation_late_output_ignored:{med_id}"),
+                            )
+                            .await?;
                         let _ =
                             db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
                                 &mut metric_tx,
@@ -4164,11 +4199,12 @@ impl BackgroundExecutor {
                     // unexpected provider lag against superseded/canceled
                     // mediations.
                     if let Some(ref med_id) = mediation_record_id {
-                        let mut metric_tx = db::pool::begin_immediate_with_retry(
-                            &self.pool,
-                            "executor.record_mediation_late_output_ignored",
-                        )
-                        .await?;
+                        let mut metric_tx = self
+                            .begin_executor_transaction(
+                                "executor.record_mediation_late_output_ignored",
+                                format!("executor.record_mediation_late_output_ignored:{med_id}"),
+                            )
+                            .await?;
                         let _ =
                             db::repos::workflow_conflicts::record_mediation_late_output_ignored_tx(
                                 &mut metric_tx,
@@ -4654,11 +4690,12 @@ impl BackgroundExecutor {
                     let usage_output_tokens = result.usage.as_ref().and_then(|u| u.output_tokens);
                     let usage_cached_input_tokens =
                         result.usage.as_ref().and_then(|u| u.cached_input_tokens);
-                    let mut completion_tx = db::pool::begin_immediate_with_retry(
-                        &self.pool,
-                        "mediation.complete_with_attribution",
-                    )
-                    .await?;
+                    let mut completion_tx = self
+                        .begin_executor_transaction(
+                            "mediation.complete_with_attribution",
+                            format!("mediation.complete_with_attribution:{agent_exec_id}"),
+                        )
+                        .await?;
                     if let Some(artifact) = mediation_transcript_artifact.as_ref() {
                         artifacts::insert_tx(&mut completion_tx, artifact).await?;
                     }
@@ -4689,11 +4726,12 @@ impl BackgroundExecutor {
                             });
                     }
                     if let Some(med_id) = mediation_record_id.as_deref() {
-                        let mut tx = db::pool::begin_immediate_with_retry(
-                            &self.pool,
-                            "mediation.agent_execution_completed",
-                        )
-                        .await?;
+                        let mut tx = self
+                            .begin_executor_transaction(
+                                "mediation.agent_execution_completed",
+                                format!("mediation.agent_execution_completed:{med_id}"),
+                            )
+                            .await?;
                         if let Some(mediation) =
                             db::repos::lead_conflict_mediations::find_by_id_tx(&mut tx, med_id)
                                 .await?
@@ -5985,9 +6023,12 @@ impl BackgroundExecutor {
         }
 
         let tx_started = Instant::now();
-        let mut tx =
-            db::pool::begin_immediate_with_retry(&self.pool, "executor.import_declared_outputs")
-                .await?;
+        let mut tx = self
+            .begin_executor_transaction(
+                "executor.import_declared_outputs",
+                format!("executor.import_declared_outputs:{agent_exec_id}"),
+            )
+            .await?;
         for artifact in declared_artifacts_to_insert {
             artifacts::insert_tx(&mut tx, artifact).await?;
         }

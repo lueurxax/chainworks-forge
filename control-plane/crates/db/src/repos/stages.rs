@@ -6,7 +6,7 @@ use domain::ids::{RunId, StageExecutionId};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 
 pub async fn insert(pool: &SqlitePool, stage: &StageExecution) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(pool, "stages.insert").await?;
     insert_tx(&mut tx, stage).await?;
     tx.commit().await?;
     Ok(())
@@ -155,7 +155,7 @@ pub async fn settle(
     kind: StageSettlementKind,
     at: DateTime<Utc>,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(pool, "stages.settle").await?;
     settle_tx(&mut tx, id, kind, at).await?;
     tx.commit().await?;
     Ok(())

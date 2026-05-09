@@ -14,6 +14,8 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use db::write_class::WriteLane;
+use db::writer::{class_a_operation, DbWriter};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
 // ── Transaction-accepting settlement functions ────────────────────────
@@ -98,12 +100,30 @@ pub async fn settle_expired_tx(
 
 /// Engine-owned settlement service. All mediation settlements pass through here.
 pub struct MediationSettlementService {
-    pool: SqlitePool,
+    db_writer: DbWriter,
 }
 
 impl MediationSettlementService {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        let db_writer = DbWriter::new(pool.clone());
+        Self { db_writer }
+    }
+
+    async fn begin_transaction(
+        &self,
+        operation_name: &'static str,
+        mediation_record_id: &str,
+    ) -> Result<Transaction<'_, Sqlite>> {
+        self.db_writer
+            .begin_immediate_transaction(
+                class_a_operation(
+                    operation_name,
+                    WriteLane::CriticalBarrier,
+                    format!("{operation_name}:{mediation_record_id}"),
+                ),
+                operation_name,
+            )
+            .await
     }
 
     /// Settle a mediation as confirmed by operator.
@@ -112,8 +132,9 @@ impl MediationSettlementService {
         mediation_record_id: &str,
         now: DateTime<Utc>,
     ) -> Result<SettlementOutcome> {
-        let mut tx =
-            db::pool::begin_immediate_with_retry(&self.pool, "mediation.settle_confirmed").await?;
+        let mut tx = self
+            .begin_transaction("mediation.settle_confirmed", mediation_record_id)
+            .await?;
         let outcome = settle_confirmed_tx(&mut tx, mediation_record_id, now).await?;
         tx.commit().await?;
         Ok(outcome)
@@ -125,11 +146,12 @@ impl MediationSettlementService {
         mediation_record_id: &str,
         now: DateTime<Utc>,
     ) -> Result<SettlementOutcome> {
-        let mut tx = db::pool::begin_immediate_with_retry(
-            &self.pool,
-            "mediation.settle_rejected_clone_manual",
-        )
-        .await?;
+        let mut tx = self
+            .begin_transaction(
+                "mediation.settle_rejected_clone_manual",
+                mediation_record_id,
+            )
+            .await?;
         let outcome = settle_rejected_clone_manual_tx(&mut tx, mediation_record_id, now).await?;
         tx.commit().await?;
         Ok(outcome)
@@ -141,8 +163,9 @@ impl MediationSettlementService {
         mediation_record_id: &str,
         now: DateTime<Utc>,
     ) -> Result<SettlementOutcome> {
-        let mut tx =
-            db::pool::begin_immediate_with_retry(&self.pool, "mediation.settle_expired").await?;
+        let mut tx = self
+            .begin_transaction("mediation.settle_expired", mediation_record_id)
+            .await?;
         let outcome = settle_expired_tx(&mut tx, mediation_record_id, now).await?;
         tx.commit().await?;
         Ok(outcome)

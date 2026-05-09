@@ -259,16 +259,19 @@ async fn main() -> Result<()> {
     let work_queue = WorkQueue::new(pool.clone());
     let acp = Arc::new(AcpRuntimeManager::new());
     let db_writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
-    let cmd_handler = Arc::new(CommandHandler::new_with_acp(
+    let cmd_handler = Arc::new(CommandHandler::new_with_acp_capacity_and_db_writer(
         pool.clone(),
         events.clone(),
         work_queue.clone(),
         acp.clone(),
+        domain::provider::InvokeAgentCapacityConfig::default(),
+        Some(db_writer.clone()),
     ));
-    let orchestrator = Arc::new(Orchestrator::new(
+    let orchestrator = Arc::new(Orchestrator::new_with_db_writer(
         pool.clone(),
         events.clone(),
         work_queue.clone(),
+        db_writer.clone(),
     ));
     let executor = Arc::new(
         BackgroundExecutor::new_with_steward_runtime_inputs_and_db_writer(

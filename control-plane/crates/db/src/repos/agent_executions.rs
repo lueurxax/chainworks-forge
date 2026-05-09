@@ -7,7 +7,7 @@ use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
 use domain::provider::ProviderFamily;
 use domain::xcode_runtime::{XcodeRuntimeObservation, XcodeRuntimeObservationUpdate};
 
-use crate::pool::begin_immediate_with_retry;
+use crate::writer::begin_registered_immediate_transaction;
 
 const SELECT_COLS: &str = r#"id, stage_execution_id, agent_id, provider, model, status, started_at, completed_at,
                 owner_execution_lineage_id, session_lineage_id, session_generation_id, rehydrated_from_checkpoint_artifact_id,
@@ -34,7 +34,8 @@ pub struct RunningAgentExecution {
 }
 
 pub async fn insert(pool: &SqlitePool, exec: &AgentExecution) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "agent_executions.insert").await?;
     insert_tx(&mut tx, exec).await?;
     tx.commit().await?;
     Ok(())
@@ -116,7 +117,9 @@ pub async fn update_completed(
     status: AgentStatus,
     completed_at: DateTime<Utc>,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "agent_executions.update_completed")
+            .await?;
     update_completed_tx(&mut tx, id, status, completed_at).await?;
     tx.commit().await?;
     Ok(())
@@ -234,9 +237,16 @@ pub async fn append_xcode_runtime_observation(
     update: XcodeRuntimeObservationUpdate,
 ) -> Result<()> {
     for attempt in 0..3 {
-        let mut tx =
-            begin_immediate_with_retry(pool, "agent_executions.append_xcode_runtime_observation")
-                .await?;
+        let mut tx = begin_registered_immediate_transaction(
+            pool,
+            crate::writer::class_a_operation(
+                "agent_executions.append_xcode_runtime_observation",
+                crate::write_class::WriteLane::CriticalBarrier,
+                "agent_executions.append_xcode_runtime_observation",
+            ),
+            "agent_executions.append_xcode_runtime_observation",
+        )
+        .await?;
         let row = sqlx::query(
             "SELECT actual_xcode_runtime_observation_json FROM agent_executions WHERE id = ?",
         )
@@ -508,7 +518,11 @@ pub async fn list_running_across_interval(
     started_at: DateTime<Utc>,
     ended_at: DateTime<Utc>,
 ) -> Result<Vec<RunningAgentExecution>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "agent_executions.list_running_across_interval",
+    )
+    .await?;
     let executions = list_running_across_interval_tx(&mut tx, started_at, ended_at).await?;
     tx.commit().await?;
     Ok(executions)
@@ -670,7 +684,11 @@ pub async fn update_attempt_attribution(
     cached_input_tokens: Option<i64>,
     transcript_artifact_id: Option<&str>,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "agent_executions.update_attempt_attribution",
+    )
+    .await?;
     update_attempt_attribution_tx(
         &mut tx,
         id,

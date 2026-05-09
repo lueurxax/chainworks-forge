@@ -5594,24 +5594,36 @@ for idx, row in enumerate(registry.get("operations", []), start=1):
         raise SystemExit(f"P075 caller_guarded operation {name} missing duplicate test")
 
 observed = set()
-for path in (root / "control-plane/crates/db/src").rglob("*.rs"):
-    if "tests" in path.parts:
-        continue
-    text = path.read_text().split("\n#[cfg(test)]", 1)[0]
-    for match in re.finditer(r'operation_name:\s*"([^"]+)"', text):
-        name = match.group(1)
-        if name.startswith("test_"):
+for rel_root in [
+    "control-plane/crates/db/src",
+    "control-plane/crates/engine/src",
+    "control-plane/crates/mcp-server/src",
+]:
+    for path in (root / rel_root).rglob("*.rs"):
+        if "tests" in path.parts:
             continue
-        observed.add(name)
+        text = path.read_text().split("\n#[cfg(test)]", 1)[0]
+        for match in re.finditer(
+            r'(?:operation_name:\s*"([^"]+)"|class_a_operation\(\s*"([^"]+)"|begin_repository_transaction\(\s*pool\s*,\s*"([^"]+)")',
+            text,
+        ):
+            name = match.group(1) or match.group(2) or match.group(3)
+            if name.startswith("test_"):
+                continue
+            observed.add(name)
 unregistered = sorted(observed - registered)
 if unregistered:
     raise SystemExit(f"P075 unregistered WriteOperation.operation_name literals: {unregistered}")
 
 runtime_direct_write_re = re.compile(
-    r'(?:\bpool\.begin\(\)\.await\b|\.execute\((?:pool|&pool|&self\.pool)\))'
+    r'(?:\bpool\.begin\(\)\.await\b|begin_immediate_with_retry\(|\.execute\((?:pool|&pool|&self\.pool)\))'
+)
+db_repo_direct_transaction_re = re.compile(
+    r'(?:\bpool\.begin\(\)\.await\b|begin_immediate_with_retry\()'
 )
 runtime_direct_write_sites = []
 for rel_root in [
+    "control-plane/crates/db/src/repos",
     "control-plane/crates/engine/src",
     "control-plane/crates/daemon/src",
     "control-plane/crates/graphql-server/src",
@@ -5619,15 +5631,19 @@ for rel_root in [
 ]:
     for path in (root / rel_root).rglob("*.rs"):
         text = path.read_text().split("\n#[cfg(test)]", 1)[0]
-        for match in runtime_direct_write_re.finditer(text):
+        direct_write_re = (
+            db_repo_direct_transaction_re
+            if rel_root == "control-plane/crates/db/src/repos"
+            else runtime_direct_write_re
+        )
+        for match in direct_write_re.finditer(text):
             line = text.count("\n", 0, match.start()) + 1
             runtime_direct_write_sites.append(
                 f"{path.relative_to(root / 'control-plane').as_posix()}:{line}"
             )
 if runtime_direct_write_sites:
     raise SystemExit(
-        "P075 runtime direct SQL write sites must use DbWriter or "
-        "begin_immediate_with_retry: "
+        "P075 runtime direct SQL write sites must route through DbWriter: "
         + ", ".join(sorted(runtime_direct_write_sites))
     )
 
@@ -5654,11 +5670,26 @@ for required in [
     "write_lock_wait_p50",
     "write_lock_wait_p95",
     "busy_retry_rate",
+    "command_latency_p50",
+    "command_latency_p95",
     "wal_size_bytes",
+    "transactionDurationP50Ms",
+    "transactionDurationP95Ms",
     "storage_health_file_backed_canary_reports_lock_wal_and_writer_metrics",
 ]:
     if required not in baseline_text:
         raise SystemExit(f"P075 baseline evidence missing required marker: {required}")
+baseline_numeric_markers = [
+    r"\|\s*write_lock_wait_p50\s*\|[^|]*\|[^|]*\|\s*0\s*\|",
+    r"\|\s*write_lock_wait_p95\s*\|[^|]*\|[^|]*\|\s*1\s*\|",
+    r"\|\s*busy_retry_rate\s*\|[^|]*\|[^|]*\|\s*0\.0\s*\|",
+    r"\|\s*command_latency_p50\s*\|[^|]*\|[^|]*\|\s*0\s*\|",
+    r"\|\s*command_latency_p95\s*\|[^|]*\|[^|]*\|\s*2\s*\|",
+    r"\|\s*wal_size_bytes\s*\|[^|]*\|[^|]*\|\s*45352\s*\|",
+]
+for marker in baseline_numeric_markers:
+    if not re.search(marker, baseline_text):
+        raise SystemExit(f"P075 baseline evidence missing numeric baseline matching {marker}")
 
 producer_inventory_path = root / "docs/evidence/p075/producer-inventory.md"
 if not producer_inventory_path.exists():

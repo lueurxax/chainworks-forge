@@ -5,7 +5,7 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use domain::ids::{IdeaId, RunId};
 use domain::run::{Run, RunStatus};
 
-use crate::pool::begin_immediate_with_retry;
+use crate::writer::begin_registered_immediate_transaction;
 
 const SELECT_COLS: &str = r#"id, idea_id, status, workflow_id, workflow_title, workspace_root,
              artifact_root, started_at, completed_at, cancellation_requested_at,
@@ -18,7 +18,16 @@ const SELECT_COLS: &str = r#"id, idea_id, status, workflow_id, workflow_title, w
              closeout_readiness_mode"#;
 
 pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
-    let mut tx = begin_immediate_with_retry(pool, "runs.insert").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "runs.insert",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "runs.insert",
+        ),
+        "runs.insert",
+    )
+    .await?;
     insert_tx(&mut tx, run).await?;
     tx.commit().await.context("commit insert run")?;
     Ok(())
@@ -212,7 +221,16 @@ pub async fn mark_cancelling(
     id: RunId,
     requested_at: DateTime<Utc>,
 ) -> Result<()> {
-    let mut tx = begin_immediate_with_retry(pool, "runs.mark_cancelling").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "runs.mark_cancelling",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "runs.mark_cancelling",
+        ),
+        "runs.mark_cancelling",
+    )
+    .await?;
     mark_cancelling_tx(&mut tx, id, requested_at).await?;
     tx.commit().await.context("commit mark run cancelling")?;
     Ok(())
@@ -254,8 +272,16 @@ pub async fn update_cancellation_settlement_log(
     id: RunId,
     settlement_log: &str,
 ) -> Result<()> {
-    let mut tx =
-        begin_immediate_with_retry(pool, "runs.update_cancellation_settlement_log").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "runs.update_cancellation_settlement_log",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "runs.update_cancellation_settlement_log",
+        ),
+        "runs.update_cancellation_settlement_log",
+    )
+    .await?;
     update_cancellation_settlement_log_tx(&mut tx, id, settlement_log).await?;
     tx.commit()
         .await

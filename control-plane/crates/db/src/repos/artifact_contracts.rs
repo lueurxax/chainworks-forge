@@ -21,7 +21,8 @@ use domain::ids::{AgentExecutionId, ArtifactId, RunId};
 use domain::mediation::OwnerKind;
 use domain::proposal_gate_result::PROPOSAL_GATE_RESULT_V1_CONTRACT_ID;
 
-use crate::pool::{begin_immediate_with_retry, log_write_transaction};
+use crate::pool::log_write_transaction;
+use crate::writer::begin_registered_immediate_transaction;
 
 #[derive(Clone, Debug)]
 pub struct RunStateProjectionRow {
@@ -335,7 +336,11 @@ pub async fn mark_claim_superseded_pending_retry(
     superseding_work_item_id: &str,
     supersession_journal_id: &str,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "artifact_contracts.mark_claim_superseded_pending_retry",
+    )
+    .await?;
     mark_claim_superseded_pending_retry_tx(
         &mut tx,
         key,
@@ -456,7 +461,11 @@ pub async fn finalize_pending_retry_supersession_for_work_item(
     superseding_work_item_id: &str,
     new_agent_execution_id: AgentExecutionId,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "artifact_contracts.finalize_pending_retry_supersession_for_work_item",
+    )
+    .await?;
     finalize_pending_retry_supersession_tx(
         &mut tx,
         superseding_work_item_id,
@@ -471,7 +480,11 @@ pub async fn close_source_generation_claim(
     pool: &SqlitePool,
     key: &ArtifactSourceGenerationClaimKey,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "artifact_contracts.close_source_generation_claim",
+    )
+    .await?;
     close_source_generation_claim_tx(&mut tx, key).await?;
     tx.commit().await?;
     Ok(())
@@ -702,7 +715,11 @@ pub async fn create_override_and_rebuild(
     let now = Utc::now().to_rfc3339();
     let run_id = input.run_id.to_string();
     let source_artifacts_json = serde_json::to_string(&input.source_artifacts)?;
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "artifact_contracts.create_override_and_rebuild",
+    )
+    .await?;
     sqlx::query(
         r#"INSERT INTO artifact_contract_overrides
            (override_id, run_id, contract_id, override_type, from_status, to_status, reason, owner,
@@ -767,7 +784,11 @@ pub async fn expire_overrides_for_stage(
         .await?;
         Some(journal_id)
     };
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "artifact_contracts.expire_overrides_for_stage",
+    )
+    .await?;
     let result: Result<()> = async {
         sqlx::query(
             "UPDATE artifact_contract_overrides SET active = 0, expired_at = ?1 WHERE run_id = ?2 AND expires_at_stage = ?3 AND active = 1",
@@ -1027,7 +1048,11 @@ pub async fn canonical_contract_field_result(
 }
 
 pub async fn rebuild_run_state_projection(pool: &SqlitePool, run_id: RunId) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "artifact_contracts.rebuild_run_state_projection",
+    )
+    .await?;
     rebuild_run_state_projection_tx(&mut tx, run_id).await?;
     tx.commit().await?;
     export_projection_files(pool, run_id).await

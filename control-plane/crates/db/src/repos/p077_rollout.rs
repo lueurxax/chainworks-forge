@@ -4,7 +4,7 @@ use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
-use crate::pool::begin_immediate_with_retry;
+use crate::writer::begin_registered_immediate_transaction;
 
 #[derive(Clone, Debug)]
 pub struct P077RolloutMetricEventInput {
@@ -95,7 +95,16 @@ pub async fn record_decision(
         bail!("p077 affected_run_ids are only valid for rollback_to_advisory");
     }
 
-    let mut tx = begin_immediate_with_retry(pool, "p077_rollout.record_decision").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "p077_rollout.record_decision",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "p077_rollout.record_decision",
+        ),
+        "p077_rollout.record_decision",
+    )
+    .await?;
     let decision_id = Uuid::new_v4().to_string();
     let created_at = Utc::now().to_rfc3339();
     sqlx::query(

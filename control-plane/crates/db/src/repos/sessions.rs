@@ -7,7 +7,8 @@ use domain::session::{
 };
 
 pub async fn insert_lineage(pool: &SqlitePool, lineage: &SessionLineage) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "sessions.insert_lineage").await?;
     insert_lineage_tx(&mut tx, lineage).await?;
     tx.commit().await?;
     Ok(())
@@ -38,7 +39,8 @@ pub async fn insert_lineage_tx(
 }
 
 pub async fn insert_generation(pool: &SqlitePool, generation: &SessionGeneration) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "sessions.insert_generation").await?;
     insert_generation_tx(&mut tx, generation).await?;
     tx.commit().await?;
     Ok(())
@@ -87,7 +89,7 @@ pub async fn insert_generation_tx(
 }
 
 pub async fn insert_event(pool: &SqlitePool, event: &SessionEvent) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(pool, "sessions.insert_event").await?;
     insert_event_tx(&mut tx, event).await?;
     tx.commit().await?;
     Ok(())
@@ -357,7 +359,8 @@ pub async fn set_active_generation(
     lineage_id: &str,
     generation_id: Option<&str>,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "sessions.set_active_generation").await?;
     set_active_generation_tx(&mut tx, lineage_id, generation_id).await?;
     tx.commit().await?;
     Ok(())
@@ -384,7 +387,8 @@ pub async fn end_generation(
     end_reason: &str,
     ended_at: DateTime<Utc>,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::writer::begin_repository_transaction(pool, "sessions.end_generation").await?;
     end_generation_tx(&mut tx, generation_id, status, end_reason, ended_at).await?;
     tx.commit().await?;
     Ok(())

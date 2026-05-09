@@ -142,6 +142,7 @@ pub async fn storage_health_with_writer(
             "lanes": lane_health(writer_snapshot.as_ref()),
             "writeLockWaitP50Ms": lock_metrics.wait_p50_ms,
             "writeLockWaitP95Ms": lock_metrics.wait_p95_ms,
+            "transactionDurationP50Ms": writer_snapshot.as_ref().and_then(|snapshot| snapshot.transaction_duration_p50_ms),
             "transactionDurationP95Ms": writer_snapshot.as_ref().and_then(|snapshot| snapshot.transaction_duration_p95_ms),
             "busyRetryRatePerMinute": lock_metrics.busy_retry_rate_per_minute,
             "busyRetryExhaustedTotal": lock_metrics.busy_retry_exhausted_total,
@@ -537,13 +538,15 @@ mod tests {
         let health = storage_health_with_writer(&pool, Some(&writer.heartbeat))
             .await
             .unwrap();
-
         assert_eq!(health["writer"]["alive"], true);
         assert!(health["writer"]["lastHeartbeatAt"].as_str().is_some());
         assert!(health["writer"]["lastDrainAt"].as_str().is_some());
         assert_eq!(health["writer"]["totalQueued"], 0);
         assert!(health["writer"]["writeLockWaitP50Ms"].as_u64().is_some());
         assert!(health["writer"]["writeLockWaitP95Ms"].as_u64().is_some());
+        assert!(health["writer"]["transactionDurationP50Ms"]
+            .as_u64()
+            .is_some());
         assert!(health["writer"]["transactionDurationP95Ms"]
             .as_u64()
             .is_some());
@@ -622,6 +625,9 @@ mod tests {
         assert!(health["writer"]["lastDrainAt"].as_str().is_some());
         assert!(health["writer"]["writeLockWaitP50Ms"].as_u64().is_some());
         assert!(health["writer"]["writeLockWaitP95Ms"].as_u64().is_some());
+        assert!(health["writer"]["transactionDurationP50Ms"]
+            .as_u64()
+            .is_some());
         assert!(health["writer"]["transactionDurationP95Ms"]
             .as_u64()
             .is_some());

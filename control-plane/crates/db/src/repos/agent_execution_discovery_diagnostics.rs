@@ -44,7 +44,11 @@ pub async fn upsert(
     pool: &SqlitePool,
     diagnostics: &AgentExecutionDiscoveryDiagnostics,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "agent_execution_discovery_diagnostics.upsert",
+    )
+    .await?;
     upsert_tx(&mut tx, diagnostics).await?;
     tx.commit().await?;
     Ok(())

@@ -5,7 +5,7 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::IdeaId;
 
-use crate::pool::begin_immediate_with_retry;
+use crate::writer::begin_registered_immediate_transaction;
 
 pub async fn insert(pool: &SqlitePool, idea: &Idea) -> Result<()> {
     let id = idea.id.to_string();
@@ -121,7 +121,16 @@ pub async fn list(pool: &SqlitePool, include_archived: bool) -> Result<Vec<Idea>
 }
 
 pub async fn update_status(pool: &SqlitePool, id: IdeaId, status: IdeaStatus) -> Result<()> {
-    let mut tx = begin_immediate_with_retry(pool, "ideas.update_status").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "ideas.update_status",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "ideas.update_status",
+        ),
+        "ideas.update_status",
+    )
+    .await?;
     update_status_tx(&mut tx, id, status).await?;
     tx.commit().await.context("commit update idea status")?;
     Ok(())

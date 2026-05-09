@@ -44,20 +44,48 @@ use crate::synthesizers::closeout_readiness::{
     SynthesizerInputs as CloseoutSynthesizerInputs,
 };
 use crate::work_queue::WorkQueue;
+use db::write_class::WriteLane;
+use db::writer::{class_a_operation, DbWriter};
+use std::sync::Arc;
 
 pub struct Orchestrator {
     pool: SqlitePool,
     events: EventSender,
     work_queue: WorkQueue,
+    db_writer: Arc<DbWriter>,
 }
 
 impl Orchestrator {
     pub fn new(pool: SqlitePool, events: EventSender, work_queue: WorkQueue) -> Self {
+        let db_writer = Arc::new(DbWriter::new(pool.clone()));
+        Self::new_with_db_writer(pool, events, work_queue, db_writer)
+    }
+
+    pub fn new_with_db_writer(
+        pool: SqlitePool,
+        events: EventSender,
+        work_queue: WorkQueue,
+        db_writer: Arc<DbWriter>,
+    ) -> Self {
         Self {
             pool,
             events,
             work_queue,
+            db_writer,
         }
+    }
+
+    async fn begin_orchestrator_transaction(
+        &self,
+        operation_name: &'static str,
+        idempotency_key: impl Into<String>,
+    ) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
+        self.db_writer
+            .begin_immediate_transaction(
+                class_a_operation(operation_name, WriteLane::CriticalBarrier, idempotency_key),
+                operation_name,
+            )
+            .await
     }
 
     async fn enqueue_steward_analysis(&self, completed_run_id: Option<RunId>) -> Result<()> {
@@ -2669,11 +2697,12 @@ impl Orchestrator {
             );
 
             let tx_started = std::time::Instant::now();
-            let mut tx = db::pool::begin_immediate_with_retry(
-                &self.pool,
-                "orchestrator.AutoContractOutputRetry",
-            )
-            .await?;
+            let mut tx = self
+                .begin_orchestrator_transaction(
+                    "orchestrator.AutoContractOutputRetry",
+                    format!("orchestrator.AutoContractOutputRetry:{}", stage.id),
+                )
+                .await?;
             stages::settle_tx(&mut tx, stage.id, StageSettlementKind::Skipped, now).await?;
             stages::insert_tx(&mut tx, &new_stage).await?;
             sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
@@ -4365,8 +4394,12 @@ impl Orchestrator {
         };
 
         // Begin IMMEDIATE transaction for the idempotency check + insert + pointer update.
-        let mut tx =
-            db::pool::begin_immediate_with_retry(&self.pool, "mediation.try_initiate").await?;
+        let mut tx = self
+            .begin_orchestrator_transaction(
+                "mediation.try_initiate",
+                format!("mediation.try_initiate:{run_id}:{}", conflict.conflict_id),
+            )
+            .await?;
 
         // Check for existing active mediation for this conflict fingerprint (idempotent).
         if let Some(existing) = lead_conflict_mediations::find_active_for_conflict_tx(
@@ -4454,8 +4487,12 @@ impl Orchestrator {
             );
             // Best-effort recovery: mark the orphaned mediation as terminal.
             let recovery_now = chrono::Utc::now();
-            if let Ok(mut recovery_tx) =
-                db::pool::begin_immediate_with_retry(&self.pool, "mediation.orphan_recovery").await
+            if let Ok(mut recovery_tx) = self
+                .begin_orchestrator_transaction(
+                    "mediation.orphan_recovery",
+                    format!("mediation.orphan_recovery:{mediation_id}"),
+                )
+                .await
             {
                 let _ = db::repos::lead_conflict_mediations::update_status_tx(
                     &mut recovery_tx,
@@ -4599,9 +4636,12 @@ impl Orchestrator {
 
         // Update mediation status to queued.
         let now = chrono::Utc::now();
-        let mut tx =
-            db::pool::begin_immediate_with_retry(&self.pool, "mediation.update_status_queued")
-                .await?;
+        let mut tx = self
+            .begin_orchestrator_transaction(
+                "mediation.update_status_queued",
+                format!("mediation.update_status_queued:{mediation_id}"),
+            )
+            .await?;
         db::repos::lead_conflict_mediations::update_status_tx(
             &mut tx,
             mediation_id,

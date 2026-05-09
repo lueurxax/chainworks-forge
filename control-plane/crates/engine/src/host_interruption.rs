@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use db::repos::{agent_executions, artifact_contracts, scheduler, work_items};
+use db::write_class::WriteLane;
+use db::writer::{class_a_operation, DbWriter};
 use domain::agent::AgentStatus;
 use domain::ids::RunId;
 use domain::provider::{InvokeAgentCapacityConfig, ProviderFamily};
@@ -28,6 +30,7 @@ pub struct HostInterruptionService {
     pool: SqlitePool,
     work_queue: WorkQueue,
     capacity_config: InvokeAgentCapacityConfig,
+    db_writer: Arc<DbWriter>,
     runtime_cleanup: Option<Arc<dyn HostInterruptionRuntimeCleanup>>,
 }
 
@@ -271,10 +274,12 @@ impl HostInterruptionService {
         work_queue: WorkQueue,
         capacity_config: InvokeAgentCapacityConfig,
     ) -> Self {
+        let db_writer = Arc::new(DbWriter::new(pool.clone()));
         Self {
             pool,
             work_queue,
             capacity_config,
+            db_writer,
             runtime_cleanup: None,
         }
     }
@@ -285,12 +290,27 @@ impl HostInterruptionService {
         capacity_config: InvokeAgentCapacityConfig,
         runtime_cleanup: Arc<dyn HostInterruptionRuntimeCleanup>,
     ) -> Self {
+        let db_writer = Arc::new(DbWriter::new(pool.clone()));
         Self {
             pool,
             work_queue,
             capacity_config,
+            db_writer,
             runtime_cleanup: Some(runtime_cleanup),
         }
+    }
+
+    async fn begin_transaction(
+        &self,
+        operation_name: &'static str,
+        idempotency_key: impl Into<String>,
+    ) -> Result<Transaction<'_, Sqlite>> {
+        self.db_writer
+            .begin_immediate_transaction(
+                class_a_operation(operation_name, WriteLane::CriticalBarrier, idempotency_key),
+                operation_name,
+            )
+            .await
     }
 
     pub async fn record_and_requeue(
@@ -305,11 +325,12 @@ impl HostInterruptionService {
         let cleanup_summary = self.cleanup_runtime_sessions_for_event(&event, now).await?;
         let transaction_started = Instant::now();
         let writer_wait_started_at = Instant::now();
-        let mut tx = db::pool::begin_immediate_with_retry(
-            &self.pool,
-            "host_interruption.record_and_requeue",
-        )
-        .await?;
+        let mut tx = self
+            .begin_transaction(
+                "host_interruption.record_and_requeue",
+                format!("host_interruption.record_and_requeue:{}", event.started_at),
+            )
+            .await?;
         let writer_wait_ms = writer_wait_started_at.elapsed().as_millis() as i64;
         let epoch = scheduler::HostInterruptionEpoch {
             id: uuid::Uuid::new_v4().to_string(),
@@ -472,11 +493,15 @@ impl HostInterruptionService {
     ) -> Result<HostInterruptionRecoverySummary> {
         let transaction_started = Instant::now();
         let writer_wait_started_at = Instant::now();
-        let mut tx = db::pool::begin_immediate_with_retry(
-            &self.pool,
-            "host_interruption.record_non_disruptive_epoch",
-        )
-        .await?;
+        let mut tx = self
+            .begin_transaction(
+                "host_interruption.record_non_disruptive_epoch",
+                format!(
+                    "host_interruption.record_non_disruptive_epoch:{}",
+                    event.started_at
+                ),
+            )
+            .await?;
         let writer_wait_ms = writer_wait_started_at.elapsed().as_millis() as i64;
         let epoch = scheduler::HostInterruptionEpoch {
             id: uuid::Uuid::new_v4().to_string(),

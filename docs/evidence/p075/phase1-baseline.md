@@ -1,11 +1,11 @@
 # P075 Baseline — Write-Lock Wait, Busy Retry Rate, Command Latency, WAL Size
 
-> **Status:** same-tree static baseline plus file-backed storage canary captured
+> **Status:** same-tree numeric baseline plus file-backed storage canary captured
 > for P075 closeout. The next promotion step can still add a larger daemon
 > workload, but the repository gate now proves non-null live lock/WAL/writer
 > readback on a file-backed SQLite database.
 
-**Status: STATIC BASELINE AND FILE-BACKED CANARY CAPTURED**
+**Status: NUMERIC BASELINE AND FILE-BACKED CANARY CAPTURED**
 
 This file records the same-tree P075 gate, bypass inventory anchor, and the
 file-backed storage canary added for the manual closeout slice. The canary uses a
@@ -24,13 +24,13 @@ SQLite database (not `:memory:`). Record p50 and p95 for latency metrics.
 
 | Metric | Unit | Capture Method | Baseline Value |
 |--------|------|----------------|----------------|
-| write_lock_wait_p50 | ms | `storage_health_file_backed_canary_reports_lock_wal_and_writer_metrics` via P061 `begin_immediate_with_retry` metrics | non-null live sample, gate-enforced |
-| write_lock_wait_p95 | ms | same canary | non-null live sample, gate-enforced |
-| busy_retry_rate | retries/min | same canary, uncontended file-backed workload | 0 retries/min expected for the gate canary; non-zero values remain visible in `storageHealth.writer.busyRetryRatePerMinute` |
-| command_latency_p50 | ms | DbWriter enqueue-to-commit accounting and structured logs | represented by gate-covered `transactionDurationP95Ms`; broader daemon workload promotion remains optional rollout evidence |
-| command_latency_p95 | ms | DbWriter enqueue-to-commit accounting and structured logs | represented by gate-covered `transactionDurationP95Ms`; broader daemon workload promotion remains optional rollout evidence |
-| wal_size_bytes | bytes | file stat on the canary SQLite `-wal` file through `storageHealth.wal.sizeBytes` | non-null live sample, gate-enforced |
-| direct_write_call_site_count | count | `./scripts/test-gate.sh proposal-075` inventory output | 3 observed db/src operation literals; 36 allowlisted bypass entries |
+| write_lock_wait_p50 | ms | `storage_health_file_backed_canary_reports_lock_wal_and_writer_metrics` via DbWriter-owned P061 lock metrics | 0 |
+| write_lock_wait_p95 | ms | same canary | 1 |
+| busy_retry_rate | retries/min | same canary, uncontended file-backed workload | 0.0 |
+| command_latency_p50 | ms | `storageHealth.writer.transactionDurationP50Ms` from DbWriter transaction accounting | 0 |
+| command_latency_p95 | ms | `storageHealth.writer.transactionDurationP95Ms` from DbWriter transaction accounting | 2 |
+| wal_size_bytes | bytes | file stat on the canary SQLite `-wal` file through `storageHealth.wal.sizeBytes` | 45352 |
+| direct_write_call_site_count | count | `./scripts/test-gate.sh proposal-075` inventory output | 0 production runtime direct transaction sites; 5 permanent infrastructure bypass entries; 0 temporary rollout bypass entries |
 
 ## Capture Protocol
 
@@ -83,7 +83,28 @@ The Phase 8 closeout model has retired all temporary rollout bypasses. The
 remaining allowlist entries are permanent infrastructure scopes only: migrations,
 tests, startup repair, and evidence-spool orphan repair. The gate now fails on any
 `temporary_rollout` row and on production runtime direct SQL writes that bypass
-DbWriter or the bounded `begin_immediate_with_retry` transaction primitive.
+DbWriter.
+
+## Captured Numeric Sample
+
+Captured with:
+
+```bash
+cd control-plane
+cargo test -p db storage_health_file_backed_canary_reports_lock_wal_and_writer_metrics -- --nocapture
+```
+
+Sample timestamp: `2026-05-09T08:28:21.083580+00:00`
+
+| Readback Field | Value |
+|----------------|-------|
+| `storageHealth.writer.writeLockWaitP50Ms` | `0` |
+| `storageHealth.writer.writeLockWaitP95Ms` | `1` |
+| `storageHealth.writer.transactionDurationP50Ms` | `0` |
+| `storageHealth.writer.transactionDurationP95Ms` | `2` |
+| `storageHealth.writer.busyRetryRatePerMinute` | `0.0` |
+| `storageHealth.writer.busyRetryExhaustedTotal` | `0` |
+| `storageHealth.wal.sizeBytes` | `45352` |
 
 ---
 
