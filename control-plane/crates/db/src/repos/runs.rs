@@ -5,7 +5,7 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use domain::ids::{IdeaId, RunId};
 use domain::run::{Run, RunStatus};
 
-use crate::pool::begin_immediate_with_retry;
+use crate::writer::begin_registered_immediate_transaction;
 
 const SELECT_COLS: &str = r#"id, idea_id, status, workflow_id, workflow_title, workspace_root,
              artifact_root, started_at, completed_at, cancellation_requested_at,
@@ -18,7 +18,16 @@ const SELECT_COLS: &str = r#"id, idea_id, status, workflow_id, workflow_title, w
              closeout_readiness_mode"#;
 
 pub async fn insert(pool: &SqlitePool, run: &Run) -> Result<()> {
-    let mut tx = begin_immediate_with_retry(pool, "runs.insert").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "runs.insert",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "runs.insert",
+        ),
+        "runs.insert",
+    )
+    .await?;
     insert_tx(&mut tx, run).await?;
     tx.commit().await.context("commit insert run")?;
     Ok(())
@@ -153,24 +162,28 @@ pub async fn list_completed(pool: &SqlitePool, limit: i64) -> Result<Vec<Run>> {
 pub async fn update_status(pool: &SqlitePool, id: RunId, status: RunStatus) -> Result<()> {
     let id_str = id.to_string();
     let status_str = status.to_string();
-    sqlx::query(r#"UPDATE runs SET status = ?1 WHERE id = ?2"#)
-        .bind(status_str)
-        .bind(id_str)
-        .execute(pool)
-        .await
-        .context("update run status")?;
+    crate::execute_repository_write!(
+        pool,
+        "runs.update_status",
+        sqlx::query(r#"UPDATE runs SET status = ?1 WHERE id = ?2"#)
+            .bind(status_str)
+            .bind(id_str)
+    )
+    .context("update run status")?;
     Ok(())
 }
 
 /// Update the current_state for a workflow-driven run.
 pub async fn update_current_state(pool: &SqlitePool, id: RunId, state: &str) -> Result<()> {
     let id_str = id.to_string();
-    sqlx::query(r#"UPDATE runs SET current_state = ?1 WHERE id = ?2"#)
-        .bind(state)
-        .bind(id_str)
-        .execute(pool)
-        .await
-        .context("update run current_state")?;
+    crate::execute_repository_write!(
+        pool,
+        "runs.update_current_state",
+        sqlx::query(r#"UPDATE runs SET current_state = ?1 WHERE id = ?2"#)
+            .bind(state)
+            .bind(id_str)
+    )
+    .context("update run current_state")?;
     Ok(())
 }
 
@@ -180,13 +193,17 @@ pub async fn update_drift_detection(
     detected_at: DateTime<Utc>,
     details_json: &str,
 ) -> Result<()> {
-    sqlx::query(r#"UPDATE runs SET drift_detected_at = ?1, drift_details_json = ?2 WHERE id = ?3"#)
+    crate::execute_repository_write!(
+        pool,
+        "runs.update_drift_detection",
+        sqlx::query(
+            r#"UPDATE runs SET drift_detected_at = ?1, drift_details_json = ?2 WHERE id = ?3"#
+        )
         .bind(detected_at.to_rfc3339())
         .bind(details_json)
         .bind(id.to_string())
-        .execute(pool)
-        .await
-        .context("update run drift detection")?;
+    )
+    .context("update run drift detection")?;
     Ok(())
 }
 
@@ -212,7 +229,16 @@ pub async fn mark_cancelling(
     id: RunId,
     requested_at: DateTime<Utc>,
 ) -> Result<()> {
-    let mut tx = begin_immediate_with_retry(pool, "runs.mark_cancelling").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "runs.mark_cancelling",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "runs.mark_cancelling",
+        ),
+        "runs.mark_cancelling",
+    )
+    .await?;
     mark_cancelling_tx(&mut tx, id, requested_at).await?;
     tx.commit().await.context("commit mark run cancelling")?;
     Ok(())
@@ -239,13 +265,15 @@ pub async fn mark_cancelled(pool: &SqlitePool, id: RunId, settled_at: DateTime<U
     let id_str = id.to_string();
     let settled_at_str = settled_at.to_rfc3339();
     let status = RunStatus::Cancelled.to_string();
-    sqlx::query(r#"UPDATE runs SET status = ?1, cancellation_settled_at = ?2 WHERE id = ?3"#)
-        .bind(status)
-        .bind(settled_at_str)
-        .bind(id_str)
-        .execute(pool)
-        .await
-        .context("mark run cancelled")?;
+    crate::execute_repository_write!(
+        pool,
+        "runs.mark_cancelled",
+        sqlx::query(r#"UPDATE runs SET status = ?1, cancellation_settled_at = ?2 WHERE id = ?3"#)
+            .bind(status)
+            .bind(settled_at_str)
+            .bind(id_str)
+    )
+    .context("mark run cancelled")?;
     Ok(())
 }
 
@@ -254,8 +282,16 @@ pub async fn update_cancellation_settlement_log(
     id: RunId,
     settlement_log: &str,
 ) -> Result<()> {
-    let mut tx =
-        begin_immediate_with_retry(pool, "runs.update_cancellation_settlement_log").await?;
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "runs.update_cancellation_settlement_log",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "runs.update_cancellation_settlement_log",
+        ),
+        "runs.update_cancellation_settlement_log",
+    )
+    .await?;
     update_cancellation_settlement_log_tx(&mut tx, id, settlement_log).await?;
     tx.commit()
         .await
@@ -284,17 +320,19 @@ pub async fn finalize_cancellation(
     settlement_log: &str,
 ) -> Result<()> {
     let status = RunStatus::Cancelled.to_string();
-    sqlx::query(
-        r#"UPDATE runs
+    crate::execute_repository_write!(
+        pool,
+        "runs.finalize_cancellation",
+        sqlx::query(
+            r#"UPDATE runs
            SET status = ?1, cancellation_settled_at = ?2, cancellation_settlement_log = ?3
            WHERE id = ?4"#,
+        )
+        .bind(status)
+        .bind(settled_at.to_rfc3339())
+        .bind(settlement_log)
+        .bind(id.to_string())
     )
-    .bind(status)
-    .bind(settled_at.to_rfc3339())
-    .bind(settlement_log)
-    .bind(id.to_string())
-    .execute(pool)
-    .await
     .context("finalize run cancellation")?;
     Ok(())
 }
@@ -307,13 +345,15 @@ pub async fn mark_completed(
     let id_str = id.to_string();
     let completed_at_str = completed_at.to_rfc3339();
     let status = RunStatus::Completed.to_string();
-    sqlx::query(r#"UPDATE runs SET status = ?1, completed_at = ?2 WHERE id = ?3"#)
-        .bind(status)
-        .bind(completed_at_str)
-        .bind(id_str)
-        .execute(pool)
-        .await
-        .context("mark run completed")?;
+    crate::execute_repository_write!(
+        pool,
+        "runs.mark_completed",
+        sqlx::query(r#"UPDATE runs SET status = ?1, completed_at = ?2 WHERE id = ?3"#)
+            .bind(status)
+            .bind(completed_at_str)
+            .bind(id_str)
+    )
+    .context("mark run completed")?;
     Ok(())
 }
 
@@ -327,16 +367,14 @@ pub async fn update_worktree_fields(
     target_branch: &str,
 ) -> Result<()> {
     let id_str = id.to_string();
-    sqlx::query(
+    crate::execute_repository_write!(pool, "runs.update_worktree_fields", sqlx::query(
         r#"UPDATE runs SET worktree_root = ?1, base_branch = ?2, base_revision = ?3, target_branch = ?4 WHERE id = ?5"#,
     )
     .bind(worktree_root)
     .bind(base_branch)
     .bind(base_revision)
     .bind(target_branch)
-    .bind(id_str)
-    .execute(pool)
-    .await
+    .bind(id_str))
     .context("update run worktree fields")?;
     Ok(())
 }

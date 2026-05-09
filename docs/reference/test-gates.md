@@ -1850,6 +1850,46 @@ Important:
 - this is a Phase 0 contract/readback gate, not proof that Git mutation or capsule prompt injection is enabled
 - later P064 phases must extend this gate before shipping repositories, sync execution, dirty preservation, conflict routing, or prompt injection
 
+### `proposal-075|p075`
+
+Proposal 075 local persistence write budget, evidence spooling, storage diagnostics, and fail-closed registry gate.
+
+Scope:
+
+- `write_class` types: `WriteClass`, `WriteOperation`, `WriteResult`, `SpoolWriteOutcome`
+- `writer`: `DbWriter` constants, lane order, bounded MPSC executor — biased priority drain (`CriticalBarrier`/`OperatorCommand` polled before lower lanes), enqueue-to-commit deadline accounting (`WriteTimeout`), busy-error classification (`WriteBusyExhausted`), 1 Hz heartbeat with `is_alive()`, lane starvation watchdog incrementing `lane_starvation_total`, graceful shutdown that rejects new B/C/D writes and drains Class A within `SHUTDOWN_CLASS_A_DRAIN_BUDGET_MS`, populated `SHUTDOWN_ADMITTED_OPERATIONS` allowlist (terminal canonical operations admitted; unlisted Class A writes denied), Class B coalescing buffer (`COALESCE_FLUSH_INTERVAL_MS=500` with unconditional drain-all per tick, `COALESCE_FLUSH_MAX_MERGES=64`, last-writer-wins, `COALESCE_MAX_KEYS=1024` saturation reject with `coalescing_map_saturated`, force-drained on shutdown), per-lane oldest-enqueued tracking populating `WriteRejected.oldest_queued_ms`, and storage health readback units/freshness/kill-switches.
+- `evidence_spool` (Phase 3): `write_spool_file` ordering proof (temp write → SHA-256 → `fsync(file)` → atomic no-replace commit → `fsync(parent_dir)`), `verify_spool_file` reader integrity, `sweep_evidence_orphans` walk that backfills `recovered_orphan` metadata for crash-orphaned files and is idempotent on a second pass, sweep budget enforcement (`max_files`/`max_bytes` truncate the pass and set `OrphanSweepReport.truncated`, with over-budget candidates skipped before read), `run_id` filter that skips files outside the requested run, `dry_run` mode that scans and stream-hashes checksums but does not insert metadata rows, high-volume "one metadata row per logical object" proof against `evidence_spool_refs`, and security regressions: canonical-layout enforcement (`evidence/runs/...` required — P075-SEC-002 layout), write-time `run_id` path-ownership binding (P075-SEC-001 / H-002), no-clobber commit (identical bytes = idempotent retry; differing bytes = hard error — P075-SEC-002 no-clobber), symlink-escape rejection via canonicalized root plus per-segment symlink-safe parent walk that refuses to mkdir through any symlinked component, with `verify_spool_file` and orphan sweep using no-follow `symlink_metadata` on candidates (P075-SEC-H001), Unix file mode `0o600` and directory mode `0o700` (P075-SEC-H002)
+- `bypass_allowlist`: parser, expiry, canonical file validation
+- `operation_registry`: parser, validation, canonical file validation
+- `evidence_spool_refs`: migration and repository round-trips, CHECK constraints, `validate_relative_path` symmetry on read/write, `validate_path_ownership` run-id binding (P075-SEC-001), `canonicalize_summary_json` allowlist, identity-string control-character rejection
+- `storage_write_pressure_snapshots` migration, validation, repository readback, and storage health freshness classification
+- MCP/GraphQL storage diagnostics: typed `storageHealth`, `storage.health`, `storage.write_pressure`, `storage.evidence_spool_summary`, and `storage.reconcile_evidence_orphans`, including operator-only capability enforcement, fail-closed stale/degraded readback when no live writer heartbeat is supplied, and live `DbWriter` heartbeat readback when the daemon-owned writer is injected (`storage_health_with_writer` populates `writer.alive`/`totalQueued`/`lanes`/`lastHeartbeatAt`/`lastDrainAt`/lock wait p50/p95/transaction p50/p95/`isStale=false` from the live snapshot — covered by `proposal_075_storage_health_reads_live_dbwriter_heartbeat` in `graphql-server`, `storage_health_reads_live_dbwriter_heartbeat_when_injected` in `mcp-server`, and the file-backed WAL/lock canary `storage_health_file_backed_canary_reports_lock_wal_and_writer_metrics` in `db`)
+- typed MCP storage error contract (`error: true`, `errorCode`, `message`, `tool` envelope) covering `invalid_input` (`reconcile_evidence_orphans_returns_invalid_input` for non-dry-run without `runId`), `stale` (`storage_health_returns_typed_stale_error`), `unavailable`, `maintenance_disabled`, and `unauthorized` through the real `tools/call` dispatch path (`proposal_075_storage_tool_dispatch`)
+- P075 evidence docs must have no `pending_live_canary` marker in `docs/evidence/p075/phase1-baseline.md` and must include the high-volume producer inventory at `docs/evidence/p075/producer-inventory.md`
+- fail-closed registry enforcement: `write-bypass-allowlist.toml` and `write-operation-registry.toml` must exist, be valid, include retirement metadata, reject all `temporary_rollout` bypass rows, reject production runtime transaction paths that bypass DbWriter-owned entrypoints, and cover observed non-test DbWriter operation names under `control-plane/crates/db/src`, `control-plane/crates/engine/src`, and `control-plane/crates/mcp-server/src`
+
+Use when:
+
+- changing write classes, priority lanes, or `DbWriter` constants
+- updating the DB write-bypass allowlist or write-operation registry
+- changing evidence spool references or storage write-pressure snapshots
+
+Host policy:
+
+- local Rust toolchain required; no UI target or simulator needed
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-075
+```
+
+Important:
+
+- `p075` is accepted as an alias
+- this is a fail-closed persistence contract gate, not an inventory-only check
+- startup orphan reconciliation is available through the storage MCP diagnostic tool; daemon startup scheduling and future telemetry producer expansion must keep this gate green when extended
+
 ### `proposal-084|p084` retained historical alias
 
 Executable rollout gates and observability contract gate.

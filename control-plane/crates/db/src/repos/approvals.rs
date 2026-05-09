@@ -13,7 +13,7 @@ pub async fn insert(pool: &SqlitePool, approval: &Approval) -> Result<()> {
     let decided_at = approval.decided_at.map(|t| t.to_rfc3339());
     let expires_at = approval.expires_at.map(|t| t.to_rfc3339());
 
-    sqlx::query(
+    crate::execute_repository_write!(pool, "approvals.insert", sqlx::query(
         r#"
         INSERT INTO approvals (id, run_id, stage_id, decision, requested_at, decided_at, comment, expires_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -26,9 +26,7 @@ pub async fn insert(pool: &SqlitePool, approval: &Approval) -> Result<()> {
     .bind(requested_at)
     .bind(decided_at)
     .bind(&approval.comment)
-    .bind(expires_at)
-    .execute(pool)
-    .await
+    .bind(expires_at))
     .context("insert approval")?;
     Ok(())
 }
@@ -183,15 +181,13 @@ pub async fn resolve(
     let decision_str = decision.to_string();
     let decided_at_str = decided_at.to_rfc3339();
 
-    sqlx::query(
+    crate::execute_repository_write!(pool, "approvals.resolve", sqlx::query(
         r#"UPDATE approvals SET decision = ?1, decided_at = ?2, comment = COALESCE(?3, comment) WHERE id = ?4"#,
     )
     .bind(decision_str)
     .bind(decided_at_str)
     .bind(comment)
-    .bind(id_str)
-    .execute(pool)
-    .await
+    .bind(id_str))
     .context("resolve approval")?;
     Ok(())
 }
