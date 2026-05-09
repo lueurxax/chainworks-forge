@@ -35,10 +35,17 @@ async fn test_pool() -> sqlx::SqlitePool {
 }
 
 async fn register_test_shared_writer(pool: &sqlx::SqlitePool) {
+    let _ = register_test_shared_writer_handle(pool).await;
+}
+
+async fn register_test_shared_writer_handle(
+    pool: &sqlx::SqlitePool,
+) -> std::sync::Arc<db::writer::DbWriter> {
     let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
-    db::writer::register_shared_writer(pool, writer)
+    db::writer::register_shared_writer(pool, writer.clone())
         .await
         .expect("test shared DbWriter registration failed");
+    writer
 }
 
 async fn insert_p017_run(pool: &sqlx::SqlitePool) -> RunId {
@@ -2127,6 +2134,48 @@ async fn test_projection_parity_after_rebuild() {
 
     let stage_b = stage_rows.iter().find(|s| s.stage_id == "stage_b").unwrap();
     assert_eq!(stage_b.status, StageStatus::Failed.to_string());
+}
+
+#[tokio::test]
+async fn p075_projection_rebuild_uses_production_class_b_coalescing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_file = tmp.path().join("p075-production-class-b.db");
+    let pool = create_pool(&format!("sqlite://{}", db_file.display()))
+        .await
+        .unwrap();
+    let writer = register_test_shared_writer_handle(&pool).await;
+    let run_id = insert_p017_run(&pool).await;
+    let worker_count = 8usize;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(worker_count));
+    let mut handles = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            projections::rebuild_run_summary(&pool, run_id).await
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap().unwrap();
+    }
+
+    let summary_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM run_summaries WHERE run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(summary_count, 1);
+
+    let snapshot = writer.heartbeat.snapshot();
+    assert!(
+        snapshot.coalesced_merged_total > 0,
+        "production projection rebuilds must merge through Class B coalescing"
+    );
+    writer.shutdown().await;
 }
 
 /// Northbound projections must expose canonical run status even when the

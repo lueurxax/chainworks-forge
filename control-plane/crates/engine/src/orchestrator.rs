@@ -1610,12 +1610,27 @@ impl Orchestrator {
             || worktree_truth.latency_ms > CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS;
         let loop_budget_remaining =
             closeout_loop_budget_remaining(plan, all_stages, "state_10_implementation_refined");
+        let implementation_review_status =
+            match artifact_contracts::canonical_contract_field_result(
+                &self.pool,
+                run_id,
+                "implementation_review_summary",
+                "status",
+            )
+            .await
+            {
+                Ok(db::repos::artifact_contracts::CanonicalContractField::Resolved(value)) => {
+                    value.as_str().map(ToOwned::to_owned)
+                }
+                _ => None,
+            };
 
         let inputs = CloseoutSynthesizerInputs {
             run_id: &run_id_str,
             stage_id: current_state_id,
             gate_result: &gate_result,
             mode_result: &mode_result,
+            implementation_review_status: implementation_review_status.as_deref(),
             self_assessment: self_assessment_ref,
             accepted_risks: &accepted_risks,
             loop_budget_remaining,
@@ -1988,6 +2003,20 @@ impl Orchestrator {
                     source_path.display()
                 )
             })?;
+            let materialized_fixtures =
+                crate::rollout_contract_preflight::materialize_missing_rollout_contract_fixture_placeholders(
+                    &source_data,
+                    &source_path,
+                    &run.workspace_root,
+                )?;
+            if !materialized_fixtures.is_empty() {
+                info!(
+                    run_id = %run.id,
+                    stage_id = %stage.stage_id,
+                    materialized_fixture_count = materialized_fixtures.len(),
+                    "materialized missing rollout_contract_v1 fixture placeholders before approved_proposal snapshot"
+                );
+            }
             let rollout_contract_failures =
                 crate::rollout_contract_preflight::approved_proposal_rollout_contract_lint_failures(
                     &source_data,
@@ -2025,6 +2054,20 @@ impl Orchestrator {
                 target_path.display()
             )
         })?;
+        let materialized_fixtures =
+            crate::rollout_contract_preflight::materialize_missing_rollout_contract_fixture_placeholders(
+                &data,
+                &target_path,
+                &run.workspace_root,
+            )?;
+        if !materialized_fixtures.is_empty() {
+            info!(
+                run_id = %run.id,
+                stage_id = %stage.stage_id,
+                materialized_fixture_count = materialized_fixtures.len(),
+                "materialized missing rollout_contract_v1 fixture placeholders before approved_proposal registration"
+            );
+        }
         let rollout_contract_failures =
             crate::rollout_contract_preflight::approved_proposal_rollout_contract_lint_failures(
                 &data,
@@ -4124,13 +4167,10 @@ impl Orchestrator {
         else {
             return Ok(());
         };
-        if candidate_evaluations
+        let release_matched = candidate_evaluations
             .get(release_index)
             .map(|candidate| candidate.result.clone())
-            != Some(CandidateTransitionResult::Matched)
-        {
-            return Ok(());
-        }
+            == Some(CandidateTransitionResult::Matched);
 
         let target_status = plan
             .variables
@@ -4161,6 +4201,14 @@ impl Orchestrator {
             db::repos::artifact_contracts::CanonicalContractField::Resolved(ref value)
                 if value.as_str() == Some(target_status)
         ) {
+            return Ok(());
+        }
+        let status_requires_refine = matches!(
+            status,
+            db::repos::artifact_contracts::CanonicalContractField::Resolved(ref value)
+                if matches!(value.as_str(), Some("needs_code_fixes" | "invalid"))
+        );
+        if !release_matched && !status_requires_refine {
             return Ok(());
         }
 
@@ -7190,6 +7238,8 @@ mod tests {
         let mut run = test_run(run_id);
         run.workspace_root = tmp.path().to_string_lossy().into_owned();
         run.chainworks_meta_root = Some(format!(".chainworks/runs/{run_id}"));
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
 
         let source_rel = format!(".chainworks/runs/{run_id}/proposals/current/proposal.json");
         let source_path = tmp.path().join(&source_rel);
@@ -7589,7 +7639,7 @@ mod tests {
                 "backend_profiles": {
                     "gemini_review_pro": {
                         "provider": "gemini_acp",
-                        "model": "gemini-2.5-pro",
+                        "model": "gemini-3.1-pro-preview",
                         "effort": "medium",
                         "max_turns": 12
                     },
@@ -7647,7 +7697,7 @@ mod tests {
         .bind("proposal_reviewer_ui")
         .bind("gemini_acp")
         .bind("gemini")
-        .bind("gemini-2.5-pro")
+        .bind("gemini-3.1-pro-preview")
         .bind(Utc::now().to_rfc3339())
         .bind(Utc::now().to_rfc3339())
         .execute(&pool)
@@ -7664,7 +7714,7 @@ mod tests {
         task.agent.agent_id = "proposal_reviewer_ui".into();
         task.agent.backend_profile_id = Some("gemini_review_pro".into());
         task.agent.provider = "gemini_acp".into();
-        task.agent.model = Some("gemini-2.5-pro".into());
+        task.agent.model = Some("gemini-3.1-pro-preview".into());
         let output_contract = task.agent.output_contract.clone();
 
         let fallback = orchestrator

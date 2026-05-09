@@ -11,7 +11,9 @@ This file records the same-tree P075 gate, bypass inventory anchor, and the
 file-backed storage canary added for the manual closeout slice. The canary uses a
 real SQLite WAL file and submits multiple Class A writes through the shared
 `DbWriter`, then asserts that `storageHealth` exposes non-null lock wait,
-transaction-duration, heartbeat/drain, and WAL fields.
+transaction-duration, heartbeat/drain, and WAL fields. The same gate now also
+proves the Class D write-pressure rollup producer writes a bounded snapshot and
+purges history to the 24-hour/latest-288 retention contract.
 
 **Ref**: BLOCK-REL-003 (implementation review summary), prepush PPR2-003, audit REQ-011.
 
@@ -30,6 +32,7 @@ SQLite database (not `:memory:`). Record p50 and p95 for latency metrics.
 | command_latency_p50 | ms | `storageHealth.writer.transactionDurationP50Ms` from DbWriter transaction accounting | 0 |
 | command_latency_p95 | ms | `storageHealth.writer.transactionDurationP95Ms` from DbWriter transaction accounting | 2 |
 | wal_size_bytes | bytes | file stat on the canary SQLite `-wal` file through `storageHealth.wal.sizeBytes` | 45352 |
+| telemetry_rollup_retention_limit | windows | `class_d_rollup_producer_persists_bounded_snapshot_and_purges_retention` | 288 |
 | direct_write_call_site_count | count | `./scripts/test-gate.sh proposal-075` inventory output | 0 production runtime direct transaction sites; 5 permanent infrastructure bypass entries; 0 temporary rollout bypass entries |
 
 ## Capture Protocol

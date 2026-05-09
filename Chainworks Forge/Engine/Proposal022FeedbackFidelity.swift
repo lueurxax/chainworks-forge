@@ -58,6 +58,18 @@ struct ProposalFeedbackCoverageRecord: Codable, Hashable, Sendable {
     let sectionsChanged: [String]
     let factualClaimsAddedOrCorrected: [String]
     let notes: String
+
+    enum CodingKeys: String, CodingKey {
+        case proposalRevisionID = "proposal_revision_id"
+        case sourceReviewPassID = "source_review_pass_id"
+        case backlogItemsAddressed = "backlog_items_addressed"
+        case backlogItemsUnresolved = "backlog_items_unresolved"
+        case backlogItemsDeferred = "backlog_items_deferred"
+        case backlogItemsDisputed = "backlog_items_disputed"
+        case sectionsChanged = "sections_changed"
+        case factualClaimsAddedOrCorrected = "factual_claims_added_or_corrected"
+        case notes
+    }
 }
 
 struct ProposalFactDigest: Codable, Hashable, Sendable {
@@ -373,20 +385,15 @@ enum ProposalLoopFeedbackParser {
         deferredCount: Int,
         disputedCount: Int
     ) {
-        guard let object = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) else {
+        guard let coverage = try? JSONDecoder().decode(ProposalFeedbackCoverageRecord.self, from: data) else {
             return (0, 0, 0, 0)
         }
 
-        let unresolvedItems = parseStringArray(object["backlog_items_unresolved"])
-        let deferredItems = parseStringArray(object["backlog_items_deferred"])
-        let disputedItems = parseStringArray(object["backlog_items_disputed"])
-        let resolvedItems = parseStringArray(object["backlog_items_addressed"])
-
         return (
-            addressedCount: resolvedItems.count,
-            unresolvedCount: unresolvedItems.count,
-            deferredCount: deferredItems.count,
-            disputedCount: disputedItems.count
+            addressedCount: coverage.backlogItemsAddressed.count,
+            unresolvedCount: coverage.backlogItemsUnresolved.count,
+            deferredCount: coverage.backlogItemsDeferred.count,
+            disputedCount: coverage.backlogItemsDisputed.count
         )
     }
 

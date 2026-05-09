@@ -79,7 +79,7 @@ enum ProviderAdapterSupport {
         case .claudeACP:
             familyModels = ["sonnet", "opus"]
         case .geminiACP:
-            familyModels = ["gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"]
+            familyModels = ["gemini-3.1-pro-preview", "gemini-2.5-flash"]
         case .auggie:
             familyModels = ["auggie-default"]
         case .junie:
