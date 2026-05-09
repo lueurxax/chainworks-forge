@@ -44,20 +44,48 @@ use crate::synthesizers::closeout_readiness::{
     SynthesizerInputs as CloseoutSynthesizerInputs,
 };
 use crate::work_queue::WorkQueue;
+use db::write_class::WriteLane;
+use db::writer::{class_a_operation, DbWriter};
+use std::sync::Arc;
 
 pub struct Orchestrator {
     pool: SqlitePool,
     events: EventSender,
     work_queue: WorkQueue,
+    db_writer: Arc<DbWriter>,
 }
 
 impl Orchestrator {
     pub fn new(pool: SqlitePool, events: EventSender, work_queue: WorkQueue) -> Self {
+        let db_writer = Arc::new(DbWriter::new(pool.clone()));
+        Self::new_with_db_writer(pool, events, work_queue, db_writer)
+    }
+
+    pub fn new_with_db_writer(
+        pool: SqlitePool,
+        events: EventSender,
+        work_queue: WorkQueue,
+        db_writer: Arc<DbWriter>,
+    ) -> Self {
         Self {
             pool,
             events,
             work_queue,
+            db_writer,
         }
+    }
+
+    async fn begin_orchestrator_transaction(
+        &self,
+        operation_name: &'static str,
+        idempotency_key: impl Into<String>,
+    ) -> Result<db::writer::QueuedTransaction> {
+        self.db_writer
+            .begin_immediate_transaction(
+                class_a_operation(operation_name, WriteLane::CriticalBarrier, idempotency_key),
+                operation_name,
+            )
+            .await
     }
 
     async fn enqueue_steward_analysis(&self, completed_run_id: Option<RunId>) -> Result<()> {
@@ -1954,6 +1982,27 @@ impl Orchestrator {
                 return Ok(None);
             };
             let source_path = Self::absolute_artifact_path(&source.file_path, &run.workspace_root);
+            let source_data = std::fs::read(&source_path).with_context(|| {
+                format!(
+                    "read proposal_current before approved_proposal snapshot {}",
+                    source_path.display()
+                )
+            })?;
+            let rollout_contract_failures =
+                crate::rollout_contract_preflight::approved_proposal_rollout_contract_lint_failures(
+                    &source_data,
+                    &source_path,
+                    &run.workspace_root,
+                )?;
+            if !rollout_contract_failures.is_empty() {
+                warn!(
+                    run_id = %run.id,
+                    stage_id = %stage.stage_id,
+                    failure_reasons = ?rollout_contract_failures,
+                    "approved_proposal snapshot blocked by rollout_contract_v1 invariant"
+                );
+                return Ok(None);
+            }
             if let Some(parent) = target_path.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!(
@@ -1962,10 +2011,9 @@ impl Orchestrator {
                     )
                 })?;
             }
-            std::fs::copy(&source_path, &target_path).with_context(|| {
+            std::fs::write(&target_path, &source_data).with_context(|| {
                 format!(
-                    "snapshot proposal_current {} to approved_proposal {}",
-                    source_path.display(),
+                    "write approved_proposal handoff artifact {}",
                     target_path.display()
                 )
             })?;
@@ -1977,6 +2025,21 @@ impl Orchestrator {
                 target_path.display()
             )
         })?;
+        let rollout_contract_failures =
+            crate::rollout_contract_preflight::approved_proposal_rollout_contract_lint_failures(
+                &data,
+                &target_path,
+                &run.workspace_root,
+            )?;
+        if !rollout_contract_failures.is_empty() {
+            warn!(
+                run_id = %run.id,
+                stage_id = %stage.stage_id,
+                failure_reasons = ?rollout_contract_failures,
+                "approved_proposal artifact registration blocked by rollout_contract_v1 invariant"
+            );
+            return Ok(None);
+        }
         let digest = Sha256::digest(&data);
         let artifact = Artifact {
             id: ArtifactId::new(),
@@ -1986,7 +2049,8 @@ impl Orchestrator {
             name: "approved_proposal".to_string(),
             contract_id: "approved_proposal".to_string(),
             format: ArtifactFormat::Markdown,
-            file_path: target_path.to_string_lossy().into_owned(),
+            file_path: Self::workspace_relative_artifact_path(&target_path, &run.workspace_root)
+                .unwrap_or_else(|| target_path.to_string_lossy().into_owned()),
             checksum_sha256: Some(format!("{digest:x}")),
             size_bytes: Some(data.len() as i64),
             provider: "engine".to_string(),
@@ -2008,6 +2072,18 @@ impl Orchestrator {
         } else {
             std::path::Path::new(workspace_root).join(path)
         }
+    }
+
+    fn workspace_relative_artifact_path(
+        path: &std::path::Path,
+        workspace_root: &str,
+    ) -> Option<String> {
+        if !path.is_absolute() {
+            return Some(path.to_string_lossy().into_owned());
+        }
+        let workspace_root = std::path::Path::new(workspace_root);
+        let relative = path.strip_prefix(workspace_root).ok()?;
+        Some(relative.to_string_lossy().into_owned())
     }
 
     async fn persist_implementation_handoff_unavailable_conflict(
@@ -2621,18 +2697,19 @@ impl Orchestrator {
             );
 
             let tx_started = std::time::Instant::now();
-            let mut tx = db::pool::begin_immediate_with_retry(
-                &self.pool,
-                "orchestrator.AutoContractOutputRetry",
-            )
-            .await?;
+            let mut tx = self
+                .begin_orchestrator_transaction(
+                    "orchestrator.AutoContractOutputRetry",
+                    format!("orchestrator.AutoContractOutputRetry:{}", stage.id),
+                )
+                .await?;
             stages::settle_tx(&mut tx, stage.id, StageSettlementKind::Skipped, now).await?;
             stages::insert_tx(&mut tx, &new_stage).await?;
             sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
                 .bind(RunStatus::Running.to_string())
                 .bind(stage.stage_id.as_str())
                 .bind(run_id.to_string())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
             work_items::enqueue_tx(
                 &mut tx,
@@ -4317,8 +4394,12 @@ impl Orchestrator {
         };
 
         // Begin IMMEDIATE transaction for the idempotency check + insert + pointer update.
-        let mut tx =
-            db::pool::begin_immediate_with_retry(&self.pool, "mediation.try_initiate").await?;
+        let mut tx = self
+            .begin_orchestrator_transaction(
+                "mediation.try_initiate",
+                format!("mediation.try_initiate:{run_id}:{}", conflict.conflict_id),
+            )
+            .await?;
 
         // Check for existing active mediation for this conflict fingerprint (idempotent).
         if let Some(existing) = lead_conflict_mediations::find_active_for_conflict_tx(
@@ -4406,8 +4487,12 @@ impl Orchestrator {
             );
             // Best-effort recovery: mark the orphaned mediation as terminal.
             let recovery_now = chrono::Utc::now();
-            if let Ok(mut recovery_tx) =
-                db::pool::begin_immediate_with_retry(&self.pool, "mediation.orphan_recovery").await
+            if let Ok(mut recovery_tx) = self
+                .begin_orchestrator_transaction(
+                    "mediation.orphan_recovery",
+                    format!("mediation.orphan_recovery:{mediation_id}"),
+                )
+                .await
             {
                 let _ = db::repos::lead_conflict_mediations::update_status_tx(
                     &mut recovery_tx,
@@ -4551,9 +4636,12 @@ impl Orchestrator {
 
         // Update mediation status to queued.
         let now = chrono::Utc::now();
-        let mut tx =
-            db::pool::begin_immediate_with_retry(&self.pool, "mediation.update_status_queued")
-                .await?;
+        let mut tx = self
+            .begin_orchestrator_transaction(
+                "mediation.update_status_queued",
+                format!("mediation.update_status_queued:{mediation_id}"),
+            )
+            .await?;
         db::repos::lead_conflict_mediations::update_status_tx(
             &mut tx,
             mediation_id,
@@ -6514,6 +6602,12 @@ fn build_task_prompt(
              object using the canonical path keys below; the engine will \
              materialize canonical files after contract validation.",
         ));
+        parts.push(String::from(
+            "Tool stdout is not an output channel. Only the final assistant \
+             message is settled for `CHAINWORKS_OUTPUT`. Do not call shell \
+             `echo`, `printf`, or file-writing commands to return \
+             `CHAINWORKS_OUTPUT`.",
+        ));
         for output_name in &task.outputs {
             let normalized = resolved_artifact_path_for_task(output_name, plan, run, task);
             parts.push(format!("- `{output_name}` → `{normalized}`"));
@@ -6558,6 +6652,10 @@ fn build_task_prompt(
              top-level JSON object and nothing else.\n\
              - When returning outputs through `CHAINWORKS_OUTPUT`, the value \
                for each canonical path is treated as that output file content.\n\
+             - Tool stdout is not an output channel; only the final assistant \
+               message is settled.\n\
+             - Do not call shell `echo`, `printf`, or file-writing commands \
+               to return `CHAINWORKS_OUTPUT`.\n\
              - Do NOT wrap the JSON in code fences (```​ or ```json).\n\
              - Do NOT emit markdown, prose, or companion files unless they \
                are explicitly listed as required outputs.\n\
@@ -6835,6 +6933,11 @@ fn append_task_specific_guidance(
              the frozen implementation source of truth.",
         ));
         parts.push(String::from(
+            "Do not fabricate or emit `approved_proposal` for an applicable proposal \
+             unless `proposal_current` already contains a valid strict `rollout_contract_v1`. \
+             If it is missing or invalid, surface that proposal refinement is required.",
+        ));
+        parts.push(String::from(
             "Use `proposal_review_summary` as the implementation gate verdict \
              and planning context.",
         ));
@@ -7057,6 +7160,171 @@ mod tests {
         CompiledLoop, CompiledState, CompiledTask, CompiledTransition, DegradedOutputPolicy,
         OutputSchema, ResolvedAgent, RunPlan,
     };
+
+    #[test]
+    fn approved_proposal_snapshot_path_is_workspace_relative() {
+        let stored = Orchestrator::workspace_relative_artifact_path(
+            std::path::Path::new(
+                "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md",
+            ),
+            "/workspace",
+        );
+
+        assert_eq!(
+            stored.as_deref(),
+            Some(".chainworks/runs/run-1/proposals/approved/proposal.md")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approved_proposal_snapshot_requires_valid_rollout_contract() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(format!(".chainworks/runs/{run_id}"));
+
+        let source_rel = format!(".chainworks/runs/{run_id}/proposals/current/proposal.json");
+        let source_path = tmp.path().join(&source_rel);
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source_path,
+            br#"{"proposal_id":"P999","title":"Missing rollout contract"}"#,
+        )
+        .unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "state_5_implementation_ready".into(),
+            label: "Implementation ready".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "approved_proposal".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.json".into(),
+        );
+        let source_artifact = Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_4_proposal_reviewed".into(),
+            agent_id: "proposal_writer".into(),
+            name: "proposal_current".into(),
+            contract_id: "proposal_current".into(),
+            format: ArtifactFormat::Json,
+            file_path: source_rel,
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "test".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: None,
+        };
+
+        let snapshot = orchestrator
+            .snapshot_approved_proposal_handoff_artifact(&run, &plan, &stage, &[source_artifact])
+            .await
+            .unwrap();
+
+        assert!(
+            snapshot.is_none(),
+            "approved_proposal must not be created without a valid rollout_contract_v1"
+        );
+        assert!(
+            !tmp.path()
+                .join(format!(
+                    ".chainworks/runs/{run_id}/proposals/approved/proposal.json"
+                ))
+                .exists(),
+            "invalid proposal_current must not be copied into approved_proposal"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approved_proposal_registration_requires_valid_rollout_contract() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(format!(".chainworks/runs/{run_id}"));
+
+        let target_path = tmp.path().join(format!(
+            ".chainworks/runs/{run_id}/proposals/approved/proposal.json"
+        ));
+        std::fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &target_path,
+            br#"{"proposal_id":"P999","title":"Existing invalid approved proposal"}"#,
+        )
+        .unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "state_5_implementation_ready".into(),
+            label: "Implementation ready".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "approved_proposal".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.json".into(),
+        );
+
+        let snapshot = orchestrator
+            .snapshot_approved_proposal_handoff_artifact(&run, &plan, &stage, &[])
+            .await
+            .unwrap();
+
+        assert!(
+            snapshot.is_none(),
+            "existing approved_proposal file must not be registered without a valid rollout_contract_v1"
+        );
+    }
 
     fn test_run(run_id: RunId) -> Run {
         Run {
@@ -7846,6 +8114,9 @@ mod tests {
             prompt.contains("Return each required output through the final `CHAINWORKS_OUTPUT`")
         );
         assert!(prompt.contains("the engine will materialize canonical files"));
+        assert!(prompt.contains("Tool stdout is not an output channel"));
+        assert!(prompt.contains("Only the final assistant message is settled"));
+        assert!(prompt.contains("Do not call shell `echo`"));
         assert!(prompt.contains("Do not write run artifact outputs directly"));
         assert!(prompt.contains("implementation_complete"));
         assert!(prompt.contains("remaining_code_tasks"));

@@ -1009,24 +1009,23 @@ Command:
 ./scripts/test-gate.sh proposal-049
 ```
 
-### `proposal-077|p077`
+### `proposal-077|p077` - retained historical alias
 
-Bounded implementation closeout readiness gate.
+Bounded implementation closeout readiness gate. The alias name is retained for
+historical compatibility with existing scripts, tests, and receipts.
 
 Scope (what this gate actually covers):
 
-- static presence and required-field checks for
-  `docs/reference/p077-rollout-dependency-evidence.md`
-- static presence and required-field checks for
-  `docs/reference/p077-closeout-readiness-ui-evidence.md`
+- static presence and required-field checks for retained historical alias evidence file `docs/reference/p077-rollout-dependency-evidence.md`
+- static presence and required-field checks for retained historical alias evidence file `docs/reference/p077-closeout-readiness-ui-evidence.md`
 - `implementation_closeout_readiness_v1` decision-matrix validation (Rust domain/db/engine)
 - proposal gate domain contracts and status normalization
 - audit verdict policy enforcement (synthesizer unit tests)
 - bounded code/refine loop and soft convergence checkpoints (memory-level)
 - closeout fingerprinting and latency budget validation
 - DB closeout transaction atomicity (db integration tests)
-- durable P077 rollout metric, go/no-go decision, and rollback-to-advisory
-  execution fixtures
+- durable rollout metric, go/no-go decision, and rollback-to-advisory execution
+  fixtures
 - accessor routing proof (in-memory, not against live orchestrator graph)
 - GraphQL readback parity through the canonical closeout-readiness accessor
 - MCP `runs.get`/`runs.list` readback parity through the same accessor and
@@ -1042,38 +1041,35 @@ Use when:
 - changing implementation closeout readiness logic, status normalization, or decision rules
 - changing proposal gate domain contracts or DB closeout transaction
 - validating bounded loop convergence or soft checkpoint behavior at the synthesizer level
-- reproving the Proposal 077 Phase-1 Rust domain/db/engine slice
+- reproving the closeout readiness Rust domain/db/engine slice
 
 Host policy:
 
 - local Rust target only; no Swift or UI build required
 
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-077
-```
+Command: retained historical alias `./scripts/test-gate.sh proposal-077`.
 
 Important:
 
 - this gate covers the Rust domain/db/engine slice and GraphQL/MCP readback
-  parity of Proposal 077; full R14 acceptance still requires additional
-  integrated transition and macOS fixture evidence
-- it fails fast when the P077 rollout/dependency evidence document is missing
-  required dependency checklist, metric ledger, durable rollout store, or
-  rollback fields
-- it fails fast when the P077 UI evidence document is missing token, contrast,
-  diagnostics, recovery, route, or accessibility mappings
+  parity of closeout readiness; remote macOS runtime proof is the companion UI
+  gate
+- it fails fast when the retained historical alias rollout/dependency evidence
+  document is missing required dependency checklist, metric ledger, durable
+  rollout store, or rollback fields
+- it fails fast when the retained historical alias UI evidence document is
+  missing token, contrast, diagnostics, recovery, route, or accessibility
+  mappings
 - it validates that a run cannot enter manual release without a resolved proposal gate or with pending code blockers
 - it verifies the transition evaluation reads the active `implementation_closeout_readiness_v1` contract truth
 
-### `proposal-077-ui|p077-ui`
+### `proposal-077-ui|p077-ui` - retained historical alias
 
-Remote macOS runtime proof for the P077 closeout readiness surface.
+Remote macOS runtime proof for the closeout readiness surface.
 
 Scope:
 
-- direct P077 closeout-readiness fixture launch
+- direct closeout-readiness fixture launch
 - compact signal activation into the full closeout card
 - primary unblock and secondary blocker focus/read order
 - diagnostics sheet open plus explicit return/backlink route
@@ -1085,11 +1081,7 @@ Host policy:
 - remote macOS UI host required
 - runs through the same signed XCUITest path as other repository UI gates
 
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-077-ui
-```
+Command: retained historical alias `./scripts/test-gate.sh proposal-077-ui`.
 
 ### `p051-scaffold`
 
@@ -1858,7 +1850,47 @@ Important:
 - this is a Phase 0 contract/readback gate, not proof that Git mutation or capsule prompt injection is enabled
 - later P064 phases must extend this gate before shipping repositories, sync execution, dirty preservation, conflict routing, or prompt injection
 
-### `proposal-084|p084`
+### `proposal-075|p075`
+
+Proposal 075 local persistence write budget, evidence spooling, storage diagnostics, and fail-closed registry gate.
+
+Scope:
+
+- `write_class` types: `WriteClass`, `WriteOperation`, `WriteResult`, `SpoolWriteOutcome`
+- `writer`: `DbWriter` constants, lane order, bounded MPSC executor — biased priority drain (`CriticalBarrier`/`OperatorCommand` polled before lower lanes), enqueue-to-commit deadline accounting (`WriteTimeout`), busy-error classification (`WriteBusyExhausted`), 1 Hz heartbeat with `is_alive()`, lane starvation watchdog incrementing `lane_starvation_total`, graceful shutdown that rejects new B/C/D writes and drains Class A within `SHUTDOWN_CLASS_A_DRAIN_BUDGET_MS`, populated `SHUTDOWN_ADMITTED_OPERATIONS` allowlist (terminal canonical operations admitted; unlisted Class A writes denied), Class B coalescing buffer (`COALESCE_FLUSH_INTERVAL_MS=500` with unconditional drain-all per tick, `COALESCE_FLUSH_MAX_MERGES=64`, last-writer-wins, `COALESCE_MAX_KEYS=1024` saturation reject with `coalescing_map_saturated`, force-drained on shutdown), per-lane oldest-enqueued tracking populating `WriteRejected.oldest_queued_ms`, and storage health readback units/freshness/kill-switches.
+- `evidence_spool` (Phase 3): `write_spool_file` ordering proof (temp write → SHA-256 → `fsync(file)` → atomic no-replace commit → `fsync(parent_dir)`), `verify_spool_file` reader integrity, `sweep_evidence_orphans` walk that backfills `recovered_orphan` metadata for crash-orphaned files and is idempotent on a second pass, sweep budget enforcement (`max_files`/`max_bytes` truncate the pass and set `OrphanSweepReport.truncated`, with over-budget candidates skipped before read), `run_id` filter that skips files outside the requested run, `dry_run` mode that scans and stream-hashes checksums but does not insert metadata rows, high-volume "one metadata row per logical object" proof against `evidence_spool_refs`, and security regressions: canonical-layout enforcement (`evidence/runs/...` required — P075-SEC-002 layout), write-time `run_id` path-ownership binding (P075-SEC-001 / H-002), no-clobber commit (identical bytes = idempotent retry; differing bytes = hard error — P075-SEC-002 no-clobber), symlink-escape rejection via canonicalized root plus per-segment symlink-safe parent walk that refuses to mkdir through any symlinked component, with `verify_spool_file` and orphan sweep using no-follow `symlink_metadata` on candidates (P075-SEC-H001), Unix file mode `0o600` and directory mode `0o700` (P075-SEC-H002)
+- `bypass_allowlist`: parser, expiry, canonical file validation
+- `operation_registry`: parser, validation, canonical file validation
+- `evidence_spool_refs`: migration and repository round-trips, CHECK constraints, `validate_relative_path` symmetry on read/write, `validate_path_ownership` run-id binding (P075-SEC-001), `canonicalize_summary_json` allowlist, identity-string control-character rejection
+- `storage_write_pressure_snapshots` migration, validation, repository readback, and storage health freshness classification
+- MCP/GraphQL storage diagnostics: typed `storageHealth`, `storage.health`, `storage.write_pressure`, `storage.evidence_spool_summary`, and `storage.reconcile_evidence_orphans`, including operator-only capability enforcement, fail-closed stale/degraded readback when no live writer heartbeat is supplied, and live `DbWriter` heartbeat readback when the daemon-owned writer is injected (`storage_health_with_writer` populates `writer.alive`/`totalQueued`/`lanes`/`lastHeartbeatAt`/`lastDrainAt`/lock wait p50/p95/transaction p50/p95/`isStale=false` from the live snapshot — covered by `proposal_075_storage_health_reads_live_dbwriter_heartbeat` in `graphql-server`, `storage_health_reads_live_dbwriter_heartbeat_when_injected` in `mcp-server`, and the file-backed WAL/lock canary `storage_health_file_backed_canary_reports_lock_wal_and_writer_metrics` in `db`)
+- typed MCP storage error contract (`error: true`, `errorCode`, `message`, `tool` envelope) covering `invalid_input` (`reconcile_evidence_orphans_returns_invalid_input` for non-dry-run without `runId`), `stale` (`storage_health_returns_typed_stale_error`), `unavailable`, `maintenance_disabled`, and `unauthorized` through the real `tools/call` dispatch path (`proposal_075_storage_tool_dispatch`)
+- P075 evidence docs must have no `pending_live_canary` marker in `docs/evidence/p075/phase1-baseline.md` and must include the high-volume producer inventory at `docs/evidence/p075/producer-inventory.md`
+- fail-closed registry enforcement: `write-bypass-allowlist.toml` and `write-operation-registry.toml` must exist, be valid, include retirement metadata, reject all `temporary_rollout` bypass rows, reject production runtime transaction paths that bypass DbWriter-owned entrypoints, and cover observed non-test DbWriter operation names under `control-plane/crates/db/src`, `control-plane/crates/engine/src`, and `control-plane/crates/mcp-server/src`
+
+Use when:
+
+- changing write classes, priority lanes, or `DbWriter` constants
+- updating the DB write-bypass allowlist or write-operation registry
+- changing evidence spool references or storage write-pressure snapshots
+
+Host policy:
+
+- local Rust toolchain required; no UI target or simulator needed
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-075
+```
+
+Important:
+
+- `p075` is accepted as an alias
+- this is a fail-closed persistence contract gate, not an inventory-only check
+- startup orphan reconciliation is available through the storage MCP diagnostic tool; daemon startup scheduling and future telemetry producer expansion must keep this gate green when extended
+
+### `proposal-084|p084` retained historical alias
 
 Executable rollout gates and observability contract gate.
 
@@ -1873,14 +1905,14 @@ Scope:
   - `docs/evidence/rollout-contract/negative/unsafe-path-and-command.json` — fails `unsafe_command` and `unsafe_path`
 - Documentation-only negative fixtures exist as valid JSON where they describe runtime behavior rather than linter input (AC-006 self-contract check)
 - Rust rollout-contract regressions run under the canonical gate: `cargo test -p engine rollout_contract_preflight --lib`, `cargo test -p db rollout_contract_checks --lib`, clean DB migration install, and schema-version parity. The Python phase also verifies the orchestrator keeps the rollout preflight hold path before code_writer enqueue and blocks the stage/run on `RolloutContractPreflightAction::Hold` (AC-005)
-- `docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json` contains all 18 required `operator_readback_v1` decision fields and a `parity_lanes` object whose `mcp` and `release_receipt` payloads carry the same fields and whose `graphql` payload carries the matching camelCase projection fields (AC-004, AC-006)
+- The retained historical alias fixture `docs/evidence/rollout-contract/operator-readback/p084-full-surface.fixture.json` contains all 18 required `operator_readback_v1` decision fields and a `parity_lanes` object whose `mcp` and `release_receipt` payloads carry the same fields and whose `graphql` payload carries the matching camelCase projection fields (AC-004, AC-006)
 - `Chainworks ForgeTests/Proposal084Tests` runs as the Swift parity slice, proving `RolloutDecisionSummary` decodes `operator_readback_v1`, `PreflightReport` carries the read-only summary, and the GraphQL run-row read model decodes the camelCase rollout readback without recomputing authority (AC-004, AC-006)
 - This gate documentation section exists in `docs/reference/test-gates.md` and references `rollout_contract_v1`, `negative fixture`, and `lint-rollout-contract` (AC-002)
 
 Use when:
 
 - Changing the rollout gate template, linter logic, or fixture inventory
-- Proving P084 contract compliance on the current tree
+- Proving rollout-contract compliance on the current tree
 - Verifying that unsafe inputs, missing metrics, and missing hold/rollback are rejected with bounded reasons
 
 Host policy:
@@ -1891,14 +1923,14 @@ Host policy:
 Command:
 
 ```bash
-./scripts/test-gate.sh proposal-084
-./scripts/test-gate.sh p084
+./scripts/test-gate.sh proposal-084 # retained historical alias
+./scripts/test-gate.sh p084 # retained historical alias
 ```
 
 Important:
 
-- `p084` is accepted as an alias
+- `p084` is accepted as a retained historical alias
 - the gate runs `scripts/lint-rollout-contract` via subprocess; linter exit-0 on a negative fixture is a gate failure
 - documentation-only self-contract fixtures are validated for JSON well-formedness only; linter-testable scheduler and cutover fixtures are linter inputs
 - the gate validates parity-lane fixture shape (run_report, mcp, release_receipt, graphql), Rust rollout-contract preflight/storage regressions, clean migration install, and the Swift read-only presentation slice
-- the gate fails closed if the template is missing a required term, any negative fixture is absent or malformed, the p084-full-surface fixture omits a required readback field or parity-lane payload, or the `Proposal084Tests` Swift slice fails
+- the gate fails closed if the template is missing a required term, any negative fixture is absent or malformed, the retained historical alias `p084-full-surface` fixture omits a required readback field or parity-lane payload, or the `Proposal084Tests` Swift slice fails

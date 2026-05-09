@@ -32,7 +32,16 @@ pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, receipt: &RoutingReceip
 }
 
 pub async fn insert(pool: &SqlitePool, receipt: &RoutingReceipt) -> Result<()> {
-    let mut tx = crate::pool::begin_immediate_with_retry(pool, "routing_receipts.insert").await?;
+    let mut tx = crate::writer::begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "routing_receipts.insert",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "routing_receipts.insert",
+        ),
+        "routing_receipts.insert",
+    )
+    .await?;
     insert_tx(&mut tx, receipt).await?;
     tx.commit().await.context("commit insert routing_receipt")?;
     Ok(())

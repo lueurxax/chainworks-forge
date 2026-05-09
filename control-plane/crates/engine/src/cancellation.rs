@@ -11,6 +11,8 @@ use db::repos::{
     agent_executions, lead_conflict_mediations, projections, runs, scheduler, sessions, stages,
     work_items,
 };
+use db::write_class::WriteLane;
+use db::writer::class_a_operation;
 use domain::agent::AgentStatus;
 use domain::events::DomainEvent;
 use domain::ids::RunId;
@@ -55,8 +57,19 @@ pub async fn begin_settlement_with_capacity(
     capacity: &InvokeAgentCapacityConfig,
 ) -> Result<String> {
     let tx_started = std::time::Instant::now();
-    let mut tx =
-        db::pool::begin_immediate_with_retry(pool, "cancellation.begin_settlement").await?;
+    let db_writer = db::writer::shared_writer_for(pool)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("P075 shared DbWriter is not registered"))?;
+    let mut tx = db_writer
+        .begin_immediate_transaction(
+            class_a_operation(
+                "cancellation.begin_settlement",
+                WriteLane::CriticalBarrier,
+                format!("cancellation.begin_settlement:{run_id}"),
+            ),
+            "cancellation.begin_settlement",
+        )
+        .await?;
     let result = begin_settlement_tx(
         &mut tx,
         run_id,

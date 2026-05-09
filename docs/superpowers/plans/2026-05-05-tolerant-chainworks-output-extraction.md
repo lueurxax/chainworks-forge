@@ -132,7 +132,7 @@ Run: `cd control-plane && cargo test -p engine output_contract_repair_prompt_nam
 
 Expected: prompt tests pass with canonical JSON expectations.
 
-### Task 4: Add P084-Like Integration Coverage
+### Task 4: Add P084-Like Integration Coverage For A Retained Historical Alias
 
 **Files:**
 - Modify: `control-plane/crates/acp/tests/integration.rs`
@@ -143,7 +143,7 @@ Add an ACP fixture that returns final `result.output` containing `implementation
 
 - [ ] **Step 2: Verify fixture**
 
-Run: `cd control-plane && cargo test -p acp p084_like_final_output_materializes_required_outputs`
+Run the retained historical alias fixture: `cd control-plane && cargo test -p acp p084_like_final_output_materializes_required_outputs`
 
 Expected: the fixture passes and discovers all three required outputs.
 
@@ -160,7 +160,7 @@ Expected: all ACP library tests pass.
 
 - [ ] **Step 2: Run ACP integration focused test**
 
-Run: `cd control-plane && cargo test -p acp p084_like_final_output_materializes_required_outputs`
+Run the retained historical alias fixture: `cd control-plane && cargo test -p acp p084_like_final_output_materializes_required_outputs`
 
 Expected: focused integration test passes.
 

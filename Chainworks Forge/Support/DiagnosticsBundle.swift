@@ -39,6 +39,12 @@ nonisolated struct DiagnosticsExportResult: Equatable, Sendable {
     /// tokens). `false` when no principals file was found at the configured
     /// auth path.
     let hasPrincipalsRedacted: Bool
+    /// `storage_health.json` — P075 storageHealth snapshot when the caller
+    /// already has one locally. Export stays file-system only and never calls
+    /// GraphQL/MCP from this builder.
+    let hasStorageHealth: Bool
+    /// `evidence_spool_summary.json` — P075 compact evidence-spool summary.
+    let hasEvidenceSpoolSummary: Bool
     /// `system_info.txt` — OS version, hardware model, app version, and
     /// locale (§9.4). Always produced unless the platform APIs fail.
     let hasSystemInfo: Bool
@@ -81,6 +87,11 @@ nonisolated struct DiagnosticsBundleInputs {
     /// bearer token replaced by `<BEARER_REDACTED>`). Defaults to
     /// `$HOME/.chainworks/auth/principals.json`.
     var principalsPath: URL
+    /// Optional P075 storageHealth JSON snapshot. Supplying this is the
+    /// caller's responsibility; the bundle builder never performs daemon I/O.
+    var storageHealthSnapshotData: Data?
+    /// Optional P075 evidence-spool summary JSON snapshot.
+    var evidenceSpoolSummaryData: Data?
     /// Closure that produces a `system_info.txt` payload. Injectable so
     /// tests can pin deterministic contents without touching the real
     /// host's APIs.
@@ -103,6 +114,8 @@ extension DiagnosticsBundleInputs {
             appSupportDirectory: DaemonPortFile.appSupportDirectory(),
             logsDirectory: logs,
             principalsPath: principals,
+            storageHealthSnapshotData: nil,
+            evidenceSpoolSummaryData: nil,
             systemInfoProducer: DiagnosticsBundleBuilder.defaultSystemInfo
         )
     }
@@ -139,6 +152,8 @@ nonisolated struct DiagnosticsBundleBuilder {
             hasPortFile: false,
             hasCrashBudget: false,
             hasPrincipalsRedacted: false,
+            hasStorageHealth: false,
+            hasEvidenceSpoolSummary: false,
             hasSystemInfo: false,
             buildShaReported: "unknown"
         )
@@ -234,7 +249,18 @@ nonisolated struct DiagnosticsBundleBuilder {
             result = result.with(hasSystemInfo: true)
         }
 
-        // 6. Manifest stamping the export time. `build_sha` carries the
+        // 6. P075 storage diagnostics snapshots. These are caller-supplied
+        //    bytes so this exporter remains usable while the daemon is down.
+        if let data = inputs.storageHealthSnapshotData, !data.isEmpty {
+            try data.write(to: staging.appendingPathComponent("storage_health.json"))
+            result = result.with(hasStorageHealth: true)
+        }
+        if let data = inputs.evidenceSpoolSummaryData, !data.isEmpty {
+            try data.write(to: staging.appendingPathComponent("evidence_spool_summary.json"))
+            result = result.with(hasEvidenceSpoolSummary: true)
+        }
+
+        // 7. Manifest stamping the export time. `build_sha` carries the
         //    scalar so a support engineer can grep the zip's manifest
         //    for the SHA without unpacking `build-sha.txt`.
         let manifest: [String: Any] = [
@@ -248,6 +274,8 @@ nonisolated struct DiagnosticsBundleBuilder {
                 "port_file":           result.hasPortFile,
                 "crash_budget":        result.hasCrashBudget,
                 "principals_redacted": result.hasPrincipalsRedacted,
+                "storage_health":      result.hasStorageHealth,
+                "evidence_spool_summary": result.hasEvidenceSpoolSummary,
                 "system_info":         result.hasSystemInfo,
             ],
         ]
@@ -411,6 +439,8 @@ private extension DiagnosticsExportResult {
             || hasPortFile
             || hasCrashBudget
             || hasPrincipalsRedacted
+            || hasStorageHealth
+            || hasEvidenceSpoolSummary
             || hasSystemInfo
     }
 
@@ -423,6 +453,8 @@ private extension DiagnosticsExportResult {
         hasPortFile: Bool? = nil,
         hasCrashBudget: Bool? = nil,
         hasPrincipalsRedacted: Bool? = nil,
+        hasStorageHealth: Bool? = nil,
+        hasEvidenceSpoolSummary: Bool? = nil,
         hasSystemInfo: Bool? = nil,
         buildShaReported: String? = nil
     ) -> DiagnosticsExportResult {
@@ -435,6 +467,8 @@ private extension DiagnosticsExportResult {
             hasPortFile: hasPortFile ?? self.hasPortFile,
             hasCrashBudget: hasCrashBudget ?? self.hasCrashBudget,
             hasPrincipalsRedacted: hasPrincipalsRedacted ?? self.hasPrincipalsRedacted,
+            hasStorageHealth: hasStorageHealth ?? self.hasStorageHealth,
+            hasEvidenceSpoolSummary: hasEvidenceSpoolSummary ?? self.hasEvidenceSpoolSummary,
             hasSystemInfo: hasSystemInfo ?? self.hasSystemInfo,
             buildShaReported: buildShaReported ?? self.buildShaReported
         )

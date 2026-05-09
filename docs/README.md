@@ -35,7 +35,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/artifact-discovery-and-settlement-optimization.md](reference/artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model
 - [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Terminal outcomes, atomic transition settlement, cursor-driven resume, recovery precedence, host interruption, workflow conflict recovery, and startup recovery progress
-- [reference/rust-control-plane.md](reference/rust-control-plane.md) — Rust + SQLite daemon: architecture, crate layout, persistence, boundaries, capacity-aware scheduling, write serialization, provider toolchain homes, and generated-state housekeeping
+- [reference/rust-control-plane.md](reference/rust-control-plane.md) — Rust + SQLite daemon: architecture, crate layout, persistence, boundaries, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, and generated-state housekeeping
 
 ### Agents, skills, and MCP
 
@@ -54,7 +54,8 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### Outputs, contracts, and feedback
 
 - [reference/structured-output-envelope-and-contract-validation.md](reference/structured-output-envelope-and-contract-validation.md) — Named envelopes, contract binding, validation, failure substrate
-- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, implementation self-assessment and handoff, bounded closeout readiness (Proposal 077), failed-stage evidence, narrow recovery
+- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, implementation self-assessment and handoff, failed-stage evidence, narrow recovery
+- [reference/implementation-closeout-readiness.md](reference/implementation-closeout-readiness.md) — Active closeout readiness authority, state-9 release routing, readback, rollout evidence, and retained gate aliases
 - [reference/proposal-loop-feedback-fidelity-and-rereview.md](reference/proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus fidelity, backlog carry-forward, targeted rereview
 - [reference/context-strategy-and-experiment-framework.md](reference/context-strategy-and-experiment-framework.md) — Strategy-profile freezing, handoff compilation, normalized telemetry
 
@@ -62,7 +63,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 - [reference/run-control.md](reference/run-control.md) — Stop/cancel, two-phase cancellation settlement, terminal-history rules
 - [reference/release-gate.md](reference/release-gate.md) — Manual release gate: post-approval execution, native git/publish, delivery receipts
-- [reference/executable-rollout-gate-template.md](reference/executable-rollout-gate-template.md) — `rollout_contract_v1` / `rollout_contract_check_v1` / `operator_readback_v1` schemas, run-start preflight contract, and P084 self-contract
+- [reference/executable-rollout-gate-template.md](reference/executable-rollout-gate-template.md) — `rollout_contract_v1` / `rollout_contract_check_v1` / `operator_readback_v1` schemas, run-start preflight contract, and retained historical alias self-contract
 - [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — Repo-backed delivery slice: worktrees, implementation loop, manual release, assessment and handoff
 - [proposals/064-run-worktree-main-sync-and-cross-run-knowledge-transfer.md](proposals/064-run-worktree-main-sync-and-cross-run-knowledge-transfer.md) — Run worktree main sync and cross-run knowledge transfer (Phase 0 contract freeze)
 - [reference/project-workspace-contract.md](reference/project-workspace-contract.md) — Idea-owned workspace and frozen run project contract

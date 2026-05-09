@@ -183,6 +183,40 @@ final class DaemonLifecycleClientTests: XCTestCase {
         }
     }
 
+    func test_decodeStorageDiagnosticsSnapshots_extracts_p075_storage_payloads() throws {
+        let envelope: [String: Any] = [
+            "data": [
+                "storageHealth": [
+                    "updatedAt": "2026-05-08T19:00:00Z",
+                    "staleAfterMs": 5000,
+                    "isStale": false,
+                    "dbState": "HEALTHY",
+                    "evidenceSpool": [
+                        "enabled": true,
+                        "filesWrittenTotal": 2,
+                        "bytesWrittenTotal": 128,
+                        "metadataRowsTotal": 2,
+                        "orphanFiles": 0,
+                        "orphanBytes": 0,
+                        "recoveredFiles": 0,
+                        "checksumMismatchFiles": 0,
+                        "pendingDeleteFiles": 0
+                    ]
+                ]
+            ]
+        ]
+        let data = try JSONSerialization.data(withJSONObject: envelope)
+        let snapshots = try DaemonLifecycleClient.decodeStorageDiagnosticsSnapshots(data)
+        let storage = try JSONSerialization.jsonObject(with: snapshots.storageHealthData)
+            as? [String: Any]
+        let evidence = try XCTUnwrap(snapshots.evidenceSpoolSummaryData)
+        let summary = try JSONSerialization.jsonObject(with: evidence) as? [String: Any]
+
+        XCTAssertEqual(storage?["dbState"] as? String, "HEALTHY")
+        XCTAssertEqual(summary?["filesWrittenTotal"] as? Int, 2)
+        XCTAssertEqual(summary?["bytesWrittenTotal"] as? Int, 128)
+    }
+
     // MARK: - Port file
 
     func test_DaemonPortFile_reads_fallback_when_file_absent() throws {

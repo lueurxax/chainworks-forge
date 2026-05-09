@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use db::repos::{agent_executions, projections, rollout_contract_checks, runs, stages};
+use db::writer::DbWriterHeartbeat;
 use engine::command_handler::CommandHandler;
 use engine::event_bus::EventSender;
 
@@ -22,6 +23,7 @@ pub struct McpServer {
     cmd_handler: Arc<CommandHandler>,
     pub principal_table: auth::PrincipalTable,
     events: Option<EventSender>,
+    storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
 }
 
 async fn write_json_line<T: serde::Serialize>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value: &T) {
@@ -129,6 +131,22 @@ impl McpServer {
             cmd_handler,
             principal_table,
             events: None,
+            storage_writer_heartbeat: None,
+        }
+    }
+
+    pub fn new_with_storage_writer(
+        pool: SqlitePool,
+        cmd_handler: Arc<CommandHandler>,
+        principal_table: auth::PrincipalTable,
+        storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
+    ) -> Self {
+        Self {
+            pool,
+            cmd_handler,
+            principal_table,
+            events: None,
+            storage_writer_heartbeat: Some(storage_writer_heartbeat),
         }
     }
 
@@ -143,6 +161,7 @@ impl McpServer {
             cmd_handler,
             principal_table,
             events: Some(events),
+            storage_writer_heartbeat: None,
         }
     }
 
@@ -329,8 +348,9 @@ impl McpServer {
                         format!("Method not found: {tool_name}"),
                     );
                 };
+                let canonical_tool_name = tools::canonical_tool_name(&tool_name);
 
-                if !tools::p064_operator_tool_enabled(&tool_name) {
+                if !tools::p064_operator_tool_enabled(canonical_tool_name) {
                     return JsonRpcResponse::error(
                         id,
                         -32601,
@@ -339,6 +359,22 @@ impl McpServer {
                 }
 
                 if !principal.tool_capabilities.contains(&tool_id) {
+                    if canonical_tool_name.starts_with("storage.") {
+                        let result = tools::storage::typed_error(
+                            canonical_tool_name,
+                            tools::storage::ERR_UNAUTHORIZED,
+                            "caller lacks storage diagnostics capability",
+                        );
+                        return JsonRpcResponse::success(
+                            id,
+                            serde_json::json!({
+                                "content": [{
+                                    "type": "text",
+                                    "text": serde_json::to_string(&result).unwrap_or_default()
+                                }]
+                            }),
+                        );
+                    }
                     return JsonRpcResponse::error(
                         id,
                         -32601,
@@ -347,7 +383,6 @@ impl McpServer {
                 }
 
                 let tool_params = params["arguments"].clone();
-                let canonical_tool_name = tools::canonical_tool_name(&tool_name);
 
                 match self
                     .dispatch_tool(canonical_tool_name, tool_params, principal)
@@ -550,7 +585,7 @@ impl McpServer {
                     principal.class == auth::PrincipalClass::Operator,
                 )
                 .await?,
-                "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, run_id_parsed).await?,
+                "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, &self.cmd_handler, run_id_parsed).await?,
                 "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
                 "rollout_contract_readback": mcp_rollout_readback,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
@@ -709,6 +744,16 @@ impl McpServer {
             tools::artifacts::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("steward.") {
             tools::steward::execute(tool_name, params, pool, cmd, principal).await
+        } else if tool_name.starts_with("storage.") {
+            tools::storage::execute_with_writer(
+                tool_name,
+                params,
+                pool,
+                self.storage_writer_heartbeat
+                    .as_ref()
+                    .map(|heartbeat| heartbeat.as_ref()),
+            )
+            .await
         } else {
             Err(anyhow::anyhow!("Unknown tool namespace: {tool_name}"))
         }
@@ -2209,6 +2254,51 @@ mod tests {
 
     fn operator_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    #[tokio::test]
+    async fn proposal_075_storage_tool_dispatch_returns_typed_unauthorized() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let observer = auth::Principal::new("storage-observer", auth::PrincipalClass::Observer);
+
+        let payload =
+            call_tool_and_parse(&server, &observer, "storage.health", serde_json::json!({})).await;
+
+        assert_eq!(payload["error"], true);
+        assert_eq!(payload["errorCode"], tools::storage::ERR_UNAUTHORIZED);
+        assert_eq!(payload["tool"], "storage.health");
+    }
+
+    #[tokio::test]
+    async fn proposal_075_storage_tool_dispatch_returns_typed_maintenance_disabled() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        std::env::set_var("CHAINWORKS_STORAGE_MAINTENANCE_DISABLED", "1");
+        let payload = call_tool_and_parse(
+            &server,
+            &operator_principal(),
+            "storage.reconcile_evidence_orphans",
+            serde_json::json!({"dryRun": true}),
+        )
+        .await;
+        std::env::remove_var("CHAINWORKS_STORAGE_MAINTENANCE_DISABLED");
+
+        assert_eq!(payload["error"], true);
+        assert_eq!(
+            payload["errorCode"],
+            tools::storage::ERR_MAINTENANCE_DISABLED
+        );
+        assert_eq!(payload["tool"], "storage.reconcile_evidence_orphans");
     }
 
     #[tokio::test]

@@ -308,7 +308,8 @@ impl AcpRuntimeManager {
                 return Err(err);
             }
         };
-        let keep_session_alive = req.keep_session_alive && result.status == AgentStatus::Completed;
+        let keep_session_alive =
+            should_keep_session_alive_after_prompt(req.keep_session_alive, &result.status);
         if keep_session_alive {
             let generation_id = req.session_generation_id.clone().ok_or_else(|| {
                 anyhow::anyhow!("keep_session_alive requested without session_generation_id")
@@ -794,6 +795,10 @@ impl Default for AcpRuntimeManager {
     }
 }
 
+fn should_keep_session_alive_after_prompt(requested: bool, status: &AgentStatus) -> bool {
+    requested && matches!(status, AgentStatus::Completed | AgentStatus::Failed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,6 +830,22 @@ mod tests {
         assert!(Arc::ptr_eq(
             &sink,
             &manager.xcode_runtime_observation_sink()
+        ));
+    }
+
+    #[test]
+    fn keep_alive_request_preserves_failed_prompt_for_output_repair() {
+        assert!(
+            should_keep_session_alive_after_prompt(true, &AgentStatus::Failed),
+            "a failed prompt may still have a live session that executor can repair in-place"
+        );
+        assert!(should_keep_session_alive_after_prompt(
+            true,
+            &AgentStatus::Completed
+        ));
+        assert!(!should_keep_session_alive_after_prompt(
+            false,
+            &AgentStatus::Failed
         ));
     }
 

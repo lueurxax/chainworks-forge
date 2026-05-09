@@ -152,7 +152,7 @@ Related docs:
 
 [P073](../proposals/073-stability-freeze-regression-budget-and-refactor-plan.md) should remain a stabilization operating mode, not a normal feature.
 
-[../ROADMAP.md](../ROADMAP.md) should now explicitly include P075/P078/P079/P080/P081/P082/P083/P084 and should not only mention older P031/P038/P046/P068 style work.
+[../ROADMAP.md](../ROADMAP.md) should now explicitly include P075/P078/P079/P080/P081/P082/P083 plus the executable rollout-gate template and should not only mention older P031/P038/P046/P068 style work.
 
 ---
 
@@ -185,9 +185,10 @@ Frozen work:
 
 ### 3.2 First priority: make implementation proposals executable
 
-#### Step 1 - P084 minimal rollout-gate template
+#### Step 1 - executable rollout-gate template
 
-Do a minimal [P084](../proposals/084-executable-rollout-gates-and-observability-contract.md) slice before major P075/P078 implementation.
+Use the [executable rollout-gate template](../reference/executable-rollout-gate-template.md)
+before major P075/P078 implementation.
 
 Minimum deliverables:
 
@@ -201,7 +202,7 @@ Minimum deliverables:
   - hold conditions,
   - rollback disposition.
 
-Do not expand P084 into a large product feature.
+Do not expand the executable rollout-gate template into a large product feature.
 
 Purpose:
 
@@ -441,7 +442,7 @@ The new critical path is:
 
 ```text
 P073
--> P084
+-> executable rollout-gate template
 -> P072 closeout
 -> P081
 -> P075

@@ -22,9 +22,9 @@ is the only governed mutation path allowed in the macOS UI via GraphQL.
 **Rust Daemon Implementation:**
 The Rust control-plane daemon implements the same state machine and transition
 semantics while adding robust capacity-aware scheduling, scheduler fairness,
-executor backpressure, and host interruption recovery to handle concurrent runs
-on a single host. See [rust-control-plane.md](rust-control-plane.md) for details
-on the daemon's scheduler, write serialization, and recovery logic.
+executor backpressure, evidence spooling, and host interruption recovery to handle
+concurrent runs on a single host. See [rust-control-plane.md](rust-control-plane.md)
+for details on the daemon's scheduler, write serialization, and recovery logic.
 
 Related stable docs:
 
@@ -369,9 +369,10 @@ loop when the self-assessment status is `complete`, `handoff_required`, or `bloc
 
 #### Implementation closeout readiness transitions
 
-Proposal 077 adds a stricter transition guard for the implementation review stage
-(`state_9_implementation_reviewed`). A run may enter manual release (`state_11_manual_release`)
-only when `implementation_closeout_readiness_v1.decision == 'enter_manual_release'`.
+Implementation closeout readiness adds a stricter transition guard for the
+implementation review stage (`state_9_implementation_reviewed`). A run may
+enter manual release (`state_11_manual_release`) only when
+`implementation_closeout_readiness_v1.decision == 'enter_manual_release'`.
 
 This guard replaces the simpler `implementation_self_assessment_v2.complete == true`
 check. It ensures that proposal-specific gates and implementation audits are satisfied
