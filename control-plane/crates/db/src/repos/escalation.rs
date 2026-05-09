@@ -254,10 +254,24 @@ pub async fn find_execution_metadata_by_ledger(
         .collect()
 }
 
+/// Maximum size for payload_json in escalation_events (P058-SEC-L2).
+/// Enforced before any JSON validation or DB write to prevent unbounded SQLite growth.
+const PAYLOAD_JSON_MAX_BYTES: usize = 64 * 1024; // 64 KiB
+
 pub async fn insert_event_tx(
     tx: &mut Transaction<'_, Sqlite>,
     event: &EscalationEvent,
 ) -> Result<()> {
+    // Enforce payload_json size cap before JSON validation — prevents unbounded SQLite growth.
+    if let Some(ref json_str) = event.payload_json {
+        if json_str.len() > PAYLOAD_JSON_MAX_BYTES {
+            bail!(
+                "payload_json exceeds maximum allowed size of {} bytes (got {}); Phase 2+ writers must redact and trim before insert",
+                PAYLOAD_JSON_MAX_BYTES,
+                json_str.len()
+            );
+        }
+    }
     // Reject malformed JSON before writing — required by proposal even without sqlite json1.
     validate_json_field("payload_json", &event.payload_json)?;
     // Reject missing or unrecognized redaction_version — proposal mandates a known stamp on every event write.
