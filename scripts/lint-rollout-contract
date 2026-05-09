@@ -218,6 +218,21 @@ def _check_string_list(value: object, context: str, *, non_empty: bool) -> list[
     return failures
 
 
+def _check_string_list_or_map(value: object, context: str) -> list[str]:
+    if isinstance(value, list):
+        return _check_string_list(value, context, non_empty=False)
+    if not isinstance(value, dict):
+        return [f"invalid_{context}: must be an array or object"]
+    failures: list[str] = []
+    for key, item in value.items():
+        failures.extend(_check_control_chars(key, f"{context}.{key}"))
+        if not isinstance(item, str):
+            failures.append(f"invalid_{context}.{key}: value must be a string")
+        else:
+            failures.extend(_check_control_chars(item, f"{context}.{key}"))
+    return failures
+
+
 def _check_secret_like_values(value: object, context: str) -> list[str]:
     failures: list[str] = []
     if isinstance(value, dict):
@@ -386,7 +401,7 @@ def lint(path: str) -> list[str]:
 
     hcd = data.get("hold_conditions_detail")
     if hcd is not None:
-        failures.extend(_check_string_list(hcd, "hold_conditions_detail", non_empty=False))
+        failures.extend(_check_string_list_or_map(hcd, "hold_conditions_detail"))
 
     # rollback_disposition must have required sub-fields
     rd = data.get("rollback_disposition")

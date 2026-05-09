@@ -2034,6 +2034,64 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
 }
 
 #[tokio::test]
+async fn test_retry_stage_creates_missing_run_meta_root_before_new_attempt() {
+    let pool = test_pool().await;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let meta_root = ".chainworks/runs/retry-meta-root";
+    let absolute_meta_root = workspace.path().join(meta_root);
+    assert!(
+        !absolute_meta_root.exists(),
+        "test fixture must start with a missing run meta-root"
+    );
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace.path().to_string_lossy().into_owned();
+    run.chainworks_meta_root = Some(meta_root.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(old_stage_exec_id, run_id, StageStatus::Failed);
+    stage.stage_id = "flaky_stage".into();
+    stage.attempt_number = 1;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "flaky_stage".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    for child in ["", "artifacts", "context", "state", "summaries"] {
+        let path = if child.is_empty() {
+            absolute_meta_root.clone()
+        } else {
+            absolute_meta_root.join(child)
+        };
+        assert!(
+            path.is_dir(),
+            "RetryStage must recreate missing run meta-root directory {}",
+            path.display()
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_retry_stage_legacy_discovery_override_validation_failure_leaves_no_journal() {
     let pool = test_pool().await;
 
@@ -2644,7 +2702,7 @@ async fn test_targeted_retry_falls_back_from_gemini_proposal_reviewer_backend() 
             "backend_profiles": {
                 "gemini_review_pro": {
                     "provider": "gemini_acp",
-                    "model": "gemini-2.5-pro",
+                    "model": "gemini-3.1-pro-preview",
                     "effort": "medium",
                     "max_turns": 12
                 },
@@ -2667,7 +2725,7 @@ async fn test_targeted_retry_falls_back_from_gemini_proposal_reviewer_backend() 
     let mut failed_reviewer = make_agent_execution(old_stage_exec_id, AgentStatus::Failed);
     failed_reviewer.agent_id = "proposal_reviewer_macos".into();
     failed_reviewer.provider = "gemini_acp".into();
-    failed_reviewer.model = Some("gemini-2.5-pro".into());
+    failed_reviewer.model = Some("gemini-3.1-pro-preview".into());
     failed_reviewer.completed_at = Some(Utc::now());
     let failed_reviewer_id = failed_reviewer.id;
     agent_executions::insert(&pool, &failed_reviewer)
@@ -2687,7 +2745,7 @@ async fn test_targeted_retry_falls_back_from_gemini_proposal_reviewer_backend() 
                 "agent_id": "proposal_reviewer_macos",
                 "provider": "gemini",
                 "backend_profile_id": "gemini_review_pro",
-                "model": "gemini-2.5-pro",
+                "model": "gemini-3.1-pro-preview",
                 "effort": "medium",
                 "max_turns": 12,
                 "output_contract": "proposal_review_v1",
@@ -2792,7 +2850,7 @@ async fn test_targeted_retry_uses_current_catalog_binding_when_agent_profile_cha
                 },
                 "gemini_reasoning_pro_high": {
                     "provider": "gemini_acp",
-                    "model": "gemini-2.5-pro",
+                    "model": "gemini-3.1-pro-preview",
                     "effort": "high",
                     "max_turns": 16,
                     "temperature": 0.1
@@ -2882,7 +2940,10 @@ async fn test_targeted_retry_uses_current_catalog_binding_when_agent_profile_cha
         serde_json::json!("gemini_reasoning_pro_high")
     );
     assert_eq!(payload["provider"], serde_json::json!("gemini_acp"));
-    assert_eq!(payload["model"], serde_json::json!("gemini-2.5-pro"));
+    assert_eq!(
+        payload["model"],
+        serde_json::json!("gemini-3.1-pro-preview")
+    );
     assert_eq!(payload["effort"], serde_json::json!("high"));
     assert_eq!(payload["temperature"], serde_json::json!(0.1));
     assert_eq!(
@@ -4923,6 +4984,7 @@ async fn test_start_run_persists_delivery_configuration_json() {
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
     let handler = make_command_handler(pool.clone());
+    let workspace = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     std::process::Command::new("git")
         .args(["init", "--initial-branch", "main"])
@@ -4949,7 +5011,7 @@ async fn test_start_run_persists_delivery_configuration_json() {
                 idea_id,
                 workflow_id: "wf-start".into(),
                 workflow_title: "Start Run".into(),
-                workspace_root: "/tmp/ws".into(),
+                workspace_root: workspace.path().to_string_lossy().into_owned(),
                 artifact_root: "/tmp/art".into(),
                 workflow_yaml_path: test_workflow_yaml_path(),
                 agent_catalog_yaml_path: test_agent_catalog_yaml_path(),
@@ -4970,6 +5032,21 @@ async fn test_start_run_persists_delivery_configuration_json() {
 
     let run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
     assert_eq!(run.delivery_configuration_json, delivery_configuration_json);
+    let meta_root = run
+        .chainworks_meta_root
+        .as_deref()
+        .expect("StartRun derives a per-run meta root");
+    let absolute_meta_root = workspace.path().join(meta_root);
+    assert!(
+        absolute_meta_root.is_dir(),
+        "StartRun must create per-run meta root before first invocation"
+    );
+    for child in ["artifacts", "context", "state", "summaries"] {
+        assert!(
+            absolute_meta_root.join(child).is_dir(),
+            "StartRun must create {child} under the per-run meta root"
+        );
+    }
     let routing_json = run
         .review_routing_json
         .as_deref()

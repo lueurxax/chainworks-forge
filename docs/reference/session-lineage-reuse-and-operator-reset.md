@@ -187,6 +187,26 @@ It still requires:
 
 Security-, review-, or audit-style agents should remain on `same_invocation_owner` or `none`.
 
+Implementation writer stages are the important exception to the conservative default. `code_writer` work for
+initial implementation, continuation, and refinement must opt into `same_agent_family_within_run` with a stable
+implementation session family. These stages intentionally build on prior edits, review findings, failed output
+repairs, and partial work in the same run-owned worktree. If `code_writer` falls back to `none`, every retry becomes
+`fresh_session_required / policy_forbid`; the writer loses continuity and must rediscover the proposal, audit,
+prepush report, implementation summary, and worktree before it can make the next targeted edit.
+
+For implementation/refinement retry loops, this is a regression signal, not an acceptable steady state:
+
+- `agent_executions.session_reuse_disposition = fresh_session_required` with `session_reset_reason = policy_forbid`
+  for `code_writer`;
+- `session_lineages.session_reuse_scope = none` for `(run_id, code_writer)`;
+- catalog or frozen catalog snapshots where `code_writer` lacks `session_reuse_scope: same_agent_family_within_run`;
+- repeated writer transcripts that start by rereading the full proposal and review bundle instead of continuing from
+  the prior implementation context.
+
+Operator repair for an already-active run must update both the live/frozen catalog snapshot and the existing
+`session_lineages` row. Updating only `examples/agents/agents.yaml` fixes new runs, but active runs continue to use
+their frozen snapshot and persisted lineage policy until those are repaired.
+
 ## Live ACP Session Ownership
 
 `AcpRuntimeManager` is the process-lifetime owner of reusable live ACP sessions. It holds an in-memory `active_sessions` map keyed by `session_generation_id` to `ActiveAcpSessionHandle`, which owns the live subprocess, stdio pipes, initialized transport state, provider session ID, and adapter family.
