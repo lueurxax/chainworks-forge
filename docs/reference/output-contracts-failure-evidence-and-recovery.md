@@ -68,6 +68,18 @@ The repair turn is not a task retry. It must:
 
 If the repair turn produces contract-valid required outputs, the executor merges the repair result into the original execution result and the stage may continue without a new provider session. If the repair turn fails, cannot be settled, or still does not produce valid outputs, the runtime records the failed output settlement and then invalidates/closes the active session generation so the next operator retry starts from a fresh session.
 
+Repair settlement must bind only exact declared output identities. When prompts use canonical target paths as
+`CHAINWORKS_OUTPUT` keys, those keys must match byte-for-byte after JSON decoding: no leading/trailing whitespace,
+no alternate absolute path spelling, no display label, and no companion path. A repaired payload keyed as
+`" /abs/path/to/output.json"` is an undeclared envelope, not the declared `/abs/path/to/output.json` artifact, even
+if the JSON value itself is contract-valid. Recovery evidence should surface this as a binding/key mismatch rather
+than implying that the agent did no useful work.
+
+For implementation writer repair specifically, a failed same-session repair should not be allowed to erase the
+broader implementation continuity policy. The repair generation may be invalidated after the failed settlement, but
+the next normal retry should still follow the `code_writer` implementation family reuse policy documented in
+[session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md#family-reuse-is-opt-in-only).
+
 `AcpRuntimeManager` therefore keeps a requested live session alive after both `completed` and `failed` prompt statuses. A failed prompt is preserved only so the executor can make this bounded repair attempt; normal cross-invocation reuse still follows the session-lineage policy in [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md).
 
 ### One contract authority
@@ -218,7 +230,7 @@ The canonical operational reference for this behavior is
 #### Readiness Mode
 
 Closeout readiness is governed by a per-run **closeout readiness mode** frozen at run admission:
-- **`advisory`** (and the `legacy_fallback` diagnostic variant): Diagnostic-only mode. Closeout readiness is synthesized and visible to operators, but the synthesizer caps any decision that would trigger a workflow transition (`enter_manual_release`, `return_to_code_refine`) to `await_operator_decision` and records a `diagnostic_reason` explaining the cap. Observability fields (status, blocker counts, gate status) are preserved unchanged so operators see what the matrix would have decided in enforcement.
+- **`advisory`** (and the `legacy_fallback` diagnostic variant): Diagnostic-only mode for manual release. Closeout readiness is synthesized and visible to operators, and the synthesizer caps `enter_manual_release` to `await_operator_decision` until enforcement cutover. `return_to_code_refine` remains an allowed repair route: a missing release/closeout gate must not block implementation refinement when review truth says code fixes are required. Observability fields (status, blocker counts, gate status) are preserved unchanged so operators see what the matrix decided.
 - **`enforcement`**: Strict gating mode. Transition to manual release requires a resolved `enter_manual_release` decision.
 
 #### Decision and Gating

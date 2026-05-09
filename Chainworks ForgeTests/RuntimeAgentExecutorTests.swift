@@ -1831,7 +1831,7 @@ struct RuntimeAgentExecutorTests {
             configuredProviderID: configuredProviderID,
             providerFamily: "gemini",
             providerIdentifier: "gemini",
-            model: "gemini-2.5-pro",
+            model: "gemini-3.1-pro-preview",
             effort: "medium",
             transport: "acp_stdio",
             adapterVersion: "v1",
@@ -1882,13 +1882,13 @@ struct RuntimeAgentExecutorTests {
 
         let lastSessionRequest = await transport.lastSessionRequest
         #expect(lastSessionRequest?.provider == "gemini")
-        #expect(lastSessionRequest?.model == "gemini-2.5-pro")
+        #expect(lastSessionRequest?.model == "gemini-3.1-pro-preview")
 
         #expect(result.runtimeProvider == "gemini")
-        #expect(result.runtimeModel == "gemini-2.5-pro")
-        #expect(result.resolvedModel == "gemini-2.5-pro")
+        #expect(result.runtimeModel == "gemini-3.1-pro-preview")
+        #expect(result.resolvedModel == "gemini-3.1-pro-preview")
         #expect(result.providerReceipt?.providerFamily == "gemini")
-        #expect(result.providerReceipt?.model == "gemini-2.5-pro")
+        #expect(result.providerReceipt?.model == "gemini-3.1-pro-preview")
         #expect(result.providerReceipt?.transport == "acp_stdio")
         #expect(result.configuredProviderID == configuredProviderID)
 
@@ -1898,7 +1898,7 @@ struct RuntimeAgentExecutorTests {
         decoder.dateDecodingStrategy = .iso8601
         let receipt = try decoder.decode(ExecutionReceipt.self, from: receiptData)
         #expect(receipt.provider == "gemini")
-        #expect(receipt.model == "gemini-2.5-pro")
+        #expect(receipt.model == "gemini-3.1-pro-preview")
         #expect(receipt.effort == "medium")
     }
 
@@ -3190,7 +3190,7 @@ struct RuntimeAgentExecutorTests {
             workingDirectory: leadContext.workspace.workspaceRoot.path,
             workspaceMode: "read_only",
             runtimeProvider: "gemini",
-            runtimeModel: "gemini-2.5-pro"
+            runtimeModel: "gemini-3.1-pro-preview"
         )
 
         let leadContextRetry = ExecutionContext(
@@ -4163,7 +4163,7 @@ struct RuntimeAgentExecutorTests {
             events: [
                 .sessionStarted(raw: "{}"),
                 .promptSubmitted(raw: "{}"),
-                .error(message: "Gemini CLI command failed: Attempt 1 failed with status 429. No capacity available for model gemini-2.5-pro on the server. MODEL_CAPACITY_EXHAUSTED")
+                .error(message: "Gemini CLI command failed: Attempt 1 failed with status 429. No capacity available for model gemini-3.1-pro-preview on the server. MODEL_CAPACITY_EXHAUSTED")
             ]
         )
 

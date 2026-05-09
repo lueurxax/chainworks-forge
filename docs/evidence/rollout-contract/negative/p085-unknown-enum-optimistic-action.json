@@ -1,0 +1,12 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "gate_aliases": [
+    "proposal-085",
+    "p085"
+  ],
+  "commands": {
+    "allowlist": []
+  },
+  "placeholder_fixture_kind": "unknown_enum_optimistic_action"
+}

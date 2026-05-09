@@ -5486,6 +5486,10 @@ PLIST
       log "P075: db crate full regression (all db tests must pass)"
       cargo test -p db -- --nocapture
 
+      log "P075: production Class B projections use coalescing and Class D telemetry exposes drop counters"
+      cargo test -p db p075_projection_rebuild_uses_production_class_b_coalescing --test integration -- --nocapture
+      cargo test -p db class_d_telemetry_drop_counter_is_observable_via_storage_health --test proposal_075_dbwriter -- --nocapture
+
       log "P075: engine producer adoption — failed-stage evidence spools full packet and stores compact SQLite pointer"
       cargo test -p engine failed_stage_evidence_packet_tests -- --nocapture
 
@@ -5692,6 +5696,31 @@ if "P075 shared DbWriter is not registered" not in writer_text:
     raise SystemExit("P075 file-backed registered transaction path must fail closed without shared DbWriter")
 if "shared_writer_for(pool).await" not in writer_text:
     raise SystemExit("P075 registered transaction path must consult shared DbWriter registry")
+if "telemetry_dropped_total" not in writer_text or "coalesced_merged_total" not in writer_text:
+    raise SystemExit("P075 DbWriter heartbeat must expose real Class B merge and Class D drop counters")
+projection_text = (root / "control-plane/crates/db/src/repos/projections.rs").read_text().split("\n#[cfg(test)]", 1)[0]
+for operation in [
+    "projections.rebuild_approval_inbox",
+    "projections.rebuild_run_summary",
+    "projections.rebuild_stage_summaries",
+    "projections.upsert_artifact_index_entry",
+]:
+    if f'execute_repository_write!(\n        pool,\n        "{operation}"' in projection_text or f'execute_repository_write!(pool, "{operation}"' in projection_text:
+        raise SystemExit(f"P075 production Class B operation {operation} still bypasses coalescing helper")
+if "execute_repository_transaction_operation(pool, op, operation_name, work)" not in projection_text:
+    raise SystemExit("P075 production projection writes must enter the transaction coalescing helper")
+storage_health_text = (root / "control-plane/crates/db/src/repos/storage_health.rs").read_text().split("\n#[cfg(test)]", 1)[0]
+scheduler_text = (root / "control-plane/crates/db/src/repos/scheduler.rs").read_text().split("\n#[cfg(test)]", 1)[0]
+for path_label, text, operation in [
+    ("storage_health.rs", storage_health_text, "storage_health.insert_write_pressure_snapshot"),
+    ("scheduler.rs", scheduler_text, "scheduler.record_db_writer_wait_observation"),
+]:
+    if f'execute_repository_write!(\n        pool,\n        "{operation}"' in text or f'execute_repository_write!(pool, "{operation}"' in text:
+        raise SystemExit(f"P075 production Class D operation {operation} in {path_label} still bypasses telemetry helper")
+    if "execute_repository_transaction_operation(" not in text:
+        raise SystemExit(f"P075 production Class D operation {operation} in {path_label} must use DbWriter transaction helper")
+if "droppedTelemetryTotal" not in storage_health_text or "telemetryDroppedTotal" not in storage_health_text:
+    raise SystemExit("P075 storageHealth must report real Class D telemetry drop counters")
 if "insert_idempotent_via_dbwriter" in (root / "control-plane/crates/db/src/repos/evidence_spool_refs.rs").read_text():
     evidence_refs_text = (root / "control-plane/crates/db/src/repos/evidence_spool_refs.rs").read_text().split("\n#[cfg(test)]", 1)[0]
     via_plain_insert = evidence_refs_text.split("pub async fn insert_via_dbwriter", 1)[1].split("pub async fn", 1)[0]

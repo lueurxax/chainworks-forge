@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
-use crate::writer::begin_registered_immediate_transaction;
+use crate::writer::{
+    begin_registered_immediate_transaction, execute_repository_transaction_operation,
+    repository_transaction_operation,
+};
 use domain::provider::{InvokeAgentCapacityConfig, ProviderFamily};
 
 const STALE_AFTER_MS: i64 = 60_000;
@@ -398,19 +401,38 @@ pub async fn record_db_writer_wait_observation(
     wait_ms: i64,
     observed_at: DateTime<Utc>,
 ) -> Result<()> {
-    crate::execute_repository_write!(
+    let mut op = repository_transaction_operation("scheduler.record_db_writer_wait_observation");
+    op.idempotency_key = format!(
+        "scheduler:db_writer_wait:{}:{}",
+        operation,
+        observed_at.timestamp_millis()
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+    let operation = operation.to_string();
+    let observed_at = observed_at.to_rfc3339();
+    execute_repository_transaction_operation(
         pool,
+        op,
         "scheduler.record_db_writer_wait_observation",
-        sqlx::query(
-            r#"INSERT INTO scheduler_db_writer_observations
-           (id, operation, wait_ms, observed_at)
-           VALUES (?1, ?2, ?3, ?4)"#,
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(operation)
-        .bind(wait_ms.max(0))
-        .bind(observed_at.to_rfc3339())
+        Box::new(move |tx| {
+            Box::pin(async move {
+                let rows = sqlx::query(
+                    r#"INSERT INTO scheduler_db_writer_observations
+                   (id, operation, wait_ms, observed_at)
+                   VALUES (?1, ?2, ?3, ?4)"#,
+                )
+                .bind(id)
+                .bind(operation)
+                .bind(wait_ms.max(0))
+                .bind(observed_at)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected() as u32;
+                Ok(((), rows))
+            })
+        }),
     )
+    .await
     .context("record scheduler DB writer wait observation")?;
     Ok(())
 }

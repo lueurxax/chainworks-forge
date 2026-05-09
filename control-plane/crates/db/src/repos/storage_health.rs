@@ -6,6 +6,7 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::writer::{
+    execute_repository_transaction_operation, repository_transaction_operation,
     DbWriterHealthSnapshot, DbWriterHeartbeat, CRITICAL_WAL_SIZE_BYTES, TELEMETRY_FLUSH_CADENCE_MS,
     TELEMETRY_MAX_SAMPLES, TELEMETRY_MEMORY_CAP_BYTES, TELEMETRY_SNAPSHOT_TTL_HOURS,
     WARN_WAL_SIZE_BYTES,
@@ -48,20 +49,40 @@ pub async fn insert_write_pressure_snapshot(
     if payload.len() > 65_536 {
         anyhow::bail!("storage write pressure payload exceeds 65536 bytes");
     }
-    crate::execute_repository_write!(
+    let mut op = repository_transaction_operation("storage_health.insert_write_pressure_snapshot");
+    op.idempotency_key = format!(
+        "storage_health:write_pressure:{}:{}",
+        snapshot.window_start.timestamp_millis(),
+        snapshot.window_end.timestamp_millis()
+    );
+    let id = snapshot.id.clone();
+    let window_start = snapshot.window_start.to_rfc3339();
+    let window_end = snapshot.window_end.to_rfc3339();
+    let created_at = snapshot.created_at.to_rfc3339();
+    execute_repository_transaction_operation(
         pool,
+        op,
         "storage_health.insert_write_pressure_snapshot",
-        sqlx::query(
-            r#"INSERT INTO storage_write_pressure_snapshots
-           (id, window_start, window_end, payload_json, created_at)
-           VALUES (?1, ?2, ?3, ?4, ?5)"#,
-        )
-        .bind(&snapshot.id)
-        .bind(snapshot.window_start.to_rfc3339())
-        .bind(snapshot.window_end.to_rfc3339())
-        .bind(payload)
-        .bind(snapshot.created_at.to_rfc3339())
+        Box::new(move |tx| {
+            Box::pin(async move {
+                let rows = sqlx::query(
+                    r#"INSERT INTO storage_write_pressure_snapshots
+                   (id, window_start, window_end, payload_json, created_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5)"#,
+                )
+                .bind(id)
+                .bind(window_start)
+                .bind(window_end)
+                .bind(payload)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected() as u32;
+                Ok(((), rows))
+            })
+        }),
     )
+    .await
     .context("insert storage write pressure snapshot")?;
     Ok(())
 }
@@ -149,14 +170,14 @@ pub async fn storage_health_with_writer(
             "busyRetryRatePerMinute": lock_metrics.busy_retry_rate_per_minute,
             "busyRetryExhaustedTotal": lock_metrics.busy_retry_exhausted_total,
             "rejectedTotal": writer_snapshot.as_ref().map(|snapshot| snapshot.coalesced_rejected_total).unwrap_or(0),
-            "droppedTelemetryTotal": 0
+            "droppedTelemetryTotal": writer_snapshot.as_ref().map(|snapshot| snapshot.telemetry_dropped_total).unwrap_or(0)
         },
         "wal": wal_json,
         "projections": {
             "pendingInvalidations": 0,
             "projectionLagMs": null,
             "coalescedKeysPending": 0,
-            "coalescedMergedTotal": 0,
+            "coalescedMergedTotal": writer_snapshot.as_ref().map(|snapshot| snapshot.coalesced_merged_total).unwrap_or(0),
             "coalescedFlushAgeP95Ms": null
         },
         "evidenceSpool": evidence,
@@ -369,6 +390,8 @@ fn live_write_pressure_json(updated_at: DateTime<Utc>, snapshot: &DbWriterHealth
                 "lastHeartbeatAgeMs": snapshot.last_heartbeat_age_ms,
                 "lastDrainAgeMs": snapshot.last_drain_age_ms,
                 "coalescedRejectedTotal": snapshot.coalesced_rejected_total,
+                "coalescedMergedTotal": snapshot.coalesced_merged_total,
+                "telemetryDroppedTotal": snapshot.telemetry_dropped_total,
                 "starvationTotal": snapshot.starvation_total,
                 "lanes": lanes
             }
@@ -430,7 +453,11 @@ fn lane_health(writer_snapshot: Option<&DbWriterHealthSnapshot>) -> Value {
                         } else {
                             0
                         },
-                        "droppedTotal": 0
+                        "droppedTotal": if lane.lane.as_str() == "telemetry_rollup" {
+                            snapshot.telemetry_dropped_total
+                        } else {
+                            0
+                        }
                     })
                 })
                 .collect(),

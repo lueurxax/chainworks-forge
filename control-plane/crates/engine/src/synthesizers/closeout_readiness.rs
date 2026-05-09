@@ -52,6 +52,10 @@ pub struct SynthesizerInputs<'a> {
     pub stage_id: &'a str,
     pub gate_result: &'a ProposalGateResult,
     pub mode_result: &'a CloseoutReadinessModeResult,
+    /// Active implementation_review_summary_v1.status, when settled.
+    /// Review-owned code-fix decisions must be routed before release-gate checks so
+    /// a missing release gate cannot block returning to implementation refinement.
+    pub implementation_review_status: Option<&'a str>,
     pub self_assessment: Option<&'a ImplementationSelfAssessmentSummary>,
     pub accepted_risks: &'a [RiskAcceptanceLineage],
     /// Whether the P052 loop budget has been exhausted.
@@ -163,11 +167,20 @@ pub fn synthesize_implementation_closeout_readiness_for_state9(
     // apply_decision_matrix so the advisory cap can reference it afterward.
     let mode_result = inputs.mode_result;
 
+    if let Some(review_routed) = route_implementation_review_status(&inputs, &generation_id) {
+        let readiness = maybe_cap_advisory_decision(review_routed, mode_result);
+        return SynthesizerResult {
+            readiness,
+            current_blocker_digest,
+        };
+    }
+
     // Gate cause routing per R14 §architecture.gate_cause_routing.
     let gate_decision = route_gate_cause(inputs.gate_result, inputs.loop_budget_remaining);
     if let Some(gate_routed) = gate_decision {
         let readiness = gate_routed_readiness(inputs, generation_id, gate_routed);
-        // R14 Phase 1: advisory mode is diagnostic-only — cap transition decisions.
+        // Advisory mode is diagnostic-only for manual release; refinement remains
+        // an allowed repair route and must not be blocked by release-gate advisory state.
         let readiness = maybe_cap_advisory_decision(readiness, mode_result);
         return SynthesizerResult {
             readiness,
@@ -178,7 +191,8 @@ pub fn synthesize_implementation_closeout_readiness_for_state9(
     // Gate allows entry (passed or waived with valid fingerprint).
     // Apply the full decision matrix.
     let readiness = apply_decision_matrix(inputs, generation_id);
-    // R14 Phase 1: advisory mode is diagnostic-only — cap transition decisions.
+    // Advisory mode is diagnostic-only for manual release; refinement remains
+    // an allowed repair route and must not be blocked by release-gate advisory state.
     let readiness = maybe_cap_advisory_decision(readiness, mode_result);
     SynthesizerResult {
         readiness,
@@ -186,10 +200,9 @@ pub fn synthesize_implementation_closeout_readiness_for_state9(
     }
 }
 
-/// R14 Phase 1: advisory/legacy-fallback mode is diagnostic-only.
-/// Cap any decision that would trigger a workflow transition so that advisory
-/// mode produces no state_9 side effects. Readiness observability fields
-/// (status, code_blocker_count, etc.) are preserved unchanged.
+/// Advisory/legacy-fallback mode is diagnostic-only for manual release.
+/// Code refinement remains an allowed repair route: a release gate must never
+/// prevent the workflow from returning to implementation fixes.
 fn maybe_cap_advisory_decision(
     mut r: CloseoutReadiness,
     mode_result: &CloseoutReadinessModeResult,
@@ -198,18 +211,61 @@ fn maybe_cap_advisory_decision(
         return r;
     }
     match r.decision {
-        CloseoutReadinessDecision::EnterManualRelease
-        | CloseoutReadinessDecision::ReturnToCodeRefine => {
+        CloseoutReadinessDecision::EnterManualRelease => {
             let mode_str = mode_result.effective_mode().as_str();
             r.decision = CloseoutReadinessDecision::AwaitOperatorDecision;
             r.diagnostic_reason = Some(format!(
-                "advisory_mode: {mode_str} — diagnostic-only; \
-                 no transition side effects until cutover to enforcement"
+                "advisory_mode: {mode_str} — manual release is diagnostic-only until cutover to enforcement"
             ));
         }
         _ => {}
     }
     r
+}
+
+fn route_implementation_review_status(
+    inputs: &SynthesizerInputs<'_>,
+    generation_id: &str,
+) -> Option<CloseoutReadiness> {
+    let status = inputs.implementation_review_status?.trim();
+    if !matches!(status, "needs_code_fixes" | "invalid") {
+        return None;
+    }
+
+    let (decision, reason, primary_unblock) = if inputs.loop_budget_remaining {
+        (
+            CloseoutReadinessDecision::ReturnToCodeRefine,
+            format!(
+                "implementation_review_summary.status={status} requires implementation refinement; release gate is not required for code-fix routing"
+            ),
+            "Resolve implementation review code blockers".to_string(),
+        )
+    } else {
+        (
+            CloseoutReadinessDecision::AwaitOperatorDecision,
+            format!(
+                "implementation_review_summary.status={status} requires refinement, but refinement loop budget is exhausted"
+            ),
+            "Operator decision required for exhausted implementation refinement budget"
+                .to_string(),
+        )
+    };
+
+    Some(CloseoutReadiness {
+        run_id: inputs.run_id.to_string(),
+        stage_id: inputs.stage_id.to_string(),
+        status: CloseoutReadinessStatus::NotReady,
+        decision,
+        generation_id: generation_id.to_string(),
+        readiness_mode: inputs.mode_result.effective_mode().as_str().to_string(),
+        diagnostic_reason: Some(reason),
+        primary_unblock: Some(primary_unblock),
+        code_blocker_count: 1,
+        handoff_owner: None,
+        risk_settlement_required: false,
+        fingerprint: inputs.fingerprint.clone(),
+        synthesized_at: Utc::now(),
+    })
 }
 
 /// Gate cause routing — returns Some if the gate status itself determines the decision.
@@ -277,11 +333,9 @@ fn gate_routed_readiness(
         GateRouted::AwaitGateDefinition => (
             CloseoutReadinessStatus::Unknown,
             CloseoutReadinessDecision::AwaitGateDefinition,
-            format!(
-                "gate missing_definition: proposal-077 gate not registered; \
-                 run ./scripts/test-gate.sh proposal-077 to register"
-            ),
-            Some("Register the proposal-077 gate script".into()),
+            "gate missing_definition: closeout release gate not registered; register or import the governed gate before manual release"
+                .to_string(),
+            Some("Register or import the closeout release gate before manual release".into()),
         ),
         GateRouted::RerunOrImportCurrentReceipt => (
             CloseoutReadinessStatus::Unknown,
@@ -311,7 +365,7 @@ fn gate_routed_readiness(
             CloseoutReadinessDecision::ReturnToCodeRefine,
             "gate failed: code work required; proposal gate failed with budget remaining"
                 .to_string(),
-            Some("Fix gate failures and re-run proposal-077 gate".into()),
+            Some("Fix gate failures and re-run the closeout release gate".into()),
         ),
         GateRouted::UnauthorizedWaiver => (
             CloseoutReadinessStatus::Blocked,
@@ -742,6 +796,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -763,6 +818,44 @@ mod tests {
             ),
             "missing gate cannot enter manual release"
         );
+        let reason = result.readiness.diagnostic_reason.unwrap_or_default();
+        assert!(
+            !reason.contains("proposal-077"),
+            "missing gate diagnostics must not claim a proposal-077 run-specific gate: got {reason}"
+        );
+    }
+
+    #[test]
+    fn review_needs_code_fixes_returns_to_refine_even_when_release_gate_missing() {
+        let gate = gate_with_status(ProposalGateStatus::MissingDefinition);
+        let assessment = complete_assessment();
+        let mode = enforcement_mode();
+
+        let result = synthesize_implementation_closeout_readiness_for_state9(SynthesizerInputs {
+            run_id: "run-1",
+            stage_id: "state_9",
+            gate_result: &gate,
+            mode_result: &mode,
+            implementation_review_status: Some("needs_code_fixes"),
+            self_assessment: Some(&assessment),
+            accepted_risks: &[],
+            loop_budget_remaining: true,
+            fingerprint: None,
+            fingerprint_latency_exceeded: false,
+            controlled_reports_green: Some(true),
+            previous_blocker_digest: None,
+        });
+
+        assert_eq!(
+            result.readiness.decision,
+            CloseoutReadinessDecision::ReturnToCodeRefine,
+            "review-owned code blockers must route to refine before missing release gate checks"
+        );
+        let reason = result.readiness.diagnostic_reason.unwrap_or_default();
+        assert!(
+            reason.contains("implementation_review_summary.status=needs_code_fixes"),
+            "diagnostic_reason must name the review-owned routing source: got {reason}"
+        );
     }
 
     #[test]
@@ -779,6 +872,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -808,6 +902,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: false,
@@ -837,6 +932,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -867,6 +963,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -896,6 +993,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &risks,
             loop_budget_remaining: true,
@@ -927,6 +1025,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -960,6 +1059,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -987,6 +1087,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: false,
@@ -1013,6 +1114,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -1026,6 +1128,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -1054,6 +1157,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -1093,6 +1197,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -1121,6 +1226,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -1174,6 +1280,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -1206,6 +1313,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -1234,6 +1342,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -1267,6 +1376,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -1296,6 +1406,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -1333,6 +1444,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true,
@@ -1356,6 +1468,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment),
             accepted_risks: &[],
             loop_budget_remaining: true, // budget NOT exhausted
@@ -1399,6 +1512,7 @@ mod tests {
             stage_id: "state_9",
             gate_result: &gate,
             mode_result: &mode,
+            implementation_review_status: None,
             self_assessment: Some(&assessment2),
             accepted_risks: &[],
             loop_budget_remaining: true,

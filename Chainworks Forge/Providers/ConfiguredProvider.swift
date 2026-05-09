@@ -45,7 +45,7 @@ enum ProviderDefaults {
         case .claudeACP:
             return "sonnet"
         case .geminiACP:
-            return "gemini-2.5-pro"
+            return "gemini-3.1-pro-preview"
         case .auggie:
             return "auggie-default"
         case .junie:

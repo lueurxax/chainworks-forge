@@ -218,6 +218,17 @@ async fn implementation_run_start_rollout_contract_preflight_inner(
         rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run.id.inner())
             .await?
     {
+        if approved_proposal.is_some()
+            && terminal_check_can_be_recomputed_after_repair(pool, run, &check).await?
+        {
+            return upsert_current_rollout_contract_check(
+                pool,
+                run,
+                approved_proposal,
+                retry_count,
+            )
+            .await;
+        }
         let check = if let Some(drift) = current_identity
             .as_ref()
             .and_then(|identity| identity.drift_from(&check))
@@ -232,6 +243,15 @@ async fn implementation_run_start_rollout_contract_preflight_inner(
         return Ok(evaluate_terminal_check(check));
     }
 
+    upsert_current_rollout_contract_check(pool, run, approved_proposal, retry_count).await
+}
+
+async fn upsert_current_rollout_contract_check(
+    pool: &SqlitePool,
+    run: &Run,
+    approved_proposal: Option<&Artifact>,
+    retry_count: i64,
+) -> Result<RolloutContractPreflightEvaluation> {
     let policy = effective_preflight_policy(pool, run, Utc::now()).await?;
     let mode = policy.enforcement_mode.clone();
     if !policy.failures.is_empty() {
@@ -275,6 +295,43 @@ async fn implementation_run_start_rollout_contract_preflight_inner(
     };
     write_rollout_contract_check_projection(run, &check)?;
     Ok(evaluate_terminal_check(check))
+}
+
+async fn terminal_check_can_be_recomputed_after_repair(
+    pool: &SqlitePool,
+    run: &Run,
+    previous: &StoredRolloutContractCheck,
+) -> Result<bool> {
+    if matches!(
+        previous.status,
+        RolloutContractStatus::MissingContract
+            | RolloutContractStatus::Fail
+            | RolloutContractStatus::Timeout
+    ) {
+        return Ok(true);
+    }
+
+    if previous.status != RolloutContractStatus::Stale {
+        return Ok(false);
+    }
+
+    let green_terminal_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM rollout_contract_checks
+           WHERE run_id = ?1
+             AND lifecycle_state = 'terminal'
+             AND (
+               (status = 'pass' AND decision = 'release')
+               OR (status = 'waived' AND decision = 'waive')
+               OR (status = 'not_applicable' AND decision = 'not_applicable')
+             )"#,
+    )
+    .bind(run.id.inner().to_string())
+    .fetch_one(pool)
+    .await
+    .context("count green terminal rollout_contract_checks for drift recompute")?;
+
+    Ok(green_terminal_count == 0)
 }
 
 #[derive(Clone, Debug)]
@@ -1577,6 +1634,89 @@ pub(crate) fn approved_proposal_rollout_contract_lint_failures(
     Ok(lint.failures)
 }
 
+pub(crate) fn materialize_missing_rollout_contract_fixture_placeholders(
+    data: &[u8],
+    proposal_path: &std::path::Path,
+    workspace_root: &str,
+) -> Result<Vec<std::path::PathBuf>> {
+    let proposal_value: serde_json::Value = match serde_json::from_slice(data) {
+        Ok(value) => value,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let Some(contract_source) =
+        extract_rollout_contract_source(&proposal_value, proposal_path, workspace_root)?
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(contract) = contract_source.contract.as_object() else {
+        return Ok(Vec::new());
+    };
+
+    let mut specs = Vec::new();
+    if let Some(readback_fixture) = contract
+        .get("readback_fixture")
+        .and_then(|value| value.as_str())
+    {
+        specs.push((readback_fixture.to_string(), "readback".to_string()));
+    }
+    if let Some(negative_fixtures) = contract
+        .get("negative_fixtures")
+        .and_then(|value| value.as_object())
+    {
+        for (name, path) in negative_fixtures {
+            if let Some(path) = path.as_str() {
+                specs.push((path.to_string(), format!("negative:{name}")));
+            }
+        }
+    }
+
+    let mut materialized = Vec::new();
+    for (relative_path, kind) in specs {
+        if !missing_rollout_fixture_path_is_materializable(&relative_path, workspace_root) {
+            continue;
+        }
+        let target = std::path::Path::new(workspace_root).join(&relative_path);
+        if target.exists() {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create rollout contract fixture placeholder directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let content = if kind == "readback" {
+            rollout_readback_placeholder(&proposal_value, &relative_path)
+        } else {
+            rollout_negative_fixture_placeholder(&proposal_value, &kind)
+        };
+        let bytes = serde_json::to_vec_pretty(&content)?;
+        std::fs::write(&target, bytes).with_context(|| {
+            format!(
+                "write rollout contract fixture placeholder {}",
+                target.display()
+            )
+        })?;
+        if let Err(failures) = canonical_repo_path(
+            &relative_path,
+            "rollout_contract_fixture_placeholder",
+            workspace_root,
+            &["docs/evidence/rollout-contract"],
+        ) {
+            let _ = std::fs::remove_file(&target);
+            anyhow::bail!(
+                "materialized rollout contract fixture placeholder failed safety check: {}",
+                failures.join("; ")
+            );
+        }
+        materialized.push(target);
+    }
+
+    Ok(materialized)
+}
+
 #[derive(Clone, Debug)]
 struct RolloutContractLint {
     failures: Vec<String>,
@@ -2034,7 +2174,10 @@ fn lint_rollout_contract(
         failures.extend(check_string_array(value, "hold_conditions", false));
     }
     if let Some(value) = object.get("hold_conditions_detail") {
-        failures.extend(check_string_array(value, "hold_conditions_detail", false));
+        failures.extend(check_string_array_or_string_map(
+            value,
+            "hold_conditions_detail",
+        ));
     }
 
     match object.get("rollback_disposition") {
@@ -2359,6 +2502,193 @@ fn check_path_safety(value: &str, context: &str) -> Vec<String> {
     Vec::new()
 }
 
+fn missing_rollout_fixture_path_is_materializable(value: &str, workspace_root: &str) -> bool {
+    if !check_path_safety(value, "rollout_contract_fixture_placeholder").is_empty() {
+        return false;
+    }
+    let relative = std::path::Path::new(value);
+    if !relative.starts_with("docs/evidence/rollout-contract") {
+        return false;
+    }
+    let workspace = std::path::Path::new(workspace_root);
+    let allowed_root = workspace.join("docs/evidence/rollout-contract");
+    let Ok(canonical_allowed_root) = allowed_root.canonicalize() else {
+        return false;
+    };
+    let target = workspace.join(relative);
+    let mut ancestor = target.parent();
+    while let Some(parent) = ancestor {
+        if parent.exists() {
+            let Ok(canonical_parent) = parent.canonicalize() else {
+                return false;
+            };
+            return canonical_parent.starts_with(&canonical_allowed_root);
+        }
+        ancestor = parent.parent();
+    }
+    false
+}
+
+fn rollout_readback_placeholder(
+    proposal: &serde_json::Value,
+    relative_path: &str,
+) -> serde_json::Value {
+    let proposal_revision_id = proposal
+        .get("proposal_revision_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or(DEFAULT_PROPOSAL_REVISION_ID);
+    let proposal_id = proposal
+        .get("title")
+        .and_then(|value| value.as_str())
+        .and_then(|title| {
+            title
+                .split_whitespace()
+                .find(|part| part.starts_with('P') && part[1..].chars().all(|c| c.is_ascii_digit()))
+        })
+        .unwrap_or(DEFAULT_PROPOSAL_ID);
+
+    let mcp_lane = rollout_readback_snake_lane_placeholder(
+        "mcp",
+        "Replace placeholder with concrete MCP readback evidence.",
+    );
+    let release_receipt_lane = rollout_readback_snake_lane_placeholder(
+        "release_receipt",
+        "Replace placeholder with concrete release receipt evidence.",
+    );
+    let graphql_lane = rollout_readback_graphql_lane_placeholder();
+
+    serde_json::json!({
+        "schema_version": "operator_readback_v1",
+        "fixture_purpose": "Engine materialized placeholder for a rollout_contract_v1 readback fixture declared by an approved proposal. Implementation must replace or update this fixture with concrete evidence before the proposal gate can be treated as release evidence.",
+        "proposal_id": proposal_id,
+        "proposal_revision_id": proposal_revision_id,
+        "source_lane": "run_report",
+        "placeholder": {
+            "materialized_by": "chainworks_engine",
+            "path": relative_path,
+            "status": "pending_implementation_evidence"
+        },
+        "rollout_contract_status": "fail",
+        "rollout_contract_decision": "hold",
+        "rollout_contract_failure_reasons": ["placeholder_pending_implementation_evidence"],
+        "rollout_contract_waiver_state": "none",
+        "rollout_contract_waiver_expires_at": null,
+        "rollout_contract_enforcement_mode": "enforce",
+        "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
+        "rollout_contract_hold_conditions": ["Replace engine materialized placeholder with proposal-specific rollout evidence."],
+        "rollout_contract_rollback_disposition": {
+            "mode": "not_applicable",
+            "data_loss_risk": "none"
+        },
+        "rollout_contract_source_lane": "run_report",
+        "rollout_contract_enabled_state": "disabled",
+        "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
+        "rollout_contract_action_id": null,
+        "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
+        "rollout_contract_projection_integrity": "stale",
+        "rollout_contract_cutover_policy_revision": null,
+        "rollout_contract_diagnostic_redaction": "none",
+        "rollout_contract_next_steps": ["Replace placeholder with concrete operator readback evidence."],
+        "parity_lanes": {
+            "mcp": mcp_lane,
+            "release_receipt": release_receipt_lane,
+            "graphql": graphql_lane
+        }
+    })
+}
+
+fn rollout_readback_snake_lane_placeholder(
+    source_lane: &str,
+    next_step: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "rollout_contract_status": "fail",
+        "rollout_contract_decision": "hold",
+        "rollout_contract_failure_reasons": ["placeholder_pending_implementation_evidence"],
+        "rollout_contract_waiver_state": "none",
+        "rollout_contract_waiver_expires_at": null,
+        "rollout_contract_enforcement_mode": "enforce",
+        "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
+        "rollout_contract_hold_conditions": ["Replace engine materialized placeholder with proposal-specific rollout evidence."],
+        "rollout_contract_rollback_disposition": {
+            "mode": "not_applicable",
+            "data_loss_risk": "none"
+        },
+        "rollout_contract_source_lane": source_lane,
+        "rollout_contract_enabled_state": "disabled",
+        "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
+        "rollout_contract_action_id": null,
+        "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
+        "rollout_contract_projection_integrity": "stale",
+        "rollout_contract_cutover_policy_revision": null,
+        "rollout_contract_diagnostic_redaction": "none",
+        "rollout_contract_next_steps": [next_step]
+    })
+}
+
+fn rollout_readback_graphql_lane_placeholder() -> serde_json::Value {
+    serde_json::json!({
+        "rolloutContractStatus": "fail",
+        "rolloutContractDecision": "hold",
+        "rolloutContractFailureReasons": ["placeholder_pending_implementation_evidence"],
+        "rolloutContractWaiverState": "none",
+        "rolloutContractWaiverExpiresAt": null,
+        "rolloutContractEnforcementMode": "enforce",
+        "rolloutContractEnforcementModeReason": "declared_fixture_placeholder",
+        "rolloutContractHoldConditions": ["Replace engine materialized placeholder with proposal-specific rollout evidence."],
+        "rolloutContractRollbackDisposition": {
+            "mode": "not_applicable",
+            "dataLossRisk": "none"
+        },
+        "rolloutContractSourceLane": "graphql",
+        "rolloutContractEnabledState": "disabled",
+        "rolloutContractDisabledReasonCode": "placeholder_pending_implementation_evidence",
+        "rolloutContractActionId": null,
+        "rolloutContractOperatorMessage": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
+        "rolloutContractProjectionIntegrity": "stale",
+        "rolloutContractCutoverPolicyRevision": null,
+        "rolloutContractDiagnosticRedaction": "none",
+        "rolloutContractNextSteps": ["Replace placeholder with concrete GraphQL readback evidence."]
+    })
+}
+
+fn rollout_negative_fixture_placeholder(
+    proposal: &serde_json::Value,
+    fixture_kind: &str,
+) -> serde_json::Value {
+    let gate_aliases = proposal
+        .get("rollout_contract_v1")
+        .and_then(|contract| contract.get("gate_aliases"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!(["proposal-placeholder"]));
+
+    serde_json::json!({
+        "schema_version": ROLLOUT_CONTRACT_SCHEMA_VERSION,
+        "applicability": "required",
+        "gate_aliases": gate_aliases,
+        "commands": {
+            "allowlist": []
+        },
+        "migrations": {
+            "not_applicable": true,
+            "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input."
+        },
+        "metrics": {
+            "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
+        },
+        "readback_lanes": ["run_report"],
+        "readback_fields": ["rollout_contract_status"],
+        "operator_report_fields": ["rollout_contract_status"],
+        "hold_conditions": ["placeholder negative fixture"],
+        "rollback_disposition": {
+            "mode": "not_applicable",
+            "data_loss_risk": "none"
+        },
+        "decision_vocabulary": ["pass", "fail"],
+        "placeholder_fixture_kind": fixture_kind
+    })
+}
+
 fn check_path_safety_under_root(
     value: &str,
     context: &str,
@@ -2486,6 +2816,24 @@ fn check_string_array(value: &serde_json::Value, context: &str, non_empty: bool)
                 failures.extend(check_control_chars(entry, &format!("{context}[{idx}]")))
             }
             None => failures.push(format!("invalid_{context}[{idx}]: entry must be a string")),
+        }
+    }
+    failures
+}
+
+fn check_string_array_or_string_map(value: &serde_json::Value, context: &str) -> Vec<String> {
+    if value.is_array() {
+        return check_string_array(value, context, false);
+    }
+    let Some(entries) = value.as_object() else {
+        return vec![format!("invalid_{context}: must be an array or object")];
+    };
+    let mut failures = Vec::new();
+    for (key, entry) in entries {
+        failures.extend(check_control_chars(key, &format!("{context}.{key}")));
+        match entry.as_str() {
+            Some(text) => failures.extend(check_control_chars(text, &format!("{context}.{key}"))),
+            None => failures.push(format!("invalid_{context}.{key}: value must be a string")),
         }
     }
     failures
@@ -2926,6 +3274,21 @@ fn projection_mismatches(
 }
 
 fn rollout_contract_check_projection_path(run: &Run) -> std::path::PathBuf {
+    if let Some(meta_root) = run
+        .chainworks_meta_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    {
+        let meta_root = std::path::Path::new(meta_root);
+        let root = if meta_root.is_absolute() {
+            meta_root.to_path_buf()
+        } else {
+            std::path::Path::new(&run.workspace_root).join(meta_root)
+        };
+        return root.join("readiness").join("rollout-contract-check.json");
+    }
+
     std::path::Path::new(&run.artifact_root)
         .join("readiness")
         .join("rollout-contract-check.json")
@@ -3439,6 +3802,36 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn rollout_contract_projection_path_uses_per_run_meta_root_when_available() {
+        let mut run = test_run();
+        run.chainworks_meta_root = Some(format!(".chainworks/runs/{}", run.id));
+
+        let path = rollout_contract_check_projection_path(&run);
+
+        assert_eq!(
+            path,
+            std::path::Path::new(&run.workspace_root)
+                .join(run.chainworks_meta_root.as_deref().unwrap())
+                .join("readiness")
+                .join("rollout-contract-check.json")
+        );
+    }
+
+    #[test]
+    fn rollout_contract_projection_path_preserves_legacy_artifact_root_fallback() {
+        let run = test_run();
+
+        let path = rollout_contract_check_projection_path(&run);
+
+        assert_eq!(
+            path,
+            std::path::Path::new(&run.artifact_root)
+                .join("readiness")
+                .join("rollout-contract-check.json")
+        );
+    }
+
     #[tokio::test]
     async fn retry_exhausted_record_holds_under_enforce_and_counts_attempts() {
         let dir = TempDir::new().unwrap();
@@ -3894,6 +4287,26 @@ mod tests {
     }
 
     #[test]
+    fn lint_accepts_hold_conditions_detail_string_map() {
+        let dir = TempDir::new().unwrap();
+        write_valid_rollout_contract_fixtures(dir.path());
+        let mut contract = valid_rollout_contract();
+        contract["hold_conditions_detail"] = serde_json::json!({
+            "missing_gate_alias": "Both aliases must run the same proof slice.",
+            "missing_schema_proof": "Every referenced schema symbol needs proof."
+        });
+
+        let workspace_root = dir.path().to_string_lossy();
+        let lint = lint_rollout_contract(&contract, &workspace_root);
+
+        assert!(
+            lint.failures.is_empty(),
+            "hold_conditions_detail map should be valid: {:?}",
+            lint.failures
+        );
+    }
+
+    #[test]
     fn lint_rejects_missing_readback_fixture_path() {
         let dir = TempDir::new().unwrap();
         write_valid_rollout_contract_fixtures(dir.path());
@@ -3925,6 +4338,67 @@ mod tests {
             .failures
             .iter()
             .any(|failure| failure.starts_with("missing_fixture_path: negative_fixtures.missing")));
+    }
+
+    #[test]
+    fn materialize_missing_rollout_fixture_placeholders_unblocks_declared_paths() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/evidence/rollout-contract")).unwrap();
+        let mut contract = valid_rollout_contract();
+        contract["readback_fixture"] = serde_json::json!(
+            "docs/evidence/rollout-contract/operator-readback/p085-test-full-surface.fixture.json"
+        );
+        contract["negative_fixtures"] = serde_json::json!({
+            "missing_affordance_row": "docs/evidence/rollout-contract/negative/p085-test-missing-affordance-row.json"
+        });
+        let proposal = serde_json::json!({
+            "title": "P085 fixture materialization test",
+            "proposal_revision_id": "p085-test-r1",
+            "rollout_contract_v1": contract
+        });
+        let data = serde_json::to_vec(&proposal).unwrap();
+        let proposal_path = dir.path().join("proposal.json");
+        let workspace_root = dir.path().to_string_lossy();
+
+        let before = approved_proposal_rollout_contract_lint_failures(
+            &data,
+            &proposal_path,
+            &workspace_root,
+        )
+        .unwrap();
+        assert!(before
+            .iter()
+            .any(|failure| failure.starts_with("missing_fixture_path: readback_fixture")));
+        assert!(before.iter().any(|failure| {
+            failure.starts_with("missing_fixture_path: negative_fixtures.missing_affordance_row")
+        }));
+
+        let materialized = materialize_missing_rollout_contract_fixture_placeholders(
+            &data,
+            &proposal_path,
+            &workspace_root,
+        )
+        .unwrap();
+
+        assert_eq!(materialized.len(), 2);
+        assert!(dir
+            .path()
+            .join("docs/evidence/rollout-contract/operator-readback/p085-test-full-surface.fixture.json")
+            .exists());
+        assert!(dir
+            .path()
+            .join("docs/evidence/rollout-contract/negative/p085-test-missing-affordance-row.json")
+            .exists());
+        let after = approved_proposal_rollout_contract_lint_failures(
+            &data,
+            &proposal_path,
+            &workspace_root,
+        )
+        .unwrap();
+        assert!(
+            after.is_empty(),
+            "materialized placeholders should satisfy path presence without weakening schema lint: {after:?}"
+        );
     }
 
     #[tokio::test]
@@ -4225,6 +4699,101 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("proposal_content_hash")));
+    }
+
+    #[tokio::test]
+    async fn missing_contract_check_recomputes_after_approved_proposal_repair() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+        run.artifact_root = dir
+            .path()
+            .join("run-artifacts")
+            .to_string_lossy()
+            .to_string();
+        apply_enforce_policy(&mut run);
+
+        let missing = implementation_run_start_rollout_contract_preflight(&pool, &run, None)
+            .await
+            .unwrap();
+        assert_eq!(missing.action, RolloutContractPreflightAction::Hold);
+        assert_eq!(missing.check.status, RolloutContractStatus::MissingContract);
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        let proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/084-executable-rollout-gates-and-observability-contract.md",
+            "proposal_revision_id": "p084-r5",
+            "rollout_contract_v1": valid_rollout_contract()
+        });
+        std::fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+
+        let repaired =
+            implementation_run_start_rollout_contract_preflight(&pool, &run, Some(&artifact))
+                .await
+                .unwrap();
+
+        assert_ne!(missing.check.id, repaired.check.id);
+        assert_eq!(repaired.action, RolloutContractPreflightAction::Allow);
+        assert_eq!(repaired.check.status, RolloutContractStatus::Pass);
+        assert_eq!(repaired.check.decision, RolloutContractDecision::Release);
+        assert_eq!(
+            repaired.check.projection_integrity,
+            ProjectionIntegrity::Valid
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_check_without_prior_green_recomputes_after_operator_repair() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = db::pool::create_pool(&url).await.unwrap();
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+        run.artifact_root = dir
+            .path()
+            .join("run-artifacts")
+            .to_string_lossy()
+            .to_string();
+        apply_enforce_policy(&mut run);
+
+        let missing = implementation_run_start_rollout_contract_preflight(&pool, &run, None)
+            .await
+            .unwrap();
+        assert_eq!(missing.check.status, RolloutContractStatus::MissingContract);
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        let proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/084-executable-rollout-gates-and-observability-contract.md",
+            "proposal_revision_id": "p084-r5",
+            "rollout_contract_v1": valid_rollout_contract()
+        });
+        std::fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+        let current_identity = current_contract_identity(&run, Some(&artifact))
+            .unwrap()
+            .unwrap();
+        let drift = current_identity.drift_from(&missing.check).unwrap();
+        let stale = upsert_hash_drift_contract_check(&pool, &missing.check, &drift, 0)
+            .await
+            .unwrap();
+        assert_eq!(stale.status, RolloutContractStatus::Stale);
+
+        let repaired =
+            implementation_run_start_rollout_contract_preflight(&pool, &run, Some(&artifact))
+                .await
+                .unwrap();
+
+        assert_ne!(stale.id, repaired.check.id);
+        assert_eq!(repaired.action, RolloutContractPreflightAction::Allow);
+        assert_eq!(repaired.check.status, RolloutContractStatus::Pass);
+        assert_eq!(repaired.check.decision, RolloutContractDecision::Release);
+        assert_eq!(
+            repaired.check.projection_integrity,
+            ProjectionIntegrity::Valid
+        );
     }
 
     #[tokio::test]
