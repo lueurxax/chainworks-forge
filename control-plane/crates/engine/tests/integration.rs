@@ -7189,6 +7189,7 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                 acp_pre_prompt_metadata_timeout: false,
                 acp_pre_prompt_metadata_digest_bytes: 0,
                 legacy_broad_discovery_snapshot: None,
+                runtime_receipt: None,
             })
         }
     }
@@ -7390,6 +7391,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                 acp_pre_prompt_metadata_timeout: false,
                 acp_pre_prompt_metadata_digest_bytes: 0,
                 legacy_broad_discovery_snapshot: None,
+                runtime_receipt: None,
             })
         }
     }
@@ -9936,6 +9938,7 @@ impl acp::adapters::AcpAdapter for ActivePromptCloseOnceAdapter {
             acp_pre_prompt_metadata_timeout: false,
             acp_pre_prompt_metadata_digest_bytes: 0,
             legacy_broad_discovery_snapshot: None,
+            runtime_receipt: None,
         })
     }
 }

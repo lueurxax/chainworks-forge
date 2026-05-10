@@ -1,5 +1,6 @@
 pub mod agent_execution_discovery_diagnostics;
 pub mod agent_execution_runtime_facts;
+pub mod agent_execution_runtime_receipts;
 pub mod agent_executions;
 pub mod agent_retry_budget_ledger;
 pub mod approvals;

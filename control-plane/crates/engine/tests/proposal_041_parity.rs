@@ -1673,6 +1673,7 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
             acp_pre_prompt_metadata_timeout: false,
             acp_pre_prompt_metadata_digest_bytes: 0,
             legacy_broad_discovery_snapshot: None,
+            runtime_receipt: None,
         })
     }
 }

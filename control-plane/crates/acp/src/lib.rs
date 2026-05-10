@@ -304,6 +304,8 @@ pub struct ExecutionResult {
     pub acp_pre_prompt_metadata_digest_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_broad_discovery_snapshot: Option<LegacyBroadDiscoverySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_receipt: Option<AcpRuntimeReceipt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,6 +315,109 @@ pub struct AcpCloseDiagnostic {
     #[serde(default)]
     pub provider_exit_status: Option<i64>,
     pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpRuntimeReceipt {
+    pub schema_version: i64,
+    pub transport_family: String,
+    pub provider: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub provider_session_id: Option<String>,
+    #[serde(default)]
+    pub session_generation_id: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub failure_phase: Option<String>,
+    pub started_at: String,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    pub xcode_shim_injected: bool,
+    pub requires_xcode_host_execution: bool,
+    pub handshake: AcpRuntimeReceiptHandshake,
+    pub counters: AcpRuntimeReceiptCounters,
+    #[serde(default)]
+    pub first_events: Vec<AcpRuntimeReceiptEvent>,
+    #[serde(default)]
+    pub last_events: Vec<AcpRuntimeReceiptEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AcpRuntimeReceiptHandshake {
+    #[serde(default)]
+    pub initialize_sent_at_ms: Option<u64>,
+    #[serde(default)]
+    pub initialize_received_at_ms: Option<u64>,
+    #[serde(default)]
+    pub session_new_sent_at_ms: Option<u64>,
+    #[serde(default)]
+    pub session_new_received_at_ms: Option<u64>,
+    #[serde(default)]
+    pub prompt_sent_at_ms: Option<u64>,
+    #[serde(default)]
+    pub terminal_response_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AcpRuntimeReceiptCounters {
+    pub total_messages: i64,
+    pub session_update_count: i64,
+    pub permission_request_count: i64,
+    pub permission_grant_sent_count: i64,
+    pub permission_grant_failed_count: i64,
+    pub agent_message_chunk_count: i64,
+    pub agent_thought_chunk_count: i64,
+    pub tool_call_count: i64,
+    pub tool_call_update_count: i64,
+    pub plan_update_count: i64,
+    pub meaningful_progress_count: i64,
+    pub unknown_notification_count: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpRuntimeReceiptEvent {
+    pub at_ms: u64,
+    pub kind: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct AcpExecutionError {
+    message: String,
+    runtime_receipt: Option<AcpRuntimeReceipt>,
+}
+
+impl AcpExecutionError {
+    pub fn new(message: impl Into<String>, runtime_receipt: Option<AcpRuntimeReceipt>) -> Self {
+        Self {
+            message: message.into(),
+            runtime_receipt,
+        }
+    }
+
+    pub fn runtime_receipt(&self) -> Option<&AcpRuntimeReceipt> {
+        self.runtime_receipt.as_ref()
+    }
+}
+
+impl std::fmt::Display for AcpExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AcpExecutionError {}
+
+pub fn runtime_receipt_from_error(error: &anyhow::Error) -> Option<&AcpRuntimeReceipt> {
+    for cause in error.chain() {
+        if let Some(error) = cause.downcast_ref::<AcpExecutionError>() {
+            return error.runtime_receipt();
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

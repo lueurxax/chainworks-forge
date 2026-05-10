@@ -3,9 +3,10 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 
 use db::repos::{
-    agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
-    artifact_contracts, artifacts, closeout, lead_conflict_mediations, legacy_discovery_overrides,
-    rollout_contract_checks, sessions, validation, workflow_conflicts,
+    agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
+    agent_execution_runtime_receipts, agent_executions, artifact_contracts, artifacts, closeout,
+    lead_conflict_mediations, legacy_discovery_overrides, rollout_contract_checks, sessions,
+    validation, workflow_conflicts,
 };
 use db::write_class::WriteLane;
 use db::writer::class_a_operation;
@@ -330,6 +331,8 @@ async fn mediation_execution_attempts_json(
         let attempt_number = (idx + 1) as i64;
         let runtime_facts =
             agent_execution_runtime_facts::find_by_execution_id(pool, execution.id).await?;
+        let runtime_receipt =
+            agent_execution_runtime_receipts::find_by_execution_id(pool, execution.id).await?;
 
         let runtime_facts_summary = runtime_facts
             .as_ref()
@@ -343,6 +346,19 @@ async fn mediation_execution_attempts_json(
                     "ignored_late_output_count": f.ignored_late_output_count,
                     "operator_action_hint": f.operator_action_hint.as_ref().map(|h| format!("{:?}", h).to_lowercase()),
                 })
+            })
+            .unwrap_or(serde_json::Value::Null);
+        let runtime_receipt_summary = runtime_receipt
+            .as_ref()
+            .map(|receipt| {
+                serde_json::from_str::<serde_json::Value>(&receipt.receipt_json).unwrap_or_else(
+                    |error| {
+                        serde_json::json!({
+                            "parse_error": error.to_string(),
+                            "raw_receipt_available": true,
+                        })
+                    },
+                )
             })
             .unwrap_or(serde_json::Value::Null);
 
@@ -456,6 +472,7 @@ async fn mediation_execution_attempts_json(
             "completed_at": execution.completed_at.map(|t| t.to_rfc3339()),
             "attempt_number": attempt_number,
             "runtime_facts": runtime_facts_summary,
+            "runtime_receipt": runtime_receipt_summary,
             "watchdog": watchdog,
             // P017 R4 / API-002: cost + transcript_ref are now populated
             // from per-execution columns when the provider reported
@@ -512,6 +529,11 @@ pub(crate) async fn execution_mcp_truth_json(
             (execution_id, facts)
         })
         .collect::<HashMap<_, _>>();
+    let runtime_receipts = agent_execution_runtime_receipts::list_by_run(pool, run_id).await?;
+    let runtime_receipts_by_execution_id: HashMap<_, _> = runtime_receipts
+        .into_iter()
+        .map(|receipt| (receipt.agent_execution_id.to_string(), receipt))
+        .collect::<HashMap<_, _>>();
     let discovery_diagnostics =
         agent_execution_discovery_diagnostics::list_readback_by_run(pool, run_id).await?;
     let discovery_diagnostics_by_execution_id: HashMap<_, _> = discovery_diagnostics
@@ -531,7 +553,14 @@ pub(crate) async fn execution_mcp_truth_json(
                 if reconciliation_pending {
                     facts.valid_required_outputs = false;
                 }
-                runtime_facts_json(pool, &execution, &facts, include_operator_debug).await?
+                runtime_facts_json(
+                    pool,
+                    &execution,
+                    &facts,
+                    runtime_receipts_by_execution_id.get(&execution_id),
+                    include_operator_debug,
+                )
+                .await?
             }
             None => {
                 let mut facts =
@@ -539,7 +568,14 @@ pub(crate) async fn execution_mcp_truth_json(
                 if reconciliation_pending {
                     facts.valid_required_outputs = false;
                 }
-                runtime_facts_json(pool, &execution, &facts, include_operator_debug).await?
+                runtime_facts_json(
+                    pool,
+                    &execution,
+                    &facts,
+                    runtime_receipts_by_execution_id.get(&execution_id),
+                    include_operator_debug,
+                )
+                .await?
             }
         };
         let discovery_diagnostics = match discovery_diagnostics_readback {
@@ -651,6 +687,7 @@ async fn runtime_facts_json(
     pool: &SqlitePool,
     execution: &AgentExecution,
     facts: &AgentExecutionRuntimeFacts,
+    runtime_receipt: Option<&domain::agent::AgentExecutionRuntimeReceiptRecord>,
     include_operator_debug: bool,
 ) -> Result<serde_json::Value> {
     let lineage = match execution.session_lineage_id.as_deref() {
@@ -677,6 +714,18 @@ async fn runtime_facts_json(
             }
             _ => None,
         };
+    let runtime_receipt = runtime_receipt
+        .map(|receipt| {
+            serde_json::from_str::<serde_json::Value>(&receipt.receipt_json).unwrap_or_else(
+                |error| {
+                    serde_json::json!({
+                        "parse_error": error.to_string(),
+                        "raw_receipt_available": true,
+                    })
+                },
+            )
+        })
+        .unwrap_or(serde_json::Value::Null);
     Ok(serde_json::json!({
         "agent_execution_id": facts.agent_execution_id.to_string(),
         "failure_kind": facts.failure_kind.as_ref().map(ToString::to_string),
@@ -708,6 +757,7 @@ async fn runtime_facts_json(
         "fresh_provider_process": fresh_provider_process_for_disposition(execution.session_reuse_disposition.as_deref()),
         "rehydrated_from_checkpoint_artifact_id": execution.rehydrated_from_checkpoint_artifact_id.clone(),
         "quota_ledger_id": facts.quota_ledger_id.clone(),
+        "runtime_receipt": runtime_receipt,
         "created_at": facts.created_at.to_rfc3339(),
         "updated_at": facts.updated_at.to_rfc3339(),
     }))

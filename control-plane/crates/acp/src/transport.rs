@@ -36,7 +36,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     AcpCloseDiagnostic, AcpMcpServerPayload, AcpPromptProgressKind, AcpPromptProgressSink,
-    AcpPromptProgressUpdate, DiscoveredArtifact, DiscoveredArtifactSourceKind, ExecutionRequest,
+    AcpPromptProgressUpdate, AcpRuntimeReceipt, AcpRuntimeReceiptCounters, AcpRuntimeReceiptEvent,
+    AcpRuntimeReceiptHandshake, DiscoveredArtifact, DiscoveredArtifactSourceKind, ExecutionRequest,
     McpActualObservation, NoopAcpPromptProgressSink, ResolvedMcpServerTransport, UsageSnapshot,
 };
 
@@ -368,6 +369,7 @@ const ACP_NDJSON_LINE_OVERHEAD_BYTES: usize = 64 * 1024;
 const MAX_STREAMED_TRANSCRIPT_BYTES: usize = 10 * 1024 * 1024;
 const STREAMED_TRANSCRIPT_TRUNCATION_MARKER: &str =
     "\n[chainworks transcript truncated at 10485760 bytes]\n";
+const RUNTIME_RECEIPT_EVENT_SAMPLE_LIMIT: usize = 8;
 
 #[derive(Clone, Debug, Default)]
 struct ClaudeLocalActivitySummary {
@@ -1796,6 +1798,243 @@ pub struct AcpTransportSession {
     discovery_filesystem: Box<dyn DiscoveryFilesystem>,
     request_counter: u64,
     closed: bool,
+    provider: String,
+    model: Option<String>,
+    xcode_shim_injected: bool,
+    requires_xcode_host_execution: bool,
+    last_runtime_receipt: Option<AcpRuntimeReceipt>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeReceiptTracker {
+    started_at_wall: chrono::DateTime<chrono::Utc>,
+    started_at_mono: Instant,
+    handshake: AcpRuntimeReceiptHandshake,
+    counters: AcpRuntimeReceiptCounters,
+    first_events: Vec<AcpRuntimeReceiptEvent>,
+    last_events: Vec<AcpRuntimeReceiptEvent>,
+    last_event_kind: Option<String>,
+    last_event_at_ms: Option<u64>,
+}
+
+impl RuntimeReceiptTracker {
+    fn new(started_at_wall: chrono::DateTime<chrono::Utc>, started_at_mono: Instant) -> Self {
+        Self {
+            started_at_wall,
+            started_at_mono,
+            handshake: AcpRuntimeReceiptHandshake::default(),
+            counters: AcpRuntimeReceiptCounters::default(),
+            first_events: Vec::new(),
+            last_events: Vec::new(),
+            last_event_kind: None,
+            last_event_at_ms: None,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started_at_mono.elapsed().as_millis() as u64
+    }
+
+    fn push_event(&mut self, kind: impl Into<String>, detail: Option<String>) {
+        let at_ms = self.elapsed_ms();
+        let event = AcpRuntimeReceiptEvent {
+            at_ms,
+            kind: kind.into(),
+            detail: detail.map(|detail| truncate_runtime_receipt_detail(&detail)),
+        };
+        if self.first_events.len() < RUNTIME_RECEIPT_EVENT_SAMPLE_LIMIT {
+            self.first_events.push(event.clone());
+        }
+        self.last_events.push(event.clone());
+        if self.last_events.len() > RUNTIME_RECEIPT_EVENT_SAMPLE_LIMIT {
+            self.last_events.remove(0);
+        }
+        self.last_event_kind = Some(event.kind.clone());
+        self.last_event_at_ms = Some(at_ms);
+    }
+
+    fn note_initialize_sent(&mut self) {
+        self.handshake.initialize_sent_at_ms = Some(self.elapsed_ms());
+        self.push_event("initialize_sent", None);
+    }
+
+    fn note_initialize_received(&mut self) {
+        self.handshake.initialize_received_at_ms = Some(self.elapsed_ms());
+        self.push_event("initialize_received", None);
+    }
+
+    fn note_session_new_sent(&mut self) {
+        self.handshake.session_new_sent_at_ms = Some(self.elapsed_ms());
+        self.push_event("session_new_sent", None);
+    }
+
+    fn note_session_new_received(&mut self, session_id: &str) {
+        self.handshake.session_new_received_at_ms = Some(self.elapsed_ms());
+        self.push_event(
+            "session_new_received",
+            Some(format!("session_id={session_id}")),
+        );
+    }
+
+    fn note_prompt_sent(&mut self) {
+        self.handshake.prompt_sent_at_ms = Some(self.elapsed_ms());
+        self.push_event("prompt_sent", None);
+    }
+
+    fn note_terminal_response(&mut self, status: &str) {
+        self.handshake.terminal_response_at_ms = Some(self.elapsed_ms());
+        self.push_event("terminal_response", Some(format!("status={status}")));
+    }
+
+    fn note_incoming_message(&mut self, detail: Option<String>) {
+        self.counters.total_messages += 1;
+        self.push_event("incoming_message", detail);
+    }
+
+    fn note_permission_request(&mut self, detail: Option<String>) {
+        self.counters.permission_request_count += 1;
+        self.push_event("permission_request", detail);
+    }
+
+    fn note_permission_grant_sent(&mut self, detail: Option<String>) {
+        self.counters.permission_grant_sent_count += 1;
+        self.counters.meaningful_progress_count += 1;
+        self.push_event("permission_grant_sent", detail);
+    }
+
+    fn note_permission_grant_failed(&mut self, detail: Option<String>) {
+        self.counters.permission_grant_failed_count += 1;
+        self.push_event("permission_grant_failed", detail);
+    }
+
+    fn note_session_update(
+        &mut self,
+        kind: &str,
+        meaningful_progress: bool,
+        detail: Option<String>,
+    ) {
+        self.counters.session_update_count += 1;
+        match kind {
+            "agent_message_chunk" => self.counters.agent_message_chunk_count += 1,
+            "agent_thought_chunk" => self.counters.agent_thought_chunk_count += 1,
+            "tool_call" => self.counters.tool_call_count += 1,
+            "tool_call_update" => self.counters.tool_call_update_count += 1,
+            "plan" => self.counters.plan_update_count += 1,
+            _ => self.counters.unknown_notification_count += 1,
+        }
+        if meaningful_progress {
+            self.counters.meaningful_progress_count += 1;
+        }
+        self.push_event(format!("session_update:{kind}"), detail);
+    }
+
+    fn build(
+        &self,
+        provider: &str,
+        model: Option<&String>,
+        provider_session_id: &str,
+        session_generation_id: Option<&String>,
+        xcode_shim_injected: bool,
+        requires_xcode_host_execution: bool,
+        status: &str,
+        failure_phase: Option<String>,
+    ) -> AcpRuntimeReceipt {
+        AcpRuntimeReceipt {
+            schema_version: 1,
+            transport_family: "acp_stdio".to_string(),
+            provider: provider.to_string(),
+            model: model.cloned(),
+            provider_session_id: Some(provider_session_id.to_string()),
+            session_generation_id: session_generation_id.cloned(),
+            status: status.to_string(),
+            failure_phase,
+            started_at: self.started_at_wall.to_rfc3339(),
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            xcode_shim_injected,
+            requires_xcode_host_execution,
+            handshake: self.handshake.clone(),
+            counters: self.counters.clone(),
+            first_events: self.first_events.clone(),
+            last_events: self.last_events.clone(),
+        }
+    }
+}
+
+fn truncate_runtime_receipt_detail(detail: &str) -> String {
+    const LIMIT: usize = 240;
+    if detail.len() <= LIMIT {
+        detail.to_string()
+    } else {
+        format!("{}…", &detail[..LIMIT])
+    }
+}
+
+fn session_update_observation(parsed: &Value) -> (&'static str, bool, Option<String>) {
+    let mut type_markers = Vec::new();
+    collect_nested_type_markers(parsed, &mut type_markers);
+    let has_text_progress = extract_text_chunk(parsed)
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|chunk| !chunk.is_empty());
+    let kind = if type_markers
+        .iter()
+        .any(|marker| marker == "tool_call_update")
+    {
+        "tool_call_update"
+    } else if type_markers.iter().any(|marker| marker == "tool_call") {
+        "tool_call"
+    } else if type_markers
+        .iter()
+        .any(|marker| marker == "agent_message_chunk")
+    {
+        "agent_message_chunk"
+    } else if type_markers
+        .iter()
+        .any(|marker| marker == "agent_thought_chunk")
+    {
+        "agent_thought_chunk"
+    } else if type_markers.iter().any(|marker| marker == "plan") {
+        "plan"
+    } else if has_text_progress {
+        "text_chunk"
+    } else {
+        "other"
+    };
+    let meaningful_progress = matches!(
+        kind,
+        "tool_call_update"
+            | "tool_call"
+            | "agent_message_chunk"
+            | "agent_thought_chunk"
+            | "plan"
+            | "text_chunk"
+    );
+    let detail = (!type_markers.is_empty())
+        .then(|| type_markers.join(","))
+        .or_else(|| has_text_progress.then(|| "text_progress".to_string()));
+    (kind, meaningful_progress, detail)
+}
+
+fn collect_nested_type_markers(value: &Value, markers: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(marker) = map.get("type").and_then(Value::as_str) {
+                let marker = marker.to_string();
+                if !markers.iter().any(|existing| existing == &marker) {
+                    markers.push(marker);
+                }
+            }
+            for nested in map.values() {
+                collect_nested_type_markers(nested, markers);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_nested_type_markers(item, markers);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn record_prompt_progress_for_session(
@@ -1900,6 +2139,7 @@ impl AcpTransportSession {
         config: &AcpSessionConfig<'_>,
         discovery_filesystem: Box<dyn DiscoveryFilesystem>,
     ) -> Result<Self> {
+        let startup_wall_started = chrono::Utc::now();
         let startup_started = Instant::now();
         let mut stdin = child
             .stdin
@@ -1993,6 +2233,8 @@ impl AcpTransportSession {
         );
         let init_id = next_id!();
         let initialize_started = Instant::now();
+        let mut startup_receipt = RuntimeReceiptTracker::new(startup_wall_started, startup_started);
+        startup_receipt.note_initialize_sent();
         send_ndjson(
             &mut stdin,
             &serde_json::json!({
@@ -2014,6 +2256,7 @@ impl AcpTransportSession {
         await_response(&mut reader, init_id, HANDSHAKE_TIMEOUT)
             .await
             .context("ACP: initialize handshake")?;
+        startup_receipt.note_initialize_received();
         let acp_initialize_latency_ms = initialize_started.elapsed().as_millis() as u64;
         info!(
             run_id = %req.run_id,
@@ -2027,6 +2270,7 @@ impl AcpTransportSession {
         let sn_params =
             build_session_new_params(req, config).context("ACP: build session/new params")?;
         let session_new_started = Instant::now();
+        startup_receipt.note_session_new_sent();
         {
             send_ndjson(
                 &mut stdin,
@@ -2057,6 +2301,7 @@ impl AcpTransportSession {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("ACP session/new response missing 'sessionId' field"))?
             .to_string();
+        startup_receipt.note_session_new_received(&session_id);
         let mcp_observation = observe_mcp_actuals(&sn_result, req, &session_id);
         let mcp_session_startup_latency_ms = mcp_observation
             .as_ref()
@@ -2163,6 +2408,17 @@ impl AcpTransportSession {
             );
         }
 
+        let last_runtime_receipt = Some(startup_receipt.build(
+            &req.provider,
+            req.model.as_ref(),
+            &session_id,
+            req.session_generation_id.as_ref(),
+            req.xcode_shim_injection_signal,
+            req.requires_xcode_host_execution,
+            "session_ready",
+            None,
+        ));
+
         Ok(Self {
             child,
             stdin,
@@ -2178,6 +2434,11 @@ impl AcpTransportSession {
             discovery_filesystem,
             request_counter: req_counter,
             closed: false,
+            provider: req.provider.clone(),
+            model: req.model.clone(),
+            xcode_shim_injected: req.xcode_shim_injection_signal,
+            requires_xcode_host_execution: req.requires_xcode_host_execution,
+            last_runtime_receipt,
         })
     }
 
@@ -2211,6 +2472,10 @@ impl AcpTransportSession {
 
     pub fn acp_session_new_latency_ms(&self) -> u64 {
         self.acp_session_new_latency_ms
+    }
+
+    pub fn runtime_receipt(&self) -> Option<&AcpRuntimeReceipt> {
+        self.last_runtime_receipt.as_ref()
     }
 
     pub fn is_alive(&mut self) -> bool {
@@ -2366,6 +2631,38 @@ impl AcpTransportSession {
         u64,
         Option<LegacyBroadDiscoverySnapshot>,
     )> {
+        let startup_offset_ms = if req.reuse_existing_session {
+            0
+        } else {
+            self.acp_pre_initialize_local_latency_ms
+                + self.acp_initialize_latency_ms
+                + self.acp_session_new_latency_ms
+        };
+        let runtime_started_mono = Instant::now() - Duration::from_millis(startup_offset_ms);
+        let runtime_started_wall =
+            chrono::Utc::now() - chrono::Duration::milliseconds(startup_offset_ms as i64);
+        let mut runtime_receipt =
+            RuntimeReceiptTracker::new(runtime_started_wall, runtime_started_mono);
+        if req.reuse_existing_session {
+            runtime_receipt.push_event(
+                "session_reused",
+                req.session_generation_id
+                    .as_ref()
+                    .map(|generation_id| format!("generation_id={generation_id}")),
+            );
+        } else {
+            runtime_receipt.handshake.initialize_sent_at_ms =
+                Some(self.acp_pre_initialize_local_latency_ms);
+            runtime_receipt.handshake.initialize_received_at_ms =
+                Some(self.acp_pre_initialize_local_latency_ms + self.acp_initialize_latency_ms);
+            runtime_receipt.handshake.session_new_sent_at_ms =
+                runtime_receipt.handshake.initialize_received_at_ms;
+            runtime_receipt.handshake.session_new_received_at_ms = Some(
+                self.acp_pre_initialize_local_latency_ms
+                    + self.acp_initialize_latency_ms
+                    + self.acp_session_new_latency_ms,
+            );
+        }
         let typed_expected_outputs = !req.expected_outputs.is_empty();
         let expected_baseline_paths: Vec<&str> = if typed_expected_outputs {
             Vec::new()
@@ -2448,7 +2745,7 @@ impl AcpTransportSession {
         let prompt_started_at = SystemTime::now();
         let mut claude_local_activity =
             ClaudeLocalActivityMonitor::for_request(req, &self.session_id);
-        send_ndjson(
+        if let Err(error) = send_ndjson(
             &mut self.stdin,
             &serde_json::json!({
                 "jsonrpc": "2.0",
@@ -2461,7 +2758,21 @@ impl AcpTransportSession {
             }),
         )
         .await
-        .context("ACP: send session/prompt")?;
+        .context("ACP: send session/prompt")
+        {
+            self.last_runtime_receipt = Some(runtime_receipt.build(
+                &self.provider,
+                self.model.as_ref(),
+                &self.session_id,
+                req.session_generation_id.as_ref(),
+                self.xcode_shim_injected,
+                self.requires_xcode_host_execution,
+                "failed",
+                Some("prompt_send_failed".to_string()),
+            ));
+            return Err(error);
+        }
+        runtime_receipt.note_prompt_sent();
         self.record_prompt_progress(req, &progress_sink, AcpPromptProgressKind::PromptSent)
             .await;
 
@@ -2476,6 +2787,7 @@ impl AcpTransportSession {
         let mut latest_usage_snapshot = None;
         let mut xcode_shim_warning_events = Vec::new();
         let mut seen_xcode_warning_keys = HashSet::new();
+        let mut failure_phase: Option<String> = None;
 
         'streaming: loop {
             poll_claude_local_activity_watchdog(
@@ -2507,7 +2819,18 @@ impl AcpTransportSession {
                     .as_ref()
                     .map(|monitor| monitor.summary_for_error())
                     .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
-                bail!(
+                failure_phase = Some("idle_timeout".to_string());
+                self.last_runtime_receipt = Some(runtime_receipt.build(
+                    &self.provider,
+                    self.model.as_ref(),
+                    &self.session_id,
+                    req.session_generation_id.as_ref(),
+                    self.xcode_shim_injected,
+                    self.requires_xcode_host_execution,
+                    "failed",
+                    failure_phase.clone(),
+                ));
+                return Err(anyhow::anyhow!(
                     "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
                     IDLE_TIMEOUT.as_secs(),
                     self.session_id,
@@ -2515,7 +2838,7 @@ impl AcpTransportSession {
                     last_provider_local_activity
                         .map(|instant| instant.elapsed().as_secs().to_string())
                         .unwrap_or_else(|| "none".to_string())
-                );
+                ));
             }
             let effective_last_progress =
                 max_instant_option(last_acp_progress, last_provider_local_progress);
@@ -2531,11 +2854,22 @@ impl AcpTransportSession {
                         }
                     })
                     .unwrap_or("idle_hang_before_first_progress");
-                bail!(
+                failure_phase = Some("progress_timeout".to_string());
+                self.last_runtime_receipt = Some(runtime_receipt.build(
+                    &self.provider,
+                    self.model.as_ref(),
+                    &self.session_id,
+                    req.session_generation_id.as_ref(),
+                    self.xcode_shim_injected,
+                    self.requires_xcode_host_execution,
+                    "failed",
+                    failure_phase.clone(),
+                ));
+                return Err(anyhow::anyhow!(
                     "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={})",
                     PROGRESS_TIMEOUT.as_secs(),
                     self.session_id
-                );
+                ));
             }
             let remaining_idle = IDLE_TIMEOUT - idle;
             let remaining_progress = PROGRESS_TIMEOUT - progress_idle;
@@ -2583,6 +2917,7 @@ impl AcpTransportSession {
                     match read_outcome {
                         AcpPromptReadOutcome::CloseRequested => {
                             close_requested = true;
+                            failure_phase = Some("prompt_closed_during_stream".to_string());
                             break Err(anyhow::anyhow!(
                                 "ACP session closed during active prompt (session={session_id})"
                             ));
@@ -2626,6 +2961,7 @@ impl AcpTransportSession {
                                     .unwrap_or_else(|| {
                                         "provider_local_activity=unavailable".to_string()
                                     });
+                                failure_phase = Some("idle_timeout".to_string());
                                 break Err(anyhow::anyhow!(
                                     "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
                                     IDLE_TIMEOUT.as_secs(),
@@ -2650,6 +2986,7 @@ impl AcpTransportSession {
                                         }
                                     })
                                     .unwrap_or("idle_hang_before_first_progress");
+                                failure_phase = Some("progress_timeout".to_string());
                                 break Err(anyhow::anyhow!(
                                     "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={})",
                                     PROGRESS_TIMEOUT.as_secs(),
@@ -2659,6 +2996,7 @@ impl AcpTransportSession {
                             continue;
                         }
                         AcpPromptReadOutcome::PollElapsed => {
+                            failure_phase = Some("read_poll_elapsed_without_message".to_string());
                             break Err(anyhow::anyhow!(
                                 "ACP session idle timeout — no message received"
                             ));
@@ -2669,13 +3007,42 @@ impl AcpTransportSession {
             if close_requested {
                 let _ = self.close().await;
             }
-            let n = n_result?;
+            let n = match n_result {
+                Ok(n) => n,
+                Err(error) => {
+                    self.last_runtime_receipt = Some(
+                        runtime_receipt.build(
+                            &self.provider,
+                            self.model.as_ref(),
+                            &self.session_id,
+                            req.session_generation_id.as_ref(),
+                            self.xcode_shim_injected,
+                            self.requires_xcode_host_execution,
+                            "failed",
+                            failure_phase
+                                .clone()
+                                .or_else(|| Some("prompt_stream_failed".to_string())),
+                        ),
+                    );
+                    return Err(error);
+                }
+            };
 
             if n == 0 {
-                bail!(
+                self.last_runtime_receipt = Some(runtime_receipt.build(
+                    &self.provider,
+                    self.model.as_ref(),
+                    &self.session_id,
+                    req.session_generation_id.as_ref(),
+                    self.xcode_shim_injected,
+                    self.requires_xcode_host_execution,
+                    "failed",
+                    Some("stdout_closed_before_terminal_response".to_string()),
+                ));
+                return Err(anyhow::anyhow!(
                     "ACP stdout closed before terminal response (session={})",
                     self.session_id
-                );
+                ));
             }
 
             let trimmed = line.trim();
@@ -2688,6 +3055,12 @@ impl AcpTransportSession {
                 Err(_) => continue,
             };
             last_acp_activity = Instant::now();
+            runtime_receipt.note_incoming_message(
+                parsed
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .map(|method| format!("method={method}")),
+            );
             debug!(msg = %trimmed, "ACP ← subprocess (stream)");
             if last_prompt_progress_reported
                 .map(|reported_at| reported_at.elapsed() >= PROMPT_PROGRESS_REPORT_INTERVAL)
@@ -2716,16 +3089,22 @@ impl AcpTransportSession {
                     "session/request_permission" => {
                         if let Some(req_id) = parsed.get("id") {
                             let params = parsed.get("params").cloned().unwrap_or(Value::Null);
+                            runtime_receipt.note_permission_request(Some(format!("id={req_id}")));
                             debug!(
                                 session_id = %self.session_id,
                                 "ACP: auto-granting permission request id={req_id}"
                             );
                             if let Some(grant) = build_permission_grant(req_id, &params) {
                                 if let Err(e) = send_ndjson(&mut self.stdin, &grant).await {
+                                    runtime_receipt
+                                        .note_permission_grant_failed(Some(e.to_string()));
                                     warn!(
                                         session_id = %self.session_id,
                                         "ACP: failed to send permission grant: {e}"
                                     );
+                                } else {
+                                    runtime_receipt
+                                        .note_permission_grant_sent(Some(format!("id={req_id}")));
                                 }
                                 last_acp_progress = Instant::now();
                                 if last_prompt_progress_reported
@@ -2748,6 +3127,13 @@ impl AcpTransportSession {
                     }
                     "session/update" => {
                         debug!(session_id = %self.session_id, "ACP: session/update notification");
+                        let (update_kind, meaningful_progress, detail) =
+                            session_update_observation(&parsed);
+                        runtime_receipt.note_session_update(
+                            update_kind,
+                            meaningful_progress,
+                            detail,
+                        );
                         for warning in residual_xcode_path_warnings_from_update(&parsed) {
                             let dedupe_key = format!(
                                 "{}\u{1f}{}\u{1f}{}",
@@ -2794,6 +3180,17 @@ impl AcpTransportSession {
                 if id == prompt_id {
                     if parsed.get("error").is_some() {
                         let err_msg = parsed["error"]["message"].as_str().unwrap_or("ACP error");
+                        runtime_receipt.note_terminal_response("failed");
+                        self.last_runtime_receipt = Some(runtime_receipt.build(
+                            &self.provider,
+                            self.model.as_ref(),
+                            &self.session_id,
+                            req.session_generation_id.as_ref(),
+                            self.xcode_shim_injected,
+                            self.requires_xcode_host_execution,
+                            "failed",
+                            Some("prompt_error_response".to_string()),
+                        ));
                         warn!(
                             session_id = %self.session_id,
                             "ACP session/prompt returned error: {err_msg}"
@@ -2823,6 +3220,7 @@ impl AcpTransportSession {
                             &mut streamed_text_truncated,
                         );
                     }
+                    runtime_receipt.note_terminal_response("completed");
                     break 'streaming;
                 }
                 continue;
@@ -2840,6 +3238,16 @@ impl AcpTransportSession {
             acp_prompt_duration_ms = acp_prompt_duration_ms,
             "P053 ACP prompt duration measured"
         );
+        self.last_runtime_receipt = Some(runtime_receipt.build(
+            &self.provider,
+            self.model.as_ref(),
+            &self.session_id,
+            req.session_generation_id.as_ref(),
+            self.xcode_shim_injected,
+            self.requires_xcode_host_execution,
+            "completed",
+            None,
+        ));
 
         let post_files = legacy_broad_discovery_enabled.then(|| {
             let recorder = NoopDiscoveryOperationRecorder;

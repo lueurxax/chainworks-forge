@@ -25,6 +25,8 @@ nonisolated enum SupervisionClassification: String, Codable, Sendable, Equatable
     case idleHangAfterProgress = "idle_hang_after_progress"
     case idleHangReadLoop = "idle_hang_read_loop"
     case idleHangAfterFirstEdit = "idle_hang_after_first_edit"
+    case waitingOnPermissionRoundtrip = "waiting_on_permission_roundtrip"
+    case providerActiveWithoutTerminalResponse = "provider_active_without_terminal_response"
     case mutationSideEffectMissing = "mutation_side_effect_missing"
 
     var defaultSummary: String {
@@ -37,6 +39,10 @@ nonisolated enum SupervisionClassification: String, Codable, Sendable, Equatable
             return "Execution stalled in a weak read loop without strong progress"
         case .idleHangAfterFirstEdit:
             return "Execution stalled after the first edit boundary"
+        case .waitingOnPermissionRoundtrip:
+            return "Execution stalled while waiting for a permission round-trip to settle"
+        case .providerActiveWithoutTerminalResponse:
+            return "Execution stayed active and emitted progress, but never produced a terminal response"
         case .mutationSideEffectMissing:
             return "Mutating tool reported success, but no filesystem side effect was observed"
         }

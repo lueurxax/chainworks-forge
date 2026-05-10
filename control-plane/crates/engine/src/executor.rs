@@ -20,17 +20,18 @@ use crate::release::{
 };
 use acp::AcpRuntimeManager;
 use db::repos::{
-    agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
-    agent_retry_budget_ledger, artifact_contracts, artifacts, evidence_spool_refs, ideas,
-    legacy_discovery_overrides, projections, rollout_contract_checks, scheduler, sessions, stages,
-    validation, work_items, workflow_conflicts,
+    agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
+    agent_execution_runtime_receipts, agent_executions, agent_retry_budget_ledger,
+    artifact_contracts, artifacts, evidence_spool_refs, ideas, legacy_discovery_overrides,
+    projections, rollout_contract_checks, scheduler, sessions, stages, validation, work_items,
+    workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::{WriteLane, WriteResult};
 use db::writer::{class_a_operation, DbWriter};
 use domain::agent::{
-    AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement, AgentStatus,
-    OperatorActionHint,
+    AgentExecutionRuntimeFacts, AgentExecutionRuntimeReceiptRecord, AgentFailureKind,
+    AgentOutputSettlement, AgentStatus, OperatorActionHint,
 };
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::artifact_contracts::{
@@ -1719,7 +1720,60 @@ fn runtime_facts_for_acp_error(
     facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
     facts.transport_error_code = classification.transport_error_code;
     facts.supervision_classification = classification.supervision_classification;
+    if let Some(receipt) = acp::runtime_receipt_from_error(error) {
+        enrich_runtime_facts_with_receipt(&mut facts, receipt);
+    }
     facts
+}
+
+fn runtime_receipt_record_from_receipt(
+    agent_exec_id: domain::ids::AgentExecutionId,
+    receipt: &acp::AcpRuntimeReceipt,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<AgentExecutionRuntimeReceiptRecord> {
+    let event_count = receipt.counters.total_messages
+        + receipt.counters.permission_request_count
+        + receipt.counters.permission_grant_sent_count
+        + receipt.counters.permission_grant_failed_count;
+    Ok(AgentExecutionRuntimeReceiptRecord {
+        agent_execution_id: agent_exec_id,
+        provider: receipt.provider.clone(),
+        transport_family: receipt.transport_family.clone(),
+        status: receipt.status.clone(),
+        failure_phase: receipt.failure_phase.clone(),
+        event_count,
+        last_event_kind: receipt.last_events.last().map(|event| event.kind.clone()),
+        last_event_at_ms: receipt.last_events.last().map(|event| event.at_ms as i64),
+        receipt_json: serde_json::to_string(receipt)?,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+fn enrich_runtime_facts_with_receipt(
+    facts: &mut AgentExecutionRuntimeFacts,
+    receipt: &acp::AcpRuntimeReceipt,
+) {
+    let counters = &receipt.counters;
+    let has_provider_activity = counters.permission_request_count > 0
+        || counters.permission_grant_sent_count > 0
+        || counters.session_update_count > 0
+        || counters.tool_call_count > 0
+        || counters.tool_call_update_count > 0
+        || counters.agent_message_chunk_count > 0
+        || counters.agent_thought_chunk_count > 0
+        || counters.plan_update_count > 0
+        || counters.meaningful_progress_count > 0;
+    let waiting_on_permission_roundtrip =
+        counters.permission_request_count > counters.permission_grant_sent_count;
+
+    facts.supervision_classification = if waiting_on_permission_roundtrip {
+        Some("waiting_on_permission_roundtrip".to_string())
+    } else if has_provider_activity {
+        Some("provider_active_without_terminal_response".to_string())
+    } else {
+        facts.supervision_classification.clone()
+    };
 }
 
 fn suppress_interactive_review_xcode_mcp_for_invocation(
@@ -1792,6 +1846,7 @@ fn runtime_facts_for_execution_result(
     observed_failure_classification: Option<RuntimeFailureClassification>,
     now: chrono::DateTime<chrono::Utc>,
     close_diagnostic: Option<&acp::AcpCloseDiagnostic>,
+    runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
 ) -> AgentExecutionRuntimeFacts {
     let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
     facts.valid_required_outputs = validation_summary.is_some_and(|summary| {
@@ -1878,6 +1933,9 @@ fn runtime_facts_for_execution_result(
             }
             .to_string(),
         );
+    }
+    if let Some(receipt) = runtime_receipt {
+        enrich_runtime_facts_with_receipt(&mut facts, receipt);
     }
     facts
 }
@@ -3175,6 +3233,14 @@ impl BackgroundExecutor {
         )
         .await?;
         agent_execution_runtime_facts::upsert(&self.pool, &runtime_facts).await?;
+        if let Some(receipt) = acp::runtime_receipt_from_error(error) {
+            let receipt_record = runtime_receipt_record_from_receipt(
+                claimed.agent_execution_id,
+                receipt,
+                completed_at,
+            )?;
+            agent_execution_runtime_receipts::upsert(&self.pool, &receipt_record).await?;
+        }
 
         if let Some(decision) = policy_decision {
             let _ = self.acp.close_session(&decision.generation.id).await;
@@ -4085,12 +4151,11 @@ impl BackgroundExecutor {
                     .await?
                     .iter()
                     .any(|artifact| artifact.name == APPROVED_PROPOSAL_OUTPUT_NAME);
-                let suppressed_approved_proposal = preserve_existing_approved_proposal_on_retry(
+                let suppressed_approved_proposal = suppress_duplicate_approved_proposal_output(
                     &mut declared_outputs,
                     &mut prompt,
                     &stage_id,
                     &task_name,
-                    stage_attempt_number,
                     has_existing_approved_proposal,
                 );
                 if suppressed_approved_proposal {
@@ -4099,7 +4164,7 @@ impl BackgroundExecutor {
                         stage_id = %stage_id,
                         task_name = %task_name,
                         attempt = stage_attempt_number,
-                        "Suppressing agent-returned approved_proposal to preserve frozen implementation handoff"
+                        "Suppressing duplicate agent-returned approved_proposal to preserve frozen implementation handoff"
                     );
                 }
                 let expected_output_paths: Vec<String> = declared_outputs
@@ -4275,6 +4340,42 @@ impl BackgroundExecutor {
                                 error = %update_error,
                                 "Failed to persist ACP startup failure runtime facts"
                             );
+                        }
+                        if let Some(receipt) = acp::runtime_receipt_from_error(&error) {
+                            match runtime_receipt_record_from_receipt(
+                                agent_exec_id,
+                                receipt,
+                                completed_at,
+                            ) {
+                                Ok(receipt_record) => {
+                                    if let Err(update_error) =
+                                        agent_execution_runtime_receipts::upsert(
+                                            &self.pool,
+                                            &receipt_record,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            run_id = %run_id,
+                                            stage_id = %stage_id,
+                                            agent_id = %agent_id,
+                                            agent_execution_id = %agent_exec_id,
+                                            error = %update_error,
+                                            "Failed to persist ACP startup failure runtime receipt"
+                                        );
+                                    }
+                                }
+                                Err(update_error) => {
+                                    warn!(
+                                        run_id = %run_id,
+                                        stage_id = %stage_id,
+                                        agent_id = %agent_id,
+                                        agent_execution_id = %agent_exec_id,
+                                        error = %update_error,
+                                        "Failed to encode ACP startup failure runtime receipt"
+                                    );
+                                }
+                            }
                         }
                         if let Some(decision) = policy_decision.as_ref() {
                             match invalidate_generation_after_missing_required_outputs(
@@ -5454,6 +5555,7 @@ impl BackgroundExecutor {
                             result.transcript_text.as_deref(),
                         ),
                         result.close_diagnostic.as_ref(),
+                        result.runtime_receipt.as_ref(),
                         discovery_diagnostics.as_ref(),
                         &stage_degraded_output_policy,
                         validation_summary_override,
@@ -6165,6 +6267,7 @@ impl BackgroundExecutor {
         result_status: AgentStatus,
         observed_failure_classification: Option<RuntimeFailureClassification>,
         close_diagnostic: Option<&acp::AcpCloseDiagnostic>,
+        runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
         discovery_diagnostics: Option<&AgentExecutionDiscoveryDiagnostics>,
         stage_degraded_output_policy: &workflow::plan::DegradedOutputPolicy,
         validation_summary_override: Option<TaskValidationSummary>,
@@ -6184,6 +6287,7 @@ impl BackgroundExecutor {
             observed_failure_classification,
             completed_at,
             close_diagnostic,
+            runtime_receipt,
         );
         let policy_failure_kind = runtime_facts
             .failure_kind
@@ -6308,6 +6412,18 @@ impl BackgroundExecutor {
             ));
         }
 
+        let original_declared_artifact_count = declared_artifacts_to_insert.len();
+        let declared_artifacts_to_insert = filter_duplicate_approved_proposal_declared_artifacts(
+            persisted_artifacts,
+            declared_artifacts_to_insert,
+        );
+        if declared_artifacts_to_insert.len() != original_declared_artifact_count {
+            warn!(
+                agent_execution_id = %agent_exec_id,
+                stage_execution_id = %stage_execution_id,
+                "Ignoring duplicate declared approved_proposal artifact because a frozen version already exists"
+            );
+        }
         let tx_started = Instant::now();
         let mut tx = self
             .begin_executor_transaction(
@@ -6315,7 +6431,7 @@ impl BackgroundExecutor {
                 format!("executor.import_declared_outputs:{agent_exec_id}"),
             )
             .await?;
-        for artifact in declared_artifacts_to_insert {
+        for artifact in &declared_artifacts_to_insert {
             artifacts::insert_tx(&mut tx, artifact).await?;
         }
         let mut projection_dirty = false;
@@ -6383,6 +6499,11 @@ impl BackgroundExecutor {
             }
             runtime_facts.quota_ledger_id = Some(ledger.id);
         }
+        if let Some(runtime_receipt) = runtime_receipt {
+            let receipt_record =
+                runtime_receipt_record_from_receipt(agent_exec_id, runtime_receipt, completed_at)?;
+            agent_execution_runtime_receipts::upsert_tx(&mut tx, &receipt_record).await?;
+        }
         agent_execution_runtime_facts::upsert_tx(&mut tx, &runtime_facts).await?;
         let invalidated_session_after_missing_outputs =
             invalidate_generation_after_missing_required_outputs_tx(
@@ -6399,7 +6520,7 @@ impl BackgroundExecutor {
                 let _ = self.acp.close_session(session_generation_id).await;
             }
         }
-        for artifact in declared_artifacts_to_insert {
+        for artifact in &declared_artifacts_to_insert {
             self.persist_implementation_self_assessment_summary_if_applicable(artifact)
                 .await?;
             let _ = self
@@ -7422,18 +7543,16 @@ fn release_artifact_path(artifact_root: &str, name: &str) -> String {
         .into_owned()
 }
 
-fn preserve_existing_approved_proposal_on_retry(
+fn suppress_duplicate_approved_proposal_output(
     declared_outputs: &mut Vec<DeclaredOutput>,
     prompt: &mut String,
     stage_id: &str,
     task_name: &str,
-    stage_attempt_number: i64,
     has_existing_approved_proposal: bool,
 ) -> bool {
-    if !should_reuse_existing_approved_proposal(
+    if !should_suppress_duplicate_approved_proposal_output(
         stage_id,
         task_name,
-        stage_attempt_number,
         has_existing_approved_proposal,
     ) {
         return false;
@@ -7458,20 +7577,35 @@ fn preserve_existing_approved_proposal_on_retry(
     true
 }
 
-fn should_reuse_existing_approved_proposal(
+fn should_suppress_duplicate_approved_proposal_output(
     stage_id: &str,
     task_name: &str,
-    stage_attempt_number: i64,
     has_existing_approved_proposal: bool,
 ) -> bool {
     has_existing_approved_proposal
-        && stage_attempt_number > 1
         && stage_id == IMPLEMENTATION_STARTED_STAGE_ID
         && task_name == FREEZE_PROPOSAL_TASK_NAME
 }
 
 fn should_ignore_undeclared_envelope_artifact(name: &str) -> bool {
     name == APPROVED_PROPOSAL_OUTPUT_NAME
+}
+
+fn filter_duplicate_approved_proposal_declared_artifacts(
+    persisted_artifacts: &[Artifact],
+    declared_artifacts_to_insert: &[Artifact],
+) -> Vec<Artifact> {
+    let has_existing_approved_proposal = persisted_artifacts
+        .iter()
+        .any(|artifact| artifact.name == APPROVED_PROPOSAL_OUTPUT_NAME);
+    if !has_existing_approved_proposal {
+        return declared_artifacts_to_insert.to_vec();
+    }
+    declared_artifacts_to_insert
+        .iter()
+        .filter(|artifact| artifact.name != APPROVED_PROPOSAL_OUTPUT_NAME)
+        .cloned()
+        .collect()
 }
 
 fn stored_artifact_file_path(name: &str, path: &str, workspace_root: &str) -> String {
@@ -7962,12 +8096,11 @@ mod tests {
         ];
         let mut prompt = "Freeze proposal and provision worktree".to_string();
 
-        let suppressed = preserve_existing_approved_proposal_on_retry(
+        let suppressed = suppress_duplicate_approved_proposal_output(
             &mut declared_outputs,
             &mut prompt,
             IMPLEMENTATION_STARTED_STAGE_ID,
             FREEZE_PROPOSAL_TASK_NAME,
-            2,
             true,
         );
 
@@ -7980,7 +8113,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_state_7_freeze_still_allows_first_approved_proposal_output() {
+    fn initial_state_7_freeze_suppresses_duplicate_approved_proposal_even_on_first_attempt() {
         let mut declared_outputs = vec![DeclaredOutput {
             output_name: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
             target_path: "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md"
@@ -7992,13 +8125,38 @@ mod tests {
         }];
         let mut prompt = "Freeze proposal and provision worktree".to_string();
 
-        let suppressed = preserve_existing_approved_proposal_on_retry(
+        let suppressed = suppress_duplicate_approved_proposal_output(
             &mut declared_outputs,
             &mut prompt,
             IMPLEMENTATION_STARTED_STAGE_ID,
             FREEZE_PROPOSAL_TASK_NAME,
-            1,
             true,
+        );
+
+        assert!(suppressed);
+        assert!(declared_outputs.is_empty());
+        assert!(prompt.contains("Approved Proposal Immutability"));
+    }
+
+    #[test]
+    fn initial_state_7_freeze_allows_first_approved_proposal_output_when_none_exists_yet() {
+        let mut declared_outputs = vec![DeclaredOutput {
+            output_name: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+            target_path: "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md"
+                .to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+        let mut prompt = "Freeze proposal and provision worktree".to_string();
+
+        let suppressed = suppress_duplicate_approved_proposal_output(
+            &mut declared_outputs,
+            &mut prompt,
+            IMPLEMENTATION_STARTED_STAGE_ID,
+            FREEZE_PROPOSAL_TASK_NAME,
+            false,
         );
 
         assert!(!suppressed);
@@ -8014,6 +8172,75 @@ mod tests {
         assert!(!should_ignore_undeclared_envelope_artifact(
             "implementation_plan"
         ));
+    }
+
+    #[test]
+    fn declared_duplicate_approved_proposal_artifact_is_filtered_before_insert() {
+        let persisted = vec![Artifact {
+            id: domain::ids::ArtifactId::new(),
+            run_id: RunId::new(),
+            stage_id: IMPLEMENTATION_STARTED_STAGE_ID.to_string(),
+            agent_id: "engine".to_string(),
+            name: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+            contract_id: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+            format: ArtifactFormat::Markdown,
+            file_path: ".chainworks/runs/run-1/proposals/approved/proposal.md".to_string(),
+            checksum_sha256: Some("abc".to_string()),
+            size_bytes: Some(1),
+            provider: "engine".to_string(),
+            model: None,
+            created_at: chrono::Utc::now(),
+            is_pinned: true,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: None,
+        }];
+        let duplicate = Artifact {
+            id: domain::ids::ArtifactId::new(),
+            run_id: RunId::new(),
+            stage_id: IMPLEMENTATION_STARTED_STAGE_ID.to_string(),
+            agent_id: "lead_orchestrator".to_string(),
+            name: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+            contract_id: "gemini.output".to_string(),
+            format: ArtifactFormat::Markdown,
+            file_path: ".chainworks/runs/run-1/proposals/approved/proposal.md".to_string(),
+            checksum_sha256: None,
+            size_bytes: Some(1),
+            provider: "gemini".to_string(),
+            model: Some("gemini".to_string()),
+            created_at: chrono::Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: Some(domain::ids::AgentExecutionId::new().to_string()),
+        };
+        let preserved_plan = Artifact {
+            id: domain::ids::ArtifactId::new(),
+            run_id: RunId::new(),
+            stage_id: IMPLEMENTATION_STARTED_STAGE_ID.to_string(),
+            agent_id: "lead_orchestrator".to_string(),
+            name: "implementation_plan".to_string(),
+            contract_id: "gemini.output".to_string(),
+            format: ArtifactFormat::Markdown,
+            file_path: ".chainworks/runs/run-1/implementation/plan.md".to_string(),
+            checksum_sha256: None,
+            size_bytes: Some(1),
+            provider: "gemini".to_string(),
+            model: Some("gemini".to_string()),
+            created_at: chrono::Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: Some(domain::ids::AgentExecutionId::new().to_string()),
+        };
+
+        let filtered = filter_duplicate_approved_proposal_declared_artifacts(
+            &persisted,
+            &[duplicate, preserved_plan.clone()],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, preserved_plan.name);
     }
 
     #[test]
@@ -8936,6 +9163,7 @@ mod tests {
             )),
             chrono::Utc::now(),
             None,
+            None,
         );
         assert_eq!(facts.failure_kind, Some(AgentFailureKind::ProviderQuota));
         assert!(degraded_policy_allows_valid_failed_outputs(
@@ -8968,6 +9196,7 @@ mod tests {
                 },
             )),
             chrono::Utc::now(),
+            None,
             None,
         );
 
@@ -9010,6 +9239,123 @@ mod tests {
         assert!(!raw_debug.contains("abc123"));
     }
 
+    fn sample_runtime_receipt(
+        counters: acp::AcpRuntimeReceiptCounters,
+        failure_phase: Option<&str>,
+    ) -> acp::AcpRuntimeReceipt {
+        acp::AcpRuntimeReceipt {
+            schema_version: 1,
+            transport_family: "acp_stdio".into(),
+            provider: "junie".into(),
+            model: Some("junie-default".into()),
+            provider_session_id: Some("provider-session-1".into()),
+            session_generation_id: Some("generation-1".into()),
+            status: "failed".into(),
+            failure_phase: failure_phase.map(str::to_string),
+            started_at: "2026-05-10T04:35:44Z".into(),
+            completed_at: Some("2026-05-10T04:41:06Z".into()),
+            xcode_shim_injected: false,
+            requires_xcode_host_execution: false,
+            handshake: acp::AcpRuntimeReceiptHandshake {
+                initialize_sent_at_ms: Some(1),
+                initialize_received_at_ms: Some(2),
+                session_new_sent_at_ms: Some(3),
+                session_new_received_at_ms: Some(4),
+                prompt_sent_at_ms: Some(5),
+                terminal_response_at_ms: None,
+            },
+            counters,
+            first_events: vec![acp::AcpRuntimeReceiptEvent {
+                at_ms: 5,
+                kind: "prompt_sent".into(),
+                detail: None,
+            }],
+            last_events: vec![acp::AcpRuntimeReceiptEvent {
+                at_ms: 321_000,
+                kind: "session_update:tool_call_update".into(),
+                detail: Some("tool_call_update".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn acp_runtime_facts_use_permission_roundtrip_classification_from_receipt() {
+        let receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 2,
+                session_update_count: 0,
+                permission_request_count: 1,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 0,
+                unknown_notification_count: 0,
+            },
+            Some("idle_timeout"),
+        );
+        let error = anyhow::Error::new(acp::AcpExecutionError::new(
+            "ACP session idle timeout — no message received",
+            Some(receipt),
+        ))
+        .context(anyhow::anyhow!(
+            "ACP session idle timeout — no message received"
+        ));
+
+        let facts = runtime_facts_for_acp_error(
+            domain::ids::AgentExecutionId::new(),
+            &error,
+            chrono::Utc::now(),
+        );
+
+        assert_eq!(
+            facts.supervision_classification.as_deref(),
+            Some("waiting_on_permission_roundtrip")
+        );
+    }
+
+    #[test]
+    fn acp_runtime_facts_use_active_provider_classification_from_receipt() {
+        let receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 14,
+                session_update_count: 12,
+                permission_request_count: 1,
+                permission_grant_sent_count: 1,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 1,
+                agent_thought_chunk_count: 1,
+                tool_call_count: 1,
+                tool_call_update_count: 9,
+                plan_update_count: 1,
+                meaningful_progress_count: 11,
+                unknown_notification_count: 0,
+            },
+            Some("progress_timeout"),
+        );
+        let error = anyhow::Error::new(acp::AcpExecutionError::new(
+            "ACP session progress timeout: idle_hang_before_first_progress; no meaningful progress for 300s",
+            Some(receipt),
+        ))
+        .context(anyhow::anyhow!(
+            "ACP session progress timeout: idle_hang_before_first_progress; no meaningful progress for 300s"
+        ));
+
+        let facts = runtime_facts_for_acp_error(
+            domain::ids::AgentExecutionId::new(),
+            &error,
+            chrono::Utc::now(),
+        );
+
+        assert_eq!(
+            facts.supervision_classification.as_deref(),
+            Some("provider_active_without_terminal_response")
+        );
+    }
+
     #[test]
     fn proposal_058_close_after_valid_output_records_nonblocking_runtime_fact() {
         let validation = TaskValidationSummary {
@@ -9039,6 +9385,7 @@ mod tests {
             None,
             chrono::Utc::now(),
             Some(&close_diagnostic),
+            None,
         );
 
         assert_eq!(
