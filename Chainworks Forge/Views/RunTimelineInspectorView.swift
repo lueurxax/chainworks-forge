@@ -1,4 +1,52 @@
+import Combine
 import SwiftUI
+
+@MainActor
+final class P036TimelinePresentationModel: ObservableObject {
+    @Published private(set) var entries: [FocusedTimelineSpineEntry] = []
+    
+    private var buffer: (live: [LiveExecutionTimelineEntry], persisted: [WorkflowMapPersistedTimelineEntry], xcode: [WorkflowMapXcodeRuntimeObservation])?
+    private var lastFlush = Date.distantPast
+    private let flushInterval: TimeInterval = 2.0
+    private var timer: AnyCancellable?
+    
+    func update(
+        live: [LiveExecutionTimelineEntry],
+        persisted: [WorkflowMapPersistedTimelineEntry],
+        xcode: [WorkflowMapXcodeRuntimeObservation]
+    ) {
+        buffer = (live, persisted, xcode)
+        
+        let now = Date()
+        if now.timeIntervalSince(lastFlush) >= flushInterval {
+            flush()
+        } else if timer == nil {
+            timer = Timer.publish(every: 0.5, on: .main, in: .common)
+                .autoconnect()
+                .sink { [weak self] _ in
+                    guard let self = self else { return }
+                    if Date().timeIntervalSince(self.lastFlush) >= self.flushInterval {
+                        self.flush()
+                    }
+                }
+        }
+    }
+    
+    private func flush() {
+        timer?.cancel()
+        timer = nil
+        
+        guard let buffer = buffer else { return }
+        self.buffer = nil
+        lastFlush = Date()
+        
+        entries = buildFocusedTimelineSpineEntries(
+            liveTimeline: buffer.live,
+            persistedTimeline: buffer.persisted,
+            xcodeRuntimeObservations: buffer.xcode
+        )
+    }
+}
 
 struct FocusedTimelineSpineEntry: Identifiable, Sendable {
     let id: String
@@ -68,13 +116,11 @@ func buildFocusedTimelineSpineEntries(
 struct RunTimelineInspectorView: View {
     let projection: WorkflowMapProjection
     var showsTitle: Bool = true
+    
+    @StateObject private var model = P036TimelinePresentationModel()
+    @Environment(\.accessibilityReduceMotion) var reduceMotion
 
     var body: some View {
-        let timelineEntries = buildFocusedTimelineSpineEntries(
-            liveTimeline: projection.liveTimeline,
-            persistedTimeline: projection.persistedTimeline,
-            xcodeRuntimeObservations: projection.xcodeRuntimeObservations
-        )
         let bridgeProgressStatus = latestXcodeBridgeProgressStatus(
             in: projection.xcodeRuntimeObservations
         )
@@ -106,7 +152,7 @@ struct RunTimelineInspectorView: View {
                         XcodeRuntimeObservationsView(observations: projection.xcodeRuntimeObservations)
                     }
 
-                    if timelineEntries.isEmpty {
+                    if model.entries.isEmpty {
                         ContentUnavailableView(
                             "No Timeline Data",
                             systemImage: "waveform.path.ecg",
@@ -117,7 +163,7 @@ struct RunTimelineInspectorView: View {
                     } else {
                         GroupBox("Timeline") {
                             VStack(alignment: .leading, spacing: 10) {
-                                ForEach(timelineEntries) { entry in
+                                ForEach(model.entries) { entry in
                                     VStack(alignment: .leading, spacing: 4) {
                                         HStack {
                                             Text(entry.title)
@@ -167,7 +213,7 @@ struct RunTimelineInspectorView: View {
                                 }
                             }
                         }
-                        .animation(.spring(response: 0.45, dampingFraction: 0.82), value: timelineEntries.map(\.id))
+                        .animation(reduceMotion ? .linear(duration: 0.1) : .spring(response: 0.45, dampingFraction: 0.82), value: model.entries.map(\.id))
                     }
 
                     // Invisible anchor used to auto-scroll to the latest entry
@@ -178,10 +224,24 @@ struct RunTimelineInspectorView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
             }
-            .onChange(of: timelineEntries.count) {
-                withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+            .onChange(of: model.entries.count) {
+                withAnimation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82)) {
                     proxy.scrollTo("live-timeline-bottom", anchor: .bottom)
                 }
+            }
+            .onAppear {
+                model.update(
+                    live: projection.liveTimeline,
+                    persisted: projection.persistedTimeline,
+                    xcode: projection.xcodeRuntimeObservations
+                )
+            }
+            .onChange(of: projection) { _, newValue in
+                model.update(
+                    live: newValue.liveTimeline,
+                    persisted: newValue.persistedTimeline,
+                    xcode: newValue.xcodeRuntimeObservations
+                )
             }
         }
         .frame(minWidth: 480, minHeight: 420)

@@ -165,6 +165,7 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
     let id: String
     let title: String
     let mode: String
+    let group: String?
     let backendProfile: String
     let permissionProfile: String
     let mcpProfile: String?
@@ -191,7 +192,7 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
     let toolchainCachePolicy: ToolchainCachePolicy?
 
     enum CodingKeys: String, CodingKey {
-        case id, title, mode, prompt, notes, inputs, outputs
+        case id, title, mode, group, prompt, notes, inputs, outputs
         case backendProfile = "backend_profile"
         case permissionProfile = "permission_profile"
         case mcpProfile = "mcp_profile"
@@ -213,6 +214,7 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         id: String,
         title: String,
         mode: String,
+        group: String? = nil,
         backendProfile: String,
         permissionProfile: String,
         mcpProfile: String? = nil,
@@ -236,6 +238,7 @@ struct AgentDefinition: Codable, Sendable, Identifiable {
         self.id = id
         self.title = title
         self.mode = mode
+        self.group = group
         self.backendProfile = backendProfile
         self.permissionProfile = permissionProfile
         self.mcpProfile = mcpProfile

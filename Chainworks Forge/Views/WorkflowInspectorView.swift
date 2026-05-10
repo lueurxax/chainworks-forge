@@ -61,16 +61,33 @@ struct WorkflowInspectorView: View {
     private func fullWorkflowContent(_ workflow: WorkflowDefinition, issues: [ValidationIssue]) -> some View {
         let errorCount = issues.filter { $0.severity == .error }.count
         let warnCount = issues.filter { $0.severity == .warning }.count
+        let sorted = sortedStates
 
         return VStack(spacing: 0) {
             fullSummaryStrip(workflow: workflow, errorCount: errorCount, warnCount: warnCount)
 
             NavigationSplitView {
-                List(Array(workflow.states.keys.sorted()), id: \.self) { stateID in
-                    NavigationLink {
-                        stateDetail(stateID: stateID, state: workflow.states[stateID]!)
-                    } label: {
-                        stateRow(stateID: stateID, state: workflow.states[stateID]!)
+                List {
+                    Section("Execution Path") {
+                        ForEach(sorted.reachable, id: \.self) { stateID in
+                            NavigationLink {
+                                stateDetail(stateID: stateID, state: workflow.states[stateID]!)
+                            } label: {
+                                stateRow(stateID: stateID, state: workflow.states[stateID]!)
+                            }
+                        }
+                    }
+                    
+                    if !sorted.unreachable.isEmpty {
+                        Section("Unreachable States") {
+                            ForEach(sorted.unreachable, id: \.self) { stateID in
+                                NavigationLink {
+                                    stateDetail(stateID: stateID, state: workflow.states[stateID]!)
+                                } label: {
+                                    stateRow(stateID: stateID, state: workflow.states[stateID]!)
+                                }
+                            }
+                        }
                     }
                 }
             } detail: {
@@ -82,6 +99,39 @@ struct WorkflowInspectorView: View {
                 }
             }
         }
+    }
+
+    struct SortedStates {
+        let reachable: [String]
+        let unreachable: [String]
+    }
+
+    private var sortedStates: SortedStates {
+        guard case .loaded(let workflow, _) = fullState else { return SortedStates(reachable: [], unreachable: []) }
+        
+        // P036: Deterministic execution order sorting
+        var ordered: [String] = []
+        var visited = Set<String>()
+        
+        func traverse(_ id: String) {
+            guard !visited.contains(id) else { return }
+            visited.insert(id)
+            ordered.append(id)
+            
+            if let transitions = workflow.states[id]?.transitions {
+                // Declared transition order is preserved in the array
+                for t in transitions {
+                    traverse(t.to)
+                }
+            }
+        }
+        
+        traverse(workflow.initialState)
+        
+        // Unvisited states (unreachable or separate islands)
+        let unvisited = workflow.states.keys.filter { !visited.contains($0) }.sorted()
+        
+        return SortedStates(reachable: ordered, unreachable: unvisited)
     }
 
     private func fullSummaryStrip(workflow: WorkflowDefinition, errorCount: Int, warnCount: Int) -> some View {
@@ -116,6 +166,13 @@ struct WorkflowInspectorView: View {
                 Text(state.label)
                     .font(.headline)
                     .lineLimit(1)
+                
+                if let transitions = state.transitions, transitions.count > 1 {
+                    Image(systemName: "arrow.branch")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .help("Ambiguous transitions")
+                }
             }
             Text(stateID)
                 .font(.caption)

@@ -160,6 +160,14 @@ PROPOSAL_033_TESTS=(
   "Chainworks ForgeTests/ProviderPlatformTests"
 )
 
+PROPOSAL_036_TESTS=(
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests"
+  "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
+  "Chainworks ForgeTests/RunTimelineInspectorViewTests"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal036NavigationShellParity"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal036DefinitionsSegmentedWrapper"
+)
+
 PROPOSAL_037_TESTS=(
   "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorFailClosesACPProposalReviewReadLoopStallsBeforeWatchdogAndEmitsDurableFailureEvidence()"
   "Chainworks ForgeTests/RuntimeAgentExecutorTests/acpProposalReviewerReadLoopStallFailsEarlyWithDurableFailureEvidence()"
@@ -1151,7 +1159,7 @@ approved_remote_ui_hosts() {
 
 gate_requires_remote_ui_host() {
   case "${1:-}" in
-    ui-smoke|proposal-006|p006|proposal-012|p012|proposal-013|p013|proposal-014|p014|proposal-015|p015|proposal-022|p022|proposal-024|p024|proposal-077-ui|p077-ui|full)
+    ui-smoke|proposal-006|p006|proposal-012|p012|proposal-013|p013|proposal-014|p014|proposal-015|p015|proposal-022|p022|proposal-024|p024|proposal-036|p036|proposal-077-ui|p077-ui|full)
       return 0
       ;;
     *)
@@ -2175,6 +2183,7 @@ Available gates:
   proposal-029    Proposal 029 second-wave ACP runtime profiles gate
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
   proposal-031,p031  Thin GraphQL-only UI inventory/static guard/write-path guide gate
+  proposal-036,p036  UX Consolidation and Navigation Simplification gate
   proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
   proposal-077,p077  Proposal 077 closeout readiness gates (Rust domain/db/engine plus GraphQL/MCP readback parity; UI remote evidence separate)
   proposal-077-ui,p077-ui  Proposal 077 remote macOS compact/focus/backlink/accessibility runtime proof
@@ -2789,6 +2798,17 @@ PY
     run_targeted_tests "proposal-029-prereq" "${PROPOSAL_029_TESTS[@]}"
     run_build "proposal-033"
     run_targeted_tests "proposal-033" "${PROPOSAL_033_TESTS[@]}"
+    ;;
+  proposal-036|p036)
+    check_idle_environment allow_app
+    if [[ -n "$BEFORE_CRASH_LOG" ]]; then
+      log "Latest crash log before run: $BEFORE_CRASH_LOG"
+    else
+      log "No prior Chainworks Forge crash logs found"
+    fi
+    guard_direct_run_insertion
+    run_build "proposal-036"
+    run_targeted_tests "proposal-036" "${PROPOSAL_036_TESTS[@]}"
     ;;
   proposal-037|p037)
     check_idle_environment allow_app

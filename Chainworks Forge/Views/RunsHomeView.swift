@@ -6,6 +6,7 @@ import AppKit
 
 struct RunsHomeView: View {
     @StateObject private var model: P031ThinReadDashboardModel
+    @StateObject private var workbench: RunsWorkbenchPresentationModel
     @State private var selectedRunDetailTab: P031RunDetailTab = .overview
     @State private var focusedArtifactStageID: String?
     @State private var closeoutReadinessScrollRequest = 0
@@ -13,7 +14,9 @@ struct RunsHomeView: View {
 
     @MainActor
     init() {
-        _model = StateObject(wrappedValue: P031ThinReadDashboardModel.bootstrap())
+        let model = P031ThinReadDashboardModel.bootstrap()
+        _model = StateObject(wrappedValue: model)
+        _workbench = StateObject(wrappedValue: RunsWorkbenchPresentationModel())
         _selectedRunDetailTab = State(initialValue: .overview)
     }
 
@@ -22,6 +25,7 @@ struct RunsHomeView: View {
         initialTab: P031RunDetailTab
     ) {
         _model = StateObject(wrappedValue: model)
+        _workbench = StateObject(wrappedValue: RunsWorkbenchPresentationModel())
         _selectedRunDetailTab = State(initialValue: initialTab)
     }
 
@@ -53,15 +57,24 @@ struct RunsHomeView: View {
 
     private var runsSidebar: some View {
         List {
-            if let runsHome = model.runsHome {
+            if workbench.sidebarLanes.isEmpty {
                 Section {
-                    if runsHome.rows.isEmpty {
-                        P031EmptySectionRow(
-                            title: runsHome.emptyStateTitle ?? "No runs",
-                            detail: runsHome.errorDescription ?? runsHome.refreshFeedbackText
-                        )
+                    if model.isLoading {
+                        ProgressView("Checking latest data")
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     } else {
-                        ForEach(runsHome.rows, id: \.runID) { row in
+                        P031EmptySectionRow(
+                            title: model.runsHome?.emptyStateTitle ?? "No runs",
+                            detail: model.runsHome?.errorDescription ?? model.runsHome?.refreshFeedbackText ?? ""
+                        )
+                    }
+                } header: {
+                    Text("Runs")
+                }
+            } else {
+                ForEach(workbench.sidebarLanes) { lane in
+                    Section {
+                        ForEach(lane.runs, id: \.runID) { row in
                             Button {
                                 selectedRunDetailTab = .overview
                                 focusedArtifactStageID = nil
@@ -75,25 +88,24 @@ struct RunsHomeView: View {
                             .buttonStyle(.plain)
                             .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                         }
+                    } header: {
+                        Text(lane.title)
                     }
-                } header: {
-                    P031SectionHeader(
-                        title: "Runs",
-                        subtitle: runsHome.refreshFeedbackText,
-                        freshness: runsHome.freshness
-                    )
-                }
-            } else {
-                Section {
-                    ProgressView("Checking latest data")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } header: {
-                    Text("Runs")
                 }
             }
         }
         .listStyle(.sidebar)
         .accessibilityIdentifier("runs-home-list")
+        .onChange(of: model.runsHome) { _, newValue in
+            if let newValue {
+                workbench.populate(from: newValue)
+            }
+        }
+        .onChange(of: model.runDetail) { _, newValue in
+            if let newValue {
+                workbench.populate(from: newValue)
+            }
+        }
     }
 
     private var runDetailPane: some View {
@@ -127,6 +139,59 @@ struct RunsHomeView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .windowBackgroundColor))
         .accessibilityIdentifier("run-detail-panel")
+    }
+
+    @ViewBuilder
+    private var inlineApprovalsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(workbench.inlineApprovals) { approval in
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(approval.title)
+                            .font(.headline)
+                        if let reason = approval.disabledReason {
+                            Text(reason)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    
+                    Spacer()
+                    
+                    if approval.isActionable {
+                        HStack(spacing: 8) {
+                            Button("Approve") {
+                                Task {
+                                    await model.settleApproval(approval.id, action: .approve)
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.green)
+                            
+                            Button("Reject") {
+                                Task {
+                                    await model.settleApproval(approval.id, action: .reject(reason: "Rejected from inline view"))
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.red)
+                        }
+                        .disabled(model.resolvingApprovalIDs.contains(approval.id))
+                    } else if let state = approval.deferredState {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                            Text(state.rawValue)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    }
+                }
+                .padding(12)
+                .background(Color.primary.opacity(0.04))
+                .cornerRadius(8)
+            }
+        }
+        .padding(.top, 4)
     }
 
     @ViewBuilder
@@ -182,6 +247,9 @@ struct RunsHomeView: View {
                             presentation: runDetail,
                             onCompactCloseoutActivated: activateCloseoutReadinessFromCompactSignal
                         )
+                        if !workbench.inlineApprovals.isEmpty {
+                            inlineApprovalsSection
+                        }
                         if let closeoutReadiness = runDetail.closeoutReadiness {
                             P077CloseoutReadinessCard(
                                 presentation: closeoutReadiness,
@@ -322,6 +390,10 @@ final class P031ThinReadDashboardModel: ObservableObject {
     @Published private(set) var approvalActionError: String?
     @Published private(set) var daemonRestartError: String?
     @Published private(set) var selectedRunID: String?
+
+    var totalPendingApprovalCount: Int {
+        approvalInbox?.rows.count ?? 0
+    }
 
     private let loadRunsHomeAction: @Sendable (P031FreshnessSnapshot, Bool) async -> P031RunsHomePresentation
     private let loadRunDetailAction: @Sendable (String, P031FreshnessSnapshot) async -> P031RunDetailPresentation

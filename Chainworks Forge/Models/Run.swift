@@ -277,7 +277,7 @@ extension Run {
     }
 }
 
-enum RunStatus: String, Codable {
+enum RunStatus: String, Codable, Equatable {
     case pending
     case ready
     case running

@@ -1,6 +1,6 @@
 import Foundation
 
-enum WorkflowMapStageState: String, Sendable {
+enum WorkflowMapStageState: String, Sendable, Equatable {
     case notStarted = "not_started"
     case pending
     case ready
@@ -12,7 +12,7 @@ enum WorkflowMapStageState: String, Sendable {
     case skipped
 }
 
-enum WorkflowMapOccurrenceState: String, Sendable, CaseIterable {
+enum WorkflowMapOccurrenceState: String, Sendable, CaseIterable, Equatable {
     case notStarted = "not_started"
     case ready
     case thinking
@@ -22,7 +22,7 @@ enum WorkflowMapOccurrenceState: String, Sendable, CaseIterable {
     case skipped
 }
 
-enum WorkflowMapEdgeKind: String, Sendable {
+enum WorkflowMapEdgeKind: String, Sendable, Equatable {
     case sequence
     case fanout
     case join
@@ -30,7 +30,7 @@ enum WorkflowMapEdgeKind: String, Sendable {
     case loop
 }
 
-struct WorkflowMapProjection: Sendable {
+struct WorkflowMapProjection: Sendable, Equatable {
     let runID: UUID
     let workflowID: String
     let workflowTitle: String
@@ -87,7 +87,7 @@ struct WorkflowMapProjection: Sendable {
     }
 }
 
-struct WorkflowMapPersistedTimelineEntry: Identifiable, Sendable {
+struct WorkflowMapPersistedTimelineEntry: Identifiable, Sendable, Equatable {
     let id: String
     let title: String
     let detail: String
@@ -580,7 +580,7 @@ private struct WorkflowMapXcodeRuntimePayload: Decodable {
     }
 }
 
-struct WorkflowMapStageProjection: Identifiable, Sendable {
+struct WorkflowMapStageProjection: Identifiable, Sendable, Equatable {
     let id: String
     let label: String
     let order: Int
@@ -602,7 +602,7 @@ struct WorkflowMapStageProjection: Identifiable, Sendable {
     }
 }
 
-struct WorkflowMapOccurrenceProjection: Identifiable, Sendable {
+struct WorkflowMapOccurrenceProjection: Identifiable, Sendable, Equatable {
     let id: String
     let agentID: String
     let agentTitle: String
@@ -622,7 +622,7 @@ struct WorkflowMapOccurrenceProjection: Identifiable, Sendable {
     let ordinal: Int
 }
 
-struct WorkflowMapEdge: Identifiable, Sendable {
+struct WorkflowMapEdge: Identifiable, Sendable, Equatable {
     let id: String
     let kind: WorkflowMapEdgeKind
     let fromLabel: String
@@ -633,7 +633,7 @@ struct WorkflowMapEdge: Identifiable, Sendable {
     let detail: String?
 }
 
-struct WorkflowMapLoopTelemetry: Identifiable, Sendable {
+struct WorkflowMapLoopTelemetry: Identifiable, Sendable, Equatable {
     let id: String
     let counter: String
     let current: Int

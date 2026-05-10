@@ -43,20 +43,23 @@ struct AgentCatalogView: View {
                     }
                     summaryStrip(catalog: catalog, issues: issues)
                     List(selection: $selectedAgentID) {
-                        // Agent list
-                        ForEach(catalog.agents) { agent in
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(agent.title).font(.headline)
-                                Text(agent.id).font(.caption).foregroundStyle(.secondary)
-                                HStack(spacing: 8) {
-                                    Label(agent.backendProfile, systemImage: "server.rack")
-                                    Label(agent.permissionProfile, systemImage: "lock.shield")
+                        ForEach(groupedAgents, id: \.0) { group, agents in
+                            Section(group) {
+                                ForEach(agents) { agent in
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(agent.title).font(.headline)
+                                        Text(agent.id).font(.caption).foregroundStyle(.secondary)
+                                        HStack(spacing: 8) {
+                                            Label(agent.backendProfile, systemImage: "server.rack")
+                                            Label(agent.permissionProfile, systemImage: "lock.shield")
+                                        }
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                    }
+                                    .accessibilityIdentifier("agent-catalog-agent-\(agent.id)")
+                                    .tag(Optional(agent.id))
                                 }
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
                             }
-                            .accessibilityIdentifier("agent-catalog-agent-\(agent.id)")
-                            .tag(Optional(agent.id))
                         }
 
                         // Validation issues section
@@ -145,6 +148,52 @@ struct AgentCatalogView: View {
             selectionState?.wrappedValue = newValue
         }
         .task { loadCatalog() }
+    }
+
+    private var groupedAgents: [(String, [AgentDefinition])] {
+        guard case .loaded(let catalog, _) = state else { return [] }
+        // P036: Deterministic agent grouping with source-order fallback
+        // Precedence: explicit supported group field, then mode, then profile, then role, then Other.
+        
+        func getGroup(for agent: AgentDefinition) -> String {
+            if let group = agent.group?.trimmingCharacters(in: .whitespacesAndNewlines), !group.isEmpty {
+                return group
+            }
+            if !agent.mode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return agent.mode
+            }
+            if !agent.backendProfile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return agent.backendProfile
+            }
+            if let role = agent.skillRole?.trimmingCharacters(in: .whitespacesAndNewlines), !role.isEmpty {
+                return role
+            }
+            return "Other"
+        }
+        
+        func normalizeLabel(_ label: String) -> String {
+            let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { return "Other" }
+            // Title case normalization
+            return trimmed.split(separator: " ")
+                .map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }
+                .joined(separator: " ")
+        }
+
+        var groups: [String: [AgentDefinition]] = [:]
+        var order: [String] = []
+        
+        for agent in catalog.agents {
+            let rawLabel = getGroup(for: agent)
+            let normalized = normalizeLabel(rawLabel)
+            if groups[normalized] == nil {
+                order.append(normalized)
+                groups[normalized] = []
+            }
+            groups[normalized]?.append(agent)
+        }
+        
+        return order.map { ($0, groups[$0]!) }
     }
 
     private func summaryStrip(catalog: AgentCatalog, issues: [ValidationIssue]) -> some View {

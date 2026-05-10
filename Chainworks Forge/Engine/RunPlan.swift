@@ -103,7 +103,7 @@ struct ExecutableState: Sendable {
     let loop: ResolvedLoopConfig?
 }
 
-enum StateType: String, Sendable {
+enum StateType: String, Sendable, Equatable {
     case start
     case end
     case manualGate = "manual_gate"

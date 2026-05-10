@@ -194,6 +194,12 @@ nonisolated struct DaemonStatus: Codable, Sendable, Equatable {
     let pid: Int
     let xcodeBrokerHealth: XcodeBrokerHealthSnapshot?
 
+    var mode: String { state.rawValue }
+    var uptimeSeconds: Int {
+        guard let startedAt else { return 0 }
+        return Int(Date().timeIntervalSince(startedAt))
+    }
+
     enum CodingKeys: String, CodingKey {
         case state
         case schemaVersion = "schema_version"

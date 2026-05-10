@@ -10,18 +10,29 @@ struct ContentView: View {
     @State private var selectedTab: Tab
     @StateObject private var daemonStatus = DaemonStatusViewModel.bootstrap()
     @StateObject private var schedulerHealth = SchedulerHealthViewModel.bootstrap()
+    @StateObject private var runsModel = P031ThinReadDashboardModel.bootstrap()
 
     private let forcedInitialTab: Tab?
     private let forcedUISurface: UISurface?
 
     enum Tab: String, CaseIterable {
-        case runsHome = "Runs Home"
+        case runs = "Runs"
         case ideas = "Ideas"
-        case approvals = "Approvals"
-        case agentCatalog = "Agent Catalog"
-        case workflowInspector = "Workflow Inspector"
-        case pilotReadiness = "Pilot Readiness"
-        case providerSettings = "Settings"
+        case definitions = "Definitions"
+        case settings = "Settings"
+
+        static func from(rawValue: String) -> Tab? {
+            switch rawValue {
+            case "Runs Home", "runsHome", "Runs": return .runs
+            case "Ideas", "ideas": return .ideas
+            case "Approvals", "approvals": return .runs
+            case "Agent Catalog", "agentCatalog", "Definitions": return .definitions
+            case "Workflow Inspector", "workflowInspector": return .definitions
+            case "Pilot Readiness", "pilotReadiness", "Settings": return .settings
+            case "Settings", "providerSettings": return .settings
+            default: return Tab(rawValue: rawValue)
+            }
+        }
     }
 
     enum UISurface: String {
@@ -32,11 +43,11 @@ struct ContentView: View {
     init() {
         let environment = ProcessInfo.processInfo.environment
         let initialTab = environment["CHAINWORKS_UI_TEST_INITIAL_TAB"]
-            .flatMap(Tab.init(rawValue:))
+            .flatMap(Tab.from(rawValue:))
         forcedInitialTab = initialTab
         forcedUISurface = environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"]
             .flatMap(UISurface.init(rawValue:))
-        _selectedTab = State(initialValue: initialTab ?? .runsHome)
+        _selectedTab = State(initialValue: initialTab ?? .runs)
     }
 
     var body: some View {
@@ -49,7 +60,7 @@ struct ContentView: View {
                         DaemonLifecycleBanner(
                             viewModel: daemonStatus,
                             schedulerHealthIssue: schedulerHealth.bannerIssue,
-                            onOpenSchedulerHealth: { selectedTab = .pilotReadiness }
+                            onOpenSchedulerHealth: { selectedTab = .settings }
                         )
                         .padding(.horizontal, 12)
                         .padding(.top, 8)
@@ -68,11 +79,12 @@ struct ContentView: View {
 
     private var tabShell: some View {
         TabView(selection: $selectedTab) {
-            tabContent(.runsHome) {
-                RunsHomeView()
+            tabContent(.runs) {
+                RunsHomeView(model: runsModel, initialTab: .overview)
             }
-            .tabItem { Label("Runs Home", systemImage: "house") }
-            .tag(Tab.runsHome)
+            .tabItem { Label("Runs", systemImage: "house") }
+            .tag(Tab.runs)
+            .badge(runsModel.totalPendingApprovalCount > 0 ? runsModel.totalPendingApprovalCount : 0)
 
             tabContent(.ideas) {
                 if P031IdeasCompatibilitySurface.usesUITestFixture {
@@ -84,26 +96,13 @@ struct ContentView: View {
             .tabItem { Label("Ideas", systemImage: "lightbulb") }
             .tag(Tab.ideas)
 
-            tabContent(.approvals) {
-                P031ApprovalCompatibilitySurface()
-            }
-            .tabItem { Label("Approvals", systemImage: "checkmark.seal") }
-            .tag(Tab.approvals)
-
-            tabContent(.agentCatalog) {
-                AgentCatalogView(
+            tabContent(.definitions) {
+                DefinitionsView(
                     catalogURL: exampleFileURL(
                         environmentKey: "CHAINWORKS_AGENT_CATALOG_SOURCE_PATH",
                         bundleName: "agents",
                         repoRelativePath: "examples/agents/agents.yaml"
-                    )
-                )
-            }
-            .tabItem { Label("Agent Catalog", systemImage: "person.3") }
-            .tag(Tab.agentCatalog)
-
-            tabContent(.workflowInspector) {
-                WorkflowInspectorView(
+                    ),
                     workflowURL: exampleFileURL(
                         environmentKey: "CHAINWORKS_WORKFLOW_SOURCE_PATH",
                         bundleName: "workflow",
@@ -113,38 +112,17 @@ struct ContentView: View {
                         environmentKey: nil,
                         bundleName: "proposal-to-release",
                         repoRelativePath: "examples/workflows/proposal-to-release.yaml"
-                    ),
-                    catalogURL: exampleFileURL(
-                        environmentKey: "CHAINWORKS_AGENT_CATALOG_SOURCE_PATH",
-                        bundleName: "agents",
-                        repoRelativePath: "examples/agents/agents.yaml"
                     )
                 )
             }
-            .tabItem { Label("Workflow Inspector", systemImage: "flowchart") }
-            .tag(Tab.workflowInspector)
+            .tabItem { Label("Definitions", systemImage: "square.grid.2x2") }
+            .tag(Tab.definitions)
 
-            tabContent(.pilotReadiness) {
-                P031OperatorPlaceholder(
-                    title: "Pilot Readiness",
-                    message: "Readiness evidence is tracked in repository evidence and daemon-backed run projections.",
-                    identifier: "pilot-readiness-view",
-                    titleIdentifier: "pilot-readiness-title"
-                )
-            }
-            .tabItem { Label("Pilot Readiness", systemImage: "checkmark.shield") }
-            .tag(Tab.pilotReadiness)
-
-            tabContent(.providerSettings) {
-                P031OperatorPlaceholder(
-                    title: "Settings",
-                    message: "Provider configuration is owned by the control plane and packaged daemon.",
-                    identifier: "provider-settings-view",
-                    titleIdentifier: "provider-settings-title"
-                )
+            tabContent(.settings) {
+                SettingsView()
             }
             .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
-            .tag(Tab.providerSettings)
+            .tag(Tab.settings)
         }
         .task(id: forcedInitialTab?.rawValue ?? "default") {
             guard let forcedInitialTab, selectedTab != forcedInitialTab else { return }
@@ -153,12 +131,12 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .chainworksSelectTab)) { notification in
             guard
                 let rawValue = notification.userInfo?["tab"] as? String,
-                let tab = Tab(rawValue: rawValue)
+                let tab = Tab.from(rawValue: rawValue)
             else { return }
             selectedTab = tab
         }
         .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { _ in
-            selectedTab = .runsHome
+            selectedTab = .runs
         }
     }
 
@@ -379,19 +357,23 @@ private struct P031DaemonIdeaDetail: View {
 
                     Divider()
 
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Runs")
-                            .font(.headline)
-                        if runs.isEmpty {
-                            Text("No active runs for this idea.")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(runs, id: \.id) { run in
-                                P031DaemonIdeaRunRow(run: run)
-                            }
-                        }
-                    }
-                } else if isLoading {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Run Status")
+                    .font(.headline)
+                
+                let waitingCount = runs.filter { ($0.pendingApprovals ?? 0) > 0 }.count
+                let blockedCount = runs.filter { $0.status.lowercased().contains("blocked") || $0.status.lowercased().contains("failed") }.count
+                let runningCount = runs.filter { $0.status.lowercased().contains("running") || $0.status.lowercased().contains("active") }.count
+                let completedCount = runs.filter { $0.status.lowercased().contains("completed") || $0.status.lowercased().contains("success") }.count
+                
+                VStack(alignment: .leading, spacing: 8) {
+                    compactStatusStrip(label: "Waiting Approval", count: waitingCount, color: .orange)
+                    compactStatusStrip(label: "Blocked or Failed", count: blockedCount, color: .red)
+                    compactStatusStrip(label: "Running", count: runningCount, color: .blue)
+                    compactStatusStrip(label: "Completed", count: completedCount, color: .green)
+                }
+            }
+        } else if isLoading {
                     ProgressView("Loading ideas")
                 } else {
                     ContentUnavailableView(
@@ -420,47 +402,71 @@ private struct P031DaemonIdeaDetail: View {
             }
         }
     }
+
+    private func compactStatusStrip(label: String, count: Int, color: Color) -> some View {
+        HStack {
+            Text(label)
+                .font(.subheadline)
+            Spacer()
+            Text("\(count)")
+                .font(.caption.monospacedDigit().bold())
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(color.opacity(0.15))
+                .foregroundStyle(color)
+                .clipShape(Capsule())
+            
+            if count > 0 {
+                Button {
+                    NotificationCenter.default.post(
+                        name: .chainworksSelectTab,
+                        object: nil,
+                        userInfo: ["tab": "Runs"]
+                    )
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.primary.opacity(0.04))
+        .cornerRadius(8)
+    }
 }
 
 private struct P031DaemonIdeaRunRow: View {
     let run: P031RunRowReadModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(run.workflowTitle)
-                    .font(.headline)
-                Spacer()
-                Text(P031DaemonIdeasModel.displayStatus(run.status))
-                    .font(.caption.weight(.semibold))
+        HStack(spacing: 8) {
+            Text(run.workflowTitle)
+                .font(.subheadline.weight(.medium))
+                .lineLimit(1)
+            Spacer()
+            if let pending = run.pendingApprovals, pending > 0 {
+                Image(systemName: "checkmark.seal.fill")
+                    .foregroundStyle(.orange)
+                    .font(.caption)
+                Text("\(pending)")
+                    .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            HStack(spacing: 10) {
-                if let progress = progressLabel {
-                    Text(progress)
-                }
-                if let pending = run.pendingApprovals, pending > 0 {
-                    Text("\(pending) approval\(pending == 1 ? "" : "s")")
-                }
-                Text(run.freshnessState.rawValue)
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            Text(P031DaemonIdeasModel.displayStatus(run.status))
+                .font(.caption2.weight(.bold))
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+                .background(.quaternary)
+                .clipShape(Capsule())
         }
-        .padding(12)
-        .background(.quaternary)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.quaternary.opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
         .accessibilityIdentifier("idea-run-row-\(run.id)")
-    }
-
-    private var progressLabel: String? {
-        guard let total = run.totalStages else { return nil }
-        let completed = run.completedStages ?? 0
-        let failed = run.failedStages ?? 0
-        if failed > 0 {
-            return "\(completed)/\(total) stages, \(failed) failed"
-        }
-        return "\(completed)/\(total) stages"
     }
 }
 
@@ -810,39 +816,6 @@ private struct P031CompletedExportHubCompatibilitySurface: View {
     }
 }
 
-private struct P031OperatorPlaceholder: View {
-    let title: String
-    let message: String
-    let identifier: String
-    let titleIdentifier: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(title)
-                .font(.title2.weight(.semibold))
-                .accessibilityIdentifier(titleIdentifier)
-            Text(message)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(24)
-        .accessibilityIdentifier(identifier)
-    }
-}
-
-private struct P031AccessibilityMarker: View {
-    let identifier: String
-
-    var body: some View {
-        Text(" ")
-            .font(.system(size: 1))
-            .frame(width: 1, height: 1)
-            .foregroundStyle(.clear)
-            .accessibilityLabel(identifier)
-            .accessibilityIdentifier(identifier)
-    }
-}
 
 #Preview {
     ContentView()
