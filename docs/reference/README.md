@@ -6,16 +6,16 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 ## Foundation Layer
 
-- [domain-model.md](domain-model.md) — SwiftData persistence: `Idea`, `Run`, `StageExecution`, `AgentExecution`, `Approval`, `Artifact`, Steward records, provenance snapshots, drift detection, cost tracking; plus Rust-only **lead mediation and confirmation** models
+- [domain-model.md](domain-model.md) — SwiftData persistence: `Idea`, `Run`, `StageExecution`, `AgentExecution`, `Approval`, `Artifact`, Steward records, provenance snapshots, drift detection, cost tracking; plus Rust-only **lead mediation, side effects, and confirmation** models
 - [yaml-dsl-parser.md](yaml-dsl-parser.md) — YAML parsing, validation (10 check categories), compact workflow normalization, provenance hashing, verification scaffold
 - [architecture-decisions.md](architecture-decisions.md) — Key AD decisions: CodingKeys, single-active-run, drift detection, snapshot storage, integer cost, derived currentStageID, and **owner-aware execution identity**
 
 ## Execution Engine
 
-- [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service, and **lead conflict mediation**
+- [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service, **durable side effects**, and **lead conflict mediation**
 - [artifact-discovery-and-settlement-optimization.md](artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules, and **mediation-owned execution identity**
-- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, atomic transition settlement, cursor-driven resume, stage-owned recovery evidence, approval restore, runtime binding truth, host interruption, **mediation settlement**, and startup recovery progress readback
+- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, atomic transition settlement, cursor-driven resume, stage-owned recovery evidence, approval restore, runtime binding truth, host interruption, **side-effect reconciliation**, **mediation settlement**, and startup recovery progress readback
 - [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md) — Skill resolution, role specialization, runtime injection, frozen skill truth, and operator readback
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) — Per-agent MCP profiles, requested/predicted/actual/denied truth, runtime validation, and MCP telemetry
 - [failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](failed-stage-evidence-delivery-preflight-and-mcp-resolution.md) — Rust failed-stage evidence packets, delivery preflight, execution-time MCP resolution, ACP `mcpServers`, and northbound readback
@@ -31,7 +31,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 ## Control Plane
 
-- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, boundary shape, configuration, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, **mediation settlement**, and generated-state housekeeping
+- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, side-effect ledger, boundary shape, configuration, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, **mediation settlement**, and generated-state housekeeping
 - [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md) — Local daemon lifecycle, supervision, health/readiness, packaged-mode paths, SQLite startup safety, failed-serve behavior, diagnostics, and packaging proof lanes
 - [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) — Bearer auth, caller-scoped capability filtering, per-command audit journaling, **mixed inbox (stage approvals + mediation confirmations)**, and `journal_id` surfacing on MCP + GraphQL northbound surfaces
 - [ui-action-boundary.md](ui-action-boundary.md) — Governed SwiftUI action boundary: GraphQL reads/subscriptions plus approval mutations; non-approval operations are MCP-only
@@ -51,7 +51,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [p077-closeout-readiness-ui-evidence.md](p077-closeout-readiness-ui-evidence.md) — Retained historical alias evidence file for closeout-readiness token, contrast, diagnostic, focus, recovery, and accessibility proof
 - [ui-quality-and-polish.md](ui-quality-and-polish.md) — UI readability, bounded accessibility, shared status semantics, and owner-surface proof contract
 - [run-control.md](run-control.md) — Stop vs archive boundary, two-phase cancellation settlement, operator-visible `cancelling`/`cancelled` truth, northbound reader split
-- [release-gate.md](release-gate.md) — Manual release gate: post-approval task execution, N-phase ordering, native deterministic git/publish, canonical release artifacts, and `delivery_receipt` settlement
+- [release-gate.md](release-gate.md) — Manual release gate: post-approval task execution, N-phase ordering, native deterministic git/publish, canonical release artifacts, **durable side-effect ledger**, and `delivery_receipt` settlement
 - [executable-rollout-gate-template.md](executable-rollout-gate-template.md) — `rollout_contract_v1` / `rollout_contract_check_v1` / `operator_readback_v1` schemas, run-start preflight contract, security/path/authorization guidance, and retained historical alias self-contract
 - [project-workspace-contract.md](project-workspace-contract.md) — `requires_project_access`, idea-owned workspace root, frozen run workspace contract
 - [provider-binding-truth.md](provider-binding-truth.md) — Frozen provider/model truth, provenance, and cross-family mismatch handling

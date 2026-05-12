@@ -327,6 +327,37 @@ impl AgentExecutionRuntimeFacts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentExecutionRuntimeReceiptRecord {
+    pub agent_execution_id: AgentExecutionId,
+    pub provider: String,
+    pub transport_family: String,
+    pub status: String,
+    pub failure_phase: Option<String>,
+    pub event_count: i64,
+    pub last_event_kind: Option<String>,
+    pub last_event_at_ms: Option<i64>,
+    pub receipt_json: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentExecutionRuntimePromptReceiptRecord {
+    pub runtime_receipt_id: String,
+    pub agent_execution_id: AgentExecutionId,
+    pub prompt_kind: String,
+    pub turn_index: i64,
+    pub prompt_template_id: Option<String>,
+    pub prompt_template_version: Option<i64>,
+    pub prompt_sha256: Option<String>,
+    pub redacted_prompt_artifact_path: Option<String>,
+    pub expected_output_contract_snapshot_sha256: Option<String>,
+    pub expected_output_contract_snapshot_path: Option<String>,
+    pub repair_or_settlement_reason: Option<String>,
+    pub runtime_receipt: AgentExecutionRuntimeReceiptRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactSourceClaimState {
     Active,

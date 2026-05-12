@@ -1,0 +1,18 @@
+{
+  "schema_version": "p088_fixture_v1",
+  "scenario": "p087_70c9_preexisting_dirty_timeout",
+  "run_id": "b4edcf82-0d3f-4281-83b7-f8fe94721721",
+  "stage_id": "state_7_implementation_started",
+  "agent_id": "code_writer",
+  "attempt_prefix": "70c9b120",
+  "terminal_response_status": "timeout",
+  "work_change_kind": "preexisting_dirty_work",
+  "expected_not_failure_class": "work_completed_missing_current_attempt_outputs",
+  "expected_completion_turn_result": "skipped_ineligible",
+  "expected_next_operator_action": "do_not_retry_preexisting_dirty_timeout",
+  "fingerprint_expectations": {
+    "preexisting_dirty_path_count_min": 1,
+    "current_attempt_changed_path_count": 0,
+    "required_path_status": "preexisting_dirty"
+  }
+}

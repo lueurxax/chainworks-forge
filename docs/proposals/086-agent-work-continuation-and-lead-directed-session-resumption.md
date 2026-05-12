@@ -5,7 +5,7 @@
 | Date | 2026-05-07 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | [Local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), P078 Durable Side-Effect Ledger for side-effect lanes, P081 Boundary Matrix / UI Action Boundary |
+| Depends on | [Local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), [durable side-effect ledger](../reference/rust-control-plane.md#durable-side-effect-ledger) for side-effect lanes, P081 Boundary Matrix / UI Action Boundary |
 | Related | P079 Contract-Aware Output Repair, P080 Continuous Stale Execution Reconciliation, Session Lineage Reference, ACP Runtime Transport |
 | Scope | Add an in-band way to continue useful agent work through server-owned provider session continuity instead of forcing a fresh retry that re-discovers the proposal, repository, blockers, and current diff. Support live-handle continuation first, define provider-session resurrection by known provider `session_id` for adapters that can attach/resume that provider session, fail closed for adapters that cannot, and allow both operator-triggered continuation through MCP and lead-directed automatic continuation under strict eligibility and safety rules. |
 | Goal | Reduce wasted time and model/runtime burn on implementation work by preserving useful provider-session continuity while still recording Chainworks truth, evidence, provenance, and safety boundaries. |
@@ -580,7 +580,7 @@ Rules:
 
 ## 11. Side-effect safety
 
-Continuation must obey P078.
+Continuation must obey the durable side-effect ledger.
 
 If unresolved side-effect ledger entries exist, continuation fails with:
 

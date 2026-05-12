@@ -7,8 +7,8 @@ use tracing::warn;
 use crate::adapters::XcodeShimGrantCleanup;
 use crate::transport::{AcpSessionConfig, AcpTransportSession};
 use crate::{
-    AcpCloseDiagnostic, AcpPromptProgressSink, ExecutionRequest, ExecutionResult,
-    NoopAcpPromptProgressSink,
+    AcpCloseDiagnostic, AcpExecutionError, AcpPromptProgressSink, ExecutionRequest,
+    ExecutionResult, NoopAcpPromptProgressSink,
 };
 use domain::ids::AgentExecutionId;
 
@@ -134,6 +134,19 @@ impl AcpSession {
                     .await
             }
         };
+        let prompt_result = match prompt_result {
+            Ok(prompt_result) => prompt_result,
+            Err(error) => {
+                if let Some(receipt) = self.transport.runtime_receipt().cloned() {
+                    let message = error.to_string();
+                    return Err(
+                        anyhow::Error::new(AcpExecutionError::new(message, Some(receipt)))
+                            .context(error),
+                    );
+                }
+                return Err(error);
+            }
+        };
         self.xcode_shim_grants
             .iter()
             .for_each(|grant| grant.set_active_prompt(false));
@@ -143,6 +156,7 @@ impl AcpSession {
             discovered_artifacts,
             pre_prompt_expected_outputs,
             transcript_text,
+            completion_text_capture,
             usage,
             xcode_shim_warning_events,
             acp_pre_initialize_local_latency_ms,
@@ -153,7 +167,7 @@ impl AcpSession {
             acp_pre_prompt_metadata_timeout,
             acp_pre_prompt_metadata_digest_bytes,
             legacy_broad_discovery_snapshot,
-        ) = prompt_result?;
+        ) = prompt_result;
         let mcp_observation = self.transport.mcp_observation();
         let actual_mcp_extensions = mcp_observation
             .as_ref()
@@ -170,6 +184,7 @@ impl AcpSession {
             discovered_artifacts,
             pre_prompt_expected_outputs,
             transcript_text,
+            completion_text_capture,
             cost_cents: usage.as_ref().and_then(|snapshot| snapshot.cost_cents),
             usage,
             provider_session_id: Some(self.transport.session_id().to_string()),
@@ -189,6 +204,7 @@ impl AcpSession {
             acp_pre_prompt_metadata_timeout,
             acp_pre_prompt_metadata_digest_bytes,
             legacy_broad_discovery_snapshot,
+            runtime_receipt: self.transport.runtime_receipt().cloned(),
         })
     }
 

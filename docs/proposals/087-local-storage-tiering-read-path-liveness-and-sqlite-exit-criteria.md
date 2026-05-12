@@ -5,7 +5,7 @@
 | Date | 2026-05-08 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | Implemented SQLite write-discipline / evidence-spooling baseline, P078 Durable Side-Effect Ledger, UI Action Boundary reference |
+| Depends on | Implemented SQLite write-discipline / evidence-spooling baseline, [durable side-effect ledger](../reference/rust-control-plane.md#durable-side-effect-ledger), UI Action Boundary reference |
 | Related | P038 Run Compaction, P079 Contract-Aware Output Repair, P080 Continuous Stale Execution Reconciliation, P086 Agent Work Continuation |
 | Scope | Formalize Plan A for local storage: keep SQLite as compact canonical state DB, move high-volume evidence to file spool, serve hot reads from materialized/in-memory projections, add MCP/read-path liveness rules, and define explicit exit criteria for moving parts of storage elsewhere. |
 | Goal | Avoid turning SQLite into a choke point while preserving the local single-process architecture. Prevent future durability and recovery proposals from increasing write pressure or blocking MCP/GraphQL read surfaces. |
@@ -19,7 +19,7 @@ This proposal is written against the current `main` branch state.
 Observed current state:
 
 - `docs/ROADMAP.md` treats provider toolchain cache mapping as a completed/reference prerequisite and says the local persistence write-budget / evidence-spooling infrastructure is implemented and remains the persistence safety baseline.
-- `docs/proposals/078-durable-side-effect-ledger-release-settlement-and-reconciliation.md` now depends on the implemented local persistence write-budget contract rather than on an active P075 proposal.
+- the durable side-effect ledger implementation depends on the implemented local persistence write-budget contract rather than active proposal text.
 - `docs/proposals/086-agent-work-continuation-and-lead-directed-session-resumption.md` also depends on the implemented write-budget contract and requires spooled continuation evidence.
 - `control-plane/crates/db/src/writer.rs` already contains the DbWriter implementation with six priority lanes, write classes, coalescing, WAL policy, shutdown drain rules, and evidence metadata lane.
 - `control-plane/crates/db/src/evidence_spool.rs` exists and should remain the path for high-volume evidence bytes.
@@ -130,7 +130,7 @@ This proposal does **not**:
 - introduce RocksDB;
 - replace SQLite;
 - undo DbWriter;
-- change P078 side-effect semantics;
+- change durable side-effect ledger semantics;
 - change the UI action boundary;
 - add new UI write controls;
 - add new ACP provider families;
@@ -376,9 +376,9 @@ This proposal adds:
 
 ---
 
-## 10. Interaction with P078
+## 10. Interaction with the Durable Side-Effect Ledger
 
-P078 side-effect ledger must use Plan A as follows:
+The durable side-effect ledger must use Plan A as follows:
 
 - `side_effects` rows are compact SQLite state;
 - `side_effect_attempts` rows are compact attempt metadata;
@@ -388,7 +388,7 @@ P078 side-effect ledger must use Plan A as follows:
 - `effects.reconcile` may perform readback but must not block generic MCP read tools;
 - unresolved side-effect count is projected into hot read state.
 
-P078 must not create high-volume SQLite event rows.
+The durable ledger must not create high-volume SQLite event rows.
 
 ---
 
@@ -593,7 +593,7 @@ P087 is complete when:
 5. GraphQL hot reads use projections/cache, not deep scans.
 6. Storage health exposes write pressure, WAL, spool, and projection lag.
 7. Storage exit criteria are documented and enforced by a gate.
-8. P078/P038/P086 can rely on the storage tiering contract without increasing SQLite pressure unexpectedly.
+8. the durable side-effect ledger, P038, and P086 can rely on the storage tiering contract without increasing SQLite pressure unexpectedly.
 
 ---
 

@@ -81,11 +81,11 @@ It explicitly does not own:
 
 This is important as context for future work, but it should not be scheduled as a new run.
 
-#### The write-budget contract and P078 now address the root durability concern
+#### The write-budget contract and durable side-effect ledger now address the root durability concern
 
 The implemented [Rust control-plane write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter) keeps SQLite as a compact local control-plane DB, not a runtime event stream.
 
-[P078](../proposals/078-durable-side-effect-ledger-release-settlement-and-reconciliation.md) correctly states that external side effects require durable intent, idempotency, readback, reconciliation, and retry blocking.
+The implemented [durable side-effect ledger](../reference/rust-control-plane.md#durable-side-effect-ledger) gives external side effects durable intent, idempotency, readback, reconciliation, and retry blocking.
 
 This pair is now the most important safety foundation after the UI/action boundary.
 
@@ -95,7 +95,7 @@ This pair is now the most important safety foundation after the UI/action bounda
 
 [P080](../proposals/080-continuous-stale-execution-reconciliation.md) covers continuous stale execution reconciliation.
 
-Both are useful, but both must remain downstream of the implemented write-budget contract and P078 safety rails.
+Both are useful, but both must remain downstream of the implemented write-budget contract and durable side-effect safety rails.
 
 ---
 
@@ -125,7 +125,7 @@ The system already uses SQLite for many control-plane concerns.
 
 The implemented write-budget contract is the guardrail for adding more durability state without making the database behave like an event stream.
 
-This is now the most important technical risk before implementing P078 and P038.
+This is now the most important technical risk before broadening compaction and storage-heavy recovery work.
 
 Related docs:
 
@@ -133,17 +133,17 @@ Related docs:
 - [P038 run compaction and artifact governance](../proposals/038-run-compaction-artifact-governance-and-canonical-snapshot-maintenance.md)
 - [Rust control plane reference](../reference/rust-control-plane.md)
 
-### 2.3 Retry/recovery is unsafe until side-effect ledger lands
+### 2.3 Retry/recovery is unsafe without the side-effect ledger
 
-P078 identifies that retry of release-side-effect stages can duplicate external actions.
+The durable side-effect ledger identifies and guards the risk that retry of release-side-effect stages can duplicate external actions.
 
-Until P078 lands, retry automation must fail closed around release/publish/git stages.
+Retry automation must fail closed around release/publish/git stages while unresolved side effects exist.
 
-P076/P080 should not perform active repair/retry for side-effect lanes until P078 is implemented.
+P076/P080 should not perform active repair/retry for side-effect lanes unless the durable ledger readback clears them.
 
 Related docs:
 
-- [P078 durable side-effect ledger](../proposals/078-durable-side-effect-ledger-release-settlement-and-reconciliation.md)
+- [Durable side-effect ledger](../reference/rust-control-plane.md#durable-side-effect-ledger)
 - [P076 auto-retry observation ledger](../proposals/076-auto-retry-observation-ledger-and-recovery-policy.md)
 - [P080 continuous stale execution reconciliation](../proposals/080-continuous-stale-execution-reconciliation.md)
 - [Execution truth and recovery](../reference/execution-truth-and-recovery.md)
@@ -152,7 +152,7 @@ Related docs:
 
 [P073](../proposals/073-stability-freeze-regression-budget-and-refactor-plan.md) should remain a stabilization operating mode, not a normal feature.
 
-[../ROADMAP.md](../ROADMAP.md) should now explicitly include the implemented write-budget contract plus P078/P079/P080/P081/P082/P083 and the executable rollout-gate template, not only older P031/P038/P046/P068 style work.
+[../ROADMAP.md](../ROADMAP.md) should now explicitly include the implemented write-budget contract, the durable side-effect ledger, P079/P080/P081/P082/P083, and the executable rollout-gate template, not only older P031/P038/P046/P068 style work.
 
 ---
 
@@ -169,7 +169,7 @@ Allowed work:
 - boundary cleanup,
 - provider toolchain cache mapping follow-up only when a regression is found,
 - write-budget gate maintenance,
-- P078 side-effect safety,
+- durable side-effect safety,
 - P031 closeout,
 - P038 compaction after the write-budget contract,
 - P070/P083 consolidation after core safety rails.
@@ -188,7 +188,7 @@ Frozen work:
 #### Step 1 - executable rollout-gate template
 
 Use the [executable rollout-gate template](../reference/executable-rollout-gate-template.md)
-before major P078 and persistence/recovery implementation work.
+before major persistence/recovery implementation work.
 
 Minimum deliverables:
 
@@ -206,7 +206,7 @@ Do not expand the executable rollout-gate template into a large product feature.
 
 Purpose:
 
-> Keep write-budget and P078 behavior executable and measurable before they touch core persistence/recovery behavior.
+> Keep write-budget and durable side-effect behavior executable and measurable before they touch core persistence/recovery behavior.
 
 ### 3.3 Boundary closeout
 
@@ -262,7 +262,7 @@ This should be a small executable contract and test slice, not a new feature sur
 
 #### Step 5 - local persistence write budget
 
-This foundation is implemented and remains a prerequisite for P078 and P038.
+This foundation is implemented and remains a prerequisite for the durable side-effect ledger and P038.
 
 Implemented slice:
 
@@ -275,9 +275,9 @@ Implemented slice:
 
 The current contract does not require rewriting all existing persistence at once.
 
-The write-budget gate protects new P078/P038 paths.
+The write-budget gate protects durable side-effect and P038 paths.
 
-#### Step 6 - P078 durable side-effect ledger
+#### Step 6 - durable side-effect ledger
 
 After the write-budget contract.
 
@@ -316,7 +316,7 @@ Minimum rows:
 
 #### Step 8 - P076 / P080 recovery automation
 
-Only after P078 guard exists.
+Only after the durable side-effect guard exists.
 
 Allowed early:
 
@@ -324,7 +324,7 @@ Allowed early:
 - readback,
 - typed stale classifications.
 
-Allowed after P078:
+Allowed after durable side-effect clearance:
 
 - active repair for non-release lanes,
 - release lanes routed to `requires_effect_reconciliation`.
@@ -333,7 +333,7 @@ Never retry release/publish/git work while unresolved side effects exist.
 
 #### Step 9 - P079 output repair/fallback
 
-After the write-budget contract and P078, preferably after P082 coverage.
+After the write-budget contract and durable side-effect ledger, preferably after P082 coverage.
 
 P079 is useful, but it introduces repair/fallback behavior.
 
@@ -359,7 +359,7 @@ Reset remains MCP-only.
 
 After the write-budget contract.
 
-Preferably after P078 so compaction can preserve side-effect reconciliation evidence.
+Preferably after the durable side-effect ledger so compaction can preserve side-effect reconciliation evidence.
 
 Deliverables:
 
@@ -372,7 +372,7 @@ Deliverables:
 
 #### Step 12 - P083 ownership invariant model
 
-Do [P083](../proposals/083-execution-truth-ownership-invariant-model.md) after P078 or alongside late P078.
+Do [P083](../proposals/083-execution-truth-ownership-invariant-model.md) after the durable side-effect ledger or alongside late side-effect hardening.
 
 Purpose:
 
@@ -433,8 +433,8 @@ The most important progress is:
 - UI action boundary is now reference-level truth.
 - P031 is corrected to approval-only mutation stop-state.
 - P066 provider toolchain cache mapping is implemented reference truth, not a next run.
-- The write-budget contract and P078 now name the real local-control-plane durability problem.
-- P079/P080 are useful but must remain downstream of the write-budget contract and P078.
+- The write-budget contract and durable side-effect ledger now name the real local-control-plane durability problem.
+- P079/P080 are useful but must remain downstream of the write-budget contract and durable side-effect safety.
 
 The plan should be updated, not replaced.
 
@@ -446,7 +446,7 @@ P073
 -> P072 closeout
 -> P081
 -> write-budget contract
--> P078
+-> durable side-effect ledger
 -> P082
 -> P076/P080
 -> P079

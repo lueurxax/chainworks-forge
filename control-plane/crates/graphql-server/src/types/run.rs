@@ -4,6 +4,12 @@ use domain::artifact_contracts::{
     HandoffTaskSummary, ImplementationSelfAssessmentSummary, RemainingCodeTaskSummary,
     TargetStageSummary, ValidationIssue,
 };
+use domain::code_writer_completion::{
+    CodeWriterCompletionOutputDecisionRecord, CodeWriterCompletionReceiptReadback,
+    CodeWriterCompletionReceiptRecord, CodeWriterCompletionTextCaptureRecord,
+    ImplementationCompletionSummary, ImplementationCompletionTextCaptureReadback,
+    PublicEnumReadback,
+};
 use domain::mediation::LeadConflictMediationRecord;
 use domain::run::Run;
 use domain::workflow_conflict::{
@@ -61,6 +67,12 @@ pub struct GqlRun {
     pub main_sync_readback_json: Option<Json<serde_json::Value>>,
     pub knowledge_capsule_readback_json: Option<Json<serde_json::Value>>,
     pub rollout_contract_readback_json: Option<Json<serde_json::Value>>,
+    /// P078: Run-scoped side-effect ledger readback for operator surfaces.
+    pub side_effect_readback_json: Option<Json<serde_json::Value>>,
+    /// P088: Code-writer completion receipts for current-attempt output freshness readback.
+    pub code_writer_completion_receipts: Vec<GqlCodeWriterCompletionReceipt>,
+    /// P088: Public implementation-completion summary with closed vocabularies and unknown metadata.
+    pub implementation_completion: GqlImplementationCompletionSummary,
     /// P077: Active closeout readiness summary (via CloseoutReadinessSummaryAccessor).
     pub closeout_readiness_summary_json: Option<Json<serde_json::Value>>,
     /// P077: Documented alias for the implementation closeout readiness summary.
@@ -113,6 +125,9 @@ impl From<Run> for GqlRun {
             main_sync_readback_json: None,
             knowledge_capsule_readback_json: None,
             rollout_contract_readback_json: None,
+            side_effect_readback_json: None,
+            code_writer_completion_receipts: Vec::new(),
+            implementation_completion: GqlImplementationCompletionSummary::not_attempted(),
             closeout_readiness_summary_json: None,
             implementation_closeout_readiness_summary: None,
         }
@@ -183,8 +198,365 @@ impl From<RunProjectionRow> for GqlRun {
             main_sync_readback_json: None,
             knowledge_capsule_readback_json: None,
             rollout_contract_readback_json: None,
+            side_effect_readback_json: None,
+            code_writer_completion_receipts: Vec::new(),
+            implementation_completion: GqlImplementationCompletionSummary::not_attempted(),
             closeout_readiness_summary_json: None,
             implementation_closeout_readiness_summary: None,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "PublicEnumReadback", rename_fields = "camelCase")]
+pub struct GqlPublicEnumReadback {
+    pub value: String,
+    pub raw: Option<String>,
+    pub known: bool,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "ImplementationCompletionSummary", rename_fields = "camelCase")]
+pub struct GqlImplementationCompletionSummary {
+    pub status: GqlPublicEnumReadback,
+    pub failure_class: Option<String>,
+    pub work_change_kind: Option<String>,
+    pub activation_source: Option<String>,
+    pub completion_mode: Option<String>,
+    pub published_at: Option<String>,
+    pub ingestion_boundary_failure: GqlPublicEnumReadback,
+    pub pre_prompt_worktree_fingerprint_path: Option<String>,
+    pub post_prompt_worktree_fingerprint_path: Option<String>,
+    pub completion_turn_attempted: bool,
+    pub completion_turn_result: GqlPublicEnumReadback,
+    pub terminal_response_status: Option<String>,
+    pub completion_text_captures: Vec<GqlImplementationCompletionTextCapture>,
+    pub prompt_template_id: Option<String>,
+    pub prompt_template_version: Option<i64>,
+    pub prompt_sha256: Option<String>,
+    pub redacted_prompt_artifact_path: Option<String>,
+    pub expected_output_contract_snapshot_sha256: Option<String>,
+    pub repair_or_settlement_reason: Option<String>,
+    pub fresh_required_output_count: i64,
+    pub stale_required_output_count: i64,
+    pub missing_required_output_count: i64,
+    pub control_plane_output_count: i64,
+    pub completion_repair_turn_count: i64,
+    pub generic_repair_turn_count: i64,
+    pub missing_outputs: Vec<String>,
+    pub stale_outputs: Vec<String>,
+    pub completion_repair_text_status: Option<String>,
+    pub completion_repair_redacted_text_artifact_path: Option<String>,
+    pub completion_repair_text_absence_reason: Option<String>,
+    pub transcript_status: Option<String>,
+    pub transcript_absence_reason: Option<String>,
+    pub receipt_artifact_path: Option<String>,
+    pub failed_stage_evidence_path: Option<String>,
+    pub next_operator_action: GqlPublicEnumReadback,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(
+    name = "ImplementationCompletionTextCapture",
+    rename_fields = "camelCase"
+)]
+pub struct GqlImplementationCompletionTextCapture {
+    pub prompt_kind: String,
+    pub turn_index: i64,
+    pub terminal_response_status: Option<String>,
+    pub completion_text_status: String,
+    pub completion_text_capture_source: Option<String>,
+    pub completion_text_raw_byte_limit: Option<i64>,
+    pub completion_text_captured_byte_count: Option<i64>,
+    pub completion_text_truncated: bool,
+    pub extraction_input_truncated: bool,
+    pub extraction_input_sha256: Option<String>,
+    pub redacted_text_artifact_path: Option<String>,
+    pub text_absence_reason: Option<String>,
+    pub created_at: String,
+}
+
+impl GqlImplementationCompletionSummary {
+    pub fn not_attempted() -> Self {
+        domain::code_writer_completion::project_implementation_completion(&[]).into()
+    }
+}
+
+impl From<PublicEnumReadback> for GqlPublicEnumReadback {
+    fn from(value: PublicEnumReadback) -> Self {
+        Self {
+            value: value.value,
+            raw: value.raw,
+            known: value.known,
+        }
+    }
+}
+
+impl From<ImplementationCompletionSummary> for GqlImplementationCompletionSummary {
+    fn from(summary: ImplementationCompletionSummary) -> Self {
+        Self {
+            status: summary.status.into(),
+            failure_class: summary.failure_class,
+            work_change_kind: summary.work_change_kind,
+            activation_source: summary.activation_source,
+            completion_mode: summary.completion_mode,
+            published_at: summary
+                .published_at
+                .map(|published_at| published_at.to_rfc3339()),
+            ingestion_boundary_failure: summary.ingestion_boundary_failure.into(),
+            pre_prompt_worktree_fingerprint_path: summary.pre_prompt_worktree_fingerprint_path,
+            post_prompt_worktree_fingerprint_path: summary.post_prompt_worktree_fingerprint_path,
+            completion_turn_attempted: summary.completion_turn_attempted,
+            completion_turn_result: summary.completion_turn_result.into(),
+            terminal_response_status: summary.terminal_response_status,
+            completion_text_captures: summary
+                .completion_text_captures
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            prompt_template_id: summary.prompt_template_id,
+            prompt_template_version: summary.prompt_template_version,
+            prompt_sha256: summary.prompt_sha256,
+            redacted_prompt_artifact_path: summary.redacted_prompt_artifact_path,
+            expected_output_contract_snapshot_sha256: summary
+                .expected_output_contract_snapshot_sha256,
+            repair_or_settlement_reason: summary.repair_or_settlement_reason,
+            fresh_required_output_count: summary.fresh_required_output_count,
+            stale_required_output_count: summary.stale_required_output_count,
+            missing_required_output_count: summary.missing_required_output_count,
+            control_plane_output_count: summary.control_plane_output_count,
+            completion_repair_turn_count: summary.completion_repair_turn_count,
+            generic_repair_turn_count: summary.generic_repair_turn_count,
+            missing_outputs: summary.missing_outputs,
+            stale_outputs: summary.stale_outputs,
+            completion_repair_text_status: summary.completion_repair_text_status,
+            completion_repair_redacted_text_artifact_path: summary
+                .completion_repair_redacted_text_artifact_path,
+            completion_repair_text_absence_reason: summary.completion_repair_text_absence_reason,
+            transcript_status: summary.transcript_status,
+            transcript_absence_reason: summary.transcript_absence_reason,
+            receipt_artifact_path: summary.receipt_artifact_path,
+            failed_stage_evidence_path: summary.failed_stage_evidence_path,
+            next_operator_action: summary.next_operator_action.into(),
+        }
+    }
+}
+
+impl From<ImplementationCompletionTextCaptureReadback> for GqlImplementationCompletionTextCapture {
+    fn from(capture: ImplementationCompletionTextCaptureReadback) -> Self {
+        Self {
+            prompt_kind: capture.prompt_kind,
+            turn_index: capture.turn_index,
+            terminal_response_status: capture.terminal_response_status,
+            completion_text_status: capture.completion_text_status,
+            completion_text_capture_source: capture.completion_text_capture_source,
+            completion_text_raw_byte_limit: capture.completion_text_raw_byte_limit,
+            completion_text_captured_byte_count: capture.completion_text_captured_byte_count,
+            completion_text_truncated: capture.completion_text_truncated,
+            extraction_input_truncated: capture.extraction_input_truncated,
+            extraction_input_sha256: capture.extraction_input_sha256,
+            redacted_text_artifact_path: capture.redacted_text_artifact_path,
+            text_absence_reason: capture.text_absence_reason,
+            created_at: capture.created_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "CodeWriterCompletionReceipt", rename_fields = "camelCase")]
+pub struct GqlCodeWriterCompletionReceipt {
+    pub id: String,
+    pub run_id: ID,
+    pub stage_execution_id: ID,
+    pub agent_execution_id: ID,
+    pub session_generation_id: Option<String>,
+    pub original_runtime_receipt_id: Option<String>,
+    pub completion_repair_runtime_receipt_id: Option<String>,
+    pub provider: String,
+    pub model: Option<String>,
+    pub completion_mode: Option<String>,
+    pub published_at: Option<String>,
+    pub activation_source: String,
+    pub ingestion_boundary_failure: Option<String>,
+    pub work_change_kind: Option<String>,
+    pub pre_prompt_worktree_fingerprint_path: Option<String>,
+    pub post_prompt_worktree_fingerprint_path: Option<String>,
+    pub pre_prompt_worktree_fingerprint_sha256: Option<String>,
+    pub post_prompt_worktree_fingerprint_sha256: Option<String>,
+    pub current_attempt_changed_path_count: i64,
+    pub preexisting_dirty_path_count: i64,
+    pub completion_status: String,
+    pub failure_class: Option<String>,
+    pub terminal_response_status: Option<String>,
+    pub completion_turn_attempted: bool,
+    pub completion_turn_result: Option<String>,
+    pub completion_text_capture_count: i64,
+    pub completion_text_absence_count: i64,
+    pub completion_repair_text_status: Option<String>,
+    pub completion_repair_raw_text_artifact_path: Option<String>,
+    pub completion_repair_redacted_text_artifact_path: Option<String>,
+    pub completion_repair_text_absence_reason: Option<String>,
+    pub fresh_required_output_count: i64,
+    pub stale_required_output_count: i64,
+    pub missing_required_output_count: i64,
+    pub control_plane_output_count: i64,
+    pub completion_repair_turn_count: i64,
+    pub generic_repair_turn_count: i64,
+    pub missing_outputs: Vec<String>,
+    pub stale_outputs: Vec<String>,
+    pub transcript_status: Option<String>,
+    pub transcript_absence_reason: Option<String>,
+    pub receipt_artifact_path: Option<String>,
+    pub failed_stage_evidence_path: Option<String>,
+    pub created_at: String,
+    pub text_captures: Vec<GqlCodeWriterCompletionTextCapture>,
+    pub output_decisions: Vec<GqlCodeWriterCompletionOutputDecision>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "CodeWriterCompletionTextCapture", rename_fields = "camelCase")]
+pub struct GqlCodeWriterCompletionTextCapture {
+    pub prompt_kind: String,
+    pub turn_index: i64,
+    pub terminal_response_status: Option<String>,
+    pub completion_text_status: String,
+    pub completion_text_capture_source: Option<String>,
+    pub completion_text_raw_byte_limit: Option<i64>,
+    pub completion_text_captured_byte_count: Option<i64>,
+    pub completion_text_truncated: bool,
+    pub extraction_input_truncated: bool,
+    pub extraction_input_sha256: Option<String>,
+    pub raw_text_artifact_path: Option<String>,
+    pub redacted_text_artifact_path: Option<String>,
+    pub text_absence_reason: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(
+    name = "CodeWriterCompletionOutputDecision",
+    rename_fields = "camelCase"
+)]
+pub struct GqlCodeWriterCompletionOutputDecision {
+    pub output_name: String,
+    pub contract_id: Option<String>,
+    pub canonical_path: String,
+    pub pre_prompt_sha256: Option<String>,
+    pub post_prompt_sha256: Option<String>,
+    pub content_sha256: Option<String>,
+    pub settlement_source: Option<String>,
+    pub validation_status: Option<String>,
+    pub rejection_reason: Option<String>,
+}
+
+impl From<CodeWriterCompletionReceiptReadback> for GqlCodeWriterCompletionReceipt {
+    fn from(readback: CodeWriterCompletionReceiptReadback) -> Self {
+        let receipt = readback.receipt;
+        Self::from_parts(receipt, readback.text_captures, readback.output_decisions)
+    }
+}
+
+impl GqlCodeWriterCompletionReceipt {
+    pub fn from_parts(
+        receipt: CodeWriterCompletionReceiptRecord,
+        text_captures: Vec<CodeWriterCompletionTextCaptureRecord>,
+        output_decisions: Vec<CodeWriterCompletionOutputDecisionRecord>,
+    ) -> Self {
+        Self {
+            id: receipt.id,
+            run_id: ID(receipt.run_id.to_string()),
+            stage_execution_id: ID(receipt.stage_execution_id.to_string()),
+            agent_execution_id: ID(receipt.agent_execution_id.to_string()),
+            session_generation_id: receipt.session_generation_id,
+            original_runtime_receipt_id: receipt.original_runtime_receipt_id,
+            completion_repair_runtime_receipt_id: receipt.completion_repair_runtime_receipt_id,
+            provider: receipt.provider,
+            model: receipt.model,
+            completion_mode: receipt.completion_mode,
+            published_at: receipt
+                .published_at
+                .map(|published_at| published_at.to_rfc3339()),
+            activation_source: receipt.activation_source,
+            ingestion_boundary_failure: receipt.ingestion_boundary_failure,
+            work_change_kind: receipt.work_change_kind,
+            pre_prompt_worktree_fingerprint_path: receipt.pre_prompt_worktree_fingerprint_path,
+            post_prompt_worktree_fingerprint_path: receipt.post_prompt_worktree_fingerprint_path,
+            pre_prompt_worktree_fingerprint_sha256: receipt.pre_prompt_worktree_fingerprint_sha256,
+            post_prompt_worktree_fingerprint_sha256: receipt
+                .post_prompt_worktree_fingerprint_sha256,
+            current_attempt_changed_path_count: receipt.current_attempt_changed_path_count,
+            preexisting_dirty_path_count: receipt.preexisting_dirty_path_count,
+            completion_status: receipt.completion_status,
+            failure_class: receipt.failure_class,
+            terminal_response_status: receipt.terminal_response_status,
+            completion_turn_attempted: receipt.completion_turn_attempted,
+            completion_turn_result: receipt.completion_turn_result,
+            completion_text_capture_count: receipt.completion_text_capture_count,
+            completion_text_absence_count: receipt.completion_text_absence_count,
+            completion_repair_text_status: receipt.completion_repair_text_status,
+            completion_repair_raw_text_artifact_path: receipt
+                .completion_repair_raw_text_artifact_path,
+            completion_repair_redacted_text_artifact_path: receipt
+                .completion_repair_redacted_text_artifact_path,
+            completion_repair_text_absence_reason: receipt.completion_repair_text_absence_reason,
+            fresh_required_output_count: receipt.fresh_required_output_count,
+            stale_required_output_count: receipt.stale_required_output_count,
+            missing_required_output_count: receipt.missing_required_output_count,
+            control_plane_output_count: receipt.control_plane_output_count,
+            completion_repair_turn_count: receipt.completion_repair_turn_count,
+            generic_repair_turn_count: receipt.generic_repair_turn_count,
+            missing_outputs: receipt.missing_outputs,
+            stale_outputs: receipt.stale_outputs,
+            transcript_status: receipt.transcript_status,
+            transcript_absence_reason: receipt.transcript_absence_reason,
+            receipt_artifact_path: receipt.receipt_artifact_path,
+            failed_stage_evidence_path: receipt.failed_stage_evidence_path,
+            created_at: receipt.created_at.to_rfc3339(),
+            text_captures: text_captures
+                .into_iter()
+                .map(GqlCodeWriterCompletionTextCapture::from)
+                .collect(),
+            output_decisions: output_decisions
+                .into_iter()
+                .map(GqlCodeWriterCompletionOutputDecision::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<CodeWriterCompletionTextCaptureRecord> for GqlCodeWriterCompletionTextCapture {
+    fn from(capture: CodeWriterCompletionTextCaptureRecord) -> Self {
+        Self {
+            prompt_kind: capture.prompt_kind,
+            turn_index: capture.turn_index,
+            terminal_response_status: capture.terminal_response_status,
+            completion_text_status: capture.completion_text_status,
+            completion_text_capture_source: capture.completion_text_capture_source,
+            completion_text_raw_byte_limit: capture.completion_text_raw_byte_limit,
+            completion_text_captured_byte_count: capture.completion_text_captured_byte_count,
+            completion_text_truncated: capture.completion_text_truncated,
+            extraction_input_truncated: capture.extraction_input_truncated,
+            extraction_input_sha256: capture.extraction_input_sha256,
+            raw_text_artifact_path: capture.raw_text_artifact_path,
+            redacted_text_artifact_path: capture.redacted_text_artifact_path,
+            text_absence_reason: capture.text_absence_reason,
+            created_at: capture.created_at.to_rfc3339(),
+        }
+    }
+}
+
+impl From<CodeWriterCompletionOutputDecisionRecord> for GqlCodeWriterCompletionOutputDecision {
+    fn from(decision: CodeWriterCompletionOutputDecisionRecord) -> Self {
+        Self {
+            output_name: decision.output_name,
+            contract_id: decision.contract_id,
+            canonical_path: decision.canonical_path,
+            pre_prompt_sha256: decision.pre_prompt_sha256,
+            post_prompt_sha256: decision.post_prompt_sha256,
+            content_sha256: decision.content_sha256,
+            settlement_source: decision.settlement_source,
+            validation_status: decision.validation_status,
+            rejection_reason: decision.rejection_reason,
         }
     }
 }

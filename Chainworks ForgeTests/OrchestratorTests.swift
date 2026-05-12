@@ -670,7 +670,7 @@ struct OrchestratorTests {
             skillRef: "proposal_review_triad",
             skillRole: "architect",
             prompt: "Review the proposal as an architect.",
-            outputContract: nil,
+            outputContract: "implementation_self_assessment_v2",
             requiresHumanApproval: false,
             inputs: [],
             outputs: ["proposal_review_architect"]
@@ -1155,14 +1155,14 @@ struct OrchestratorTests {
             sessionID: "session-2",
             durationSeconds: 1,
             providerReceipt: nil,
-            resolvedModel: "gemini-3.1-pro-preview",
+            resolvedModel: "gemini-2.5-flash",
             configuredProviderID: nil,
             adapterVersion: nil,
             canonicalOutcome: .completed,
             sessionReuseDisposition: .fresh,
             outputPresence: .durableOutput,
             runtimeProvider: ProviderFamily.geminiACP.runtimeProviderIdentifier,
-            runtimeModel: "gemini-3.1-pro-preview"
+            runtimeModel: "gemini-2.5-flash"
         )
         let box = SequencedExecutionBox(results: [firstFailure, secondSuccess])
 
@@ -1300,14 +1300,14 @@ struct OrchestratorTests {
             sessionID: "session-2",
             durationSeconds: 1,
             providerReceipt: nil,
-            resolvedModel: "gemini-3.1-pro-preview",
+            resolvedModel: "gemini-2.5-flash",
             configuredProviderID: nil,
             adapterVersion: nil,
             canonicalOutcome: .completed,
             sessionReuseDisposition: .fresh,
             outputPresence: .durableOutput,
             runtimeProvider: ProviderFamily.geminiACP.runtimeProviderIdentifier,
-            runtimeModel: "gemini-3.1-pro-preview"
+            runtimeModel: "gemini-2.5-flash"
         )
         let box = SequencedExecutionBox(results: [firstFailure, secondSuccess])
 
@@ -4295,6 +4295,7 @@ struct OrchestratorTests {
                 "notes": "Execution stopped before canonical test reporting."
             ], options: [.sortedKeys]),
             "implementation_self_assessment": try JSONSerialization.data(withJSONObject: [
+                "status": "needs_code_fixes",
                 "implementation_complete": false,
                 "verification_green": false,
                 "remaining_code_tasks": [
@@ -4357,8 +4358,8 @@ struct OrchestratorTests {
                     ]),
                     runAfterApproval: nil,
                     transitions: [
-                        ExecutableTransition(to: "continue", condition: .expression("implementation_self_assessment_v2.status == 'needs_code_fixes'")),
-                        ExecutableTransition(to: "end", condition: .expression("implementation_self_assessment_v2.status == 'complete'"))
+                        ExecutableTransition(to: "continue", condition: .expression("implementation_self_assessment.status == 'needs_code_fixes'")),
+                        ExecutableTransition(to: "end", condition: .expression("implementation_self_assessment.status == 'complete'"))
                     ],
                     approvalRequired: false,
                     approvalPolicy: nil,

@@ -212,3 +212,25 @@ struct FailedStageEvidencePanel: View {
         }
     }
 }
+
+struct XcodeRuntimeFriendlyFailure: Equatable {
+    let title: String
+    let suggestedAction: String
+
+    static func first(in text: String) -> XcodeRuntimeFriendlyFailure? {
+        let normalized = text.lowercased()
+        if normalized.contains("host_env_unavailable") || normalized.contains("xcode environment") {
+            return XcodeRuntimeFriendlyFailure(
+                title: "Host Xcode environment unavailable",
+                suggestedAction: "Check the configured Xcode host and retry after the host environment is available."
+            )
+        }
+        if normalized.contains("simulator") && normalized.contains("unavailable") {
+            return XcodeRuntimeFriendlyFailure(
+                title: "Simulator unavailable",
+                suggestedAction: "Verify the selected simulator exists and retry the Xcode-backed stage."
+            )
+        }
+        return nil
+    }
+}

@@ -95,7 +95,10 @@ enum RunStageSnapshotLoader {
 
     static func load(for run: Run) -> [RunStageSnapshot] {
         if let cached = cachedSnapshots(for: run.id) {
-            return cached
+            if run.stageExecutions.isEmpty || cached.count >= run.stageExecutions.count {
+                return cached
+            }
+            cache.removeValue(forKey: run.id)
         }
 
         if let modelContext = run.modelContext {

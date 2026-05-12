@@ -1334,6 +1334,269 @@ struct P031ReportMetadataReadModel: Decodable, Equatable, Sendable {
   }
 }
 
+struct P088PublicEnumReadback: Decodable, Equatable, Sendable {
+  let value: String
+  let raw: String?
+  let known: Bool
+
+  nonisolated init(value: String, raw: String? = nil, known: Bool) {
+    self.value = value
+    self.raw = raw
+    self.known = known
+  }
+
+  nonisolated static func known(value: String) -> P088PublicEnumReadback {
+    P088PublicEnumReadback(value: value, raw: value, known: true)
+  }
+}
+
+struct P088ImplementationCompletionTextCaptureReadModel: Decodable, Equatable, Sendable {
+  let promptKind: String
+  let turnIndex: Int
+  let terminalResponseStatus: String?
+  let completionTextStatus: String
+  let completionTextCaptureSource: String?
+  let completionTextRawByteLimit: Int?
+  let completionTextCapturedByteCount: Int?
+  let completionTextTruncated: Bool
+  let extractionInputTruncated: Bool
+  let extractionInputSha256: String?
+  let redactedTextArtifactPath: String?
+  let textAbsenceReason: String?
+  let createdAt: String?
+}
+
+struct P088ImplementationCompletionReadModel: Decodable, Equatable, Sendable {
+  let status: P088PublicEnumReadback
+  let failureClass: String?
+  let workChangeKind: String?
+  let activationSource: String?
+  let ingestionBoundaryFailure: P088PublicEnumReadback
+  let completionTurnAttempted: Bool
+  let completionTurnResult: P088PublicEnumReadback
+  let terminalResponseStatus: String?
+  let completionTextCaptures: [P088ImplementationCompletionTextCaptureReadModel]
+  let freshRequiredOutputCount: Int
+  let staleRequiredOutputCount: Int
+  let missingRequiredOutputCount: Int
+  let controlPlaneOutputCount: Int
+  let receiptArtifactPath: String?
+  let failedStageEvidencePath: String?
+  let nextOperatorAction: P088PublicEnumReadback
+
+  nonisolated init(
+    status: P088PublicEnumReadback,
+    failureClass: String?,
+    workChangeKind: String?,
+    activationSource: String?,
+    ingestionBoundaryFailure: P088PublicEnumReadback,
+    completionTurnAttempted: Bool,
+    completionTurnResult: P088PublicEnumReadback,
+    terminalResponseStatus: String?,
+    completionTextCaptures: [P088ImplementationCompletionTextCaptureReadModel],
+    freshRequiredOutputCount: Int,
+    staleRequiredOutputCount: Int,
+    missingRequiredOutputCount: Int,
+    controlPlaneOutputCount: Int,
+    receiptArtifactPath: String?,
+    failedStageEvidencePath: String?,
+    nextOperatorAction: P088PublicEnumReadback
+  ) {
+    self.status = status
+    self.failureClass = failureClass
+    self.workChangeKind = workChangeKind
+    self.activationSource = activationSource
+    self.ingestionBoundaryFailure = ingestionBoundaryFailure
+    self.completionTurnAttempted = completionTurnAttempted
+    self.completionTurnResult = completionTurnResult
+    self.terminalResponseStatus = terminalResponseStatus
+    self.completionTextCaptures = completionTextCaptures
+    self.freshRequiredOutputCount = freshRequiredOutputCount
+    self.staleRequiredOutputCount = staleRequiredOutputCount
+    self.missingRequiredOutputCount = missingRequiredOutputCount
+    self.controlPlaneOutputCount = controlPlaneOutputCount
+    self.receiptArtifactPath = receiptArtifactPath
+    self.failedStageEvidencePath = failedStageEvidencePath
+    self.nextOperatorAction = nextOperatorAction
+  }
+}
+
+enum P088ImplementationCompletionVisualState: Equatable, Sendable {
+  case neutral
+  case positive
+  case warning
+  case blocking
+}
+
+struct P088ImplementationCompletionPresentation: Equatable, Sendable {
+  let compactSignalLabel: String
+  let statusLabel: String
+  let failureClassLabel: String?
+  let workChangeKindLabel: String?
+  let outputFreshnessLabel: String
+  let primaryEvidencePath: String?
+  let evidencePathLabel: String?
+  let nextOperatorActionLabel: String
+  let diagnosticRows: [String]
+  let copyItems: [P031DiagnosticCopyItem]
+  let accessibilityLabel: String
+  let visualState: P088ImplementationCompletionVisualState
+}
+
+enum P088ImplementationCompletionPresenter {
+  nonisolated static func presentationIfPresent(
+    for readback: P088ImplementationCompletionReadModel?
+  ) -> P088ImplementationCompletionPresentation? {
+    guard let readback, readback.status.value != "not_attempted" else {
+      return nil
+    }
+    return presentation(for: readback)
+  }
+
+  nonisolated static func presentation(
+    for readback: P088ImplementationCompletionReadModel
+  ) -> P088ImplementationCompletionPresentation {
+    let statusLabel = P031ThinPresentationFormatting.titleCase(readback.status.value)
+    let compactSignalLabel = "Implementation Completion: \(statusLabel)"
+    let failureClassLabel = normalizedText(readback.failureClass).map { "Failure class: \($0)" }
+    let workChangeKindLabel = normalizedText(readback.workChangeKind).map { "Work change: \($0)" }
+    let outputFreshnessLabel = [
+      "\(readback.freshRequiredOutputCount) fresh",
+      "\(readback.staleRequiredOutputCount) stale",
+      "\(readback.missingRequiredOutputCount) missing",
+      "\(readback.controlPlaneOutputCount) control-plane",
+    ].joined(separator: ", ")
+    let evidencePath = normalizedText(readback.receiptArtifactPath)
+      ?? normalizedText(readback.failedStageEvidencePath)
+    let evidencePathLabel = evidencePath.map { "Evidence: \($0)" }
+    let nextOperatorActionLabel =
+      "Next: \(P031ThinPresentationFormatting.titleCase(readback.nextOperatorAction.value))"
+    let capturedCount = readback.completionTextCaptures.filter {
+      $0.completionTextStatus == "captured"
+    }.count
+    let absentCount = readback.completionTextCaptures.filter {
+      $0.completionTextStatus != "captured"
+    }.count
+
+    let diagnosticRows = [
+      failureClassLabel,
+      workChangeKindLabel,
+      normalizedText(readback.activationSource).map { "Activation: \($0)" },
+      "Ingestion boundary: \(readback.ingestionBoundaryFailure.value)",
+      "Completion turn: \(readback.completionTurnAttempted ? "attempted" : "not attempted") / \(readback.completionTurnResult.value)",
+      normalizedText(readback.terminalResponseStatus).map { "Terminal response: \($0)" },
+      "Outputs: \(readback.freshRequiredOutputCount) fresh, \(readback.staleRequiredOutputCount) stale, \(readback.missingRequiredOutputCount) missing, \(readback.controlPlaneOutputCount) control-plane",
+      "Capture: \(capturedCount) captured, \(absentCount) absent",
+      evidencePathLabel,
+      nextOperatorActionLabel,
+    ].compactMap { $0 }
+
+    let copyItems = [
+      readback.receiptArtifactPath.map {
+        P031DiagnosticCopyItem(label: "Receipt path", value: $0)
+      },
+      readback.failedStageEvidencePath.map {
+        P031DiagnosticCopyItem(label: "Failed-stage evidence path", value: $0)
+      },
+    ].compactMap { $0 }
+
+    return P088ImplementationCompletionPresentation(
+      compactSignalLabel: compactSignalLabel,
+      statusLabel: statusLabel,
+      failureClassLabel: failureClassLabel,
+      workChangeKindLabel: workChangeKindLabel,
+      outputFreshnessLabel: "Outputs: \(outputFreshnessLabel)",
+      primaryEvidencePath: evidencePath,
+      evidencePathLabel: evidencePathLabel,
+      nextOperatorActionLabel: nextOperatorActionLabel,
+      diagnosticRows: diagnosticRows,
+      copyItems: copyItems,
+      accessibilityLabel: ([compactSignalLabel, failureClassLabel, workChangeKindLabel,
+                            "Outputs: \(outputFreshnessLabel)", evidencePathLabel,
+                            nextOperatorActionLabel] as [String?]).compactMap { $0 }.joined(separator: ", "),
+      visualState: visualState(for: readback.status.value)
+    )
+  }
+
+  private nonisolated static func visualState(for status: String) -> P088ImplementationCompletionVisualState {
+    switch status {
+    case "succeeded", "not_attempted":
+      return .positive
+    case "partial_evidence", "repair_succeeded":
+      return .warning
+    case "failed", "repair_failed":
+      return .blocking
+    default:
+      return .neutral
+    }
+  }
+
+  private nonisolated static func normalizedText(_ value: String?) -> String? {
+    let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed?.isEmpty == false ? trimmed : nil
+  }
+}
+
+enum P078SideEffectReadbackVisualState: Equatable, Sendable {
+  case neutral
+  case blocking
+}
+
+struct P078SideEffectReadbackPresentation: Equatable, Sendable {
+  let compactSignalLabel: String
+  let statusLabel: String
+  let nextOperatorActionLabel: String
+  let diagnosticRows: [String]
+  let copyItems: [P031DiagnosticCopyItem]
+  let accessibilityLabel: String
+  let visualState: P078SideEffectReadbackVisualState
+}
+
+enum P078SideEffectReadbackPresenter {
+  nonisolated static func presentationIfPresent(
+    for readback: SideEffectReadbackSummary?
+  ) -> P078SideEffectReadbackPresentation? {
+    guard let readback, readback.blocked || readback.unresolvedCount > 0 else {
+      return nil
+    }
+    return presentation(for: readback)
+  }
+
+  nonisolated static func presentation(
+    for readback: SideEffectReadbackSummary
+  ) -> P078SideEffectReadbackPresentation {
+    let first = readback.effects.first
+    let action = first?.operatorNextAction ?? "effects.inspect"
+    let compact = "Release Side Effects: \(readback.unresolvedCount) unresolved"
+    let rows = readback.effects.flatMap { effect in
+      [
+        "\(effect.effectKind): \(effect.status)",
+        "Blocked: \(effect.blockedReason)",
+        "Next: \(effect.operatorNextAction)",
+        effect.reportPath.map { "Evidence: \($0)" },
+      ].compactMap { $0 }
+    }
+    let copyItems = readback.effects.flatMap { effect in
+      [
+        P031DiagnosticCopyItem(label: "Effect ID", value: effect.id),
+        effect.reportPath.map { P031DiagnosticCopyItem(label: "Evidence path", value: $0) },
+      ].compactMap { $0 }
+    }
+
+    return P078SideEffectReadbackPresentation(
+      compactSignalLabel: compact,
+      statusLabel: readback.blocked ? "Release blocked" : "Release side effects clear",
+      nextOperatorActionLabel: "Next: \(action)",
+      diagnosticRows: rows,
+      copyItems: copyItems,
+      accessibilityLabel: ([compact, first?.blockedReason, "Next: \(action)"] as [String?])
+        .compactMap { $0 }
+        .joined(separator: ", "),
+      visualState: readback.blocked ? .blocking : .neutral
+    )
+  }
+}
+
 struct P031RunRowReadModel: Decodable, Equatable, Sendable {
   let id: String
   let status: String
@@ -1351,6 +1614,8 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
   let pendingApprovals: Int?
   let closeoutReadinessSummary: P077CloseoutReadinessSummaryReadModel?
   let rolloutDecisionSummary: RolloutDecisionSummary?
+  let implementationCompletion: P088ImplementationCompletionReadModel?
+  let sideEffectReadback: SideEffectReadbackSummary?
 
   nonisolated init(
     id: String,
@@ -1368,7 +1633,9 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     failedStages: Int?,
     pendingApprovals: Int?,
     closeoutReadinessSummary: P077CloseoutReadinessSummaryReadModel? = nil,
-    rolloutDecisionSummary: RolloutDecisionSummary? = nil
+    rolloutDecisionSummary: RolloutDecisionSummary? = nil,
+    implementationCompletion: P088ImplementationCompletionReadModel? = nil,
+    sideEffectReadback: SideEffectReadbackSummary? = nil
   ) {
     self.id = id
     self.status = status
@@ -1386,6 +1653,8 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     self.pendingApprovals = pendingApprovals
     self.closeoutReadinessSummary = closeoutReadinessSummary
     self.rolloutDecisionSummary = rolloutDecisionSummary
+    self.implementationCompletion = implementationCompletion
+    self.sideEffectReadback = sideEffectReadback
   }
 
   enum CodingKeys: String, CodingKey {
@@ -1403,9 +1672,11 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     case completedStages
     case failedStages
     case pendingApprovals
+    case implementationCompletion
     case implementationCloseoutReadinessSummary
     case closeoutReadinessSummaryJson
     case rolloutDecisionSummary = "rolloutContractReadbackJson"
+    case sideEffectReadback = "sideEffectReadbackJson"
   }
 
   init(from decoder: Decoder) throws {
@@ -1433,7 +1704,18 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
           P077CloseoutReadinessSummaryReadModel.self,
           forKey: .closeoutReadinessSummaryJson
         ),
-      rolloutDecisionSummary: try container.decodeIfPresent(RolloutDecisionSummary.self, forKey: .rolloutDecisionSummary)
+      rolloutDecisionSummary: try container.decodeIfPresent(
+        RolloutDecisionSummary.self,
+        forKey: .rolloutDecisionSummary
+      ),
+      implementationCompletion: try container.decodeIfPresent(
+        P088ImplementationCompletionReadModel.self,
+        forKey: .implementationCompletion
+      ),
+      sideEffectReadback: try container.decodeIfPresent(
+        SideEffectReadbackSummary.self,
+        forKey: .sideEffectReadback
+      )
     )
   }
 
@@ -1454,7 +1736,9 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
       failedStages: failedStages,
       pendingApprovals: pendingApprovals,
       closeoutReadinessSummary: closeoutReadinessSummary,
-      rolloutDecisionSummary: rolloutDecisionSummary
+      rolloutDecisionSummary: rolloutDecisionSummary,
+      implementationCompletion: implementationCompletion,
+      sideEffectReadback: sideEffectReadback
     )
   }
 }
@@ -2007,8 +2291,41 @@ enum P031GraphQLDocuments {
         completedStages
         failedStages
         pendingApprovals
+        implementationCompletion {
+          status { value raw known }
+          failureClass
+          workChangeKind
+          activationSource
+          ingestionBoundaryFailure { value raw known }
+          completionTurnAttempted
+          completionTurnResult { value raw known }
+          terminalResponseStatus
+          completionTextCaptures {
+            promptKind
+            turnIndex
+            terminalResponseStatus
+            completionTextStatus
+            completionTextCaptureSource
+            completionTextRawByteLimit
+            completionTextCapturedByteCount
+            completionTextTruncated
+            extractionInputTruncated
+            extractionInputSha256
+            redactedTextArtifactPath
+            textAbsenceReason
+            createdAt
+          }
+          freshRequiredOutputCount
+          staleRequiredOutputCount
+          missingRequiredOutputCount
+          controlPlaneOutputCount
+          receiptArtifactPath
+          failedStageEvidencePath
+          nextOperatorAction { value raw known }
+        }
         implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson
         rolloutContractReadbackJson
+        sideEffectReadbackJson
       }
     }
     """
@@ -2029,8 +2346,41 @@ enum P031GraphQLDocuments {
         completedStages
         failedStages
         pendingApprovals
+        implementationCompletion {
+          status { value raw known }
+          failureClass
+          workChangeKind
+          activationSource
+          ingestionBoundaryFailure { value raw known }
+          completionTurnAttempted
+          completionTurnResult { value raw known }
+          terminalResponseStatus
+          completionTextCaptures {
+            promptKind
+            turnIndex
+            terminalResponseStatus
+            completionTextStatus
+            completionTextCaptureSource
+            completionTextRawByteLimit
+            completionTextCapturedByteCount
+            completionTextTruncated
+            extractionInputTruncated
+            extractionInputSha256
+            redactedTextArtifactPath
+            textAbsenceReason
+            createdAt
+          }
+          freshRequiredOutputCount
+          staleRequiredOutputCount
+          missingRequiredOutputCount
+          controlPlaneOutputCount
+          receiptArtifactPath
+          failedStageEvidencePath
+          nextOperatorAction { value raw known }
+        }
         implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson
         rolloutContractReadbackJson
+        sideEffectReadbackJson
       }
       stages(runId: $runId) {
         id
@@ -3577,6 +3927,8 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
   let progressLabel: String?
   let pendingApprovalsLabel: String?
   let closeoutReadinessSignalLabel: String?
+  let implementationCompletionSignalLabel: String?
+  let sideEffectSignalLabel: String?
   let freshnessState: P031FreshnessState
   let accessibilityLabel: String
 
@@ -3588,6 +3940,8 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
     progressLabel: String?,
     pendingApprovalsLabel: String?,
     closeoutReadinessSignalLabel: String? = nil,
+    implementationCompletionSignalLabel: String? = nil,
+    sideEffectSignalLabel: String? = nil,
     freshnessState: P031FreshnessState,
     accessibilityLabel: String
   ) {
@@ -3598,6 +3952,8 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
     self.progressLabel = progressLabel
     self.pendingApprovalsLabel = pendingApprovalsLabel
     self.closeoutReadinessSignalLabel = closeoutReadinessSignalLabel
+    self.implementationCompletionSignalLabel = implementationCompletionSignalLabel
+    self.sideEffectSignalLabel = sideEffectSignalLabel
     self.freshnessState = freshnessState
     self.accessibilityLabel = accessibilityLabel
   }
@@ -3872,6 +4228,8 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let reportRows: [P031ReportMetadataRowPresentation]
   let catalogContext: P031CatalogContextPresentation?
   let closeoutReadiness: P077CloseoutReadinessPresentation?
+  let implementationCompletion: P088ImplementationCompletionPresentation?
+  let sideEffectReadback: P078SideEffectReadbackPresentation?
   let freshness: P031FreshnessSnapshot
   let refreshFeedbackText: String
   let emptyStateTitle: String?
@@ -3892,6 +4250,8 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     reportRows: [P031ReportMetadataRowPresentation],
     catalogContext: P031CatalogContextPresentation?,
     closeoutReadiness: P077CloseoutReadinessPresentation? = nil,
+    implementationCompletion: P088ImplementationCompletionPresentation? = nil,
+    sideEffectReadback: P078SideEffectReadbackPresentation? = nil,
     freshness: P031FreshnessSnapshot,
     refreshFeedbackText: String,
     emptyStateTitle: String?,
@@ -3911,6 +4271,8 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.catalogContext = catalogContext
     self.rolloutDecisionSummary = rolloutDecisionSummary
     self.closeoutReadiness = closeoutReadiness
+    self.implementationCompletion = implementationCompletion
+    self.sideEffectReadback = sideEffectReadback
     self.freshness = freshness
     self.refreshFeedbackText = refreshFeedbackText
     self.emptyStateTitle = emptyStateTitle
@@ -4440,6 +4802,12 @@ enum P031RunsHomePresenter {
     let closeoutReadiness = run.closeoutReadinessSummary.map {
       P077CloseoutReadinessPresenter.presentation(for: $0)
     }
+    let implementationCompletion = P088ImplementationCompletionPresenter.presentationIfPresent(
+      for: run.implementationCompletion
+    )
+    let sideEffectReadback = P078SideEffectReadbackPresenter.presentationIfPresent(
+      for: run.sideEffectReadback
+    )
     let accessibilityParts = [
       displayTitle,
       workflowLabel,
@@ -4447,6 +4815,8 @@ enum P031RunsHomePresenter {
       progressLabel,
       pendingApprovalsLabel,
       closeoutReadiness?.compactSignalLabel,
+      implementationCompletion?.compactSignalLabel,
+      sideEffectReadback?.compactSignalLabel,
       P031ThinPresentationFormatting.freshnessAccessibilityLabel(run.freshnessState),
     ].compactMap { $0 }
 
@@ -4458,6 +4828,8 @@ enum P031RunsHomePresenter {
       progressLabel: progressLabel,
       pendingApprovalsLabel: pendingApprovalsLabel,
       closeoutReadinessSignalLabel: closeoutReadiness?.compactSignalLabel,
+      implementationCompletionSignalLabel: implementationCompletion?.compactSignalLabel,
+      sideEffectSignalLabel: sideEffectReadback?.compactSignalLabel,
       freshnessState: run.freshnessState,
       accessibilityLabel: accessibilityParts.joined(separator: ", ")
     )
@@ -4615,6 +4987,12 @@ enum P031RunDetailPresenter {
     let closeoutReadiness = run?.closeoutReadinessSummary.map {
       P077CloseoutReadinessPresenter.presentation(for: $0)
     }
+    let implementationCompletion = P088ImplementationCompletionPresenter.presentationIfPresent(
+      for: run?.implementationCompletion
+    )
+    let sideEffectReadback = P078SideEffectReadbackPresenter.presentationIfPresent(
+      for: run?.sideEffectReadback
+    )
     let emptyStateTitle: String?
     switch run {
     case .some:
@@ -4638,6 +5016,8 @@ enum P031RunDetailPresenter {
       reportRows: reportRows,
       catalogContext: run.map(P031CatalogContextPresenter.presentation),
       closeoutReadiness: closeoutReadiness,
+      implementationCompletion: implementationCompletion,
+      sideEffectReadback: sideEffectReadback,
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
         currentFreshness: currentFreshness,
         checkedAt: checkedAt,
@@ -4669,6 +5049,8 @@ enum P031RunDetailPresenter {
       reportRows: [],
       catalogContext: nil,
       closeoutReadiness: nil,
+      implementationCompletion: nil,
+      sideEffectReadback: nil,
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
         event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))

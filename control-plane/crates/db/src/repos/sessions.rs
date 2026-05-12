@@ -500,6 +500,28 @@ pub async fn count_generation_events(
     Ok(row.get("event_count"))
 }
 
+pub async fn count_generation_events_for_agent_execution(
+    pool: &SqlitePool,
+    generation_id: &str,
+    event_type: SessionEventType,
+    agent_execution_id: &str,
+) -> Result<i64> {
+    let row = sqlx::query(
+        r#"SELECT COUNT(*) AS event_count
+           FROM session_events
+           WHERE generation_id = ?1
+             AND event_type = ?2
+             AND json_extract(details_json, '$.agent_execution_id') = ?3"#,
+    )
+    .bind(generation_id)
+    .bind(session_event_type_to_str(&event_type))
+    .bind(agent_execution_id)
+    .fetch_one(pool)
+    .await
+    .context("count session generation events for agent execution")?;
+    Ok(row.get("event_count"))
+}
+
 pub async fn count_generation_events_tx(
     tx: &mut Transaction<'_, Sqlite>,
     generation_id: &str,
@@ -646,5 +668,8 @@ fn session_event_type_to_str(event_type: &SessionEventType) -> &'static str {
         SessionEventType::OutputContractRepairSucceeded => "output_contract_repair_succeeded",
         SessionEventType::OutputContractRepairFailed => "output_contract_repair_failed",
         SessionEventType::OutputContractRepairSkipped => "output_contract_repair_skipped",
+        SessionEventType::CodeWriterCompletionStarted => "code_writer_completion_started",
+        SessionEventType::CodeWriterCompletionSucceeded => "code_writer_completion_succeeded",
+        SessionEventType::CodeWriterCompletionFailed => "code_writer_completion_failed",
     }
 }

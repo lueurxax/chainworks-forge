@@ -149,6 +149,7 @@ Tools are namespaced:
 | `runs.*` | `runs.start`, `runs.list`, `runs.get`, `runs.cancel`, `runs.main_sync.request`, `runs.main_sync.retry`, `runs.main_sync.set_override`, `runs.main_sync.repair_state`, `runs.main_sync.record_recovery_decision`, `runs.knowledge_capsule.ignore`, `runs.settle_proposal_gate` |
 | `approvals.*` | `approvals.list`, `approvals.resolve` |
 | `stages.*` | `stages.retry` |
+| `effects.*` | `effects.list`, `effects.inspect`, `effects.reconcile`, `effects.mark_unrecoverable`, `effects.clear_after_manual_verification` |
 | `reports.*` | `reports.get` |
 
 **Implementation self-assessment detail extension:**
@@ -198,6 +199,54 @@ The `WorktreeMutationBarrier` ensures that sensitive operations like `git merge`
 - **Knowledge Capsules**: Compact cross-run knowledge emitted from completed runs, matched and injected into future runs to prevent repeat mistakes.
 
 Note: Main sync and knowledge capsule logic is currently in **Phase 0 contract freeze**.
+
+## Durable side-effect ledger
+
+The daemon uses a durable side-effect ledger for irreversible or externally visible release operations such as `git_push` and `connect_upload`. Native release services create compact SQLite intent before an external write and store large evidence in the file spool, so retry, recovery, and operator readback can distinguish "not started" from "started but unsettled."
+
+### Lifecycle and safety rules
+
+- A `side_effects` row is persisted with status `prepared` before an external write begins.
+- Each `side_effects` row may make at most one external-write attempt. Ordinary retry never reuses that row to push, upload, publish, tag, or otherwise mutate the outside world again.
+- Deterministic idempotency keys and request fingerprints distinguish the intended target from equivalent request content and block unresolved version drift for the same target.
+- Retry, targeted retry, cancellation, scheduler advancement, and startup recovery run fail-closed preflight. If unresolved side effects exist, or if ledger readback fails, the command returns `requires_effect_reconciliation` before mutating canonical run/stage/work-item state.
+- A per-call-site readback circuit breaker opens after repeated ledger readback failures and remains fail-closed until expiry.
+- `CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED=false` disables preparing new release side effects. Existing unresolved rows remain readable and reconcilable.
+
+Statuses that block ordinary mutation are `prepared`, `executing`, `externally_observed`, `needs_reconciliation`, `conflict`, and `unrecoverable`. `settled` and `reconciled` are the resolved states for normal workflow progress.
+
+### Evidence and settlement
+
+Side-effect settlement records compact lifecycle truth in SQLite and stores bulky evidence under the run artifact root using the evidence spool. The release evidence manifest covers:
+
+- `release-receipt.json`
+- `stdout.log`
+- `stderr.log`
+- `git-ls-remote.json`
+- `upload-readback.json`
+- `archive-summary.json`
+- `reconciliation-report.json`
+- `evidence-manifest.json`
+
+The manifest is written last. Startup/watchdog recovery verifies the manifest and referenced files; missing files, checksum mismatches, size mismatches, or partial evidence move the affected effect back to reconciliation-oriented readback rather than silently settling.
+
+### Reconciliation and readback
+
+- Startup and watchdog repair move stale `executing`, prepared crash-window, externally observed, and bad-settlement-evidence rows to `needs_reconciliation` when the CAS predicates still match the observed row.
+- Operators use MCP `effects.list`, `effects.inspect`, `effects.reconcile`, `effects.mark_conflict`, `effects.mark_unrecoverable`, and `effects.clear_after_manual_verification` to review and disposition unresolved effects.
+- `effects.reconcile` performs bounded readback and writes a reconciliation report. It does not perform another external mutation.
+- GraphQL, MCP run/report readback, release receipts, and SwiftUI expose read-only side-effect summaries, unresolved counts, evidence pointers, and the recommended MCP next action. Governed SwiftUI does not expose side-effect mutation controls.
+
+### Wired operations
+
+The current release implementation wires:
+
+- `git_commit`
+- `git_push`
+- `build_archive`
+- `connect_upload`
+
+`tag_create` and `artifact_publish` are schema-supported deferred kinds and are not wired to release execution paths yet.
 
 ## Workflow engine
 ...
@@ -293,7 +342,7 @@ Defined in `crates/acp/src/transport.rs`:
 
 ### Permission auto-grant
 
-When the subprocess sends `session/request_permission`, the transport auto-grants by selecting `allow_once` (or `approved` as fallback). This matches the autonomous execution model. See `build_permission_grant()` in `crates/acp/src/transport.rs`.
+When the subprocess sends `session/request_permission`, the transport auto-grants by selecting the narrowest stable autonomous option. Provider-declared read-only allowlist options win first, then `allow_once`, then `approved` as fallback. This avoids repeated fragile approval round-trips for safe read-only commands while keeping write-capable terminal actions one-shot. See `build_permission_grant()` in `crates/acp/src/transport.rs`.
 
 ### Artifact discovery
 
@@ -323,7 +372,7 @@ The `AcpRuntimeManager` (`crates/acp/src/manager.rs`) pre-registers five adapter
 | `AuggieAdapter` | `auggie` | `CHAINWORKS_AUGGIE_ACP_BINARY` |
 | `JunieAdapter` | `junie` | `CHAINWORKS_JUNIE_ACP_BINARY` |
 
-Each adapter reads its binary path from the environment at construction and spawns the subprocess with piped stdio in its own process group when `execute()` is called.
+Each adapter reads its binary path from the environment at construction and spawns the subprocess with piped stdio in its own process group when `execute()` is called. Runtime provider subprocesses are launched with cwd set to the run worktree when write-enabled, otherwise to `workspace_root`; capability probes remain cwd-neutral preflight checks.
 `JunieAdapter` passes `--acp true` at launch so the local Junie CLI enters ACP JSON-RPC mode.
 
 ### Timeouts
@@ -331,6 +380,21 @@ Each adapter reads its binary path from the environment at construction and spaw
 - Handshake: 90 seconds by default; 120 seconds for Gemini
 - Idle (no message): 300 seconds (reset on every received line)
 - Shutdown wait: 5 seconds
+
+Idle/progress timeouts are normalized by runtime facts before operator
+readback. When a provider times out after meaningful `session/update` progress
+and the final receipt events include streamed text or a diff update, while all
+permission requests have already been granted, the engine records a recoverable
+handoff gap instead of an ordinary provider timeout:
+
+- `failure_kind = missing_required_outputs`
+- `output_settlement = missing_required_outputs`
+- `supervision_classification = recoverable_handoff_gap_after_provider_progress`
+- `transport_error_code = ACP_HANDOFF_IDLE_AFTER_DIFF`
+
+This distinguishes “the agent changed the worktree but did not finish the
+required handoff files” from a generic provider timeout or a terminal permission
+wait.
 
 ## Persistence model
 
@@ -495,6 +559,12 @@ The scheduler remains language-neutral: it allocates bounded execution capacity
 and writable roots, while provider adapters map the generic toolchain root to 
 tool-specific environment variables or command arguments.
 
+Invocations that declare `requires_xcode_host_execution` or
+`xcode_shim_injection_signal` are promoted to a brokered `xcode` MCP request
+before ACP startup. The Xcode MCP broker lease and warm-up therefore run before
+the provider subprocess receives the task, and MCP registry/broker failures fail
+closed before launching the agent.
+
 **Diagnostics and Readback:**
 Each `AgentExecution` records `actualToolchainMappingDiagnostics` (GraphQL) / 
 `actual_toolchain_mapping_diagnostics` (MCP/Report). This document includes 
@@ -512,7 +582,7 @@ queue-wait latency.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`):
 
 | Table | Purpose |
 |---|---|
@@ -530,6 +600,9 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `run_knowledge_capsules` | P064: Compact cross-run knowledge capsules emitted from terminal runs |
 | `run_knowledge_capsule_match_keys` | P064: Search keys for capsule relevance matching (proposal id, artifact path, etc.) |
 | `run_knowledge_capsule_attachments` | P064: Links between matching capsules and an active run |
+| `side_effects` | Durable record of irreversible side-effect intent and lifecycle state |
+| `side_effect_attempts` | Individual attempt records for side effects |
+| `side_effect_settlements` | Authoritative settlement/reconciliation records |
 | `retry_operator_instruction_bindings` | P065: Durable parent bindings for operator-guided retries (ARCH-065) |
 | `retry_operator_instruction_deliveries` | P065: Per-work-item delivery records for retry instructions (ARCH-065) |
 | `evidence_spool_refs` | Compact metadata pointers to high-volume evidence files |

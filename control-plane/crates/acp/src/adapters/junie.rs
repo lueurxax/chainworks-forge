@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use std::time::Duration;
 use tracing::info;
 
 use crate::adapters::{AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
@@ -71,11 +72,13 @@ impl AcpAdapter for JunieAdapter {
     }
 
     fn prepare_session_new_spec(&self, _req: &ExecutionRequest) -> Result<AcpSessionNewSpec> {
-        Ok(AcpSessionNewSpec::new("default", "bypassPermissions"))
+        let mut spec = AcpSessionNewSpec::new("default", "bypassPermissions");
+        spec.permission_grant_debounce = Duration::from_millis(25);
+        Ok(spec)
     }
 
     fn supports_http_mcp_capability_probe(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -133,6 +136,27 @@ mod tests {
 
         assert_eq!(launch_spec.binary_path, "/bin/junie-fixture");
         assert_eq!(launch_spec.args, vec!["--acp", "true"]);
+    }
+
+    #[test]
+    fn junie_supports_brokered_xcode_http_mcp_probe_path() {
+        let adapter = JunieAdapter::new_with_binary("/bin/junie-fixture");
+
+        assert!(
+            adapter.supports_http_mcp_capability_probe(),
+            "Junie must enter the brokered Xcode MCP capability path instead of failing before probe"
+        );
+    }
+
+    #[test]
+    fn junie_requests_permission_grant_debounce_in_session_config() {
+        let adapter = JunieAdapter::new_with_binary("/bin/junie-fixture");
+
+        let spec = adapter
+            .prepare_session_new_spec(&request())
+            .expect("junie session/new spec");
+
+        assert_eq!(spec.permission_grant_debounce, Duration::from_millis(25));
     }
 
     #[cfg(unix)]

@@ -581,6 +581,7 @@ pub struct AcpSessionNewSpec {
     pub config_options: Vec<(String, String)>,
     pub required_config_options: Vec<(String, String)>,
     pub set_mode_after_session_new: bool,
+    pub permission_grant_debounce: Duration,
 }
 
 impl AcpSessionNewSpec {
@@ -592,6 +593,7 @@ impl AcpSessionNewSpec {
             config_options: Vec::new(),
             required_config_options: Vec::new(),
             set_mode_after_session_new: false,
+            permission_grant_debounce: Duration::ZERO,
         }
     }
 
@@ -603,6 +605,7 @@ impl AcpSessionNewSpec {
             config_options: config.config_options,
             required_config_options: config.required_config_options,
             set_mode_after_session_new: config.set_mode_after_session_new,
+            permission_grant_debounce: config.permission_grant_debounce,
         }
     }
 
@@ -614,6 +617,7 @@ impl AcpSessionNewSpec {
             config_options: self.config_options.clone(),
             required_config_options: self.required_config_options.clone(),
             set_mode_after_session_new: self.set_mode_after_session_new,
+            permission_grant_debounce: self.permission_grant_debounce,
         }
     }
 }
@@ -785,10 +789,13 @@ pub trait AcpAdapter: Send + Sync {
         let mut command = Command::new(&launch_spec.binary_path);
         launch_spec.apply_chainworks_meta_root_env(req);
         ensure_chainworks_meta_root_launch_dir(req)?;
+        let execution_root = provider_execution_root(req);
+        ensure_provider_execution_root(&execution_root)?;
         launch_spec.verify_capability_fingerprint()?;
         command
             .args(&launch_spec.args)
             .envs(launch_spec.env.drain(..))
+            .current_dir(&execution_root)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -915,12 +922,34 @@ fn ensure_chainworks_meta_root_launch_dir(req: &ExecutionRequest) -> Result<()> 
     Ok(())
 }
 
+fn provider_execution_root(req: &ExecutionRequest) -> PathBuf {
+    if req.worktree_write_enabled {
+        req.worktree_root
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(&req.workspace_root))
+    } else {
+        PathBuf::from(&req.workspace_root)
+    }
+}
+
+fn ensure_provider_execution_root(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        Ok(())
+    } else {
+        bail!(
+            "missing_provider_execution_root: ACP provider cwd {} does not exist or is not a directory",
+            path.display()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        default_provider_path_dirs, ensure_chainworks_meta_root_launch_dir, AcpAdapter,
-        AcpLaunchSpec, ProbeKey, ProviderCapabilities, ProviderCapabilityCache,
-        XcodeShimLaunchRuntime,
+        default_provider_path_dirs, ensure_chainworks_meta_root_launch_dir,
+        provider_execution_root, AcpAdapter, AcpLaunchSpec, ProbeKey, ProviderCapabilities,
+        ProviderCapabilityCache, XcodeShimLaunchRuntime,
     };
     use crate::{XcodeShimGrantRecord, XcodeShimGrantStore};
     use std::sync::{Arc, Mutex};
@@ -1203,6 +1232,52 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn provider_execution_root_prefers_write_enabled_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let worktree = tmp.path().join("worktree");
+        let mut req = crate::ExecutionRequest {
+            agent_execution_id: None,
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "stage_cwd".to_string(),
+            attempt_number: 1,
+            agent_id: "agent_cwd".to_string(),
+            provider: "junie".to_string(),
+            model: None,
+            effort: None,
+            workspace_root: workspace.to_string_lossy().into_owned(),
+            prompt: "prompt".to_string(),
+            worktree_root: Some(worktree.to_string_lossy().into_owned()),
+            worktree_write_enabled: true,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: None,
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: None,
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
+        };
+
+        assert_eq!(provider_execution_root(&req), worktree);
+
+        req.worktree_write_enabled = false;
+        assert_eq!(provider_execution_root(&req), workspace);
     }
 
     #[cfg(unix)]
