@@ -6,7 +6,7 @@
 | Status | Draft |
 | Author | Codex |
 | Depends on | P037 ACP supervision, P058 claim/start ownership, P061 scheduler/write coordination, P065 retry instructions, P076 auto-retry observation ledger |
-| Related | P051 Xcode MCP bridge pool, [local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), P078 side-effect reconciliation, `docs/reference/rust-control-plane.md`, `docs/reference/session-lineage-reuse-and-operator-reset.md` |
+| Related | P051 Xcode MCP bridge pool, [local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), [durable side-effect reconciliation](../reference/execution-truth-and-recovery.md#durable-side-effect-ledger-and-reconciliation), `docs/reference/rust-control-plane.md`, `docs/reference/session-lineage-reuse-and-operator-reset.md` |
 | Scope | Add a continuous reconciliation subsystem for stale running execution truth, provider/session ownership, and helper-process lifecycle. |
 | Non-goal | No automatic human approval, no blind retry of release side effects, and no replacement for existing startup repair or provider idle supervision. |
 
@@ -55,12 +55,12 @@ Missing pieces:
 - Make helper processes and provider sessions owned by durable lease/session records.
 - Surface clear operator readback: `useful_work_active`, `startup_stalled`, `prompt_stalled`, `helper_orphaned`, `needs_operator`, `needs_effect_reconciliation`.
 - Feed P076 with typed stale signatures so auto-retry can avoid noisy blind retries.
-- Keep release side-effect stages fail-closed and route them to P078 reconciliation.
+- Keep release side-effect stages fail-closed and route them to durable side-effect reconciliation.
 
 ## 4. Non-Goals
 
 - Do not auto-approve human gates.
-- Do not retry release/publish/git side effects while P078 reports unresolved effects.
+- Do not retry release/publish/git side effects while the durable side-effect ledger reports unresolved effects.
 - Do not use GraphQL mutations for repair.
 - Do not infer useful work from UI projection freshness alone.
 - Do not kill arbitrary user processes outside Chainworks-owned lease/session ownership.
@@ -113,7 +113,7 @@ Action: terminate only the owned process group, record helper cleanup evidence, 
 
 ### 5.5 Release Side-Effect Drift
 
-Release work is stale only after checking P078 side-effect ledger state.
+Release work is stale only after checking durable side-effect ledger state.
 
 Action: block retry with `requires_effect_reconciliation` until MCP reconciliation settles the effect.
 
@@ -155,7 +155,7 @@ All repairs must use engine/domain transitions or existing repository repair fun
 - no raw operator DB patching;
 - no deleting rows;
 - no losing old execution evidence;
-- no retrying release side effects without P078 clearance.
+- no retrying release side effects without durable ledger clearance.
 
 ### 6.4 Operator Readback
 
@@ -227,7 +227,7 @@ Add or extend `proposal-080` gate with deterministic fixtures:
 3. Enable scheduler ownership drift repair for non-release work.
 4. Enable owned helper process reaping.
 5. Wire P076 auto-retry decisions to stale class observations.
-6. Keep release reconciliation behind P078 closeout.
+6. Keep release reconciliation behind the implemented durable side-effect contract.
 
 ## 11. Acceptance Criteria
 

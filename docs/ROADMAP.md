@@ -29,15 +29,15 @@ These are not active workstreams:
   - All non-approval operator actions are MCP-only.
 - **P081** boundary-first API/auth contract matrix.
 - **Local persistence write-budget / evidence-spooling infrastructure** is implemented and remains the persistence safety baseline.
-- **P078** durable side-effect ledger, release settlement, retry blocking, and reconciliation.
+- **Durable side-effect ledger**: release settlement, retry blocking, and reconciliation.
 - **Configurable Agent Escalation Chains**:
   - keep scoped to contract-output repair/fallback;
   - do not include release agents;
-  - do not bypass P078 side-effect safety.
+  - do not bypass durable side-effect safety.
 
 ## Parallel UI recovery lane
 
-This lane may proceed in parallel with P078 as long as it preserves the implemented write-budget contract and does not add non-approval UI mutations.
+This lane may proceed in parallel with durable side-effect stabilization as long as it preserves the implemented write-budget contract and does not add non-approval UI mutations.
 
 - **P085** thin-client read-model parity and affordance contract.
 - **P036** visual/navigation restoration over the GraphQL read model.
@@ -49,7 +49,7 @@ Goal:
 
 ## Now
 
-After the write-budget and P078 safety rails are in place:
+After the write-budget and durable side-effect safety rails are in place:
 
 - **P081** boundary-first API/auth contract matrix.
 - **P082** recovery/retry state-machine test matrix.
@@ -64,7 +64,7 @@ After the safety and UI recovery lanes stabilize:
 
 - **P038** MCP-only run compaction.
   - Must follow the implemented write-budget contract.
-  - Preferably follows P078 so compaction preserves side-effect reconciliation evidence.
+  - Preferably follows the durable side-effect ledger so compaction preserves side-effect reconciliation evidence.
 - **P083** execution-truth ownership invariant model.
 - **P070** typed-boundary consolidation.
 
@@ -83,7 +83,7 @@ P073 freeze mode
 → UI action boundary / P072 closeout
 → P081 boundary matrix
 → implemented SQLite write discipline
-→ P078 side-effect ledger
+→ durable side-effect ledger
 → P082 recovery/retry matrix
 → P076/P080 effect-aware recovery
 → P079 output repair/fallback

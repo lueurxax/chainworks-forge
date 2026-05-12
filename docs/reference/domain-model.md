@@ -347,7 +347,7 @@ Per-work-item delivery record for retry instructions (P065).
 
 ### `SideEffect` (Rust-only)
 
-The durable record for an irreversible or externally visible operation (P078).
+The durable record for an irreversible or externally visible release operation.
 
 | Field | Type | Notes |
 |---|---|---|

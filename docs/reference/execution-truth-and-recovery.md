@@ -212,15 +212,17 @@ The important contract is ownership, not file shape:
 `recoverySnapshotJSON` is stage-owned next-action truth, not agent-level execution truth.
 It may narrow the operator action after a watchdog failure or exhausted retry, but it must not override the settled `AgentExecution` truth described above.
 
-### Durable Side-Effect Ledger and Reconciliation (P078)
+### Durable Side-Effect Ledger and Reconciliation
 
 For irreversible or externally visible operations (e.g., `git_push`, `connect_upload`), success is not just about the agent finishing. The system must ensure that the side effect is durable and reconcilable if a crash occurs mid-execution.
 
 **Durability Rules:**
 - **Durable Intent**: The control plane persists a `SideEffect` record with status `prepared` before the external operation begins.
-- **Fail-Closed Retry**: If a run or stage has unresolved side effects (status `executing`, `externally_observed`, or `needs_reconciliation`), the engine **blocks all retry attempts** for that run/stage with `requires_effect_reconciliation`.
+- **Fail-Closed Retry**: If a run or stage has unresolved side effects (status `prepared`, `executing`, `externally_observed`, `needs_reconciliation`, `conflict`, or `unrecoverable`), the engine **blocks retry, cancellation, scheduler advancement, and recovery mutations** for that run/stage with `requires_effect_reconciliation`.
 - **At-Most-Once Write**: The engine guarantees at most one external-write attempt per `side_effect` row. If an attempt fails or is ambiguous, the record moves to `needs_reconciliation` rather than auto-retrying.
 - **Idempotency**: Every side effect uses a deterministic `idempotency_key` (derived from run/stage/agent/target) to help external systems (like GitHub or App Store Connect) detect duplicate requests.
+- **Readback Circuit Breaker**: Repeated ledger readback failures for the same call site open a fail-closed circuit breaker; fallback heuristics may describe risk but cannot permit mutation while the circuit is open.
+- **Evidence Integrity**: Release evidence is file-spooled and checked through a manifest. Missing, partial, checksum, or size failures transition affected records to reconciliation-oriented readback instead of silently settling release truth.
 
 **Side-Effect Statuses:**
 - `prepared`: Intent recorded, operation not yet started.
@@ -234,7 +236,9 @@ For irreversible or externally visible operations (e.g., `git_push`, `connect_up
 
 **Reconciliation Paths:**
 - **Startup Repair**: The daemon reconciles stale `executing` side effects at launch. If they outlived their lease or deadline, they move to `needs_reconciliation`.
-- **MCP Operator Tools**: Operators use `effects.list`, `inspect`, and `reconcile` to review unresolved effects and apply a disposition (`mark_unrecoverable` or `clear_after_manual_verification`).
+- **Watchdog Repair**: The engine also checks prepared, externally observed, and settled-evidence integrity windows and fails closed when evidence cannot prove the settled state.
+- **MCP Operator Tools**: Operators use `effects.list`, `inspect`, and `reconcile` to review unresolved effects and apply dispositions such as `mark_conflict`, `mark_unrecoverable`, or `clear_after_manual_verification`.
+- **Read-Only Clients**: GraphQL, run reports, release receipts, and SwiftUI expose side-effect readback and recommended MCP next actions. They do not provide side-effect mutation affordances.
 
 ### Workflow Conflict Recovery
 

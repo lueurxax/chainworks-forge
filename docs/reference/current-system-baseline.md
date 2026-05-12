@@ -180,7 +180,7 @@ The following flows should be treated as implemented system behavior:
 10. rejected implementation approval loopback to proposal refinement,
 11. evidence-pack export for repo-backed runs,
 12. benchmark/sign-off evaluation and export,
-13. durable side-effect ledger, release settlement, and reconciliation (P078).
+13. durable side-effect ledger, release settlement, and reconciliation.
 
 ## Current review posture
 

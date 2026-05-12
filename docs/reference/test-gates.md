@@ -1083,13 +1083,13 @@ Host policy:
 
 Command: retained historical alias `./scripts/test-gate.sh proposal-077-ui`.
 
-### `proposal-078|p078`
+### Retained Historical Alias: `proposal-078|p078`
 
-Proposal 078 durable side-effect ledger gate for migration, CAS races, preflight, release lifecycle wiring, and MCP tools.
+Durable side-effect ledger gate for migration, CAS races, preflight, release lifecycle wiring, and MCP tools. The `proposal-078` and `p078` names are retained historical aliases after the proposal text was promoted into the reference docs.
 
 Scope:
 
-- P078 domain side-effect models and status transitions
+- side-effect domain models and status transitions
 - Migration 052 round-trip and CHECK constraints
 - Side-effect repository operations and CAS predicates
 - DurableEffectCoordinator preflight blocking for unresolved effects
@@ -1097,7 +1097,7 @@ Scope:
 - Startup/watchdog recovery for prepared, externally observed, and settled-evidence integrity windows
 - Ledger readback circuit breaker: three readback errors in five minutes opens a ten-minute fail-closed breaker per call site
 - Lease renewal and deadline wiring for long-running release side effects
-- P078 side-effect evidence spooling manifest contract, including `release-receipt.json`, `stdout.log`, `stderr.log`, `git-ls-remote.json`, `upload-readback.json`, `archive-summary.json`, `reconciliation-report.json`, and manifest-last validation
+- side-effect evidence spooling manifest contract, including `release-receipt.json`, `stdout.log`, `stderr.log`, `git-ls-remote.json`, `upload-readback.json`, `archive-summary.json`, `reconciliation-report.json`, and manifest-last validation
 - Release retry integration coverage for stage retry, manual release retry, and targeted retry guards
 - Native release lifecycle coverage for `git_commit`, `git_push`, `build_archive`, and `connect_upload`
 - Executor start CAS (prepared -> executing) with race-condition verification
@@ -1105,8 +1105,8 @@ Scope:
 - MCP effects.* tools (list, inspect, reconcile, mark_conflict, mark_unrecoverable, clear_after_manual_verification)
 - Authorization policy: all effects.* tools are operator-only (reads and mutations both gated to `PrincipalClass::Operator`, since `last_error` and evidence pointers may contain sensitive adapter output)
 - GraphQL, MCP run report, rollout-contract fixture, and Swift read-only projections for side effects
-- P078 metric literals for the full rollout contract: durable-intent percent, intent, transition, retry block, readback error, circuit-open, recovery, settlement latency, unresolved gauges/age, evidence bytes/disk, and prepare-denied counters
-- Recorded macOS accessibility/view-hierarchy proof for the read-only P078 card and sidebar signal
+- retained side-effect metric literals for the full rollout contract: durable-intent percent, intent, transition, retry block, readback error, circuit-open, recovery, settlement latency, unresolved gauges/age, evidence bytes/disk, and prepare-denied counters
+- Recorded macOS accessibility/view-hierarchy proof for the read-only side-effect card and sidebar signal
 
 Use when:
 
@@ -1123,16 +1123,12 @@ Host policy:
 - no UI host or simulator needed
 - executes in-process against the control-plane/ workspace
 
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-078
-```
+Command: retained historical alias `./scripts/test-gate.sh proposal-078`.
 
 Important:
 
-- `p078` is accepted as an alias
-- this is the canonical proof path for the P078 durable side-effect ledger slice
+- `p078` is accepted as a retained historical alias
+- this is the canonical proof path for the durable side-effect ledger slice
 - it validates that at most one external-write attempt is allowed per side_effect row
 - it verifies the fail-closed preflight that blocks retries when unresolved effects exist
 - it verifies the fail-closed circuit breaker that blocks retries when ledger readback repeatedly fails

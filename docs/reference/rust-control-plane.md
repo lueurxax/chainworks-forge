@@ -200,30 +200,53 @@ The `WorktreeMutationBarrier` ensures that sensitive operations like `git merge`
 
 Note: Main sync and knowledge capsule logic is currently in **Phase 0 contract freeze**.
 
-## Durable side-effect ledger (P078)
+## Durable side-effect ledger
 
-The daemon implements a durable side-effect ledger to handle irreversible or externally visible operations (e.g., `git_push`, `connect_upload`).
+The daemon uses a durable side-effect ledger for irreversible or externally visible release operations such as `git_push` and `connect_upload`. Native release services create compact SQLite intent before an external write and store large evidence in the file spool, so retry, recovery, and operator readback can distinguish "not started" from "started but unsettled."
 
-### Durable intent and settlement
-- **Durable Intent**: A `SideEffect` record is persisted with status `prepared` before any external write attempt.
-- **Barrier Transaction**: Side-effect settlement is an atomic database transaction that updates the effect status, records evidence, and advances the workflow cursor.
-- **Fail-Closed Retry**: If a run or stage has unresolved side effects (`prepared`, `executing`, `externally_observed`, or `needs_reconciliation`), the engine blocks all retry attempts with `requires_effect_reconciliation`.
-- **At-Most-Once Write**: The system guarantees at most one external-write attempt per `side_effect` row. Ambiguous outcomes move the record to `needs_reconciliation` instead of auto-retrying.
+### Lifecycle and safety rules
 
-### Reconciliation
-- **Startup Repair**: The daemon reconciles stale `executing` side effects at launch. If they outlived their lease or deadline, they move to `needs_reconciliation`.
-- **MCP Tooling**: Operators use `effects.list`, `inspect`, and `reconcile` to review unresolved effects and apply a disposition (`mark_unrecoverable` or `clear_after_manual_verification`).
+- A `side_effects` row is persisted with status `prepared` before an external write begins.
+- Each `side_effects` row may make at most one external-write attempt. Ordinary retry never reuses that row to push, upload, publish, tag, or otherwise mutate the outside world again.
+- Deterministic idempotency keys and request fingerprints distinguish the intended target from equivalent request content and block unresolved version drift for the same target.
+- Retry, targeted retry, cancellation, scheduler advancement, and startup recovery run fail-closed preflight. If unresolved side effects exist, or if ledger readback fails, the command returns `requires_effect_reconciliation` before mutating canonical run/stage/work-item state.
+- A per-call-site readback circuit breaker opens after repeated ledger readback failures and remains fail-closed until expiry.
+- `CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED=false` disables preparing new release side effects. Existing unresolved rows remain readable and reconcilable.
+
+Statuses that block ordinary mutation are `prepared`, `executing`, `externally_observed`, `needs_reconciliation`, `conflict`, and `unrecoverable`. `settled` and `reconciled` are the resolved states for normal workflow progress.
+
+### Evidence and settlement
+
+Side-effect settlement records compact lifecycle truth in SQLite and stores bulky evidence under the run artifact root using the evidence spool. The release evidence manifest covers:
+
+- `release-receipt.json`
+- `stdout.log`
+- `stderr.log`
+- `git-ls-remote.json`
+- `upload-readback.json`
+- `archive-summary.json`
+- `reconciliation-report.json`
+- `evidence-manifest.json`
+
+The manifest is written last. Startup/watchdog recovery verifies the manifest and referenced files; missing files, checksum mismatches, size mismatches, or partial evidence move the affected effect back to reconciliation-oriented readback rather than silently settling.
+
+### Reconciliation and readback
+
+- Startup and watchdog repair move stale `executing`, prepared crash-window, externally observed, and bad-settlement-evidence rows to `needs_reconciliation` when the CAS predicates still match the observed row.
+- Operators use MCP `effects.list`, `effects.inspect`, `effects.reconcile`, `effects.mark_conflict`, `effects.mark_unrecoverable`, and `effects.clear_after_manual_verification` to review and disposition unresolved effects.
+- `effects.reconcile` performs bounded readback and writes a reconciliation report. It does not perform another external mutation.
+- GraphQL, MCP run/report readback, release receipts, and SwiftUI expose read-only side-effect summaries, unresolved counts, evidence pointers, and the recommended MCP next action. Governed SwiftUI does not expose side-effect mutation controls.
 
 ### Wired operations
-The initial implementation supports:
+
+The current release implementation wires:
+
 - `git_commit`
 - `git_push`
 - `build_archive`
 - `connect_upload`
 
-Deferred kinds (schema-supported but not yet wired):
-- `tag_create`
-- `artifact_publish`
+`tag_create` and `artifact_publish` are schema-supported deferred kinds and are not wired to release execution paths yet.
 
 ## Workflow engine
 ...
@@ -559,7 +582,7 @@ queue-wait latency.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`):
 
 | Table | Purpose |
 |---|---|
@@ -577,9 +600,9 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `run_knowledge_capsules` | P064: Compact cross-run knowledge capsules emitted from terminal runs |
 | `run_knowledge_capsule_match_keys` | P064: Search keys for capsule relevance matching (proposal id, artifact path, etc.) |
 | `run_knowledge_capsule_attachments` | P064: Links between matching capsules and an active run |
-| `side_effects` | P078: Durable record of irreversible side effects |
-| `side_effect_attempts` | P078: Individual attempt records for side effects |
-| `side_effect_settlements` | P078: Authoritative settlement/reconciliation records |
+| `side_effects` | Durable record of irreversible side-effect intent and lifecycle state |
+| `side_effect_attempts` | Individual attempt records for side effects |
+| `side_effect_settlements` | Authoritative settlement/reconciliation records |
 | `retry_operator_instruction_bindings` | P065: Durable parent bindings for operator-guided retries (ARCH-065) |
 | `retry_operator_instruction_deliveries` | P065: Per-work-item delivery records for retry instructions (ARCH-065) |
 | `evidence_spool_refs` | Compact metadata pointers to high-volume evidence files |

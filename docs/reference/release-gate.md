@@ -12,7 +12,7 @@ A release stage is a manual-approval gate that:
 4. freezes delivery inputs at run start,
 5. writes canonical release artifacts at catalog-defined paths,
 6. produces a structured `delivery_receipt` that survives success, failure, retry, and terminal backfill paths,
-7. ensures irreversible external operations are backed by the **durable side-effect ledger (P078)** for fail-closed recovery and reconciliation.
+7. ensures irreversible external operations are backed by the **durable side-effect ledger** for fail-closed recovery and reconciliation.
 
 Release side effects are irreversible, so the gate is designed to make human approval, task ordering, durable intent, and receipt truth load-bearing rather than advisory.
 
@@ -30,7 +30,7 @@ This reference covers:
 - frozen `delivery_configuration_json` input truth,
 - canonical release artifact paths,
 - `delivery_receipt` preserve/backfill semantics,
-- **durable side-effect reconciliation and fail-closed retry blocking (P078)**,
+- **durable side-effect reconciliation and fail-closed retry blocking**,
 - northbound readback of release configuration and evidence.
 
 It does not replace:
@@ -146,7 +146,7 @@ Pending handoff tasks from the self-assessment are displayed when applicable. Ha
 
 ### Native Release Execution
 
-### Durable Side Effects and Reconciliation (P078)
+### Durable Side Effects and Reconciliation
 
 To ensure that irreversible or externally visible operations (like git push or App Store Connect upload) are handled safely even across crashes or process restarts, the engine uses a **durable side-effect ledger**.
 
@@ -160,6 +160,8 @@ Supported durable side effects:
 - `git_push`
 - `build_archive`
 - `connect_upload`
+
+`tag_create` and `artifact_publish` are schema-supported deferred kinds and are not wired to release execution paths yet.
 
 ### Release agents bypass ACP
 
@@ -290,7 +292,7 @@ The northbound contract:
 - release artifacts remain discoverable at canonical paths,
 - structured release-result truth survives into operator/report surfaces.
 
-## Side-Effect Schema (P078)
+## Side-Effect Schema
 
 The durable ledger uses three primary tables in the SQLite database:
 

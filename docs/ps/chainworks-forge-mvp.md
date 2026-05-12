@@ -109,7 +109,7 @@ The implementation must track separate status machines for:
 - **Stage**: `pending`, `ready`, `running`, `waiting_approval`, `blocked`, `completed`, `failed`, `skipped`
 - **Agent execution**: `pending`, `ready`, `running`, `completed`, `failed`, `cancelled`, `skipped`
 - **Approval**: `pending`, `requested`, `granted`, `rejected`, `expired`
-- **Side effect**: `prepared`, `executing`, `externally_observed`, `needs_reconciliation`, `settled`, `reconciled`, `conflict`, `unrecoverable` (P078)
+- **Side effect**: `prepared`, `executing`, `externally_observed`, `needs_reconciliation`, `settled`, `reconciled`, `conflict`, `unrecoverable`
 
 ### 4.4 Artifact model
 
