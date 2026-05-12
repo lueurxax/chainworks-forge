@@ -64,7 +64,7 @@ enum OutputContractDeclarativeBridge {
         case "proposal_review_po", "proposal_review_ux", "proposal_review_ui", "proposal_review_architect":
             return "proposal_review_v1"
         case "proposal_review_summary":
-            return "proposal_review_summary_v1"
+            return "proposal_review_summary_v2"
         case "prepush_review_report":
             return "prepush_review_v1"
         case "final_feature_report":

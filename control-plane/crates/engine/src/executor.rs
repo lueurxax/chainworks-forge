@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,8 +20,9 @@ use crate::release::{
 };
 use acp::AcpRuntimeManager;
 use db::repos::{
-    agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
-    agent_retry_budget_ledger, artifact_contracts, artifacts, evidence_spool_refs, ideas,
+    agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
+    agent_execution_runtime_receipts, agent_executions, agent_retry_budget_ledger,
+    artifact_contracts, artifacts, code_writer_completion_receipts, evidence_spool_refs, ideas,
     legacy_discovery_overrides, projections, rollout_contract_checks, scheduler, sessions, stages,
     validation, work_items, workflow_conflicts,
 };
@@ -29,7 +30,8 @@ use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::{WriteLane, WriteResult};
 use db::writer::{class_a_operation, DbWriter};
 use domain::agent::{
-    AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement, AgentStatus,
+    AgentExecutionRuntimeFacts, AgentExecutionRuntimePromptReceiptRecord,
+    AgentExecutionRuntimeReceiptRecord, AgentFailureKind, AgentOutputSettlement, AgentStatus,
     OperatorActionHint,
 };
 use domain::artifact::{Artifact, ArtifactFormat};
@@ -39,6 +41,10 @@ use domain::artifact_contracts::{
     SourceGenerationImportDecision, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
     IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
 };
+use domain::code_writer_completion::{
+    CodeWriterCompletionOutputDecisionRecord, CodeWriterCompletionReceiptRecord,
+    CodeWriterCompletionTextCaptureRecord,
+};
 use domain::discovery::{
     AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, DiscoveryFilesystem,
     DiscoveryPathKind, ExpectedOutputSpec, ExpectedPathBaselineStatus, LegacyBroadDiscoveryPolicy,
@@ -47,6 +53,7 @@ use domain::discovery::{
     PrePromptExpectedOutputMetadata, SourceGenerationOwner, StdDiscoveryFilesystem,
     DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
 };
+use domain::error_sanitizer::sanitize_error_for_storage;
 use domain::ids::RunId;
 use domain::provider::ProviderFamily;
 use domain::run::DeliveryConfiguration;
@@ -74,9 +81,20 @@ use crate::session::policy::{
     invalidate_generation_after_missing_required_outputs_tx, SessionPolicyDecision,
     SessionPolicyInput,
 };
+use crate::side_effects::{
+    run_unresolved_effects_preflight, side_effects_enabled, DurableEffectCoordinator,
+};
 use crate::work_queue::WorkQueue;
+use crate::worktree_fingerprint::{
+    capture_worktree_fingerprint_v1, CapturePhase, WorkChangeKind, WorktreeFingerprintInput,
+    WorktreeFingerprintV1,
+};
+use domain::side_effect::{EffectKind, PrepareEffectIntent};
 
 const ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS: i64 = 3;
+const APPROVED_PROPOSAL_OUTPUT_NAME: &str = "approved_proposal";
+const IMPLEMENTATION_STARTED_STAGE_ID: &str = "state_7_implementation_started";
+const FREEZE_PROPOSAL_TASK_NAME: &str = "freeze_proposal_and_provision_worktree";
 
 #[derive(Debug)]
 struct WorkItemRequeued {
@@ -1119,6 +1137,10 @@ fn build_declared_output_discovery_settlement_with_filesystem(
         accepted_aggregate_bytes = aggregate_after;
         let digest = sha256_digest(&bytes);
         accepted_payloads.insert(payload_ref.clone(), bytes.clone());
+        let mut diagnostics = BTreeMap::new();
+        if let Some(source_kind) = source_kind {
+            diagnostics.insert("source_kind".to_string(), enum_snake_value(source_kind));
+        }
         decisions.push(OutputDiscoveryDecision {
             output_name: spec.output_name.clone(),
             output_role: spec.output_role,
@@ -1142,7 +1164,7 @@ fn build_declared_output_discovery_settlement_with_filesystem(
             accepted_bytes_sha256: Some(digest),
             generated_by: (spec.source_generation_owner == SourceGenerationOwner::ControlPlane)
                 .then_some("control_plane".to_string()),
-            diagnostics: Default::default(),
+            diagnostics,
             decision_at: chrono::Utc::now(),
         });
     }
@@ -1716,7 +1738,130 @@ fn runtime_facts_for_acp_error(
     facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
     facts.transport_error_code = classification.transport_error_code;
     facts.supervision_classification = classification.supervision_classification;
+    if let Some(receipt) = acp::runtime_receipt_from_error(error) {
+        enrich_runtime_facts_with_receipt(&mut facts, receipt);
+    }
     facts
+}
+
+fn runtime_receipt_record_from_receipt(
+    agent_exec_id: domain::ids::AgentExecutionId,
+    receipt: &acp::AcpRuntimeReceipt,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<AgentExecutionRuntimeReceiptRecord> {
+    let event_count = receipt.counters.total_messages
+        + receipt.counters.permission_request_count
+        + receipt.counters.permission_grant_sent_count
+        + receipt.counters.permission_grant_failed_count;
+    Ok(AgentExecutionRuntimeReceiptRecord {
+        agent_execution_id: agent_exec_id,
+        provider: receipt.provider.clone(),
+        transport_family: receipt.transport_family.clone(),
+        status: receipt.status.clone(),
+        failure_phase: receipt.failure_phase.clone(),
+        event_count,
+        last_event_kind: receipt.last_events.last().map(|event| event.kind.clone()),
+        last_event_at_ms: receipt.last_events.last().map(|event| event.at_ms as i64),
+        receipt_json: serde_json::to_string(receipt)?,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+fn runtime_prompt_receipt_record_from_receipt(
+    agent_exec_id: domain::ids::AgentExecutionId,
+    receipt: &acp::AcpRuntimeReceipt,
+    now: chrono::DateTime<chrono::Utc>,
+    prompt_kind: &str,
+    turn_index: i64,
+    prompt_template_id: &str,
+    prompt_template_version: &str,
+    prompt_text: &str,
+    repair_or_settlement_reason: &str,
+    redacted_prompt_artifact_path: Option<&str>,
+    expected_output_contract_snapshot_sha256: Option<&str>,
+    expected_output_contract_snapshot_path: Option<&str>,
+) -> Result<AgentExecutionRuntimePromptReceiptRecord> {
+    let runtime_receipt = runtime_receipt_record_from_receipt(agent_exec_id, receipt, now)?;
+    Ok(AgentExecutionRuntimePromptReceiptRecord {
+        runtime_receipt_id: format!("{agent_exec_id}:{prompt_kind}:{turn_index}"),
+        agent_execution_id: agent_exec_id,
+        prompt_kind: prompt_kind.to_string(),
+        turn_index,
+        prompt_template_id: Some(prompt_template_id.to_string()),
+        prompt_template_version: Some(prompt_template_version.parse().unwrap_or(1)),
+        prompt_sha256: Some(sha256_hex(prompt_text.as_bytes())),
+        redacted_prompt_artifact_path: redacted_prompt_artifact_path.map(str::to_string),
+        expected_output_contract_snapshot_sha256: expected_output_contract_snapshot_sha256
+            .map(str::to_string),
+        expected_output_contract_snapshot_path: expected_output_contract_snapshot_path
+            .map(str::to_string),
+        repair_or_settlement_reason: Some(repair_or_settlement_reason.to_string()),
+        runtime_receipt,
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn enrich_runtime_facts_with_receipt(
+    facts: &mut AgentExecutionRuntimeFacts,
+    receipt: &acp::AcpRuntimeReceipt,
+) {
+    let counters = &receipt.counters;
+    let has_provider_activity = counters.permission_request_count > 0
+        || counters.permission_grant_sent_count > 0
+        || counters.session_update_count > 0
+        || counters.tool_call_count > 0
+        || counters.tool_call_update_count > 0
+        || counters.agent_message_chunk_count > 0
+        || counters.agent_thought_chunk_count > 0
+        || counters.plan_update_count > 0
+        || counters.meaningful_progress_count > 0;
+    let waiting_on_permission_roundtrip =
+        counters.permission_request_count > counters.permission_grant_sent_count;
+
+    facts.supervision_classification = if waiting_on_permission_roundtrip {
+        Some("waiting_on_permission_roundtrip".to_string())
+    } else if facts.output_settlement == AgentOutputSettlement::MissingRequiredOutputs
+        && receipt_indicates_recoverable_handoff_gap(receipt)
+    {
+        facts.failure_kind = Some(AgentFailureKind::MissingRequiredOutputs);
+        facts.operator_action_hint = Some(OperatorActionHint::Retry);
+        facts.transport_error_code = Some("ACP_HANDOFF_IDLE_AFTER_DIFF".to_string());
+        Some("recoverable_handoff_gap_after_provider_progress".to_string())
+    } else if has_provider_activity {
+        Some("provider_active_without_terminal_response".to_string())
+    } else {
+        facts.supervision_classification.clone()
+    };
+}
+
+fn receipt_indicates_recoverable_handoff_gap(receipt: &acp::AcpRuntimeReceipt) -> bool {
+    if receipt.status != "failed" {
+        return false;
+    }
+    if !matches!(
+        receipt.failure_phase.as_deref(),
+        Some("read_poll_elapsed_without_message" | "idle_timeout" | "progress_timeout")
+    ) {
+        return false;
+    }
+    let counters = &receipt.counters;
+    if counters.permission_request_count > counters.permission_grant_sent_count {
+        return false;
+    }
+    if counters.meaningful_progress_count == 0 || counters.session_update_count == 0 {
+        return false;
+    }
+    receipt.last_events.iter().any(|event| {
+        event.kind == "session_update:text_chunk"
+            || event
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("diff"))
+    })
 }
 
 fn suppress_interactive_review_xcode_mcp_for_invocation(
@@ -1737,6 +1882,33 @@ fn suppress_interactive_review_xcode_mcp_for_invocation(
                 backend_profile_id,
                 Some("codex_audit_high" | "claude_prepush_medium")
             )))
+}
+
+fn ensure_xcode_mcp_requested_for_host_execution(
+    requested_mcp_server_ids: &mut Vec<String>,
+    requires_xcode_runtime: bool,
+    suppress_interactive_xcode_mcp: bool,
+) -> bool {
+    if !requires_xcode_runtime || suppress_interactive_xcode_mcp {
+        return false;
+    }
+    if requested_mcp_server_ids.iter().any(|id| id == "xcode") {
+        return false;
+    }
+    requested_mcp_server_ids.push("xcode".to_string());
+    true
+}
+
+fn xcode_broker_required_for_invocation(
+    requested_mcp_server_ids: &[String],
+    explicit_xcode_broker_required: bool,
+    requires_xcode_runtime: bool,
+    suppress_interactive_xcode_mcp: bool,
+) -> bool {
+    !suppress_interactive_xcode_mcp
+        && (explicit_xcode_broker_required
+            || requires_xcode_runtime
+            || requested_mcp_server_ids.iter().any(|id| id == "xcode"))
 }
 
 fn is_reused_live_session_transport_error(message: &str) -> bool {
@@ -1789,6 +1961,7 @@ fn runtime_facts_for_execution_result(
     observed_failure_classification: Option<RuntimeFailureClassification>,
     now: chrono::DateTime<chrono::Utc>,
     close_diagnostic: Option<&acp::AcpCloseDiagnostic>,
+    runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
 ) -> AgentExecutionRuntimeFacts {
     let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
     facts.valid_required_outputs = validation_summary.is_some_and(|summary| {
@@ -1875,6 +2048,9 @@ fn runtime_facts_for_execution_result(
             }
             .to_string(),
         );
+    }
+    if let Some(receipt) = runtime_receipt {
+        enrich_runtime_facts_with_receipt(&mut facts, receipt);
     }
     facts
 }
@@ -2032,6 +2208,15 @@ fn captured_output_json<'a>(
         .find(|output| output.declared.output_name == output_name)
         .and_then(|output| output.machine_bytes.as_deref())?;
     serde_json::from_slice::<serde_json::Value>(bytes).ok()
+}
+
+fn captured_output<'a>(
+    captured_outputs: &'a [CapturedOutput],
+    output_name: &str,
+) -> Option<&'a CapturedOutput> {
+    captured_outputs
+        .iter()
+        .find(|output| output.declared.output_name == output_name)
 }
 
 fn collect_backlog_item_ids(value: Option<&serde_json::Value>) -> Vec<String> {
@@ -2204,6 +2389,33 @@ fn proposal_writer_backlog_alignment_issues_from_outputs(
     }
 
     issues
+}
+
+fn proposal_current_freeze_readiness_issue(
+    captured_outputs: &[CapturedOutput],
+    workspace_root: &str,
+) -> Result<Option<ProposalWriterBacklogValidationIssue>> {
+    let Some(output) = captured_output(captured_outputs, "proposal_current") else {
+        return Ok(None);
+    };
+    let Some(bytes) = output.machine_bytes.as_deref() else {
+        return Ok(None);
+    };
+    let failures = crate::rollout_contract_preflight::proposal_current_freeze_readiness_failures(
+        bytes,
+        std::path::Path::new(&output.declared.target_path),
+        workspace_root,
+    )?;
+    if failures.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ProposalWriterBacklogValidationIssue {
+        output_name: "proposal_current".to_string(),
+        validation_error: format!(
+            "proposal_current must satisfy implementation-freeze readiness before implementation approval: {}",
+            failures.join(", ")
+        ),
+    }))
 }
 
 struct ExecutionDiscoveryMetrics {
@@ -2798,6 +3010,35 @@ impl BackgroundExecutor {
         }
     }
 
+    async fn record_code_writer_completion_event(
+        &self,
+        policy_decision: Option<&SessionPolicyDecision>,
+        event_type: domain::session::SessionEventType,
+        mut details: serde_json::Value,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+    ) {
+        let Some(decision) = policy_decision else {
+            return;
+        };
+        if let Some(details) = details.as_object_mut() {
+            details.insert(
+                "session_generation_id".to_string(),
+                serde_json::Value::String(decision.generation.id.clone()),
+            );
+        }
+        self.record_output_contract_repair_event(
+            Some(decision),
+            event_type,
+            details,
+            run_id,
+            stage_id,
+            agent_id,
+        )
+        .await;
+    }
+
     pub async fn persist_implementation_self_assessment_summary_if_applicable(
         &self,
         artifact: &domain::artifact::Artifact,
@@ -3172,6 +3413,14 @@ impl BackgroundExecutor {
         )
         .await?;
         agent_execution_runtime_facts::upsert(&self.pool, &runtime_facts).await?;
+        if let Some(receipt) = acp::runtime_receipt_from_error(error) {
+            let receipt_record = runtime_receipt_record_from_receipt(
+                claimed.agent_execution_id,
+                receipt,
+                completed_at,
+            )?;
+            agent_execution_runtime_receipts::upsert(&self.pool, &receipt_record).await?;
+        }
 
         if let Some(decision) = policy_decision {
             let _ = self.acp.close_session(&decision.generation.id).await;
@@ -3396,6 +3645,7 @@ impl BackgroundExecutor {
         match item.kind {
             WorkItemKind::AdvanceRun => {
                 let run_id = self.extract_run_id(&item)?;
+                run_unresolved_effects_preflight(&self.pool, &run_id, "advance_run").await?;
                 self.orchestrator.advance_run(run_id).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
             }
@@ -3474,7 +3724,7 @@ impl BackgroundExecutor {
                     .ok_or_else(|| anyhow::anyhow!("Run not found: {}", run_id))?;
                 // Use the prompt from the work item payload if provided
                 // (workflow-driven runs include the agent's system prompt from YAML).
-                let prompt = payload["prompt"]
+                let mut prompt = payload["prompt"]
                     .as_str()
                     .unwrap_or(&format!("Execute stage {} for run {}", stage_id, run_id))
                     .to_string();
@@ -3497,11 +3747,21 @@ impl BackgroundExecutor {
                 let mut requested_mcp_server_ids: Vec<String> =
                     serde_json::from_value(payload["requested_mcp_server_ids"].clone())
                         .unwrap_or_default();
-                if suppress_interactive_review_xcode_mcp_for_invocation(
-                    &agent_id,
-                    payload["backend_profile_id"].as_str(),
-                    payload["permission_profile"].as_str(),
-                ) {
+                let xcode_shim_injection_signal = payload["xcode_shim_injection_signal"]
+                    .as_bool()
+                    .unwrap_or(false);
+                let requires_xcode_host_execution = payload["requires_xcode_host_execution"]
+                    .as_bool()
+                    .unwrap_or(false);
+                let xcode_shim_required =
+                    xcode_shim_injection_signal || requires_xcode_host_execution;
+                let suppress_interactive_xcode_mcp =
+                    suppress_interactive_review_xcode_mcp_for_invocation(
+                        &agent_id,
+                        payload["backend_profile_id"].as_str(),
+                        payload["permission_profile"].as_str(),
+                    );
+                if suppress_interactive_xcode_mcp {
                     let before = requested_mcp_server_ids.len();
                     requested_mcp_server_ids.retain(|id| id != "xcode");
                     if requested_mcp_server_ids.len() != before {
@@ -3512,6 +3772,17 @@ impl BackgroundExecutor {
                             "Suppressing interactive Xcode MCP lease for read-only review/audit invocation"
                         );
                     }
+                } else if ensure_xcode_mcp_requested_for_host_execution(
+                    &mut requested_mcp_server_ids,
+                    xcode_shim_required,
+                    suppress_interactive_xcode_mcp,
+                ) {
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        agent_id = %agent_id,
+                        "Promoting Xcode host execution requirement to brokered Xcode MCP request"
+                    );
                 }
                 let mut mcp_resolution = crate::mcp::resolve_mcp_servers(
                     &requested_mcp_server_ids,
@@ -3543,40 +3814,17 @@ impl BackgroundExecutor {
                     .unwrap_or_default();
                 let session_reuse_scope = payload["session_reuse_scope"].as_str().map(String::from);
                 let session_family_id = payload["session_family_id"].as_str().map(String::from);
-                let xcode_broker_required = !suppress_interactive_review_xcode_mcp_for_invocation(
-                    &agent_id,
-                    backend_profile_id.as_deref(),
-                    permission_profile.as_deref(),
-                ) && payload["xcode_broker_required"]
-                    .as_bool()
-                    .unwrap_or_else(|| requested_mcp_server_ids.iter().any(|id| id == "xcode"));
-                let xcode_shim_injection_signal = payload["xcode_shim_injection_signal"]
-                    .as_bool()
-                    .unwrap_or(false);
-                let requires_xcode_host_execution = payload["requires_xcode_host_execution"]
-                    .as_bool()
-                    .unwrap_or(false);
-                let xcode_shim_required =
-                    xcode_shim_injection_signal || requires_xcode_host_execution;
-                let declared_outputs: Vec<DeclaredOutput> =
+                let xcode_broker_required = xcode_broker_required_for_invocation(
+                    &requested_mcp_server_ids,
+                    payload["xcode_broker_required"].as_bool().unwrap_or(false),
+                    xcode_shim_required,
+                    suppress_interactive_xcode_mcp,
+                );
+                let mut declared_outputs: Vec<DeclaredOutput> =
                     serde_json::from_value(payload["declared_outputs"].clone()).unwrap_or_default();
                 let stage_degraded_output_policy: workflow::plan::DegradedOutputPolicy =
                     serde_json::from_value(payload["stage_degraded_output_policy"].clone())
                         .unwrap_or_default();
-                let expected_output_paths: Vec<String> = declared_outputs
-                    .iter()
-                    .flat_map(|declared| {
-                        std::iter::once(declared.target_path.clone())
-                            .chain(declared.companion_path.clone().into_iter())
-                    })
-                    .collect();
-                let expected_outputs = build_expected_output_specs(
-                    &declared_outputs,
-                    &run.workspace_root,
-                    run.worktree_root.as_deref(),
-                    run.chainworks_meta_root.as_deref(),
-                    worktree_write_enabled,
-                );
 
                 let effective_working_directory = if worktree_write_enabled
                     || matches!(
@@ -4092,6 +4340,41 @@ impl BackgroundExecutor {
                     tx.commit().await?;
                 }
 
+                let has_existing_approved_proposal = artifacts::list_by_run(&self.pool, run_id)
+                    .await?
+                    .iter()
+                    .any(|artifact| artifact.name == APPROVED_PROPOSAL_OUTPUT_NAME);
+                let suppressed_approved_proposal = suppress_duplicate_approved_proposal_output(
+                    &mut declared_outputs,
+                    &mut prompt,
+                    &stage_id,
+                    &task_name,
+                    has_existing_approved_proposal,
+                );
+                if suppressed_approved_proposal {
+                    warn!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        task_name = %task_name,
+                        attempt = stage_attempt_number,
+                        "Suppressing duplicate agent-returned approved_proposal to preserve frozen implementation handoff"
+                    );
+                }
+                let expected_output_paths: Vec<String> = declared_outputs
+                    .iter()
+                    .flat_map(|declared| {
+                        std::iter::once(declared.target_path.clone())
+                            .chain(declared.companion_path.clone().into_iter())
+                    })
+                    .collect();
+                let expected_outputs = build_expected_output_specs(
+                    &declared_outputs,
+                    &run.workspace_root,
+                    run.worktree_root.as_deref(),
+                    run.chainworks_meta_root.as_deref(),
+                    worktree_write_enabled,
+                );
+
                 let execution_prompt = if policy_decision.is_some() || !declared_outputs.is_empty()
                 {
                     prompt_with_runtime_invocation_contract(
@@ -4183,6 +4466,56 @@ impl BackgroundExecutor {
                     toolchain_home: None,
                     toolchain_go_scope_enabled: false,
                 };
+                let p088_code_writer_completion_candidate =
+                    agent_id == "code_writer" && !declared_outputs.is_empty();
+                let p088_operator_retry_completion_recovery = p088_code_writer_completion_candidate
+                    && payload_requests_p088_operator_retry_completion_recovery(&payload);
+                let mut p088_pre_original_fingerprint_path: Option<String> = None;
+                let p088_pre_original_fingerprint = if p088_code_writer_completion_candidate
+                    && worktree_write_enabled
+                {
+                    match capture_worktree_fingerprint_v1(WorktreeFingerprintInput {
+                        worktree_root: PathBuf::from(&effective_working_directory),
+                        run_id: run_id.to_string(),
+                        stage_execution_id: stage_execution_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| stage_id.clone()),
+                        agent_execution_id: agent_exec_id.to_string(),
+                        session_generation_id: req
+                            .session_generation_id
+                            .clone()
+                            .unwrap_or_else(|| "none".to_string()),
+                        capture_phase: CapturePhase::PreOriginalPrompt,
+                        active_proposal_id: Some("088".to_string()),
+                        baseline: None,
+                    })
+                    .await
+                    {
+                        Ok(fingerprint) => {
+                            p088_pre_original_fingerprint_path = persist_p088_worktree_fingerprint(
+                                &run.artifact_root,
+                                agent_exec_id,
+                                &fingerprint,
+                            )
+                            .await
+                            .ok();
+                            Some(fingerprint)
+                        }
+                        Err(error) => {
+                            warn!(
+                                run_id = %run_id,
+                                stage_id = %stage_id,
+                                agent_id = %agent_id,
+                                agent_execution_id = %agent_exec_id,
+                                error = %error,
+                                "P088 pre-original worktree fingerprint capture failed"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 // Runtime event: session starting
                 let _ = self
                     .events
@@ -4198,26 +4531,28 @@ impl BackgroundExecutor {
                     Ok(result) => result,
                     Err(error) => {
                         let completed_at = chrono::Utc::now();
-                        if let Some(claimed) = preclaimed_start.as_ref() {
-                            if self
-                                .auto_requeue_active_prompt_close(
-                                    &item,
-                                    claimed,
-                                    policy_decision.as_ref(),
-                                    run_id,
-                                    &stage_id,
-                                    &agent_id,
-                                    &provider,
-                                    &error,
-                                    completed_at,
-                                )
-                                .await?
-                            {
-                                return Err(WorkItemRequeued {
-                                    work_item_id: item.id.clone(),
-                                    reason: "active_prompt_transport_closed",
+                        if !p088_code_writer_completion_candidate {
+                            if let Some(claimed) = preclaimed_start.as_ref() {
+                                if self
+                                    .auto_requeue_active_prompt_close(
+                                        &item,
+                                        claimed,
+                                        policy_decision.as_ref(),
+                                        run_id,
+                                        &stage_id,
+                                        &agent_id,
+                                        &provider,
+                                        &error,
+                                        completed_at,
+                                    )
+                                    .await?
+                                {
+                                    return Err(WorkItemRequeued {
+                                        work_item_id: item.id.clone(),
+                                        reason: "active_prompt_transport_closed",
+                                    }
+                                    .into());
                                 }
-                                .into());
                             }
                         }
                         let runtime_facts =
@@ -4250,6 +4585,139 @@ impl BackgroundExecutor {
                                 error = %update_error,
                                 "Failed to persist ACP startup failure runtime facts"
                             );
+                        }
+                        if let Some(receipt) = acp::runtime_receipt_from_error(&error) {
+                            match runtime_receipt_record_from_receipt(
+                                agent_exec_id,
+                                receipt,
+                                completed_at,
+                            ) {
+                                Ok(receipt_record) => {
+                                    if let Err(update_error) =
+                                        agent_execution_runtime_receipts::upsert(
+                                            &self.pool,
+                                            &receipt_record,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            run_id = %run_id,
+                                            stage_id = %stage_id,
+                                            agent_id = %agent_id,
+                                            agent_execution_id = %agent_exec_id,
+                                            error = %update_error,
+                                            "Failed to persist ACP startup failure runtime receipt"
+                                        );
+                                    }
+                                }
+                                Err(update_error) => {
+                                    warn!(
+                                        run_id = %run_id,
+                                        stage_id = %stage_id,
+                                        agent_id = %agent_id,
+                                        agent_execution_id = %agent_exec_id,
+                                        error = %update_error,
+                                        "Failed to encode ACP startup failure runtime receipt"
+                                    );
+                                }
+                            }
+                        }
+                        if p088_code_writer_completion_candidate {
+                            let mut p088_error_post_fingerprint_path: Option<String> = None;
+                            let p088_error_post_fingerprint = if worktree_write_enabled {
+                                match capture_worktree_fingerprint_v1(WorktreeFingerprintInput {
+                                    worktree_root: PathBuf::from(&effective_working_directory),
+                                    run_id: run_id.to_string(),
+                                    stage_execution_id: stage_execution_id
+                                        .map(|id| id.to_string())
+                                        .unwrap_or_else(|| stage_id.clone()),
+                                    agent_execution_id: agent_exec_id.to_string(),
+                                    session_generation_id: req
+                                        .session_generation_id
+                                        .clone()
+                                        .unwrap_or_else(|| "none".to_string()),
+                                    capture_phase: CapturePhase::PostOriginalPrompt,
+                                    active_proposal_id: Some("088".to_string()),
+                                    baseline: p088_pre_original_fingerprint.as_ref(),
+                                })
+                                .await
+                                {
+                                    Ok(fingerprint) => {
+                                        p088_error_post_fingerprint_path =
+                                            persist_p088_worktree_fingerprint(
+                                                &run.artifact_root,
+                                                agent_exec_id,
+                                                &fingerprint,
+                                            )
+                                            .await
+                                            .ok();
+                                        Some(fingerprint)
+                                    }
+                                    Err(capture_error) => {
+                                        warn!(
+                                            run_id = %run_id,
+                                            stage_id = %stage_id,
+                                            agent_id = %agent_id,
+                                            agent_execution_id = %agent_exec_id,
+                                            error = %capture_error,
+                                            "P088 error-path post-original worktree fingerprint capture failed"
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let error_settlement = settle_agent_outputs_from_discovery_decisions(
+                                &declared_outputs,
+                                &expected_outputs,
+                                &[],
+                                &[],
+                            )
+                            .ok();
+                            let empty_capture = acp::AcpCompletionTextCaptureMetadata::default();
+                            if let Some(stage_execution_id) = stage_execution_id {
+                                if let Err(persist_error) =
+                                    persist_p088_code_writer_completion_receipt(
+                                        &self.pool,
+                                        &run.artifact_root,
+                                        run_id,
+                                        stage_execution_id,
+                                        agent_exec_id,
+                                        req.session_generation_id.as_deref(),
+                                        &provider,
+                                        model.as_deref(),
+                                        &p088_pre_original_fingerprint,
+                                        &p088_error_post_fingerprint,
+                                        p088_pre_original_fingerprint_path.as_deref(),
+                                        p088_error_post_fingerprint_path.as_deref(),
+                                        error_settlement.as_ref(),
+                                        None,
+                                        &empty_capture,
+                                        None,
+                                        acp::runtime_receipt_from_error(&error),
+                                        None,
+                                        None,
+                                        false,
+                                        0,
+                                        p088_operator_retry_completion_recovery,
+                                        Some("skipped_no_live_session"),
+                                        None,
+                                        None,
+                                        completed_at,
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        run_id = %run_id,
+                                        stage_id = %stage_id,
+                                        agent_id = %agent_id,
+                                        agent_execution_id = %agent_exec_id,
+                                        error = %persist_error,
+                                        "Failed to persist P088 error-path completion receipt"
+                                    );
+                                }
+                            }
                         }
                         if let Some(decision) = policy_decision.as_ref() {
                             match invalidate_generation_after_missing_required_outputs(
@@ -4507,6 +4975,53 @@ impl BackgroundExecutor {
                 let mut acp_git_manifest_status: Option<String> = None;
                 let mut acp_exact_output_acceptance_latency_ms: Option<u64> = None;
                 let mut acp_resume_discovery_warning: Option<String> = None;
+                let mut p088_post_original_fingerprint_path: Option<String> = None;
+                let p088_post_original_fingerprint =
+                    if p088_code_writer_completion_candidate && worktree_write_enabled {
+                        match capture_worktree_fingerprint_v1(WorktreeFingerprintInput {
+                            worktree_root: PathBuf::from(&effective_working_directory),
+                            run_id: run_id.to_string(),
+                            stage_execution_id: stage_execution_id
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| stage_id.clone()),
+                            agent_execution_id: agent_exec_id.to_string(),
+                            session_generation_id: result
+                                .session_generation_id
+                                .clone()
+                                .or_else(|| req.session_generation_id.clone())
+                                .unwrap_or_else(|| "none".to_string()),
+                            capture_phase: CapturePhase::PostOriginalPrompt,
+                            active_proposal_id: Some("088".to_string()),
+                            baseline: p088_pre_original_fingerprint.as_ref(),
+                        })
+                        .await
+                        {
+                            Ok(fingerprint) => {
+                                p088_post_original_fingerprint_path =
+                                    persist_p088_worktree_fingerprint(
+                                        &run.artifact_root,
+                                        agent_exec_id,
+                                        &fingerprint,
+                                    )
+                                    .await
+                                    .ok();
+                                Some(fingerprint)
+                            }
+                            Err(error) => {
+                                warn!(
+                                    run_id = %run_id,
+                                    stage_id = %stage_id,
+                                    agent_id = %agent_id,
+                                    agent_execution_id = %agent_exec_id,
+                                    error = %error,
+                                    "P088 post-original worktree fingerprint capture failed"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                 let mut declared_output_settlement = if !declared_outputs.is_empty() {
                     let manifest_started = Instant::now();
                     match generate_changed_files_manifest_if_declared(
@@ -4611,6 +5126,16 @@ impl BackgroundExecutor {
                 };
 
                 let mut output_contract_repair_turn_count = 0_i64;
+                let mut p088_completion_turn_attempted = false;
+                let mut p088_completion_turn_result: Option<String> = None;
+                let mut p088_completion_repair_text_capture: Option<
+                    acp::AcpCompletionTextCaptureMetadata,
+                > = None;
+                let mut p088_completion_repair_runtime_receipt: Option<acp::AcpRuntimeReceipt> =
+                    None;
+                let mut p088_completion_repair_runtime_prompt_receipt: Option<
+                    AgentExecutionRuntimePromptReceiptRecord,
+                > = None;
                 if let Some(settlement) = declared_output_settlement.as_ref() {
                     let captured = build_captured_outputs_from_discovery_decisions(
                         &declared_outputs,
@@ -4623,6 +5148,14 @@ impl BackgroundExecutor {
                         )
                         .await?;
                     if validation_summary_requires_output_contract_repair(&validation) {
+                        let p088_work_change_kind = p088_post_original_fingerprint
+                            .as_ref()
+                            .map(|fingerprint| fingerprint.summary.work_change_kind);
+                        let p088_completion_eligible = p088_code_writer_completion_candidate
+                            && (matches!(
+                                p088_work_change_kind,
+                                Some(WorkChangeKind::CurrentAttemptDiff)
+                            ) || p088_operator_retry_completion_recovery);
                         if let Some(session_generation_id) =
                             result.session_generation_id.clone().or_else(|| {
                                 policy_decision
@@ -4630,29 +5163,122 @@ impl BackgroundExecutor {
                                     .map(|decision| decision.generation.id.clone())
                             })
                         {
-                            let mut repair_req = req.clone();
-                            repair_req.prompt =
-                                output_contract_repair_prompt(&validation, &declared_outputs);
-                            repair_req.reuse_existing_session = true;
-                            repair_req.keep_session_alive = true;
-                            repair_req.session_generation_id = Some(session_generation_id.clone());
-                            repair_req.provider_session_id = result
-                                .provider_session_id
-                                .clone()
-                                .or_else(|| repair_req.provider_session_id.clone());
-                            let repair_prompt_bytes = repair_req.prompt.len();
-                            let failed_outputs = failed_output_validation_details(&validation);
-                            info!(
-                                run_id = %run_id,
-                                stage_id = %stage_id,
-                                agent_id = %agent_id,
-                                agent_execution_id = %agent_exec_id,
-                                session_generation_id = %session_generation_id,
-                                failed_output_count = failed_outputs.len(),
-                                repair_prompt_bytes,
-                                "Output contract repair turn starting"
-                            );
-                            self.record_output_contract_repair_event(
+                            let failed_generic_repair_count =
+                                sessions::count_generation_events_for_agent_execution(
+                                    &self.pool,
+                                    &session_generation_id,
+                                    domain::session::SessionEventType::OutputContractRepairFailed,
+                                    &agent_exec_id.to_string(),
+                                )
+                                .await
+                                .unwrap_or(0);
+                            let generic_repair_already_failed =
+                                p088_should_block_after_generic_repair_failed(
+                                    p088_code_writer_completion_candidate,
+                                    p088_completion_eligible,
+                                    failed_generic_repair_count,
+                                );
+                            if generic_repair_already_failed {
+                                p088_completion_turn_result = Some(
+                                    "generic_repair_already_failed_completion_contract_required"
+                                        .to_string(),
+                                );
+                                warn!(
+                                    run_id = %run_id,
+                                    stage_id = %stage_id,
+                                    agent_id = %agent_id,
+                                    agent_execution_id = %agent_exec_id,
+                                    session_generation_id = %session_generation_id,
+                                    "P088 blocked ineligible code_writer completion attempt after failed generic repair"
+                                );
+                                self.record_output_contract_repair_event(
+                                    policy_decision.as_ref(),
+                                    domain::session::SessionEventType::OutputContractRepairSkipped,
+                                    serde_json::json!({
+                                        "agent_execution_id": agent_exec_id.to_string(),
+                                        "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                        "failure_kind": "generic_repair_already_failed_completion_contract_required",
+                                    }),
+                                    run_id,
+                                    &stage_id,
+                                    &agent_id,
+                                )
+                                .await;
+                                self.record_code_writer_completion_event(
+                                    policy_decision.as_ref(),
+                                    domain::session::SessionEventType::CodeWriterCompletionFailed,
+                                    serde_json::json!({
+                                        "agent_execution_id": agent_exec_id.to_string(),
+                                        "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                        "repair_turn_count": 0,
+                                        "result": "generic_repair_already_failed_completion_contract_required",
+                                    }),
+                                    run_id,
+                                    &stage_id,
+                                    &agent_id,
+                                )
+                                .await;
+                            } else {
+                                let mut repair_req = req.clone();
+                                repair_req.prompt = if p088_completion_eligible {
+                                    code_writer_completion_repair_prompt(
+                                        &validation,
+                                        &declared_outputs,
+                                    )
+                                } else {
+                                    output_contract_repair_prompt(&validation, &declared_outputs)
+                                };
+                                repair_req.reuse_existing_session = true;
+                                repair_req.keep_session_alive = true;
+                                repair_req.session_generation_id =
+                                    Some(session_generation_id.clone());
+                                repair_req.provider_session_id = result
+                                    .provider_session_id
+                                    .clone()
+                                    .or_else(|| repair_req.provider_session_id.clone());
+                                let repair_prompt_text = repair_req.prompt.clone();
+                                let repair_prompt_bytes = repair_req.prompt.len();
+                                let failed_outputs = failed_output_validation_details(&validation);
+                                let p088_repair_prompt_artifact_path = if p088_completion_eligible {
+                                    persist_p088_prompt_artifact(
+                                        &run.artifact_root,
+                                        agent_exec_id,
+                                        "code_writer_completion_repair",
+                                        1,
+                                        &repair_prompt_text,
+                                    )
+                                    .await
+                                    .ok()
+                                } else {
+                                    None
+                                };
+                                let p088_expected_output_snapshot = if p088_completion_eligible {
+                                    persist_p088_expected_output_snapshot(
+                                        &run.artifact_root,
+                                        agent_exec_id,
+                                        "code_writer_completion_repair",
+                                        1,
+                                        &declared_outputs,
+                                    )
+                                    .await
+                                    .ok()
+                                } else {
+                                    None
+                                };
+                                if p088_completion_eligible {
+                                    p088_completion_turn_attempted = true;
+                                }
+                                info!(
+                                    run_id = %run_id,
+                                    stage_id = %stage_id,
+                                    agent_id = %agent_id,
+                                    agent_execution_id = %agent_exec_id,
+                                    session_generation_id = %session_generation_id,
+                                    failed_output_count = failed_outputs.len(),
+                                    repair_prompt_bytes,
+                                    "Output contract repair turn starting"
+                                );
+                                self.record_output_contract_repair_event(
                                 policy_decision.as_ref(),
                                 domain::session::SessionEventType::OutputContractRepairStarted,
                                 serde_json::json!({
@@ -4666,36 +5292,247 @@ impl BackgroundExecutor {
                                 &agent_id,
                             )
                             .await;
+                                if p088_completion_eligible {
+                                    self.record_code_writer_completion_event(
+                                    policy_decision.as_ref(),
+                                    domain::session::SessionEventType::CodeWriterCompletionStarted,
+                                    serde_json::json!({
+                                        "agent_execution_id": agent_exec_id.to_string(),
+                                        "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                        "repair_turn_count": 1,
+                                        "repair_prompt_bytes": repair_prompt_bytes,
+                                    }),
+                                    run_id,
+                                    &stage_id,
+                                    &agent_id,
+                                )
+                                .await;
+                                }
 
-                            match self
-                                .acp
-                                .prompt_session(&session_generation_id, repair_req)
-                                .await
-                            {
-                                Ok(repair_result) => {
-                                    output_contract_repair_turn_count += 1;
-                                    match settle_agent_outputs_from_discovery_decisions(
-                                        &declared_outputs,
-                                        &expected_outputs,
-                                        &repair_result.discovered_artifacts,
-                                        &repair_result.pre_prompt_expected_outputs,
-                                    ) {
-                                        Ok(repair_settlement) => {
-                                            let repair_captured =
-                                                build_captured_outputs_from_discovery_decisions(
-                                                    &declared_outputs,
-                                                    &repair_settlement.decisions,
-                                                    &repair_settlement.accepted_payloads,
+                                let p088_pre_completion_repair_fingerprint =
+                                    if p088_completion_eligible && worktree_write_enabled {
+                                        match capture_worktree_fingerprint_v1(
+                                            WorktreeFingerprintInput {
+                                                worktree_root: PathBuf::from(
+                                                    &effective_working_directory,
+                                                ),
+                                                run_id: run_id.to_string(),
+                                                stage_execution_id: stage_execution_id
+                                                    .map(|id| id.to_string())
+                                                    .unwrap_or_else(|| stage_id.clone()),
+                                                agent_execution_id: agent_exec_id.to_string(),
+                                                session_generation_id: session_generation_id
+                                                    .clone(),
+                                                capture_phase: CapturePhase::PreCompletionRepair,
+                                                active_proposal_id: Some("088".to_string()),
+                                                baseline: p088_post_original_fingerprint.as_ref(),
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            Ok(fingerprint) => {
+                                                let _ = persist_p088_worktree_fingerprint(
+                                                    &run.artifact_root,
+                                                    agent_exec_id,
+                                                    &fingerprint,
+                                                )
+                                                .await;
+                                                Some(fingerprint)
+                                            }
+                                            Err(error) => {
+                                                warn!(
+                                                    run_id = %run_id,
+                                                    stage_id = %stage_id,
+                                                    agent_id = %agent_id,
+                                                    agent_execution_id = %agent_exec_id,
+                                                    error = %error,
+                                                    "P088 pre-completion repair worktree fingerprint capture failed"
                                                 );
-                                            let (
-                                                repair_found_count,
-                                                repair_missing_count,
-                                                repair_stale_count,
-                                                repair_rejected_count,
-                                            ) = output_discovery_decision_counts(
-                                                &repair_settlement.decisions,
+                                                None
+                                            }
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                match self
+                                    .acp
+                                    .prompt_session(&session_generation_id, repair_req)
+                                    .await
+                                {
+                                    Ok(repair_result) => {
+                                        output_contract_repair_turn_count += 1;
+                                        if p088_completion_eligible {
+                                            p088_completion_repair_text_capture =
+                                                Some(repair_result.completion_text_capture.clone());
+                                            p088_completion_repair_runtime_receipt =
+                                                repair_result.runtime_receipt.clone();
+                                            if let Some(runtime_receipt) =
+                                                repair_result.runtime_receipt.as_ref()
+                                            {
+                                                if let Ok(receipt_record) =
+                                                    runtime_prompt_receipt_record_from_receipt(
+                                                        agent_exec_id,
+                                                        runtime_receipt,
+                                                        chrono::Utc::now(),
+                                                        "code_writer_completion_repair",
+                                                        output_contract_repair_turn_count,
+                                                        "code_writer_completion_repair_v1",
+                                                        "1",
+                                                        &repair_prompt_text,
+                                                        "missing_required_outputs",
+                                                        p088_repair_prompt_artifact_path.as_deref(),
+                                                        p088_expected_output_snapshot
+                                                            .as_ref()
+                                                            .map(|snapshot| snapshot.0.as_str()),
+                                                        p088_expected_output_snapshot
+                                                            .as_ref()
+                                                            .map(|snapshot| snapshot.1.as_str()),
+                                                    )
+                                                {
+                                                    p088_completion_repair_runtime_prompt_receipt =
+                                                        Some(receipt_record.clone());
+                                                    if let Err(error) =
+                                                    agent_execution_runtime_receipts::upsert_prompt_receipt(
+                                                        &self.pool,
+                                                        &receipt_record,
+                                                    )
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        run_id = %run_id,
+                                                        stage_id = %stage_id,
+                                                        agent_id = %agent_id,
+                                                        agent_execution_id = %agent_exec_id,
+                                                        error = %error,
+                                                        "Failed to persist P088 completion repair runtime receipt"
+                                                    );
+                                                }
+                                                }
+                                            }
+                                        }
+                                        let p088_completion_repair_mutation_failure =
+                                            if p088_completion_eligible && worktree_write_enabled {
+                                                match capture_worktree_fingerprint_v1(
+                                                    WorktreeFingerprintInput {
+                                                        worktree_root: PathBuf::from(
+                                                            &effective_working_directory,
+                                                        ),
+                                                        run_id: run_id.to_string(),
+                                                        stage_execution_id: stage_execution_id
+                                                            .map(|id| id.to_string())
+                                                            .unwrap_or_else(|| stage_id.clone()),
+                                                        agent_execution_id: agent_exec_id
+                                                            .to_string(),
+                                                        session_generation_id:
+                                                            session_generation_id.clone(),
+                                                        capture_phase:
+                                                            CapturePhase::PostCompletionRepair,
+                                                        active_proposal_id: Some("088".to_string()),
+                                                        baseline:
+                                                            p088_pre_completion_repair_fingerprint
+                                                                .as_ref(),
+                                                    },
+                                                )
+                                                .await
+                                                {
+                                                    Ok(fingerprint) => {
+                                                        let _ = persist_p088_worktree_fingerprint(
+                                                            &run.artifact_root,
+                                                            agent_exec_id,
+                                                            &fingerprint,
+                                                        )
+                                                        .await;
+                                                        (fingerprint
+                                                        .summary
+                                                        .current_attempt_changed_path_count
+                                                        > 0)
+                                                        .then_some(
+                                                            "unexpected_worktree_mutation_during_completion_repair",
+                                                        )
+                                                    }
+                                                    Err(error) => {
+                                                        warn!(
+                                                            run_id = %run_id,
+                                                            stage_id = %stage_id,
+                                                            agent_id = %agent_id,
+                                                            agent_execution_id = %agent_exec_id,
+                                                            error = %error,
+                                                            "P088 post-completion repair worktree fingerprint capture failed"
+                                                        );
+                                                        Some("completion_repair_mutation_guard_unavailable")
+                                                    }
+                                                }
+                                            } else {
+                                                None
+                                            };
+                                        if let Some(failure_kind) =
+                                            p088_completion_repair_mutation_failure
+                                        {
+                                            p088_completion_turn_result =
+                                                Some(failure_kind.to_string());
+                                            warn!(
+                                                run_id = %run_id,
+                                                stage_id = %stage_id,
+                                                agent_id = %agent_id,
+                                                agent_execution_id = %agent_exec_id,
+                                                session_generation_id = %session_generation_id,
+                                                failure_kind,
+                                                "P088 completion repair rejected by mutation guard"
                                             );
-                                            let repair_validation = self
+                                            self.record_output_contract_repair_event(
+                                            policy_decision.as_ref(),
+                                            domain::session::SessionEventType::OutputContractRepairFailed,
+                                            serde_json::json!({
+                                                "agent_execution_id": agent_exec_id.to_string(),
+                                                "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                                "failure_kind": failure_kind,
+                                            }),
+                                            run_id,
+                                            &stage_id,
+                                            &agent_id,
+                                        )
+                                        .await;
+                                            if p088_completion_eligible {
+                                                self.record_code_writer_completion_event(
+                                                policy_decision.as_ref(),
+                                                domain::session::SessionEventType::CodeWriterCompletionFailed,
+                                                serde_json::json!({
+                                                    "agent_execution_id": agent_exec_id.to_string(),
+                                                    "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                                    "repair_turn_count": output_contract_repair_turn_count,
+                                                    "result": "failed_unexpected_worktree_mutation",
+                                                    "failure_kind": failure_kind,
+                                                }),
+                                                run_id,
+                                                &stage_id,
+                                                &agent_id,
+                                            )
+                                            .await;
+                                            }
+                                        } else {
+                                            match settle_agent_outputs_from_discovery_decisions(
+                                                &declared_outputs,
+                                                &expected_outputs,
+                                                &repair_result.discovered_artifacts,
+                                                &repair_result.pre_prompt_expected_outputs,
+                                            ) {
+                                                Ok(repair_settlement) => {
+                                                    let repair_captured =
+                                                    build_captured_outputs_from_discovery_decisions(
+                                                        &declared_outputs,
+                                                        &repair_settlement.decisions,
+                                                        &repair_settlement.accepted_payloads,
+                                                    );
+                                                    let (
+                                                        repair_found_count,
+                                                        repair_missing_count,
+                                                        repair_stale_count,
+                                                        repair_rejected_count,
+                                                    ) = output_discovery_decision_counts(
+                                                        &repair_settlement.decisions,
+                                                    );
+                                                    let repair_validation = self
                                                 .validate_task_outputs_with_conflict_resolution_context(
                                                     run_id,
                                                     &stage_id,
@@ -4703,119 +5540,200 @@ impl BackgroundExecutor {
                                                     &repair_captured,
                                                 )
                                                 .await?;
-                                            if repair_validation.failure_class.is_none() {
-                                                merge_contract_repair_result(
-                                                    &mut result,
-                                                    repair_result,
-                                                );
-                                                declared_output_settlement =
-                                                    Some(repair_settlement);
-                                                info!(
-                                                    run_id = %run_id,
-                                                    stage_id = %stage_id,
-                                                    agent_id = %agent_id,
-                                                    agent_execution_id = %agent_exec_id,
-                                                    session_generation_id = %session_generation_id,
-                                                    repair_found_count,
-                                                    repair_missing_count,
-                                                    repair_stale_count,
-                                                    repair_rejected_count,
-                                                    "Output contract repair turn produced valid declared outputs"
-                                                );
-                                                self.record_output_contract_repair_event(
-                                                    policy_decision.as_ref(),
-                                                    domain::session::SessionEventType::OutputContractRepairSucceeded,
-                                                    serde_json::json!({
-                                                        "agent_execution_id": agent_exec_id.to_string(),
-                                                        "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
-                                                        "repair_found_count": repair_found_count,
-                                                        "repair_missing_count": repair_missing_count,
-                                                        "repair_stale_count": repair_stale_count,
-                                                        "repair_rejected_count": repair_rejected_count,
-                                                    }),
-                                                    run_id,
-                                                    &stage_id,
-                                                    &agent_id,
-                                                )
-                                                .await;
-                                            } else {
-                                                let repair_failed_outputs =
-                                                    failed_output_validation_details(
-                                                        &repair_validation,
+                                                    if repair_validation.failure_class.is_none() {
+                                                        if p088_completion_eligible {
+                                                            p088_completion_turn_result =
+                                                                Some("succeeded".to_string());
+                                                        }
+                                                        merge_contract_repair_result(
+                                                            &mut result,
+                                                            repair_result,
+                                                        );
+                                                        declared_output_settlement =
+                                                            Some(repair_settlement);
+                                                        info!(
+                                                            run_id = %run_id,
+                                                            stage_id = %stage_id,
+                                                            agent_id = %agent_id,
+                                                            agent_execution_id = %agent_exec_id,
+                                                            session_generation_id = %session_generation_id,
+                                                            repair_found_count,
+                                                            repair_missing_count,
+                                                            repair_stale_count,
+                                                            repair_rejected_count,
+                                                            "Output contract repair turn produced valid declared outputs"
+                                                        );
+                                                        self.record_output_contract_repair_event(
+                                                        policy_decision.as_ref(),
+                                                        domain::session::SessionEventType::OutputContractRepairSucceeded,
+                                                        serde_json::json!({
+                                                            "agent_execution_id": agent_exec_id.to_string(),
+                                                            "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                                            "repair_found_count": repair_found_count,
+                                                            "repair_missing_count": repair_missing_count,
+                                                            "repair_stale_count": repair_stale_count,
+                                                            "repair_rejected_count": repair_rejected_count,
+                                                        }),
+                                                        run_id,
+                                                        &stage_id,
+                                                        &agent_id,
+                                                    )
+                                                    .await;
+                                                        if p088_completion_eligible {
+                                                            self.record_code_writer_completion_event(
+                                                            policy_decision.as_ref(),
+                                                            domain::session::SessionEventType::CodeWriterCompletionSucceeded,
+                                                            serde_json::json!({
+                                                                "agent_execution_id": agent_exec_id.to_string(),
+                                                                "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                                                "repair_turn_count": output_contract_repair_turn_count,
+                                                                "result": "succeeded",
+                                                                "repair_found_count": repair_found_count,
+                                                                "repair_missing_count": repair_missing_count,
+                                                                "repair_stale_count": repair_stale_count,
+                                                                "repair_rejected_count": repair_rejected_count,
+                                                            }),
+                                                            run_id,
+                                                            &stage_id,
+                                                            &agent_id,
+                                                        )
+                                                        .await;
+                                                        }
+                                                    } else {
+                                                        if p088_completion_eligible {
+                                                            p088_completion_turn_result = Some(
+                                                                "failed_missing_outputs"
+                                                                    .to_string(),
+                                                            );
+                                                        }
+                                                        let repair_failed_outputs =
+                                                            failed_output_validation_details(
+                                                                &repair_validation,
+                                                            );
+                                                        warn!(
+                                                            run_id = %run_id,
+                                                            stage_id = %stage_id,
+                                                            agent_id = %agent_id,
+                                                            agent_execution_id = %agent_exec_id,
+                                                            session_generation_id = %session_generation_id,
+                                                            repair_found_count,
+                                                            repair_missing_count,
+                                                            repair_stale_count,
+                                                            repair_rejected_count,
+                                                            failed_output_count = repair_failed_outputs.len(),
+                                                            failure = ?repair_validation.failure_summary,
+                                                            "Output contract repair turn did not produce valid declared outputs"
+                                                        );
+                                                        self.record_output_contract_repair_event(
+                                                        policy_decision.as_ref(),
+                                                        domain::session::SessionEventType::OutputContractRepairFailed,
+                                                        serde_json::json!({
+                                                            "agent_execution_id": agent_exec_id.to_string(),
+                                                            "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                                            "failure_kind": "validation_failed",
+                                                            "failure_summary": repair_validation.failure_summary,
+                                                            "repair_found_count": repair_found_count,
+                                                            "repair_missing_count": repair_missing_count,
+                                                            "repair_stale_count": repair_stale_count,
+                                                            "repair_rejected_count": repair_rejected_count,
+                                                            "failed_outputs": repair_failed_outputs,
+                                                        }),
+                                                        run_id,
+                                                        &stage_id,
+                                                        &agent_id,
+                                                    )
+                                                    .await;
+                                                        if p088_completion_eligible {
+                                                            self.record_code_writer_completion_event(
+                                                            policy_decision.as_ref(),
+                                                            domain::session::SessionEventType::CodeWriterCompletionFailed,
+                                                            serde_json::json!({
+                                                                "agent_execution_id": agent_exec_id.to_string(),
+                                                                "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                                                "repair_turn_count": output_contract_repair_turn_count,
+                                                                "result": "failed_missing_outputs",
+                                                                "failure_kind": "validation_failed",
+                                                                "failure_summary": repair_validation.failure_summary,
+                                                                "repair_found_count": repair_found_count,
+                                                                "repair_missing_count": repair_missing_count,
+                                                                "repair_stale_count": repair_stale_count,
+                                                                "repair_rejected_count": repair_rejected_count,
+                                                                "failed_outputs": repair_failed_outputs,
+                                                            }),
+                                                            run_id,
+                                                            &stage_id,
+                                                            &agent_id,
+                                                        )
+                                                        .await;
+                                                        }
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    if p088_completion_eligible {
+                                                        p088_completion_turn_result = Some(
+                                                            "failed_missing_outputs".to_string(),
+                                                        );
+                                                    }
+                                                    warn!(
+                                                        run_id = %run_id,
+                                                        stage_id = %stage_id,
+                                                        agent_id = %agent_id,
+                                                        agent_execution_id = %agent_exec_id,
+                                                        session_generation_id = %session_generation_id,
+                                                        error = %error,
+                                                        "Output contract repair settlement failed"
                                                     );
-                                                warn!(
-                                                    run_id = %run_id,
-                                                    stage_id = %stage_id,
-                                                    agent_id = %agent_id,
-                                                    agent_execution_id = %agent_exec_id,
-                                                    session_generation_id = %session_generation_id,
-                                                    repair_found_count,
-                                                    repair_missing_count,
-                                                    repair_stale_count,
-                                                    repair_rejected_count,
-                                                    failed_output_count = repair_failed_outputs.len(),
-                                                    failure = ?repair_validation.failure_summary,
-                                                    "Output contract repair turn did not produce valid declared outputs"
-                                                );
-                                                self.record_output_contract_repair_event(
+                                                    self.record_output_contract_repair_event(
                                                     policy_decision.as_ref(),
                                                     domain::session::SessionEventType::OutputContractRepairFailed,
                                                     serde_json::json!({
                                                         "agent_execution_id": agent_exec_id.to_string(),
                                                         "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
-                                                        "failure_kind": "validation_failed",
-                                                        "failure_summary": repair_validation.failure_summary,
-                                                        "repair_found_count": repair_found_count,
-                                                        "repair_missing_count": repair_missing_count,
-                                                        "repair_stale_count": repair_stale_count,
-                                                        "repair_rejected_count": repair_rejected_count,
-                                                        "failed_outputs": repair_failed_outputs,
+                                                        "failure_kind": "settlement_failed",
+                                                        "error": error.to_string(),
                                                     }),
                                                     run_id,
                                                     &stage_id,
                                                     &agent_id,
                                                 )
                                                 .await;
+                                                    if p088_completion_eligible {
+                                                        self.record_code_writer_completion_event(
+                                                        policy_decision.as_ref(),
+                                                        domain::session::SessionEventType::CodeWriterCompletionFailed,
+                                                        serde_json::json!({
+                                                            "agent_execution_id": agent_exec_id.to_string(),
+                                                            "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                                            "repair_turn_count": output_contract_repair_turn_count,
+                                                            "result": "failed_missing_outputs",
+                                                            "failure_kind": "settlement_failed",
+                                                            "error": error.to_string(),
+                                                        }),
+                                                        run_id,
+                                                        &stage_id,
+                                                        &agent_id,
+                                                    )
+                                                    .await;
+                                                    }
+                                                }
                                             }
                                         }
-                                        Err(error) => {
-                                            warn!(
-                                                run_id = %run_id,
-                                                stage_id = %stage_id,
-                                                agent_id = %agent_id,
-                                                agent_execution_id = %agent_exec_id,
-                                                session_generation_id = %session_generation_id,
-                                                error = %error,
-                                                "Output contract repair settlement failed"
-                                            );
-                                            self.record_output_contract_repair_event(
-                                                policy_decision.as_ref(),
-                                                domain::session::SessionEventType::OutputContractRepairFailed,
-                                                serde_json::json!({
-                                                    "agent_execution_id": agent_exec_id.to_string(),
-                                                    "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
-                                                    "failure_kind": "settlement_failed",
-                                                    "error": error.to_string(),
-                                                }),
-                                                run_id,
-                                                &stage_id,
-                                                &agent_id,
-                                            )
-                                            .await;
-                                        }
                                     }
-                                }
-                                Err(error) => {
-                                    warn!(
-                                        run_id = %run_id,
-                                        stage_id = %stage_id,
-                                        agent_id = %agent_id,
-                                        agent_execution_id = %agent_exec_id,
-                                        session_generation_id = %session_generation_id,
-                                        error = %error,
-                                        "Output contract repair turn failed"
-                                    );
-                                    self.record_output_contract_repair_event(
+                                    Err(error) => {
+                                        if p088_completion_eligible {
+                                            p088_completion_turn_result =
+                                                Some("failed_missing_outputs".to_string());
+                                        }
+                                        warn!(
+                                            run_id = %run_id,
+                                            stage_id = %stage_id,
+                                            agent_id = %agent_id,
+                                            agent_execution_id = %agent_exec_id,
+                                            session_generation_id = %session_generation_id,
+                                            error = %error,
+                                            "Output contract repair turn failed"
+                                        );
+                                        self.record_output_contract_repair_event(
                                         policy_decision.as_ref(),
                                         domain::session::SessionEventType::OutputContractRepairFailed,
                                         serde_json::json!({
@@ -4829,9 +5747,32 @@ impl BackgroundExecutor {
                                         &agent_id,
                                     )
                                     .await;
+                                        if p088_completion_eligible {
+                                            self.record_code_writer_completion_event(
+                                            policy_decision.as_ref(),
+                                            domain::session::SessionEventType::CodeWriterCompletionFailed,
+                                            serde_json::json!({
+                                                "agent_execution_id": agent_exec_id.to_string(),
+                                                "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                                "repair_turn_count": output_contract_repair_turn_count,
+                                                "result": "failed_missing_outputs",
+                                                "failure_kind": "prompt_failed",
+                                                "error": error.to_string(),
+                                            }),
+                                            run_id,
+                                            &stage_id,
+                                            &agent_id,
+                                        )
+                                        .await;
+                                        }
+                                    }
                                 }
                             }
                         } else {
+                            if p088_code_writer_completion_candidate {
+                                p088_completion_turn_result =
+                                    Some("skipped_no_live_session".to_string());
+                            }
                             warn!(
                                 run_id = %run_id,
                                 stage_id = %stage_id,
@@ -5268,8 +6209,8 @@ impl BackgroundExecutor {
                     )
                     .await?;
                 let _transcript_exists = transcript_artifact.is_some();
-                if let Some(artifact) = transcript_artifact {
-                    persisted_artifacts.push(artifact);
+                if let Some(artifact) = transcript_artifact.as_ref() {
+                    persisted_artifacts.push(artifact.clone());
                 }
                 let mut declared_artifacts = self.prepare_declared_output_artifacts(
                     &declared_outputs,
@@ -5429,6 +6370,7 @@ impl BackgroundExecutor {
                             result.transcript_text.as_deref(),
                         ),
                         result.close_diagnostic.as_ref(),
+                        result.runtime_receipt.as_ref(),
                         discovery_diagnostics.as_ref(),
                         &stage_degraded_output_policy,
                         validation_summary_override,
@@ -5438,6 +6380,50 @@ impl BackgroundExecutor {
                 let validation_summary = import_result.validation_summary;
                 let final_agent_status = import_result.final_agent_status;
                 let _degraded_outputs_satisfy_stage = import_result.degraded_outputs_satisfy_stage;
+
+                if p088_code_writer_completion_candidate {
+                    if let Err(error) = persist_p088_code_writer_completion_receipt(
+                        &self.pool,
+                        &run.artifact_root,
+                        run_id,
+                        stage_execution_id,
+                        agent_exec_id,
+                        result.session_generation_id.as_deref(),
+                        &provider,
+                        model.as_deref(),
+                        &p088_pre_original_fingerprint,
+                        &p088_post_original_fingerprint,
+                        p088_pre_original_fingerprint_path.as_deref(),
+                        p088_post_original_fingerprint_path.as_deref(),
+                        declared_output_settlement.as_ref(),
+                        validation_summary.as_ref(),
+                        &result.completion_text_capture,
+                        p088_completion_repair_text_capture.as_ref(),
+                        result.runtime_receipt.as_ref(),
+                        p088_completion_repair_runtime_receipt.as_ref(),
+                        p088_completion_repair_runtime_prompt_receipt.as_ref(),
+                        p088_completion_turn_attempted,
+                        output_contract_repair_turn_count,
+                        p088_operator_retry_completion_recovery,
+                        p088_completion_turn_result.as_deref(),
+                        result.transcript_text.as_deref(),
+                        transcript_artifact
+                            .as_ref()
+                            .map(|artifact| artifact.file_path.as_str()),
+                        completed_at,
+                    )
+                    .await
+                    {
+                        warn!(
+                            run_id = %run_id,
+                            stage_id = %stage_id,
+                            agent_id = %agent_id,
+                            agent_execution_id = %agent_exec_id,
+                            error = %error,
+                            "Failed to persist P088 code writer completion receipt"
+                        );
+                    }
+                }
 
                 if let Some(summary) = validation_summary {
                     if summary.failure_class.is_some() {
@@ -5607,6 +6593,17 @@ impl BackgroundExecutor {
             }
 
             WorkItemKind::StartupRepair => {
+                let coordinator = DurableEffectCoordinator::new(
+                    self.pool.clone(),
+                    format!("startup-repair-{}", uuid::Uuid::new_v4()),
+                );
+                let transitioned = coordinator.watchdog_pass().await?;
+                if transitioned > 0 {
+                    warn!(
+                        transitioned,
+                        "P078 startup repair moved expired side effects to needs_reconciliation"
+                    );
+                }
                 let recovery = RecoveryService::new_with_db_writer(
                     self.pool.clone(),
                     self.work_queue.clone(),
@@ -5618,12 +6615,14 @@ impl BackgroundExecutor {
 
             WorkItemKind::TriggerNextStage => {
                 let run_id = self.extract_run_id(&item)?;
+                run_unresolved_effects_preflight(&self.pool, &run_id, "trigger_next_stage").await?;
                 self.orchestrator.advance_run(run_id).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
             }
 
             WorkItemKind::SettleStage => {
                 let run_id = self.extract_run_id(&item)?;
+                run_unresolved_effects_preflight(&self.pool, &run_id, "settle_stage").await?;
                 self.orchestrator.advance_run(run_id).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
             }
@@ -5697,7 +6696,23 @@ impl BackgroundExecutor {
         _worktree_strategy: Option<String>,
         _payload: serde_json::Value,
     ) -> Result<()> {
-        let mut delivery_config = self.load_delivery_configuration(&run).await?;
+        let now = chrono::Utc::now();
+        let mut delivery_config = match self.load_delivery_configuration(&run).await {
+            Ok(config) => config,
+            Err(error) => {
+                self.fail_release_agent_precondition(
+                    run_id,
+                    stage_execution_id,
+                    agent_exec_id,
+                    &stage_id,
+                    &agent_id,
+                    &provider,
+                    now,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         if let Some(run_target_branch) = run
             .target_branch
             .as_deref()
@@ -5714,14 +6729,51 @@ impl BackgroundExecutor {
             }
             delivery_config.target_branch = run_target_branch.to_string();
         }
-        let worktree_root = run.worktree_root.clone().ok_or_else(|| {
-            anyhow::anyhow!("Release agent requires a provisioned worktree but none is available.")
-        })?;
+        let worktree_root = match run.worktree_root.clone() {
+            Some(root) => root,
+            None => {
+                let error = anyhow::anyhow!(
+                    "Release agent requires a provisioned worktree but none is available."
+                );
+                self.fail_release_agent_precondition(
+                    run_id,
+                    stage_execution_id,
+                    agent_exec_id,
+                    &stage_id,
+                    &agent_id,
+                    &provider,
+                    now,
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         let idea_title = ideas::find_by_id(&self.pool, run.idea_id)
             .await?
             .map(|idea| idea.title)
             .unwrap_or_else(|| "Unknown".to_string());
-        let now = chrono::Utc::now();
+
+        // P078: refuse external writes when the durable side-effects ledger is disabled
+        if !side_effects_enabled() {
+            let error = anyhow::anyhow!(
+                "release agent {} blocked: CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED is not set \
+                 (rollback mode — enable P078 before dispatching release agents)",
+                agent_id
+            );
+            self.fail_release_agent_precondition(
+                run_id,
+                stage_execution_id,
+                agent_exec_id,
+                &stage_id,
+                &agent_id,
+                &provider,
+                now,
+            )
+            .await?;
+            return Err(error);
+        }
+        let coordinator =
+            DurableEffectCoordinator::new(self.pool.clone(), uuid::Uuid::new_v4().to_string());
 
         let runtime_started = domain::events::DomainEvent::RuntimeStatusChanged {
             run_id,
@@ -5735,82 +6787,160 @@ impl BackgroundExecutor {
         if agent_id == "commit_and_push_to_github" {
             let commit_message = format!("[{}] {} :: {}", run_id, idea_title, stage_id);
             let git_service = GitReleaseService;
-            match git_service
-                .commit_and_push(
-                    &worktree_root,
-                    &delivery_config.target_branch,
-                    &commit_message,
+            let commit_target_key = format!("git_commit://{}:{}", run_id, stage_execution_id);
+            let commit_idempotency_key = derive_p078_idempotency_key(
+                "git_commit",
+                run_id,
+                stage_execution_id,
+                Some(agent_exec_id),
+                &commit_target_key,
+                1,
+            );
+            let commit_request_fingerprint = derive_p078_request_fingerprint(
+                "git_commit",
+                &[
+                    ("target_branch", delivery_config.target_branch.as_str()),
+                    ("commit_message", commit_message.as_str()),
+                    ("worktree_root", worktree_root.as_str()),
+                ],
+            );
+            let commit_evidence_root = self.p078_side_effect_evidence_root(
+                &run,
+                stage_execution_id,
+                &agent_id,
+                &EffectKind::GitCommit,
+                &commit_idempotency_key,
+            )?;
+            let commit_expected_evidence_json = self.p078_expected_evidence_json(
+                &EffectKind::GitCommit,
+                &commit_target_key,
+                &commit_evidence_root,
+            )?;
+            let commit_intent = PrepareEffectIntent {
+                run_id,
+                stage_execution_id,
+                agent_execution_id: Some(agent_exec_id),
+                effect_kind: EffectKind::GitCommit,
+                target_key: commit_target_key,
+                idempotency_key: commit_idempotency_key,
+                idempotency_key_version: 1,
+                request_fingerprint: commit_request_fingerprint,
+                request_fingerprint_version: 1,
+                expected_evidence_json: Some(commit_expected_evidence_json),
+                evidence_root: Some(commit_evidence_root.clone()),
+                deadline_at: Some(
+                    chrono::Utc::now()
+                        + chrono::Duration::seconds(EffectKind::GitCommit.deadline_seconds()),
+                ),
+            };
+            let mut commit_lease = coordinator.prepare_and_lease(commit_intent).await?;
+            if !coordinator.mark_write_started(&commit_lease).await? {
+                return Err(anyhow::anyhow!(
+                    "side_effect_cas_lost: mark_write_started CAS missed for effect {}; release adapter not invoked",
+                    commit_lease.effect_id
+                ));
+            }
+
+            let commit_manifest = match coordinator
+                .run_with_lease_renewal(
+                    &mut commit_lease,
+                    &EffectKind::GitCommit,
+                    git_service.commit_changes(
+                        &worktree_root,
+                        &delivery_config.target_branch,
+                        &commit_message,
+                    ),
                 )
                 .await
             {
-                Ok((manifest, receipt)) => {
-                    let _manifest_path = self
-                        .persist_json_artifact(
+                Ok(manifest) => {
+                    let manifest_artifact = self.prepare_release_json_artifact(
+                        &run,
+                        &stage_id,
+                        &agent_id,
+                        &provider,
+                        model.clone(),
+                        "release_manifest",
+                        &manifest,
+                    )?;
+                    let manifest_artifact_id = manifest_artifact.id.to_string();
+                    let manifest_path = manifest_artifact.file_path.clone();
+                    let evidence_summary = self
+                        .write_p078_side_effect_evidence_manifest(
                             &run,
+                            stage_execution_id,
                             &stage_id,
                             &agent_id,
-                            &provider,
-                            model.clone(),
-                            "release_manifest",
-                            &manifest,
+                            &commit_evidence_root,
+                            &EffectKind::GitCommit,
+                            &manifest_path,
+                            "settled",
                         )
                         .await?;
-                    let _receipt_path = self
-                        .persist_json_artifact(
-                            &run,
-                            &stage_id,
-                            &agent_id,
-                            &provider,
-                            model.clone(),
-                            "git_push_receipt",
-                            &receipt,
+                    let mut tx = self
+                        .begin_executor_transaction(
+                            "executor.release_git_commit_success",
+                            format!(
+                                "executor.release_git_commit_success:{}:{}",
+                                stage_execution_id, commit_lease.effect_id
+                            ),
                         )
                         .await?;
+                    artifacts::insert_tx(&mut tx, &manifest_artifact).await?;
+                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                        effect_id: &commit_lease.effect_id,
+                        owner_instance_id: &commit_lease.owner_instance_id,
+                        settlement_attempt_id: &commit_lease.attempt_id,
+                        observed_lease_renewed_at: commit_lease.lease_renewed_at,
+                        new_status: domain::side_effect::SideEffectStatus::Settled,
+                        observed_evidence_summary_json: Some(evidence_summary.as_str()),
+                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
+                        last_error_kind: None,
+                        last_error: None,
+                        now: chrono::Utc::now(),
+                        settlement_source: "executor",
+                        receipt_artifact_id: Some(manifest_artifact_id.as_str()),
+                        decision_json: None,
+                        decision_json_hash: None,
+                        disposition_id: None,
+                    };
+                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?
+                    {
+                        return Err(anyhow::anyhow!(
+                            "side_effect_cas_lost: settle_success CAS missed for effect {}; canonical release state not mutated",
+                            commit_lease.effect_id
+                        ));
+                    }
+                    tx.commit().await?;
                     let _ = self
                         .events
-                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                        .send(domain::events::DomainEvent::ArtifactCreated {
                             run_id,
-                            stage_id: stage_id.clone(),
-                            agent_id: agent_id.clone(),
-                            provider: provider.clone(),
-                            event_kind: "session_completed".to_string(),
+                            artifact_id: manifest_artifact.id,
                         });
-                    agent_executions::update_completed(
-                        &self.pool,
-                        agent_exec_id,
-                        AgentStatus::Completed,
-                        now,
-                    )
-                    .await?;
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
-                    self.work_queue
-                        .enqueue(
-                            WorkItemKind::AdvanceRun,
-                            Some(run_id),
-                            None,
-                            serde_json::json!({ "run_id": run_id.to_string() }),
-                        )
-                        .await?;
                     info!(
                         run_id = %run_id,
                         stage_id = %stage_id,
-                        status = "completed",
-                        "Release agent completed"
+                        artifact_path = %manifest_path,
+                        "Release git_commit step completed"
                     );
-                    return Ok(());
+                    manifest
                 }
                 Err(error) => {
+                    let error_str = sanitize_release_error(&error.to_string());
                     let release_result = ReleaseResult {
                         git_manifest: None,
                         git_receipt: None,
                         bundle_manifest: None,
                         upload_receipt: None,
                         succeeded: false,
-                        failure_stage: Some("commit_and_push".to_string()),
-                        failure_reason: Some(error.to_string()),
+                        failure_stage: Some("git_commit".to_string()),
+                        failure_reason: Some(error_str.clone()),
                     };
-                    if let Some(receipt_path) = self
-                        .persist_delivery_receipt_if_absent(
+                    let delivery_artifact = self
+                        .prepare_delivery_receipt_artifact_if_absent(
                             &run,
                             &delivery_config,
                             &release_result,
@@ -5820,9 +6950,316 @@ impl BackgroundExecutor {
                             &provider,
                             model.clone(),
                         )
+                        .await?;
+                    let mut tx = self
+                        .begin_executor_transaction(
+                            "executor.release_git_commit_failure",
+                            format!(
+                                "executor.release_git_commit_failure:{}:{}",
+                                stage_execution_id, commit_lease.effect_id
+                            ),
+                        )
+                        .await?;
+                    if let Some(artifact) = delivery_artifact.as_ref() {
+                        artifacts::insert_tx(&mut tx, artifact).await?;
+                    }
+                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                        effect_id: &commit_lease.effect_id,
+                        owner_instance_id: &commit_lease.owner_instance_id,
+                        attempt_id: &commit_lease.attempt_id,
+                        observed_lease_renewed_at: commit_lease.lease_renewed_at,
+                        last_error_kind: "git_commit_failed",
+                        last_error: &error_str,
+                        now: chrono::Utc::now(),
+                    };
+                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                    {
+                        return Err(anyhow::anyhow!(
+                            "side_effect_cas_lost: settle_failure CAS missed for effect {}; canonical release state not mutated",
+                            commit_lease.effect_id
+                        ));
+                    }
+                    agent_executions::update_completed_tx(
+                        &mut tx,
+                        agent_exec_id,
+                        AgentStatus::Failed,
+                        now,
+                    )
+                    .await?;
+                    stages::settle_tx(
+                        &mut tx,
+                        stage_execution_id,
+                        domain::stage::StageSettlementKind::Failed,
+                        now,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    if let Some(artifact) = delivery_artifact {
+                        let _ = self
+                            .events
+                            .send(domain::events::DomainEvent::ArtifactCreated {
+                                run_id,
+                                artifact_id: artifact.id,
+                            });
+                        info!(run_id = %run_id, receipt_path = %artifact.file_path, "delivery receipt persisted");
+                    }
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                            run_id,
+                            stage_id: stage_id.clone(),
+                            agent_id: agent_id.clone(),
+                            provider: provider.clone(),
+                            event_kind: "session_failed".to_string(),
+                        });
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::StageStatusChanged {
+                            run_id,
+                            stage_execution_id,
+                            status: domain::stage::StageStatus::Failed,
+                        });
+                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        error = %error,
+                        "Release git_commit step failed"
+                    );
+                    return Err(error);
+                }
+            };
+
+            let push_target_key = format!("refs/heads/{}", delivery_config.target_branch);
+            let push_idempotency_key = derive_p078_idempotency_key(
+                "git_push",
+                run_id,
+                stage_execution_id,
+                Some(agent_exec_id),
+                &push_target_key,
+                1,
+            );
+            let push_request_fingerprint = derive_p078_request_fingerprint(
+                "git_push",
+                &[
+                    ("target_branch", delivery_config.target_branch.as_str()),
+                    ("commit_sha", commit_manifest.commit_sha.as_str()),
+                    ("worktree_root", worktree_root.as_str()),
+                ],
+            );
+            let push_evidence_root = self.p078_side_effect_evidence_root(
+                &run,
+                stage_execution_id,
+                &agent_id,
+                &EffectKind::GitPush,
+                &push_idempotency_key,
+            )?;
+            let push_expected_evidence_json = self.p078_expected_evidence_json(
+                &EffectKind::GitPush,
+                &push_target_key,
+                &push_evidence_root,
+            )?;
+            let push_intent = PrepareEffectIntent {
+                run_id,
+                stage_execution_id,
+                agent_execution_id: Some(agent_exec_id),
+                effect_kind: EffectKind::GitPush,
+                target_key: push_target_key,
+                idempotency_key: push_idempotency_key,
+                idempotency_key_version: 1,
+                request_fingerprint: push_request_fingerprint,
+                request_fingerprint_version: 1,
+                expected_evidence_json: Some(push_expected_evidence_json),
+                evidence_root: Some(push_evidence_root.clone()),
+                deadline_at: Some(
+                    chrono::Utc::now()
+                        + chrono::Duration::seconds(EffectKind::GitPush.deadline_seconds()),
+                ),
+            };
+            let mut push_lease = coordinator.prepare_and_lease(push_intent).await?;
+            if !coordinator.mark_write_started(&push_lease).await? {
+                return Err(anyhow::anyhow!(
+                    "side_effect_cas_lost: mark_write_started CAS missed for effect {}; release adapter not invoked",
+                    push_lease.effect_id
+                ));
+            }
+
+            match coordinator
+                .run_with_lease_renewal(
+                    &mut push_lease,
+                    &EffectKind::GitPush,
+                    git_service.push_commit(&worktree_root, &delivery_config.target_branch),
+                )
+                .await
+            {
+                Ok(receipt) => {
+                    let receipt_artifact = self.prepare_release_json_artifact(
+                        &run,
+                        &stage_id,
+                        &agent_id,
+                        &provider,
+                        model.clone(),
+                        "git_push_receipt",
+                        &receipt,
+                    )?;
+                    let receipt_path = receipt_artifact.file_path.clone();
+                    let receipt_artifact_id = receipt_artifact.id.to_string();
+                    let evidence_summary = self
+                        .write_p078_side_effect_evidence_manifest(
+                            &run,
+                            stage_execution_id,
+                            &stage_id,
+                            &agent_id,
+                            &push_evidence_root,
+                            &EffectKind::GitPush,
+                            &receipt_path,
+                            "settled",
+                        )
+                        .await?;
+                    let advance_run = self.build_advance_run_work_item(run_id)?;
+                    let mut tx = self
+                        .begin_executor_transaction(
+                            "executor.release_git_push_success",
+                            format!(
+                                "executor.release_git_push_success:{}:{}",
+                                stage_execution_id, push_lease.effect_id
+                            ),
+                        )
+                        .await?;
+                    artifacts::insert_tx(&mut tx, &receipt_artifact).await?;
+                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                        effect_id: &push_lease.effect_id,
+                        owner_instance_id: &push_lease.owner_instance_id,
+                        settlement_attempt_id: &push_lease.attempt_id,
+                        observed_lease_renewed_at: push_lease.lease_renewed_at,
+                        new_status: domain::side_effect::SideEffectStatus::Settled,
+                        observed_evidence_summary_json: Some(evidence_summary.as_str()),
+                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
+                        last_error_kind: None,
+                        last_error: None,
+                        now,
+                        settlement_source: "executor",
+                        receipt_artifact_id: Some(receipt_artifact_id.as_str()),
+                        decision_json: None,
+                        decision_json_hash: None,
+                        disposition_id: None,
+                    };
+                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
                         .await?
                     {
-                        info!(run_id = %run_id, receipt_path = %receipt_path, "delivery receipt persisted");
+                        return Err(anyhow::anyhow!(
+                            "side_effect_cas_lost: settle_success CAS missed for effect {}; canonical release state not mutated",
+                            push_lease.effect_id
+                        ));
+                    }
+                    agent_executions::update_completed_tx(
+                        &mut tx,
+                        agent_exec_id,
+                        AgentStatus::Completed,
+                        now,
+                    )
+                    .await?;
+                    work_items::enqueue_tx(&mut tx, &advance_run).await?;
+                    tx.commit().await?;
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::ArtifactCreated {
+                            run_id,
+                            artifact_id: receipt_artifact.id,
+                        });
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                            run_id,
+                            stage_id: stage_id.clone(),
+                            agent_id: agent_id.clone(),
+                            provider: provider.clone(),
+                            event_kind: "session_completed".to_string(),
+                        });
+                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        receipt_path = %receipt_path,
+                        status = "completed",
+                        "Release git_push step completed"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    let error_str = sanitize_release_error(&error.to_string());
+                    let release_result = ReleaseResult {
+                        git_manifest: Some(commit_manifest),
+                        git_receipt: None,
+                        bundle_manifest: None,
+                        upload_receipt: None,
+                        succeeded: false,
+                        failure_stage: Some("git_push".to_string()),
+                        failure_reason: Some(error_str.clone()),
+                    };
+                    let delivery_artifact = self
+                        .prepare_delivery_receipt_artifact_if_absent(
+                            &run,
+                            &delivery_config,
+                            &release_result,
+                            &idea_title,
+                            None,
+                            &stage_id,
+                            &provider,
+                            model.clone(),
+                        )
+                        .await?;
+                    let mut tx = self
+                        .begin_executor_transaction(
+                            "executor.release_git_push_failure",
+                            format!(
+                                "executor.release_git_push_failure:{}:{}",
+                                stage_execution_id, push_lease.effect_id
+                            ),
+                        )
+                        .await?;
+                    if let Some(artifact) = delivery_artifact.as_ref() {
+                        artifacts::insert_tx(&mut tx, artifact).await?;
+                    }
+                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                        effect_id: &push_lease.effect_id,
+                        owner_instance_id: &push_lease.owner_instance_id,
+                        attempt_id: &push_lease.attempt_id,
+                        observed_lease_renewed_at: push_lease.lease_renewed_at,
+                        last_error_kind: "git_push_failed",
+                        last_error: &error_str,
+                        now,
+                    };
+                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                    {
+                        return Err(anyhow::anyhow!(
+                            "side_effect_cas_lost: settle_failure CAS missed for effect {}; canonical release state not mutated",
+                            push_lease.effect_id
+                        ));
+                    }
+                    agent_executions::update_completed_tx(
+                        &mut tx,
+                        agent_exec_id,
+                        AgentStatus::Failed,
+                        now,
+                    )
+                    .await?;
+                    stages::settle_tx(
+                        &mut tx,
+                        stage_execution_id,
+                        domain::stage::StageSettlementKind::Failed,
+                        now,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    if let Some(artifact) = delivery_artifact {
+                        let _ = self
+                            .events
+                            .send(domain::events::DomainEvent::ArtifactCreated {
+                                run_id,
+                                artifact_id: artifact.id,
+                            });
+                        info!(run_id = %run_id, receipt_path = %artifact.file_path, "delivery receipt persisted");
                     }
 
                     let _ = self
@@ -5834,15 +7271,6 @@ impl BackgroundExecutor {
                             provider: provider.clone(),
                             event_kind: "session_failed".to_string(),
                         });
-                    agent_executions::update_completed(
-                        &self.pool,
-                        agent_exec_id,
-                        AgentStatus::Failed,
-                        now,
-                    )
-                    .await?;
-                    let settlement_kind = domain::stage::StageSettlementKind::Failed;
-                    stages::settle(&self.pool, stage_execution_id, settlement_kind, now).await?;
                     let _ = self
                         .events
                         .send(domain::events::DomainEvent::StageStatusChanged {
@@ -5868,119 +7296,161 @@ impl BackgroundExecutor {
                 .load_release_artifact(run_id, "release_manifest")
                 .await?;
             let publish_service = ConnectPublishService;
-            match publish_service
-                .build_and_distribute(
-                    &worktree_root,
-                    &git_receipt,
-                    &release_manifest,
-                    &delivery_config,
+            let build_target_key = format!("build_archive://{}:{}", run_id, stage_execution_id);
+            let build_idempotency_key = derive_p078_idempotency_key(
+                "build_archive",
+                run_id,
+                stage_execution_id,
+                Some(agent_exec_id),
+                &build_target_key,
+                1,
+            );
+            let build_request_fingerprint = derive_p078_request_fingerprint(
+                "build_archive",
+                &[
+                    ("commit_sha", git_receipt.commit_sha.as_str()),
+                    ("worktree_root", worktree_root.as_str()),
+                    ("target_branch", delivery_config.target_branch.as_str()),
+                ],
+            );
+            let build_evidence_root = self.p078_side_effect_evidence_root(
+                &run,
+                stage_execution_id,
+                &agent_id,
+                &EffectKind::BuildArchive,
+                &build_idempotency_key,
+            )?;
+            let build_expected_evidence_json = self.p078_expected_evidence_json(
+                &EffectKind::BuildArchive,
+                &build_target_key,
+                &build_evidence_root,
+            )?;
+            let build_intent = PrepareEffectIntent {
+                run_id,
+                stage_execution_id,
+                agent_execution_id: Some(agent_exec_id),
+                effect_kind: EffectKind::BuildArchive,
+                target_key: build_target_key,
+                idempotency_key: build_idempotency_key,
+                idempotency_key_version: 1,
+                request_fingerprint: build_request_fingerprint,
+                request_fingerprint_version: 1,
+                expected_evidence_json: Some(build_expected_evidence_json),
+                evidence_root: Some(build_evidence_root.clone()),
+                deadline_at: Some(
+                    chrono::Utc::now()
+                        + chrono::Duration::seconds(EffectKind::BuildArchive.deadline_seconds()),
+                ),
+            };
+            let mut build_lease = coordinator.prepare_and_lease(build_intent).await?;
+            if !coordinator.mark_write_started(&build_lease).await? {
+                return Err(anyhow::anyhow!(
+                    "side_effect_cas_lost: mark_write_started CAS missed for effect {}; release adapter not invoked",
+                    build_lease.effect_id
+                ));
+            }
+
+            let bundle_manifest = match coordinator
+                .run_with_lease_renewal(
+                    &mut build_lease,
+                    &EffectKind::BuildArchive,
+                    publish_service.build_archive(
+                        &worktree_root,
+                        &git_receipt,
+                        &release_manifest,
+                        &delivery_config,
+                    ),
                 )
                 .await
             {
-                Ok((bundle_manifest, upload_receipt)) => {
-                    let bundle_path = self
-                        .persist_json_artifact(
+                Ok(bundle_manifest) => {
+                    let bundle_artifact = self.prepare_release_json_artifact(
+                        &run,
+                        &stage_id,
+                        &agent_id,
+                        &provider,
+                        model.clone(),
+                        "release_bundle_manifest",
+                        &bundle_manifest,
+                    )?;
+                    let bundle_artifact_id = bundle_artifact.id.to_string();
+                    let bundle_path = bundle_artifact.file_path.clone();
+                    let evidence_summary = self
+                        .write_p078_side_effect_evidence_manifest(
                             &run,
-                            &stage_id,
-                            &agent_id,
-                            &provider,
-                            model.clone(),
-                            "release_bundle_manifest",
-                            &bundle_manifest,
-                        )
-                        .await?;
-                    let upload_path = self
-                        .persist_json_artifact(
-                            &run,
-                            &stage_id,
-                            &agent_id,
-                            &provider,
-                            model.clone(),
-                            "connect_upload_receipt",
-                            &upload_receipt,
-                        )
-                        .await?;
-                    let release_result = ReleaseResult {
-                        git_manifest: Some(release_manifest),
-                        git_receipt: Some(git_receipt),
-                        bundle_manifest: Some(bundle_manifest),
-                        upload_receipt: Some(upload_receipt),
-                        succeeded: true,
-                        failure_stage: None,
-                        failure_reason: None,
-                    };
-                    let _ = self
-                        .persist_delivery_receipt_if_absent(
-                            &run,
-                            &delivery_config,
-                            &release_result,
-                            &idea_title,
-                            None,
-                            &stage_id,
-                            &provider,
-                            model.clone(),
-                        )
-                        .await?;
-                    let _ = self
-                        .events
-                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
-                            run_id,
-                            stage_id: stage_id.clone(),
-                            agent_id: agent_id.clone(),
-                            provider: provider.clone(),
-                            event_kind: "session_completed".to_string(),
-                        });
-                    agent_executions::update_completed(
-                        &self.pool,
-                        agent_exec_id,
-                        AgentStatus::Completed,
-                        now,
-                    )
-                    .await?;
-                    stages::settle(
-                        &self.pool,
-                        stage_execution_id,
-                        domain::stage::StageSettlementKind::Completed,
-                        now,
-                    )
-                    .await?;
-                    let _ = self
-                        .events
-                        .send(domain::events::DomainEvent::StageStatusChanged {
-                            run_id,
                             stage_execution_id,
-                            status: domain::stage::StageStatus::Completed,
+                            &stage_id,
+                            &agent_id,
+                            &build_evidence_root,
+                            &EffectKind::BuildArchive,
+                            &bundle_path,
+                            "settled",
+                        )
+                        .await?;
+                    let mut tx = self
+                        .begin_executor_transaction(
+                            "executor.release_build_archive_success",
+                            format!(
+                                "executor.release_build_archive_success:{}:{}",
+                                stage_execution_id, build_lease.effect_id
+                            ),
+                        )
+                        .await?;
+                    artifacts::insert_tx(&mut tx, &bundle_artifact).await?;
+                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                        effect_id: &build_lease.effect_id,
+                        owner_instance_id: &build_lease.owner_instance_id,
+                        settlement_attempt_id: &build_lease.attempt_id,
+                        observed_lease_renewed_at: build_lease.lease_renewed_at,
+                        new_status: domain::side_effect::SideEffectStatus::Settled,
+                        observed_evidence_summary_json: Some(evidence_summary.as_str()),
+                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
+                        last_error_kind: None,
+                        last_error: None,
+                        now: chrono::Utc::now(),
+                        settlement_source: "executor",
+                        receipt_artifact_id: Some(bundle_artifact_id.as_str()),
+                        decision_json: None,
+                        decision_json_hash: None,
+                        disposition_id: None,
+                    };
+                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?
+                    {
+                        return Err(anyhow::anyhow!(
+                            "side_effect_cas_lost: settle_success CAS missed for effect {}; canonical release state not mutated",
+                            build_lease.effect_id
+                        ));
+                    }
+                    tx.commit().await?;
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::ArtifactCreated {
+                            run_id,
+                            artifact_id: bundle_artifact.id,
                         });
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
-                    self.work_queue
-                        .enqueue(
-                            WorkItemKind::AdvanceRun,
-                            Some(run_id),
-                            None,
-                            serde_json::json!({ "run_id": run_id.to_string() }),
-                        )
-                        .await?;
                     info!(
                         run_id = %run_id,
                         stage_id = %stage_id,
                         bundle_path = %bundle_path,
-                        upload_path = %upload_path,
-                        "Release publish step completed"
+                        "Release build_archive step completed"
                     );
-                    return Ok(());
+                    bundle_manifest
                 }
                 Err(error) => {
+                    let error_str = sanitize_release_error(&error.to_string());
                     let release_result = ReleaseResult {
-                        git_manifest: Some(release_manifest),
-                        git_receipt: Some(git_receipt),
+                        git_manifest: Some(release_manifest.clone()),
+                        git_receipt: Some(git_receipt.clone()),
                         bundle_manifest: None,
                         upload_receipt: None,
                         succeeded: false,
-                        failure_stage: Some("build_archive_and_push".to_string()),
-                        failure_reason: Some(error.to_string()),
+                        failure_stage: Some("build_archive".to_string()),
+                        failure_reason: Some(error_str.clone()),
                     };
-                    if let Some(receipt_path) = self
-                        .persist_delivery_receipt_if_absent(
+                    let delivery_artifact = self
+                        .prepare_delivery_receipt_artifact_if_absent(
                             &run,
                             &delivery_config,
                             &release_result,
@@ -5990,9 +7460,58 @@ impl BackgroundExecutor {
                             &provider,
                             model.clone(),
                         )
-                        .await?
+                        .await?;
+                    let mut tx = self
+                        .begin_executor_transaction(
+                            "executor.release_build_archive_failure",
+                            format!(
+                                "executor.release_build_archive_failure:{}:{}",
+                                stage_execution_id, build_lease.effect_id
+                            ),
+                        )
+                        .await?;
+                    if let Some(artifact) = delivery_artifact.as_ref() {
+                        artifacts::insert_tx(&mut tx, artifact).await?;
+                    }
+                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                        effect_id: &build_lease.effect_id,
+                        owner_instance_id: &build_lease.owner_instance_id,
+                        attempt_id: &build_lease.attempt_id,
+                        observed_lease_renewed_at: build_lease.lease_renewed_at,
+                        last_error_kind: "build_archive_failed",
+                        last_error: &error_str,
+                        now,
+                    };
+                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
                     {
-                        info!(run_id = %run_id, receipt_path = %receipt_path, "delivery receipt persisted");
+                        return Err(anyhow::anyhow!(
+                            "side_effect_cas_lost: settle_failure CAS missed for effect {}; canonical release state not mutated",
+                            build_lease.effect_id
+                        ));
+                    }
+                    agent_executions::update_completed_tx(
+                        &mut tx,
+                        agent_exec_id,
+                        AgentStatus::Failed,
+                        now,
+                    )
+                    .await?;
+                    stages::settle_tx(
+                        &mut tx,
+                        stage_execution_id,
+                        domain::stage::StageSettlementKind::Failed,
+                        now,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    if let Some(artifact) = delivery_artifact {
+                        let _ = self
+                            .events
+                            .send(domain::events::DomainEvent::ArtifactCreated {
+                                run_id,
+                                artifact_id: artifact.id,
+                            });
+                        info!(run_id = %run_id, receipt_path = %artifact.file_path, "delivery receipt persisted");
                     }
                     let _ = self
                         .events
@@ -6003,20 +7522,6 @@ impl BackgroundExecutor {
                             provider: provider.clone(),
                             event_kind: "session_failed".to_string(),
                         });
-                    agent_executions::update_completed(
-                        &self.pool,
-                        agent_exec_id,
-                        AgentStatus::Failed,
-                        now,
-                    )
-                    .await?;
-                    stages::settle(
-                        &self.pool,
-                        stage_execution_id,
-                        domain::stage::StageSettlementKind::Failed,
-                        now,
-                    )
-                    .await?;
                     let _ = self
                         .events
                         .send(domain::events::DomainEvent::StageStatusChanged {
@@ -6029,12 +7534,370 @@ impl BackgroundExecutor {
                         run_id = %run_id,
                         stage_id = %stage_id,
                         error = %error,
-                        "Release publish step failed"
+                        "Release build_archive step failed"
+                    );
+                    return Err(error);
+                }
+            };
+
+            let connect_target_key = format!(
+                "connect://{}:{}:{}",
+                delivery_config.release_mode.as_deref().unwrap_or(""),
+                delivery_config.release_target_id.as_deref().unwrap_or(""),
+                bundle_manifest.checksum_sha256
+            );
+            let connect_idempotency_key = derive_p078_idempotency_key(
+                "connect_upload",
+                run_id,
+                stage_execution_id,
+                Some(agent_exec_id),
+                &connect_target_key,
+                1,
+            );
+            let connect_request_fingerprint = derive_p078_request_fingerprint(
+                "connect_upload",
+                &[
+                    ("commit_sha", git_receipt.commit_sha.as_str()),
+                    ("bundle_checksum", bundle_manifest.checksum_sha256.as_str()),
+                    (
+                        "release_mode",
+                        delivery_config.release_mode.as_deref().unwrap_or(""),
+                    ),
+                    (
+                        "release_target_id",
+                        delivery_config.release_target_id.as_deref().unwrap_or(""),
+                    ),
+                ],
+            );
+            let connect_evidence_root = self.p078_side_effect_evidence_root(
+                &run,
+                stage_execution_id,
+                &agent_id,
+                &EffectKind::ConnectUpload,
+                &connect_idempotency_key,
+            )?;
+            let connect_expected_evidence_json = self.p078_expected_evidence_json(
+                &EffectKind::ConnectUpload,
+                &connect_target_key,
+                &connect_evidence_root,
+            )?;
+            let connect_intent = PrepareEffectIntent {
+                run_id,
+                stage_execution_id,
+                agent_execution_id: Some(agent_exec_id),
+                effect_kind: EffectKind::ConnectUpload,
+                target_key: connect_target_key,
+                idempotency_key: connect_idempotency_key,
+                idempotency_key_version: 1,
+                request_fingerprint: connect_request_fingerprint,
+                request_fingerprint_version: 1,
+                expected_evidence_json: Some(connect_expected_evidence_json),
+                evidence_root: Some(connect_evidence_root.clone()),
+                deadline_at: Some(
+                    chrono::Utc::now()
+                        + chrono::Duration::seconds(EffectKind::ConnectUpload.deadline_seconds()),
+                ),
+            };
+            let mut connect_lease = coordinator.prepare_and_lease(connect_intent).await?;
+            if !coordinator.mark_write_started(&connect_lease).await? {
+                return Err(anyhow::anyhow!(
+                    "side_effect_cas_lost: mark_write_started CAS missed for effect {}; release adapter not invoked",
+                    connect_lease.effect_id
+                ));
+            }
+
+            match coordinator
+                .run_with_lease_renewal(
+                    &mut connect_lease,
+                    &EffectKind::ConnectUpload,
+                    publish_service.upload_archive(
+                        &git_receipt,
+                        &bundle_manifest,
+                        &delivery_config,
+                    ),
+                )
+                .await
+            {
+                Ok(upload_receipt) => {
+                    let upload_artifact = self.prepare_release_json_artifact(
+                        &run,
+                        &stage_id,
+                        &agent_id,
+                        &provider,
+                        model.clone(),
+                        "connect_upload_receipt",
+                        &upload_receipt,
+                    )?;
+                    let release_result = ReleaseResult {
+                        git_manifest: Some(release_manifest),
+                        git_receipt: Some(git_receipt),
+                        bundle_manifest: Some(bundle_manifest),
+                        upload_receipt: Some(upload_receipt),
+                        succeeded: true,
+                        failure_stage: None,
+                        failure_reason: None,
+                    };
+                    let delivery_artifact = self
+                        .prepare_delivery_receipt_artifact_if_absent(
+                            &run,
+                            &delivery_config,
+                            &release_result,
+                            &idea_title,
+                            None,
+                            &stage_id,
+                            &provider,
+                            model.clone(),
+                        )
+                        .await?;
+                    let upload_path = upload_artifact.file_path.clone();
+                    let upload_artifact_id = upload_artifact.id.to_string();
+                    let evidence_summary = self
+                        .write_p078_side_effect_evidence_manifest(
+                            &run,
+                            stage_execution_id,
+                            &stage_id,
+                            &agent_id,
+                            &connect_evidence_root,
+                            &EffectKind::ConnectUpload,
+                            &upload_path,
+                            "settled",
+                        )
+                        .await?;
+                    let advance_run = self.build_advance_run_work_item(run_id)?;
+                    let mut tx = self
+                        .begin_executor_transaction(
+                            "executor.release_connect_upload_success",
+                            format!(
+                                "executor.release_connect_upload_success:{}:{}",
+                                stage_execution_id, connect_lease.effect_id
+                            ),
+                        )
+                        .await?;
+                    artifacts::insert_tx(&mut tx, &upload_artifact).await?;
+                    if let Some(artifact) = delivery_artifact.as_ref() {
+                        artifacts::insert_tx(&mut tx, artifact).await?;
+                    }
+                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                        effect_id: &connect_lease.effect_id,
+                        owner_instance_id: &connect_lease.owner_instance_id,
+                        settlement_attempt_id: &connect_lease.attempt_id,
+                        observed_lease_renewed_at: connect_lease.lease_renewed_at,
+                        new_status: domain::side_effect::SideEffectStatus::Settled,
+                        observed_evidence_summary_json: Some(evidence_summary.as_str()),
+                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
+                        last_error_kind: None,
+                        last_error: None,
+                        now,
+                        settlement_source: "executor",
+                        receipt_artifact_id: Some(upload_artifact_id.as_str()),
+                        decision_json: None,
+                        decision_json_hash: None,
+                        disposition_id: None,
+                    };
+                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?
+                    {
+                        return Err(anyhow::anyhow!(
+                            "side_effect_cas_lost: settle_success CAS missed for effect {}; canonical release state not mutated",
+                            connect_lease.effect_id
+                        ));
+                    }
+                    agent_executions::update_completed_tx(
+                        &mut tx,
+                        agent_exec_id,
+                        AgentStatus::Completed,
+                        now,
+                    )
+                    .await?;
+                    stages::settle_tx(
+                        &mut tx,
+                        stage_execution_id,
+                        domain::stage::StageSettlementKind::Completed,
+                        now,
+                    )
+                    .await?;
+                    work_items::enqueue_tx(&mut tx, &advance_run).await?;
+                    tx.commit().await?;
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::ArtifactCreated {
+                            run_id,
+                            artifact_id: upload_artifact.id,
+                        });
+                    if let Some(artifact) = delivery_artifact {
+                        let _ = self
+                            .events
+                            .send(domain::events::DomainEvent::ArtifactCreated {
+                                run_id,
+                                artifact_id: artifact.id,
+                            });
+                    }
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                            run_id,
+                            stage_id: stage_id.clone(),
+                            agent_id: agent_id.clone(),
+                            provider: provider.clone(),
+                            event_kind: "session_completed".to_string(),
+                        });
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::StageStatusChanged {
+                            run_id,
+                            stage_execution_id,
+                            status: domain::stage::StageStatus::Completed,
+                        });
+                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        upload_path = %upload_path,
+                        "Release connect_upload step completed"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    let error_str = sanitize_release_error(&error.to_string());
+                    let release_result = ReleaseResult {
+                        git_manifest: Some(release_manifest),
+                        git_receipt: Some(git_receipt),
+                        bundle_manifest: Some(bundle_manifest),
+                        upload_receipt: None,
+                        succeeded: false,
+                        failure_stage: Some("connect_upload".to_string()),
+                        failure_reason: Some(error_str.clone()),
+                    };
+                    let delivery_artifact = self
+                        .prepare_delivery_receipt_artifact_if_absent(
+                            &run,
+                            &delivery_config,
+                            &release_result,
+                            &idea_title,
+                            None,
+                            &stage_id,
+                            &provider,
+                            model.clone(),
+                        )
+                        .await?;
+                    let mut tx = self
+                        .begin_executor_transaction(
+                            "executor.release_connect_upload_failure",
+                            format!(
+                                "executor.release_connect_upload_failure:{}:{}",
+                                stage_execution_id, connect_lease.effect_id
+                            ),
+                        )
+                        .await?;
+                    if let Some(artifact) = delivery_artifact.as_ref() {
+                        artifacts::insert_tx(&mut tx, artifact).await?;
+                    }
+                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                        effect_id: &connect_lease.effect_id,
+                        owner_instance_id: &connect_lease.owner_instance_id,
+                        attempt_id: &connect_lease.attempt_id,
+                        observed_lease_renewed_at: connect_lease.lease_renewed_at,
+                        last_error_kind: "connect_upload_failed",
+                        last_error: &error_str,
+                        now,
+                    };
+                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                    {
+                        return Err(anyhow::anyhow!(
+                            "side_effect_cas_lost: settle_failure CAS missed for effect {}; canonical release state not mutated",
+                            connect_lease.effect_id
+                        ));
+                    }
+                    agent_executions::update_completed_tx(
+                        &mut tx,
+                        agent_exec_id,
+                        AgentStatus::Failed,
+                        now,
+                    )
+                    .await?;
+                    stages::settle_tx(
+                        &mut tx,
+                        stage_execution_id,
+                        domain::stage::StageSettlementKind::Failed,
+                        now,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    if let Some(artifact) = delivery_artifact {
+                        let _ = self
+                            .events
+                            .send(domain::events::DomainEvent::ArtifactCreated {
+                                run_id,
+                                artifact_id: artifact.id,
+                            });
+                        info!(run_id = %run_id, receipt_path = %artifact.file_path, "delivery receipt persisted");
+                    }
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                            run_id,
+                            stage_id: stage_id.clone(),
+                            agent_id: agent_id.clone(),
+                            provider: provider.clone(),
+                            event_kind: "session_failed".to_string(),
+                        });
+                    let _ = self
+                        .events
+                        .send(domain::events::DomainEvent::StageStatusChanged {
+                            run_id,
+                            stage_execution_id,
+                            status: domain::stage::StageStatus::Failed,
+                        });
+                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    info!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        error = %error,
+                        "Release connect_upload step failed"
                     );
                     return Err(error);
                 }
             }
         }
+    }
+
+    async fn fail_release_agent_precondition(
+        &self,
+        run_id: RunId,
+        stage_execution_id: domain::ids::StageExecutionId,
+        agent_exec_id: domain::ids::AgentExecutionId,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        agent_executions::update_completed(&self.pool, agent_exec_id, AgentStatus::Failed, at)
+            .await?;
+        stages::settle(
+            &self.pool,
+            stage_execution_id,
+            domain::stage::StageSettlementKind::Failed,
+            at,
+        )
+        .await?;
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                run_id,
+                stage_id: stage_id.to_string(),
+                agent_id: agent_id.to_string(),
+                provider: provider.to_string(),
+                event_kind: "session_failed".to_string(),
+            });
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::StageStatusChanged {
+                run_id,
+                stage_execution_id,
+                status: domain::stage::StageStatus::Failed,
+            });
+        projections::rebuild_all_for_run(&self.pool, run_id).await?;
+        Ok(())
     }
 
     async fn load_delivery_configuration(
@@ -6140,6 +8003,7 @@ impl BackgroundExecutor {
         result_status: AgentStatus,
         observed_failure_classification: Option<RuntimeFailureClassification>,
         close_diagnostic: Option<&acp::AcpCloseDiagnostic>,
+        runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
         discovery_diagnostics: Option<&AgentExecutionDiscoveryDiagnostics>,
         stage_degraded_output_policy: &workflow::plan::DegradedOutputPolicy,
         validation_summary_override: Option<TaskValidationSummary>,
@@ -6159,6 +8023,7 @@ impl BackgroundExecutor {
             observed_failure_classification,
             completed_at,
             close_diagnostic,
+            runtime_receipt,
         );
         let policy_failure_kind = runtime_facts
             .failure_kind
@@ -6283,6 +8148,18 @@ impl BackgroundExecutor {
             ));
         }
 
+        let original_declared_artifact_count = declared_artifacts_to_insert.len();
+        let declared_artifacts_to_insert = filter_duplicate_approved_proposal_declared_artifacts(
+            persisted_artifacts,
+            declared_artifacts_to_insert,
+        );
+        if declared_artifacts_to_insert.len() != original_declared_artifact_count {
+            warn!(
+                agent_execution_id = %agent_exec_id,
+                stage_execution_id = %stage_execution_id,
+                "Ignoring duplicate declared approved_proposal artifact because a frozen version already exists"
+            );
+        }
         let tx_started = Instant::now();
         let mut tx = self
             .begin_executor_transaction(
@@ -6290,7 +8167,7 @@ impl BackgroundExecutor {
                 format!("executor.import_declared_outputs:{agent_exec_id}"),
             )
             .await?;
-        for artifact in declared_artifacts_to_insert {
+        for artifact in &declared_artifacts_to_insert {
             artifacts::insert_tx(&mut tx, artifact).await?;
         }
         let mut projection_dirty = false;
@@ -6358,6 +8235,11 @@ impl BackgroundExecutor {
             }
             runtime_facts.quota_ledger_id = Some(ledger.id);
         }
+        if let Some(runtime_receipt) = runtime_receipt {
+            let receipt_record =
+                runtime_receipt_record_from_receipt(agent_exec_id, runtime_receipt, completed_at)?;
+            agent_execution_runtime_receipts::upsert_tx(&mut tx, &receipt_record).await?;
+        }
         agent_execution_runtime_facts::upsert_tx(&mut tx, &runtime_facts).await?;
         let invalidated_session_after_missing_outputs =
             invalidate_generation_after_missing_required_outputs_tx(
@@ -6374,7 +8256,7 @@ impl BackgroundExecutor {
                 let _ = self.acp.close_session(session_generation_id).await;
             }
         }
-        for artifact in declared_artifacts_to_insert {
+        for artifact in &declared_artifacts_to_insert {
             self.persist_implementation_self_assessment_summary_if_applicable(artifact)
                 .await?;
             let _ = self
@@ -6579,10 +8461,16 @@ impl BackgroundExecutor {
         let Some(backlog) = parse_proposal_writer_backlog_context(&backlog_bytes) else {
             return Ok(Vec::new());
         };
-        Ok(proposal_writer_backlog_alignment_issues_from_outputs(
-            captured_outputs,
-            &backlog,
-        ))
+        let mut issues =
+            proposal_writer_backlog_alignment_issues_from_outputs(captured_outputs, &backlog);
+        if let Some(run) = db::repos::runs::find_by_id(&self.pool, run_id).await? {
+            if let Some(issue) =
+                proposal_current_freeze_readiness_issue(captured_outputs, &run.workspace_root)?
+            {
+                issues.push(issue);
+            }
+        }
+        Ok(issues)
     }
 
     async fn persist_undeclared_envelope_artifacts(
@@ -6608,6 +8496,15 @@ impl BackgroundExecutor {
         for discovered in discovered_artifacts {
             if discovered.source_path.is_some() || declared_names.contains(discovered.name.as_str())
             {
+                continue;
+            }
+            if should_ignore_undeclared_envelope_artifact(&discovered.name) {
+                warn!(
+                    stage_id = %stage_id,
+                    agent_id = %agent_id,
+                    provider = %provider,
+                    "Ignoring undeclared approved_proposal envelope artifact to preserve frozen proposal immutability"
+                );
                 continue;
             }
 
@@ -7129,7 +9026,7 @@ impl BackgroundExecutor {
             .map_err(|e| anyhow::anyhow!("decode artifact {}: {}", artifact.file_path, e))
     }
 
-    async fn persist_json_artifact<T: Serialize>(
+    fn prepare_release_json_artifact<T: Serialize>(
         &self,
         run: &domain::run::Run,
         stage_id: &str,
@@ -7138,17 +9035,17 @@ impl BackgroundExecutor {
         model: Option<String>,
         name: &str,
         value: &T,
-    ) -> Result<String> {
+    ) -> Result<Artifact> {
         let path = self.resolve_release_artifact_path(run, name);
         if let Some(parent) = std::path::Path::new(&path).parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow::anyhow!("create artifact dir {}: {}", parent.display(), e))?;
         }
         let json = serde_json::to_string_pretty(value)?;
-        std::fs::write(&path, json)
+        std::fs::write(&path, &json)
             .map_err(|e| anyhow::anyhow!("write artifact {}: {}", path, e))?;
 
-        let artifact = domain::artifact::Artifact {
+        Ok(Artifact {
             id: domain::ids::ArtifactId::new(),
             run_id: run.id,
             stage_id: stage_id.to_string(),
@@ -7156,9 +9053,9 @@ impl BackgroundExecutor {
             name: name.to_string(),
             contract_id: name.to_string(),
             format: ArtifactFormat::Json,
-            file_path: path.clone(),
+            file_path: path,
             checksum_sha256: None,
-            size_bytes: None,
+            size_bytes: Some(json.len() as i64),
             provider: provider.to_string(),
             model,
             created_at: chrono::Utc::now(),
@@ -7166,18 +9063,385 @@ impl BackgroundExecutor {
             report_kind: None,
             report_version: None,
             agent_execution_id: None,
-        };
-        artifacts::insert(&self.pool, &artifact).await?;
-        let _ = self
-            .events
-            .send(domain::events::DomainEvent::ArtifactCreated {
-                run_id: run.id,
-                artifact_id: artifact.id,
-            });
-        Ok(path)
+        })
     }
 
-    async fn persist_delivery_receipt_if_absent(
+    fn p078_side_effect_evidence_root(
+        &self,
+        run: &domain::run::Run,
+        stage_execution_id: domain::ids::StageExecutionId,
+        agent_id: &str,
+        effect_kind: &EffectKind,
+        idempotency_key: &str,
+    ) -> Result<String> {
+        let root = Path::new(&run.artifact_root)
+            .join("evidence")
+            .join("runs")
+            .join(run.id.to_string())
+            .join("stages")
+            .join(stage_execution_id.to_string())
+            .join("agents")
+            .join(agent_id)
+            .join("receipt")
+            .join("side-effects")
+            .join(effect_kind.to_string())
+            .join(idempotency_key.replace(['/', ':'], "_"));
+        std::fs::create_dir_all(&root).map_err(|e| {
+            anyhow::anyhow!("create side-effect evidence root {}: {}", root.display(), e)
+        })?;
+        Ok(root.to_string_lossy().into_owned())
+    }
+
+    fn p078_expected_evidence_json(
+        &self,
+        effect_kind: &EffectKind,
+        target_key: &str,
+        evidence_root: &str,
+    ) -> Result<String> {
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": "p078_expected_side_effect_evidence_v1",
+            "effect_kind": effect_kind.to_string(),
+            "target_key": target_key,
+            "evidence_root": evidence_root,
+            "manifest_path": Path::new(evidence_root)
+                .join("evidence-manifest.json")
+                .to_string_lossy()
+                .to_string(),
+            "manifest_write_order": "manifest_last",
+            "durability_protocol": "p075_write_spool_file",
+            "required_files": [
+                { "kind": "release_receipt", "file_name": "release-receipt.json", "required": true, "checksum_required": true, "size_required": true },
+                { "kind": "stdout", "file_name": "stdout.log", "required": true, "checksum_required": true, "size_required": true },
+                { "kind": "stderr", "file_name": "stderr.log", "required": true, "checksum_required": true, "size_required": true },
+                { "kind": "git_ls_remote", "file_name": "git-ls-remote.json", "required": true, "checksum_required": true, "size_required": true },
+                { "kind": "upload_readback", "file_name": "upload-readback.json", "required": true, "checksum_required": true, "size_required": true },
+                { "kind": "archive_summary", "file_name": "archive-summary.json", "required": true, "checksum_required": true, "size_required": true },
+                { "kind": "reconciliation_report", "file_name": "reconciliation-report.json", "required": true, "checksum_required": true, "size_required": true },
+                { "kind": "evidence_manifest", "file_name": "evidence-manifest.json", "required": true, "checksum_required": true, "size_required": true, "write_order": "last" }
+            ]
+        }))
+        .map_err(Into::into)
+    }
+
+    async fn write_p078_side_effect_evidence_manifest(
+        &self,
+        run: &domain::run::Run,
+        stage_execution_id: domain::ids::StageExecutionId,
+        stage_id: &str,
+        agent_id: &str,
+        evidence_root: &str,
+        effect_kind: &EffectKind,
+        receipt_path: &str,
+        status: &str,
+    ) -> Result<String> {
+        let receipt_bytes = std::fs::read(receipt_path)
+            .map_err(|e| anyhow::anyhow!("read side-effect receipt {}: {}", receipt_path, e))?;
+        let receipt_sha = sha256_hex(&receipt_bytes);
+        let evidence_root_hash = sha256_hex(evidence_root.as_bytes());
+        let evidence_root_slug = &evidence_root_hash[..16];
+        let artifact_root = Path::new(&run.artifact_root);
+        tokio::fs::create_dir_all(artifact_root).await?;
+        let now = chrono::Utc::now();
+
+        struct SpoolInput {
+            kind: &'static str,
+            file_name: &'static str,
+            evidence_kind: evidence_spool_refs::EvidenceKind,
+            content_type: &'static str,
+            source_artifact_path: Option<String>,
+            bytes: Vec<u8>,
+        }
+
+        let json_bytes = |value: serde_json::Value| -> Result<Vec<u8>> {
+            serde_json::to_vec_pretty(&value).map_err(Into::into)
+        };
+        let mut spool_inputs = vec![
+            SpoolInput {
+                kind: "release_receipt",
+                file_name: "release-receipt.json",
+                evidence_kind: evidence_spool_refs::EvidenceKind::Receipt,
+                content_type: "application/json",
+                source_artifact_path: Some(receipt_path.to_string()),
+                bytes: receipt_bytes,
+            },
+            SpoolInput {
+                kind: "stdout",
+                file_name: "stdout.log",
+                evidence_kind: evidence_spool_refs::EvidenceKind::Stdout,
+                content_type: "text/plain",
+                source_artifact_path: None,
+                bytes: format!(
+                    "P078 side-effect {} completed local evidence capture with status {}.\n",
+                    effect_kind, status
+                )
+                .into_bytes(),
+            },
+            SpoolInput {
+                kind: "stderr",
+                file_name: "stderr.log",
+                evidence_kind: evidence_spool_refs::EvidenceKind::Stderr,
+                content_type: "text/plain",
+                source_artifact_path: None,
+                bytes: Vec::new(),
+            },
+            SpoolInput {
+                kind: "git_ls_remote",
+                file_name: "git-ls-remote.json",
+                evidence_kind: evidence_spool_refs::EvidenceKind::DeliveryReadback,
+                content_type: "application/json",
+                source_artifact_path: None,
+                bytes: json_bytes(serde_json::json!({
+                    "schema_version": "p078_git_ls_remote_evidence_v1",
+                    "effect_kind": effect_kind.to_string(),
+                    "applicable": effect_kind == &EffectKind::GitPush,
+                    "readback_source": "local_fake_gate_or_release_receipt",
+                    "status": status
+                }))?,
+            },
+            SpoolInput {
+                kind: "upload_readback",
+                file_name: "upload-readback.json",
+                evidence_kind: evidence_spool_refs::EvidenceKind::DeliveryReadback,
+                content_type: "application/json",
+                source_artifact_path: None,
+                bytes: json_bytes(serde_json::json!({
+                    "schema_version": "p078_upload_readback_evidence_v1",
+                    "effect_kind": effect_kind.to_string(),
+                    "applicable": effect_kind == &EffectKind::ConnectUpload,
+                    "readback_source": "local_fake_gate_or_release_receipt",
+                    "status": status
+                }))?,
+            },
+            SpoolInput {
+                kind: "archive_summary",
+                file_name: "archive-summary.json",
+                evidence_kind: evidence_spool_refs::EvidenceKind::DeliveryReadback,
+                content_type: "application/json",
+                source_artifact_path: None,
+                bytes: json_bytes(serde_json::json!({
+                    "schema_version": "p078_archive_summary_evidence_v1",
+                    "effect_kind": effect_kind.to_string(),
+                    "applicable": effect_kind == &EffectKind::BuildArchive,
+                    "readback_source": "local_fake_gate_or_release_receipt",
+                    "status": status
+                }))?,
+            },
+            SpoolInput {
+                kind: "reconciliation_report",
+                file_name: "reconciliation-report.json",
+                evidence_kind: evidence_spool_refs::EvidenceKind::DeliveryReadback,
+                content_type: "application/json",
+                source_artifact_path: None,
+                bytes: json_bytes(serde_json::json!({
+                    "schema_version": "p078_reconciliation_report_v1",
+                    "effect_kind": effect_kind.to_string(),
+                    "status": "not_required_for_normal_settlement",
+                    "operator_next_action": null
+                }))?,
+            },
+        ];
+
+        #[derive(Clone)]
+        struct SpoolManifestEntry {
+            kind: String,
+            file_name: String,
+            path: String,
+            relative_path: String,
+            sha256: String,
+            size_bytes: u64,
+            source_artifact_path: Option<String>,
+        }
+
+        let mut manifest_entries = Vec::with_capacity(spool_inputs.len());
+        let mut spooled_bytes = 0u64;
+        for input in spool_inputs.drain(..) {
+            let relative_path = format!(
+                "evidence/runs/{}/stages/{}/agents/{}/receipt/side-effects/{}/{}/{}",
+                run.id,
+                stage_execution_id,
+                agent_id,
+                effect_kind,
+                evidence_root_slug,
+                input.file_name
+            );
+            let spool = db::evidence_spool::write_spool_file(
+                artifact_root,
+                &run.id.to_string(),
+                &relative_path,
+                &input.bytes,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("write P078 {} evidence spool: {e}", input.kind))?;
+            spooled_bytes += spool.size_bytes;
+            let spool_ref = evidence_spool_refs::EvidenceSpoolRef {
+                id: format!(
+                    "evsp_p078_{}_{}",
+                    input.kind,
+                    &sha256_hex(spool.relative_path.as_bytes())[..24]
+                ),
+                metadata_version: 1,
+                run_id: run.id.to_string(),
+                stage_execution_id: Some(stage_execution_id.to_string()),
+                stage_id: Some(stage_id.to_string()),
+                agent_execution_id: None,
+                agent_id: Some(agent_id.to_string()),
+                kind: input.evidence_kind,
+                relative_path: spool.relative_path.clone(),
+                size_bytes: spool.size_bytes as i64,
+                checksum_algorithm: spool.checksum_algorithm.to_string(),
+                checksum: spool.checksum.clone(),
+                producer_operation: format!("p078_side_effect_{}_spool_ref_insert", input.kind),
+                content_type: Some(input.content_type.to_string()),
+                summary_json: Some(
+                    serde_json::json!({
+                        "byte_count": spool.size_bytes,
+                        "producer_label": format!("p078_side_effect_{}", input.kind),
+                        "started_at": now.to_rfc3339(),
+                        "finished_at": now.to_rfc3339()
+                    })
+                    .to_string(),
+                ),
+                created_at: now,
+                status: evidence_spool_refs::EvidenceSpoolRefStatus::Available,
+            };
+            match evidence_spool_refs::insert_idempotent_via_dbwriter(&self.db_writer, spool_ref)
+                .await
+            {
+                WriteResult::Committed | WriteResult::Coalesced => {}
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "P078 {} evidence spool metadata was not committed: {other:?}",
+                        input.kind
+                    ));
+                }
+            }
+            manifest_entries.push(SpoolManifestEntry {
+                kind: input.kind.to_string(),
+                file_name: input.file_name.to_string(),
+                path: spool.absolute_path.to_string_lossy().to_string(),
+                relative_path: spool.relative_path.clone(),
+                sha256: spool.checksum.clone(),
+                size_bytes: spool.size_bytes,
+                source_artifact_path: input.source_artifact_path,
+            });
+        }
+        info!(
+            metric_name = "side_effect_evidence_spooled_bytes_total",
+            effect_kind = %effect_kind,
+            status,
+            bytes = spooled_bytes,
+            "p078_side_effect_metric"
+        );
+        info!(
+            metric_name = "side_effect_evidence_disk_bytes",
+            effect_kind = %effect_kind,
+            status,
+            bytes = spooled_bytes,
+            "p078_side_effect_metric"
+        );
+
+        let manifest = serde_json::json!({
+            "schema_version": "p078_side_effect_evidence_manifest_v1",
+            "effect_kind": effect_kind.to_string(),
+            "status": status,
+            "generated_at": now.to_rfc3339(),
+            "manifest_write_order": "manifest_last",
+            "durability_protocol": "p075_write_spool_file",
+            "files": manifest_entries.iter().map(|entry| serde_json::json!({
+                "kind": &entry.kind,
+                "path": &entry.path,
+                "relative_path": &entry.relative_path,
+                "source_artifact_path": &entry.source_artifact_path,
+                "file_name": &entry.file_name,
+                "sha256": &entry.sha256,
+                "size_bytes": entry.size_bytes
+            })).collect::<Vec<_>>()
+        });
+        let bytes = serde_json::to_vec_pretty(&manifest)?;
+        let manifest_relative_path = format!(
+            "evidence/runs/{}/stages/{}/agents/{}/receipt/side-effects/{}/{}/evidence-manifest.json",
+            run.id,
+            stage_execution_id,
+            agent_id,
+            effect_kind,
+            evidence_root_slug
+        );
+        let manifest_spool = db::evidence_spool::write_spool_file(
+            artifact_root,
+            &run.id.to_string(),
+            &manifest_relative_path,
+            &bytes,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("write P078 evidence manifest spool: {e}"))?;
+        let manifest_spool_ref = evidence_spool_refs::EvidenceSpoolRef {
+            id: format!(
+                "evsp_p078_manifest_{}",
+                &sha256_hex(manifest_spool.relative_path.as_bytes())[..24]
+            ),
+            metadata_version: 1,
+            run_id: run.id.to_string(),
+            stage_execution_id: Some(stage_execution_id.to_string()),
+            stage_id: Some(stage_id.to_string()),
+            agent_execution_id: None,
+            agent_id: Some(agent_id.to_string()),
+            kind: evidence_spool_refs::EvidenceKind::Receipt,
+            relative_path: manifest_spool.relative_path.clone(),
+            size_bytes: manifest_spool.size_bytes as i64,
+            checksum_algorithm: manifest_spool.checksum_algorithm.to_string(),
+            checksum: manifest_spool.checksum.clone(),
+            producer_operation: "p078_side_effect_manifest_spool_ref_insert".to_string(),
+            content_type: Some("application/json".to_string()),
+            summary_json: Some(
+                serde_json::json!({
+                    "byte_count": manifest_spool.size_bytes,
+                    "producer_label": "p078_side_effect_manifest",
+                    "started_at": now.to_rfc3339(),
+                    "finished_at": now.to_rfc3339()
+                })
+                .to_string(),
+            ),
+            created_at: now,
+            status: evidence_spool_refs::EvidenceSpoolRefStatus::Available,
+        };
+        match evidence_spool_refs::insert_idempotent_via_dbwriter(
+            &self.db_writer,
+            manifest_spool_ref,
+        )
+        .await
+        {
+            WriteResult::Committed | WriteResult::Coalesced => {}
+            other => {
+                return Err(anyhow::anyhow!(
+                    "P078 manifest evidence spool metadata was not committed: {other:?}"
+                ));
+            }
+        }
+        let receipt_entry = manifest_entries
+            .iter()
+            .find(|entry| entry.kind == "release_receipt")
+            .ok_or_else(|| {
+                anyhow::anyhow!("P078 evidence manifest missing release_receipt entry")
+            })?;
+        Ok(serde_json::to_string(&serde_json::json!({
+            "schema_version": "p078_observed_evidence_summary_v1",
+            "manifest_path": manifest_spool.absolute_path.to_string_lossy().to_string(),
+            "manifest_relative_path": manifest_spool.relative_path.clone(),
+            "manifest_sha256": manifest_spool.checksum.clone(),
+            "manifest_size_bytes": manifest_spool.size_bytes,
+            "receipt_path": receipt_path,
+            "receipt_spool_path": receipt_entry.path.clone(),
+            "receipt_spool_relative_path": receipt_entry.relative_path.clone(),
+            "receipt_sha256": receipt_sha,
+            "status": status,
+            "file_count": manifest_entries.len() + 1,
+            "manifest_file_count": manifest_entries.len(),
+            "spooled_bytes": spooled_bytes + manifest_spool.size_bytes,
+            "durability_protocol": "p075_write_spool_file"
+        }))?)
+    }
+
+    async fn prepare_delivery_receipt_artifact_if_absent(
         &self,
         run: &domain::run::Run,
         delivery_config: &DeliveryConfiguration,
@@ -7187,7 +9451,7 @@ impl BackgroundExecutor {
         stage_id: &str,
         provider: &str,
         model: Option<String>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<Artifact>> {
         let rollout_contract_readback =
             rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
                 &self.pool,
@@ -7210,17 +9474,93 @@ impl BackgroundExecutor {
         if std::path::Path::new(&path).exists() {
             return Ok(None);
         }
+        self.prepare_release_json_artifact(
+            run,
+            stage_id,
+            "system_delivery",
+            provider,
+            model,
+            "delivery_receipt",
+            &receipt,
+        )
+        .map(Some)
+    }
+
+    fn build_advance_run_work_item(&self, run_id: RunId) -> Result<WorkItem> {
+        let now = chrono::Utc::now();
+        Ok(WorkItem {
+            id: uuid::Uuid::new_v4().to_string(),
+            kind: WorkItemKind::AdvanceRun,
+            payload_json: serde_json::to_string(&serde_json::json!({
+                "run_id": run_id.to_string(),
+            }))?,
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: None,
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        })
+    }
+
+    async fn persist_json_artifact<T: Serialize>(
+        &self,
+        run: &domain::run::Run,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        name: &str,
+        value: &T,
+    ) -> Result<String> {
+        let artifact = self
+            .prepare_release_json_artifact(run, stage_id, agent_id, provider, model, name, value)?;
+        let path = artifact.file_path.clone();
+        artifacts::insert(&self.pool, &artifact).await?;
         let _ = self
-            .persist_json_artifact(
+            .events
+            .send(domain::events::DomainEvent::ArtifactCreated {
+                run_id: run.id,
+                artifact_id: artifact.id,
+            });
+        Ok(path)
+    }
+
+    async fn persist_delivery_receipt_if_absent(
+        &self,
+        run: &domain::run::Run,
+        delivery_config: &DeliveryConfiguration,
+        release_result: &ReleaseResult,
+        idea_title: &str,
+        review_status: Option<&str>,
+        stage_id: &str,
+        provider: &str,
+        model: Option<String>,
+    ) -> Result<Option<String>> {
+        let Some(artifact) = self
+            .prepare_delivery_receipt_artifact_if_absent(
                 run,
+                delivery_config,
+                release_result,
+                idea_title,
+                review_status,
                 stage_id,
-                "system_delivery",
                 provider,
                 model,
-                "delivery_receipt",
-                &receipt,
             )
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
+        let path = artifact.file_path.clone();
+        artifacts::insert(&self.pool, &artifact).await?;
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::ArtifactCreated {
+                run_id: run.id,
+                artifact_id: artifact.id,
+            });
         Ok(Some(path))
     }
 
@@ -7388,8 +9728,73 @@ fn release_artifact_path(artifact_root: &str, name: &str) -> String {
         .into_owned()
 }
 
+fn suppress_duplicate_approved_proposal_output(
+    declared_outputs: &mut Vec<DeclaredOutput>,
+    prompt: &mut String,
+    stage_id: &str,
+    task_name: &str,
+    has_existing_approved_proposal: bool,
+) -> bool {
+    if !should_suppress_duplicate_approved_proposal_output(
+        stage_id,
+        task_name,
+        has_existing_approved_proposal,
+    ) {
+        return false;
+    }
+    let original_len = declared_outputs.len();
+    declared_outputs.retain(|output| {
+        output.output_name != APPROVED_PROPOSAL_OUTPUT_NAME
+            && output.companion_output_name.as_deref() != Some(APPROVED_PROPOSAL_OUTPUT_NAME)
+    });
+    if declared_outputs.len() == original_len {
+        return false;
+    }
+    prompt.push_str(
+        "\n\n### Approved Proposal Immutability\n\
+         A frozen `approved_proposal` artifact already exists for this run and is the sole \
+         implementation source of truth for this retry.\n\
+         Do not emit, rewrite, re-freeze, or modify `approved_proposal` in this turn.\n\
+         Reuse the existing frozen proposal exactly as-is. Return only the remaining declared \
+         implementation outputs such as `implementation_plan`, `implementation_backlog`, and \
+         `run_state`. Any proposal changes after freeze require an explicit amendment path.\n",
+    );
+    true
+}
+
+fn should_suppress_duplicate_approved_proposal_output(
+    stage_id: &str,
+    task_name: &str,
+    has_existing_approved_proposal: bool,
+) -> bool {
+    has_existing_approved_proposal
+        && stage_id == IMPLEMENTATION_STARTED_STAGE_ID
+        && task_name == FREEZE_PROPOSAL_TASK_NAME
+}
+
+fn should_ignore_undeclared_envelope_artifact(name: &str) -> bool {
+    name == APPROVED_PROPOSAL_OUTPUT_NAME
+}
+
+fn filter_duplicate_approved_proposal_declared_artifacts(
+    persisted_artifacts: &[Artifact],
+    declared_artifacts_to_insert: &[Artifact],
+) -> Vec<Artifact> {
+    let has_existing_approved_proposal = persisted_artifacts
+        .iter()
+        .any(|artifact| artifact.name == APPROVED_PROPOSAL_OUTPUT_NAME);
+    if !has_existing_approved_proposal {
+        return declared_artifacts_to_insert.to_vec();
+    }
+    declared_artifacts_to_insert
+        .iter()
+        .filter(|artifact| artifact.name != APPROVED_PROPOSAL_OUTPUT_NAME)
+        .cloned()
+        .collect()
+}
+
 fn stored_artifact_file_path(name: &str, path: &str, workspace_root: &str) -> String {
-    if name != "approved_proposal" {
+    if name != APPROVED_PROPOSAL_OUTPUT_NAME {
         return path.to_string();
     }
     workspace_relative_artifact_file_path(path, workspace_root).unwrap_or_else(|| path.to_string())
@@ -7710,6 +10115,858 @@ fn output_discovery_decision_counts(
     (found, missing, stale, rejected)
 }
 
+async fn persist_p088_worktree_fingerprint(
+    artifact_root: &str,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    fingerprint: &WorktreeFingerprintV1,
+) -> Result<String> {
+    let phase = serde_json::to_value(fingerprint.capture_phase)?
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+    let path = Path::new(artifact_root)
+        .join("evidence")
+        .join("p088")
+        .join(agent_exec_id.to_string())
+        .join(format!("{phase}-worktree-fingerprint.json"));
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let bytes = serde_json::to_vec_pretty(fingerprint)?;
+    tokio::fs::write(&path, bytes).await?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+async fn persist_p088_prompt_artifact(
+    artifact_root: &str,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    prompt_kind: &str,
+    turn_index: i64,
+    prompt_text: &str,
+) -> Result<String> {
+    let path = Path::new(artifact_root)
+        .join("evidence")
+        .join("p088")
+        .join(agent_exec_id.to_string())
+        .join(format!("{prompt_kind}-{turn_index}-prompt-redacted.txt"));
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&path, redact_runtime_message(prompt_text)).await?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+async fn persist_p088_expected_output_snapshot(
+    artifact_root: &str,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    prompt_kind: &str,
+    turn_index: i64,
+    declared_outputs: &[DeclaredOutput],
+) -> Result<(String, String)> {
+    let path = Path::new(artifact_root)
+        .join("evidence")
+        .join("p088")
+        .join(agent_exec_id.to_string())
+        .join(format!(
+            "{prompt_kind}-{turn_index}-expected-output-contracts.json"
+        ));
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let bytes = serde_json::to_vec_pretty(declared_outputs)?;
+    let sha = sha256_hex(&bytes);
+    tokio::fs::write(&path, bytes).await?;
+    Ok((sha, path.to_string_lossy().into_owned()))
+}
+
+async fn persist_p088_completion_text_artifacts(
+    artifact_root: &str,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    prompt_kind: &str,
+    turn_index: i64,
+    capture: &acp::AcpCompletionTextCaptureMetadata,
+) -> Result<Option<P088TextArtifactPaths>> {
+    let Some(text) = capture.captured_text.as_deref() else {
+        return Ok(None);
+    };
+    let base = Path::new(artifact_root)
+        .join("evidence")
+        .join("p088")
+        .join(agent_exec_id.to_string());
+    tokio::fs::create_dir_all(&base).await?;
+    let raw_path = base.join(format!("{prompt_kind}-{turn_index}-completion-raw.txt"));
+    let redacted_path = base.join(format!(
+        "{prompt_kind}-{turn_index}-completion-redacted.txt"
+    ));
+    let raw_result = tokio::fs::write(&raw_path, text).await;
+    let redacted_result = tokio::fs::write(&redacted_path, redact_runtime_message(text)).await;
+    let storage_error = raw_result
+        .as_ref()
+        .err()
+        .or_else(|| redacted_result.as_ref().err())
+        .map(|error| error.to_string());
+    Ok(Some(P088TextArtifactPaths {
+        raw_path: raw_result
+            .is_ok()
+            .then(|| raw_path.to_string_lossy().into_owned()),
+        redacted_path: redacted_result
+            .is_ok()
+            .then(|| redacted_path.to_string_lossy().into_owned()),
+        storage_error,
+    }))
+}
+
+struct P088TextArtifactPaths {
+    raw_path: Option<String>,
+    redacted_path: Option<String>,
+    storage_error: Option<String>,
+}
+
+async fn persist_p088_receipt_artifact(
+    artifact_root: &str,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    receipt: &CodeWriterCompletionReceiptRecord,
+    captures: &[CodeWriterCompletionTextCaptureRecord],
+    decisions: &[CodeWriterCompletionOutputDecisionRecord],
+) -> Result<String> {
+    let path = Path::new(artifact_root)
+        .join("evidence")
+        .join("p088")
+        .join(agent_exec_id.to_string())
+        .join("code-writer-completion-receipt-v1.json");
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let value = serde_json::json!({
+        "schema_version": "code_writer_completion_receipt_v1",
+        "receipt": receipt,
+        "text_captures": captures,
+        "output_decisions": decisions,
+    });
+    tokio::fs::write(&path, serde_json::to_vec_pretty(&value)?).await?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+async fn persist_p088_failed_stage_evidence(
+    artifact_root: &str,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    receipt: &CodeWriterCompletionReceiptRecord,
+    captures: &[CodeWriterCompletionTextCaptureRecord],
+    decisions: &[CodeWriterCompletionOutputDecisionRecord],
+) -> Result<String> {
+    let path = Path::new(artifact_root)
+        .join("evidence")
+        .join("p088")
+        .join(agent_exec_id.to_string())
+        .join("failed-stage-evidence.json");
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let value = serde_json::json!({
+        "report_kind": "failed_stage_evidence",
+        "evidence_source": "p088_code_writer_completion",
+        "failure_class": receipt.failure_class,
+        "activation_source": receipt.activation_source,
+        "work_change_kind": receipt.work_change_kind,
+        "completion_turn_result": receipt.completion_turn_result,
+        "receipt": receipt,
+        "text_captures": captures,
+        "output_decisions": decisions,
+    });
+    tokio::fs::write(&path, serde_json::to_vec_pretty(&value)?).await?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+async fn persist_p088_code_writer_completion_receipt(
+    pool: &SqlitePool,
+    artifact_root: &str,
+    run_id: RunId,
+    stage_execution_id: domain::ids::StageExecutionId,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    session_generation_id: Option<&str>,
+    provider: &str,
+    model: Option<&str>,
+    pre_fingerprint: &Option<WorktreeFingerprintV1>,
+    post_fingerprint: &Option<WorktreeFingerprintV1>,
+    pre_fingerprint_path: Option<&str>,
+    post_fingerprint_path: Option<&str>,
+    settlement: Option<&DeclaredOutputDiscoverySettlement>,
+    validation: Option<&TaskValidationSummary>,
+    original_capture: &acp::AcpCompletionTextCaptureMetadata,
+    repair_capture: Option<&acp::AcpCompletionTextCaptureMetadata>,
+    original_runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
+    repair_runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
+    repair_runtime_prompt_receipt: Option<&AgentExecutionRuntimePromptReceiptRecord>,
+    completion_turn_attempted: bool,
+    generic_repair_turn_count: i64,
+    operator_retry_completion_recovery: bool,
+    completion_turn_result: Option<&str>,
+    transcript_text: Option<&str>,
+    transcript_artifact_path: Option<&str>,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let receipt_id = format!("{agent_exec_id}:code_writer_completion_receipt_v1");
+    let mut partial_write_reasons = Vec::new();
+    let original_text_artifacts_result = persist_p088_completion_text_artifacts(
+        artifact_root,
+        agent_exec_id,
+        "original",
+        0,
+        original_capture,
+    )
+    .await;
+    if let Err(error) = &original_text_artifacts_result {
+        partial_write_reasons.push(format!("original_completion_text:{error}"));
+    }
+    let original_text_artifacts = original_text_artifacts_result.ok().flatten();
+    if let Some(paths) = &original_text_artifacts {
+        if let Some(error) = &paths.storage_error {
+            partial_write_reasons.push(format!("original_completion_text:{error}"));
+        }
+    }
+    let repair_text_artifacts = match repair_capture {
+        Some(capture) => {
+            let result = persist_p088_completion_text_artifacts(
+                artifact_root,
+                agent_exec_id,
+                "code_writer_completion_repair",
+                1,
+                capture,
+            )
+            .await;
+            if let Err(error) = &result {
+                partial_write_reasons.push(format!("completion_repair_text:{error}"));
+            }
+            let paths = result.ok().flatten();
+            if let Some(paths) = &paths {
+                if let Some(error) = &paths.storage_error {
+                    partial_write_reasons.push(format!("completion_repair_text:{error}"));
+                }
+            }
+            paths
+        }
+        None => None,
+    };
+    let decisions = settlement
+        .map(|settlement| p088_output_decisions(&receipt_id, &settlement.decisions, validation))
+        .unwrap_or_default();
+    let (fresh, missing, stale, control_plane) = settlement
+        .map(|settlement| p088_decision_counts(&settlement.decisions))
+        .unwrap_or_default();
+    let work_change_kind = post_fingerprint
+        .as_ref()
+        .map(|fingerprint| enum_snake_value(fingerprint.summary.work_change_kind));
+    let normalized_completion_turn_result = completion_turn_result
+        .map(p088_completion_turn_result)
+        .or_else(|| {
+            if completion_turn_attempted {
+                Some("failed_missing_outputs".to_string())
+            } else {
+                Some("not_attempted".to_string())
+            }
+        });
+    let completion_status = if missing == 0 && stale == 0 {
+        "complete"
+    } else if fresh > 0 {
+        "partial"
+    } else {
+        "missing_required_outputs"
+    };
+    let completion_mode = p088_completion_mode(settlement, completion_turn_attempted);
+    let missing_outputs = settlement
+        .map(|settlement| {
+            settlement
+                .decisions
+                .iter()
+                .filter(|decision| decision.status == OutputDiscoveryStatus::Missing)
+                .map(|decision| decision.output_name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let stale_outputs = settlement
+        .map(|settlement| {
+            settlement
+                .decisions
+                .iter()
+                .filter(|decision| decision.reason == OutputDiscoveryReason::StaleExpectedOutput)
+                .map(|decision| decision.output_name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let terminal_response_status = original_runtime_receipt.map(|receipt| receipt.status.clone());
+    let mut failure_class = if missing > 0 {
+        if terminal_response_status.as_deref() == Some("completed") {
+            Some("terminal_response_completed_missing_required_outputs".to_string())
+        } else if work_change_kind.as_deref() == Some("current_attempt_diff") {
+            Some("work_completed_missing_current_attempt_outputs".to_string())
+        } else {
+            Some("missing_required_outputs".to_string())
+        }
+    } else {
+        None
+    };
+    if !partial_write_reasons.is_empty() {
+        failure_class = Some("completion_receipt_partial_write".to_string());
+    }
+    if normalized_completion_turn_result.as_deref()
+        == Some("generic_repair_already_failed_completion_contract_required")
+    {
+        failure_class =
+            Some("generic_repair_already_failed_completion_contract_required".to_string());
+    }
+    let mut captures = vec![p088_text_capture_record(
+        &receipt_id,
+        "original",
+        0,
+        original_runtime_receipt,
+        original_capture,
+        original_text_artifacts
+            .as_ref()
+            .and_then(|paths| paths.raw_path.as_deref()),
+        original_text_artifacts
+            .as_ref()
+            .and_then(|paths| paths.redacted_path.as_deref()),
+        created_at,
+    )];
+    if let Some(repair_capture) = repair_capture {
+        captures.push(p088_text_capture_record(
+            &receipt_id,
+            "code_writer_completion_repair",
+            1,
+            repair_runtime_receipt,
+            repair_capture,
+            repair_text_artifacts
+                .as_ref()
+                .and_then(|paths| paths.raw_path.as_deref()),
+            repair_text_artifacts
+                .as_ref()
+                .and_then(|paths| paths.redacted_path.as_deref()),
+            created_at,
+        ));
+    }
+    let absence_count = captures
+        .iter()
+        .filter(|capture| capture.completion_text_status == "unavailable")
+        .count() as i64;
+    let (transcript_status, transcript_absence_reason) =
+        p088_transcript_status(transcript_text, transcript_artifact_path);
+    let mut receipt = CodeWriterCompletionReceiptRecord {
+        id: receipt_id.clone(),
+        run_id,
+        stage_execution_id,
+        agent_execution_id: agent_exec_id,
+        session_generation_id: session_generation_id.map(str::to_string),
+        original_runtime_receipt_id: original_runtime_receipt
+            .map(|_| format!("{agent_exec_id}:original:0")),
+        completion_repair_runtime_receipt_id: repair_runtime_receipt
+            .map(|_| format!("{agent_exec_id}:code_writer_completion_repair:1")),
+        provider: provider.to_string(),
+        model: model.map(str::to_string),
+        completion_mode,
+        published_at: (completion_status == "complete").then_some(created_at),
+        activation_source: p088_activation_source(
+            original_runtime_receipt,
+            work_change_kind.as_deref(),
+            missing,
+            operator_retry_completion_recovery,
+        ),
+        ingestion_boundary_failure: p088_ingestion_boundary_failure(
+            original_capture,
+            settlement,
+            missing,
+        ),
+        work_change_kind,
+        pre_prompt_worktree_fingerprint_path: pre_fingerprint_path.map(str::to_string),
+        post_prompt_worktree_fingerprint_path: post_fingerprint_path.map(str::to_string),
+        pre_prompt_worktree_fingerprint_sha256: pre_fingerprint
+            .as_ref()
+            .and_then(|fingerprint| fingerprint.artifact_sha256().ok()),
+        post_prompt_worktree_fingerprint_sha256: post_fingerprint
+            .as_ref()
+            .and_then(|fingerprint| fingerprint.artifact_sha256().ok()),
+        current_attempt_changed_path_count: post_fingerprint
+            .as_ref()
+            .map(|fingerprint| fingerprint.summary.current_attempt_changed_path_count as i64)
+            .unwrap_or_default(),
+        preexisting_dirty_path_count: post_fingerprint
+            .as_ref()
+            .map(|fingerprint| fingerprint.summary.preexisting_dirty_path_count as i64)
+            .unwrap_or_default(),
+        completion_status: completion_status.to_string(),
+        failure_class,
+        terminal_response_status,
+        completion_turn_attempted,
+        completion_turn_result: normalized_completion_turn_result,
+        completion_text_capture_count: captures.len() as i64,
+        completion_text_absence_count: absence_count,
+        completion_repair_text_status: repair_capture.map(|capture| {
+            p088_capture_status(
+                capture,
+                repair_text_artifacts
+                    .as_ref()
+                    .is_some_and(|paths| paths.raw_path.is_some()),
+                repair_text_artifacts
+                    .as_ref()
+                    .is_some_and(|paths| paths.redacted_path.is_some()),
+            )
+        }),
+        completion_repair_raw_text_artifact_path: repair_text_artifacts
+            .as_ref()
+            .and_then(|paths| paths.raw_path.clone()),
+        completion_repair_redacted_text_artifact_path: repair_text_artifacts
+            .as_ref()
+            .and_then(|paths| paths.redacted_path.clone()),
+        completion_repair_text_absence_reason: repair_capture.and_then(|capture| {
+            let text_artifact_persisted = repair_text_artifacts
+                .as_ref()
+                .is_some_and(|paths| paths.raw_path.is_some() || paths.redacted_path.is_some());
+            let storage_failed = repair_text_artifacts
+                .as_ref()
+                .is_some_and(|paths| paths.storage_error.is_some());
+            if storage_failed && !text_artifact_persisted {
+                Some("storage_write_failed".to_string())
+            } else {
+                p088_absence_reason(
+                    capture,
+                    repair_runtime_receipt.map(|receipt| receipt.status.as_str()),
+                    text_artifact_persisted,
+                )
+            }
+        }),
+        fresh_required_output_count: fresh as i64,
+        stale_required_output_count: stale as i64,
+        missing_required_output_count: missing as i64,
+        control_plane_output_count: control_plane as i64,
+        completion_repair_turn_count: i64::from(completion_turn_attempted),
+        generic_repair_turn_count,
+        missing_outputs,
+        stale_outputs,
+        transcript_status,
+        transcript_absence_reason,
+        receipt_artifact_path: None,
+        failed_stage_evidence_path: None,
+        created_at,
+    };
+    match persist_p088_receipt_artifact(
+        artifact_root,
+        agent_exec_id,
+        &receipt,
+        &captures,
+        &decisions,
+    )
+    .await
+    {
+        Ok(path) => receipt.receipt_artifact_path = Some(path),
+        Err(error) => {
+            partial_write_reasons.push(format!("receipt_artifact:{error}"));
+            receipt.failure_class = Some("completion_receipt_partial_write".to_string());
+        }
+    }
+    if receipt.failure_class.is_some() || receipt.missing_required_output_count > 0 {
+        match persist_p088_failed_stage_evidence(
+            artifact_root,
+            agent_exec_id,
+            &receipt,
+            &captures,
+            &decisions,
+        )
+        .await
+        {
+            Ok(path) => receipt.failed_stage_evidence_path = Some(path),
+            Err(error) => {
+                partial_write_reasons.push(format!("failed_stage_evidence:{error}"));
+                receipt.failure_class = Some("completion_receipt_partial_write".to_string());
+            }
+        }
+    }
+    if !partial_write_reasons.is_empty() {
+        receipt.transcript_absence_reason = Some("storage_write_failed".to_string());
+    }
+    let original_runtime_receipt_record = original_runtime_receipt
+        .map(|runtime_receipt| {
+            runtime_receipt_record_from_receipt(agent_exec_id, runtime_receipt, created_at)
+        })
+        .transpose()?;
+    code_writer_completion_receipts::upsert_with_runtime_receipts(
+        pool,
+        &receipt,
+        &captures,
+        &decisions,
+        original_runtime_receipt_record.as_ref(),
+        repair_runtime_prompt_receipt,
+    )
+    .await
+}
+
+fn p088_decision_counts(decisions: &[OutputDiscoveryDecision]) -> (usize, usize, usize, usize) {
+    let fresh = decisions
+        .iter()
+        .filter(|decision| {
+            decision.status == OutputDiscoveryStatus::Accepted
+                && decision.reason != OutputDiscoveryReason::ControlPlaneGenerated
+        })
+        .count();
+    let missing = decisions
+        .iter()
+        .filter(|decision| decision.status == OutputDiscoveryStatus::Missing)
+        .count();
+    let stale = decisions
+        .iter()
+        .filter(|decision| decision.reason == OutputDiscoveryReason::StaleExpectedOutput)
+        .count();
+    let control_plane = decisions
+        .iter()
+        .filter(|decision| decision.reason == OutputDiscoveryReason::ControlPlaneGenerated)
+        .count();
+    (fresh, missing, stale, control_plane)
+}
+
+fn p088_completion_mode(
+    settlement: Option<&DeclaredOutputDiscoverySettlement>,
+    completion_turn_attempted: bool,
+) -> Option<String> {
+    if completion_turn_attempted {
+        return Some("code_writer_completion_repair_turn".to_string());
+    }
+    let settlement = settlement?;
+    let mut modes = settlement
+        .decisions
+        .iter()
+        .filter(|decision| {
+            decision.status == OutputDiscoveryStatus::Accepted
+                && decision.reason != OutputDiscoveryReason::ControlPlaneGenerated
+        })
+        .filter_map(|decision| match decision.reason {
+            OutputDiscoveryReason::ProviderEnvelope => {
+                if decision
+                    .diagnostics
+                    .get("source_kind")
+                    .is_some_and(|kind| kind == "chainworks_output")
+                {
+                    Some("acp_final_text_chainworks_output")
+                } else {
+                    Some("provider_envelope")
+                }
+            }
+            OutputDiscoveryReason::ExactPathNew | OutputDiscoveryReason::ExactPathChanged => {
+                Some("exact_path_current_attempt")
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    modes.sort_unstable();
+    modes.dedup();
+    match modes.as_slice() {
+        [] => None,
+        [single] => Some((*single).to_string()),
+        _ => Some("mixed".to_string()),
+    }
+}
+
+fn p088_output_decisions(
+    receipt_id: &str,
+    decisions: &[OutputDiscoveryDecision],
+    validation: Option<&TaskValidationSummary>,
+) -> Vec<CodeWriterCompletionOutputDecisionRecord> {
+    decisions
+        .iter()
+        .map(|decision| {
+            let validation_result = validation.and_then(|summary| {
+                summary
+                    .output_results
+                    .iter()
+                    .find(|result| result.output_name == decision.output_name)
+            });
+            CodeWriterCompletionOutputDecisionRecord {
+                receipt_id: receipt_id.to_string(),
+                output_name: decision.output_name.clone(),
+                contract_id: validation_result.and_then(|result| result.contract_id.clone()),
+                canonical_path: decision
+                    .canonical_path
+                    .clone()
+                    .unwrap_or_else(|| decision.target_path.clone()),
+                pre_prompt_sha256: None,
+                post_prompt_sha256: decision.content_digest.clone(),
+                content_sha256: decision
+                    .accepted_bytes_sha256
+                    .clone()
+                    .or_else(|| decision.content_digest.clone()),
+                settlement_source: Some(enum_snake_value(decision.reason)),
+                validation_status: validation_result
+                    .map(|result| format!("{:?}", result.status).to_ascii_lowercase()),
+                rejection_reason: validation_result
+                    .and_then(|result| result.validation_error.clone()),
+            }
+        })
+        .collect()
+}
+
+fn p088_text_capture_record(
+    receipt_id: &str,
+    prompt_kind: &str,
+    turn_index: i64,
+    runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
+    capture: &acp::AcpCompletionTextCaptureMetadata,
+    raw_text_artifact_path: Option<&str>,
+    redacted_text_artifact_path: Option<&str>,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> CodeWriterCompletionTextCaptureRecord {
+    CodeWriterCompletionTextCaptureRecord {
+        receipt_id: receipt_id.to_string(),
+        prompt_kind: prompt_kind.to_string(),
+        turn_index,
+        terminal_response_status: runtime_receipt.map(|receipt| receipt.status.clone()),
+        completion_text_status: p088_capture_status(
+            capture,
+            raw_text_artifact_path.is_some(),
+            redacted_text_artifact_path.is_some(),
+        ),
+        completion_text_capture_source: capture.capture_source.as_ref().map(p088_capture_source),
+        completion_text_raw_byte_limit: Some(capture.raw_byte_limit as i64),
+        completion_text_captured_byte_count: Some(capture.captured_byte_count as i64),
+        completion_text_truncated: capture.completion_text_truncated,
+        extraction_input_truncated: capture.extraction_input_truncated,
+        extraction_input_sha256: capture.extraction_input_sha256.clone(),
+        raw_text_artifact_path: raw_text_artifact_path.map(str::to_string),
+        redacted_text_artifact_path: redacted_text_artifact_path.map(str::to_string),
+        text_absence_reason: p088_absence_reason(
+            capture,
+            runtime_receipt.map(|receipt| receipt.status.as_str()),
+            raw_text_artifact_path.is_some() || redacted_text_artifact_path.is_some(),
+        ),
+        created_at,
+    }
+}
+
+fn p088_capture_status(
+    capture: &acp::AcpCompletionTextCaptureMetadata,
+    raw_text_artifact_persisted: bool,
+    redacted_text_artifact_persisted: bool,
+) -> String {
+    match (
+        &capture.capture_status,
+        raw_text_artifact_persisted,
+        redacted_text_artifact_persisted,
+    ) {
+        (acp::AcpCompletionCaptureStatus::Captured, true, _) => "captured".to_string(),
+        (acp::AcpCompletionCaptureStatus::Captured, false, true) => "redacted_only".to_string(),
+        (acp::AcpCompletionCaptureStatus::Captured, false, false) => "unavailable".to_string(),
+        (acp::AcpCompletionCaptureStatus::Absent, _, _) => "unavailable".to_string(),
+    }
+}
+
+fn p088_absence_reason(
+    capture: &acp::AcpCompletionTextCaptureMetadata,
+    terminal_response_status: Option<&str>,
+    text_artifact_persisted: bool,
+) -> Option<String> {
+    if capture.extraction_input_truncated {
+        return Some("extraction_input_truncated".to_string());
+    }
+    if capture.completion_text_truncated {
+        return Some("terminal_response_capture_truncated_before_output".to_string());
+    }
+    if capture.capture_status == acp::AcpCompletionCaptureStatus::Captured
+        && !text_artifact_persisted
+    {
+        return Some("storage_write_failed".to_string());
+    }
+    capture.absence_reason.as_ref().map(|reason| match reason {
+        acp::AcpCompletionAbsenceReason::NoTerminalOrStreamText => {
+            if terminal_response_status == Some("completed") {
+                "terminal_response_without_text".to_string()
+            } else {
+                "provider_did_not_emit_text".to_string()
+            }
+        }
+        acp::AcpCompletionAbsenceReason::TerminalResponseWithoutText => {
+            "terminal_response_without_text".to_string()
+        }
+        acp::AcpCompletionAbsenceReason::TerminalResponseCaptureTruncatedBeforeOutput => {
+            "terminal_response_capture_truncated_before_output".to_string()
+        }
+        acp::AcpCompletionAbsenceReason::ExtractionInputTruncated => {
+            "extraction_input_truncated".to_string()
+        }
+        acp::AcpCompletionAbsenceReason::EmptyAfterSanitization
+        | acp::AcpCompletionAbsenceReason::RedactionFailed => "redaction_failed".to_string(),
+        acp::AcpCompletionAbsenceReason::RawCaptureDisabled => "raw_capture_disabled".to_string(),
+        acp::AcpCompletionAbsenceReason::StorageWriteFailed => "storage_write_failed".to_string(),
+        acp::AcpCompletionAbsenceReason::RedactedStorageWriteFailed => {
+            "redacted_storage_write_failed".to_string()
+        }
+        acp::AcpCompletionAbsenceReason::CaptureDisabled => "raw_capture_disabled".to_string(),
+        acp::AcpCompletionAbsenceReason::CaptureFailed => "storage_write_failed".to_string(),
+        acp::AcpCompletionAbsenceReason::SessionReuseWithoutTerminalCapture => {
+            "provider_did_not_emit_text".to_string()
+        }
+    })
+}
+
+fn p088_completion_turn_result(result: &str) -> String {
+    match result {
+        "unexpected_worktree_mutation_during_completion_repair" => {
+            "failed_unexpected_worktree_mutation".to_string()
+        }
+        "completion_repair_mutation_guard_unavailable" => {
+            "failed_unexpected_worktree_mutation".to_string()
+        }
+        known => known.to_string(),
+    }
+}
+
+fn p088_transcript_status(
+    transcript_text: Option<&str>,
+    transcript_artifact_path: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if transcript_artifact_path.is_some() {
+        (Some("captured".to_string()), None)
+    } else if transcript_text.is_some_and(|text| !text.trim().is_empty()) {
+        (
+            Some("unavailable".to_string()),
+            Some(
+                p088_transcript_absence_reason(P088TranscriptAbsenceReason::StorageWriteFailed)
+                    .to_string(),
+            ),
+        )
+    } else {
+        (
+            Some("unavailable".to_string()),
+            Some(
+                p088_transcript_absence_reason(P088TranscriptAbsenceReason::ProviderDidNotSupply)
+                    .to_string(),
+            ),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum P088TranscriptAbsenceReason {
+    ProviderDidNotSupply,
+    CaptureDisabled,
+    CaptureFailed,
+    StorageWriteFailed,
+    SessionReuseWithoutTerminalCapture,
+}
+
+fn p088_transcript_absence_reason(reason: P088TranscriptAbsenceReason) -> &'static str {
+    match reason {
+        P088TranscriptAbsenceReason::ProviderDidNotSupply => "provider_did_not_supply",
+        P088TranscriptAbsenceReason::CaptureDisabled => "capture_disabled",
+        P088TranscriptAbsenceReason::CaptureFailed => "capture_failed",
+        P088TranscriptAbsenceReason::StorageWriteFailed => "storage_write_failed",
+        P088TranscriptAbsenceReason::SessionReuseWithoutTerminalCapture => {
+            "session_reuse_without_terminal_capture"
+        }
+    }
+}
+
+fn p088_ingestion_boundary_failure(
+    capture: &acp::AcpCompletionTextCaptureMetadata,
+    settlement: Option<&DeclaredOutputDiscoverySettlement>,
+    missing_required_output_count: usize,
+) -> Option<String> {
+    if capture.extraction_input_truncated {
+        return Some("extraction_input_truncated".to_string());
+    }
+    if capture.completion_text_truncated {
+        return Some("terminal_response_capture_truncated_before_output".to_string());
+    }
+    if capture.capture_status == acp::AcpCompletionCaptureStatus::Absent {
+        return Some("acp_final_text_not_collected".to_string());
+    }
+    if settlement.is_some_and(|settlement| {
+        settlement
+            .decisions
+            .iter()
+            .any(|decision| decision.status == OutputDiscoveryStatus::Rejected)
+    }) {
+        return Some("declared_output_settlement_rejected_usable_payload".to_string());
+    }
+    if missing_required_output_count > 0
+        && capture.capture_status == acp::AcpCompletionCaptureStatus::Captured
+    {
+        return Some("chainworks_output_not_extracted".to_string());
+    }
+    None
+}
+
+fn p088_activation_source(
+    original_runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
+    work_change_kind: Option<&str>,
+    missing_required_output_count: usize,
+    operator_retry_completion_recovery: bool,
+) -> String {
+    if operator_retry_completion_recovery {
+        "operator_retry_completion_recovery".to_string()
+    } else if missing_required_output_count > 0
+        && work_change_kind == Some("current_attempt_diff")
+        && original_runtime_receipt.is_some_and(receipt_indicates_recoverable_handoff_gap)
+    {
+        "p037_idle_terminalization".to_string()
+    } else {
+        "declared_output_settlement_failed".to_string()
+    }
+}
+
+fn p088_should_block_after_generic_repair_failed(
+    code_writer_completion_candidate: bool,
+    completion_eligible: bool,
+    failed_generic_repair_count: i64,
+) -> bool {
+    code_writer_completion_candidate && !completion_eligible && failed_generic_repair_count > 0
+}
+
+fn p088_capture_source(source: &acp::AcpCompletionCaptureSource) -> String {
+    match source {
+        acp::AcpCompletionCaptureSource::TerminalFinalResponse => {
+            "terminal_final_response".to_string()
+        }
+        acp::AcpCompletionCaptureSource::StreamedUpdateTail => "streamed_update_tail".to_string(),
+        acp::AcpCompletionCaptureSource::CappedStream => "session_update_stream".to_string(),
+    }
+}
+
+fn payload_requests_p088_operator_retry_completion_recovery(payload: &serde_json::Value) -> bool {
+    let explicit = payload
+        .pointer("/p088/operator_retry_completion_recovery")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || payload
+            .pointer("/p088/activation_source")
+            .and_then(serde_json::Value::as_str)
+            == Some("operator_retry_completion_recovery")
+        || payload
+            .get("activation_source")
+            .and_then(serde_json::Value::as_str)
+            == Some("operator_retry_completion_recovery")
+        || payload
+            .get("retry_reason")
+            .and_then(serde_json::Value::as_str)
+            == Some("operator_retry_completion_recovery");
+    let has_preserved_evidence = payload
+        .pointer("/p088/preserved_historical_evidence_packet_path")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+        || payload
+            .pointer("/p088/historical_evidence_packet_path")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        || payload
+            .get("preserved_historical_evidence_packet_path")
+            .and_then(serde_json::Value::as_str)
+            .is_some();
+    explicit && has_preserved_evidence
+}
+
+fn enum_snake_value<T: Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn failed_output_validation_details(validation: &TaskValidationSummary) -> Vec<serde_json::Value> {
     validation
         .output_results
@@ -7797,6 +11054,72 @@ fn output_contract_repair_prompt(
     prompt
 }
 
+fn code_writer_completion_repair_prompt(
+    validation: &TaskValidationSummary,
+    declared_outputs: &[DeclaredOutput],
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("### Code Writer Completion Repair v1\n");
+    prompt.push_str(
+        "The implementation work for the current attempt already happened, but the required \
+         structured completion outputs did not settle. This is an output-publication turn only. \
+         Do not edit repository files, do not redo implementation work, and do not call tools. \
+         Return only one final JSON object containing `CHAINWORKS_OUTPUT` entries for the \
+         missing or invalid outputs listed below.\n",
+    );
+    if let Some(summary) = validation.failure_summary.as_deref() {
+        prompt.push_str(&format!("- Completion failure: {summary}\n"));
+    }
+    for result in &validation.output_results {
+        if result.status == domain::validation::ValidationStatus::Passed {
+            continue;
+        }
+        prompt.push_str(&format!("- `{}` must be emitted", result.output_name));
+        if let Some(contract_id) = result.contract_id.as_deref() {
+            prompt.push_str(&format!(" using contract `{contract_id}`"));
+        }
+        if !result.missing_fields.is_empty() {
+            prompt.push_str(&format!(
+                "; missing fields: {}",
+                result.missing_fields.join(", ")
+            ));
+        }
+        if let Some(error) = result.validation_error.as_deref() {
+            prompt.push_str(&format!("; validation error: {error}"));
+        }
+        prompt.push('\n');
+    }
+    prompt.push_str(
+        "\nReturn exactly one JSON object. Use canonical target paths as `CHAINWORKS_OUTPUT` keys:\n",
+    );
+    let failed_outputs: Vec<DeclaredOutput> = declared_outputs
+        .iter()
+        .filter(|output| {
+            validation.output_results.iter().any(|result| {
+                result.output_name == output.output_name
+                    && result.status != domain::validation::ValidationStatus::Passed
+            })
+        })
+        .cloned()
+        .collect();
+    let outputs_for_example = if failed_outputs.is_empty() {
+        declared_outputs.to_vec()
+    } else {
+        failed_outputs
+    };
+    for output in &outputs_for_example {
+        append_status_allowed_values_for_declared_output(&mut prompt, output);
+    }
+    let example_outputs = chainworks_output_contract_example(&outputs_for_example);
+    let example = serde_json::json!({ "CHAINWORKS_OUTPUT": example_outputs });
+    if let Ok(example) = serde_json::to_string(&example) {
+        prompt.push_str(&example);
+        prompt.push('\n');
+    }
+    append_docs_noop_contract_guidance(&mut prompt, declared_outputs);
+    prompt
+}
+
 fn merge_contract_repair_result(initial: &mut acp::ExecutionResult, repair: acp::ExecutionResult) {
     initial.status = repair.status;
     initial.artifact_paths.extend(repair.artifact_paths);
@@ -7854,9 +11177,179 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retry_state_7_reuses_existing_approved_proposal_instead_of_reemitting_it() {
+        let mut declared_outputs = vec![
+            DeclaredOutput {
+                output_name: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+                target_path: "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md"
+                    .to_string(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "implementation_plan".to_string(),
+                target_path: "/workspace/.chainworks/runs/run-1/implementation-plan.md".to_string(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let mut prompt = "Freeze proposal and provision worktree".to_string();
+
+        let suppressed = suppress_duplicate_approved_proposal_output(
+            &mut declared_outputs,
+            &mut prompt,
+            IMPLEMENTATION_STARTED_STAGE_ID,
+            FREEZE_PROPOSAL_TASK_NAME,
+            true,
+        );
+
+        assert!(suppressed);
+        assert_eq!(declared_outputs.len(), 1);
+        assert_eq!(declared_outputs[0].output_name, "implementation_plan");
+        assert!(prompt.contains("Approved Proposal Immutability"));
+        assert!(prompt.contains("Do not emit, rewrite, re-freeze, or modify `approved_proposal`"));
+        assert!(prompt.contains("explicit amendment path"));
+    }
+
+    #[test]
+    fn initial_state_7_freeze_suppresses_duplicate_approved_proposal_even_on_first_attempt() {
+        let mut declared_outputs = vec![DeclaredOutput {
+            output_name: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+            target_path: "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md"
+                .to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+        let mut prompt = "Freeze proposal and provision worktree".to_string();
+
+        let suppressed = suppress_duplicate_approved_proposal_output(
+            &mut declared_outputs,
+            &mut prompt,
+            IMPLEMENTATION_STARTED_STAGE_ID,
+            FREEZE_PROPOSAL_TASK_NAME,
+            true,
+        );
+
+        assert!(suppressed);
+        assert!(declared_outputs.is_empty());
+        assert!(prompt.contains("Approved Proposal Immutability"));
+    }
+
+    #[test]
+    fn initial_state_7_freeze_allows_first_approved_proposal_output_when_none_exists_yet() {
+        let mut declared_outputs = vec![DeclaredOutput {
+            output_name: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+            target_path: "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md"
+                .to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+        let mut prompt = "Freeze proposal and provision worktree".to_string();
+
+        let suppressed = suppress_duplicate_approved_proposal_output(
+            &mut declared_outputs,
+            &mut prompt,
+            IMPLEMENTATION_STARTED_STAGE_ID,
+            FREEZE_PROPOSAL_TASK_NAME,
+            false,
+        );
+
+        assert!(!suppressed);
+        assert_eq!(declared_outputs.len(), 1);
+        assert!(!prompt.contains("Approved Proposal Immutability"));
+    }
+
+    #[test]
+    fn undeclared_approved_proposal_envelope_artifact_is_rejected() {
+        assert!(should_ignore_undeclared_envelope_artifact(
+            APPROVED_PROPOSAL_OUTPUT_NAME
+        ));
+        assert!(!should_ignore_undeclared_envelope_artifact(
+            "implementation_plan"
+        ));
+    }
+
+    #[test]
+    fn declared_duplicate_approved_proposal_artifact_is_filtered_before_insert() {
+        let persisted = vec![Artifact {
+            id: domain::ids::ArtifactId::new(),
+            run_id: RunId::new(),
+            stage_id: IMPLEMENTATION_STARTED_STAGE_ID.to_string(),
+            agent_id: "engine".to_string(),
+            name: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+            contract_id: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+            format: ArtifactFormat::Markdown,
+            file_path: ".chainworks/runs/run-1/proposals/approved/proposal.md".to_string(),
+            checksum_sha256: Some("abc".to_string()),
+            size_bytes: Some(1),
+            provider: "engine".to_string(),
+            model: None,
+            created_at: chrono::Utc::now(),
+            is_pinned: true,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: None,
+        }];
+        let duplicate = Artifact {
+            id: domain::ids::ArtifactId::new(),
+            run_id: RunId::new(),
+            stage_id: IMPLEMENTATION_STARTED_STAGE_ID.to_string(),
+            agent_id: "lead_orchestrator".to_string(),
+            name: APPROVED_PROPOSAL_OUTPUT_NAME.to_string(),
+            contract_id: "gemini.output".to_string(),
+            format: ArtifactFormat::Markdown,
+            file_path: ".chainworks/runs/run-1/proposals/approved/proposal.md".to_string(),
+            checksum_sha256: None,
+            size_bytes: Some(1),
+            provider: "gemini".to_string(),
+            model: Some("gemini".to_string()),
+            created_at: chrono::Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: Some(domain::ids::AgentExecutionId::new().to_string()),
+        };
+        let preserved_plan = Artifact {
+            id: domain::ids::ArtifactId::new(),
+            run_id: RunId::new(),
+            stage_id: IMPLEMENTATION_STARTED_STAGE_ID.to_string(),
+            agent_id: "lead_orchestrator".to_string(),
+            name: "implementation_plan".to_string(),
+            contract_id: "gemini.output".to_string(),
+            format: ArtifactFormat::Markdown,
+            file_path: ".chainworks/runs/run-1/implementation/plan.md".to_string(),
+            checksum_sha256: None,
+            size_bytes: Some(1),
+            provider: "gemini".to_string(),
+            model: Some("gemini".to_string()),
+            created_at: chrono::Utc::now(),
+            is_pinned: false,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: Some(domain::ids::AgentExecutionId::new().to_string()),
+        };
+
+        let filtered = filter_duplicate_approved_proposal_declared_artifacts(
+            &persisted,
+            &[duplicate, preserved_plan.clone()],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, preserved_plan.name);
+    }
+
+    #[test]
     fn approved_proposal_artifact_path_is_stored_workspace_relative() {
         let stored = stored_artifact_file_path(
-            "approved_proposal",
+            APPROVED_PROPOSAL_OUTPUT_NAME,
             "/workspace/.chainworks/runs/run-1/proposals/approved/proposal.md",
             "/workspace",
         );
@@ -8460,6 +11953,78 @@ mod tests {
     }
 
     #[test]
+    fn proposal_current_freeze_readiness_rejects_invalid_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let captured = vec![CapturedOutput {
+            declared: DeclaredOutput {
+                output_name: "proposal_current".to_string(),
+                target_path: temp
+                    .path()
+                    .join(".chainworks/proposals/current/proposal.json")
+                    .to_string_lossy()
+                    .into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            machine_bytes: Some(br#"{"proposal_id":"087"},"rollout":{}"#.to_vec()),
+            companion_bytes: None,
+        }];
+
+        let issue = proposal_current_freeze_readiness_issue(
+            &captured,
+            temp.path().to_string_lossy().as_ref(),
+        )
+        .unwrap()
+        .expect("invalid proposal_current should fail freeze readiness");
+
+        assert!(issue
+            .validation_error
+            .contains("invalid_proposal_current_artifact"));
+    }
+
+    #[test]
+    fn proposal_current_freeze_readiness_rejects_missing_rollout_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let captured = vec![CapturedOutput {
+            declared: DeclaredOutput {
+                output_name: "proposal_current".to_string(),
+                target_path: temp
+                    .path()
+                    .join(".chainworks/proposals/current/proposal.json")
+                    .to_string_lossy()
+                    .into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            machine_bytes: Some(
+                serde_json::json!({
+                    "schema_version": "proposal_document_v1",
+                    "proposal_id": "087",
+                    "proposal_revision_id": "p087-r6"
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+            companion_bytes: None,
+        }];
+
+        let issue = proposal_current_freeze_readiness_issue(
+            &captured,
+            temp.path().to_string_lossy().as_ref(),
+        )
+        .unwrap()
+        .expect("proposal_current without rollout contract should fail freeze readiness");
+
+        assert!(issue
+            .validation_error
+            .contains("missing_rollout_contract_check"));
+    }
+
+    #[test]
     fn runtime_invocation_contract_does_not_mutate_session_fingerprint_prompt() {
         let base_prompt = "Base stable prompt".to_string();
         let declared_outputs = Vec::new();
@@ -8560,6 +12125,53 @@ mod tests {
             "code_writer",
             Some("codex_writer_high"),
             Some("WRITE")
+        ));
+    }
+
+    #[test]
+    fn xcode_host_execution_promotes_to_brokered_xcode_mcp_request() {
+        let mut requested = Vec::new();
+
+        assert!(ensure_xcode_mcp_requested_for_host_execution(
+            &mut requested,
+            true,
+            false
+        ));
+        assert_eq!(requested, vec!["xcode".to_string()]);
+
+        assert!(!ensure_xcode_mcp_requested_for_host_execution(
+            &mut requested,
+            true,
+            false
+        ));
+        assert_eq!(requested, vec!["xcode".to_string()]);
+    }
+
+    #[test]
+    fn xcode_host_execution_promotion_respects_interactive_review_suppression() {
+        let mut requested = Vec::new();
+
+        assert!(!ensure_xcode_mcp_requested_for_host_execution(
+            &mut requested,
+            true,
+            true
+        ));
+        assert!(requested.is_empty());
+    }
+
+    #[test]
+    fn xcode_host_execution_requires_broker_even_when_payload_flag_is_absent() {
+        assert!(xcode_broker_required_for_invocation(
+            &[],
+            false,
+            true,
+            false
+        ));
+        assert!(!xcode_broker_required_for_invocation(
+            &[],
+            false,
+            true,
+            true
         ));
     }
 
@@ -8773,6 +12385,7 @@ mod tests {
             )),
             chrono::Utc::now(),
             None,
+            None,
         );
         assert_eq!(facts.failure_kind, Some(AgentFailureKind::ProviderQuota));
         assert!(degraded_policy_allows_valid_failed_outputs(
@@ -8805,6 +12418,7 @@ mod tests {
                 },
             )),
             chrono::Utc::now(),
+            None,
             None,
         );
 
@@ -8847,6 +12461,392 @@ mod tests {
         assert!(!raw_debug.contains("abc123"));
     }
 
+    fn sample_runtime_receipt(
+        counters: acp::AcpRuntimeReceiptCounters,
+        failure_phase: Option<&str>,
+    ) -> acp::AcpRuntimeReceipt {
+        acp::AcpRuntimeReceipt {
+            schema_version: 1,
+            transport_family: "acp_stdio".into(),
+            provider: "junie".into(),
+            model: Some("junie-default".into()),
+            provider_session_id: Some("provider-session-1".into()),
+            session_generation_id: Some("generation-1".into()),
+            status: "failed".into(),
+            failure_phase: failure_phase.map(str::to_string),
+            started_at: "2026-05-10T04:35:44Z".into(),
+            completed_at: Some("2026-05-10T04:41:06Z".into()),
+            xcode_shim_injected: false,
+            requires_xcode_host_execution: false,
+            handshake: acp::AcpRuntimeReceiptHandshake {
+                initialize_sent_at_ms: Some(1),
+                initialize_received_at_ms: Some(2),
+                session_new_sent_at_ms: Some(3),
+                session_new_received_at_ms: Some(4),
+                prompt_sent_at_ms: Some(5),
+                terminal_response_at_ms: None,
+            },
+            counters,
+            permission_roundtrips: Vec::new(),
+            first_events: vec![acp::AcpRuntimeReceiptEvent {
+                at_ms: 5,
+                kind: "prompt_sent".into(),
+                detail: None,
+            }],
+            last_events: vec![acp::AcpRuntimeReceiptEvent {
+                at_ms: 321_000,
+                kind: "session_update:tool_call_update".into(),
+                detail: Some("tool_call_update".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn acp_runtime_facts_use_permission_roundtrip_classification_from_receipt() {
+        let receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 2,
+                session_update_count: 0,
+                permission_request_count: 1,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 0,
+                unknown_notification_count: 0,
+            },
+            Some("idle_timeout"),
+        );
+        let error = anyhow::Error::new(acp::AcpExecutionError::new(
+            "ACP session idle timeout — no message received",
+            Some(receipt),
+        ))
+        .context(anyhow::anyhow!(
+            "ACP session idle timeout — no message received"
+        ));
+
+        let facts = runtime_facts_for_acp_error(
+            domain::ids::AgentExecutionId::new(),
+            &error,
+            chrono::Utc::now(),
+        );
+
+        assert_eq!(
+            facts.supervision_classification.as_deref(),
+            Some("waiting_on_permission_roundtrip")
+        );
+    }
+
+    #[test]
+    fn acp_runtime_facts_use_active_provider_classification_from_receipt() {
+        let receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 14,
+                session_update_count: 12,
+                permission_request_count: 1,
+                permission_grant_sent_count: 1,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 1,
+                agent_thought_chunk_count: 1,
+                tool_call_count: 1,
+                tool_call_update_count: 9,
+                plan_update_count: 1,
+                meaningful_progress_count: 11,
+                unknown_notification_count: 0,
+            },
+            Some("progress_timeout"),
+        );
+        let error = anyhow::Error::new(acp::AcpExecutionError::new(
+            "ACP session progress timeout: idle_hang_before_first_progress; no meaningful progress for 300s",
+            Some(receipt),
+        ))
+        .context(anyhow::anyhow!(
+            "ACP session progress timeout: idle_hang_before_first_progress; no meaningful progress for 300s"
+        ));
+
+        let facts = runtime_facts_for_acp_error(
+            domain::ids::AgentExecutionId::new(),
+            &error,
+            chrono::Utc::now(),
+        );
+
+        assert_eq!(
+            facts.supervision_classification.as_deref(),
+            Some("provider_active_without_terminal_response")
+        );
+    }
+
+    #[test]
+    fn acp_runtime_facts_classify_post_diff_idle_as_recoverable_handoff_gap() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 1782,
+                session_update_count: 1776,
+                permission_request_count: 2,
+                permission_grant_sent_count: 2,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 1716,
+                unknown_notification_count: 1776,
+            },
+            Some("read_poll_elapsed_without_message"),
+        );
+        receipt.last_events = vec![
+            acp::AcpRuntimeReceiptEvent {
+                at_ms: 592_363,
+                kind: "session_update:text_chunk".into(),
+                detail: Some("content,text".into()),
+            },
+            acp::AcpRuntimeReceiptEvent {
+                at_ms: 595_776,
+                kind: "session_update:other".into(),
+                detail: Some("com.agentclientprotocol.rpc.JsonRpcNotification,diff".into()),
+            },
+        ];
+        let error = anyhow::Error::new(acp::AcpExecutionError::new(
+            "ACP session idle timeout — no message received",
+            Some(receipt),
+        ))
+        .context(anyhow::anyhow!(
+            "ACP session idle timeout — no message received"
+        ));
+
+        let facts = runtime_facts_for_acp_error(
+            domain::ids::AgentExecutionId::new(),
+            &error,
+            chrono::Utc::now(),
+        );
+
+        assert_eq!(
+            facts.failure_kind,
+            Some(AgentFailureKind::MissingRequiredOutputs)
+        );
+        assert_eq!(facts.operator_action_hint, Some(OperatorActionHint::Retry));
+        assert_eq!(
+            facts.supervision_classification.as_deref(),
+            Some("recoverable_handoff_gap_after_provider_progress")
+        );
+        assert_eq!(
+            facts.transport_error_code.as_deref(),
+            Some("ACP_HANDOFF_IDLE_AFTER_DIFF")
+        );
+        assert_eq!(
+            facts.output_settlement,
+            AgentOutputSettlement::MissingRequiredOutputs
+        );
+    }
+
+    #[test]
+    fn proposal_088_activation_source_uses_p037_idle_terminalization_for_recoverable_handoff_gap() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 1782,
+                session_update_count: 1776,
+                permission_request_count: 2,
+                permission_grant_sent_count: 2,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 1716,
+                unknown_notification_count: 1776,
+            },
+            Some("read_poll_elapsed_without_message"),
+        );
+        receipt.last_events = vec![acp::AcpRuntimeReceiptEvent {
+            at_ms: 595_776,
+            kind: "session_update:other".into(),
+            detail: Some("com.agentclientprotocol.rpc.JsonRpcNotification,diff".into()),
+        }];
+
+        assert_eq!(
+            p088_activation_source(Some(&receipt), Some("current_attempt_diff"), 3, false),
+            "p037_idle_terminalization"
+        );
+        assert_eq!(
+            p088_activation_source(Some(&receipt), Some("preexisting_dirty_work"), 3, false),
+            "declared_output_settlement_failed"
+        );
+        assert_eq!(
+            p088_activation_source(Some(&receipt), Some("current_attempt_diff"), 0, false),
+            "declared_output_settlement_failed"
+        );
+    }
+
+    #[test]
+    fn proposal_088_completion_capture_status_uses_proposal_vocabulary() {
+        let captured = acp::AcpCompletionTextCaptureMetadata {
+            capture_status: acp::AcpCompletionCaptureStatus::Captured,
+            capture_source: Some(acp::AcpCompletionCaptureSource::TerminalFinalResponse),
+            captured_text: Some("done".to_string()),
+            raw_byte_limit: 4096,
+            captured_byte_count: 4,
+            completion_text_truncated: false,
+            extraction_input_truncated: false,
+            extraction_input_sha256: None,
+            absence_reason: None,
+        };
+        let absent = acp::AcpCompletionTextCaptureMetadata::default();
+        let storage_failed = acp::AcpCompletionTextCaptureMetadata {
+            captured_text: Some("redacted text persisted".to_string()),
+            ..captured.clone()
+        };
+
+        assert_eq!(p088_capture_status(&captured, true, true), "captured");
+        assert_eq!(
+            p088_capture_status(&storage_failed, false, true),
+            "redacted_only"
+        );
+        assert_eq!(p088_capture_status(&absent, false, false), "unavailable");
+        assert_eq!(
+            p088_absence_reason(&absent, None, false).as_deref(),
+            Some("provider_did_not_emit_text")
+        );
+        assert_eq!(
+            p088_absence_reason(&absent, Some("completed"), false).as_deref(),
+            Some("terminal_response_without_text")
+        );
+        assert_eq!(
+            p088_absence_reason(&captured, None, false).as_deref(),
+            Some("storage_write_failed")
+        );
+        for (reason, expected) in [
+            (
+                acp::AcpCompletionAbsenceReason::TerminalResponseWithoutText,
+                "terminal_response_without_text",
+            ),
+            (
+                acp::AcpCompletionAbsenceReason::TerminalResponseCaptureTruncatedBeforeOutput,
+                "terminal_response_capture_truncated_before_output",
+            ),
+            (
+                acp::AcpCompletionAbsenceReason::ExtractionInputTruncated,
+                "extraction_input_truncated",
+            ),
+            (
+                acp::AcpCompletionAbsenceReason::RawCaptureDisabled,
+                "raw_capture_disabled",
+            ),
+            (
+                acp::AcpCompletionAbsenceReason::RedactionFailed,
+                "redaction_failed",
+            ),
+            (
+                acp::AcpCompletionAbsenceReason::StorageWriteFailed,
+                "storage_write_failed",
+            ),
+            (
+                acp::AcpCompletionAbsenceReason::RedactedStorageWriteFailed,
+                "redacted_storage_write_failed",
+            ),
+        ] {
+            let capture = acp::AcpCompletionTextCaptureMetadata {
+                absence_reason: Some(reason),
+                ..absent.clone()
+            };
+            assert_eq!(
+                p088_absence_reason(&capture, None, false).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_088_transcript_status_uses_proposal_vocabulary() {
+        assert_eq!(
+            p088_transcript_status(Some("transcript"), Some("/tmp/transcript.txt")),
+            (Some("captured".to_string()), None)
+        );
+        assert_eq!(
+            p088_transcript_status(Some("transcript"), None),
+            (
+                Some("unavailable".to_string()),
+                Some("storage_write_failed".to_string())
+            )
+        );
+        assert_eq!(
+            p088_transcript_status(None, None),
+            (
+                Some("unavailable".to_string()),
+                Some("provider_did_not_supply".to_string())
+            )
+        );
+        let reasons = [
+            P088TranscriptAbsenceReason::ProviderDidNotSupply,
+            P088TranscriptAbsenceReason::CaptureDisabled,
+            P088TranscriptAbsenceReason::CaptureFailed,
+            P088TranscriptAbsenceReason::StorageWriteFailed,
+            P088TranscriptAbsenceReason::SessionReuseWithoutTerminalCapture,
+        ]
+        .map(p088_transcript_absence_reason);
+        assert_eq!(
+            reasons,
+            [
+                "provider_did_not_supply",
+                "capture_disabled",
+                "capture_failed",
+                "storage_write_failed",
+                "session_reuse_without_terminal_capture",
+            ]
+        );
+    }
+
+    #[test]
+    fn proposal_088_operator_retry_completion_recovery_payload_requires_marker_and_preserved_evidence(
+    ) {
+        let marker_only = serde_json::json!({
+            "p088": {
+                "activation_source": "operator_retry_completion_recovery"
+            }
+        });
+        let evidence_only = serde_json::json!({
+            "p088": {
+                "preserved_historical_evidence_packet_path": ".chainworks/p088/failed-stage.json"
+            }
+        });
+        let complete = serde_json::json!({
+            "p088": {
+                "activation_source": "operator_retry_completion_recovery",
+                "preserved_historical_evidence_packet_path": ".chainworks/p088/failed-stage.json"
+            }
+        });
+
+        assert!(!payload_requests_p088_operator_retry_completion_recovery(
+            &marker_only
+        ));
+        assert!(!payload_requests_p088_operator_retry_completion_recovery(
+            &evidence_only
+        ));
+        assert!(payload_requests_p088_operator_retry_completion_recovery(
+            &complete
+        ));
+    }
+
+    #[test]
+    fn proposal_088_blocks_ineligible_attempt_after_failed_generic_repair() {
+        assert!(p088_should_block_after_generic_repair_failed(
+            true, false, 1
+        ));
+        assert!(!p088_should_block_after_generic_repair_failed(
+            true, true, 1
+        ));
+        assert!(!p088_should_block_after_generic_repair_failed(
+            true, false, 0
+        ));
+        assert!(!p088_should_block_after_generic_repair_failed(
+            false, false, 1
+        ));
+    }
+
     #[test]
     fn proposal_058_close_after_valid_output_records_nonblocking_runtime_fact() {
         let validation = TaskValidationSummary {
@@ -8876,6 +12876,7 @@ mod tests {
             None,
             chrono::Utc::now(),
             Some(&close_diagnostic),
+            None,
         );
 
         assert_eq!(
@@ -9460,4 +13461,37 @@ mod tests {
             domain::discovery::ExpectedOutputRole::Machine
         ));
     }
+}
+
+fn sanitize_release_error(s: &str) -> String {
+    const MAX_BYTES: usize = 512;
+    sanitize_error_for_storage(s, MAX_BYTES)
+}
+
+fn derive_p078_idempotency_key(
+    effect_kind: &str,
+    run_id: RunId,
+    stage_execution_id: domain::ids::StageExecutionId,
+    agent_execution_id: Option<domain::ids::AgentExecutionId>,
+    target_key: &str,
+    intent_version: u32,
+) -> String {
+    let agent = agent_execution_id
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let input = format!(
+        "p078:v1:{effect_kind}:{run_id}:{stage_execution_id}:{agent}:{target_key}:{intent_version}"
+    );
+    format!("p078:v1:{effect_kind}:{}", sha256_hex(input.as_bytes()))
+}
+
+fn derive_p078_request_fingerprint(effect_kind: &str, pairs: &[(&str, &str)]) -> String {
+    let mut input = format!("p078:request:v1:{effect_kind}");
+    for (key, value) in pairs {
+        input.push('\n');
+        input.push_str(key);
+        input.push('=');
+        input.push_str(value);
+    }
+    sha256_hex(input.as_bytes())
 }

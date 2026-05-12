@@ -1,0 +1,17 @@
+{
+  "schema_version": "p088_fixture_v1",
+  "scenario": "p087_terminal_completed_missing_outputs",
+  "run_id": "b4edcf82-0d3f-4281-83b7-f8fe94721721",
+  "stage_id": "state_7_implementation_started",
+  "agent_id": "code_writer",
+  "terminal_response_status": "completed",
+  "work_change_kind": "current_attempt_diff",
+  "required_outputs": [
+    "implementation_progress",
+    "implementation_self_assessment_v2",
+    "tests_result"
+  ],
+  "expected_failure_class": "terminal_response_completed_missing_required_outputs",
+  "expected_completion_turn_result": "failed_missing_outputs",
+  "expected_next_operator_action": "inspect_outputs_then_retry"
+}

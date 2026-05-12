@@ -71,7 +71,7 @@ Denylist includes:
 - `DerivedData`, `.build`, `node_modules`
 - `.chainworks/*.db.backup-*`, `.chainworks/*.sqlite`
 
-### Evidence Spooling (Proposal 075)
+### Evidence Spooling
 
 High-volume runtime evidence such as transcripts, tool traces, and raw runtime events are spooled directly to files under the run's `chainworks_meta_root/evidence/` directory.
 

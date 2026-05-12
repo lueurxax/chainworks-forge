@@ -1,0 +1,19 @@
+{
+  "schema_version": "p088_fixture_v1",
+  "scenario": "ingestion_boundary_failures",
+  "known_values": [
+    "acp_final_text_not_collected",
+    "chainworks_output_not_extracted",
+    "declared_output_settlement_rejected_usable_payload",
+    "terminal_response_capture_truncated_before_output",
+    "extraction_input_truncated"
+  ],
+  "typed_absence_reasons": [
+    "provider_did_not_emit_text",
+    "provider_did_not_supply",
+    "capture_disabled",
+    "capture_failed",
+    "storage_write_failed",
+    "session_reuse_without_terminal_capture"
+  ]
+}

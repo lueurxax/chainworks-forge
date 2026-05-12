@@ -1,0 +1,10 @@
+{
+  "schema_version": "p088_fixture_v1",
+  "scenario": "generated_evidence_only_ineligible",
+  "changed_paths": [
+    ".chainworks/runs/run/evidence/generated.json",
+    "artifacts/changed_files_manifest.json"
+  ],
+  "work_change_kind": "generated_artifact_only_manifest",
+  "expected_eligible_for_completion_repair": false
+}

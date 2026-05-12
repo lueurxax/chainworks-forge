@@ -1190,7 +1190,7 @@ struct RuntimeAgentExecutorTests {
                     try? await Task.sleep(for: .milliseconds(20))
                     continuation.yield(.finalOutput(content: """
                     <<<CHAINWORKS_OUTPUT:proposal_review_summary>>>
-                    {"pass":false,"average_score":7.75,"aggregate_score":7.75,"min_individual_score":4,"blocker_count":3,"summary":"revise","required_changes":["a"],"recurring_themes":["b"],"decision":"revise"}
+                    {"pass":false,"average_score":7.75,"aggregate_score":7.75,"min_individual_score":4,"blocker_count":3,"blocking_issues":["API-BLOCK-001"],"summary":"revise","blocking_required_changes":["a"],"advisory_follow_ups":[],"recurring_themes":["b"],"decision":"revise"}
                     <<<END_CHAINWORKS_OUTPUT>>>
                     """))
                     continuation.yield(.finish(reason: "end_turn", totalTokens: 42, raw: #"{"stopReason":"end_turn"}"#))

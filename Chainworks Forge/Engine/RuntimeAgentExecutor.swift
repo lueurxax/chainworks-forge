@@ -2218,6 +2218,10 @@ private struct ACPWatchdogClassificationError: LocalizedError {
                 return "ACP execution stalled after first mutating tool '\(lastMutatingToolName)' for \(Int(silenceSeconds))s"
             }
             return "ACP execution stalled after first edit boundary for \(Int(silenceSeconds))s"
+        case .waitingOnPermissionRoundtrip:
+            return SupervisionClassification.waitingOnPermissionRoundtrip.defaultSummary
+        case .providerActiveWithoutTerminalResponse:
+            return SupervisionClassification.providerActiveWithoutTerminalResponse.defaultSummary
         case .mutationSideEffectMissing:
             return SupervisionClassification.mutationSideEffectMissing.defaultSummary
         }

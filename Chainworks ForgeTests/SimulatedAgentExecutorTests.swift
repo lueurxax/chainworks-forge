@@ -214,7 +214,7 @@ struct SimulatedAgentExecutorTests {
     func allContractTemplatesProduceValidJSON() throws {
         let contractIDs = [
             "proposal_review_v1",
-            "proposal_review_summary_v1",
+            "proposal_review_summary_v2",
             "implementation_self_assessment_v1",
             "audit_report_v1",
             "security_report_v1",

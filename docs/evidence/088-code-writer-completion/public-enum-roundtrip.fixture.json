@@ -1,0 +1,18 @@
+{
+  "schema_version": "p088_fixture_v1",
+  "scenario": "public_enum_roundtrip",
+  "known_values": {
+    "ingestion_boundary_failure": [
+      "extraction_input_truncated",
+      "terminal_response_capture_truncated_before_output"
+    ],
+    "completion_turn_result": [
+      "skipped_no_live_session"
+    ]
+  },
+  "unknown_future_value": {
+    "raw": "future_completion_state",
+    "known": false,
+    "graphql_fallback": "UNKNOWN"
+  }
+}

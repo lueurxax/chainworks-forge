@@ -51,7 +51,7 @@ struct Proposal025Tests {
     @Test("Simulated canonical contract outputs satisfy bundled workflow thresholds")
     func simulatedCanonicalContractOutputsSatisfyBundledWorkflowThresholds() throws {
         let summaryData = OutputContractTemplates.generate(
-            contractID: "proposal_review_summary_v1",
+            contractID: "proposal_review_summary_v2",
             agentID: "lead_orchestrator",
             stageID: "state_4_proposal_reviewed"
         ).data

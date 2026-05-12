@@ -624,7 +624,11 @@ struct ArtifactContentRenderer: View {
             case .markdownDocument:
                 MarkdownDocumentView(content: prepared.content, localRoots: context.localRoots)
             case .jsonTree:
-                JSONTreeDocumentView(rawJSON: prepared.content)
+                if context.artifactName == "proposal_review_summary" {
+                    ProposalReviewSummaryArtifactView(rawJSON: prepared.content)
+                } else {
+                    JSONTreeDocumentView(rawJSON: prepared.content)
+                }
             case .diff:
                 DiffArtifactView(content: prepared.content)
             case .plainText(let monospaced):
@@ -1405,6 +1409,125 @@ struct JSONTreeDocumentView: View {
     }
 }
 
+private struct ProposalReviewSummaryArtifactView: View {
+    let rawJSON: String
+    private let presentation: ProposalReviewSummaryPresentation?
+
+    init(rawJSON: String) {
+        self.rawJSON = rawJSON
+        self.presentation = ProposalReviewSummaryPresentation.parse(rawJSON)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if let presentation {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 10) {
+                        Text(presentation.pass ? "Approved" : "Blocked")
+                            .font(.headline)
+                        Text("Blockers: \(presentation.blockerCount)")
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let summary = presentation.summary {
+                        Text(summary)
+                            .foregroundStyle(.primary)
+                    }
+
+                    proposalSection("Blocking Issues", items: presentation.blockingIssues)
+                    proposalSection(
+                        "Blocking Required Changes",
+                        items: presentation.blockingRequiredChanges
+                    )
+                    proposalSection("Advisory Follow-Ups", items: presentation.advisoryFollowUps)
+                    proposalSection("Recurring Themes", items: presentation.recurringThemes)
+                }
+                .padding(12)
+                .background(Color.secondary.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+
+            DisclosureGroup("Raw JSON") {
+                JSONTreeDocumentView(rawJSON: rawJSON)
+                    .padding(.top, 8)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func proposalSection(_ title: String, items: [String]) -> some View {
+        if items.isEmpty == false {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                ForEach(items, id: \.self) { item in
+                    Text("• \(item)")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+    }
+}
+
+struct ProposalReviewSummaryPresentation: Equatable {
+    let pass: Bool
+    let blockerCount: Int
+    let summary: String?
+    let blockingIssues: [String]
+    let blockingRequiredChanges: [String]
+    let advisoryFollowUps: [String]
+    let recurringThemes: [String]
+
+    static func parse(_ rawJSON: String) -> ProposalReviewSummaryPresentation? {
+        guard let data = rawJSON.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let pass = object["pass"] as? Bool,
+              let blockerCount = object["blocker_count"] as? Int
+        else {
+            return nil
+        }
+
+        return ProposalReviewSummaryPresentation(
+            pass: pass,
+            blockerCount: blockerCount,
+            summary: object["summary"] as? String,
+            blockingIssues: renderJSONArray(object["blocking_issues"]),
+            blockingRequiredChanges: renderJSONArray(
+                object["blocking_required_changes"] ?? object["required_changes"]
+            ),
+            advisoryFollowUps: renderJSONArray(object["advisory_follow_ups"]),
+            recurringThemes: renderJSONArray(object["recurring_themes"])
+        )
+    }
+
+    nonisolated private static func renderJSONArray(_ value: Any?) -> [String] {
+        guard let values = value as? [Any] else { return [] }
+        return values.compactMap(renderJSONValue)
+    }
+
+    nonisolated private static func renderJSONValue(_ value: Any) -> String? {
+        if let string = value as? String {
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        if let dict = value as? [String: Any] {
+            if let id = dict["id"] as? String, id.isEmpty == false,
+               let summary = dict["summary"] as? String, summary.isEmpty == false {
+                return "\(id): \(summary)"
+            }
+            if let id = dict["id"] as? String, id.isEmpty == false {
+                return id
+            }
+            if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
+               let string = String(data: data, encoding: .utf8) {
+                return string
+            }
+        }
+        return String(describing: value)
+    }
+}
+
 private struct JSONTreeNodeView: View {
     let node: JSONTreeNode
     let key: String?
@@ -1565,6 +1688,13 @@ struct WorkflowRunArtifactSnapshot {
             .filter { artifact in
                 artifact.name == "proposal_review_summary" || artifact.name == "proposal_current"
             }
+            .reduce(into: [String: Artifact]()) { latestByName, artifact in
+                if let current = latestByName[artifact.name], current.createdAt >= artifact.createdAt {
+                    return
+                }
+                latestByName[artifact.name] = artifact
+            }
+            .values
             .sorted { lhs, rhs in
                 Self.approvalContextRank(lhs.name) < Self.approvalContextRank(rhs.name)
             }

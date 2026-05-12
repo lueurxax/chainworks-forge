@@ -190,15 +190,34 @@ struct Proposal013Tests {
     @Test("Validation passes for valid aggregate proposal review summary JSON")
     func validationPassesForValidAggregateSummaryJSON() {
         let catalog = makeTestCatalog(withContracts: [
-            "proposal_review_summary_v1": ArtifactContract(
+            "proposal_review_summary_v2": ArtifactContract(
                 format: "json",
-                requiredFields: ["average_score", "min_individual_score", "blocker_count", "decision"]
+                requiredFields: [
+                    "pass",
+                    "average_score",
+                    "aggregate_score",
+                    "min_individual_score",
+                    "blocker_count",
+                    "blocking_issues",
+                    "summary",
+                    "blocking_required_changes",
+                    "advisory_follow_ups",
+                    "recurring_themes",
+                    "decision"
+                ]
             )
         ])
         let summaryJSON = try! JSONSerialization.data(withJSONObject: [
+            "pass": true,
             "average_score": 8.0,
+            "aggregate_score": 8.0,
             "min_individual_score": 7.0,
             "blocker_count": 0,
+            "blocking_issues": [],
+            "summary": "approved",
+            "blocking_required_changes": [],
+            "advisory_follow_ups": ["carry rollout caution into implementation"],
+            "recurring_themes": ["durability"],
             "decision": "approve"
         ])
 
@@ -209,7 +228,44 @@ struct Proposal013Tests {
         )
 
         #expect(result.status == .passed)
-        #expect(result.contractID == "proposal_review_summary_v1")
+        #expect(result.contractID == "proposal_review_summary_v2")
+    }
+
+    @Test("Validation fails for approved v2 summary that still carries blocking required changes")
+    func validationFailsForApprovedSummaryWithBlockingRequiredChanges() {
+        let catalog = makeTestCatalog(withContracts: [
+            "proposal_review_summary_v2": ArtifactContract(
+                format: "json",
+                requiredFields: [
+                    "pass", "average_score", "aggregate_score", "min_individual_score",
+                    "blocker_count", "blocking_issues", "summary",
+                    "blocking_required_changes", "advisory_follow_ups",
+                    "recurring_themes", "decision"
+                ]
+            )
+        ])
+        let summaryJSON = try! JSONSerialization.data(withJSONObject: [
+            "pass": true,
+            "average_score": 8.0,
+            "aggregate_score": 8.0,
+            "min_individual_score": 7.0,
+            "blocker_count": 0,
+            "blocking_issues": [],
+            "summary": "approved",
+            "blocking_required_changes": ["fix schema mismatch"],
+            "advisory_follow_ups": [],
+            "recurring_themes": [],
+            "decision": "approve"
+        ])
+
+        let result = ProposalReviewContractAdapter.validateReviewOutput(
+            outputName: "proposal_review_summary",
+            data: summaryJSON,
+            catalog: catalog
+        )
+
+        #expect(result.status == .failed)
+        #expect(result.validationError?.contains("pass=true while blocker evidence is non-empty") == true)
     }
 
     @Test("Validation fails for JSON output missing required fields (strict_structured)")
@@ -384,7 +440,7 @@ struct Proposal013Tests {
     @Test("Validation failure summary includes failing output name")
     func validationFailureSummaryIncludesOutputName() {
         let catalog = makeTestCatalog(withContracts: [
-            "proposal_review_summary_v1": ArtifactContract(
+            "proposal_review_summary_v2": ArtifactContract(
                 format: "json",
                 requiredFields: ["agent_id"],
                 machineFormat: "json",
@@ -396,7 +452,7 @@ struct Proposal013Tests {
             validationResults: [
                 "proposal_review_summary": OutputValidationResult(
                     outputName: "proposal_review_summary",
-                    contractID: "proposal_review_summary_v1",
+                    contractID: "proposal_review_summary_v2",
                     status: .failed,
                     missingFields: ["agent_id"],
                     validationError: "Output is not valid JSON or not a JSON object",
@@ -671,7 +727,7 @@ struct Proposal013Tests {
             outputResults: [
                 OutputValidationResult(
                     outputName: "proposal_review_summary",
-                    contractID: "proposal_review_summary_v1",
+                    contractID: "proposal_review_summary_v2",
                     status: .failed,
                     missingFields: [],
                     validationError: "Output is not valid JSON or not a JSON object",
@@ -683,10 +739,10 @@ struct Proposal013Tests {
             contractMetadata: [
                 ContractValidationMetadata(
                     outputName: "proposal_review_summary",
-                    contractID: "proposal_review_summary_v1",
+                    contractID: "proposal_review_summary_v2",
                     machineFormat: "json",
                     validationMode: "strict_structured",
-                    requiredFieldCount: 8,
+                    requiredFieldCount: 11,
                     rawArtifactName: nil,
                     normalizedArtifactName: nil
                 )
@@ -715,7 +771,7 @@ struct Proposal013Tests {
                     rawPayloadSize: 2048,
                     rawPayloadChecksum: "summary-checksum",
                     rawPayloadPersisted: true,
-                    contractID: "proposal_review_summary_v1",
+                    contractID: "proposal_review_summary_v2",
                     provider: "claude_code"
                 )
             ],
@@ -1029,7 +1085,7 @@ struct Proposal013Tests {
     @Test("ProposalReviewContractAdapter rejects markdown-only aggregate summary outputs")
     func reviewSummaryRejectsMarkdown() {
         let catalog = makeTestCatalog(withContracts: [
-            "proposal_review_summary_v1": ArtifactContract(
+            "proposal_review_summary_v2": ArtifactContract(
                 format: "json",
                 requiredFields: [
                     "pass",
@@ -1037,8 +1093,10 @@ struct Proposal013Tests {
                     "aggregate_score",
                     "min_individual_score",
                     "blocker_count",
+                    "blocking_issues",
                     "summary",
-                    "required_changes",
+                    "blocking_required_changes",
+                    "advisory_follow_ups",
                     "recurring_themes",
                     "decision"
                 ]

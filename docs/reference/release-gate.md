@@ -11,9 +11,10 @@ A release stage is a manual-approval gate that:
 3. runs sensitive release side effects through native executor code (not ACP agents),
 4. freezes delivery inputs at run start,
 5. writes canonical release artifacts at catalog-defined paths,
-6. produces a structured `delivery_receipt` that survives success, failure, retry, and terminal backfill paths.
+6. produces a structured `delivery_receipt` that survives success, failure, retry, and terminal backfill paths,
+7. ensures irreversible external operations are backed by the **durable side-effect ledger** for fail-closed recovery and reconciliation.
 
-Release side effects are irreversible, so the gate is designed to make human approval, task ordering, and receipt truth load-bearing rather than advisory.
+Release side effects are irreversible, so the gate is designed to make human approval, task ordering, durable intent, and receipt truth load-bearing rather than advisory.
 
 ## Scope
 
@@ -29,6 +30,7 @@ This reference covers:
 - frozen `delivery_configuration_json` input truth,
 - canonical release artifact paths,
 - `delivery_receipt` preserve/backfill semantics,
+- **durable side-effect reconciliation and fail-closed retry blocking**,
 - northbound readback of release configuration and evidence.
 
 It does not replace:
@@ -143,6 +145,23 @@ If the implementation self-assessment status is `blocked` (meaning code work is 
 Pending handoff tasks from the self-assessment are displayed when applicable. Handoff tasks with `blocking_review: true` use warning treatment and provide links to the full artifact or assessment panel.
 
 ### Native Release Execution
+
+### Durable Side Effects and Reconciliation
+
+To ensure that irreversible or externally visible operations (like git push or App Store Connect upload) are handled safely even across crashes or process restarts, the engine uses a **durable side-effect ledger**.
+
+1. **Durable Intent**: Before any native release operation begins, the engine persists a `side_effects` row with status `prepared`.
+2. **Fail-Closed Retry**: If a run has an unresolved side effect (status `executing` or `needs_reconciliation`), the orchestrator **blocks all retry attempts** for that stage or run. The operator must first reconcile the side effect.
+3. **Deterministic Idempotency**: Every side effect generates a deterministic `idempotency_key`. This key is passed to external services (where supported) to prevent duplicate actions if the operation is retried after a crash.
+4. **Operator Reconciliation**: If an operation's outcome is ambiguous (e.g., the daemon crashed while waiting for a git push response), the side effect moves to `needs_reconciliation`. The operator must use MCP tools (`effects.list`, `effects.reconcile`) to manually confirm the outcome before the run can proceed or retry.
+
+Supported durable side effects:
+- `git_commit`
+- `git_push`
+- `build_archive`
+- `connect_upload`
+
+`tag_create` and `artifact_publish` are schema-supported deferred kinds and are not wired to release execution paths yet.
 
 ### Release agents bypass ACP
 
@@ -273,10 +292,24 @@ The northbound contract:
 - release artifacts remain discoverable at canonical paths,
 - structured release-result truth survives into operator/report surfaces.
 
+## Side-Effect Schema
+
+The durable ledger uses three primary tables in the SQLite database:
+
+| Table | Purpose |
+|---|---|
+| `side_effects` | Header record for the irreversible intent, with status and idempotency key. |
+| `side_effect_attempts` | Individual attempt records with timestamps and raw result evidence. |
+| `side_effect_settlements` | Authoritative settlement or manual reconciliation records. |
+
 ## Implementation Surface
 
 | File | Role |
 |---|---|
+| `control-plane/crates/domain/src/side_effect.rs` | Domain models, statuses, and idempotency logic |
+| `control-plane/crates/db/src/repos/side_effects.rs` | SQLite persistence for the side-effect ledger |
+| `control-plane/crates/engine/src/side_effects.rs` | Engine-side orchestration and reconciliation logic |
+| `control-plane/crates/mcp-server/src/tools/effects.rs` | MCP tools for side-effect management (`effects.*`) |
 | `control-plane/crates/workflow/src/compiler.rs` | N-phase assignment for `sequence` and `then` blocks |
 | `control-plane/crates/workflow/src/plan.rs` | `CompiledState.post_approval_tasks`, `CompiledTask.phase` |
 | `control-plane/crates/engine/src/orchestrator.rs` | `effective_tasks()`, N-phase gating, post-approval enqueuing, end-state execution |

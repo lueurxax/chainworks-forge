@@ -86,15 +86,31 @@ artifacts:
   agent_retrospective_report: ${CHAINWORKS_META_ROOT:-.chainworks}/steward/reports/retrospective-report.json
 skills:
   proposal_review_triad:
-    type: external_skill
-    path: ../skills/proposal-review-triad
-    notes: Shared skill for PO / UX / UI / Architect proposal review lenses.
+    type: inline_skill
+    description: >-
+      Deprecated compatibility alias for old snapshots that still reference the
+      proposal review triad. Use proposal_review_router_skill for all current
+      proposal reviewer agents. Run proposal-first, evidence-backed review through
+      the requested role lens and output only the proposal_review_v1 contract.
   proposal_review_router_skill:
     type: inline_skill
-    description: Deterministic proposal reviewer routing. Build evidence-backed stack, surface, and risk tags, then select the smallest sufficient reviewer set.
+    description: >-
+      Proposal-first review router and specialist reviewer skill. In routing mode,
+      build evidence-backed stack, surface, and risk tags, then select the smallest
+      sufficient reviewer set. In specialist role mode, review the proposal through
+      the requested lens only, using local proposal/docs/reference evidence first,
+      and output only the declared structured review contract. Do not require
+      build, daemon startup, UI smoke, benchmarks, fuzzing, or live runtime proof
+      in proposal-readiness review unless the user explicitly asks for runtime
+      validation.
   proposal_implementation_audit:
-    type: external_skill
-    path: ../skills/proposal-implementation-audit
+    type: inline_skill
+    description: >-
+      Proposal-vs-implementation audit skill. Compare the approved proposal against
+      the current implementation with evidence-first requirement conformance and
+      readiness findings. Inspect only relevant code, tests, configs, docs, and
+      artifacts; run focused validation when useful; write exactly one structured
+      audit report and do not modify implementation or proposal files.
   docs_quality_guardian:
     type: builtin_agent
     name: docs-quality-guardian
@@ -152,7 +168,7 @@ contracts:
       - requires_operator_confirmation
       - recommended_action
       - rationale_summary
-  proposal_review_summary_v1:
+  proposal_review_summary_v2:
     format: json
     machine_format: json
     validation_mode: strict_structured
@@ -164,8 +180,10 @@ contracts:
       - aggregate_score
       - min_individual_score
       - blocker_count
+      - blocking_issues
       - summary
-      - required_changes
+      - blocking_required_changes
+      - advisory_follow_ups
       - recurring_themes
       - decision
   review_corpus_bundle_v1:
@@ -1221,7 +1239,7 @@ agents:
     mode: proposal_review.product_owner
     backend_profile: claude_product_high
     permission_profile: RO_REVIEW
-    skill_ref: proposal_review_triad
+    skill_ref: proposal_review_router_skill
     skill_role: product_owner
     session_reuse_scope: same_invocation_owner
     inputs:
@@ -1265,7 +1283,7 @@ agents:
     mode: proposal_review.ux
     backend_profile: gemini_review_pro
     permission_profile: RO_REVIEW
-    skill_ref: proposal_review_triad
+    skill_ref: proposal_review_router_skill
     skill_role: ux_designer
     inputs:
       - idea_brief
@@ -1308,7 +1326,7 @@ agents:
     mode: proposal_review.ui
     backend_profile: gemini_review_pro
     permission_profile: RO_REVIEW
-    skill_ref: proposal_review_triad
+    skill_ref: proposal_review_router_skill
     skill_role: ui_designer
     inputs:
       - idea_brief
@@ -1351,7 +1369,7 @@ agents:
     mode: proposal_review.architect
     backend_profile: codex_architect_high
     permission_profile: RO_REVIEW
-    skill_ref: proposal_review_triad
+    skill_ref: proposal_review_router_skill
     skill_role: architect
     inputs:
       - idea_brief
@@ -1409,7 +1427,7 @@ agents:
     mode: proposal_review.apple_architecture
     backend_profile: codex_architect_high
     permission_profile: RO_REVIEW
-    skill_ref: proposal_review_triad
+    skill_ref: proposal_review_router_skill
     skill_role: architect
     inputs:
       [
@@ -1444,7 +1462,7 @@ agents:
     mode: proposal_review.macos
     backend_profile: gemini_review_pro
     permission_profile: RO_REVIEW
-    skill_ref: proposal_review_triad
+    skill_ref: proposal_review_router_skill
     skill_role: ui_designer
     inputs:
       [
@@ -1480,7 +1498,7 @@ agents:
     mode: proposal_review.rust_architecture
     backend_profile: codex_architect_high
     permission_profile: RO_REVIEW
-    skill_ref: proposal_review_triad
+    skill_ref: proposal_review_router_skill
     skill_role: architect
     inputs:
       [
@@ -1516,7 +1534,7 @@ agents:
     mode: proposal_review.reliability
     backend_profile: claude_product_high
     permission_profile: RO_REVIEW
-    skill_ref: proposal_review_triad
+    skill_ref: proposal_review_router_skill
     skill_role: architect
     inputs:
       [
@@ -1585,7 +1603,7 @@ agents:
     mode: proposal_review.performance
     backend_profile: claude_product_high
     permission_profile: RO_REVIEW
-    skill_ref: proposal_review_triad
+    skill_ref: proposal_review_router_skill
     skill_role: architect
     inputs:
       [
@@ -1620,7 +1638,7 @@ agents:
     mode: proposal_review.security
     backend_profile: claude_product_high
     permission_profile: RO_REVIEW
-    skill_ref: proposal_review_triad
+    skill_ref: proposal_review_router_skill
     skill_role: architect
     inputs:
       [
@@ -1681,7 +1699,7 @@ agents:
     mode: proposal_review.api_contract
     backend_profile: codex_architect_high
     permission_profile: RO_REVIEW
-    skill_ref: proposal_review_triad
+    skill_ref: proposal_review_router_skill
     skill_role: architect
     inputs:
       [
@@ -1743,7 +1761,7 @@ agents:
     mode: proposal_review.observability_rollout
     backend_profile: claude_product_high
     permission_profile: RO_REVIEW
-    skill_ref: proposal_review_triad
+    skill_ref: proposal_review_router_skill
     skill_role: product_owner
     inputs:
       [

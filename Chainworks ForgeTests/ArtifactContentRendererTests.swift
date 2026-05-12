@@ -96,6 +96,31 @@ struct ArtifactContentRendererTests {
         #expect(prepared.previewNotice?.renderedAsRawText == true)
     }
 
+    @Test("Proposal review summary presentation separates blockers and advisory follow-ups")
+    func proposalReviewSummaryPresentationSeparatesBlockersAndAdvisories() {
+        let presentation = ProposalReviewSummaryPresentation.parse(
+            """
+            {
+              "pass": true,
+              "average_score": 8.8,
+              "aggregate_score": 8.8,
+              "min_individual_score": 8.2,
+              "blocker_count": 0,
+              "blocking_issues": [],
+              "summary": "approved",
+              "blocking_required_changes": [],
+              "advisory_follow_ups": ["carry rollout caution into implementation"],
+              "recurring_themes": ["durability"],
+              "decision": "approved"
+            }
+            """
+        )
+
+        #expect(presentation?.pass == true)
+        #expect(presentation?.blockingRequiredChanges.isEmpty == true)
+        #expect(presentation?.advisoryFollowUps == ["carry rollout caution into implementation"])
+    }
+
     @Test("Markdown text view skips redundant attributed string updates")
     func markdownTextViewSkipsRedundantAttributedStringUpdates() {
         let text = NSAttributedString(string: "Hello")

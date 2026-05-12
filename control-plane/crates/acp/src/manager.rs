@@ -8,6 +8,7 @@ use domain::agent::AgentStatus;
 use domain::provider::ProviderFamily;
 use domain::xcode_runtime::{
     McpBrokerObservation, XcodeRuntimeFailureClass, XcodeRuntimeObservationUpdate, XcodeShimEvent,
+    XcodeShimRuntimeAttachedEvent,
 };
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -371,7 +372,8 @@ impl AcpRuntimeManager {
             lease_ids: attachment.lease_ids.clone(),
         });
         let session_req = attachment.request;
-        self.attach_xcode_shim_runtime_if_needed(&session_req, &mut launch_spec)?;
+        self.attach_xcode_shim_runtime_if_needed(&session_req, &mut launch_spec)
+            .await?;
 
         if let Err(err) = adapter.reject_unconverted_broker_intents(&session_req) {
             self.release_xcode_leases(lease_cleanup).await;
@@ -453,7 +455,7 @@ impl AcpRuntimeManager {
         })
     }
 
-    fn attach_xcode_shim_runtime_if_needed(
+    async fn attach_xcode_shim_runtime_if_needed(
         &self,
         req: &ExecutionRequest,
         launch_spec: &mut crate::adapters::AcpLaunchSpec,
@@ -476,16 +478,43 @@ impl AcpRuntimeManager {
             })?;
         let token_id = uuid::Uuid::new_v4().to_string();
         let token_secret = uuid::Uuid::new_v4().to_string();
+        let lease_id = format!("xcode-shim-{token_id}");
         launch_spec.attach_xcode_shim_runtime(XcodeShimLaunchRuntime {
             token_id: token_id.clone(),
             token_secret,
-            lease_id: format!("xcode-shim-{token_id}"),
+            lease_id: lease_id.clone(),
             socket_path: config.socket_path,
             shim_dir: config.shim_dir,
             workspace_root: req.workspace_root.clone(),
             agent_execution_id: req.agent_execution_id,
             store: config.store,
         });
+        if let Some(agent_execution_id) = req.agent_execution_id {
+            let runtime = launch_spec
+                .xcode_shim_runtime
+                .as_ref()
+                .expect("xcode shim runtime just attached");
+            let reason = if req.requires_xcode_host_execution {
+                "requires_xcode_host_execution"
+            } else {
+                "xcode_shim_injection_signal"
+            };
+            let update = XcodeRuntimeObservationUpdate::XcodeShimEvent(
+                XcodeShimEvent::ShimRuntimeAttached(XcodeShimRuntimeAttachedEvent {
+                    ts: chrono::Utc::now(),
+                    source: "xcode_shim_runtime".to_string(),
+                    reason: reason.to_string(),
+                    lease_id,
+                    shim_dir: runtime.shim_dir.clone(),
+                    socket_path: runtime.socket_path.clone(),
+                    workspace_root: runtime.workspace_root.clone(),
+                    agent_execution_id: Some(agent_execution_id.to_string()),
+                }),
+            );
+            self.xcode_runtime_observation_sink()
+                .append_xcode_runtime_observation(agent_execution_id, update)
+                .await?;
+        }
         Ok(())
     }
 
@@ -820,6 +849,42 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingObservationSink {
+        updates: TokioMutex<Vec<(AgentExecutionId, XcodeRuntimeObservationUpdate)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl XcodeRuntimeObservationSink for RecordingObservationSink {
+        async fn append_xcode_runtime_observation(
+            &self,
+            agent_execution_id: AgentExecutionId,
+            update: XcodeRuntimeObservationUpdate,
+        ) -> anyhow::Result<()> {
+            self.updates.lock().await.push((agent_execution_id, update));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct NoopGrantStore;
+
+    impl XcodeShimGrantStore for NoopGrantStore {
+        fn insert_xcode_shim_grant(&self, _record: crate::XcodeShimGrantRecord) {}
+
+        fn set_xcode_shim_grant_active_prompt(
+            &self,
+            _token_id: &str,
+            _active_prompt: bool,
+        ) -> bool {
+            false
+        }
+
+        fn remove_xcode_shim_grant(&self, _token_id: &str) -> Option<crate::XcodeShimGrantRecord> {
+            None
+        }
+    }
+
     #[test]
     fn returns_configured_xcode_runtime_observation_sink() {
         let manager = AcpRuntimeManager::new_with_adapters(Vec::new());
@@ -1033,8 +1098,8 @@ mod tests {
             .is_none());
     }
 
-    #[test]
-    fn broker_disabled_env_suppresses_xcode_shim_injection() {
+    #[tokio::test]
+    async fn broker_disabled_env_suppresses_xcode_shim_injection() {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         let previous = std::env::var("CHAINWORKS_XCODE_BROKER_DISABLED").ok();
@@ -1079,6 +1144,7 @@ mod tests {
 
         manager
             .attach_xcode_shim_runtime_if_needed(&req, &mut launch_spec)
+            .await
             .unwrap();
 
         assert!(launch_spec.xcode_shim_runtime.is_none());
@@ -1090,6 +1156,85 @@ mod tests {
         match previous {
             Some(value) => std::env::set_var("CHAINWORKS_XCODE_BROKER_DISABLED", value),
             None => std::env::remove_var("CHAINWORKS_XCODE_BROKER_DISABLED"),
+        }
+    }
+
+    #[tokio::test]
+    async fn xcode_shim_runtime_attachment_is_persisted_as_observation() {
+        let manager = AcpRuntimeManager::new_with_adapters(Vec::new());
+        let sink = Arc::new(RecordingObservationSink::default());
+        manager.set_xcode_runtime_observation_sink(sink.clone());
+        manager.set_xcode_shim_runtime(
+            Arc::new(NoopGrantStore),
+            "/tmp/chainworks-test-xcode-shim.sock",
+            "/tmp/chainworks-test-xcode-shims",
+        );
+
+        let agent_execution_id = AgentExecutionId::new();
+        let req = ExecutionRequest {
+            agent_execution_id: Some(agent_execution_id),
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "stage_xcode".to_string(),
+            attempt_number: 1,
+            agent_id: "agent_xcode".to_string(),
+            provider: "junie".to_string(),
+            model: None,
+            effort: None,
+            workspace_root: "/tmp/workspace".to_string(),
+            prompt: "prompt".to_string(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: None,
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: None,
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: true,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
+        };
+        let mut launch_spec = crate::adapters::AcpLaunchSpec::new("/bin/sh");
+
+        manager
+            .attach_xcode_shim_runtime_if_needed(&req, &mut launch_spec)
+            .await
+            .expect("xcode shim attach");
+
+        assert!(
+            launch_spec.xcode_shim_runtime.is_some(),
+            "requires_xcode_host_execution must inject shim runtime"
+        );
+        let updates = sink.updates.lock().await;
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, agent_execution_id);
+        match &updates[0].1 {
+            XcodeRuntimeObservationUpdate::XcodeShimEvent(XcodeShimEvent::ShimRuntimeAttached(
+                event,
+            )) => {
+                assert_eq!(event.source, "xcode_shim_runtime");
+                assert_eq!(event.reason, "requires_xcode_host_execution");
+                assert_eq!(
+                    event.lease_id,
+                    launch_spec.xcode_shim_runtime.as_ref().unwrap().lease_id
+                );
+                assert_eq!(
+                    event.agent_execution_id.as_deref(),
+                    Some(agent_execution_id.to_string().as_str())
+                );
+            }
+            other => panic!("unexpected xcode observation update: {other:?}"),
         }
     }
 

@@ -6,7 +6,7 @@
 | Status | Draft |
 | Author | Codex |
 | Depends on | [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), [065-operator-retry-instruction-contract.md](065-operator-retry-instruction-contract.md), [076-auto-retry-observation-ledger-and-recovery-policy.md](076-auto-retry-observation-ledger-and-recovery-policy.md), [080-continuous-stale-execution-reconciliation.md](080-continuous-stale-execution-reconciliation.md) |
-| Related | P037, P064, P078, April 30 2026 orchestration recovery and ACP startup fixes |
+| Related | P037, P064, [durable side-effect reconciliation](../reference/execution-truth-and-recovery.md#durable-side-effect-ledger-and-reconciliation), April 30 2026 orchestration recovery and ACP startup fixes |
 | Scope | Create a reusable failure matrix and required DB/engine tests for restart, retry, stale execution, duplicate mediation, late output, and ACP startup recovery. |
 | Goal | Turn recurring recovery fixes into one state-machine proof suite instead of one-off incident patches. |
 
@@ -53,7 +53,7 @@ Initial rows:
 | duplicate session/startup | two startup claims for same work | keep one owner, fail/repair duplicate | one active session generation | capacity not double counted | duplicate owner reason |
 | stale ACP startup | running work, no provider session/activity after grace | mark stale and requeue/repair | session invalidated or repaired | one replacement work item | `startup_stalled` |
 | stale scheduler ownership | running work without live executor owner | safe repair or needs reconciliation | capacity freed only through transition | no blind retry of release side effects | `stale_repaired` or `needs_effect_reconciliation` |
-| release side-effect drift | unresolved side-effect ledger exists | block retry, route to P078 | side-effect status unchanged | no duplicate push/upload | `requires_effect_reconciliation` |
+| release side-effect drift | unresolved side-effect ledger exists | block retry, route to durable side-effect reconciliation | side-effect status unchanged | no duplicate push/upload | `requires_effect_reconciliation` |
 | retry identifier mismatch | stage execution UUID used where workflow stage id required | reject with guidance | no retry mutation | typed MCP error | valid identifier guidance |
 
 ## 4. Required Behavior
@@ -102,7 +102,7 @@ Required tests:
 
 - Do not add blind automatic retry.
 - Do not auto-resolve human approvals.
-- Do not retry release side effects while P078 reports unresolved effects.
+- Do not retry release side effects while the durable side-effect ledger reports unresolved effects.
 - Do not replace P045/P065/P076/P080; this proposal supplies their shared proof matrix.
 
 ## 7. Acceptance Criteria

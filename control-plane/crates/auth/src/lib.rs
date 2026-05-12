@@ -35,18 +35,21 @@ impl Principal {
 
     fn from_entry(entry: &PrincipalEntry) -> Self {
         let mut principal = Principal::new(entry.id.clone(), entry.class.clone());
-        if let Some(mcp) = entry
-            .surface_policies
-            .as_ref()
-            .and_then(|policies| policies.mcp.as_ref())
-        {
-            principal.tool_capabilities = mcp
-                .allowed_tools
-                .iter()
-                .filter_map(|tool| capability_tool_id_for_name(tool))
-                .filter(|id| tool_allowed_for_class(&principal.class, *id))
-                .collect();
+        if let Some(policies) = entry.surface_policies.as_ref() {
+            // surface_policies present: override class defaults. Fail closed —
+            // an absent mcp stanza means no MCP tool access, not full defaults.
+            if let Some(mcp) = policies.mcp.as_ref() {
+                principal.tool_capabilities = mcp
+                    .allowed_tools
+                    .iter()
+                    .filter_map(|tool| capability_tool_id_for_name(tool))
+                    .filter(|id| tool_allowed_for_class(&principal.class, *id))
+                    .collect();
+            } else {
+                principal.tool_capabilities = BTreeSet::new();
+            }
         }
+        // No surface_policies: v1 behavior — keep class-default tool_capabilities.
         principal
     }
 }
@@ -143,6 +146,27 @@ impl PrincipalTable {
     /// operator-class principal, write it to disk, and return the table.
     pub fn load_or_bootstrap(path: &Path) -> Result<Self, AuthError> {
         if path.exists() {
+            // Security: reject symlinks and files with permissions other than 0600 (HIGH-002).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let meta = std::fs::symlink_metadata(path).map_err(|e| {
+                    AuthError::TableLoadFailed(format!("stat {}: {e}", path.display()))
+                })?;
+                if meta.file_type().is_symlink() {
+                    return Err(AuthError::TableLoadFailed(
+                        "principals.json must not be a symlink".into(),
+                    ));
+                }
+                let mode = meta.mode() & 0o777;
+                if mode != 0o600 {
+                    return Err(AuthError::TableLoadFailed(format!(
+                        "principals.json has unsafe permissions {:o}; expected 0600",
+                        mode
+                    )));
+                }
+            }
+
             let content = std::fs::read_to_string(path)
                 .map_err(|e| AuthError::TableLoadFailed(format!("read {}: {e}", path.display())))?;
             let file: PrincipalTableFile = serde_json::from_str(&content).map_err(|e| {
@@ -179,10 +203,12 @@ impl PrincipalTable {
             {
                 use std::io::Write;
                 use std::os::unix::fs::OpenOptionsExt;
+                // create_new(true) maps to O_CREAT|O_EXCL — fails atomically if a file or
+                // symlink was placed at `path` between the exists() check and this open,
+                // preventing TOCTOU-based symlink substitution attacks.
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
-                    .create(true)
-                    .truncate(true)
+                    .create_new(true)
                     .mode(0o600)
                     .open(path)
                     .map_err(|e| {
@@ -200,8 +226,7 @@ impl PrincipalTable {
             }
             tracing::info!(
                 path = %path.display(),
-                token = %token,
-                "Auto-bootstrapped default operator principal"
+                "Auto-bootstrapped default operator principal (token written to file, not logged)"
             );
             Ok(PrincipalTable {
                 entries: vec![entry],
@@ -494,7 +519,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 27] {
+fn all_tool_capabilities() -> [CapabilityToolId; 33] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -523,6 +548,12 @@ fn all_tool_capabilities() -> [CapabilityToolId; 27] {
         CapabilityToolId::StorageEvidenceSpoolSummary,
         CapabilityToolId::StorageReconcileEvidenceOrphans,
         CapabilityToolId::ProposalGateSettle,
+        CapabilityToolId::EffectsList,
+        CapabilityToolId::EffectsInspect,
+        CapabilityToolId::EffectsReconcile,
+        CapabilityToolId::EffectsMarkConflict,
+        CapabilityToolId::EffectsMarkUnrecoverable,
+        CapabilityToolId::EffectsClearAfterManualVerification,
     ]
 }
 
@@ -579,6 +610,17 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
             matches!(class, PrincipalClass::Operator)
         }
         CapabilityToolId::ProposalGateSettle => matches!(class, PrincipalClass::Operator),
+        // P078: All effects.* tools are Operator-only. The MCP surface is the
+        // only reconciliation command/control path; last_error and evidence_root
+        // may contain sensitive adapter output so Observer access is not granted.
+        CapabilityToolId::EffectsList => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::EffectsInspect => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::EffectsReconcile => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::EffectsMarkConflict => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::EffectsMarkUnrecoverable => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::EffectsClearAfterManualVerification => {
+            matches!(class, PrincipalClass::Operator)
+        }
     }
 }
 
@@ -677,6 +719,14 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "storage.evidence_spool_summary" => Some(CapabilityToolId::StorageEvidenceSpoolSummary),
         "storage.reconcile_evidence_orphans" => {
             Some(CapabilityToolId::StorageReconcileEvidenceOrphans)
+        }
+        "effects.list" => Some(CapabilityToolId::EffectsList),
+        "effects.inspect" => Some(CapabilityToolId::EffectsInspect),
+        "effects.reconcile" => Some(CapabilityToolId::EffectsReconcile),
+        "effects.mark_conflict" => Some(CapabilityToolId::EffectsMarkConflict),
+        "effects.mark_unrecoverable" => Some(CapabilityToolId::EffectsMarkUnrecoverable),
+        "effects.clear_after_manual_verification" => {
+            Some(CapabilityToolId::EffectsClearAfterManualVerification)
         }
         _ => None,
     }
@@ -1315,6 +1365,242 @@ mod tests {
         assert_eq!(
             is_subscription_allowed_by_surface_policy(&table, "v1-operator"),
             None
+        );
+    }
+
+    // ── P078 effects.* auth tests ─────────────────────────────────────────
+
+    #[test]
+    fn proposal_078_effects_tool_names_are_recognized() {
+        // All P078 effects.* tool names must resolve to their CapabilityToolIds.
+        // Without these arms, v2 principal tables listing effects.* tools would
+        // crash the principal-table loader with "unknown MCP tool".
+        let cases = [
+            ("effects.list", CapabilityToolId::EffectsList),
+            ("effects.inspect", CapabilityToolId::EffectsInspect),
+            ("effects.reconcile", CapabilityToolId::EffectsReconcile),
+            (
+                "effects.mark_conflict",
+                CapabilityToolId::EffectsMarkConflict,
+            ),
+            (
+                "effects.mark_unrecoverable",
+                CapabilityToolId::EffectsMarkUnrecoverable,
+            ),
+            (
+                "effects.clear_after_manual_verification",
+                CapabilityToolId::EffectsClearAfterManualVerification,
+            ),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                capability_tool_id_for_name(name),
+                Some(expected),
+                "capability_tool_id_for_name({name}) must return {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_078_effects_tools_operator_only() {
+        // All effects.* tools must be granted to Operator and denied to Observer/Agent.
+        let op = Principal::new("op", PrincipalClass::Operator);
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        for tool in [
+            "effects.list",
+            "effects.inspect",
+            "effects.reconcile",
+            "effects.mark_conflict",
+            "effects.mark_unrecoverable",
+            "effects.clear_after_manual_verification",
+        ] {
+            assert!(is_tool_allowed(&op, tool), "Operator must have {tool}");
+            assert!(!is_tool_allowed(&ob, tool), "Observer must not have {tool}");
+            assert!(!is_tool_allowed(&ag, tool), "Agent must not have {tool}");
+        }
+    }
+
+    #[test]
+    fn proposal_078_v2_principal_with_effects_tools_is_accepted() {
+        // A v2 principal table listing effects.* tools must not be rejected.
+        let entries = vec![PrincipalEntry {
+            token: "tok".into(),
+            id: "default-operator".into(),
+            class: PrincipalClass::Operator,
+            surface_policies: Some(SurfacePolicies {
+                graphql: Some(GraphqlPolicy {
+                    allow_queries: true,
+                    allow_subscriptions: true,
+                    allowed_mutations: approval_mutations(),
+                }),
+                mcp: Some(McpPolicy {
+                    allowed_tools: vec![
+                        "effects.list".into(),
+                        "effects.inspect".into(),
+                        "effects.reconcile".into(),
+                    ],
+                }),
+            }),
+        }];
+        assert!(
+            validate_v2_principals(&entries).is_ok(),
+            "v2 principal table with effects.* tools must be accepted"
+        );
+    }
+
+    #[test]
+    fn proposal_078_resolve_bearer_grants_effects_tools_from_surface_policy() {
+        let table = PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: "tok-effects".into(),
+                id: "default-operator".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: Some(GraphqlPolicy {
+                        allow_queries: true,
+                        allow_subscriptions: true,
+                        allowed_mutations: approval_mutations(),
+                    }),
+                    mcp: Some(McpPolicy {
+                        allowed_tools: vec![
+                            "effects.list".into(),
+                            "effects.inspect".into(),
+                            "effects.reconcile".into(),
+                        ],
+                    }),
+                }),
+            }],
+        };
+        let p = resolve_bearer("tok-effects", &table).unwrap();
+        assert!(p.tool_capabilities.contains(&CapabilityToolId::EffectsList));
+        assert!(p
+            .tool_capabilities
+            .contains(&CapabilityToolId::EffectsInspect));
+        assert!(p
+            .tool_capabilities
+            .contains(&CapabilityToolId::EffectsReconcile));
+        assert!(!p
+            .tool_capabilities
+            .contains(&CapabilityToolId::EffectsMarkUnrecoverable));
+    }
+
+    // ── HIGH-001 regression: v2 surface_policies present but mcp absent → empty tools ──
+
+    #[test]
+    fn high_001_v2_surface_policies_with_no_mcp_stanza_fails_closed() {
+        // A v2 principal that has surface_policies but omits the mcp stanza
+        // must resolve to ZERO tool_capabilities — NOT the class-default set.
+        let table = PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: "tok-no-mcp".into(),
+                id: "default-operator".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: Some(GraphqlPolicy {
+                        allow_queries: true,
+                        allow_subscriptions: true,
+                        allowed_mutations: approval_mutations(),
+                    }),
+                    mcp: None, // deliberately absent
+                }),
+            }],
+        };
+
+        let p = resolve_bearer("tok-no-mcp", &table).unwrap();
+
+        // Must have zero MCP tools — fail closed, not class defaults.
+        assert!(
+            p.tool_capabilities.is_empty(),
+            "A v2 principal with surface_policies but no mcp stanza must have \
+             empty tool_capabilities, got {:?}",
+            p.tool_capabilities
+        );
+
+        // Crucially, the dangerous effects.* tools must NOT be granted.
+        assert!(
+            !p.tool_capabilities
+                .contains(&CapabilityToolId::EffectsMarkUnrecoverable),
+            "effects.mark_unrecoverable must not be granted when mcp stanza is absent"
+        );
+        assert!(
+            !p.tool_capabilities
+                .contains(&CapabilityToolId::EffectsClearAfterManualVerification),
+            "effects.clear_after_manual_verification must not be granted when mcp stanza is absent"
+        );
+    }
+
+    #[test]
+    fn high_001_v1_principal_without_surface_policies_keeps_class_defaults() {
+        // A v1 principal (no surface_policies at all) must still get class-default tools.
+        let table = PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: "tok-v1".into(),
+                id: "v1-op".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: None,
+            }],
+        };
+
+        let p = resolve_bearer("tok-v1", &table).unwrap();
+        assert!(
+            !p.tool_capabilities.is_empty(),
+            "v1 principal without surface_policies must keep class-default tool_capabilities"
+        );
+        assert!(
+            p.tool_capabilities.contains(&CapabilityToolId::RunsList),
+            "v1 operator must have runs.list by default"
+        );
+    }
+
+    // ── HIGH-002 regression: bootstrap log must not contain the bearer token ──
+
+    #[test]
+    fn high_002_bootstrap_log_does_not_contain_token() {
+        use std::sync::{Arc, Mutex};
+
+        let log_output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log_output_clone = log_output.clone();
+        let make_writer = move || CaptureWriter(log_output_clone.clone());
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(make_writer)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        let dir = tempfile::tempdir().expect("create tmp dir");
+        let path = dir.path().join("principals.json");
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _table =
+                PrincipalTable::load_or_bootstrap(&path).expect("bootstrap should succeed");
+        });
+
+        // Read the actual token that was written to the file
+        let content = std::fs::read_to_string(&path).expect("principals file exists");
+        let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
+        let token = parsed["principals"][0]["token"]
+            .as_str()
+            .expect("token field present");
+
+        let log_str = String::from_utf8_lossy(&log_output.lock().unwrap()).to_string();
+
+        assert!(
+            !log_str.contains(token),
+            "Bootstrap log must not contain the bearer token. \
+             Token was found in log output. This is a security regression (HIGH-002)."
         );
     }
 

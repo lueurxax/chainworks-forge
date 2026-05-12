@@ -2122,6 +2122,38 @@ async fn p075_projection_rebuild_uses_production_class_b_coalescing() {
     writer.shutdown().await;
 }
 
+#[test]
+fn projection_rebuild_survives_small_runtime_stack() {
+    let worker = std::thread::Builder::new()
+        .name("small-stack-projection-caller".into())
+        .stack_size(512 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let pool = test_pool().await;
+                register_test_shared_writer(&pool).await;
+                let run_id = insert_p017_run(&pool).await;
+
+                projections::rebuild_all_for_run(&pool, run_id)
+                    .await
+                    .unwrap();
+
+                let projection = projections::find_run_projection(&pool, &run_id.to_string())
+                    .await
+                    .unwrap()
+                    .expect("run projection");
+                assert_eq!(projection.id, run_id.to_string());
+                assert!(projection.projection_present);
+            });
+        })
+        .expect("spawn small-stack projection caller");
+
+    worker.join().expect("small-stack projection caller");
+}
+
 /// Northbound projections must expose canonical run status even when the
 /// denormalized summary row has not caught up yet.
 #[tokio::test]

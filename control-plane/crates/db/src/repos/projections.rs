@@ -1,4 +1,6 @@
-use anyhow::Result;
+use std::future::Future;
+
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use domain::ids::RunId;
 use serde::Serialize;
@@ -20,6 +22,55 @@ async fn execute_projection_write(
     op.idempotency_key = idempotency_key.into();
     op.observed_at = Some(Utc::now().timestamp_millis().max(0) as u64);
     execute_repository_transaction_operation(pool, op, operation_name, work).await
+}
+
+const PROJECTION_REBUILD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+async fn run_projection_rebuild_on_dedicated_stack<F, Fut, T>(
+    name: &'static str,
+    future: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let worker = std::thread::Builder::new()
+            .name(format!("projection-rebuild-{name}"))
+            .stack_size(PROJECTION_REBUILD_STACK_BYTES)
+            .spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.block_on(future())
+                }))
+            })
+            .with_context(|| format!("spawn projection rebuild worker for {name}"))?;
+
+        match worker.join() {
+            Ok(Ok(result)) => result,
+            Ok(Err(payload)) => Err(anyhow!(
+                "projection rebuild {name} panicked: {}",
+                panic_payload_to_string(payload)
+            )),
+            Err(payload) => Err(anyhow!(
+                "projection rebuild {name} worker panicked: {}",
+                panic_payload_to_string(payload)
+            )),
+        }
+    })
+    .await
+    .with_context(|| format!("join projection rebuild task for {name}"))?
+}
+
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +387,14 @@ pub async fn find_run_projection(
 
 /// Rebuild run_summary for a single run from canonical tables.
 pub async fn rebuild_run_summary(pool: &SqlitePool, run_id: RunId) -> Result<()> {
+    let pool = pool.clone();
+    run_projection_rebuild_on_dedicated_stack("run-summary", move || async move {
+        rebuild_run_summary_on_current_thread(&pool, run_id).await
+    })
+    .await
+}
+
+async fn rebuild_run_summary_on_current_thread(pool: &SqlitePool, run_id: RunId) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     let run_id_string = run_id.to_string();
 
@@ -444,6 +503,14 @@ fn build_cancellation_settlement_summary(raw: &str) -> Option<String> {
 
 /// Rebuild stage_summaries for all stages in a run.
 pub async fn rebuild_stage_summaries(pool: &SqlitePool, run_id: RunId) -> Result<()> {
+    let pool = pool.clone();
+    run_projection_rebuild_on_dedicated_stack("stage-summaries", move || async move {
+        rebuild_stage_summaries_on_current_thread(&pool, run_id).await
+    })
+    .await
+}
+
+async fn rebuild_stage_summaries_on_current_thread(pool: &SqlitePool, run_id: RunId) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     let run_id_string = run_id.to_string();
 
@@ -486,6 +553,14 @@ pub async fn rebuild_stage_summaries(pool: &SqlitePool, run_id: RunId) -> Result
 
 /// Rebuild approval_inbox for a run.
 pub async fn rebuild_approval_inbox(pool: &SqlitePool, run_id: RunId) -> Result<()> {
+    let pool = pool.clone();
+    run_projection_rebuild_on_dedicated_stack("approval-inbox", move || async move {
+        rebuild_approval_inbox_on_current_thread(&pool, run_id).await
+    })
+    .await
+}
+
+async fn rebuild_approval_inbox_on_current_thread(pool: &SqlitePool, run_id: RunId) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     let run_id_string = run_id.to_string();
 
@@ -531,6 +606,17 @@ pub async fn rebuild_approval_inbox(pool: &SqlitePool, run_id: RunId) -> Result<
 
 /// Rebuild artifact_index entries for new artifacts in a run.
 pub async fn upsert_artifact_index_entry(pool: &SqlitePool, run_id: RunId) -> Result<()> {
+    let pool = pool.clone();
+    run_projection_rebuild_on_dedicated_stack("artifact-index", move || async move {
+        upsert_artifact_index_entry_on_current_thread(&pool, run_id).await
+    })
+    .await
+}
+
+async fn upsert_artifact_index_entry_on_current_thread(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<()> {
     let run_id_string = run_id.to_string();
     execute_projection_write(
         pool,
@@ -699,10 +785,18 @@ pub struct ArtifactIndexRow {
 
 /// Full projection rebuild for a run (all tables).
 pub async fn rebuild_all_for_run(pool: &SqlitePool, run_id: RunId) -> Result<()> {
-    rebuild_run_summary(pool, run_id).await?;
-    rebuild_stage_summaries(pool, run_id).await?;
-    rebuild_approval_inbox(pool, run_id).await?;
-    upsert_artifact_index_entry(pool, run_id).await?;
+    let pool = pool.clone();
+    run_projection_rebuild_on_dedicated_stack("all-for-run", move || async move {
+        rebuild_all_for_run_on_current_thread(&pool, run_id).await
+    })
+    .await
+}
+
+async fn rebuild_all_for_run_on_current_thread(pool: &SqlitePool, run_id: RunId) -> Result<()> {
+    rebuild_run_summary_on_current_thread(pool, run_id).await?;
+    rebuild_stage_summaries_on_current_thread(pool, run_id).await?;
+    rebuild_approval_inbox_on_current_thread(pool, run_id).await?;
+    upsert_artifact_index_entry_on_current_thread(pool, run_id).await?;
     artifact_contracts::rebuild_projection_and_exports(pool, run_id).await?;
     info!(run_id = %run_id, "Full projection rebuild complete");
     Ok(())

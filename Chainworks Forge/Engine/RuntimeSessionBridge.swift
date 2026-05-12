@@ -675,6 +675,9 @@ final class RuntimeSessionBridge: Sendable {
                 for field in hint.requiredFields {
                     parts.append("- \(field)")
                 }
+                for line in hint.guidance {
+                    parts.append(line)
+                }
 
                 // For proposal_review contracts, provide an explicit JSON template
                 // to prevent codex/gpt providers from producing invalid output
@@ -858,6 +861,7 @@ final class RuntimeSessionBridge: Sendable {
         let outputName: String
         let contractID: String
         let requiredFields: [String]
+        let guidance: [String]
     }
 
     private static func structuredOutputHints(
@@ -878,7 +882,8 @@ final class RuntimeSessionBridge: Sendable {
                 hintsByOutput[outputName] = StructuredOutputHint(
                     outputName: outputName,
                     contractID: schema.contractID,
-                    requiredFields: schema.requiredFields
+                    requiredFields: schema.requiredFields,
+                    guidance: outputName == "proposal_review_summary" ? reviewSummaryGuidance() : []
                 )
                 continue
             }
@@ -887,13 +892,15 @@ final class RuntimeSessionBridge: Sendable {
                 hintsByOutput[outputName] = StructuredOutputHint(
                     outputName: outputName,
                     contractID: ProposalReviewContractAdapter.reviewContractID,
-                    requiredFields: reviewRequiredFields(agentID: agent.id)
+                    requiredFields: reviewRequiredFields(agentID: agent.id),
+                    guidance: []
                 )
             } else if isProposalReviewSummaryOutput(outputName) {
                 hintsByOutput[outputName] = StructuredOutputHint(
                     outputName: outputName,
                     contractID: ProposalReviewContractAdapter.summaryContractID,
-                    requiredFields: reviewSummaryRequiredFields()
+                    requiredFields: reviewSummaryRequiredFields(),
+                    guidance: reviewSummaryGuidance()
                 )
             }
         }
@@ -929,10 +936,22 @@ final class RuntimeSessionBridge: Sendable {
             "aggregate_score: Number",
             "min_individual_score: Number",
             "blocker_count: Integer",
+            "blocking_issues: Array",
             "summary: String",
-            "required_changes: Array of Strings",
+            "blocking_required_changes: Array of Strings",
+            "advisory_follow_ups: Array of Strings",
             "recurring_themes: Array of Strings",
             "decision: String"
+        ]
+    }
+
+    private static func reviewSummaryGuidance() -> [String] {
+        [
+            "Keep blocker truth and advisory follow-ups separate.",
+            "- Put refinement-blocking work only in `blocking_required_changes`.",
+            "- Put implementation notes, rollout cautions, and non-blocking suggestions only in `advisory_follow_ups`.",
+            "- If `pass` is `true`, then `blocker_count` must be `0`, `blocking_issues` must be empty, and `blocking_required_changes` must be empty.",
+            "- If `pass` is `false`, at least one of `blocker_count > 0`, non-empty `blocking_issues`, or non-empty `blocking_required_changes` must be true."
         ]
     }
 

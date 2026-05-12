@@ -153,6 +153,34 @@ Shared ACP plumbing lives in `control-plane/crates/acp/src/transport.rs`.
 Junie must be launched in explicit ACP mode with `--acp true`; plain `junie`
 does not enter the JSON-RPC ACP handshake.
 
+When an invocation declares `requires_xcode_host_execution` or
+`xcode_shim_injection_signal`, the engine treats that as a brokered `xcode` MCP
+requirement before ACP startup. This forces Xcode MCP lease acquisition and
+warm-up to happen before the provider subprocess receives the task; if the
+broker or registry is unavailable, the invocation fails closed before the agent
+is launched.
+
+Runtime provider subprocesses start with cwd set to the active execution root:
+the run worktree for write-enabled implementation work, otherwise
+`workspace_root`. This keeps terminal commands, provider-local project context,
+and MCP-backed tool resolution aligned with the same tree the orchestrator
+expects the agent to operate on.
+
+Permission auto-grant prefers provider-declared read-only allowlist options
+before falling back to one-shot approval. This preserves autonomous operation
+without repeatedly exercising fragile terminal approval round-trips for safe
+read-only commands such as `cat`, `ls`, and `grep`.
+
+If an ACP session fails by idle/progress timeout after provider progress and the
+runtime receipt's final events include streamed text or a diff update, the
+engine records the failure as a recoverable handoff gap instead of an ordinary
+provider timeout. The persisted runtime facts use
+`failure_kind = missing_required_outputs`,
+`supervision_classification = recoverable_handoff_gap_after_provider_progress`,
+and `transport_error_code = ACP_HANDOFF_IDLE_AFTER_DIFF`. Permission waits still
+win first: an ungranted permission request remains classified as
+`waiting_on_permission_roundtrip`.
+
 The Swift app process does not spawn live ACP providers. It reads durable run
 truth through GraphQL and disk-backed artifacts, and its local transport factory
 rejects live ACP adapter families.

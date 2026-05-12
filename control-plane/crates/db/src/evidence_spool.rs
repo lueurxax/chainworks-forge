@@ -604,19 +604,23 @@ async fn create_spool_parent_safe(canonical_root: &Path, parent_path: &Path) -> 
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 #[cfg(unix)]
-                tokio::fs::DirBuilder::new()
+                let create_result = tokio::fs::DirBuilder::new()
                     .recursive(false)
                     .mode(0o700)
                     .create(&current)
-                    .await
-                    .with_context(|| format!("create spool directory {}", current.display()))?;
+                    .await;
                 #[cfg(not(unix))]
-                tokio::fs::create_dir(&current)
-                    .await
-                    .with_context(|| format!("create spool directory {}", current.display()))?;
+                let create_result = tokio::fs::create_dir(&current).await;
+
+                if let Err(create_error) = create_result {
+                    if create_error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(anyhow::Error::from(create_error)
+                            .context(format!("create spool directory {}", current.display())));
+                    }
+                }
                 // Post-create verify: confirm we actually created a real directory.
-                // Guards against a race where another process created a symlink at this
-                // path between our symlink_metadata check and the mkdir (SEC-001).
+                // Guards against a race where another process created the directory
+                // or swapped in a symlink between our symlink_metadata check and mkdir.
                 match tokio::fs::symlink_metadata(&current).await {
                     Ok(m) if m.file_type().is_symlink() => {
                         return Err(anyhow::anyhow!(
@@ -928,6 +932,44 @@ mod tests {
             .await
             .expect("nested path should succeed");
         assert!(output.absolute_path.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn write_spool_file_tolerates_concurrent_parent_creation() {
+        use std::sync::Arc;
+        use tokio::sync::Barrier;
+
+        let dir = TempDir::new().unwrap();
+
+        for round in 0..32 {
+            let barrier = Arc::new(Barrier::new(16));
+            let mut tasks = Vec::new();
+
+            for task_index in 0..16 {
+                let barrier = Arc::clone(&barrier);
+                let artifact_root = dir.path().to_path_buf();
+                let relative_path = format!(
+                    "evidence/runs/run-concurrent/stages/s-{round}/agents/a-1/runtime_event/file-{task_index}.json"
+                );
+                tasks.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    tokio::task::yield_now().await;
+                    write_spool_file(
+                        &artifact_root,
+                        "run-concurrent",
+                        &relative_path,
+                        br#"{\"ok\":true}"#,
+                    )
+                    .await
+                }));
+            }
+
+            for task in tasks {
+                task.await
+                    .expect("join should succeed")
+                    .expect("concurrent parent creation should not fail");
+            }
+        }
     }
 
     // ── Security regression tests ─────────────────────────────────────────────

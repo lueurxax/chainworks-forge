@@ -17,6 +17,8 @@ struct OutputContractTemplates {
         case "proposal_review_v1":
             return (proposalReview(agentID: agentID), .json)
         case "proposal_review_summary_v1":
+            return (proposalReviewSummaryV1(), .json)
+        case "proposal_review_summary_v2":
             return (proposalReviewSummary(), .json)
         case "review_corpus_bundle_v1":
             return (reviewCorpusBundle(), .json)
@@ -146,7 +148,7 @@ struct OutputContractTemplates {
         return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
     }
 
-    private static func proposalReviewSummary() -> Data {
+    private static func proposalReviewSummaryV1() -> Data {
         let json: [String: Any] = [
             "pass": true,
             "average_score": 9.25,
@@ -155,6 +157,25 @@ struct OutputContractTemplates {
             "blocker_count": 0,
             "summary": "The proposal clears the review threshold and can move to approval.",
             "required_changes": [] as [String],
+            "recurring_themes": ["Testing coverage", "Error handling"],
+            "decision": "proceed"
+        ]
+        return try! JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    private static func proposalReviewSummary() -> Data {
+        let json: [String: Any] = [
+            "pass": true,
+            "average_score": 9.25,
+            "aggregate_score": 9.25,
+            "min_individual_score": 9.1,
+            "blocker_count": 0,
+            "blocking_issues": [] as [String],
+            "summary": "The proposal clears the review threshold and can move to approval.",
+            "blocking_required_changes": [] as [String],
+            "advisory_follow_ups": [
+                "Carry rollout caution notes into implementation planning"
+            ],
             "recurring_themes": ["Testing coverage", "Error handling"],
             "decision": "proceed"
         ]

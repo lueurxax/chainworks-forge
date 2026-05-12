@@ -31,11 +31,11 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 ### Execution engine
 
-- [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume, declarative workflow authority, and conflict resolution / lead mediation
+- [reference/workflow-execution-engine.md](reference/workflow-execution-engine.md) — RunPlan compiler, orchestrator, executors, artifact management, resume, declarative workflow authority, durable side-effect ledger, and conflict resolution / lead mediation
 - [reference/artifact-discovery-and-settlement-optimization.md](reference/artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [reference/runtime-contract.md](reference/runtime-contract.md) — Frozen run snapshots, state machines, artifact model
-- [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Terminal outcomes, atomic transition settlement, cursor-driven resume, recovery precedence, host interruption, workflow conflict recovery, and startup recovery progress
-- [reference/rust-control-plane.md](reference/rust-control-plane.md) — Rust + SQLite daemon: architecture, crate layout, persistence, boundaries, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, and generated-state housekeeping
+- [reference/execution-truth-and-recovery.md](reference/execution-truth-and-recovery.md) — Terminal outcomes, atomic transition settlement, cursor-driven resume, recovery precedence, host interruption, workflow conflict recovery, durable side-effect reconciliation, and startup recovery progress
+- [reference/rust-control-plane.md](reference/rust-control-plane.md) — Rust + SQLite daemon: architecture, crate layout, persistence, side-effect ledger, boundaries, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, and generated-state housekeeping
 
 ### Agents, skills, and MCP
 
@@ -76,6 +76,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/operator-experience.md](reference/operator-experience.md) — Operator shell baseline, backpressure visibility, and host interruption labels
 - [reference/p031-operator-write-path-guide.md](reference/p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls; the `p031` filename is a retained gate alias
 - [reference/query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) — Canonical GraphQL projection read contract for the thin macOS client
+- [reference/thin-client-read-model-affordance-contract.md](reference/thin-client-read-model-affordance-contract.md) — Thin-client affordance contract: GraphQL-driven UI state, actionability, and fallback copy
 - [reference/run-surface-information-architecture-and-artifact-hierarchy.md](reference/run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, focused timeline, artifact hierarchy
 - [reference/live-workflow-map.md](reference/live-workflow-map.md) — Workflow topology and agent-activity surface
 - [reference/artifact-content-rendering.md](reference/artifact-content-rendering.md) — Unified read-only markdown/JSON rendering

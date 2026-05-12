@@ -15,7 +15,8 @@ use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::artifact_contracts::{
-    contract_status_allowed_values, ImplementationSelfAssessmentStatus,
+    contract_status_allowed_values, proposal_review_summary_transition_truth_conflict,
+    ImplementationSelfAssessmentStatus,
 };
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::events::DomainEvent;
@@ -1695,6 +1696,21 @@ impl Orchestrator {
                 &persisted_artifacts,
             )
             .await?;
+        if !approved_proposal_present {
+            if let Some(proposal_current) = persisted_artifacts
+                .iter()
+                .rev()
+                .find(|artifact| artifact.name == "proposal_current")
+            {
+                let _ = crate::rollout_contract_preflight::persist_proposal_current_rollout_contract_hold(
+                    &self.pool,
+                    run,
+                    proposal_current,
+                    0,
+                )
+                .await?;
+            }
+        }
 
         let preflight =
             crate::rollout_contract_preflight::implementation_run_start_rollout_contract_preflight(
@@ -1761,6 +1777,7 @@ impl Orchestrator {
         if run.status != RunStatus::Blocked {
             runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
         }
+        artifact_contracts::rebuild_projection_and_exports(&self.pool, run_id).await?;
         let _ = self.events.send(DomainEvent::StageStatusChanged {
             run_id,
             stage_execution_id: stage.id,
@@ -4935,79 +4952,16 @@ impl Orchestrator {
             return Ok(None);
         }
 
-        let pass = self
-            .read_artifact_field("proposal_review_summary", "pass", run, plan)
+        let Some(summary_json) = self
+            .read_artifact_json("proposal_review_summary", run, plan)
             .await
-            .and_then(|value| value.as_bool());
-        let blocker_count = self
-            .read_artifact_field("proposal_review_summary", "blocker_count", run, plan)
-            .await
-            .and_then(|value| json_value_to_u64(&value));
-        let blocking_issues = self
-            .read_artifact_field("proposal_review_summary", "blocking_issues", run, plan)
-            .await;
-        let required_changes = self
-            .read_artifact_field("proposal_review_summary", "required_changes", run, plan)
-            .await;
-        let decision = self
-            .read_artifact_field("proposal_review_summary", "decision", run, plan)
-            .await
-            .and_then(|value| value.as_str().map(str::to_string));
+        else {
+            return Ok(None);
+        };
 
-        let has_blocker_count = blocker_count.is_some_and(|count| count > 0);
-        let has_blocking_issues = json_value_has_entries(blocking_issues.as_ref());
-        let has_required_changes = json_value_has_entries(required_changes.as_ref());
-        let has_blocking_evidence =
-            has_blocker_count || has_blocking_issues || has_required_changes;
-
-        if pass == Some(true) && has_blocking_evidence {
-            return Ok(Some(
-                "proposal_review_summary_v1 has pass=true while blocker evidence is non-empty"
-                    .to_string(),
-            ));
-        }
-
-        let explicitly_no_blocking_issues = blocking_issues
-            .as_ref()
-            .is_some_and(json_value_is_empty_collection);
-        let explicitly_no_required_changes = required_changes
-            .as_ref()
-            .is_some_and(json_value_is_empty_collection);
-        if pass == Some(false)
-            && blocker_count == Some(0)
-            && explicitly_no_blocking_issues
-            && explicitly_no_required_changes
-        {
-            return Ok(Some(
-                "proposal_review_summary_v1 has pass=false while blocker evidence is explicitly empty"
-                    .to_string(),
-            ));
-        }
-
-        if let Some(decision) = decision.as_deref() {
-            let decision = decision.to_ascii_lowercase();
-            let decision_passes = decision.contains("pass")
-                || decision.contains("approve")
-                || decision.contains("approved");
-            let decision_blocks = decision.contains("fail")
-                || decision.contains("block")
-                || decision.contains("revise")
-                || decision.contains("changes_required");
-            if decision_passes && (pass == Some(false) || has_blocking_evidence) {
-                return Ok(Some(
-                    "proposal_review_summary_v1 decision indicates pass while authoritative fields block"
-                        .to_string(),
-                ));
-            }
-            if decision_blocks && pass == Some(true) && !has_blocking_evidence {
-                return Ok(Some(
-                    "proposal_review_summary_v1 decision indicates blocking while authoritative fields pass"
-                        .to_string(),
-                ));
-            }
-        }
-
-        Ok(None)
+        Ok(proposal_review_summary_transition_truth_conflict(
+            &summary_json,
+        ))
     }
 
     async fn evaluate_transition_candidate(
@@ -5510,6 +5464,43 @@ impl Orchestrator {
         extract_json_field(&json, field_name)
     }
 
+    async fn read_artifact_json(
+        &self,
+        artifact_name: &str,
+        run: &domain::run::Run,
+        plan: &workflow::plan::RunPlan,
+    ) -> Option<serde_json::Value> {
+        let path = if let Some(template) = plan.artifact_paths.get(artifact_name) {
+            let resolved = resolve_path_template(
+                template,
+                &run.workspace_root,
+                run.chainworks_meta_root.as_deref(),
+            );
+            if std::path::Path::new(&resolved).exists() {
+                resolved
+            } else if run.chainworks_meta_root.is_none() {
+                let alt = format!("{}/{}", run.artifact_root, artifact_name);
+                if std::path::Path::new(&alt).exists() {
+                    alt
+                } else {
+                    let alt2 = format!("{}/{}/{}", run.artifact_root, run.id, artifact_name);
+                    if std::path::Path::new(&alt2).exists() {
+                        alt2
+                    } else {
+                        return None;
+                    }
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+
+        let content = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
     async fn active_implementation_self_assessment_summary_field(
         &self,
         run_id: RunId,
@@ -5984,32 +5975,6 @@ fn annotate_aggregate_transition_truth_conflict(
     }) {
         candidate.result = CandidateTransitionResult::EvaluationError;
         candidate.sanitized_diagnostic = Some(diagnostic.to_string());
-    }
-}
-
-fn json_value_to_u64(value: &serde_json::Value) -> Option<u64> {
-    match value {
-        serde_json::Value::Number(number) => number.as_u64(),
-        serde_json::Value::String(text) => text.trim().parse::<u64>().ok(),
-        _ => None,
-    }
-}
-
-fn json_value_has_entries(value: Option<&serde_json::Value>) -> bool {
-    match value {
-        Some(serde_json::Value::Array(values)) => !values.is_empty(),
-        Some(serde_json::Value::Object(values)) => !values.is_empty(),
-        Some(serde_json::Value::String(value)) => !value.trim().is_empty(),
-        _ => false,
-    }
-}
-
-fn json_value_is_empty_collection(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Array(values) => values.is_empty(),
-        serde_json::Value::Object(values) => values.is_empty(),
-        serde_json::Value::String(value) => value.trim().is_empty(),
-        _ => false,
     }
 }
 
@@ -6756,6 +6721,16 @@ fn build_task_prompt(
                      - `known_risks`, `tests_run`, and `docs_impacted` must be arrays of strings.\n\
                      - Do not use strings in `remaining_code_tasks`; do not use booleans in `docs_impacted`; do not invent owner classes such as `docs-agent`, `operator`, `security-owner`, or `release-owner`.",
                 ));
+            } else if schema.contract_id == "proposal_review_summary_v2" {
+                parts.push(String::from(
+                    "Required nested shapes and invariants for `proposal_review_summary_v2`:\n\
+                     - `blocking_issues`, `blocking_required_changes`, `advisory_follow_ups`, and `recurring_themes` must be arrays.\n\
+                     - Put refinement-blocking work only in `blocking_required_changes`.\n\
+                     - Put implementation notes, cautions, and non-blocking suggestions only in `advisory_follow_ups`.\n\
+                     - If `pass` is `true`, then `blocker_count` must be `0`, `blocking_issues` must be empty, and `blocking_required_changes` must be empty.\n\
+                     - If `pass` is `false`, at least one of `blocker_count > 0`, non-empty `blocking_issues`, or non-empty `blocking_required_changes` must be true.\n\
+                     - Approved summaries must not carry blocker evidence in blocker fields.",
+                ));
             }
         }
     }
@@ -7441,9 +7416,14 @@ mod tests {
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
-        create_pool("sqlite::memory:")
+        let pool = create_pool("sqlite::memory:")
             .await
-            .expect("in-memory pool failed")
+            .expect("in-memory pool failed");
+        let writer = Arc::new(DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .expect("test shared DbWriter registration failed");
+        pool
     }
 
     fn test_idea(id: IdeaId) -> Idea {
@@ -8337,7 +8317,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn proposal_057_controlled_artifact_does_not_fall_back_to_raw_file_truth() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),
@@ -8416,7 +8396,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn proposal_057_controlled_exists_uses_active_contract_truth_not_raw_files() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),
@@ -8511,7 +8491,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn proposal_057_controlled_artifact_fails_closed_without_async_lookup() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),
@@ -8543,7 +8523,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn proposal_017_exists_unknown_artifact_fails_closed() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),
@@ -8565,7 +8545,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_stale_failed_stage_reentry_is_ignored() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),
@@ -8713,7 +8693,7 @@ permission_profiles:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn loop_budget_allows_final_cross_state_review_after_refinement() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),
@@ -8820,7 +8800,7 @@ permission_profiles:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn loop_budget_blocks_entering_exhausted_loop_state() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),
@@ -9289,7 +9269,7 @@ permission_profiles:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn proposal_017_orchestrator_blocks_conflicted_proposal_review_summary() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),
@@ -9406,6 +9386,115 @@ permission_profiles:
             .unwrap();
         assert_eq!(stored_run.status, RunStatus::Blocked);
         assert_eq!(stored_run.current_state.as_deref(), Some("review"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proposal_017_orchestrator_allows_v2_advisory_follow_ups_without_conflict() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "P036".into(),
+            body: "advisory follow ups should not block".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.workspace_root = tmp.path().to_string_lossy().into_owned();
+        run.chainworks_meta_root = Some(tmp.path().to_string_lossy().into_owned());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let stage = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "review".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("lead_orchestrator".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &stage).await.unwrap();
+
+        let summary_path = tmp.path().join("reviews/proposal/summary.json");
+        std::fs::create_dir_all(summary_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &summary_path,
+            r#"{"pass":true,"average_score":8.8,"aggregate_score":8.8,"min_individual_score":8.2,"blocker_count":0,"blocking_issues":[],"summary":"approved","blocking_required_changes":[],"advisory_follow_ups":["carry rollout caution into implementation"],"recurring_themes":["durability"],"decision":"approved"}"#,
+        )
+        .unwrap();
+
+        let mut plan = test_plan();
+        plan.artifact_paths.insert(
+            "proposal_review_summary".into(),
+            "${CHAINWORKS_META_ROOT:-.chainworks}/reviews/proposal/summary.json".into(),
+        );
+        plan.states.insert(
+            "review".into(),
+            compiled_state(
+                "review",
+                vec![
+                    CompiledTransition {
+                        to: "approved".into(),
+                        condition: "proposal_review_summary.pass == true".into(),
+                    },
+                    CompiledTransition {
+                        to: "refine".into(),
+                        condition: "proposal_review_summary.pass == false".into(),
+                    },
+                ],
+                false,
+            ),
+        );
+        plan.states.insert(
+            "approved".into(),
+            compiled_state("approved", Vec::new(), true),
+        );
+        plan.states
+            .insert("refine".into(), compiled_state("refine", Vec::new(), true));
+
+        orchestrator
+            .evaluate_and_transition(run_id, "review", &plan, &[stage])
+            .await
+            .unwrap();
+
+        let blocked = db::repos::workflow_conflicts::get_current_blocking_conflict(&pool, run_id)
+            .await
+            .unwrap();
+        assert!(
+            blocked.is_none(),
+            "advisory follow-ups should not create a blocking conflict"
+        );
+
+        let cursor = db::repos::workflow_conflicts::get_transition_cursor(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("approved transition should settle");
+        assert_eq!(cursor.selected_next_state_id.as_deref(), Some("approved"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -74,7 +74,7 @@ P079 makes this behavior explicit and bounded.
 - Do not rerun arbitrary implementation work inside the repair prompt.
 - Do not make live Claude/Gemini/Codex behavior part of the required gate.
 - Do not replace P076 observation ledger, retry cooldown, or known-issue catalog.
-- Do not change release side-effect retry safety; that belongs to P078.
+- Do not change release side-effect retry safety; that belongs to the implemented durable side-effect ledger contract.
 - Do not broaden legacy artifact discovery beyond the declared output contract.
 
 ## 5. Eligibility
@@ -260,7 +260,7 @@ Initial P079 coverage is intentionally narrow:
 | `prepush_code_reviewer` | yes | yes | yes |
 | release agents | no | no | no |
 
-Release agents are excluded because they may have external side effects. P078 owns that retry/reconciliation lane.
+Release agents are excluded because they may have external side effects. The implemented durable side-effect ledger owns that retry/reconciliation lane.
 
 ## 10. Durable Evidence
 
@@ -439,7 +439,7 @@ The gate must use deterministic fixture ACP transports only. It must not require
 | Junie plan files are mistaken for output truth | `.junie/plans/*.md` is evidence only; strict structured required outputs remain unsettled until a canonical payload validates. |
 | Same-session repair repeats provider plan-mode behavior | Junie strict structured output failures skip same-session repair and proceed directly to configured fallback. |
 | Retry budget becomes confusing | Repair and provider fallback use separate evidence counters and do not silently consume ordinary operator retry semantics. |
-| Release retry safety is weakened | Release agents are excluded; P078 owns side-effect reconciliation. |
+| Release retry safety is weakened | Release agents are excluded; the implemented durable side-effect ledger owns side-effect reconciliation. |
 | P076 keeps retrying despite repair failure | P076 must consume repair/fallback outcome evidence and escalate recurring signatures instead of blind retry. |
 
 ## 17. Open Questions

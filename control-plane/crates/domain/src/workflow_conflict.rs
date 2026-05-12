@@ -549,3 +549,68 @@ pub fn proposal_review_summary_v1_authority_table() -> Vec<AggregateFieldAuthori
     })
     .collect()
 }
+
+pub fn proposal_review_summary_v2_field_authority(field: &str) -> Option<AggregateFieldAuthority> {
+    Some(match field {
+        "pass" | "blocker_count" | "blocking_issues" | "blocking_required_changes" => {
+            AggregateFieldAuthority::TransitionAuthoritative
+        }
+        "decision" => AggregateFieldAuthority::ContradictionBearing,
+        "advisory_follow_ups" => AggregateFieldAuthority::AdvisoryOnly,
+        "summary" | "recurring_themes" => AggregateFieldAuthority::NonAuthoritative,
+        _ => return None,
+    })
+}
+
+pub fn proposal_review_summary_v2_authority_table() -> Vec<AggregateFieldAuthorityEntry> {
+    [
+        (
+            "pass",
+            AggregateFieldAuthority::TransitionAuthoritative,
+            "Primary pass/fail branch input for review-loop transitions.",
+        ),
+        (
+            "blocker_count",
+            AggregateFieldAuthority::TransitionAuthoritative,
+            "Confirms whether failed review must route to refinement.",
+        ),
+        (
+            "blocking_issues",
+            AggregateFieldAuthority::TransitionAuthoritative,
+            "Provides blocker presence and issue refs for failed-review transition conditions.",
+        ),
+        (
+            "blocking_required_changes",
+            AggregateFieldAuthority::TransitionAuthoritative,
+            "Provides concrete blocker/remediation evidence for failed-review transition conditions.",
+        ),
+        (
+            "decision",
+            AggregateFieldAuthority::ContradictionBearing,
+            "May indicate internal aggregate inconsistency when it conflicts with pass, blocker_count, or blocking_issues.",
+        ),
+        (
+            "advisory_follow_ups",
+            AggregateFieldAuthority::AdvisoryOnly,
+            "Carries non-blocking implementation follow-ups without affecting graph transitions.",
+        ),
+        (
+            "summary",
+            AggregateFieldAuthority::NonAuthoritative,
+            "Operator explanation only; not transition input.",
+        ),
+        (
+            "recurring_themes",
+            AggregateFieldAuthority::NonAuthoritative,
+            "Operator explanation only; not transition input.",
+        ),
+    ]
+    .into_iter()
+    .map(|(field, authority, use_description)| AggregateFieldAuthorityEntry {
+        contract_id: "proposal_review_summary_v2".to_string(),
+        field: field.to_string(),
+        authority,
+        use_description: use_description.to_string(),
+    })
+    .collect()
+}

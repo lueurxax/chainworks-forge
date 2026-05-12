@@ -1,0 +1,9 @@
+{
+  "schema_version": "p088_fixture_v1",
+  "scenario": "docs_only_implementation_change",
+  "changed_paths": [
+    "docs/reference/rust-control-plane.md"
+  ],
+  "work_change_kind": "current_attempt_diff",
+  "expected_eligible_for_completion_repair": true
+}

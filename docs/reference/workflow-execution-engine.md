@@ -232,6 +232,15 @@ Nonisolated, `Sendable` disk I/O layer.
 - Path traversal guard: rejects any resolved path outside `workspaceRoot`.
 - Atomic writes with SHA-256 checksums.
 
+### Durable Side Effects and Release Settlement
+
+To handle irreversible or externally visible operations (release stages), the engine implements a durable side-effect ledger.
+- **Durable Intent**: persists a `SideEffect` record before any external write attempt.
+- **At-Most-Once Write**: allows at most one external-write attempt per `side_effect` row.
+- **Fail-Closed Retry**: blocks retry, cancellation, scheduler advancement, and recovery mutations when unresolved side effects exist for the run or stage.
+- **Operator Reconciliation**: routes ambiguous outcomes, conflicts, and unrecoverable effects to MCP `effects.*` tooling.
+- **Wired Operations**: supports `git_commit`, `git_push`, `build_archive`, and `connect_upload`; `tag_create` and `artifact_publish` remain schema-supported deferred kinds.
+
 ### Worktree Mutation Barrier (P064)
 
 To protect worktrees during orchestrated mutations (like main-sync), the engine uses an exclusive mutation barrier.

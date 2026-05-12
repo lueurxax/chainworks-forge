@@ -26,7 +26,7 @@ enum ProposalReviewContractAdapter {
     static let reviewContractID = "proposal_review_v1"
 
     /// The canonical contract ID for the aggregated review summary.
-    static let summaryContractID = "proposal_review_summary_v1"
+    static let summaryContractID = "proposal_review_summary_v2"
 
     /// Check if an output name is a proposal review output.
     static func isReviewOutput(_ outputName: String) -> Bool {
@@ -78,6 +78,17 @@ enum ProposalReviewContractAdapter {
            let dict = jsonObject as? [String: Any] {
             let missingFields = schema.requiredFields.filter { dict[$0] == nil }
             if missingFields.isEmpty {
+                if schema.contractID == summaryContractID,
+                   let validationError = OutputContractResolverV2.proposalReviewSummaryV2ValidationError(in: dict) {
+                    return OutputValidationResult(
+                        outputName: outputName,
+                        contractID: schema.contractID,
+                        status: .failed,
+                        missingFields: [],
+                        validationError: validationError,
+                        rawPayloadSize: data.count
+                    )
+                }
                 return OutputValidationResult(
                     outputName: outputName,
                     contractID: schema.contractID,

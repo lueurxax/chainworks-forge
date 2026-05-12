@@ -1083,6 +1083,58 @@ Host policy:
 
 Command: retained historical alias `./scripts/test-gate.sh proposal-077-ui`.
 
+### Retained Historical Alias: `proposal-078|p078`
+
+Durable side-effect ledger gate for migration, CAS races, preflight, release lifecycle wiring, and MCP tools. The `proposal-078` and `p078` names are retained historical aliases after the proposal text was promoted into the reference docs.
+
+Scope:
+
+- side-effect domain models and status transitions
+- Migration 052 round-trip and CHECK constraints
+- Side-effect repository operations and CAS predicates
+- DurableEffectCoordinator preflight blocking for unresolved effects
+- Startup/watchdog recovery for expired executing side effects
+- Startup/watchdog recovery for prepared, externally observed, and settled-evidence integrity windows
+- Ledger readback circuit breaker: three readback errors in five minutes opens a ten-minute fail-closed breaker per call site
+- Lease renewal and deadline wiring for long-running release side effects
+- side-effect evidence spooling manifest contract, including `release-receipt.json`, `stdout.log`, `stderr.log`, `git-ls-remote.json`, `upload-readback.json`, `archive-summary.json`, `reconciliation-report.json`, and manifest-last validation
+- Release retry integration coverage for stage retry, manual release retry, and targeted retry guards
+- Native release lifecycle coverage for `git_commit`, `git_push`, `build_archive`, and `connect_upload`
+- Executor start CAS (prepared -> executing) with race-condition verification
+- Reaper transition (stale executing -> needs_reconciliation)
+- MCP effects.* tools (list, inspect, reconcile, mark_conflict, mark_unrecoverable, clear_after_manual_verification)
+- Authorization policy: all effects.* tools are operator-only (reads and mutations both gated to `PrincipalClass::Operator`, since `last_error` and evidence pointers may contain sensitive adapter output)
+- GraphQL, MCP run report, rollout-contract fixture, and Swift read-only projections for side effects
+- retained side-effect metric literals for the full rollout contract: durable-intent percent, intent, transition, retry block, readback error, circuit-open, recovery, settlement latency, unresolved gauges/age, evidence bytes/disk, and prepare-denied counters
+- Recorded macOS accessibility/view-hierarchy proof for the read-only side-effect card and sidebar signal
+
+Use when:
+
+- changing side-effect persistence or status logic
+- changing durable-retry preflight or reconciliation logic
+- changing native release executor wiring or release receipt settlement
+- changing MCP effects.* tools or authorization
+- changing side-effect readback in GraphQL or reports
+- changing rollout-contract side-effect readback fixtures or Swift read-only decoding
+
+Host policy:
+
+- local Rust toolchain required
+- no UI host or simulator needed
+- executes in-process against the control-plane/ workspace
+
+Command: retained historical alias `./scripts/test-gate.sh proposal-078`.
+
+Important:
+
+- `p078` is accepted as a retained historical alias
+- this is the canonical proof path for the durable side-effect ledger slice
+- it validates that at most one external-write attempt is allowed per side_effect row
+- it verifies the fail-closed preflight that blocks retries when unresolved effects exist
+- it verifies the fail-closed circuit breaker that blocks retries when ledger readback repeatedly fails
+- it verifies the wired release adapters and receipt/readback lifecycle without live external side effects
+- it verifies startup/watchdog recovery, lease renewal markers, side-effect evidence spooling, public conflict disposition, and rollout/operator readback parity
+
 ### `p051-scaffold`
 
 Historical bridge-pool scaffold gate alias for the shared Xcode MCP bridge pool substrate.
@@ -1850,9 +1902,76 @@ Important:
 - this is a Phase 0 contract/readback gate, not proof that Git mutation or capsule prompt injection is enabled
 - later P064 phases must extend this gate before shipping repositories, sync execution, dirty preservation, conflict routing, or prompt injection
 
+### `proposal-085|p085`
+
+Thin-client read-model parity and affordance contract gate.
+
+The original proposal document is retired after implementation. Operational truth lives in
+[thin-client-read-model-affordance-contract.md](thin-client-read-model-affordance-contract.md);
+the `proposal-085` and `p085` names remain as retained proof aliases.
+
+Scope:
+
+- `docs/reference/thin-client-read-model-affordance-contract.md` exists and contains `thin_client_affordance_contract_v1` with all required affordance rows (`artifact.preview.listLabel`, `artifact.preview.detail`, `report.payload.metadata`, `freshness.badge.run/stage/approval/artifact`, `approval.resolve.approve/reject`, `diagnostic.copy`, `external.command.placeholder`)
+- All eight p085 negative fixture files exist as valid JSON with a `contract_violation` field and scenario-specific semantic expectations
+- `control-plane/crates/graphql-server` runs the P085 backend proof slice (`proposal_085_`) covering approval projection fields, artifact/report payload projection states, authorization denial for diagnostic fields, P081 boundary row linkage, and typed `conflictResultCode` readback with a real failed `command_journal` id for both approval mutations
+- `Chainworks Forge/Support/P085AffordancePresenter.swift` exists with immutable Equatable Sendable DTOs: `P085ArtifactAffordanceState`, `P085ApprovalAffordanceState`, `P085FreshnessAffordanceState`, `P085DiagnosticAffordanceState`; `canDrivePayloadAvailability` and `canDriveApprovalActionability` are always `false`; `mergedAffordance` enforces stale-detail guard; `payloadPresentation(fromRaw:)` and `P085FreshnessState.fromRaw` map unknown enum strings to `.unknown`
+- `Chainworks ForgeTests/Proposal085Tests` runs as the Swift parity slice proving: `payload_deferred` → `.deferred` (not `.unavailable`); `metadata_only` → `.metadataOnly`; unknown enum strings → `.unknown`; stale async detail does not overwrite newer selection; approval actionability requires `writePathState == .available` and matching `availableActions`; freshness is diagnostic-only; diagnostic affordance invalidates on unauthorized freshness
+
+Use when:
+
+- Changing `P085AffordancePresenter` mapping logic or DTOs
+- Adding a new GraphQL-driven Swift affordance (must add a contract row first)
+- Verifying that `payload_deferred` and `metadata_only` are represented honestly
+
+Host policy:
+
+- local Swift toolchain (Xcode 26.3+), Rust toolchain, and Python 3 required; no UI host, daemon, or network required
+- the Rust slice is a backend GraphQL contract proof and must pass before the Swift presenter slice runs
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-085
+./scripts/test-gate.sh p085
+```
+
+Important:
+
+- `p085` is accepted as an alias; both run the same proof slice
+- the gate fails closed if the contract doc is missing a required row, P081 boundary row, or term; any negative fixture is absent or fails its scenario-specific semantic expectation; the backend GraphQL proof is missing/failing; the presenter file is missing a required symbol; or the `Proposal085Tests` Swift slice fails
+- `payload_deferred` must never collapse to `unavailable`; enforced by the Swift test slice
+- unknown GraphQL enum values must produce `.unknown` states; proved by `unknownPayloadStateFailsClosed` and `unknownFreshnessStateFailsClosed` tests
+
+### `proposal-088|p088`
+
+Code-writer completion handoff, output freshness, and repair diagnostics gate.
+
+Scope:
+
+- deterministic P088 evidence fixtures exist under `docs/evidence/088-code-writer-completion/`
+- fixtures cover P087 terminal-completed missing outputs, the 70c9-shaped preexisting dirty-work timeout negative case, large streamed prelude/tail capture, prompt-side evidence, public enum unknown handling, normal materialization without repair, mutation-guard failure, docs-only eligibility, generated-evidence-only ineligibility, ingestion-boundary failures, partial-write recovery, and `worktree_fingerprint_v1`
+- Rust focused tests cover ACP capture, typed code-writer completion session events, prompt-level runtime receipt persistence, canonical receipt-link readback, receipt linkage/conflict detection, worktree fingerprint classification, completion receipt readback, GraphQL/MCP/run-report `implementationCompletion` parity with closed vocabularies plus `known=false` unknown-value metadata, and a stale `implementation_active`/P037 idle-terminalization canary proving `code_writer` candidates enter P088 receipt readback instead of active-prompt auto-requeue
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-088
+./scripts/test-gate.sh p088
+```
+
+Important:
+
+- completion repair eligibility must require `work_change_kind=current_attempt_diff`; inherited dirty work must fail closed as ineligible
+- stale `implementation_active` proof is a focused executable engine canary for the actual `InvokeAgent` error branch; it does not claim a full live ACP supervisor timeout end-to-end
+- usable final `CHAINWORKS_OUTPUT` must materialize through normal settlement without completion repair
+- public readback must preserve known enum values and fail closed for unknown future values
+- `implementationCompletion` must be projected from canonical linked receipt truth, not from latest historical receipt by timestamp
+- required evidence write failures must surface as `completion_receipt_partial_write` / `storage_write_failed`, not clean missing fields
+
 ### `proposal-075|p075`
 
-Proposal 075 local persistence write budget, evidence spooling, storage diagnostics, and fail-closed registry gate.
+Retained historical alias for the local persistence write budget, evidence spooling, storage diagnostics, and fail-closed registry gate. Operational truth lives in `docs/reference/rust-control-plane.md`.
 
 Scope:
 
@@ -1888,7 +2007,7 @@ Important:
 
 - `p075` is accepted as an alias
 - this is a fail-closed persistence contract gate, not an inventory-only check
-- startup orphan reconciliation is available through the storage MCP diagnostic tool; daemon startup scheduling and future telemetry producer expansion must keep this gate green when extended
+- startup orphan reconciliation is available through the storage MCP diagnostic tool; daemon startup scheduling and telemetry producer extensions must keep this gate green
 
 ### `proposal-084|p084` retained historical alias
 
