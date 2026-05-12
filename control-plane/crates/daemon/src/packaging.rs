@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 
 /// P042 §7.1 mode dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +76,9 @@ impl ModePaths {
     }
     pub fn daemon_port_path(&self) -> PathBuf {
         self.app_support_dir.join("daemon.port")
+    }
+    pub fn daemon_endpoint_path(&self) -> PathBuf {
+        self.app_support_dir.join("daemon-endpoint.json")
     }
     pub fn build_sha_path(&self) -> PathBuf {
         self.app_support_dir.join("build-sha.txt")
@@ -196,6 +200,28 @@ pub async fn bind_with_fallback(paths: &ModePaths) -> Result<(tokio::net::TcpLis
 fn write_daemon_port_file(paths: &ModePaths, port: u16) -> Result<()> {
     let path = paths.daemon_port_path();
     std::fs::write(&path, port.to_string()).with_context(|| format!("write {}", path.display()))
+}
+
+#[derive(Serialize)]
+struct DaemonEndpointSnapshot<'a> {
+    pid: u32,
+    port: u16,
+    build_sha: &'a str,
+}
+
+pub fn write_daemon_endpoint_snapshot(
+    paths: &ModePaths,
+    pid: u32,
+    port: u16,
+    build_sha: &str,
+) -> Result<()> {
+    let payload = serde_json::to_vec_pretty(&DaemonEndpointSnapshot {
+        pid,
+        port,
+        build_sha,
+    })?;
+    let path = paths.daemon_endpoint_path();
+    std::fs::write(&path, payload).with_context(|| format!("write {}", path.display()))
 }
 
 /// The literal build SHA baked into the binary at compile time by the
@@ -382,6 +408,27 @@ mod tests {
         let contents = std::fs::read_to_string(paths.daemon_port_path()).unwrap();
         assert_eq!(contents, port.to_string());
         drop(listener);
+    }
+
+    #[test]
+    fn write_daemon_endpoint_snapshot_persists_pid_port_and_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ModePaths {
+            mode: DaemonMode::Test,
+            database_url: "sqlite::memory:".into(),
+            principals_path: PathBuf::from("/tmp/p.json"),
+            app_support_dir: dir.path().to_path_buf(),
+            log_path: None,
+            bind_addr: "127.0.0.1:0".into(),
+        };
+
+        write_daemon_endpoint_snapshot(&paths, 4242, 64446, "65a2f5d3").unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(paths.daemon_endpoint_path()).unwrap()).unwrap();
+        assert_eq!(value["pid"], 4242);
+        assert_eq!(value["port"], 64446);
+        assert_eq!(value["build_sha"], "65a2f5d3");
     }
 
     #[test]

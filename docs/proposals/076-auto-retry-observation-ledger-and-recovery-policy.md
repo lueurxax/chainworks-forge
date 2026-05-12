@@ -59,7 +59,7 @@ The monitor therefore creates useful raw evidence, but each later proposal/audit
 
 | Signature | Evidence | Current behavior | Problem |
 |---|---|---|---|
-| `missing_required_outputs:proposal_writer:proposal_current` | `.chainworks/known-blocked-run-problems.md`, P075 run `4e4f203a...` | Repeated `stages.retry` eventually unblocks or reblocks. | No same-session contract repair or provider fallback is guaranteed before durable block. |
+| `missing_required_outputs:proposal_writer:proposal_current` | `.chainworks/known-blocked-run-problems.md`, write-budget investigation run `4e4f203a...` | Repeated `stages.retry` eventually unblocks or reblocks. | No same-session contract repair or provider fallback is guaranteed before durable block. |
 | `missing_required_outputs:proposal_reviewer_*:proposal_review_v1` | `/Users/user/.codex/automations/auto-retry/known-issues.md` on 2026-04-28/29 | Stage retry clears top-level blocked state temporarily. | Reviewer output contract failure is treated like generic retryable blocked state. |
 | `stage_stuck_running:startup_repair` | multiple entries for run `4e4f203a...` | Startup repair marks blocked for operator retry. | Repair action is correct, but monitor must classify it as infrastructure stale truth and track recurrence. |
 | `projection_divergence:run_blocked_projection_running` | multiple entries for runs `4459e17c...`, `4e4f203a...`, `4c5dacfa...` | Retry or manual projection repair clears symptoms. | The issue is often projection/settlement lag, not a proposal code blocker. |
@@ -220,7 +220,7 @@ Update /Users/user/.codex/automations/auto-retry/memory.md with only the latest 
    - output contract validation, same-session repair, and provider fallback: P079 lane
    - recovery/retry MCP ergonomics: P045/P065 lane
    - projection/settlement divergence: P073 / UI action boundary follow-up lane
-   - native release diagnostics: P075 lane
+   - native release diagnostics: write-budget lane
 
 ## 8. Acceptance Criteria
 
@@ -240,7 +240,7 @@ Update /Users/user/.codex/automations/auto-retry/memory.md with only the latest 
 | Generated `.chainworks` operational logs grow without bound | Keep JSONL local/generated, add retention guidance, and roll up by signature. |
 | The monitor hides real implementation blockers by retrying too aggressively | Require classification, cooldown, and `needs_systemic_fix` escalation. |
 | The catalog becomes another hand-maintained markdown sink | Treat JSONL as the primary source and catalog as deduplicated generated/maintained summary. |
-| This overlaps existing recovery proposals | Make P076 the observation/policy layer and route implementation fixes to P017/P045/P063/P065/P073/P075 where they already own the runtime surface. |
+| This overlaps existing recovery proposals | Make P076 the observation/policy layer and route implementation fixes to P017/P045/P063/P065/P073 and the implemented write-budget contract where they already own the runtime surface. |
 
 ## 10. Open Questions
 

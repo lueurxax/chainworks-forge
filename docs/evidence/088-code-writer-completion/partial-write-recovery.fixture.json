@@ -1,0 +1,8 @@
+{
+  "schema_version": "p088_fixture_v1",
+  "scenario": "completion_receipt_partial_write",
+  "artifact_write_failure": true,
+  "expected_failure_class": "completion_receipt_partial_write",
+  "expected_absence_reason": "storage_write_failed",
+  "expected_next_operator_action": "inspect_prompt_and_expected_output_contract"
+}

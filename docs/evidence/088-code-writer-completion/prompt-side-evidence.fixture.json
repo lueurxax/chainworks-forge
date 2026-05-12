@@ -1,0 +1,12 @@
+{
+  "schema_version": "p088_fixture_v1",
+  "scenario": "prompt_side_evidence",
+  "prompt_kind": "code_writer_completion_repair",
+  "turn_index": 1,
+  "prompt_template_id": "code_writer_completion_repair_v1",
+  "prompt_template_version": "1",
+  "prompt_sha256": "fixture",
+  "redacted_prompt_artifact_path": "artifacts/p088/redacted-prompt.txt",
+  "expected_output_contract_snapshot_sha256": "fixture",
+  "repair_or_settlement_reason": "missing_required_outputs"
+}

@@ -56,7 +56,7 @@ final class Proposal015AppProofHarness {
             runID: UUID(uuidString: "01500000-0000-4000-8000-000000000001") ?? UUID(),
             comparisonRunID: UUID(uuidString: "01500000-0000-4000-8000-000000000002") ?? UUID(),
             proofAgentID: "proposal_reviewer_product_owner",
-            reportSkillRef: "proposal_review_triad",
+            reportSkillRef: "proposal_review_router_skill",
             reportSkillRole: "product_owner",
             comparisonSkillRole: "architect",
             primaryArtifactName: "proposal_current",

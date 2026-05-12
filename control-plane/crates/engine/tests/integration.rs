@@ -7,8 +7,8 @@ use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
-    ideas, projections, retry_operator_instructions, runs, sessions, stages, work_items,
-    workflow_conflicts,
+    code_writer_completion_receipts, ideas, projections, retry_operator_instructions, runs,
+    sessions, stages, work_items, workflow_conflicts,
 };
 use domain::agent::{
     AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
@@ -4811,10 +4811,179 @@ agents:
 }
 
 #[tokio::test]
+async fn test_proposal_017_invalid_proposal_current_surfaces_fail_and_blocked_projection() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("invalid-proposal-current.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .unwrap();
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let workflow_path = temp.path().join("workflow.yaml");
+    let catalog_path = temp.path().join("catalog.yaml");
+    std::fs::write(
+        &workflow_path,
+        r#"
+workflow:
+  id: code-writer-invalid-proposal-current
+initial_state: implementation
+states:
+  implementation:
+    label: Implementation
+    owner: code_writer
+    run:
+      sequence:
+        - agent: code_writer
+          task: start_implementation
+          inputs:
+            - approved_proposal
+          outputs:
+            - implementation_self_assessment
+    transitions:
+      - to: reviewed
+        when: implementation_self_assessment.implementation_complete == true
+  reviewed:
+    label: Reviewed
+    type: end
+    owner: code_writer
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &catalog_path,
+        r#"
+artifacts:
+  lead_resolution: ${CHAINWORKS_META_ROOT:-.chainworks}/mediation/lead-resolution.json
+  approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
+  implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/implementation/self-assessment.json
+backend_profiles:
+  code_writer_profile:
+    provider: codex
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
+  implementation_self_assessment_v2:
+    format: json
+    required_fields:
+      - implementation_complete
+      - verification_green
+      - remaining_code_tasks
+      - handoff_tasks
+      - known_risks
+      - tests_run
+      - docs_impacted
+agents:
+  - id: code_writer
+    system_role: lead
+    backend_profile: code_writer_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
+    output_contract: implementation_self_assessment_v2
+"#,
+    )
+    .unwrap();
+
+    let meta_root = temp.path().join(".chainworks");
+    std::fs::create_dir_all(&meta_root).unwrap();
+    let proposal_current_path = temp.path().join("proposal-current.json");
+    std::fs::write(
+        &proposal_current_path,
+        br#"{"proposal_id":"087","proposal_revision_id":"p087-r6"},"rollout":{"mode":"observe"}"#,
+    )
+    .unwrap();
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("implementation".into());
+    run.workspace_root = temp.path().to_string_lossy().into_owned();
+    run.artifact_root = temp.path().join("artifacts").to_string_lossy().into_owned();
+    run.chainworks_meta_root = Some(meta_root.to_string_lossy().into_owned());
+    run.workflow_yaml_path = Some(workflow_path.to_string_lossy().into_owned());
+    run.agent_catalog_yaml_path = Some(catalog_path.to_string_lossy().into_owned());
+    runs::insert(&pool, &run).await.unwrap();
+
+    artifacts::insert(
+        &pool,
+        &Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "proposal_review".into(),
+            agent_id: "lead_orchestrator".into(),
+            name: "proposal_current".into(),
+            contract_id: "proposal_current".into(),
+            format: ArtifactFormat::Json,
+            file_path: "proposal-current.json".into(),
+            checksum_sha256: None,
+            size_bytes: Some(80),
+            provider: "codex".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: true,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut pending_stage = make_stage(stage_execution_id, run_id, StageStatus::Pending);
+    pending_stage.stage_id = "implementation".into();
+    pending_stage.label = "Implementation".into();
+    stages::insert(&pool, &pending_stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Orchestrator::new(pool.clone(), events, work_queue);
+
+    orchestrator.advance_run(run_id).await.unwrap();
+
+    let stored_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(stored_run.status, RunStatus::Blocked);
+
+    let check = db::repos::rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
+        &pool,
+        run_id.inner(),
+    )
+    .await
+    .unwrap()
+    .expect("invalid proposal_current should produce rollout contract hold");
+    assert_eq!(check.status.to_string(), "fail");
+    assert!(check
+        .failure_reasons
+        .iter()
+        .any(|reason| reason == "invalid_proposal_current_artifact"));
+
+    let projection = db::repos::artifact_contracts::find_run_state_projection(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("blocked-before-code should rebuild run-state projection");
+    assert_eq!(projection.run_state_json["status"], "blocked");
+    assert_eq!(projection.run_state_json["current_state"], "implementation");
+}
+
+#[tokio::test]
 async fn test_proposal_017_code_writer_start_snapshots_proposal_current_before_invoke() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("snapshot-handoff.sqlite");
     let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
         .await
         .unwrap();
 
@@ -4898,7 +5067,95 @@ agents:
     let meta_root = temp.path().join(".chainworks");
     std::fs::create_dir_all(&meta_root).unwrap();
     let proposal_current_path = temp.path().join("proposal-current.md");
-    std::fs::write(&proposal_current_path, "# Approved proposal\n").unwrap();
+    let readback = temp
+        .path()
+        .join("docs/evidence/rollout-contract/operator-readback/p017-full-surface.fixture.json");
+    let negative = temp
+        .path()
+        .join("docs/evidence/rollout-contract/negative/p017-unsafe-path.json");
+    std::fs::create_dir_all(readback.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(negative.parent().unwrap()).unwrap();
+    std::fs::write(&readback, br#"{"schema_version":"operator_readback_v1"}"#).unwrap();
+    std::fs::write(&negative, br#"{"schema_version":"rollout_contract_v1"}"#).unwrap();
+    std::fs::write(
+        &proposal_current_path,
+        serde_json::json!({
+            "schema_version": "proposal_document_v1",
+            "proposal_id": "017",
+            "proposal_revision_id": "p017-r1",
+            "rollout_contract_v1": {
+                "schema_version": "rollout_contract_v1",
+                "applicability": "required",
+                "gate_aliases": ["proposal-017", "p017"],
+                "commands": {
+                    "allowlist": ["./scripts/test-gate.sh proposal-017"]
+                },
+                "migrations": {
+                    "not_applicable": true,
+                    "justification": "No migration required for integration snapshot test."
+                },
+                "metrics": {
+                    "adoption_metric": "proposal_017_rollout_gate_percent",
+                    "operational_metrics": [
+                        "rollout_contract_lint_total{proposal_id,status,failure_reason}"
+                    ]
+                },
+                "readback_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
+                "readback_fields": [
+                    "rollout_contract_status",
+                    "rollout_contract_decision",
+                    "rollout_contract_failure_reasons",
+                    "rollout_contract_waiver_state",
+                    "rollout_contract_waiver_expires_at",
+                    "rollout_contract_enforcement_mode",
+                    "rollout_contract_enforcement_mode_reason",
+                    "rollout_contract_hold_conditions",
+                    "rollout_contract_rollback_disposition",
+                    "rollout_contract_source_lane",
+                    "rollout_contract_enabled_state",
+                    "rollout_contract_disabled_reason_code",
+                    "rollout_contract_action_id",
+                    "rollout_contract_operator_message",
+                    "rollout_contract_projection_integrity",
+                    "rollout_contract_cutover_policy_revision",
+                    "rollout_contract_diagnostic_redaction",
+                    "rollout_contract_next_steps"
+                ],
+                "readback_fixture": "docs/evidence/rollout-contract/operator-readback/p017-full-surface.fixture.json",
+                "operator_report_fields": [
+                    "rollout_contract_status",
+                    "rollout_contract_decision",
+                    "rollout_contract_failure_reasons",
+                    "rollout_contract_waiver_state",
+                    "rollout_contract_waiver_expires_at",
+                    "rollout_contract_enforcement_mode",
+                    "rollout_contract_enforcement_mode_reason",
+                    "rollout_contract_hold_conditions",
+                    "rollout_contract_rollback_disposition",
+                    "rollout_contract_source_lane",
+                    "rollout_contract_enabled_state",
+                    "rollout_contract_disabled_reason_code",
+                    "rollout_contract_action_id",
+                    "rollout_contract_operator_message",
+                    "rollout_contract_projection_integrity",
+                    "rollout_contract_cutover_policy_revision",
+                    "rollout_contract_diagnostic_redaction",
+                    "rollout_contract_next_steps"
+                ],
+                "hold_conditions": [],
+                "rollback_disposition": {
+                    "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+                    "data_loss_risk": "none"
+                },
+                "decision_vocabulary": ["pass", "fail", "waived", "not_applicable", "timeout"],
+                "negative_fixtures": {
+                    "unsafe_path_and_command": "docs/evidence/rollout-contract/negative/p017-unsafe-path.json"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
 
     let mut run = make_run(run_id, idea_id, RunStatus::Running);
     run.current_state = Some("implementation".into());
@@ -4919,7 +5176,7 @@ agents:
             name: "proposal_current".into(),
             contract_id: "proposal_current".into(),
             format: ArtifactFormat::Markdown,
-            file_path: proposal_current_path.to_string_lossy().into_owned(),
+            file_path: "proposal-current.md".into(),
             checksum_sha256: None,
             size_bytes: Some(20),
             provider: "codex".into(),
@@ -4978,7 +5235,7 @@ agents:
         handoff.approved_proposal_artifact_id.as_deref(),
         Some(approved_artifact_id.as_str())
     );
-    assert!(std::path::Path::new(&approved_artifact.file_path).exists());
+    assert!(temp.path().join(&approved_artifact.file_path).exists());
 }
 
 /// Starting a run must persist the frozen delivery configuration JSON on the
@@ -7173,6 +7430,7 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                 source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
                 }],
                 pre_prompt_expected_outputs: Vec::new(),
+                completion_text_capture: Default::default(),
                 transcript_text: Some(
                     r#"<<<CHAINWORKS_OUTPUT:prepush_review_report>>>{"status":"PASS_WITH_NOTES"}<<<END_CHAINWORKS_OUTPUT>>>"#
                         .into(),
@@ -7196,6 +7454,7 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                 acp_pre_prompt_metadata_timeout: false,
                 acp_pre_prompt_metadata_digest_bytes: 0,
                 legacy_broad_discovery_snapshot: None,
+                runtime_receipt: None,
             })
         }
     }
@@ -7375,6 +7634,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                     source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
                 }],
                 pre_prompt_expected_outputs: Vec::new(),
+                completion_text_capture: Default::default(),
                 transcript_text: Some(
                     "provider quota limit reached after producing valid structured output".into(),
                 ),
@@ -7397,6 +7657,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                 acp_pre_prompt_metadata_timeout: false,
                 acp_pre_prompt_metadata_digest_bytes: 0,
                 legacy_broad_discovery_snapshot: None,
+                runtime_receipt: None,
             })
         }
     }
@@ -9930,6 +10191,7 @@ impl acp::adapters::AcpAdapter for ActivePromptCloseOnceAdapter {
             artifact_paths: Vec::new(),
             discovered_artifacts: Vec::new(),
             pre_prompt_expected_outputs: Vec::new(),
+            completion_text_capture: Default::default(),
             transcript_text: Some("recovered".into()),
             cost_cents: None,
             usage: None,
@@ -9950,7 +10212,84 @@ impl acp::adapters::AcpAdapter for ActivePromptCloseOnceAdapter {
             acp_pre_prompt_metadata_timeout: false,
             acp_pre_prompt_metadata_digest_bytes: 0,
             legacy_broad_discovery_snapshot: None,
+            runtime_receipt: None,
         })
+    }
+}
+
+struct P088StaleImplementationActiveAdapter;
+
+#[async_trait::async_trait]
+impl acp::adapters::AcpAdapter for P088StaleImplementationActiveAdapter {
+    fn provider_name(&self) -> &str {
+        "p088_stale_implementation_active"
+    }
+
+    async fn execute(&self, req: acp::ExecutionRequest) -> anyhow::Result<acp::ExecutionResult> {
+        let worktree_root = req
+            .worktree_root
+            .as_deref()
+            .unwrap_or(req.workspace_root.as_str());
+        let changed_path = std::path::Path::new(worktree_root)
+            .join("control-plane/crates/engine/src/p088_probe.rs");
+        if let Some(parent) = changed_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            &changed_path,
+            "pub fn p088_probe() -> &'static str { \"current-attempt-diff\" }\n",
+        )?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let receipt = acp::AcpRuntimeReceipt {
+            schema_version: 1,
+            transport_family: "acp".into(),
+            provider: req.provider.clone(),
+            model: req.model.clone(),
+            provider_session_id: Some("p088-stale-active-session".into()),
+            session_generation_id: req.session_generation_id.clone(),
+            status: "failed".into(),
+            failure_phase: Some("read_poll_elapsed_without_message".into()),
+            started_at: now.clone(),
+            completed_at: Some(now),
+            xcode_shim_injected: false,
+            requires_xcode_host_execution: false,
+            handshake: acp::AcpRuntimeReceiptHandshake::default(),
+            counters: acp::AcpRuntimeReceiptCounters {
+                total_messages: 8,
+                session_update_count: 5,
+                permission_request_count: 1,
+                permission_grant_sent_count: 1,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 4,
+                unknown_notification_count: 0,
+            },
+            permission_roundtrips: Vec::new(),
+            first_events: Vec::new(),
+            last_events: vec![
+                acp::AcpRuntimeReceiptEvent {
+                    at_ms: 1250,
+                    kind: "session_update:text_chunk".into(),
+                    detail: Some("editing implementation".into()),
+                },
+                acp::AcpRuntimeReceiptEvent {
+                    at_ms: 2400,
+                    kind: "session_update:other".into(),
+                    detail: Some("com.agentclientprotocol.rpc.JsonRpcNotification,diff".into()),
+                },
+            ],
+        };
+
+        Err(acp::AcpExecutionError::new(
+            "ACP session closed during active prompt after provider diff",
+            Some(receipt),
+        )
+        .into())
     }
 }
 
@@ -10053,6 +10392,316 @@ async fn test_invoke_agent_active_prompt_close_auto_requeues_with_fresh_attempt(
         .find(|item| item.kind == db::work_item::WorkItemKind::InvokeAgent)
         .expect("InvokeAgent work item should exist after recovery");
     assert_eq!(invoke.status, db::work_item::WorkItemStatus::Completed);
+}
+
+#[tokio::test]
+async fn proposal_088_code_writer_stale_implementation_active_enters_receipt_path_not_auto_requeue()
+{
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("p088-stale-implementation-active.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .expect("test shared DbWriter registration failed");
+    let workspace_root = tmp.path().to_string_lossy().into_owned();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("git init should run");
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    let output_path = tmp
+        .path()
+        .join(".chainworks/review/implementation-summary.json");
+    std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root.clone();
+    run.worktree_root = Some(workspace_root.clone());
+    run.artifact_root = workspace_root.clone();
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "implementation_active".into();
+    stage.label = "Implementation Active".into();
+    stage.owner_agent = Some("code_writer".into());
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![Arc::new(
+        P088StaleImplementationActiveAdapter,
+    )]));
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("implementation_active".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "implementation_active",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "code_writer",
+                "provider": "p088_stale_implementation_active",
+                "prompt": "implement and write required summary",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "code_writer",
+                "worktree_write_enabled": true,
+                "worktree_strategy": "shared_implementation_worktree",
+                "declared_outputs": [{
+                    "output_name": "implementation_review_summary",
+                    "target_path": output_path.to_string_lossy(),
+                    "schema": {
+                        "contract_id": "implementation_review_summary_v1",
+                        "format": "json",
+                        "human_format": serde_json::Value::Null,
+                        "machine_format": "json",
+                        "validation_mode": "strict_structured",
+                        "normalized_artifact_name": "implementation_review_summary",
+                        "raw_artifact_name": serde_json::Value::Null,
+                        "required_fields": ["status", "open_blockers", "must_fix", "recommended_next_step"]
+                    },
+                    "companion_output_name": serde_json::Value::Null,
+                    "companion_path": serde_json::Value::Null
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let error = executor
+        .process_next_item()
+        .await
+        .expect_err("stale active code_writer should fail the invoke item after P088 receipt");
+    assert!(
+        error
+            .to_string()
+            .contains("ACP session closed during active prompt"),
+        "unexpected error: {error}"
+    );
+
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    let execution = &executions[0];
+    assert_eq!(execution.agent_id, "code_writer");
+    assert_eq!(execution.status, AgentStatus::Failed);
+    assert!(execution.completed_at.is_some());
+
+    let facts = agent_execution_runtime_facts::find_by_execution_id(&pool, execution.id)
+        .await
+        .unwrap()
+        .expect("runtime facts should be persisted");
+    assert_eq!(
+        facts.supervision_classification.as_deref(),
+        Some("recoverable_handoff_gap_after_provider_progress")
+    );
+    assert_eq!(
+        facts.transport_error_code.as_deref(),
+        Some("ACP_HANDOFF_IDLE_AFTER_DIFF")
+    );
+
+    let receipts = code_writer_completion_receipts::list_canonical_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0].receipt;
+    assert_eq!(receipt.agent_execution_id, execution.id);
+    assert_eq!(receipt.activation_source, "p037_idle_terminalization");
+    assert_eq!(
+        receipt.work_change_kind.as_deref(),
+        Some("current_attempt_diff")
+    );
+    assert_eq!(receipt.missing_required_output_count, 1);
+    assert_eq!(
+        receipt.failure_class.as_deref(),
+        Some("work_completed_missing_current_attempt_outputs")
+    );
+    assert_eq!(
+        receipt.completion_turn_result.as_deref(),
+        Some("skipped_no_live_session")
+    );
+
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let invoke = items
+        .iter()
+        .find(|item| item.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .expect("InvokeAgent work item should remain readable");
+    assert_eq!(invoke.status, db::work_item::WorkItemStatus::Failed);
+    let failed_payload: serde_json::Value = serde_json::from_str(&invoke.payload_json).unwrap();
+    assert!(
+        failed_payload.get("acp_active_prompt_recovery").is_none(),
+        "P088 candidates must not bypass receipt persistence via active-prompt auto-requeue"
+    );
+}
+
+#[tokio::test]
+async fn proposal_088_startup_repair_recovers_receipt_artifact_without_db_row() {
+    use domain::code_writer_completion::{
+        CodeWriterCompletionOutputDecisionRecord, CodeWriterCompletionReceiptRecord,
+        CodeWriterCompletionTextCaptureRecord,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("p088-startup-recovery.sqlite");
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .expect("test shared DbWriter registration failed");
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.artifact_root = tmp.path().to_string_lossy().into_owned();
+    runs::insert(&pool, &run).await.unwrap();
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.owner_agent = Some("code_writer".into());
+    stages::insert(&pool, &stage).await.unwrap();
+    let mut execution = make_agent_execution(stage_exec_id, AgentStatus::Failed);
+    execution.agent_id = "code_writer".into();
+    execution.completed_at = Some(Utc::now());
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let receipt = CodeWriterCompletionReceiptRecord {
+        id: format!("{}:code_writer_completion_receipt_v1", execution.id),
+        run_id,
+        stage_execution_id: stage_exec_id,
+        agent_execution_id: execution.id,
+        session_generation_id: Some("generation-recovered".into()),
+        original_runtime_receipt_id: Some(format!("{}:original:0", execution.id)),
+        completion_repair_runtime_receipt_id: None,
+        provider: "codex".into(),
+        model: Some("gpt-5".into()),
+        completion_mode: None,
+        published_at: None,
+        activation_source: "p037_idle_terminalization".into(),
+        ingestion_boundary_failure: Some("chainworks_output_not_extracted".into()),
+        work_change_kind: Some("current_attempt_diff".into()),
+        pre_prompt_worktree_fingerprint_path: None,
+        post_prompt_worktree_fingerprint_path: None,
+        pre_prompt_worktree_fingerprint_sha256: None,
+        post_prompt_worktree_fingerprint_sha256: None,
+        current_attempt_changed_path_count: 1,
+        preexisting_dirty_path_count: 0,
+        completion_status: "missing_required_outputs".into(),
+        failure_class: None,
+        terminal_response_status: Some("completed".into()),
+        completion_turn_attempted: false,
+        completion_turn_result: Some("not_attempted".into()),
+        completion_text_capture_count: 1,
+        completion_text_absence_count: 0,
+        completion_repair_text_status: None,
+        completion_repair_raw_text_artifact_path: None,
+        completion_repair_redacted_text_artifact_path: None,
+        completion_repair_text_absence_reason: None,
+        fresh_required_output_count: 0,
+        stale_required_output_count: 0,
+        missing_required_output_count: 1,
+        control_plane_output_count: 0,
+        completion_repair_turn_count: 0,
+        generic_repair_turn_count: 0,
+        missing_outputs: vec!["implementation_progress".into()],
+        stale_outputs: Vec::new(),
+        transcript_status: Some("unavailable".into()),
+        transcript_absence_reason: Some("provider_did_not_supply".into()),
+        receipt_artifact_path: None,
+        failed_stage_evidence_path: None,
+        created_at: Utc::now(),
+    };
+    let capture = CodeWriterCompletionTextCaptureRecord {
+        receipt_id: receipt.id.clone(),
+        prompt_kind: "original".into(),
+        turn_index: 0,
+        terminal_response_status: Some("completed".into()),
+        completion_text_status: "captured".into(),
+        completion_text_capture_source: Some("terminal_final_response".into()),
+        completion_text_raw_byte_limit: Some(262144),
+        completion_text_captured_byte_count: Some(64),
+        completion_text_truncated: false,
+        extraction_input_truncated: false,
+        extraction_input_sha256: Some("sha256:recovered".into()),
+        raw_text_artifact_path: None,
+        redacted_text_artifact_path: None,
+        text_absence_reason: None,
+        created_at: receipt.created_at,
+    };
+    let decision = CodeWriterCompletionOutputDecisionRecord {
+        receipt_id: receipt.id.clone(),
+        output_name: "implementation_progress".into(),
+        contract_id: Some("implementation_progress_v1".into()),
+        canonical_path: "implementation/progress.md".into(),
+        pre_prompt_sha256: None,
+        post_prompt_sha256: None,
+        content_sha256: None,
+        settlement_source: Some("missing".into()),
+        validation_status: Some("missing".into()),
+        rejection_reason: Some("missing_required_output".into()),
+    };
+    let artifact_path = tmp
+        .path()
+        .join("evidence")
+        .join("p088")
+        .join(execution.id.to_string())
+        .join("code-writer-completion-receipt-v1.json");
+    std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &artifact_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": "code_writer_completion_receipt_v1",
+            "receipt": receipt,
+            "text_captures": [capture],
+            "output_decisions": [decision],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let recovery = RecoveryService::new_with_db_writer(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+        Arc::new(db::writer::DbWriter::new(pool.clone())),
+    );
+    let summary = recovery.run_startup_repair().await.unwrap();
+    assert_eq!(summary.runs_repaired, 1);
+
+    let receipts = code_writer_completion_receipts::list_canonical_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    let recovered = &receipts[0].receipt;
+    assert_eq!(recovered.agent_execution_id, execution.id);
+    assert_eq!(
+        recovered.failure_class.as_deref(),
+        Some("completion_receipt_partial_write")
+    );
+    assert_eq!(
+        recovered.receipt_artifact_path.as_deref(),
+        Some(artifact_path.to_string_lossy().as_ref())
+    );
 }
 
 #[cfg(unix)]

@@ -335,6 +335,40 @@ struct Proposal027Tests {
         #expect(snapshot.latestDebugArtifacts.map(\.name) == ["proposal_writer_receipt.json"])
     }
 
+    @Test("Workflow run artifact snapshot keeps only the latest approval-context artifact per name")
+    func workflowRunArtifactSnapshotKeepsLatestApprovalContextArtifactPerName() {
+        let now = Date()
+        let runID = UUID()
+
+        let olderSummary = Artifact(
+            name: "proposal_review_summary",
+            contractID: "proposal_review_summary_v1",
+            format: .json,
+            filePath: tempDirectory.appendingPathComponent("proposal_review_summary-old.json").path,
+            createdAt: now.addingTimeInterval(-30),
+            runID: runID,
+            stageID: "state_4_proposal_reviewed",
+            agentID: "lead_orchestrator",
+            provider: "claude-code"
+        )
+        let newerSummary = Artifact(
+            name: "proposal_review_summary",
+            contractID: "proposal_review_summary_v2",
+            format: .json,
+            filePath: tempDirectory.appendingPathComponent("proposal_review_summary-new.json").path,
+            createdAt: now.addingTimeInterval(-5),
+            runID: runID,
+            stageID: "state_4_proposal_reviewed",
+            agentID: "lead_orchestrator",
+            provider: "claude-code"
+        )
+
+        let snapshot = WorkflowRunArtifactSnapshot(artifacts: [olderSummary, newerSummary])
+
+        #expect(snapshot.approvalContextArtifacts.count == 1)
+        #expect(snapshot.approvalContextArtifacts.first?.contractID == "proposal_review_summary_v2")
+    }
+
     @Test("Native markdown keeps markdown presentation intent when payload is not JSON")
     func nativeMarkdownKeepsMarkdownPresentationIntent() {
         let intent = ArtifactPresentationIntent.resolve(

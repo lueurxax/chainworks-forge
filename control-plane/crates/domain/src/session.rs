@@ -24,6 +24,9 @@ pub enum SessionEventType {
     OutputContractRepairSucceeded,
     OutputContractRepairFailed,
     OutputContractRepairSkipped,
+    CodeWriterCompletionStarted,
+    CodeWriterCompletionSucceeded,
+    CodeWriterCompletionFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -90,4 +93,32 @@ pub struct SessionEvent {
     pub event_type: SessionEventType,
     pub recorded_at: DateTime<Utc>,
     pub details_json: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionEventType;
+
+    #[test]
+    fn proposal_088_code_writer_completion_event_types_serialize_as_contract_names() {
+        let cases = [
+            (
+                SessionEventType::CodeWriterCompletionStarted,
+                "\"code_writer_completion_started\"",
+            ),
+            (
+                SessionEventType::CodeWriterCompletionSucceeded,
+                "\"code_writer_completion_succeeded\"",
+            ),
+            (
+                SessionEventType::CodeWriterCompletionFailed,
+                "\"code_writer_completion_failed\"",
+            ),
+        ];
+
+        for (event_type, expected) in cases {
+            let json = serde_json::to_string(&event_type).expect("serialize event type");
+            assert_eq!(json, expected);
+        }
+    }
 }

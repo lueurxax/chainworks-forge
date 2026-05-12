@@ -305,6 +305,127 @@ async fn class_d_rollup_producer_persists_bounded_snapshot_and_purges_retention(
     writer.shutdown().await;
 }
 
+#[tokio::test]
+async fn class_d_duplicate_window_rollups_merge_counters_and_max_gauges() {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = Arc::new(DbWriter::new(pool.clone()));
+    let window_start = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let window_end = chrono::Utc::now();
+
+    storage_health::insert_write_pressure_snapshot(
+        &pool,
+        &storage_health::StorageWritePressureSnapshot {
+            id: "rollup-a".into(),
+            window_start,
+            window_end,
+            payload_json: serde_json::json!({
+                "source": "dbwriter_telemetry_rollup",
+                "rollup": {
+                    "telemetryDroppedTotal": 2,
+                    "coalescedMergedTotal": 3,
+                    "starvationTotal": 1,
+                    "totalQueued": 4,
+                    "transactionDurationP95Ms": 7,
+                    "lanes": [
+                        {
+                            "lane": "telemetry_rollup",
+                            "queuedDepth": 5,
+                            "capacity": 1024,
+                            "oldestQueuedAgeMs": 11
+                        }
+                    ]
+                }
+            }),
+            created_at: window_end,
+        },
+    )
+    .await
+    .unwrap();
+
+    storage_health::insert_write_pressure_snapshot(
+        &pool,
+        &storage_health::StorageWritePressureSnapshot {
+            id: "rollup-b".into(),
+            window_start,
+            window_end,
+            payload_json: serde_json::json!({
+                "source": "dbwriter_telemetry_rollup",
+                "rollup": {
+                    "telemetryDroppedTotal": 5,
+                    "coalescedMergedTotal": 7,
+                    "starvationTotal": 4,
+                    "totalQueued": 9,
+                    "transactionDurationP95Ms": 13,
+                    "lanes": [
+                        {
+                            "lane": "telemetry_rollup",
+                            "queuedDepth": 8,
+                            "capacity": 1024,
+                            "oldestQueuedAgeMs": 3
+                        }
+                    ]
+                }
+            }),
+            created_at: window_end + chrono::Duration::seconds(1),
+        },
+    )
+    .await
+    .unwrap();
+
+    let row_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM storage_write_pressure_snapshots WHERE window_start = ?1 AND window_end = ?2",
+    )
+    .bind(window_start.to_rfc3339())
+    .bind(window_end.to_rfc3339())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row_count, 1,
+        "duplicate Class D windows must merge into one row"
+    );
+
+    let latest = storage_health::latest_write_pressure_snapshot(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.id, "rollup-a");
+    assert_eq!(
+        latest.payload_json["rollup"]["telemetryDroppedTotal"].as_u64(),
+        Some(7)
+    );
+    assert_eq!(
+        latest.payload_json["rollup"]["coalescedMergedTotal"].as_u64(),
+        Some(10)
+    );
+    assert_eq!(
+        latest.payload_json["rollup"]["starvationTotal"].as_u64(),
+        Some(5)
+    );
+    assert_eq!(
+        latest.payload_json["rollup"]["totalQueued"].as_u64(),
+        Some(9),
+        "gauge fields must merge by max"
+    );
+    assert_eq!(
+        latest.payload_json["rollup"]["transactionDurationP95Ms"].as_u64(),
+        Some(13),
+        "p95 gauge must merge by max"
+    );
+    assert_eq!(
+        latest.payload_json["rollup"]["lanes"][0]["queuedDepth"].as_u64(),
+        Some(8),
+        "lane gauges must merge by max for the same lane"
+    );
+    assert_eq!(
+        latest.payload_json["rollup"]["lanes"][0]["oldestQueuedAgeMs"].as_u64(),
+        Some(11),
+        "oldest queued age gauge must preserve the max pressure"
+    );
+
+    writer.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // P2-T02: Multiple concurrent Class A writes all commit
 // ---------------------------------------------------------------------------

@@ -351,6 +351,82 @@ Per-work-item delivery record for retry instructions (P065).
 | `deliveredAt` | `Date?` | When prompt augmentation succeeded |
 
 
+### `SideEffect` (Rust-only)
+
+The durable record for an irreversible or externally visible release operation.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique identifier (UUID) |
+| `runID` | `String` | Run ID |
+| `stageExecutionID` | `String` | Stage execution ID |
+| `agentExecutionID` | `String?` | Agent execution ID (optional) |
+| `effectKind` | `EffectKind` | `git_commit` · `git_push` · `build_archive` · `connect_upload` · `tag_create` · `artifact_publish` |
+| `targetKey` | `String` | Target identifier (e.g. branch, repo, file path) |
+| `idempotencyKey` | `String` | Deterministic key for external idempotency |
+| `idempotencyKeyVersion`| `Int` | Version for idempotency key derivation |
+| `requestFingerprint` | `String` | Content-based fingerprint of the request |
+| `requestFingerprintVersion`| `Int` | Version for fingerprinting logic |
+| `status` | `SideEffectStatus` | `prepared` · `executing` · `externally_observed` · `needs_reconciliation` · `settled` · `reconciled` · `conflict` · `unrecoverable` |
+| `ownerInstanceID` | `String?` | Identity of the executing daemon instance |
+| `leaseAcquiredAt` | `Date?` | When the lease was acquired |
+| `leaseRenewedAt` | `Date?` | When the lease was last renewed |
+| `leaseExpiresAt` | `Date?` | When the lease expires |
+| `deadlineAt` | `Date?` | Hard deadline for completion |
+| `externalWriteStartedAt`| `Date?` | When the external operation actually started |
+| `externalWriteAttempted`| `Bool` | Whether an external write was actually started |
+| `attemptBudgetRemaining`| `Int` | Number of retries allowed (fail-closed) |
+| `expectedEvidenceJSON` | `String?` | Expected evidence for settlement |
+| `observedEvidenceSummaryJSON`| `String?` | Summary of evidence observed so far |
+| `evidenceRoot` | `String?` | Root path for evidence files |
+| `lastErrorKind` | `String?` | e.g. `transport_error`, `deadline_exceeded` |
+| `lastError` | `String?` | Detailed error message |
+| `settlementTxnID` | `String?` | DB transaction ID that settled the effect |
+| `createdAt` | `Date` | Creation timestamp |
+| `updatedAt` | `Date` | Last update |
+
+### `SideEffectAttempt` (Rust-only)
+
+Individual attempt record for a side effect.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique identifier (UUID) |
+| `sideEffectID` | `String` | Parent side effect ID |
+| `attemptNumber` | `Int` | Attempt counter |
+| `attemptKind` | `String` | `external_write` · `readback_reconciliation` |
+| `ownerInstanceID` | `String` | Identity of the executing daemon instance |
+| `startedAt` | `Date` | When the attempt started |
+| `completedAt` | `Date?` | When the attempt finished |
+| `deadlineAt` | `Date?` | Attempt-specific deadline |
+| `exitStatus` | `String?` | Process exit status or transport code |
+| `stdoutPath` | `String?` | Path to spooled stdout |
+| `stderrPath` | `String?` | Path to spooled stderr |
+| `tracePath` | `String?` | Path to spooled trace/logs |
+| `observedEvidenceSummaryJSON`| `String?` | Evidence observed during this attempt |
+| `errorKind` | `String?` | Stable error category |
+| `error` | `String?` | Detailed error message |
+
+### `SideEffectSettlement` (Rust-only)
+
+The authoritative settlement or reconciliation record for a side effect.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `String` | Unique identifier (UUID) |
+| `sideEffectID` | `String` | Parent side effect ID |
+| `settlementStatus` | `SideEffectStatus` | Resulting terminal status |
+| `settlementSource` | `String` | `provider_observation` · `mcp_operator` · `startup_repair` |
+| `receiptArtifactID`| `String?` | Link to external receipt artifact |
+| `reconciliationReportArtifactID`| `String?` | Link to operator-visible report |
+| `appliedAt` | `Date` | When the settlement was applied |
+| `appliedBy` | `String?` | Identity of the operator or service |
+| `dispositionID` | `String?` | Idempotency key for operator dispositions |
+| `settlementAttemptID`| `String?` | The attempt that led to this settlement |
+| `decisionJSON` | `String?` | Rationale for manual reconciliation |
+| `decisionJSONHash` | `String?` | Payload hash for disposition idempotency |
+
+
 ## Status enums
 
 ### `RunStatus` (8 states)

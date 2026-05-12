@@ -27,6 +27,15 @@ SwiftUI must not use:
 - escalation policy drift acknowledgement.
 - tier mutation (retry, resume, cancel, or force-primary).
 
+## Boundary Matrix
+
+| Row ID | SwiftUI surface | Allowed transport | Allowed action | Denied action families |
+|---|---|---|---|---|
+| `P081-UI-APPROVAL-APPROVE` | Approval inbox / approval detail | GraphQL mutation | `approveApproval` only when durable approval state is pending/requested and caller policy allows it | start/cancel/retry/reset/compact/clone/recovery/runtime-profile/context-strategy/experiment |
+| `P081-UI-APPROVAL-REJECT` | Approval inbox / approval detail | GraphQL mutation | `rejectApproval` only when durable approval state is pending/requested and caller policy allows it | start/cancel/retry/reset/compact/clone/recovery/runtime-profile/context-strategy/experiment |
+| `P081-UI-READ-ONLY` | Runs, stages, artifacts, diagnostics, freshness badges | GraphQL query/subscription | read-only projection display | all mutations and all direct SQLite/local workflow writes |
+| `P081-UI-EXTERNAL-COMMANDS` | Command placeholders and guidance | MCP/control-plane outside governed SwiftUI | none from SwiftUI | all non-approval command/control operations from GraphQL or local Swift state |
+
 ## Forbidden UI Mutations
 
 The governed SwiftUI app must not create, start, cancel, retry, reset, compact,
@@ -57,6 +66,11 @@ Examples:
 - `runs.start`,
 - `runs.cancel`,
 - `stages.retry`,
+- `effects.list`,
+- `effects.inspect`,
+- `effects.reconcile`,
+- `effects.mark_unrecoverable`,
+- `effects.clear_after_manual_verification`,
 - `workflow_conflicts.resolve`,
 - `legacy_discovery_override_create`,
 - `steward.run_analysis`,
@@ -76,5 +90,6 @@ SQLite is internal daemon storage, not an automation API.
 ## Owner References
 
 - GraphQL projection read shape: [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md)
+- Thin-client affordance contract: [thin-client-read-model-affordance-contract.md](thin-client-read-model-affordance-contract.md)
 - MCP command/control surface: [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md)
 - Operator shell behavior: [operator-experience.md](operator-experience.md)

@@ -374,7 +374,8 @@ struct EndToEndTests {
             let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
             #expect(json["pass"] as? Bool == true)
             #expect(json["average_score"] as? Double != nil)
-            #expect(json["required_changes"] as? [Any] != nil)
+            #expect(json["blocking_required_changes"] as? [Any] != nil)
+            #expect(json["advisory_follow_ups"] as? [Any] != nil)
         } else {
             Issue.record("Expected proposal_review_summary artifact to be persisted")
         }

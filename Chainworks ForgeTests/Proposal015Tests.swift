@@ -26,26 +26,25 @@ struct Proposal015Tests {
         try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
     }
 
-    @Test("External skill resolution applies current proposal review mode mapping")
-    func externalSkillResolutionAppliesCurrentProposalReviewModeMapping() throws {
-        let bundleURL = try makeSkillBundle(
-            named: "proposal-review-triad",
-            content: """
-            Shared review skill root.
-            """
-        )
+    @Test("Inline proposal review router skill applies current proposal review mode mapping")
+    func inlineProposalReviewRouterSkillAppliesCurrentProposalReviewModeMapping() throws {
         let resolved = try SkillResolver.resolve(
-            skillID: "proposal_review_triad",
-            skillRef: SkillRef(type: "external_skill", path: bundleURL.path, name: nil, description: nil),
+            skillID: "proposal_review_router_skill",
+            skillRef: SkillRef(
+                type: "inline_skill",
+                path: nil,
+                name: nil,
+                description: "Proposal-first review router and specialist reviewer skill."
+            ),
             skillRole: "product_owner",
-            context: SkillResolverContext(catalogBaseURL: bundleURL)
+            context: SkillResolverContext()
         )
 
-        #expect(resolved.type == .external)
-        #expect(resolved.sourcePath == bundleURL.path)
+        #expect(resolved.type == .inline)
+        #expect(resolved.sourcePath == nil)
         #expect(resolved.injectedContent.contains("product-only"))
         #expect(resolved.specializationSummary?.contains("product-only") == true)
-        #expect(resolved.injectedContentHash != DefinitionHasher.hashString("proposal_review_triad"))
+        #expect(resolved.injectedContentHash != DefinitionHasher.hashString("proposal_review_router_skill"))
     }
 
     @Test("Relative external skill path is normalized against catalog base URL")
@@ -67,23 +66,20 @@ struct Proposal015Tests {
         #expect(resolved.sourcePath?.contains("/../") == false)
     }
 
-    @Test("Portable catalog copy localizes external skill bundles next to the rewritten catalog")
-    func portableCatalogCopyLocalizesExternalSkillBundles() throws {
+    @Test("Portable catalog copy preserves packaged-safe inline skills")
+    func portableCatalogCopyPreservesPackagedSafeInlineSkills() throws {
         let catalogFixtureURL = try fixtureURL(name: "agents", ext: "yaml")
         let localizedURL = tempDirectory.appendingPathComponent("agents-portable.yaml")
         let copiedURL = try writePortableCatalogCopy(from: catalogFixtureURL, to: localizedURL)
         let copiedCatalog = try YAMLParser.loadAgentCatalog(from: copiedURL)
-        let triadSkill = try #require(copiedCatalog.skills["proposal_review_triad"])
+        let routerSkill = try #require(copiedCatalog.skills["proposal_review_router_skill"])
         let auditSkill = try #require(copiedCatalog.skills["proposal_implementation_audit"])
-        let triadPath = try #require(triadSkill.path)
-        let auditPath = try #require(auditSkill.path)
 
-        #expect(triadPath.contains("portable-skills-"))
-        #expect(auditPath.contains("portable-skills-"))
-        #expect(FileManager.default.fileExists(atPath: (triadPath as NSString).appendingPathComponent("SKILL.md")))
-        #expect(FileManager.default.fileExists(atPath: (auditPath as NSString).appendingPathComponent("SKILL.md")))
-        #expect(triadPath.hasPrefix(tempDirectory.path))
-        #expect(auditPath.hasPrefix(tempDirectory.path))
+        #expect(routerSkill.type == "inline_skill")
+        #expect(routerSkill.path == nil)
+        #expect(auditSkill.type == "inline_skill")
+        #expect(auditSkill.path == nil)
+        #expect(copiedCatalog.skills.values.allSatisfy { $0.type != "external_skill" })
     }
 
     @Test("Runtime session packet injects resolved skill content before agent prompt")
@@ -153,8 +149,12 @@ struct Proposal015Tests {
         let mutatedCatalogURL = tempDirectory.appendingPathComponent("agents-missing-skill.yaml")
         let fixtureContent = try String(contentsOf: catalogFixtureURL, encoding: .utf8)
         let mutated = fixtureContent.replacingOccurrences(
-            of: tempDirectory.appendingPathComponent("skills/proposal-review-triad").path,
-            with: tempDirectory.appendingPathComponent("missing-proposal-review-triad").path
+            of: "proposal_review_router_skill:\n    type: inline_skill",
+            with: """
+            proposal_review_router_skill:
+                type: external_skill
+                path: \(tempDirectory.appendingPathComponent("missing-proposal-review-router").path)
+            """
         )
         try mutated.write(to: mutatedCatalogURL, atomically: true, encoding: .utf8)
 
@@ -190,7 +190,7 @@ struct Proposal015Tests {
         })
         #expect(report.blockingIssues.contains {
             $0.localizedCaseInsensitiveContains("failed resolution")
-                && $0.localizedCaseInsensitiveContains("proposal_review_triad")
+                && $0.localizedCaseInsensitiveContains("proposal_review_router_skill")
         })
     }
 
@@ -248,7 +248,7 @@ struct Proposal015Tests {
         let result = try Proposal015AppProofHarness().run()
 
         #expect(result.proofAgentID == "proposal_reviewer_product_owner")
-        #expect(result.reportSkillRef == "proposal_review_triad")
+        #expect(result.reportSkillRef == "proposal_review_router_skill")
         #expect(result.reportSkillRole == "product_owner")
         #expect(result.comparisonSkillRole == "architect")
         #expect(result.primaryArtifactName == "proposal_current")
@@ -269,7 +269,7 @@ struct Proposal015Tests {
         )
 
         #expect(export.result.runID == persisted.result.runID)
-        #expect(persisted.result.reportSkillRef == "proposal_review_triad")
+        #expect(persisted.result.reportSkillRef == "proposal_review_router_skill")
         #expect(persisted.result.reportSkillRole == "product_owner")
         #expect(persisted.result.comparisonSkillRole == "architect")
         #expect(persisted.result.primaryArtifactExists)
@@ -435,19 +435,19 @@ struct Proposal015Tests {
         #expect(result.reportAgent.resolvedSkillContent == result.agent.resolvedSkill?.resolvedContent)
     }
 
-    @Test("External skill resolves from YAML through execution and provenance")
-    func externalSkillResolvesFromYAMLThroughExecutionAndProvenance() async throws {
+    @Test("Proposal review router skill resolves from YAML through execution and provenance")
+    func proposalReviewRouterSkillResolvesFromYAMLThroughExecutionAndProvenance() async throws {
         let result = try await executeFixtureSkillE2E(
             agentID: "proposal_reviewer_product_owner",
             taskName: "review_proposal_as_product_owner",
             outputName: "proposal_review_po"
         )
 
-        #expect(result.agent.resolvedSkill?.type == .external)
-        #expect(result.execution.skillType == "external")
+        #expect(result.agent.resolvedSkill?.type == .inline)
+        #expect(result.execution.skillType == "inline")
         #expect(result.execution.skillRole == "product_owner")
         #expect(result.execution.skillSnapshotHash == result.agent.resolvedSkill?.injectedContentHash)
-        #expect(result.reportAgent.skillRef == "proposal_review_triad")
+        #expect(result.reportAgent.skillRef == "proposal_review_router_skill")
         #expect(result.reportAgent.resolvedSkillContent == result.agent.resolvedSkill?.resolvedContent)
     }
 
@@ -500,24 +500,23 @@ struct Proposal015Tests {
 
     @Test("Role specialization changes injected hash and execution prompt")
     func roleSpecializationChangesInjectedHashAndExecutionPrompt() throws {
-        let bundleURL = try makeSkillBundle(
-            named: "proposal-review-triad-diff",
-            content: """
-            Shared review skill root.
-            """
+        let skillRef = SkillRef(
+            type: "inline_skill",
+            path: nil,
+            name: nil,
+            description: "Proposal-first review router and specialist reviewer skill."
         )
-        let skillRef = SkillRef(type: "external_skill", path: bundleURL.path, name: nil, description: nil)
         let product = try SkillResolver.resolve(
-            skillID: "proposal_review_triad",
+            skillID: "proposal_review_router_skill",
             skillRef: skillRef,
             skillRole: "product_owner",
-            context: SkillResolverContext(catalogBaseURL: bundleURL)
+            context: SkillResolverContext()
         )
         let architect = try SkillResolver.resolve(
-            skillID: "proposal_review_triad",
+            skillID: "proposal_review_router_skill",
             skillRef: skillRef,
             skillRole: "architect",
-            context: SkillResolverContext(catalogBaseURL: bundleURL)
+            context: SkillResolverContext()
         )
 
         #expect(product.injectedContentHash != architect.injectedContentHash)
@@ -532,7 +531,7 @@ struct Proposal015Tests {
             maxTurns: 8,
             temperature: 0,
             permissionProfile: "RO_REVIEW",
-            skillRef: "proposal_review_triad",
+            skillRef: "proposal_review_router_skill",
             skillRole: "product_owner",
             resolvedSkill: product,
             prompt: "Review as product owner.",
@@ -551,7 +550,7 @@ struct Proposal015Tests {
             maxTurns: 8,
             temperature: 0,
             permissionProfile: "RO_REVIEW",
-            skillRef: "proposal_review_triad",
+            skillRef: "proposal_review_router_skill",
             skillRole: "architect",
             resolvedSkill: architect,
             prompt: "Review as architect.",

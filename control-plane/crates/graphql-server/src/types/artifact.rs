@@ -12,6 +12,9 @@ use crate::types::p031::{
 };
 use crate::types::stage::AgentOutputSettlement;
 
+pub const P085_NO_DEADLINE_JUSTIFICATION: &str =
+    "No server staleness deadline applies: this is a bounded read projection state, not an active payload-generation job.";
+
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(complex)]
 pub struct GqlArtifact {
@@ -154,9 +157,9 @@ impl From<Artifact> for GqlArtifact {
             },
             payload_text: None,
             diagnostic_id: is_report.then_some(artifact_id),
-            server_debug_detail: is_report.then_some(
-                "P031 exposes report metadata only; payload rendering is deferred".into(),
-            ),
+            server_debug_detail: is_report.then_some(format!(
+                "P031 exposes report metadata only; payload rendering is deferred. {P085_NO_DEADLINE_JUSTIFICATION}"
+            )),
         }
     }
 }
@@ -206,9 +209,9 @@ impl From<ArtifactIndexRow> for GqlArtifact {
             },
             payload_text: None,
             diagnostic_id: is_report.then_some(r.id),
-            server_debug_detail: is_report.then_some(
-                "P031 exposes report metadata only; payload rendering is deferred".into(),
-            ),
+            server_debug_detail: is_report.then_some(format!(
+                "P031 exposes report metadata only; payload rendering is deferred. {P085_NO_DEADLINE_JUSTIFICATION}"
+            )),
         }
     }
 }

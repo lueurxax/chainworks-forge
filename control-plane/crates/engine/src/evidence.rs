@@ -5,7 +5,7 @@ use db::evidence_spool::write_spool_file;
 use db::repos::evidence_spool_refs::{
     insert_idempotent_via_dbwriter, EvidenceKind, EvidenceSpoolRef, EvidenceSpoolRefStatus,
 };
-use db::repos::{agent_executions, artifacts, stages};
+use db::repos::{agent_execution_runtime_receipts, agent_executions, artifacts, stages};
 use db::write_class::WriteResult;
 use db::writer::DbWriter;
 use domain::artifact::{Artifact, ArtifactFormat};
@@ -46,6 +46,19 @@ pub async fn build_and_persist_failed_stage_evidence(
         .and_then(|stage| stage.recovery_snapshot_json.as_deref())
         .map(serde_json::from_str::<serde_json::Value>)
         .transpose()?;
+    let runtime_receipt =
+        agent_execution_runtime_receipts::find_by_execution_id(pool, input.agent_execution_id)
+            .await?
+            .map(|record| {
+                serde_json::from_str::<serde_json::Value>(&record.receipt_json).unwrap_or_else(
+                    |error| {
+                        serde_json::json!({
+                            "parse_error": error.to_string(),
+                            "raw_receipt_available": true,
+                        })
+                    },
+                )
+            });
 
     let failure_summary = validation_failure
         .as_ref()
@@ -121,6 +134,7 @@ pub async fn build_and_persist_failed_stage_evidence(
         "transcript_exists": transcript_exists,
         "validation_failure": validation_failure,
         "output_envelopes": output_envelopes,
+        "runtime_receipt": runtime_receipt,
         "timing": {
             "stage_started_at": stage.as_ref().map(|stage| stage.started_at),
             "stage_completed_at": Some(input.failed_at),
@@ -269,7 +283,7 @@ mod tests {
 
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{agent_executions, ideas, runs, stages};
+    use db::repos::{agent_execution_runtime_receipts, agent_executions, ideas, runs, stages};
     use domain::agent::{AgentExecution, AgentStatus};
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
@@ -279,7 +293,10 @@ mod tests {
     #[tokio::test]
     async fn failed_stage_evidence_packet_tests() {
         let pool = create_pool("sqlite::memory:").await.unwrap();
-        let db_writer = db::writer::DbWriter::new(pool.clone());
+        let db_writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, db_writer.clone())
+            .await
+            .unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
@@ -436,6 +453,34 @@ mod tests {
         )
         .await
         .unwrap();
+        agent_execution_runtime_receipts::upsert(
+            &pool,
+            &domain::agent::AgentExecutionRuntimeReceiptRecord {
+                agent_execution_id,
+                provider: "system".into(),
+                transport_family: "acp_stdio".into(),
+                status: "failed".into(),
+                failure_phase: Some("progress_timeout".into()),
+                event_count: 4,
+                last_event_kind: Some("session_update:tool_call_update".into()),
+                last_event_at_ms: Some(1234),
+                receipt_json: serde_json::json!({
+                    "schema_version": 1,
+                    "provider": "system",
+                    "status": "failed",
+                    "failure_phase": "progress_timeout",
+                    "counters": {
+                        "session_update_count": 2,
+                        "tool_call_update_count": 2
+                    }
+                })
+                .to_string(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
         crate::recovery::persist_failed_stage_recovery_snapshot(&pool, stage_execution_id, now)
             .await
             .unwrap();
@@ -451,7 +496,7 @@ mod tests {
                 provider: "system",
                 model: None,
                 failed_at: now,
-                db_writer: Some(&db_writer),
+                db_writer: Some(db_writer.as_ref()),
             },
         )
         .await
@@ -496,6 +541,14 @@ mod tests {
         assert_eq!(full_packet["receipt_exists"], serde_json::json!(false));
         assert_eq!(full_packet["transcript_exists"], serde_json::json!(true));
         assert_eq!(full_packet["output_envelopes"][0]["output_name"], "report");
+        assert_eq!(
+            full_packet["runtime_receipt"]["failure_phase"],
+            serde_json::json!("progress_timeout")
+        );
+        assert_eq!(
+            full_packet["runtime_receipt"]["counters"]["tool_call_update_count"],
+            serde_json::json!(2)
+        );
         assert!(full_packet["recovery_snapshot"].is_object());
     }
 }

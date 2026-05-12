@@ -1,0 +1,11 @@
+{
+  "schema_version": "p088_fixture_v1",
+  "scenario": "large_streamed_prelude_tail_capture",
+  "agent_id": "code_writer",
+  "completion_text_capture_source": "streamed_update_tail",
+  "completion_text_truncated": true,
+  "extraction_input_truncated": false,
+  "contains_final_chainworks_output_after_large_prelude": true,
+  "expected_ingestion_boundary_failure": "none",
+  "expected_completion_turn_result": "skipped_usable_final_output_settled"
+}

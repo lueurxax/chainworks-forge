@@ -208,6 +208,10 @@ PROPOSAL_084_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal084Tests"
 )
 
+PROPOSAL_085_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal085Tests"
+)
+
 P060_PROPOSAL_REVISION_ID="P060-r16-2026-04-22"
 PROPOSAL_060_CONTROL_ARTIFACT_DIR="docs/proposals/060-control-artifacts"
 PROPOSAL_060_CONTROL_ARTIFACT_SPECS=(
@@ -1829,7 +1833,7 @@ result = payload.get("result") or {}
 
 checks = [
     (result.get("proofAgentID") == "proposal_reviewer_product_owner", "proof agent id must be proposal_reviewer_product_owner"),
-    (result.get("reportSkillRef") == "proposal_review_triad", "report skill ref must be proposal_review_triad"),
+    (result.get("reportSkillRef") == "proposal_review_router_skill", "report skill ref must be proposal_review_router_skill"),
     (result.get("reportSkillRole") == "product_owner", "report skill role must be product_owner"),
     (result.get("comparisonSkillRole") == "architect", "comparison skill role must be architect"),
     (result.get("primaryArtifactName") == "proposal_current", "primary artifact must be proposal_current"),
@@ -2174,6 +2178,7 @@ Available gates:
   proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
   proposal-077,p077  Proposal 077 closeout readiness gates (Rust domain/db/engine plus GraphQL/MCP readback parity; UI remote evidence separate)
   proposal-077-ui,p077-ui  Proposal 077 remote macOS compact/focus/backlink/accessibility runtime proof
+  proposal-078,p078  Proposal 078 durable side-effect ledger gate (migration, CAS races, preflight, MCP tools)
   proposal-031-readiness,p031-readiness  Thin UI closeout readiness gate
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
@@ -2218,6 +2223,7 @@ Available gates:
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
+  proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -5495,6 +5501,7 @@ PLIST
       cargo test -p db p075_projection_rebuild_uses_production_class_b_coalescing --test integration -- --nocapture
       cargo test -p db class_d_telemetry_drop_counter_is_observable_via_storage_health --test proposal_075_dbwriter -- --nocapture
       cargo test -p db class_d_rollup_producer_persists_bounded_snapshot_and_purges_retention --test proposal_075_dbwriter -- --nocapture
+      cargo test -p db class_d_duplicate_window_rollups_merge_counters_and_max_gauges --test proposal_075_dbwriter -- --nocapture
 
       log "P075: engine producer adoption — failed-stage evidence spools full packet and stores compact SQLite pointer"
       cargo test -p engine failed_stage_evidence_packet_tests -- --nocapture
@@ -5729,12 +5736,16 @@ if "droppedTelemetryTotal" not in storage_health_text or "telemetryDroppedTotal"
     raise SystemExit("P075 storageHealth must report real Class D telemetry drop counters")
 for required in [
     "record_live_write_pressure_rollup",
+    "merge_write_pressure_payload",
     "TELEMETRY_SNAPSHOT_RETAIN_LATEST",
     "latestWindowLimit",
     "DELETE FROM storage_write_pressure_snapshots",
 ]:
     if required not in storage_health_text and required not in writer_text:
         raise SystemExit(f"P075 Class D rollup lifecycle is not wired: missing {required}")
+storage_pressure_migration = (root / "control-plane/crates/db/migrations/049_p075_storage_write_pressure_window_key.sql").read_text()
+if "idx_storage_write_pressure_window_unique" not in storage_pressure_migration or "window_start, window_end" not in storage_pressure_migration:
+    raise SystemExit("P075 Class D telemetry_merge requires a unique write-pressure window key")
 daemon_main = (root / "control-plane/crates/daemon/src/main.rs").read_text()
 if "spawn_storage_write_pressure_rollup(pool.clone(), db_writer.heartbeat.clone())" not in daemon_main:
     raise SystemExit("P075 daemon must start the production Class D write-pressure rollup producer")
@@ -6171,6 +6182,695 @@ PY
     fi
     run_targeted_tests "proposal-077-ui" "${P077_UI_TESTS[@]}"
     log "Proposal 077 remote macOS closeout-readiness UI gate passed"
+    ;;
+  proposal-078|p078)
+    # P078 durable side-effect ledger gate.
+    # Uses local/fake effect adapters. Must not perform live git pushes,
+    # Connect uploads, notarization, production daemon startup, simulator runs,
+    # or UI smoke tests.
+    log "Proposal 078 durable side-effect ledger gate"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p domain proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p db proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p engine --lib proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p engine --test proposal_058_claim_start proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p engine --test release -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p mcp-server proposal_078_ -- --nocapture
+    )
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path.cwd()
+
+fixture_path = root / "docs/evidence/rollout-contract/operator-readback/p078-full-surface.fixture.json"
+negative_path = root / "docs/evidence/rollout-contract/negative/p078-missing-side-effect-readback.json"
+accessibility_path = root / "docs/evidence/rollout-contract/operator-readback/p078-macos-accessibility.fixture.json"
+if not fixture_path.exists():
+    raise SystemExit("proposal-078: missing P078 operator-readback fixture")
+if not negative_path.exists():
+    raise SystemExit("proposal-078: missing P078 missing-readback negative fixture")
+if not accessibility_path.exists():
+    raise SystemExit("proposal-078: missing P078 macOS accessibility proof fixture")
+fixture = json.loads(fixture_path.read_text())
+negative = json.loads(negative_path.read_text())
+accessibility = json.loads(accessibility_path.read_text())
+
+def require_side_effect_readback(payload, field, label):
+    value = payload.get(field)
+    if not isinstance(value, dict):
+        raise SystemExit(f"proposal-078: {label} missing {field}")
+    if value.get("schema_version", value.get("schemaVersion")) != "p078_side_effect_readback_v1":
+        raise SystemExit(f"proposal-078: {label} has invalid side-effect readback schema")
+    for required in ["blocked", "effects"]:
+        if required not in value:
+            raise SystemExit(f"proposal-078: {label} side-effect readback missing {required}")
+    if not value.get("blocked"):
+        raise SystemExit(f"proposal-078: {label} side-effect readback must prove blocked unresolved state")
+    if value.get("unresolved_count", value.get("unresolvedCount")) != 1:
+        raise SystemExit(f"proposal-078: {label} side-effect readback must carry one unresolved effect")
+    effects = value.get("effects")
+    if not isinstance(effects, list) or not effects:
+        raise SystemExit(f"proposal-078: {label} side-effect readback must include non-empty effects")
+    first = effects[0]
+    action = first.get("operator_next_action", first.get("operatorNextAction"))
+    if action != "effects.reconcile":
+        raise SystemExit(f"proposal-078: {label} side-effect readback must expose effects.reconcile next action")
+
+require_side_effect_readback(fixture, "side_effect_readback", "run_report")
+lanes = fixture.get("parity_lanes") or {}
+require_side_effect_readback(lanes.get("mcp") or {}, "side_effect_readback", "mcp")
+require_side_effect_readback(lanes.get("release_receipt") or {}, "side_effect_readback", "release_receipt")
+require_side_effect_readback(lanes.get("graphql") or {}, "sideEffectReadback", "graphql")
+if "side_effect_readback" in negative or "sideEffectReadback" in negative:
+    raise SystemExit("proposal-078: negative fixture unexpectedly contains side-effect readback")
+metrics = fixture.get("metrics") or []
+metric_names = {item.get("name") for item in metrics if isinstance(item, dict)}
+for required_metric in [
+    "p078_release_side_effects_with_durable_intent_percent",
+    "side_effect_intent_total",
+    "side_effect_transition_total",
+    "side_effect_retry_block_total",
+    "side_effect_unresolved",
+    "side_effect_unresolved_age_seconds",
+    "side_effect_recovery_transition_total",
+    "side_effect_settlement_latency_seconds",
+    "startup_side_effect_recovery_total",
+    "startup_side_effect_recovery_duration_seconds",
+    "side_effect_ledger_readback_error_total",
+    "side_effect_ledger_readback_circuit_open_total",
+    "side_effect_evidence_spooled_bytes_total",
+    "side_effect_evidence_disk_bytes",
+    "side_effect_prepare_denied_total",
+]:
+    if required_metric not in metric_names:
+        raise SystemExit(f"proposal-078: rollout fixture missing operational metric {required_metric}")
+for item in metrics:
+    if item.get("cardinality_bound") != "effect_kind_status":
+        raise SystemExit("proposal-078: metric fixture must document effect_kind/status cardinality bound")
+
+side_effects_rs = (root / "control-plane/crates/engine/src/side_effects.rs").read_text()
+executor_rs = (root / "control-plane/crates/engine/src/executor.rs").read_text()
+effects_rs = (root / "control-plane/crates/mcp-server/src/tools/effects.rs").read_text()
+tools_mod_rs = (root / "control-plane/crates/mcp-server/src/tools/mod.rs").read_text()
+graphql_schema_rs = (root / "control-plane/crates/graphql-server/src/schema.rs").read_text()
+runs_rs = (root / "control-plane/crates/mcp-server/src/tools/runs.rs").read_text()
+swift_truth = (root / "Chainworks Forge/Models/ExecutionTruth.swift").read_text()
+swift_read_boundary = (root / "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift").read_text()
+swift_runs_home = (root / "Chainworks Forge/Views/RunsHomeView.swift").read_text()
+
+for metric in [
+    "p078_release_side_effects_with_durable_intent_percent",
+    "side_effect_intent_total",
+    "side_effect_transition_total",
+    "side_effect_retry_block_total",
+    "side_effect_ledger_readback_error_total",
+    "side_effect_ledger_readback_circuit_open_total",
+    "side_effect_recovery_transition_total",
+    "side_effect_settlement_latency_seconds",
+    "side_effect_unresolved",
+    "side_effect_unresolved_age_seconds",
+    "startup_side_effect_recovery_total",
+    "startup_side_effect_recovery_duration_seconds",
+    "side_effect_evidence_spooled_bytes_total",
+    "side_effect_evidence_disk_bytes",
+    "side_effect_prepare_denied_total",
+]:
+    if metric not in side_effects_rs + executor_rs:
+        raise SystemExit(f"proposal-078: missing metric literal {metric}")
+
+for required in [
+    "watchdog_pass().await",
+    "run_unresolved_effects_preflight",
+    "p078_expected_side_effect_evidence_v1",
+    "p078_side_effect_evidence_manifest_v1",
+    "p078_observed_evidence_summary_v1",
+    "manifest_write_order",
+    "run_with_lease_renewal",
+    "p075_write_spool_file",
+    "verify_p078_observed_evidence_summary",
+    "mark_settled_evidence_failed",
+    "P078_LEDGER_READBACK_CIRCUIT_THRESHOLD",
+    "ledger_readback_circuit_open_until",
+    "release-receipt.json",
+    "stdout.log",
+    "stderr.log",
+    "git-ls-remote.json",
+    "upload-readback.json",
+    "archive-summary.json",
+    "reconciliation-report.json",
+]:
+    if required not in executor_rs + side_effects_rs:
+        raise SystemExit(f"proposal-078: missing executor proof marker {required}")
+
+for required in [
+    "effects.mark_conflict",
+    "handle_effects_mark_conflict",
+]:
+    if required not in effects_rs or required not in tools_mod_rs + effects_rs:
+        raise SystemExit(f"proposal-078: missing MCP conflict disposition marker {required}")
+
+for required in [
+    "GqlSideEffectSummary",
+    "observed_evidence_summary_json",
+    "operator_next_action",
+    "side_effect_readback",
+    "SideEffectReadbackSummary",
+    "P078SideEffectReadbackPresenter",
+    "P078SideEffectReadbackCard",
+]:
+    haystack = "\n".join([graphql_schema_rs, runs_rs, swift_truth, swift_read_boundary, swift_runs_home])
+    if required not in haystack:
+        raise SystemExit(f"proposal-078: missing readback marker {required}")
+
+swift_tree = root / "Chainworks Forge"
+swift_text = "\n".join(path.read_text(errors="ignore") for path in swift_tree.rglob("*.swift"))
+for forbidden in ["effects.mark_conflict", "effects.mark_unrecoverable", "effects.clear_after_manual_verification"]:
+    if forbidden in swift_text:
+        raise SystemExit(f"proposal-078: Swift app must remain read-only for {forbidden}")
+
+if accessibility.get("schema_version") != "p078_macos_accessibility_view_hierarchy_v1":
+    raise SystemExit("proposal-078: invalid macOS accessibility proof schema")
+elements = accessibility.get("elements") or []
+ids = {item.get("accessibility_identifier") for item in elements if isinstance(item, dict)}
+for required_id in [
+    "p078-side-effect-readback-card",
+    "p078-side-effect-sidebar-signal",
+    "p078-side-effect-next-action",
+    "p078-side-effect-diagnostics",
+]:
+    if required_id not in ids:
+        raise SystemExit(f"proposal-078: macOS accessibility proof missing {required_id}")
+for item in elements:
+    if item.get("mutation_control"):
+        raise SystemExit("proposal-078: macOS accessibility proof contains mutation control")
+for forbidden in ["reconcile", "retry", "clear", "push", "upload", "publish", "mcp_launch"]:
+    if forbidden not in accessibility.get("forbidden_controls_absent", []):
+        raise SystemExit(f"proposal-078: macOS accessibility proof missing forbidden control check {forbidden}")
+PY
+    log "Proposal 078 durable side-effect ledger gate passed"
+    ;;
+  proposal-088|p088)
+    log "Proposal 088 gate: code-writer completion handoff and diagnostics"
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path.cwd()
+evidence = root / "docs/evidence/088-code-writer-completion"
+required = {
+    "p087-terminal-completed-missing-outputs.fixture.json": {
+        "scenario": "p087_terminal_completed_missing_outputs",
+        "expected_failure_class": "terminal_response_completed_missing_required_outputs",
+    },
+    "p087-70c9-dirty-worktree-timeout.fixture.json": {
+        "scenario": "p087_70c9_preexisting_dirty_timeout",
+        "work_change_kind": "preexisting_dirty_work",
+        "expected_next_operator_action": "do_not_retry_preexisting_dirty_timeout",
+    },
+    "large-streamed-prelude-tail-capture.fixture.json": {
+        "scenario": "large_streamed_prelude_tail_capture",
+        "completion_text_capture_source": "streamed_update_tail",
+        "extraction_input_truncated": False,
+    },
+    "public-enum-roundtrip.fixture.json": {
+        "scenario": "public_enum_roundtrip",
+    },
+    "worktree-fingerprint-v1.fixture.json": {
+        "schema_version": "worktree_fingerprint_v1",
+    },
+    "prompt-side-evidence.fixture.json": {
+        "scenario": "prompt_side_evidence",
+        "prompt_template_id": "code_writer_completion_repair_v1",
+    },
+    "normal-materialization-no-repair.fixture.json": {
+        "scenario": "normal_materialization_no_repair",
+        "expected_completion_turn_attempted": False,
+    },
+    "completion-repair-mutation-negative.fixture.json": {
+        "scenario": "completion_repair_mutation_negative",
+        "expected_completion_turn_result": "failed_unexpected_worktree_mutation",
+    },
+    "docs-only-implementation-change.fixture.json": {
+        "scenario": "docs_only_implementation_change",
+        "work_change_kind": "current_attempt_diff",
+    },
+    "generated-evidence-only-ineligible.fixture.json": {
+        "scenario": "generated_evidence_only_ineligible",
+        "expected_eligible_for_completion_repair": False,
+    },
+    "ingestion-boundary-failures.fixture.json": {
+        "scenario": "ingestion_boundary_failures",
+    },
+    "partial-write-recovery.fixture.json": {
+        "scenario": "completion_receipt_partial_write",
+        "expected_failure_class": "completion_receipt_partial_write",
+    },
+    "provider-independence.fixture.json": {
+        "scenario": "provider_independence_completion_contract",
+        "expected_failure_class": "work_completed_missing_current_attempt_outputs",
+        "provider_specific_truth_branch_allowed": False,
+    },
+}
+for name, expectations in required.items():
+    path = evidence / name
+    if not path.exists():
+        raise SystemExit(f"proposal-088: missing fixture {path}")
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"proposal-088: invalid JSON in {path}: {exc}") from exc
+    for key, expected in expectations.items():
+        actual = data.get(key)
+        if actual != expected:
+            raise SystemExit(
+                f"proposal-088: fixture {name} expected {key}={expected!r}, got {actual!r}"
+            )
+
+fingerprint = json.loads((evidence / "worktree-fingerprint-v1.fixture.json").read_text())
+paths = fingerprint.get("paths")
+summary = fingerprint.get("summary", {})
+if not isinstance(paths, list) or not paths:
+    raise SystemExit("proposal-088: worktree fingerprint fixture must contain paths")
+if paths != sorted(paths, key=lambda item: item.get("normalized_path", "")):
+    raise SystemExit("proposal-088: worktree fingerprint paths must be sorted")
+derived_preexisting = sum(1 for path in paths if path.get("path_status") == "preexisting_dirty")
+if summary.get("preexisting_dirty_path_count") != derived_preexisting:
+    raise SystemExit("proposal-088: fingerprint preexisting_dirty_path_count is not derived")
+if summary.get("work_change_kind") != "preexisting_dirty_work":
+    raise SystemExit("proposal-088: fingerprint fixture must prove preexisting dirty work")
+
+provider_fixture = json.loads((evidence / "provider-independence.fixture.json").read_text())
+providers = sorted(item.get("provider") for item in provider_fixture.get("providers", []))
+if providers != ["claude", "codex", "junie"]:
+    raise SystemExit(
+        f"proposal-088: provider independence fixture must cover claude/codex/junie, got {providers!r}"
+    )
+
+proposal = root / "docs/proposals/088-code-writer-completion-contract-and-output-freshness.md"
+if not proposal.exists():
+    raise SystemExit("proposal-088: missing proposal document")
+proposal_text = proposal.read_text()
+for required_term in [
+    "code_writer_completion_repair_v1",
+    "worktree_fingerprint_v1",
+    "terminal_response_capture_truncated_before_output",
+    "extraction_input_truncated",
+    "current_attempt_diff",
+    "preexisting_dirty_work",
+]:
+    if required_term not in proposal_text:
+        raise SystemExit(f"proposal-088: proposal missing required term {required_term!r}")
+
+gates_doc = root / "docs/reference/test-gates.md"
+if not gates_doc.exists():
+    raise SystemExit("proposal-088: missing docs/reference/test-gates.md")
+gates_text = gates_doc.read_text()
+for required_term in [
+    "### `proposal-088|p088`",
+    "worktree_fingerprint_v1",
+    "70c9",
+    "implementationCompletion",
+    "closed vocabularies",
+    "prompt-level runtime receipt persistence",
+]:
+    if required_term not in gates_text:
+        raise SystemExit(f"proposal-088: test-gates.md missing {required_term!r}")
+
+db_repo = root / "control-plane/crates/db/src/repos/code_writer_completion_receipts.rs"
+db_repo_text = db_repo.read_text()
+for required_term in [
+    "upsert_with_runtime_receipts",
+    "list_canonical_by_run",
+    "completion_receipt_conflict",
+    "code_writer_completion_receipt_links",
+]:
+    if required_term not in db_repo_text:
+        raise SystemExit(f"proposal-088: DB receipt repo missing {required_term!r}")
+
+engine_executor = root / "control-plane/crates/engine/src/executor.rs"
+engine_executor_text = engine_executor.read_text()
+for required_term in [
+    "skipped_no_live_session",
+    "p037_idle_terminalization",
+    "upsert_with_runtime_receipts",
+    "completion_receipt_partial_write",
+    "storage_write_failed",
+    "CodeWriterCompletionStarted",
+    "CodeWriterCompletionSucceeded",
+    "CodeWriterCompletionFailed",
+]:
+    if required_term not in engine_executor_text:
+        raise SystemExit(f"proposal-088: engine executor missing {required_term!r}")
+
+engine_integration = root / "control-plane/crates/engine/tests/integration.rs"
+engine_integration_text = engine_integration.read_text()
+for required_term in [
+    "proposal_088_code_writer_stale_implementation_active_enters_receipt_path_not_auto_requeue",
+    "p088_stale_implementation_active",
+    "acp_active_prompt_recovery",
+]:
+    if required_term not in engine_integration_text:
+        raise SystemExit(f"proposal-088: engine integration test missing {required_term!r}")
+
+sessions_domain = root / "control-plane/crates/domain/src/session.rs"
+sessions_repo = root / "control-plane/crates/db/src/repos/sessions.rs"
+for required_term in [
+    "CodeWriterCompletionStarted",
+    "CodeWriterCompletionSucceeded",
+    "CodeWriterCompletionFailed",
+    "code_writer_completion_started",
+    "code_writer_completion_succeeded",
+    "code_writer_completion_failed",
+]:
+    if required_term not in sessions_domain.read_text():
+        raise SystemExit(f"proposal-088: domain session events missing {required_term!r}")
+    if required_term not in sessions_repo.read_text():
+        raise SystemExit(f"proposal-088: DB session event mapping missing {required_term!r}")
+
+print("proposal-088 static fixture checks passed")
+PY
+    (
+      cd control-plane
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p acp proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p domain proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p db proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p engine proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p graphql-server proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p mcp-server proposal_088_ -- --nocapture
+    )
+    log "Proposal 088 gate passed"
+    ;;
+  proposal-085|p085)
+    log "Proposal 085 gate: thin-client read-model parity and affordance contract"
+    python3 - <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path.cwd()
+
+# 1. Contract document exists and contains required sections
+contract_doc = root / "docs/reference/thin-client-read-model-affordance-contract.md"
+if not contract_doc.exists():
+    raise SystemExit(
+        "proposal-085: missing docs/reference/thin-client-read-model-affordance-contract.md"
+    )
+contract_text = contract_doc.read_text()
+for required in [
+    "thin_client_affordance_contract_v1",
+    "artifact.preview.listLabel",
+    "artifact.preview.detail",
+    "report.payload.metadata",
+    "freshness.badge.run",
+    "freshness.badge.stage",
+    "freshness.badge.approval",
+    "freshness.badge.artifact",
+    "approval.resolve.approve",
+    "approval.resolve.reject",
+    "diagnostic.copy",
+    "external.command.placeholder",
+    "approveApproval",
+    "rejectApproval",
+    "payload_deferred",
+    "metadata_only",
+    "payloadAvailabilityState",
+    "freshnessState",
+    "disabledReasonCode",
+    "writePathState",
+    "diagnosticId",
+    "P085AffordancePresenter",
+    "canDrivePayloadAvailability",
+    "canDriveApprovalActionability",
+    "P081-UI-APPROVAL-APPROVE",
+    "P081-UI-APPROVAL-REJECT",
+    "P081-UI-READ-ONLY",
+    "P081-UI-EXTERNAL-COMMANDS",
+]:
+    if required not in contract_text:
+        raise SystemExit(
+            f"proposal-085: contract doc missing required term: {required!r}"
+        )
+
+required_rows = [
+    "artifact.preview.listLabel",
+    "artifact.preview.detail",
+    "report.payload.metadata",
+    "freshness.badge.run",
+    "freshness.badge.stage",
+    "freshness.badge.approval",
+    "freshness.badge.artifact",
+    "approval.resolve.approve",
+    "approval.resolve.reject",
+    "diagnostic.copy",
+    "external.command.placeholder",
+]
+required_row_fields = [
+    "affordance_id",
+    "source_graphql_fields",
+    "local_presentation_state",
+    "actionable_state",
+    "disabled_reason_code",
+    "fallback_text",
+    "mutation_availability",
+    "mutation_idempotency",
+    "staleness_deadline",
+    "cancellation_policy",
+    "stale_list_detail_behavior",
+    "unauthorized_behavior",
+    "supported_interactions",
+    "proof_tests",
+]
+for row in required_rows:
+    marker = f"### `{row}`"
+    start = contract_text.find(marker)
+    if start < 0:
+        raise SystemExit(f"proposal-085: missing contract row {row!r}")
+    end = contract_text.find("\n---", start)
+    section = contract_text[start:] if end < 0 else contract_text[start:end]
+    for field in required_row_fields:
+        if f"**{field}**" not in section:
+            raise SystemExit(
+                f"proposal-085: contract row {row!r} missing required field {field!r}"
+            )
+
+# 2. Negative fixtures exist as valid JSON
+p085_negative_fixtures = [
+    "docs/evidence/rollout-contract/negative/p085-approval-actionability-mismatch.json",
+    "docs/evidence/rollout-contract/negative/p085-approval-stale-double-submit-conflict.json",
+    "docs/evidence/rollout-contract/negative/p085-missing-affordance-row.json",
+    "docs/evidence/rollout-contract/negative/p085-missing-schema-symbol.json",
+    "docs/evidence/rollout-contract/negative/p085-payload-deferred-marked-unavailable.json",
+    "docs/evidence/rollout-contract/negative/p085-payload-deferred-no-deadline.json",
+    "docs/evidence/rollout-contract/negative/p085-unknown-enum-optimistic-action.json",
+    "docs/evidence/rollout-contract/negative/p085-unsafe-local-truth-fallback.json",
+]
+for fixture_path in p085_negative_fixtures:
+    full = root / fixture_path
+    if not full.exists():
+        raise SystemExit(f"proposal-085: missing negative fixture {fixture_path}")
+    try:
+        data = json.loads(full.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"proposal-085: invalid JSON in {fixture_path}: {exc}") from exc
+    if "contract_violation" not in data:
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} missing 'contract_violation' field"
+        )
+    if "hold_condition" not in data:
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} missing 'hold_condition' field"
+        )
+    if "state_conflict" in json.dumps(data):
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} references removed conflict code 'state_conflict'"
+        )
+
+p085_semantic_expectations = {
+    "p085-approval-actionability-mismatch": {
+        "contract_violation": "approval_parity_mismatch",
+        "p085_contract_row": "approval.resolve.approve",
+        "expected_presenter_output.approveAvailability": "disabled",
+        "expected_presenter_output.reasonCode": "WRITE_PATH_NOT_AVAILABLE",
+    },
+    "p085-approval-stale-double-submit-conflict": {
+        "contract_violation": "approval_conflict_missing",
+        "p085_contract_row": "approval.resolve.approve",
+        "simulated_mutation_response.approveApproval.conflictResultCode": "already_resolved",
+        "expected_presenter_output.approveAvailability": "disabled",
+    },
+    "p085-missing-affordance-row": {
+        "contract_violation": "missing_affordance_row",
+        "expected_contract_row_status": "missing",
+    },
+    "p085-missing-schema-symbol": {
+        "contract_violation": "missing_schema_proof",
+        "missing_symbol.graphql_type": "PayloadUnavailableReasonCode",
+    },
+    "p085-payload-deferred-marked-unavailable": {
+        "contract_violation": "payload_state_mismatch",
+        "p085_contract_row": "artifact.preview.listLabel",
+        "expected_presenter_output.payloadPresentation": "deferred",
+    },
+    "p085-payload-deferred-no-deadline": {
+        "contract_violation": "payload_deadline_missing",
+        "p085_contract_row": "artifact.preview.listLabel",
+        "simulated_read_model.artifact.payloadAvailabilityState": "generating",
+        "expected_server_owned_evidence": "deadline_or_stalled_diagnostic",
+    },
+    "p085-unknown-enum-optimistic-action": {
+        "contract_violation": "unknown_enum_unsafe",
+        "p085_contract_rows": ["freshness.badge.approval", "freshness.badge.run"],
+        "expected_swift_behavior.p085_freshnessState": "P085FreshnessState.unknown(rawValue: 'projection_rebuilding')",
+    },
+    "p085-unsafe-local-truth-fallback": {
+        "contract_violation": "unauthorized_fallback_violation",
+        "p085_contract_rows": ["artifact.preview.detail", "artifact.preview.listLabel"],
+        "expected_swift_behavior.payloadPresentation": "unavailable(reasonCode: .notAuthorized)",
+    },
+}
+
+def p085_lookup(data, dotted):
+    value = data
+    for segment in dotted.split("."):
+        if not isinstance(value, dict) or segment not in value:
+            raise KeyError(dotted)
+        value = value[segment]
+    return value
+
+for fixture_path in p085_negative_fixtures:
+    full = root / fixture_path
+    data = json.loads(full.read_text())
+    scenario = data.get("scenario")
+    if scenario not in p085_semantic_expectations:
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} has unexpected scenario {scenario!r}"
+        )
+    for dotted, expected in p085_semantic_expectations[scenario].items():
+        try:
+            actual = p085_lookup(data, dotted)
+        except KeyError as exc:
+            raise SystemExit(
+                f"proposal-085: negative fixture {fixture_path} missing semantic field {exc.args[0]!r}"
+            ) from exc
+        if actual != expected:
+            raise SystemExit(
+                f"proposal-085: negative fixture {fixture_path} expected {dotted}={expected!r}, got {actual!r}"
+            )
+
+# 3. test-gates.md documents the gate
+gates_doc = root / "docs/reference/test-gates.md"
+if not gates_doc.exists():
+    raise SystemExit("proposal-085: missing docs/reference/test-gates.md")
+gates_text = gates_doc.read_text()
+for required in [
+    "### `proposal-085|p085`",
+    "thin_client_affordance_contract_v1",
+    "P085AffordancePresenter",
+    "negative fixture",
+]:
+    if required not in gates_text:
+        raise SystemExit(
+            f"proposal-085: docs/reference/test-gates.md missing required content: {required!r}"
+        )
+
+# 4. Swift presenter file exists and contains required P085 symbols
+presenter = root / "Chainworks Forge/Support/P085AffordancePresenter.swift"
+if not presenter.exists():
+    raise SystemExit(
+        "proposal-085: missing Chainworks Forge/Support/P085AffordancePresenter.swift"
+    )
+presenter_text = presenter.read_text()
+for required in [
+    "P085AffordancePresenter",
+    "P085ArtifactAffordanceState",
+    "P085ApprovalAffordanceState",
+    "P085FreshnessAffordanceState",
+    "P085DiagnosticAffordanceState",
+    "P085MutationConflictResultCode",
+    "canDrivePayloadAvailability",
+    "canDriveApprovalActionability",
+    "mergedAffordance",
+    "payloadPresentation(fromRaw",
+    "static func fromRaw",
+    "case .unknown",
+    # Decision-state gating: approval checks durable decision (pending/requested = actionable)
+    "d != \"pending\"",
+    "Approval is already resolved",
+    # Conflict codes: typed idempotency/conflict result vocabulary
+    "alreadyResolved",
+]:
+    if required not in presenter_text:
+        raise SystemExit(
+            f"proposal-085: P085AffordancePresenter.swift missing required term: {required!r}"
+        )
+
+# 5. P031 enums have fail-closed decoding (custom init(from decoder:) for unknown values)
+boundary_file = root / "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift"
+if not boundary_file.exists():
+    raise SystemExit(
+        "proposal-085: missing Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift"
+    )
+boundary_text = boundary_file.read_text()
+for required in [
+    # Fail-closed init(from decoder:) must be present for all P031 enums
+    "P031FreshnessState",
+    "P031DisabledReasonCode",
+    "P031WritePathState",
+    "P031PayloadAvailabilityState",
+    "P031PayloadUnavailableReasonCode",
+    # P085 wired into production approval path
+    "P085AffordancePresenter.approvalAffordance",
+    # P085 wired into production artifact path
+    "P085AffordancePresenter.artifactListAffordance",
+    # P031 canApprove/canReject check durable decision state via isActionableDecision
+    "isActionableDecision",
+    # Typed conflict result on mutation result
+    "conflictResultCode",
+]:
+    if required not in boundary_text:
+        raise SystemExit(
+            f"proposal-085: P031ThinGraphQLReadBoundary.swift missing required term: {required!r}"
+        )
+
+# 6. Backend GraphQL path must use typed engine conflicts, not string-matched
+# error text or dummy journal IDs.
+graphql_schema = root / "control-plane/crates/graphql-server/src/schema.rs"
+command_handler = root / "control-plane/crates/engine/src/command_handler.rs"
+schema_text = graphql_schema.read_text()
+handler_text = command_handler.read_text()
+for required in [
+    "ApprovalResolutionConflict",
+    "approval_resolution_conflict_code",
+    "proposal_085_approval_conflict_result_code_uses_real_failed_journal_id",
+    "proposal_085_reject_conflict_result_code_uses_real_failed_journal_id",
+    "proposal_085_backend_artifact_projection_state_matrix",
+    "proposal_085_conflict_enum_matches_backend_emitted_codes",
+    "proposal_085_graphql_backend_projection_and_authorization_contract",
+]:
+    if required not in schema_text + handler_text:
+        raise SystemExit(
+            f"proposal-085: backend proof missing required term: {required!r}"
+        )
+for forbidden in [
+    "msg.contains(\"not actionable\")",
+    "msg.contains(\"already resolved\")",
+    "ID::from(\"00000000-0000-0000-0000-000000000000\")",
+]:
+    if forbidden in schema_text:
+        raise SystemExit(
+            f"proposal-085: GraphQL backend still contains forbidden brittle conflict handling: {forbidden!r}"
+        )
+
+print("proposal-085 all gate checks passed")
+PY
+    (
+      cd control-plane
+      CARGO_TARGET_DIR=target/proposal-085-gate cargo test -p graphql-server --lib proposal_085_ -- --test-threads=1 --nocapture
+    )
+    run_targeted_tests "proposal-085" "${PROPOSAL_085_SWIFT_TESTS[@]}"
+    log "Proposal 085 gate passed"
     ;;
   *)
     print_usage >&2

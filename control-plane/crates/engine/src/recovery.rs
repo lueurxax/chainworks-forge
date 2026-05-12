@@ -5,17 +5,23 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde::Deserialize;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, artifact_contracts, projections, runs,
-    sessions, stages, startup_repairs, work_items, workflow_conflicts,
+    agent_execution_runtime_facts, agent_executions, artifact_contracts,
+    code_writer_completion_receipts, projections, runs, sessions, stages, startup_repairs,
+    work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
 use db::writer::{class_a_operation, DbWriter};
 use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
+use domain::code_writer_completion::{
+    CodeWriterCompletionOutputDecisionRecord, CodeWriterCompletionReceiptRecord,
+    CodeWriterCompletionTextCaptureRecord,
+};
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::run::Run;
 use domain::stage::StageStatus;
@@ -71,6 +77,16 @@ pub struct RecoverySummary {
     pub oldest_recovered_queued_age_ms: Option<i64>,
     pub affected_run_count: i64,
     pub next_retry_or_backoff_time: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+struct P088CompletionReceiptArtifact {
+    schema_version: String,
+    receipt: CodeWriterCompletionReceiptRecord,
+    #[serde(default)]
+    text_captures: Vec<CodeWriterCompletionTextCaptureRecord>,
+    #[serde(default)]
+    output_decisions: Vec<CodeWriterCompletionOutputDecisionRecord>,
 }
 
 pub async fn persist_failed_stage_recovery_snapshot(
@@ -294,6 +310,25 @@ impl RecoveryService {
 
         for run in &active_runs {
             let mut repaired_run = false;
+            match self.recover_p088_completion_receipt_artifacts(run).await {
+                Ok(recovered_receipts) => {
+                    if recovered_receipts > 0 {
+                        repaired_run = true;
+                        info!(
+                            run_id = %run.id,
+                            recovered_receipts = recovered_receipts,
+                            "Startup recovery reconciled P088 completion receipt artifacts"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run.id,
+                        error = %e,
+                        "Failed to recover P088 completion receipt artifacts during startup"
+                    );
+                }
+            }
             match artifact_contracts::repair_contract_status_normalization_and_rebuild(
                 &self.pool, run.id,
             )
@@ -448,6 +483,95 @@ impl RecoveryService {
             );
         }
         Ok(requeued)
+    }
+
+    async fn recover_p088_completion_receipt_artifacts(&self, run: &Run) -> Result<usize> {
+        let p088_root = Path::new(&run.artifact_root).join("evidence").join("p088");
+        if !p088_root.exists() {
+            return Ok(0);
+        }
+
+        let mut recovered = 0usize;
+        for entry in std::fs::read_dir(&p088_root)? {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let path = entry.path().join("code-writer-completion-receipt-v1.json");
+            if !path.exists() {
+                continue;
+            }
+            let raw = match std::fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "Failed to read P088 receipt artifact during startup recovery");
+                    continue;
+                }
+            };
+            let artifact: P088CompletionReceiptArtifact = match serde_json::from_str(&raw) {
+                Ok(artifact) => artifact,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "Failed to parse P088 receipt artifact during startup recovery");
+                    continue;
+                }
+            };
+            if artifact.schema_version != "code_writer_completion_receipt_v1" {
+                continue;
+            }
+            if artifact.receipt.run_id != run.id {
+                warn!(
+                    run_id = %run.id,
+                    artifact_run_id = %artifact.receipt.run_id,
+                    path = %path.display(),
+                    "Skipping P088 receipt artifact with mismatched run id"
+                );
+                continue;
+            }
+            if code_writer_completion_receipts::find_by_execution_id(
+                &self.pool,
+                artifact.receipt.agent_execution_id,
+            )
+            .await?
+            .is_some()
+            {
+                continue;
+            }
+            if agent_executions::find_by_id(&self.pool, artifact.receipt.agent_execution_id)
+                .await?
+                .is_none()
+            {
+                warn!(
+                    run_id = %run.id,
+                    agent_execution_id = %artifact.receipt.agent_execution_id,
+                    path = %path.display(),
+                    "Skipping orphan P088 receipt artifact without matching agent execution"
+                );
+                continue;
+            }
+
+            let mut receipt = artifact.receipt;
+            receipt.receipt_artifact_path = Some(path.to_string_lossy().into_owned());
+            receipt.failure_class = Some("completion_receipt_partial_write".to_string());
+            receipt.transcript_absence_reason = Some("storage_write_failed".to_string());
+            if let Err(e) = code_writer_completion_receipts::upsert(
+                &self.pool,
+                &receipt,
+                &artifact.text_captures,
+                &artifact.output_decisions,
+            )
+            .await
+            {
+                warn!(
+                    run_id = %run.id,
+                    agent_execution_id = %receipt.agent_execution_id,
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to persist recovered P088 receipt artifact"
+                );
+                continue;
+            }
+            recovered += 1;
+        }
+        Ok(recovered)
     }
 
     async fn repair_run(&self, run: &Run) -> Result<usize> {

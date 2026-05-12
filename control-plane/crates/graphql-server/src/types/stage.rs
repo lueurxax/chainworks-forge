@@ -1,6 +1,7 @@
 use async_graphql::*;
 use db::repos::agent_execution_discovery_diagnostics;
 use db::repos::agent_execution_runtime_facts;
+use db::repos::code_writer_completion_receipts;
 use db::repos::projections::StageSummaryRow;
 use db::repos::sessions;
 use domain::ids::StageExecutionId;
@@ -8,11 +9,12 @@ use domain::session::{SessionGeneration, SessionLineage};
 use domain::stage::StageExecution;
 use domain::xcode_runtime::{
     McpBrokerObservation, XcodeHostExecutorEvent, XcodeRuntimeObservation, XcodeShimEvent,
-    XcodeShimInvocationEvent, XcodeShimWarningEvent,
+    XcodeShimInvocationEvent, XcodeShimRuntimeAttachedEvent, XcodeShimWarningEvent,
 };
 use serde_json::Value as JsonValue;
 
 use crate::types::p031::{freshness_from_projection_lag, GqlFreshnessState};
+use crate::types::run::GqlCodeWriterCompletionReceipt;
 
 fn fresh_provider_process_for_disposition(disposition: Option<&str>) -> Option<bool> {
     match disposition {
@@ -408,6 +410,7 @@ impl From<McpBrokerObservation> for GqlMcpBrokerObservation {
 
 #[derive(Union, Clone, Debug)]
 pub enum GqlXcodeShimEvent {
+    ShimRuntimeAttached(GqlXcodeShimRuntimeAttachedEvent),
     ShimInvocation(GqlXcodeShimInvocationEvent),
     Warning(GqlXcodeShimWarningEvent),
 }
@@ -415,12 +418,42 @@ pub enum GqlXcodeShimEvent {
 impl From<XcodeShimEvent> for GqlXcodeShimEvent {
     fn from(event: XcodeShimEvent) -> Self {
         match event {
+            XcodeShimEvent::ShimRuntimeAttached(event) => GqlXcodeShimEvent::ShimRuntimeAttached(
+                GqlXcodeShimRuntimeAttachedEvent::from(event),
+            ),
             XcodeShimEvent::ShimInvocation(event) => {
                 GqlXcodeShimEvent::ShimInvocation(GqlXcodeShimInvocationEvent::from(event))
             }
             XcodeShimEvent::Warning(event) => {
                 GqlXcodeShimEvent::Warning(GqlXcodeShimWarningEvent::from(event))
             }
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlXcodeShimRuntimeAttachedEvent {
+    pub ts: String,
+    pub source: String,
+    pub reason: String,
+    pub lease_id: String,
+    pub shim_dir: String,
+    pub socket_path: String,
+    pub workspace_root: String,
+    pub agent_execution_id: Option<String>,
+}
+
+impl From<XcodeShimRuntimeAttachedEvent> for GqlXcodeShimRuntimeAttachedEvent {
+    fn from(event: XcodeShimRuntimeAttachedEvent) -> Self {
+        Self {
+            ts: event.ts.to_rfc3339(),
+            source: event.source,
+            reason: event.reason,
+            lease_id: event.lease_id,
+            shim_dir: event.shim_dir,
+            socket_path: event.socket_path,
+            workspace_root: event.workspace_root,
+            agent_execution_id: event.agent_execution_id,
         }
     }
 }
@@ -532,6 +565,24 @@ impl GqlStageExecution {
 
 #[ComplexObject]
 impl GqlAgentExecution {
+    #[graphql(name = "codeWriterCompletionReceipt")]
+    async fn code_writer_completion_receipt(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<GqlCodeWriterCompletionReceipt>> {
+        let pool = ctx.data::<sqlx::SqlitePool>()?;
+        let agent_execution_id: domain::ids::AgentExecutionId = self
+            .id
+            .as_str()
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        Ok(
+            code_writer_completion_receipts::find_by_execution_id(pool, agent_execution_id)
+                .await?
+                .map(Into::into),
+        )
+    }
+
     #[graphql(name = "runtimeFacts")]
     async fn runtime_facts(&self, ctx: &Context<'_>) -> Result<GqlAgentExecutionRuntimeFacts> {
         let include_operator_debug = ctx
@@ -852,7 +903,17 @@ mod tests {
                 "prompt_cycle_index": 0,
                 "status_update": "forwarded Bearer raw-graphql-bearer"
             }],
-            "xcode_shim_events": [],
+            "xcode_shim_events": [{
+                "kind": "shim_runtime_attached",
+                "ts": "2026-05-10T17:00:00Z",
+                "source": "xcode_shim_runtime",
+                "reason": "requires_xcode_host_execution",
+                "lease_id": "xcode-lease-raw-secret",
+                "shim_dir": "/tmp/shims",
+                "socket_path": "/tmp/xcode.sock?token=raw-shim-token",
+                "workspace_root": "/workspace?authorization=raw-workspace-token",
+                "agent_execution_id": "execution-1"
+            }],
             "xcode_host_executor_events": []
         })
         .to_string();
@@ -921,5 +982,19 @@ mod tests {
             broker.status_update.as_deref(),
             Some("forwarded Bearer <redacted>")
         );
+        let shim_event = observation
+            .xcode_shim_events
+            .first()
+            .expect("shim runtime event");
+        match shim_event {
+            GqlXcodeShimEvent::ShimRuntimeAttached(event) => {
+                assert_eq!(event.source, "xcode_shim_runtime");
+                assert_eq!(event.reason, "requires_xcode_host_execution");
+                assert_eq!(event.lease_id, "xcode-lease-raw-secret");
+                assert_eq!(event.socket_path, "/tmp/xcode.sock?token=<redacted>");
+                assert_eq!(event.workspace_root, "/workspace?authorization=<redacted>");
+            }
+            other => panic!("unexpected shim event: {other:?}"),
+        }
     }
 }

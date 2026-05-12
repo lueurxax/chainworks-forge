@@ -285,11 +285,16 @@ final class FixtureACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                       "aggregate_score": 7.3,
                       "min_individual_score": 7.0,
                       "blocker_count": 2,
-                      "summary": "Proposal still needs a refine pass driven by the full review corpus.",
-                      "required_changes": [
+                      "blocking_issues": [
                         "Narrow MVP scope boundaries",
                         "Keep unresolved operator rationale explicit"
                       ],
+                      "summary": "Proposal still needs a refine pass driven by the full review corpus.",
+                      "blocking_required_changes": [
+                        "Narrow MVP scope boundaries",
+                        "Keep unresolved operator rationale explicit"
+                      ],
+                      "advisory_follow_ups": [],
                       "recurring_themes": [
                         "Scope discipline",
                         "Operator-facing rationale"
@@ -306,8 +311,12 @@ final class FixtureACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                   "aggregate_score": 9.2,
                   "min_individual_score": 9.1,
                   "blocker_count": 0,
+                  "blocking_issues": [],
                   "summary": "Proposal reaches the approval threshold while leaving one bounded follow-up visible.",
-                  "required_changes": [],
+                  "blocking_required_changes": [],
+                  "advisory_follow_ups": [
+                    "Carry one bounded follow-up into implementation planning"
+                  ],
                   "recurring_themes": [
                     "Scope is bounded",
                     "Residual operator rationale is explicit"
@@ -331,8 +340,10 @@ final class FixtureACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
               "aggregate_score": 9.25,
               "min_individual_score": 9.1,
               "blocker_count": 0,
+              "blocking_issues": [],
               "summary": "Proposal clears the review threshold.",
-              "required_changes": [],
+              "blocking_required_changes": [],
+              "advisory_follow_ups": [],
               "recurring_themes": ["Scope is clear", "Safety boundary is explicit"],
               "decision": "proceed"
             }
@@ -803,8 +814,12 @@ final class FixtureACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                   "aggregate_score": 9.25,
                   "min_individual_score": 9.1,
                   "blocker_count": 0,
+                  "blocking_issues": [],
                   "summary": "Proposal passes the review target.",
-                  "required_changes": [],
+                  "blocking_required_changes": [],
+                  "advisory_follow_ups": [
+                    "Preserve rollout cautions during implementation"
+                  ],
                   "recurring_themes": [
                     "Scope is clear",
                     "Approval context is strong"
@@ -871,8 +886,10 @@ final class FixtureACPTransport: RuntimeTransportProtocol, @unchecked Sendable {
                   "aggregate_score": 9.25,
                   "min_individual_score": 9.1,
                   "blocker_count": 0,
+                  "blocking_issues": [],
                   "summary": "Proposal passes the review target.",
-                  "required_changes": [],
+                  "blocking_required_changes": [],
+                  "advisory_follow_ups": [],
                   "recurring_themes": [
                     "Scope is clear",
                     "Approval context is strong"
