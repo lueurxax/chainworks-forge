@@ -6188,9 +6188,182 @@ PY
       cd "$ROOT_DIR/control-plane"
       CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p domain proposal_078_ -- --nocapture
       CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p db proposal_078_ -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p engine proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p engine --lib proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p engine --test proposal_058_claim_start proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p engine --test release -- --nocapture
       CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p mcp-server proposal_078_ -- --nocapture
     )
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path.cwd()
+
+fixture_path = root / "docs/evidence/rollout-contract/operator-readback/p078-full-surface.fixture.json"
+negative_path = root / "docs/evidence/rollout-contract/negative/p078-missing-side-effect-readback.json"
+accessibility_path = root / "docs/evidence/rollout-contract/operator-readback/p078-macos-accessibility.fixture.json"
+if not fixture_path.exists():
+    raise SystemExit("proposal-078: missing P078 operator-readback fixture")
+if not negative_path.exists():
+    raise SystemExit("proposal-078: missing P078 missing-readback negative fixture")
+if not accessibility_path.exists():
+    raise SystemExit("proposal-078: missing P078 macOS accessibility proof fixture")
+fixture = json.loads(fixture_path.read_text())
+negative = json.loads(negative_path.read_text())
+accessibility = json.loads(accessibility_path.read_text())
+
+def require_side_effect_readback(payload, field, label):
+    value = payload.get(field)
+    if not isinstance(value, dict):
+        raise SystemExit(f"proposal-078: {label} missing {field}")
+    if value.get("schema_version", value.get("schemaVersion")) != "p078_side_effect_readback_v1":
+        raise SystemExit(f"proposal-078: {label} has invalid side-effect readback schema")
+    for required in ["blocked", "effects"]:
+        if required not in value:
+            raise SystemExit(f"proposal-078: {label} side-effect readback missing {required}")
+    if not value.get("blocked"):
+        raise SystemExit(f"proposal-078: {label} side-effect readback must prove blocked unresolved state")
+    if value.get("unresolved_count", value.get("unresolvedCount")) != 1:
+        raise SystemExit(f"proposal-078: {label} side-effect readback must carry one unresolved effect")
+    effects = value.get("effects")
+    if not isinstance(effects, list) or not effects:
+        raise SystemExit(f"proposal-078: {label} side-effect readback must include non-empty effects")
+    first = effects[0]
+    action = first.get("operator_next_action", first.get("operatorNextAction"))
+    if action != "effects.reconcile":
+        raise SystemExit(f"proposal-078: {label} side-effect readback must expose effects.reconcile next action")
+
+require_side_effect_readback(fixture, "side_effect_readback", "run_report")
+lanes = fixture.get("parity_lanes") or {}
+require_side_effect_readback(lanes.get("mcp") or {}, "side_effect_readback", "mcp")
+require_side_effect_readback(lanes.get("release_receipt") or {}, "side_effect_readback", "release_receipt")
+require_side_effect_readback(lanes.get("graphql") or {}, "sideEffectReadback", "graphql")
+if "side_effect_readback" in negative or "sideEffectReadback" in negative:
+    raise SystemExit("proposal-078: negative fixture unexpectedly contains side-effect readback")
+metrics = fixture.get("metrics") or []
+metric_names = {item.get("name") for item in metrics if isinstance(item, dict)}
+for required_metric in [
+    "p078_release_side_effects_with_durable_intent_percent",
+    "side_effect_intent_total",
+    "side_effect_transition_total",
+    "side_effect_retry_block_total",
+    "side_effect_unresolved",
+    "side_effect_unresolved_age_seconds",
+    "side_effect_recovery_transition_total",
+    "side_effect_settlement_latency_seconds",
+    "startup_side_effect_recovery_total",
+    "startup_side_effect_recovery_duration_seconds",
+    "side_effect_ledger_readback_error_total",
+    "side_effect_ledger_readback_circuit_open_total",
+    "side_effect_evidence_spooled_bytes_total",
+    "side_effect_evidence_disk_bytes",
+    "side_effect_prepare_denied_total",
+]:
+    if required_metric not in metric_names:
+        raise SystemExit(f"proposal-078: rollout fixture missing operational metric {required_metric}")
+for item in metrics:
+    if item.get("cardinality_bound") != "effect_kind_status":
+        raise SystemExit("proposal-078: metric fixture must document effect_kind/status cardinality bound")
+
+side_effects_rs = (root / "control-plane/crates/engine/src/side_effects.rs").read_text()
+executor_rs = (root / "control-plane/crates/engine/src/executor.rs").read_text()
+effects_rs = (root / "control-plane/crates/mcp-server/src/tools/effects.rs").read_text()
+tools_mod_rs = (root / "control-plane/crates/mcp-server/src/tools/mod.rs").read_text()
+graphql_schema_rs = (root / "control-plane/crates/graphql-server/src/schema.rs").read_text()
+runs_rs = (root / "control-plane/crates/mcp-server/src/tools/runs.rs").read_text()
+swift_truth = (root / "Chainworks Forge/Models/ExecutionTruth.swift").read_text()
+swift_read_boundary = (root / "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift").read_text()
+swift_runs_home = (root / "Chainworks Forge/Views/RunsHomeView.swift").read_text()
+
+for metric in [
+    "p078_release_side_effects_with_durable_intent_percent",
+    "side_effect_intent_total",
+    "side_effect_transition_total",
+    "side_effect_retry_block_total",
+    "side_effect_ledger_readback_error_total",
+    "side_effect_ledger_readback_circuit_open_total",
+    "side_effect_recovery_transition_total",
+    "side_effect_settlement_latency_seconds",
+    "side_effect_unresolved",
+    "side_effect_unresolved_age_seconds",
+    "startup_side_effect_recovery_total",
+    "startup_side_effect_recovery_duration_seconds",
+    "side_effect_evidence_spooled_bytes_total",
+    "side_effect_evidence_disk_bytes",
+    "side_effect_prepare_denied_total",
+]:
+    if metric not in side_effects_rs + executor_rs:
+        raise SystemExit(f"proposal-078: missing metric literal {metric}")
+
+for required in [
+    "watchdog_pass().await",
+    "run_unresolved_effects_preflight",
+    "p078_expected_side_effect_evidence_v1",
+    "p078_side_effect_evidence_manifest_v1",
+    "p078_observed_evidence_summary_v1",
+    "manifest_write_order",
+    "run_with_lease_renewal",
+    "p075_write_spool_file",
+    "verify_p078_observed_evidence_summary",
+    "mark_settled_evidence_failed",
+    "P078_LEDGER_READBACK_CIRCUIT_THRESHOLD",
+    "ledger_readback_circuit_open_until",
+    "release-receipt.json",
+    "stdout.log",
+    "stderr.log",
+    "git-ls-remote.json",
+    "upload-readback.json",
+    "archive-summary.json",
+    "reconciliation-report.json",
+]:
+    if required not in executor_rs + side_effects_rs:
+        raise SystemExit(f"proposal-078: missing executor proof marker {required}")
+
+for required in [
+    "effects.mark_conflict",
+    "handle_effects_mark_conflict",
+]:
+    if required not in effects_rs or required not in tools_mod_rs + effects_rs:
+        raise SystemExit(f"proposal-078: missing MCP conflict disposition marker {required}")
+
+for required in [
+    "GqlSideEffectSummary",
+    "observed_evidence_summary_json",
+    "operator_next_action",
+    "side_effect_readback",
+    "SideEffectReadbackSummary",
+    "P078SideEffectReadbackPresenter",
+    "P078SideEffectReadbackCard",
+]:
+    haystack = "\n".join([graphql_schema_rs, runs_rs, swift_truth, swift_read_boundary, swift_runs_home])
+    if required not in haystack:
+        raise SystemExit(f"proposal-078: missing readback marker {required}")
+
+swift_tree = root / "Chainworks Forge"
+swift_text = "\n".join(path.read_text(errors="ignore") for path in swift_tree.rglob("*.swift"))
+for forbidden in ["effects.mark_conflict", "effects.mark_unrecoverable", "effects.clear_after_manual_verification"]:
+    if forbidden in swift_text:
+        raise SystemExit(f"proposal-078: Swift app must remain read-only for {forbidden}")
+
+if accessibility.get("schema_version") != "p078_macos_accessibility_view_hierarchy_v1":
+    raise SystemExit("proposal-078: invalid macOS accessibility proof schema")
+elements = accessibility.get("elements") or []
+ids = {item.get("accessibility_identifier") for item in elements if isinstance(item, dict)}
+for required_id in [
+    "p078-side-effect-readback-card",
+    "p078-side-effect-sidebar-signal",
+    "p078-side-effect-next-action",
+    "p078-side-effect-diagnostics",
+]:
+    if required_id not in ids:
+        raise SystemExit(f"proposal-078: macOS accessibility proof missing {required_id}")
+for item in elements:
+    if item.get("mutation_control"):
+        raise SystemExit("proposal-078: macOS accessibility proof contains mutation control")
+for forbidden in ["reconcile", "retry", "clear", "push", "upload", "publish", "mcp_launch"]:
+    if forbidden not in accessibility.get("forbidden_controls_absent", []):
+        raise SystemExit(f"proposal-078: macOS accessibility proof missing forbidden control check {forbidden}")
+PY
     log "Proposal 078 durable side-effect ledger gate passed"
     ;;
   proposal-088|p088)

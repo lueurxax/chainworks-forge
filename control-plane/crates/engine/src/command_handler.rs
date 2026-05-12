@@ -43,7 +43,6 @@ use domain::PrincipalClass;
 use sha2::{Digest, Sha256};
 
 use crate::cancellation;
-use crate::side_effects::{retry_preflight_within_tx, run_cancel_preflight, DurableEffectCoordinator};
 use crate::closeout_fingerprint::{
     build_closeout_fingerprint, resolve_closeout_worktree_truth,
     CLOSEOUT_FINGERPRINT_LATENCY_BUDGET_MS,
@@ -53,6 +52,7 @@ use crate::event_bus::EventSender;
 use crate::preflight::{
     missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
 };
+use crate::side_effects::{retry_preflight_within_tx, run_cancel_preflight};
 use crate::synthesizers::closeout_readiness::{
     synthesize_implementation_closeout_readiness_for_state9, SynthesizerInputs,
 };

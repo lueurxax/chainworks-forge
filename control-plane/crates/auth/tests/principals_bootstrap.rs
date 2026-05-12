@@ -108,8 +108,8 @@ fn test_principals_daemon_refuses_empty_principals_file() {
 #[test]
 #[cfg(unix)]
 fn test_high_002_principals_file_with_loose_permissions_is_rejected() {
-    use std::os::unix::fs::OpenOptionsExt;
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
 
     let dir = tempfile::tempdir().expect("create tmp dir");
     let path = dir.path().join("principals.json");

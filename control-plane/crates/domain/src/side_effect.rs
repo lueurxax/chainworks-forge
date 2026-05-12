@@ -98,7 +98,6 @@ impl AsRef<str> for SideEffectSettlementId {
     }
 }
 
-
 // ── EffectKind ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -374,12 +373,7 @@ pub fn derive_idempotency_key(
         .unwrap_or_default();
     let input = format!(
         "p078:v1:{}:{}:{}:{}:{}:{}",
-        effect_kind,
-        run_id,
-        stage_execution_id,
-        agent_part,
-        target_key,
-        intent_version,
+        effect_kind, run_id, stage_execution_id, agent_part, target_key, intent_version,
     );
     let hash_bytes = Sha256::digest(input.as_bytes());
     let hex: String = hash_bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -498,7 +492,10 @@ mod tests {
             ("prepared", SideEffectStatus::Prepared),
             ("executing", SideEffectStatus::Executing),
             ("externally_observed", SideEffectStatus::ExternallyObserved),
-            ("needs_reconciliation", SideEffectStatus::NeedsReconciliation),
+            (
+                "needs_reconciliation",
+                SideEffectStatus::NeedsReconciliation,
+            ),
             ("settled", SideEffectStatus::Settled),
             ("reconciled", SideEffectStatus::Reconciled),
             ("conflict", SideEffectStatus::Conflict),
@@ -538,10 +535,14 @@ mod tests {
     #[test]
     fn proposal_078_legal_transitions() {
         assert!(SideEffectStatus::Prepared.can_transition_to(&SideEffectStatus::Executing));
-        assert!(SideEffectStatus::Prepared.can_transition_to(&SideEffectStatus::NeedsReconciliation));
+        assert!(
+            SideEffectStatus::Prepared.can_transition_to(&SideEffectStatus::NeedsReconciliation)
+        );
         assert!(!SideEffectStatus::Prepared.can_transition_to(&SideEffectStatus::Settled));
         assert!(SideEffectStatus::Executing.can_transition_to(&SideEffectStatus::Settled));
-        assert!(SideEffectStatus::Executing.can_transition_to(&SideEffectStatus::NeedsReconciliation));
+        assert!(
+            SideEffectStatus::Executing.can_transition_to(&SideEffectStatus::NeedsReconciliation)
+        );
         assert!(!SideEffectStatus::Settled.can_transition_to(&SideEffectStatus::Executing));
     }
 
@@ -623,14 +624,8 @@ mod tests {
             "target",
             1,
         );
-        let k_push = derive_idempotency_key(
-            &EffectKind::GitPush,
-            &run_id,
-            &stage_id,
-            None,
-            "target",
-            1,
-        );
+        let k_push =
+            derive_idempotency_key(&EffectKind::GitPush, &run_id, &stage_id, None, "target", 1);
         assert_ne!(k_commit, k_push);
     }
 

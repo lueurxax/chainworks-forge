@@ -11,7 +11,9 @@ use domain::side_effect::{
 };
 
 async fn test_pool() -> sqlx::SqlitePool {
-    create_pool("sqlite::memory:").await.expect("in-memory pool")
+    create_pool("sqlite::memory:")
+        .await
+        .expect("in-memory pool")
 }
 
 fn make_effect(
@@ -54,7 +56,7 @@ fn make_effect(
 }
 
 #[tokio::test]
-async fn proposal_078_migration_046_creates_tables() {
+async fn proposal_078_migration_049_creates_tables() {
     let pool = test_pool().await;
     // Verify tables exist by querying the sqlite schema
     let tables: Vec<String> = sqlx::query_scalar(
@@ -160,7 +162,13 @@ async fn proposal_078_insert_and_find_roundtrip() {
     let pool = test_pool().await;
     let run_id = RunId::new();
     let stage_id = StageExecutionId::new();
-    let eff = make_effect("rtrip", run_id, stage_id, EffectKind::GitPush, "refs/heads/main");
+    let eff = make_effect(
+        "rtrip",
+        run_id,
+        stage_id,
+        EffectKind::GitPush,
+        "refs/heads/main",
+    );
 
     insert(&pool, &eff).await.unwrap();
     let loaded = db::repos::side_effects::find_by_id(&pool, &eff.id)
@@ -182,7 +190,13 @@ async fn proposal_078_list_unresolved_for_run() {
 
     let eff1 = make_effect("lr1", run_id, stage_id, EffectKind::GitCommit, "t1");
     let eff2 = make_effect("lr2", run_id, stage_id, EffectKind::GitPush, "t2");
-    let eff_other = make_effect("lro", other_run_id, stage_id, EffectKind::BuildArchive, "t3");
+    let eff_other = make_effect(
+        "lro",
+        other_run_id,
+        stage_id,
+        EffectKind::BuildArchive,
+        "t3",
+    );
 
     insert(&pool, &eff1).await.unwrap();
     insert(&pool, &eff2).await.unwrap();
@@ -196,7 +210,11 @@ async fn proposal_078_list_unresolved_for_run() {
     let other_unresolved = list_unresolved_for_run(&pool, &other_run_id.to_string())
         .await
         .unwrap();
-    assert_eq!(other_unresolved.len(), 1, "must return 1 effect for other run");
+    assert_eq!(
+        other_unresolved.len(),
+        1,
+        "must return 1 effect for other run"
+    );
 }
 
 #[tokio::test]
@@ -204,7 +222,13 @@ async fn proposal_078_executor_start_cas_prepared_to_executing() {
     let pool = test_pool().await;
     let run_id = RunId::new();
     let stage_id = StageExecutionId::new();
-    let eff = make_effect("cas-start", run_id, stage_id, EffectKind::GitCommit, "target");
+    let eff = make_effect(
+        "cas-start",
+        run_id,
+        stage_id,
+        EffectKind::GitCommit,
+        "target",
+    );
     insert(&pool, &eff).await.unwrap();
 
     let now = Utc::now();
@@ -235,7 +259,13 @@ async fn proposal_078_executor_start_cas_race_one_winner() {
     let pool = test_pool().await;
     let run_id = RunId::new();
     let stage_id = StageExecutionId::new();
-    let eff = make_effect("cas-race", run_id, stage_id, EffectKind::GitPush, "race-target");
+    let eff = make_effect(
+        "cas-race",
+        run_id,
+        stage_id,
+        EffectKind::GitPush,
+        "race-target",
+    );
     insert(&pool, &eff).await.unwrap();
 
     let now = Utc::now();
@@ -301,7 +331,10 @@ async fn proposal_078_external_write_attempted_at_most_once() {
         now,
     };
     let started = executor_start_cas(&pool, &start_params).await.unwrap();
-    assert!(started, "executor_start_cas must succeed before external write");
+    assert!(
+        started,
+        "executor_start_cas must succeed before external write"
+    );
 
     // First mark: succeeds (status=executing, correct owner, not yet attempted)
     let ok1 = mark_external_write_started(&pool, &eff.id, "inst-ext-write", now)
@@ -358,7 +391,13 @@ async fn proposal_078_reaper_transition_cas_executing_to_needs_reconciliation() 
     let pool = test_pool().await;
     let run_id = RunId::new();
     let stage_id = StageExecutionId::new();
-    let eff = make_effect("reaper", run_id, stage_id, EffectKind::GitCommit, "reaper-tgt");
+    let eff = make_effect(
+        "reaper",
+        run_id,
+        stage_id,
+        EffectKind::GitCommit,
+        "reaper-tgt",
+    );
     insert(&pool, &eff).await.unwrap();
 
     let now = Utc::now();
@@ -392,7 +431,10 @@ async fn proposal_078_reaper_transition_cas_executing_to_needs_reconciliation() 
     };
 
     let transitioned = reaper_transition_cas(&pool, &reaper_params).await.unwrap();
-    assert!(transitioned, "reaper_transition_cas must succeed for expired lease");
+    assert!(
+        transitioned,
+        "reaper_transition_cas must succeed for expired lease"
+    );
 
     let after = db::repos::side_effects::find_by_id(&pool, &eff.id)
         .await
@@ -410,7 +452,13 @@ async fn proposal_078_reaper_and_executor_settle_are_mutually_exclusive() {
     let pool = test_pool().await;
     let run_id = RunId::new();
     let stage_id = StageExecutionId::new();
-    let eff = make_effect("mutex", run_id, stage_id, EffectKind::GitPush, "mutex-target");
+    let eff = make_effect(
+        "mutex",
+        run_id,
+        stage_id,
+        EffectKind::GitPush,
+        "mutex-target",
+    );
     insert(&pool, &eff).await.unwrap();
 
     let now = Utc::now();
@@ -638,7 +686,13 @@ async fn proposal_078_disposition_id_mismatch_rejected() {
     let pool = test_pool().await;
     let run_id = RunId::new();
     let stage_id = StageExecutionId::new();
-    let eff = make_effect("disp-mm", run_id, stage_id, EffectKind::GitCommit, "mm-target");
+    let eff = make_effect(
+        "disp-mm",
+        run_id,
+        stage_id,
+        EffectKind::GitCommit,
+        "mm-target",
+    );
     {
         let now = Utc::now();
         let mut e = eff.clone();

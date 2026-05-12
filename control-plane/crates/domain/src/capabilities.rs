@@ -36,6 +36,8 @@ pub enum CapabilityToolId {
     EffectsInspect,
     /// P078: perform read-only reconciliation readback for an unresolved effect.
     EffectsReconcile,
+    /// P078: mark an effect as conflict after operator confirmation.
+    EffectsMarkConflict,
     /// P078: mark an effect as unrecoverable after operator confirmation.
     EffectsMarkUnrecoverable,
     /// P078: clear an effect after manual operator verification.

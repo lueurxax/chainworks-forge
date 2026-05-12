@@ -200,10 +200,12 @@ impl PrincipalTable {
             {
                 use std::io::Write;
                 use std::os::unix::fs::OpenOptionsExt;
+                // create_new(true) maps to O_CREAT|O_EXCL — fails atomically if a file or
+                // symlink was placed at `path` between the exists() check and this open,
+                // preventing TOCTOU-based symlink substitution attacks.
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
-                    .create(true)
-                    .truncate(true)
+                    .create_new(true)
                     .mode(0o600)
                     .open(path)
                     .map_err(|e| {
@@ -514,7 +516,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 32] {
+fn all_tool_capabilities() -> [CapabilityToolId; 33] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -546,6 +548,7 @@ fn all_tool_capabilities() -> [CapabilityToolId; 32] {
         CapabilityToolId::EffectsList,
         CapabilityToolId::EffectsInspect,
         CapabilityToolId::EffectsReconcile,
+        CapabilityToolId::EffectsMarkConflict,
         CapabilityToolId::EffectsMarkUnrecoverable,
         CapabilityToolId::EffectsClearAfterManualVerification,
     ]
@@ -610,6 +613,7 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::EffectsList => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::EffectsInspect => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::EffectsReconcile => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::EffectsMarkConflict => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::EffectsMarkUnrecoverable => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::EffectsClearAfterManualVerification => {
             matches!(class, PrincipalClass::Operator)
@@ -716,6 +720,7 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "effects.list" => Some(CapabilityToolId::EffectsList),
         "effects.inspect" => Some(CapabilityToolId::EffectsInspect),
         "effects.reconcile" => Some(CapabilityToolId::EffectsReconcile),
+        "effects.mark_conflict" => Some(CapabilityToolId::EffectsMarkConflict),
         "effects.mark_unrecoverable" => Some(CapabilityToolId::EffectsMarkUnrecoverable),
         "effects.clear_after_manual_verification" => {
             Some(CapabilityToolId::EffectsClearAfterManualVerification)
@@ -1364,14 +1369,21 @@ mod tests {
 
     #[test]
     fn proposal_078_effects_tool_names_are_recognized() {
-        // All five effects.* tool names must resolve to their CapabilityToolIds.
+        // All P078 effects.* tool names must resolve to their CapabilityToolIds.
         // Without these arms, v2 principal tables listing effects.* tools would
         // crash the principal-table loader with "unknown MCP tool".
         let cases = [
             ("effects.list", CapabilityToolId::EffectsList),
             ("effects.inspect", CapabilityToolId::EffectsInspect),
             ("effects.reconcile", CapabilityToolId::EffectsReconcile),
-            ("effects.mark_unrecoverable", CapabilityToolId::EffectsMarkUnrecoverable),
+            (
+                "effects.mark_conflict",
+                CapabilityToolId::EffectsMarkConflict,
+            ),
+            (
+                "effects.mark_unrecoverable",
+                CapabilityToolId::EffectsMarkUnrecoverable,
+            ),
             (
                 "effects.clear_after_manual_verification",
                 CapabilityToolId::EffectsClearAfterManualVerification,
@@ -1396,6 +1408,7 @@ mod tests {
             "effects.list",
             "effects.inspect",
             "effects.reconcile",
+            "effects.mark_conflict",
             "effects.mark_unrecoverable",
             "effects.clear_after_manual_verification",
         ] {
@@ -1458,9 +1471,15 @@ mod tests {
         };
         let p = resolve_bearer("tok-effects", &table).unwrap();
         assert!(p.tool_capabilities.contains(&CapabilityToolId::EffectsList));
-        assert!(p.tool_capabilities.contains(&CapabilityToolId::EffectsInspect));
-        assert!(p.tool_capabilities.contains(&CapabilityToolId::EffectsReconcile));
-        assert!(!p.tool_capabilities.contains(&CapabilityToolId::EffectsMarkUnrecoverable));
+        assert!(p
+            .tool_capabilities
+            .contains(&CapabilityToolId::EffectsInspect));
+        assert!(p
+            .tool_capabilities
+            .contains(&CapabilityToolId::EffectsReconcile));
+        assert!(!p
+            .tool_capabilities
+            .contains(&CapabilityToolId::EffectsMarkUnrecoverable));
     }
 
     // ── HIGH-001 regression: v2 surface_policies present but mcp absent → empty tools ──
@@ -1470,21 +1489,19 @@ mod tests {
         // A v2 principal that has surface_policies but omits the mcp stanza
         // must resolve to ZERO tool_capabilities — NOT the class-default set.
         let table = PrincipalTable {
-            entries: vec![
-                PrincipalEntry {
-                    token: "tok-no-mcp".into(),
-                    id: "default-operator".into(),
-                    class: PrincipalClass::Operator,
-                    surface_policies: Some(SurfacePolicies {
-                        graphql: Some(GraphqlPolicy {
-                            allow_queries: true,
-                            allow_subscriptions: true,
-                            allowed_mutations: approval_mutations(),
-                        }),
-                        mcp: None, // deliberately absent
+            entries: vec![PrincipalEntry {
+                token: "tok-no-mcp".into(),
+                id: "default-operator".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: Some(GraphqlPolicy {
+                        allow_queries: true,
+                        allow_subscriptions: true,
+                        allowed_mutations: approval_mutations(),
                     }),
-                },
-            ],
+                    mcp: None, // deliberately absent
+                }),
+            }],
         };
 
         let p = resolve_bearer("tok-no-mcp", &table).unwrap();
@@ -1499,11 +1516,13 @@ mod tests {
 
         // Crucially, the dangerous effects.* tools must NOT be granted.
         assert!(
-            !p.tool_capabilities.contains(&CapabilityToolId::EffectsMarkUnrecoverable),
+            !p.tool_capabilities
+                .contains(&CapabilityToolId::EffectsMarkUnrecoverable),
             "effects.mark_unrecoverable must not be granted when mcp stanza is absent"
         );
         assert!(
-            !p.tool_capabilities.contains(&CapabilityToolId::EffectsClearAfterManualVerification),
+            !p.tool_capabilities
+                .contains(&CapabilityToolId::EffectsClearAfterManualVerification),
             "effects.clear_after_manual_verification must not be granted when mcp stanza is absent"
         );
     }
@@ -1562,8 +1581,8 @@ mod tests {
         let path = dir.path().join("principals.json");
 
         tracing::subscriber::with_default(subscriber, || {
-            let _table = PrincipalTable::load_or_bootstrap(&path)
-                .expect("bootstrap should succeed");
+            let _table =
+                PrincipalTable::load_or_bootstrap(&path).expect("bootstrap should succeed");
         });
 
         // Read the actual token that was written to the file

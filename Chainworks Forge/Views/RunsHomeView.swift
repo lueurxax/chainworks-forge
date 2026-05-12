@@ -193,6 +193,9 @@ struct RunsHomeView: View {
                         if let implementationCompletion = runDetail.implementationCompletion {
                             P088ImplementationCompletionCard(presentation: implementationCompletion)
                         }
+                        if let sideEffectReadback = runDetail.sideEffectReadback {
+                            P078SideEffectReadbackCard(presentation: sideEffectReadback)
+                        }
                         P031IdeaContextCard(presentation: runDetail.ideaContext)
                         P031CatalogContextCard(presentation: runDetail.catalogContext)
                     case .stages:
@@ -480,6 +483,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
                     pendingApprovalsLabel: nil,
                     closeoutReadinessSignalLabel: closeoutSignal,
                     implementationCompletionSignalLabel: detail.implementationCompletion?.compactSignalLabel,
+                    sideEffectSignalLabel: detail.sideEffectReadback?.compactSignalLabel,
                     freshnessState: .live,
                     accessibilityLabel: "Proposal review run, running"
                 ),
@@ -1117,6 +1121,12 @@ private struct P031RunsHomeRowCard: View {
                     .foregroundStyle(.secondary)
                     .accessibilityIdentifier("p088-implementation-completion-sidebar-signal")
             }
+            if let sideEffectSignalLabel = row.sideEffectSignalLabel {
+                Label(sideEffectSignalLabel, systemImage: "externaldrive.badge.exclamationmark")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("p078-side-effect-sidebar-signal")
+            }
             if let progressLabel = row.progressLabel {
                 Text(progressLabel)
                     .font(.caption)
@@ -1303,6 +1313,70 @@ private struct P088ImplementationCompletionCard: View {
             return "xmark.octagon"
         case .neutral:
             return "questionmark.circle"
+        }
+    }
+
+    private func copy(_ item: P031DiagnosticCopyItem) {
+#if os(macOS)
+        NSPasteboard.general.clearContents()
+        let didCopy = NSPasteboard.general.setString(item.value, forType: .string)
+        copyFeedback = didCopy ? "Copied \(item.label.lowercased())" : "Copy failed"
+#else
+        copyFeedback = "Copied \(item.label.lowercased())"
+#endif
+    }
+}
+
+private struct P078SideEffectReadbackCard: View {
+    let presentation: P078SideEffectReadbackPresentation
+    @State private var copyFeedback: String?
+
+    var body: some View {
+        P031CalloutCard(
+            title: "Release Side Effects",
+            bodyText: presentation.statusLabel,
+            accentColor: presentation.visualState == .blocking ? .red : .secondary
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                Label(presentation.nextOperatorActionLabel, systemImage: "arrow.right.circle")
+                    .font(.caption.weight(.medium))
+                    .accessibilityIdentifier("p078-side-effect-next-action")
+
+                if !presentation.diagnosticRows.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(presentation.diagnosticRows, id: \.self) { row in
+                            Text(row)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .accessibilityIdentifier("p078-side-effect-diagnostics")
+                }
+
+                if !presentation.copyItems.isEmpty {
+                    HStack(spacing: 8) {
+                        ForEach(presentation.copyItems, id: \.label) { item in
+                            Button {
+                                copy(item)
+                            } label: {
+                                Label(item.label, systemImage: "doc.on.doc")
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                }
+
+                if let copyFeedback {
+                    Text(copyFeedback)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("p078-side-effect-copy-feedback")
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(presentation.accessibilityLabel)
+            .accessibilityIdentifier("p078-side-effect-readback-card")
         }
     }
 

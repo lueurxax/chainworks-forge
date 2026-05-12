@@ -150,6 +150,7 @@ async fn enrich_run_with_artifact_contracts(
         rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
             .await?
             .map(|check| Json(check.operator_readback_json_for_lane("graphql")));
+    gql.side_effect_readback_json = Some(Json(side_effect_readback_json(pool, run_id).await?));
     let code_writer_completion_readbacks =
         code_writer_completion_receipts::list_by_run(pool, run_id).await?;
     let canonical_code_writer_completion_readbacks =
@@ -628,7 +629,10 @@ impl QueryRoot {
         let pool = ctx.data::<SqlitePool>()?;
         let limit = first.unwrap_or(50).clamp(1, 100) as u32;
         let effects = db::repos::side_effects::list_unresolved(pool, limit).await?;
-        Ok(effects.into_iter().map(GqlSideEffectSummary::from_domain).collect())
+        Ok(effects
+            .into_iter()
+            .map(GqlSideEffectSummary::from_domain)
+            .collect())
     }
 }
 
@@ -908,6 +912,13 @@ pub struct GqlSideEffectSummary {
     pub target_key: String,
     pub external_write_attempted: bool,
     pub last_error_kind: Option<String>,
+    pub expected_evidence_json: Option<Json<serde_json::Value>>,
+    pub observed_evidence_summary_json: Option<Json<serde_json::Value>>,
+    pub evidence_root: Option<String>,
+    pub readback_source: String,
+    pub report_path: Option<String>,
+    pub blocked_reason: String,
+    pub operator_next_action: String,
     pub recommended_mcp_tool: String,
     pub retry_forbidden: bool,
     pub created_at: String,
@@ -918,6 +929,14 @@ impl GqlSideEffectSummary {
     pub fn from_domain(e: domain::side_effect::SideEffect) -> Self {
         let kind_str = e.effect_kind.to_string();
         let status_str = e.status.to_string();
+        let expected_evidence_json = parse_optional_json(&e.expected_evidence_json);
+        let observed_evidence_summary_json = parse_optional_json(&e.observed_evidence_summary_json);
+        let report_path = observed_evidence_summary_json
+            .as_ref()
+            .and_then(|json| json.0.get("manifest_path"))
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned);
+        let operator_next_action = side_effect_operator_next_action(&e.status);
         Self {
             id: e.id.to_string(),
             run_id: e.run_id.to_string(),
@@ -929,12 +948,60 @@ impl GqlSideEffectSummary {
             target_key: e.target_key,
             external_write_attempted: e.external_write_attempted,
             last_error_kind: e.last_error_kind,
-            recommended_mcp_tool: "effects.inspect or effects.reconcile".into(),
+            expected_evidence_json,
+            observed_evidence_summary_json,
+            evidence_root: e.evidence_root,
+            readback_source: "side_effects_ledger".into(),
+            report_path,
+            blocked_reason: side_effect_blocked_reason(&e.status),
+            operator_next_action: operator_next_action.clone(),
+            recommended_mcp_tool: operator_next_action,
             retry_forbidden: true,
             created_at: e.created_at.to_rfc3339(),
             updated_at: e.updated_at.to_rfc3339(),
         }
     }
+}
+
+fn parse_optional_json(raw: &Option<String>) -> Option<Json<serde_json::Value>> {
+    raw.as_ref().map(|value| {
+        Json(
+            serde_json::from_str(value)
+                .unwrap_or_else(|_| serde_json::Value::String(value.clone())),
+        )
+    })
+}
+
+fn side_effect_blocked_reason(status: &domain::side_effect::SideEffectStatus) -> String {
+    match status {
+        domain::side_effect::SideEffectStatus::Prepared => "prepared_effect_not_executed",
+        domain::side_effect::SideEffectStatus::Executing => "executing_effect_not_settled",
+        domain::side_effect::SideEffectStatus::ExternallyObserved => {
+            "external_write_observed_pending_settlement"
+        }
+        domain::side_effect::SideEffectStatus::NeedsReconciliation => "effect_needs_reconciliation",
+        domain::side_effect::SideEffectStatus::Conflict => "effect_conflict_requires_disposition",
+        domain::side_effect::SideEffectStatus::Unrecoverable => {
+            "effect_unrecoverable_requires_manual_clear"
+        }
+        _ => "not_blocking",
+    }
+    .to_string()
+}
+
+fn side_effect_operator_next_action(status: &domain::side_effect::SideEffectStatus) -> String {
+    match status {
+        domain::side_effect::SideEffectStatus::NeedsReconciliation
+        | domain::side_effect::SideEffectStatus::ExternallyObserved => "effects.reconcile",
+        domain::side_effect::SideEffectStatus::Conflict => {
+            "effects.mark_unrecoverable or effects.clear_after_manual_verification"
+        }
+        domain::side_effect::SideEffectStatus::Unrecoverable => {
+            "effects.clear_after_manual_verification"
+        }
+        _ => "effects.inspect",
+    }
+    .to_string()
 }
 
 async fn runs_with_latest_summaries(pool: &SqlitePool, runs: Vec<GqlRun>) -> Result<Vec<GqlRun>> {
@@ -1001,7 +1068,54 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
         run.closeout_readiness_summary_json = Some(summary_json.clone());
         run.implementation_closeout_readiness_summary = Some(summary_json);
     }
+    run.side_effect_readback_json = Some(Json(side_effect_readback_json(pool, run_id).await?));
     Ok(run)
+}
+
+async fn side_effect_readback_json(pool: &SqlitePool, run_id: RunId) -> Result<serde_json::Value> {
+    let unresolved =
+        db::repos::side_effects::list_unresolved_for_run(pool, &run_id.to_string()).await?;
+    let effects: Vec<serde_json::Value> = unresolved
+        .iter()
+        .map(|effect| {
+            let observed = effect
+                .observed_evidence_summary_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+            let report_path = observed
+                .as_ref()
+                .and_then(|value| value.get("manifest_path"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            serde_json::json!({
+                "id": effect.id.to_string(),
+                "run_id": effect.run_id.to_string(),
+                "stage_execution_id": effect.stage_execution_id.to_string(),
+                "agent_execution_id": effect.agent_execution_id.as_ref().map(|id| id.to_string()),
+                "effect_kind": effect.effect_kind.to_string(),
+                "status": effect.status.to_string(),
+                "target_key": effect.target_key,
+                "external_write_attempted": effect.external_write_attempted,
+                "evidence_root": effect.evidence_root.clone(),
+                "readback_source": "side_effects_ledger",
+                "report_path": report_path,
+                "blocked_reason": side_effect_blocked_reason(&effect.status),
+                "operator_next_action": side_effect_operator_next_action(&effect.status),
+                "recommended_mcp_tool": side_effect_operator_next_action(&effect.status),
+                "retry_forbidden": true,
+                "last_error_kind": effect.last_error_kind.clone(),
+                "updated_at": effect.updated_at.to_rfc3339()
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "schema_version": "p078_side_effect_readback_v1",
+        "run_id": run_id.to_string(),
+        "unresolved_count": effects.len(),
+        "blocked": !effects.is_empty(),
+        "readback_source": "side_effects_ledger",
+        "effects": effects
+    }))
 }
 
 async fn proposal_064_command_readback(

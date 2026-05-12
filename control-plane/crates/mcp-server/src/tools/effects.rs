@@ -1,25 +1,204 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use sqlx::SqlitePool;
+use std::path::{Path, PathBuf};
 
-use auth::Principal;
+use db::repos::runs;
 use db::repos::side_effects::{self, apply_operator_disposition, DispositionOutcome};
 use domain::side_effect::{
-    SideEffectId, SideEffectStatus, MCP_ERROR_DISPOSITION_PAYLOAD_MISMATCH,
-    MCP_ERROR_EFFECT_NOT_FOUND, MCP_ERROR_INVALID_STATUS_TRANSITION, MCP_ERROR_UNAUTHORIZED,
+    EffectKind, SideEffect, SideEffectId, SideEffectStatus, MCP_ERROR_DISPOSITION_PAYLOAD_MISMATCH,
+    MCP_ERROR_EFFECT_NOT_FOUND, MCP_ERROR_INVALID_STATUS_TRANSITION,
 };
 
 use crate::protocol::McpTool;
 
 const DECISION_JSON_MAX_BYTES: usize = 64 * 1024;
+const LAST_ERROR_MAX_BYTES: usize = 512;
+const RECONCILIATION_REPORT_FILENAME: &str = "mcp-reconcile-report.json";
+const RECONCILIATION_REPORT_SCHEMA_VERSION: &str = "p078_reconciliation_report_v1";
+
+/// Redact a stored last_error before MCP readback. Strips credential-like tokens
+/// then truncates so raw git stderr / xcodebuild output cannot leak secrets through MCP.
+fn redact_last_error(raw: Option<&str>) -> Option<String> {
+    let s = raw?;
+    Some(domain::error_sanitizer::sanitize_error_for_storage(
+        s,
+        LAST_ERROR_MAX_BYTES,
+    ))
+}
+
+struct ReconciliationReadback {
+    readback_source: String,
+    report_path: String,
+    report_details: serde_json::Value,
+}
+
+struct ReadbackProbeSpec {
+    matched_evidence_kind: &'static str,
+    relative_paths: &'static [&'static str],
+}
+
+fn parse_json_or_string(raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+}
+
+fn readback_probe_spec(effect_kind: &EffectKind) -> ReadbackProbeSpec {
+    match effect_kind {
+        EffectKind::GitCommit => ReadbackProbeSpec {
+            matched_evidence_kind: "git_commit_receipt",
+            relative_paths: &["git-commit.json", "release/git-commit.json", "commit.json"],
+        },
+        EffectKind::GitPush => ReadbackProbeSpec {
+            matched_evidence_kind: "git_push_receipt",
+            relative_paths: &["git-push.json", "release/git-push.json"],
+        },
+        EffectKind::BuildArchive => ReadbackProbeSpec {
+            matched_evidence_kind: "release_manifest",
+            relative_paths: &["manifest.json", "release/manifest.json"],
+        },
+        EffectKind::ConnectUpload => ReadbackProbeSpec {
+            matched_evidence_kind: "connect_upload_receipt",
+            relative_paths: &["connect-upload.json", "release/connect-upload.json"],
+        },
+        EffectKind::TagCreate => ReadbackProbeSpec {
+            matched_evidence_kind: "tag_create_receipt",
+            relative_paths: &["tag-create.json", "release/tag-create.json"],
+        },
+        EffectKind::ArtifactPublish => ReadbackProbeSpec {
+            matched_evidence_kind: "artifact_publish_receipt",
+            relative_paths: &["artifact-publish.json", "release/artifact-publish.json"],
+        },
+    }
+}
+
+fn reconciliation_report_dir(effect: &SideEffect, artifact_root: &str) -> PathBuf {
+    match effect.evidence_root.as_deref() {
+        Some(root) if !root.trim().is_empty() => PathBuf::from(root).join("reconciliation"),
+        _ => PathBuf::from(artifact_root)
+            .join("side-effects")
+            .join(effect.id.to_string())
+            .join("reconciliation"),
+    }
+}
+
+fn candidate_probe_paths(effect: &SideEffect, artifact_root: &str) -> Vec<String> {
+    let spec = readback_probe_spec(&effect.effect_kind);
+    let mut candidates = Vec::new();
+
+    if let Some(root) = effect.evidence_root.as_deref() {
+        if !root.trim().is_empty() {
+            for relative in spec.relative_paths {
+                let path = Path::new(root).join(relative);
+                let value = path.to_string_lossy().into_owned();
+                if !candidates.contains(&value) {
+                    candidates.push(value);
+                }
+            }
+        }
+    }
+
+    for relative in spec.relative_paths {
+        let path = Path::new(artifact_root).join(relative);
+        let value = path.to_string_lossy().into_owned();
+        if !candidates.contains(&value) {
+            candidates.push(value);
+        }
+    }
+
+    candidates
+}
+
+async fn build_reconciliation_readback(
+    pool: &SqlitePool,
+    effect: &SideEffect,
+) -> Result<ReconciliationReadback> {
+    let run = runs::find_by_id(pool, effect.run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("effect {} references missing run", effect.id))?;
+    let probe_spec = readback_probe_spec(&effect.effect_kind);
+    let candidate_paths = candidate_probe_paths(effect, &run.artifact_root);
+    let matched_path = candidate_paths
+        .iter()
+        .find(|path| Path::new(path).is_file())
+        .cloned();
+    let matched_payload = matched_path
+        .as_ref()
+        .map(|path| -> Result<serde_json::Value> {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("read reconciliation evidence {}", path))?;
+            Ok(parse_json_or_string(&raw))
+        })
+        .transpose()?;
+
+    let report_path =
+        reconciliation_report_dir(effect, &run.artifact_root).join(RECONCILIATION_REPORT_FILENAME);
+    std::fs::create_dir_all(
+        report_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid reconciliation report path"))?,
+    )
+    .with_context(|| format!("create reconciliation report dir {}", report_path.display()))?;
+
+    let report_scope = match effect.evidence_root.as_deref() {
+        Some(root) if !root.trim().is_empty() => "evidence_root",
+        _ => "effect_scoped_fallback",
+    };
+    let readback_source = if matched_path.is_some() {
+        "filesystem_receipt_probe"
+    } else if report_scope == "evidence_root" {
+        "evidence_root_scan"
+    } else {
+        "effect_scoped_reconciliation_report"
+    };
+
+    let report_details = serde_json::json!({
+        "effect_kind": effect.effect_kind.to_string(),
+        "matched_evidence_kind": matched_path.as_ref().map(|_| probe_spec.matched_evidence_kind),
+        "matched_path": matched_path,
+        "matched_payload": matched_payload,
+        "candidate_paths": candidate_paths,
+        "report_scope": report_scope,
+        "evidence_root": effect.evidence_root,
+        "artifact_root": run.artifact_root,
+        "observed_evidence_summary": effect
+            .observed_evidence_summary_json
+            .as_deref()
+            .map(parse_json_or_string),
+        "last_error_kind": effect.last_error_kind,
+    });
+
+    let report = serde_json::json!({
+        "schema_version": RECONCILIATION_REPORT_SCHEMA_VERSION,
+        "effect_id": effect.id.to_string(),
+        "run_id": effect.run_id.to_string(),
+        "stage_execution_id": effect.stage_execution_id.to_string(),
+        "effect_kind": effect.effect_kind.to_string(),
+        "status": effect.status.to_string(),
+        "readback_source": readback_source,
+        "generated_at": Utc::now().to_rfc3339(),
+        "report_path": report_path.to_string_lossy().to_string(),
+        "report_details": report_details,
+    });
+
+    std::fs::write(
+        &report_path,
+        serde_json::to_vec_pretty(&report).context("serialize reconciliation report")?,
+    )
+    .with_context(|| format!("write reconciliation report {}", report_path.display()))?;
+
+    Ok(ReconciliationReadback {
+        readback_source: readback_source.to_string(),
+        report_path: report_path.to_string_lossy().into_owned(),
+        report_details,
+    })
+}
 
 pub fn tool_specs() -> Vec<McpTool> {
     vec![
         McpTool {
             name: "effects.list".to_string(),
-            description:
-                "List unresolved side-effect records. Read-only projection; no mutations."
-                    .to_string(),
+            description: "List unresolved side-effect records. Read-only projection; no mutations."
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -70,6 +249,32 @@ pub fn tool_specs() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "effects.mark_conflict".to_string(),
+            description: concat!(
+                "Mark a side-effect as conflict after operator confirmation. ",
+                "Requires disposition_id for audit idempotency."
+            )
+            .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["effect_id", "disposition_id", "decision_json"],
+                "properties": {
+                    "effect_id": {
+                        "type": "string",
+                        "description": "The side-effect ID"
+                    },
+                    "disposition_id": {
+                        "type": "string",
+                        "description": "Unique disposition ID for audit idempotency"
+                    },
+                    "decision_json": {
+                        "type": "string",
+                        "description": "JSON payload describing the conflict determination"
+                    }
+                }
+            }),
+        },
+        McpTool {
             name: "effects.mark_unrecoverable".to_string(),
             description: concat!(
                 "Mark a side-effect as unrecoverable after operator confirmation. ",
@@ -91,33 +296,6 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "decision_json": {
                         "type": "string",
                         "description": "JSON payload describing the unrecoverable determination"
-                    }
-                }
-            }),
-        },
-        McpTool {
-            name: "effects.mark_conflict".to_string(),
-            description: concat!(
-                "Mark a side-effect as conflict when external state is ambiguous and manual ",
-                "resolution is required. Requires disposition_id for audit idempotency. ",
-                "Allowed source statuses: needs_reconciliation, executing, externally_observed."
-            )
-            .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "required": ["effect_id", "disposition_id", "decision_json"],
-                "properties": {
-                    "effect_id": {
-                        "type": "string",
-                        "description": "The side-effect ID"
-                    },
-                    "disposition_id": {
-                        "type": "string",
-                        "description": "Unique disposition ID for audit idempotency"
-                    },
-                    "decision_json": {
-                        "type": "string",
-                        "description": "JSON payload describing the conflict determination"
                     }
                 }
             }),
@@ -231,7 +409,7 @@ pub async fn handle_effects_inspect(
         "external_write_attempted": effect.external_write_attempted,
         "attempt_budget_remaining": effect.attempt_budget_remaining,
         "last_error_kind": effect.last_error_kind,
-        "last_error": effect.last_error,
+        "last_error": redact_last_error(effect.last_error.as_deref()),
         "evidence_root": effect.evidence_root,
         "observed_evidence_summary": effect.observed_evidence_summary_json,
         "deadline_at": effect.deadline_at.map(|t| t.to_rfc3339()),
@@ -266,6 +444,7 @@ pub async fn handle_effects_reconcile(
     let effect = side_effects::find_by_id(pool, &effect_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!(MCP_ERROR_EFFECT_NOT_FOUND))?;
+    let readback = build_reconciliation_readback(pool, &effect).await?;
 
     // Read-only: just surface current state and recommended next action
     let recommended_action = match effect.status {
@@ -289,11 +468,15 @@ pub async fn handle_effects_reconcile(
         "target_key": effect.target_key,
         "external_write_attempted": effect.external_write_attempted,
         "last_error_kind": effect.last_error_kind,
-        "last_error": effect.last_error,
+        "last_error": redact_last_error(effect.last_error.as_deref()),
         "observed_evidence_summary": effect.observed_evidence_summary_json,
         "evidence_root": effect.evidence_root,
-        "readback_source": "local_ledger",
+        "readback_source": readback.readback_source,
         "readback_unavailable": false,
+        "report_path": readback.report_path,
+        "report_details": readback.report_details.clone(),
+        "reconciliation_report_path": readback.report_path,
+        "reconciliation_report_details": readback.report_details,
         "recommended_action": recommended_action,
         "retry_forbidden": true,
         "updated_at": effect.updated_at.to_rfc3339()
@@ -569,8 +752,13 @@ pub async fn handle_effects_clear_after_manual_verification(
     }
 }
 
-const ALLOWED_DECISION_VALUES: &[&str] =
-    &["reconciled", "unrecoverable", "conflict", "cleared", "manual_verified"];
+const ALLOWED_DECISION_VALUES: &[&str] = &[
+    "reconciled",
+    "unrecoverable",
+    "conflict",
+    "cleared",
+    "manual_verified",
+];
 
 /// Validate that a disposition payload conforms to the side_effect_decision_v1 schema.
 /// Per P078-SEC-MED-001: validates typed fields, allowed decision enum, non-empty operator_notes.
@@ -646,7 +834,9 @@ fn validate_uuid_format(id_str: &str, field: &str) -> Result<()> {
         || parts[2].len() != 4
         || parts[3].len() != 4
         || parts[4].len() != 12
-        || !parts.iter().all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
+        || !parts
+            .iter()
+            .all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
     {
         return Err(anyhow::anyhow!(
             "invalid_disposition: {field} must be a valid UUID (got {id_str:?})"
@@ -674,9 +864,7 @@ pub async fn execute(
         "effects.list" => handle_effects_list(pool, &params).await,
         "effects.inspect" => handle_effects_inspect(pool, &params).await,
         "effects.reconcile" => handle_effects_reconcile(pool, &params).await,
-        "effects.mark_conflict" => {
-            handle_effects_mark_conflict(pool, &params, &principal.id).await
-        }
+        "effects.mark_conflict" => handle_effects_mark_conflict(pool, &params, &principal.id).await,
         "effects.mark_unrecoverable" => {
             handle_effects_mark_unrecoverable(pool, &params, &principal.id).await
         }
@@ -684,5 +872,76 @@ pub async fn execute(
             handle_effects_clear_after_manual_verification(pool, &params, &principal.id).await
         }
         _ => Err(anyhow::anyhow!("Unknown effects tool: {tool_name}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proposal_078_redact_last_error_none_returns_none() {
+        assert_eq!(redact_last_error(None), None);
+    }
+
+    #[test]
+    fn proposal_078_redact_last_error_clean_short_string_passthrough() {
+        let result = redact_last_error(Some("git push failed: network timeout"));
+        assert_eq!(result, Some("git push failed: network timeout".to_string()));
+    }
+
+    #[test]
+    fn proposal_078_redact_last_error_strips_bearer_token() {
+        let raw = "Authorization: Bearer ghp_supersecrettoken123 failed";
+        let result = redact_last_error(Some(raw)).unwrap();
+        assert!(
+            !result.contains("ghp_supersecrettoken123"),
+            "bearer token must be redacted"
+        );
+        assert!(result.contains("[redacted]"));
+    }
+
+    #[test]
+    fn proposal_078_redact_last_error_strips_api_key_assignment() {
+        let raw = "error: api_key=sk-abc1234567890 is invalid";
+        let result = redact_last_error(Some(raw)).unwrap();
+        assert!(
+            !result.contains("sk-abc1234567890"),
+            "api key value must be redacted"
+        );
+    }
+
+    #[test]
+    fn proposal_078_redact_last_error_strips_ssh_path() {
+        let raw = "error reading /home/user/.ssh/id_rsa permission denied";
+        let result = redact_last_error(Some(raw)).unwrap();
+        assert!(
+            !result.contains("/home/user/.ssh/id_rsa"),
+            "ssh path must be redacted"
+        );
+        assert!(result.contains("[redacted]"));
+    }
+
+    #[test]
+    fn proposal_078_redact_last_error_multibyte_no_panic() {
+        let prefix = "e".repeat(511);
+        let multibyte = "Ä"; // 2 bytes
+        let s = format!("{prefix}{multibyte}trailing");
+        let result = redact_last_error(Some(&s)).unwrap();
+        assert!(
+            result.ends_with("...[truncated]"),
+            "must be truncated: {result:?}"
+        );
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "result must be valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn proposal_078_redact_last_error_long_string_truncated() {
+        let long = "x".repeat(600);
+        let result = redact_last_error(Some(&long)).unwrap();
+        assert!(result.ends_with("...[truncated]"));
     }
 }

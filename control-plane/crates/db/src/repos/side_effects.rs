@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use domain::side_effect::{
-    SideEffect, SideEffectAttempt, SideEffectAttemptId, SideEffectId,
-    SideEffectSettlementId, SideEffectStatus,
+    SideEffect, SideEffectAttempt, SideEffectAttemptId, SideEffectId, SideEffectSettlementId,
+    SideEffectStatus,
 };
 
 // ── Parse helpers ─────────────────────────────────────────────────────────────
@@ -32,8 +32,7 @@ fn parse_side_effect(row: sqlx::sqlite::SqliteRow) -> Result<SideEffect> {
 
     Ok(SideEffect {
         id: SideEffectId::from_str(row.try_get::<&str, _>("id")?),
-        run_id: RunId::from_str(&run_id)
-            .with_context(|| format!("parse run_id: {run_id}"))?,
+        run_id: RunId::from_str(&run_id).with_context(|| format!("parse run_id: {run_id}"))?,
         stage_execution_id: StageExecutionId::from_str(&stage_execution_id)
             .with_context(|| format!("parse stage_execution_id: {stage_execution_id}"))?,
         agent_execution_id: agent_execution_id
@@ -41,9 +40,7 @@ fn parse_side_effect(row: sqlx::sqlite::SqliteRow) -> Result<SideEffect> {
             .map(AgentExecutionId::from_str)
             .transpose()
             .with_context(|| "parse agent_execution_id")?,
-        effect_kind: effect_kind
-            .parse()
-            .map_err(|e: String| anyhow!("{}", e))?,
+        effect_kind: effect_kind.parse().map_err(|e: String| anyhow!("{}", e))?,
         target_key: row.try_get("target_key")?,
         idempotency_key: row.try_get("idempotency_key")?,
         idempotency_key_version: row.try_get("idempotency_key_version")?,
@@ -108,7 +105,11 @@ pub async fn insert(pool: &SqlitePool, effect: &SideEffect) -> Result<()> {
     .bind(effect.lease_expires_at.map(|t| t.to_rfc3339()))
     .bind(effect.deadline_at.map(|t| t.to_rfc3339()))
     .bind(effect.external_write_started_at.map(|t| t.to_rfc3339()))
-    .bind(if effect.external_write_attempted { 1i64 } else { 0i64 })
+    .bind(if effect.external_write_attempted {
+        1i64
+    } else {
+        0i64
+    })
     .bind(effect.attempt_budget_remaining)
     .bind(&effect.expected_evidence_json)
     .bind(&effect.observed_evidence_summary_json)
@@ -150,10 +151,7 @@ pub async fn find_by_id(pool: &SqlitePool, id: &SideEffectId) -> Result<Option<S
     row.map(parse_side_effect).transpose()
 }
 
-pub async fn find_by_idempotency_key(
-    pool: &SqlitePool,
-    key: &str,
-) -> Result<Option<SideEffect>> {
+pub async fn find_by_idempotency_key(pool: &SqlitePool, key: &str) -> Result<Option<SideEffect>> {
     let row = sqlx::query(
         r#"SELECT id, run_id, stage_execution_id, agent_execution_id,
                   effect_kind, target_key,
@@ -179,10 +177,7 @@ pub async fn find_by_idempotency_key(
 
 // ── List unresolved ───────────────────────────────────────────────────────────
 
-pub async fn list_unresolved_for_run(
-    pool: &SqlitePool,
-    run_id: &str,
-) -> Result<Vec<SideEffect>> {
+pub async fn list_unresolved_for_run(pool: &SqlitePool, run_id: &str) -> Result<Vec<SideEffect>> {
     let rows = sqlx::query(
         r#"SELECT id, run_id, stage_execution_id, agent_execution_id,
                   effect_kind, target_key,
@@ -365,8 +360,8 @@ pub async fn executor_start_cas(
     pool: &SqlitePool,
     params: &ExecutorStartCasParams<'_>,
 ) -> Result<bool> {
-    let mut tx = crate::pool::begin_immediate_with_retry(pool, "side_effects.executor_start_cas")
-        .await?;
+    let mut tx =
+        crate::pool::begin_immediate_with_retry(pool, "side_effects.executor_start_cas").await?;
 
     let rows_updated: u64 = sqlx::query(
         r#"UPDATE side_effects
@@ -477,12 +472,22 @@ pub async fn executor_settle_cas(
     pool: &SqlitePool,
     params: &ExecutorSettleCasParams<'_>,
 ) -> Result<bool> {
+    let mut tx =
+        crate::pool::begin_immediate_with_retry(pool, "side_effects.executor_settle_cas").await?;
+    let settled = executor_settle_cas_tx(&mut tx, params).await?;
+    if !settled {
+        return Ok(false);
+    }
+    tx.commit().await.context("executor_settle_cas commit")?;
+    Ok(true)
+}
+
+pub async fn executor_settle_cas_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    params: &ExecutorSettleCasParams<'_>,
+) -> Result<bool> {
     let settlement_id = SideEffectSettlementId::new();
     let new_status_str = params.new_status.to_string();
-
-    let mut tx =
-        crate::pool::begin_immediate_with_retry(pool, "side_effects.executor_settle_cas")
-            .await?;
 
     // Predicate is status-sensitive per proposal:
     // - executing: require matching owner, live lease (>= now), and matching lease_renewed_at
@@ -517,7 +522,7 @@ pub async fn executor_settle_cas(
     .bind(params.effect_id.as_ref())
     .bind(params.owner_instance_id)
     .bind(params.observed_lease_renewed_at.to_rfc3339())
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("executor_settle_cas update")?
     .rows_affected();
@@ -550,7 +555,7 @@ pub async fn executor_settle_cas(
     .bind(params.last_error)
     .bind(params.settlement_attempt_id.as_ref())
     .bind(params.effect_id.as_ref())
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("executor_settle_cas update attempt")?
     .rows_affected();
@@ -579,13 +584,96 @@ pub async fn executor_settle_cas(
     .bind(params.settlement_attempt_id.as_ref())
     .bind(params.decision_json)
     .bind(params.decision_json_hash)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .context("executor_settle_cas insert settlement")?;
 
-    tx.commit()
-        .await
-        .context("executor_settle_cas commit")?;
+    Ok(true)
+}
+
+// ── CAS: executor failure (needs_reconciliation) ─────────────────────────────
+
+/// Parameters for transitioning an executing effect to needs_reconciliation after
+/// a release operation failure. Unlike executor_settle_cas, this does NOT insert
+/// into side_effect_settlements because needs_reconciliation is not a terminal state
+/// and is excluded from the settlement_status CHECK constraint.
+pub struct ExecutorFailCasParams<'a> {
+    pub effect_id: &'a SideEffectId,
+    pub owner_instance_id: &'a str,
+    pub attempt_id: &'a SideEffectAttemptId,
+    pub observed_lease_renewed_at: DateTime<Utc>,
+    pub last_error_kind: &'a str,
+    pub last_error: &'a str,
+    pub now: DateTime<Utc>,
+}
+
+/// Transition an executing effect to needs_reconciliation after a release failure.
+/// CAS predicate: status=executing AND owner matches AND lease_renewed_at matches.
+/// Returns Ok(true) on success, Ok(false) if CAS lost (reaper already transitioned),
+/// Err(e) on DB error.
+pub async fn executor_fail_cas(
+    pool: &SqlitePool,
+    params: &ExecutorFailCasParams<'_>,
+) -> Result<bool> {
+    let mut tx =
+        crate::pool::begin_immediate_with_retry(pool, "side_effects.executor_fail_cas").await?;
+    let transitioned = executor_fail_cas_tx(&mut tx, params).await?;
+    if !transitioned {
+        return Ok(false);
+    }
+    tx.commit().await.context("executor_fail_cas commit")?;
+    Ok(true)
+}
+
+pub async fn executor_fail_cas_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    params: &ExecutorFailCasParams<'_>,
+) -> Result<bool> {
+    let rows_updated: u64 = sqlx::query(
+        r#"UPDATE side_effects
+           SET status = 'needs_reconciliation',
+               last_error_kind = ?1,
+               last_error = ?2,
+               updated_at = ?3
+           WHERE id = ?4
+             AND status = 'executing'
+             AND owner_instance_id = ?5
+             AND COALESCE(lease_renewed_at, lease_acquired_at) = ?6"#,
+    )
+    .bind(params.last_error_kind)
+    .bind(params.last_error)
+    .bind(params.now.to_rfc3339())
+    .bind(params.effect_id.as_ref())
+    .bind(params.owner_instance_id)
+    .bind(params.observed_lease_renewed_at.to_rfc3339())
+    .execute(&mut **tx)
+    .await
+    .context("executor_fail_cas update")?
+    .rows_affected();
+
+    if rows_updated != 1 {
+        return Ok(false);
+    }
+
+    // Mark the attempt record as failed.
+    sqlx::query(
+        r#"UPDATE side_effect_attempts
+           SET completed_at = ?1,
+               exit_status = 'failed',
+               error_kind = ?2,
+               error = ?3
+           WHERE id = ?4
+             AND side_effect_id = ?5"#,
+    )
+    .bind(params.now.to_rfc3339())
+    .bind(params.last_error_kind)
+    .bind(params.last_error)
+    .bind(params.attempt_id.as_ref())
+    .bind(params.effect_id.as_ref())
+    .execute(&mut **tx)
+    .await
+    .context("executor_fail_cas update attempt")?;
+
     Ok(true)
 }
 
@@ -611,13 +699,11 @@ pub async fn reaper_transition_cas(
     params: &ReaperTransitionCasParams<'_>,
 ) -> Result<bool> {
     let mut tx =
-        crate::pool::begin_immediate_with_retry(pool, "side_effects.reaper_transition_cas")
-            .await?;
+        crate::pool::begin_immediate_with_retry(pool, "side_effects.reaper_transition_cas").await?;
 
     let rows_updated: u64 = match params.observed_status {
-        SideEffectStatus::Executing => {
-            sqlx::query(
-                r#"UPDATE side_effects
+        SideEffectStatus::Executing => sqlx::query(
+            r#"UPDATE side_effects
                    SET status = 'needs_reconciliation',
                        last_error_kind = ?1,
                        last_error = ?2,
@@ -627,25 +713,19 @@ pub async fn reaper_transition_cas(
                      AND owner_instance_id = ?5
                      AND COALESCE(lease_renewed_at, lease_acquired_at) = ?6
                      AND (lease_expires_at < ?3 OR deadline_at < ?3)"#,
-            )
-            .bind(params.last_error_kind)
-            .bind(params.last_error)
-            .bind(params.now.to_rfc3339())
-            .bind(params.effect_id.as_ref())
-            .bind(params.observed_owner)
-            .bind(
-                params
-                    .observed_lease_renewed_at
-                    .map(|t| t.to_rfc3339()),
-            )
-            .execute(&mut *tx)
-            .await
-            .context("reaper_transition_cas executing")?
-            .rows_affected()
-        }
-        SideEffectStatus::Prepared => {
-            sqlx::query(
-                r#"UPDATE side_effects
+        )
+        .bind(params.last_error_kind)
+        .bind(params.last_error)
+        .bind(params.now.to_rfc3339())
+        .bind(params.effect_id.as_ref())
+        .bind(params.observed_owner)
+        .bind(params.observed_lease_renewed_at.map(|t| t.to_rfc3339()))
+        .execute(&mut *tx)
+        .await
+        .context("reaper_transition_cas executing")?
+        .rows_affected(),
+        SideEffectStatus::Prepared => sqlx::query(
+            r#"UPDATE side_effects
                    SET status = 'needs_reconciliation',
                        last_error_kind = ?1,
                        last_error = ?2,
@@ -655,20 +735,18 @@ pub async fn reaper_transition_cas(
                      AND updated_at = ?5
                      AND deadline_at IS NOT NULL
                      AND deadline_at < ?3"#,
-            )
-            .bind(params.last_error_kind)
-            .bind(params.last_error)
-            .bind(params.now.to_rfc3339())
-            .bind(params.effect_id.as_ref())
-            .bind(params.observed_updated_at.to_rfc3339())
-            .execute(&mut *tx)
-            .await
-            .context("reaper_transition_cas prepared")?
-            .rows_affected()
-        }
-        SideEffectStatus::ExternallyObserved => {
-            sqlx::query(
-                r#"UPDATE side_effects
+        )
+        .bind(params.last_error_kind)
+        .bind(params.last_error)
+        .bind(params.now.to_rfc3339())
+        .bind(params.effect_id.as_ref())
+        .bind(params.observed_updated_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .context("reaper_transition_cas prepared")?
+        .rows_affected(),
+        SideEffectStatus::ExternallyObserved => sqlx::query(
+            r#"UPDATE side_effects
                    SET status = 'needs_reconciliation',
                        last_error_kind = ?1,
                        last_error = ?2,
@@ -678,17 +756,16 @@ pub async fn reaper_transition_cas(
                      AND updated_at = ?5
                      AND deadline_at IS NOT NULL
                      AND deadline_at < ?3"#,
-            )
-            .bind(params.last_error_kind)
-            .bind(params.last_error)
-            .bind(params.now.to_rfc3339())
-            .bind(params.effect_id.as_ref())
-            .bind(params.observed_updated_at.to_rfc3339())
-            .execute(&mut *tx)
-            .await
-            .context("reaper_transition_cas externally_observed")?
-            .rows_affected()
-        }
+        )
+        .bind(params.last_error_kind)
+        .bind(params.last_error)
+        .bind(params.now.to_rfc3339())
+        .bind(params.effect_id.as_ref())
+        .bind(params.observed_updated_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .context("reaper_transition_cas externally_observed")?
+        .rows_affected(),
         _ => {
             return Err(anyhow!(
                 "reaper_transition_cas: invalid source status {}",
@@ -701,9 +778,7 @@ pub async fn reaper_transition_cas(
         return Ok(false);
     }
 
-    tx.commit()
-        .await
-        .context("reaper_transition_cas commit")?;
+    tx.commit().await.context("reaper_transition_cas commit")?;
     Ok(true)
 }
 
@@ -923,8 +998,14 @@ pub async fn mark_external_write_started(
     Ok(rows_updated == 1)
 }
 
-/// Fetch expired executing effects for the watchdog reaper.
-pub async fn list_expired_executing(
+/// Fetch side effects that need startup/watchdog recovery.
+///
+/// This intentionally covers every crash window P078 cares about:
+/// - `prepared`: intent was recorded but executor never acquired/finished work
+/// - `executing`: executor lease/deadline expired
+/// - `externally_observed`: external write happened but settlement did not complete
+/// - `settled`: readback must verify evidence durability before the run can be trusted
+pub async fn list_watchdog_recovery_candidates(
     pool: &SqlitePool,
     now: DateTime<Utc>,
     limit: i64,
@@ -942,16 +1023,74 @@ pub async fn list_expired_executing(
                   last_error_kind, last_error, settlement_txn_id,
                   created_at, updated_at
            FROM side_effects
-           WHERE status = 'executing'
-             AND (lease_expires_at < ?1 OR deadline_at < ?1)
-           ORDER BY lease_expires_at ASC
+           WHERE (
+               status = 'executing'
+               AND (lease_expires_at < ?1 OR deadline_at < ?1)
+             )
+              OR (
+               status IN ('prepared', 'externally_observed')
+               AND deadline_at IS NOT NULL
+               AND deadline_at < ?1
+             )
+              OR (
+               status = 'settled'
+               AND observed_evidence_summary_json IS NOT NULL
+             )
+           ORDER BY updated_at ASC
            LIMIT ?2"#,
     )
     .bind(now.to_rfc3339())
     .bind(limit)
     .fetch_all(pool)
     .await
-    .context("list expired executing side_effects")?;
+    .context("list watchdog recovery side_effect candidates")?;
 
     rows.into_iter().map(parse_side_effect).collect()
+}
+
+/// Backward-compatible test/helper entry point for the original stale-executing
+/// watchdog query.
+pub async fn list_expired_executing(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<SideEffect>> {
+    let candidates = list_watchdog_recovery_candidates(pool, now, limit).await?;
+    Ok(candidates
+        .into_iter()
+        .filter(|effect| effect.status == SideEffectStatus::Executing)
+        .collect())
+}
+
+/// Mark a previously settled side effect as needing operator reconciliation
+/// because its evidence manifest or referenced files failed startup verification.
+pub async fn mark_settled_evidence_failed(
+    pool: &SqlitePool,
+    effect_id: &SideEffectId,
+    observed_updated_at: DateTime<Utc>,
+    last_error_kind: &str,
+    last_error: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let rows_updated = sqlx::query(
+        r#"UPDATE side_effects
+           SET status = 'needs_reconciliation',
+               last_error_kind = ?1,
+               last_error = ?2,
+               updated_at = ?3
+           WHERE id = ?4
+             AND status = 'settled'
+             AND updated_at = ?5"#,
+    )
+    .bind(last_error_kind)
+    .bind(last_error)
+    .bind(now.to_rfc3339())
+    .bind(effect_id.as_ref())
+    .bind(observed_updated_at.to_rfc3339())
+    .execute(pool)
+    .await
+    .context("mark settled side_effect evidence failed")?
+    .rows_affected();
+
+    Ok(rows_updated == 1)
 }
