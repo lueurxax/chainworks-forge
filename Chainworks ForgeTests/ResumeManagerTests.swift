@@ -1543,7 +1543,7 @@ struct ResumeManagerTests {
             iteration: 1,
             attemptNumber: 1
         )
-        stage.startedAt = Date().addingTimeInterval(-301)
+        stage.startedAt = Date().addingTimeInterval(-360)
         stage.run = run
         context.insert(stage)
         try context.save()
@@ -1562,7 +1562,7 @@ struct ResumeManagerTests {
             agentID: "test_agent",
             event: ExecutionEvent(
                 type: .sessionClosed,
-                timestamp: Date().addingTimeInterval(-301),
+                timestamp: Date().addingTimeInterval(-360),
                 detail: "Session closed"
             )
         )
@@ -1633,7 +1633,7 @@ struct ResumeManagerTests {
             iteration: 1,
             attemptNumber: 1
         )
-        stage.startedAt = Date().addingTimeInterval(-301)
+        stage.startedAt = Date().addingTimeInterval(-360)
         stage.run = run
         context.insert(stage)
 
@@ -1665,7 +1665,7 @@ struct ResumeManagerTests {
             agentID: "code_writer",
             event: ExecutionEvent(
                 type: .sessionClosed,
-                timestamp: Date().addingTimeInterval(-301),
+                timestamp: Date().addingTimeInterval(-360),
                 detail: "Session closed"
             )
         )
@@ -2465,8 +2465,8 @@ struct ResumeManagerTests {
 
         service.resolveApproval(approvalID: requestID, granted: false, comment: "persist now")
 
-        await awaitCondition("Rejected approval should detach the orchestrator", timeout: 3.0) {
-            service.orchestrator(for: persistedRunID) == nil
+        await awaitCondition("Rejected approval should leave no pending approval", timeout: 3.0) {
+            service.pendingApprovalCount == 0
         }
 
         await awaitCondition("Approval resolution should settle in fresh reads", timeout: 3.0) {

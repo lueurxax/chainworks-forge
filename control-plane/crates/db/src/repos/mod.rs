@@ -23,6 +23,7 @@ pub mod routing_receipts;
 pub mod runs;
 pub mod scheduler;
 pub mod sessions;
+pub mod side_effects;
 pub mod stages;
 pub mod startup_repairs;
 pub mod steward;

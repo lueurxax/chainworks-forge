@@ -19,18 +19,17 @@ These are not active workstreams:
 - **P066** provider toolchain cache mapping. Treat as completed/reference prerequisite; do not reopen it for settlement, retry, SQLite pressure, or control-plane boundary work.
 - **P051** shared Xcode MCP bridge pool scoped closeout. Keep in maintenance/release-host validation mode; do not expand scope.
 
-## Now
+## Recently Stabilized
 
-Highest priority work:
-
-- **P084** minimal rollout-gate template and proposal readiness contract.
+- **P073 freeze mode**.
+- **P084** minimal rollout-gate template and proposal readiness contract: template, linter, run-start preflight, authoritative storage, and four-lane operator readback.
 - **UI action boundary / P072 closeout gate**:
   - SwiftUI is GraphQL-only.
   - SwiftUI mutations are limited to `approveApproval` and `rejectApproval`.
   - All non-approval operator actions are MCP-only.
 - **P081** boundary-first API/auth contract matrix.
 - **Local persistence write-budget / evidence-spooling infrastructure** is implemented and remains the persistence safety baseline.
-- **P078** durable side-effect ledger and retry blocking.
+- **P078** durable side-effect ledger, release settlement, retry blocking, and reconciliation.
 - **Configurable Agent Escalation Chains**:
   - keep scoped to contract-output repair/fallback;
   - do not include release agents;
@@ -48,17 +47,18 @@ Goal:
 
 > recover the pre-control-plane level of UI usefulness without reintroducing client-owned orchestration or broad UI write controls.
 
-## Next
+## Now
 
 After the write-budget and P078 safety rails are in place:
 
+- **P081** boundary-first API/auth contract matrix.
 - **P082** recovery/retry state-machine test matrix.
 - **P076/P080** effect-aware recovery and stale execution reconciliation.
 - **P079** contract-aware output repair and provider fallback.
 - **P031** corrected GraphQL thin UI closeout, if not already closed by the UI recovery lane.
 - **P046** session read/subscription-only behavior.
 
-## Then
+## Next
 
 After the safety and UI recovery lanes stabilize:
 

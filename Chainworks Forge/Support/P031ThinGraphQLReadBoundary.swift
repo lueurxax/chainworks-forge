@@ -1537,6 +1537,66 @@ enum P088ImplementationCompletionPresenter {
   }
 }
 
+enum P078SideEffectReadbackVisualState: Equatable, Sendable {
+  case neutral
+  case blocking
+}
+
+struct P078SideEffectReadbackPresentation: Equatable, Sendable {
+  let compactSignalLabel: String
+  let statusLabel: String
+  let nextOperatorActionLabel: String
+  let diagnosticRows: [String]
+  let copyItems: [P031DiagnosticCopyItem]
+  let accessibilityLabel: String
+  let visualState: P078SideEffectReadbackVisualState
+}
+
+enum P078SideEffectReadbackPresenter {
+  nonisolated static func presentationIfPresent(
+    for readback: SideEffectReadbackSummary?
+  ) -> P078SideEffectReadbackPresentation? {
+    guard let readback, readback.blocked || readback.unresolvedCount > 0 else {
+      return nil
+    }
+    return presentation(for: readback)
+  }
+
+  nonisolated static func presentation(
+    for readback: SideEffectReadbackSummary
+  ) -> P078SideEffectReadbackPresentation {
+    let first = readback.effects.first
+    let action = first?.operatorNextAction ?? "effects.inspect"
+    let compact = "Release Side Effects: \(readback.unresolvedCount) unresolved"
+    let rows = readback.effects.flatMap { effect in
+      [
+        "\(effect.effectKind): \(effect.status)",
+        "Blocked: \(effect.blockedReason)",
+        "Next: \(effect.operatorNextAction)",
+        effect.reportPath.map { "Evidence: \($0)" },
+      ].compactMap { $0 }
+    }
+    let copyItems = readback.effects.flatMap { effect in
+      [
+        P031DiagnosticCopyItem(label: "Effect ID", value: effect.id),
+        effect.reportPath.map { P031DiagnosticCopyItem(label: "Evidence path", value: $0) },
+      ].compactMap { $0 }
+    }
+
+    return P078SideEffectReadbackPresentation(
+      compactSignalLabel: compact,
+      statusLabel: readback.blocked ? "Release blocked" : "Release side effects clear",
+      nextOperatorActionLabel: "Next: \(action)",
+      diagnosticRows: rows,
+      copyItems: copyItems,
+      accessibilityLabel: ([compact, first?.blockedReason, "Next: \(action)"] as [String?])
+        .compactMap { $0 }
+        .joined(separator: ", "),
+      visualState: readback.blocked ? .blocking : .neutral
+    )
+  }
+}
+
 struct P031RunRowReadModel: Decodable, Equatable, Sendable {
   let id: String
   let status: String
@@ -1555,6 +1615,7 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
   let closeoutReadinessSummary: P077CloseoutReadinessSummaryReadModel?
   let rolloutDecisionSummary: RolloutDecisionSummary?
   let implementationCompletion: P088ImplementationCompletionReadModel?
+  let sideEffectReadback: SideEffectReadbackSummary?
 
   nonisolated init(
     id: String,
@@ -1573,7 +1634,8 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     pendingApprovals: Int?,
     closeoutReadinessSummary: P077CloseoutReadinessSummaryReadModel? = nil,
     rolloutDecisionSummary: RolloutDecisionSummary? = nil,
-    implementationCompletion: P088ImplementationCompletionReadModel? = nil
+    implementationCompletion: P088ImplementationCompletionReadModel? = nil,
+    sideEffectReadback: SideEffectReadbackSummary? = nil
   ) {
     self.id = id
     self.status = status
@@ -1592,6 +1654,7 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     self.closeoutReadinessSummary = closeoutReadinessSummary
     self.rolloutDecisionSummary = rolloutDecisionSummary
     self.implementationCompletion = implementationCompletion
+    self.sideEffectReadback = sideEffectReadback
   }
 
   enum CodingKeys: String, CodingKey {
@@ -1613,6 +1676,7 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     case implementationCloseoutReadinessSummary
     case closeoutReadinessSummaryJson
     case rolloutDecisionSummary = "rolloutContractReadbackJson"
+    case sideEffectReadback = "sideEffectReadbackJson"
   }
 
   init(from decoder: Decoder) throws {
@@ -1647,6 +1711,10 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
       implementationCompletion: try container.decodeIfPresent(
         P088ImplementationCompletionReadModel.self,
         forKey: .implementationCompletion
+      ),
+      sideEffectReadback: try container.decodeIfPresent(
+        SideEffectReadbackSummary.self,
+        forKey: .sideEffectReadback
       )
     )
   }
@@ -1669,7 +1737,8 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
       pendingApprovals: pendingApprovals,
       closeoutReadinessSummary: closeoutReadinessSummary,
       rolloutDecisionSummary: rolloutDecisionSummary,
-      implementationCompletion: implementationCompletion
+      implementationCompletion: implementationCompletion,
+      sideEffectReadback: sideEffectReadback
     )
   }
 }
@@ -2256,6 +2325,7 @@ enum P031GraphQLDocuments {
         }
         implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson
         rolloutContractReadbackJson
+        sideEffectReadbackJson
       }
     }
     """
@@ -2310,6 +2380,7 @@ enum P031GraphQLDocuments {
         }
         implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson
         rolloutContractReadbackJson
+        sideEffectReadbackJson
       }
       stages(runId: $runId) {
         id
@@ -3857,6 +3928,7 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
   let pendingApprovalsLabel: String?
   let closeoutReadinessSignalLabel: String?
   let implementationCompletionSignalLabel: String?
+  let sideEffectSignalLabel: String?
   let freshnessState: P031FreshnessState
   let accessibilityLabel: String
 
@@ -3869,6 +3941,7 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
     pendingApprovalsLabel: String?,
     closeoutReadinessSignalLabel: String? = nil,
     implementationCompletionSignalLabel: String? = nil,
+    sideEffectSignalLabel: String? = nil,
     freshnessState: P031FreshnessState,
     accessibilityLabel: String
   ) {
@@ -3880,6 +3953,7 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
     self.pendingApprovalsLabel = pendingApprovalsLabel
     self.closeoutReadinessSignalLabel = closeoutReadinessSignalLabel
     self.implementationCompletionSignalLabel = implementationCompletionSignalLabel
+    self.sideEffectSignalLabel = sideEffectSignalLabel
     self.freshnessState = freshnessState
     self.accessibilityLabel = accessibilityLabel
   }
@@ -4155,6 +4229,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let catalogContext: P031CatalogContextPresentation?
   let closeoutReadiness: P077CloseoutReadinessPresentation?
   let implementationCompletion: P088ImplementationCompletionPresentation?
+  let sideEffectReadback: P078SideEffectReadbackPresentation?
   let freshness: P031FreshnessSnapshot
   let refreshFeedbackText: String
   let emptyStateTitle: String?
@@ -4176,6 +4251,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     catalogContext: P031CatalogContextPresentation?,
     closeoutReadiness: P077CloseoutReadinessPresentation? = nil,
     implementationCompletion: P088ImplementationCompletionPresentation? = nil,
+    sideEffectReadback: P078SideEffectReadbackPresentation? = nil,
     freshness: P031FreshnessSnapshot,
     refreshFeedbackText: String,
     emptyStateTitle: String?,
@@ -4196,6 +4272,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.rolloutDecisionSummary = rolloutDecisionSummary
     self.closeoutReadiness = closeoutReadiness
     self.implementationCompletion = implementationCompletion
+    self.sideEffectReadback = sideEffectReadback
     self.freshness = freshness
     self.refreshFeedbackText = refreshFeedbackText
     self.emptyStateTitle = emptyStateTitle
@@ -4728,6 +4805,9 @@ enum P031RunsHomePresenter {
     let implementationCompletion = P088ImplementationCompletionPresenter.presentationIfPresent(
       for: run.implementationCompletion
     )
+    let sideEffectReadback = P078SideEffectReadbackPresenter.presentationIfPresent(
+      for: run.sideEffectReadback
+    )
     let accessibilityParts = [
       displayTitle,
       workflowLabel,
@@ -4736,6 +4816,7 @@ enum P031RunsHomePresenter {
       pendingApprovalsLabel,
       closeoutReadiness?.compactSignalLabel,
       implementationCompletion?.compactSignalLabel,
+      sideEffectReadback?.compactSignalLabel,
       P031ThinPresentationFormatting.freshnessAccessibilityLabel(run.freshnessState),
     ].compactMap { $0 }
 
@@ -4748,6 +4829,7 @@ enum P031RunsHomePresenter {
       pendingApprovalsLabel: pendingApprovalsLabel,
       closeoutReadinessSignalLabel: closeoutReadiness?.compactSignalLabel,
       implementationCompletionSignalLabel: implementationCompletion?.compactSignalLabel,
+      sideEffectSignalLabel: sideEffectReadback?.compactSignalLabel,
       freshnessState: run.freshnessState,
       accessibilityLabel: accessibilityParts.joined(separator: ", ")
     )
@@ -4908,6 +4990,9 @@ enum P031RunDetailPresenter {
     let implementationCompletion = P088ImplementationCompletionPresenter.presentationIfPresent(
       for: run?.implementationCompletion
     )
+    let sideEffectReadback = P078SideEffectReadbackPresenter.presentationIfPresent(
+      for: run?.sideEffectReadback
+    )
     let emptyStateTitle: String?
     switch run {
     case .some:
@@ -4932,6 +5017,7 @@ enum P031RunDetailPresenter {
       catalogContext: run.map(P031CatalogContextPresenter.presentation),
       closeoutReadiness: closeoutReadiness,
       implementationCompletion: implementationCompletion,
+      sideEffectReadback: sideEffectReadback,
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
         currentFreshness: currentFreshness,
         checkedAt: checkedAt,
@@ -4964,6 +5050,7 @@ enum P031RunDetailPresenter {
       catalogContext: nil,
       closeoutReadiness: nil,
       implementationCompletion: nil,
+      sideEffectReadback: nil,
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
         event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
