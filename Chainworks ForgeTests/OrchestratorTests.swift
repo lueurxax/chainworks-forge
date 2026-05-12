@@ -670,7 +670,7 @@ struct OrchestratorTests {
             skillRef: "proposal_review_triad",
             skillRole: "architect",
             prompt: "Review the proposal as an architect.",
-            outputContract: "implementation_self_assessment_v2",
+            outputContract: nil,
             requiresHumanApproval: false,
             inputs: [],
             outputs: ["proposal_review_architect"]

@@ -21,12 +21,17 @@ struct SampleRunLauncher {
             catalogSourcePath: catalogURL.path
         )
 
-        let sampleWorkspaceRoot = AppConfiguration.defaultRepositoryRoot(
-            currentDirectoryPath: FileManager.default.currentDirectoryPath,
-            bundleURL: Bundle.main.bundleURL,
-            allowsDocumentsFallback: false,
-            sourceFilePath: #filePath
-        ).path
+        let sampleWorkspaceRoot: String?
+        if compiledPlan.requiresProjectAccess {
+            sampleWorkspaceRoot = AppConfiguration.defaultRepositoryRoot(
+                currentDirectoryPath: FileManager.default.currentDirectoryPath,
+                bundleURL: Bundle.main.bundleURL,
+                allowsDocumentsFallback: false,
+                sourceFilePath: #filePath
+            ).path
+        } else {
+            sampleWorkspaceRoot = nil
+        }
 
         let idea = Idea(
             title: sampleIdeaTitle(),
@@ -39,12 +44,10 @@ struct SampleRunLauncher {
             appConfigurationStore: appConfigurationStore,
             providerRegistry: providerRegistry
         )
-        let requiresRuntimeMCPValidation = !(executionService.executor is SimulatedAgentExecutor)
         let report = await preflight.runReport(
             workflowURL: workflowURL,
             catalogURL: catalogURL,
             plan: compiledPlan,
-            requiresRuntimeMCPValidation: requiresRuntimeMCPValidation,
             idea: idea,
             effectiveProjectRootPath: sampleWorkspaceRoot
         )

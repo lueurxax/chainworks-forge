@@ -104,7 +104,6 @@ The repository is past the scaffold stage. The implemented system now includes:
 - Run Worktree Main Sync and Cross-Run Knowledge Transfer (Proposal 064 Phase 0 contract freeze)
 - implementation completeness and handoff contract with structured status and verification truth
 - bounded implementation closeout readiness gates ensuring proposal proof, audit coverage, evidence freshness, and handoff settlement before release
-- durable side-effect ledger, release settlement, and reconciliation (P078)
 - fail-closed server parity harness with generation-scoped storage and runtime publication
 - deterministic reviewer routing and expanded proposal reviewer catalog
 - stable reference documentation under [`docs/reference`](docs/reference)

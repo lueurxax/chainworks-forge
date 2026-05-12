@@ -67,8 +67,6 @@ pub struct GqlRun {
     pub main_sync_readback_json: Option<Json<serde_json::Value>>,
     pub knowledge_capsule_readback_json: Option<Json<serde_json::Value>>,
     pub rollout_contract_readback_json: Option<Json<serde_json::Value>>,
-    /// P078: Run-scoped side-effect ledger readback for operator surfaces.
-    pub side_effect_readback_json: Option<Json<serde_json::Value>>,
     /// P088: Code-writer completion receipts for current-attempt output freshness readback.
     pub code_writer_completion_receipts: Vec<GqlCodeWriterCompletionReceipt>,
     /// P088: Public implementation-completion summary with closed vocabularies and unknown metadata.
@@ -125,7 +123,6 @@ impl From<Run> for GqlRun {
             main_sync_readback_json: None,
             knowledge_capsule_readback_json: None,
             rollout_contract_readback_json: None,
-            side_effect_readback_json: None,
             code_writer_completion_receipts: Vec::new(),
             implementation_completion: GqlImplementationCompletionSummary::not_attempted(),
             closeout_readiness_summary_json: None,
@@ -198,7 +195,6 @@ impl From<RunProjectionRow> for GqlRun {
             main_sync_readback_json: None,
             knowledge_capsule_readback_json: None,
             rollout_contract_readback_json: None,
-            side_effect_readback_json: None,
             code_writer_completion_receipts: Vec::new(),
             implementation_completion: GqlImplementationCompletionSummary::not_attempted(),
             closeout_readiness_summary_json: None,

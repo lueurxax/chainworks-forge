@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 
 use db::repos::{
     artifact_contracts, closeout, code_writer_completion_receipts, legacy_discovery_overrides,
-    projections, rollout_contract_checks, runs, side_effects,
+    projections, rollout_contract_checks, runs,
 };
 use domain::commands::{
     CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
@@ -838,10 +838,6 @@ async fn attach_implementation_self_assessment_summary(
         }
         None => None,
     };
-    let side_effect_readback = match run_id {
-        Some(run_id) => Some(build_side_effect_readback(pool, run_id).await?),
-        None => None,
-    };
 
     if let Some(object) = value.as_object_mut() {
         object.insert(
@@ -870,101 +866,9 @@ async fn attach_implementation_self_assessment_summary(
             "rollout_contract_readback".to_string(),
             rollout_contract_readback.unwrap_or(serde_json::Value::Null),
         );
-        object.insert(
-            "side_effect_readback".to_string(),
-            side_effect_readback.unwrap_or(serde_json::Value::Null),
-        );
     }
 
     Ok(value)
-}
-
-async fn build_side_effect_readback(pool: &SqlitePool, run_id: RunId) -> Result<serde_json::Value> {
-    let unresolved = side_effects::list_unresolved_for_run(pool, &run_id.to_string()).await?;
-    let items: Vec<serde_json::Value> = unresolved
-        .iter()
-        .map(|effect| {
-            let observed = effect
-                .observed_evidence_summary_json
-                .as_deref()
-                .map(parse_json_or_string);
-            let expected = effect
-                .expected_evidence_json
-                .as_deref()
-                .map(parse_json_or_string);
-            let report_path = observed
-                .as_ref()
-                .and_then(|value| value.get("manifest_path"))
-                .and_then(|value| value.as_str())
-                .map(ToOwned::to_owned);
-            serde_json::json!({
-                "id": effect.id.to_string(),
-                "run_id": effect.run_id.to_string(),
-                "stage_execution_id": effect.stage_execution_id.to_string(),
-                "agent_execution_id": effect.agent_execution_id.as_ref().map(|id| id.to_string()),
-                "effect_kind": effect.effect_kind.to_string(),
-                "status": effect.status.to_string(),
-                "target_key": effect.target_key,
-                "external_write_attempted": effect.external_write_attempted,
-                "expected_evidence": expected,
-                "observed_evidence_summary": observed,
-                "evidence_root": effect.evidence_root.clone(),
-                "readback_source": "side_effects_ledger",
-                "report_path": report_path,
-                "blocked_reason": side_effect_blocked_reason(&effect.status),
-                "operator_next_action": side_effect_operator_next_action(&effect.status),
-                "recommended_mcp_tool": side_effect_operator_next_action(&effect.status),
-                "retry_forbidden": true,
-                "last_error_kind": effect.last_error_kind.clone(),
-                "updated_at": effect.updated_at.to_rfc3339()
-            })
-        })
-        .collect();
-
-    Ok(serde_json::json!({
-        "schema_version": "p078_side_effect_readback_v1",
-        "run_id": run_id.to_string(),
-        "unresolved_count": items.len(),
-        "blocked": !items.is_empty(),
-        "readback_source": "side_effects_ledger",
-        "effects": items
-    }))
-}
-
-fn parse_json_or_string(raw: &str) -> serde_json::Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
-}
-
-fn side_effect_blocked_reason(status: &domain::side_effect::SideEffectStatus) -> &'static str {
-    match status {
-        domain::side_effect::SideEffectStatus::Prepared => "prepared_effect_not_executed",
-        domain::side_effect::SideEffectStatus::Executing => "executing_effect_not_settled",
-        domain::side_effect::SideEffectStatus::ExternallyObserved => {
-            "external_write_observed_pending_settlement"
-        }
-        domain::side_effect::SideEffectStatus::NeedsReconciliation => "effect_needs_reconciliation",
-        domain::side_effect::SideEffectStatus::Conflict => "effect_conflict_requires_disposition",
-        domain::side_effect::SideEffectStatus::Unrecoverable => {
-            "effect_unrecoverable_requires_manual_clear"
-        }
-        _ => "not_blocking",
-    }
-}
-
-fn side_effect_operator_next_action(
-    status: &domain::side_effect::SideEffectStatus,
-) -> &'static str {
-    match status {
-        domain::side_effect::SideEffectStatus::NeedsReconciliation
-        | domain::side_effect::SideEffectStatus::ExternallyObserved => "effects.reconcile",
-        domain::side_effect::SideEffectStatus::Conflict => {
-            "effects.mark_unrecoverable or effects.clear_after_manual_verification"
-        }
-        domain::side_effect::SideEffectStatus::Unrecoverable => {
-            "effects.clear_after_manual_verification"
-        }
-        _ => "effects.inspect",
-    }
 }
 
 /// P077 BLK-004: Attach closeout_readiness_summary to a run JSON value.

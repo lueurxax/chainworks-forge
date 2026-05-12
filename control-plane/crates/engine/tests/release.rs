@@ -5,7 +5,6 @@ use std::sync::Arc;
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{agent_executions, artifacts, ideas, runs, stages};
-use db::writer::{register_shared_writer, DbWriter};
 use domain::agent::AgentStatus;
 use domain::artifact::ArtifactFormat;
 use domain::idea::{Idea, IdeaStatus};
@@ -21,20 +20,9 @@ use engine::release::receipt::DeliveryReceiptBuilder;
 use engine::work_queue::WorkQueue;
 
 async fn test_pool() -> sqlx::SqlitePool {
-    let pool = create_pool("sqlite::memory:")
+    create_pool("sqlite::memory:")
         .await
-        .expect("in-memory pool failed");
-    register_shared_writer(&pool, Arc::new(DbWriter::new(pool.clone())))
-        .await
-        .expect("register shared writer");
-    pool
-}
-
-fn enable_release_side_effects() {
-    static ENABLE: std::sync::Once = std::sync::Once::new();
-    ENABLE.call_once(|| unsafe {
-        std::env::set_var("CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED", "true");
-    });
+        .expect("in-memory pool failed")
 }
 
 fn make_idea(id: IdeaId) -> Idea {
@@ -416,7 +404,6 @@ async fn delivery_receipt_builder_rejects_metadata_only_backfill_without_release
 
 #[tokio::test]
 async fn background_executor_routes_release_agents_natively() {
-    enable_release_side_effects();
     let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let (repo_dir, _remote_dir) = init_release_repo(tmp.path());
@@ -470,7 +457,6 @@ async fn background_executor_routes_release_agents_natively() {
                 "provider": "claude",
                 "model": "test",
                 "effort": "low",
-                "session_reuse_scope": null,
                 "total_tasks": 2,
             }),
         )
@@ -490,7 +476,6 @@ async fn background_executor_routes_release_agents_natively() {
                 "provider": "claude",
                 "model": "test",
                 "effort": "low",
-                "session_reuse_scope": null,
                 "total_tasks": 2,
             }),
         )
@@ -516,8 +501,6 @@ async fn background_executor_routes_release_agents_natively() {
         .ends_with(".chainworks/release/git-push.json"));
     assert!(!after_git.iter().any(|a| a.name == "delivery_receipt"));
 
-    assert!(executor.process_next_item().await.unwrap());
-    assert!(executor.process_next_item().await.unwrap());
     assert!(executor.process_next_item().await.unwrap());
 
     let final_artifacts = artifacts::list_by_run(&pool, run_id).await.unwrap();
@@ -549,7 +532,6 @@ async fn background_executor_routes_release_agents_natively() {
 
 #[tokio::test]
 async fn background_executor_release_uses_provisioned_run_branch_over_stale_delivery_config() {
-    enable_release_side_effects();
     let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let (repo_dir, remote_dir) = init_release_repo_on_branch(tmp.path(), "release/actual");
@@ -644,7 +626,6 @@ async fn background_executor_release_uses_provisioned_run_branch_over_stale_deli
 
 #[tokio::test]
 async fn background_executor_persists_delivery_receipt_on_git_failure() {
-    enable_release_side_effects();
     let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let (repo_dir, _remote_dir) = init_release_repo_on_branch(tmp.path(), "main");
@@ -709,7 +690,6 @@ async fn background_executor_persists_delivery_receipt_on_git_failure() {
                 "provider": "claude",
                 "model": "test",
                 "effort": "low",
-                "session_reuse_scope": null,
                 "total_tasks": 1,
             }),
         )
@@ -742,13 +722,15 @@ async fn background_executor_persists_delivery_receipt_on_git_failure() {
         serde_json::from_str(&std::fs::read_to_string(&delivery.file_path).unwrap()).unwrap();
     let release_result = receipt.release_result.expect("release result");
     assert_eq!(release_result.succeeded, false);
-    assert_eq!(release_result.failure_stage.as_deref(), Some("git_commit"));
+    assert_eq!(
+        release_result.failure_stage.as_deref(),
+        Some("commit_and_push")
+    );
     assert!(release_result.commit_sha.is_none());
 }
 
 #[tokio::test]
 async fn background_executor_persists_delivery_receipt_on_publish_failure() {
-    enable_release_side_effects();
     let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let (repo_dir, _remote_dir) = init_release_repo(tmp.path());
@@ -823,7 +805,6 @@ async fn background_executor_persists_delivery_receipt_on_publish_failure() {
                 "provider": "claude",
                 "model": "test",
                 "effort": "low",
-                "session_reuse_scope": null,
                 "total_tasks": 1,
             }),
         )
@@ -842,15 +823,12 @@ async fn background_executor_persists_delivery_receipt_on_publish_failure() {
                 "provider": "claude",
                 "model": "test",
                 "effort": "low",
-                "session_reuse_scope": null,
                 "total_tasks": 1,
             }),
         )
         .await
         .unwrap();
 
-    assert!(executor.process_next_item().await.unwrap());
-    assert!(executor.process_next_item().await.unwrap());
     assert!(executor.process_next_item().await.unwrap());
 
     let err = executor
@@ -883,7 +861,7 @@ async fn background_executor_persists_delivery_receipt_on_publish_failure() {
     assert_eq!(release_result.succeeded, false);
     assert_eq!(
         release_result.failure_stage.as_deref(),
-        Some("build_archive")
+        Some("build_archive_and_push")
     );
     assert_eq!(release_result.branch.as_deref(), Some("release/test"));
     assert!(release_result.commit_sha.is_some());
@@ -1095,7 +1073,6 @@ async fn advance_run_does_not_backfill_delivery_receipt_without_release_lineage(
 #[tokio::test]
 async fn background_executor_fails_closed_without_delivery_configuration_json_and_writes_no_receipt(
 ) {
-    enable_release_side_effects();
     let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let (repo_dir, _remote_dir) = init_release_repo(tmp.path());
@@ -1150,7 +1127,6 @@ async fn background_executor_fails_closed_without_delivery_configuration_json_an
                 "provider": "claude",
                 "model": "test",
                 "effort": "low",
-                "session_reuse_scope": null,
                 "total_tasks": 1,
             }),
         )
@@ -1192,7 +1168,6 @@ async fn background_executor_fails_closed_without_delivery_configuration_json_an
 
 #[tokio::test]
 async fn background_executor_preserves_existing_delivery_receipt_without_overwrite() {
-    enable_release_side_effects();
     let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let (repo_dir, _remote_dir) = init_release_repo(tmp.path());
@@ -1267,7 +1242,6 @@ async fn background_executor_preserves_existing_delivery_receipt_without_overwri
                 "provider": "claude",
                 "model": "test",
                 "effort": "low",
-                "session_reuse_scope": null,
                 "total_tasks": 1,
             }),
         )
@@ -1286,7 +1260,6 @@ async fn background_executor_preserves_existing_delivery_receipt_without_overwri
                 "provider": "claude",
                 "model": "test",
                 "effort": "low",
-                "session_reuse_scope": null,
                 "total_tasks": 1,
             }),
         )
@@ -1352,9 +1325,6 @@ async fn background_executor_preserves_existing_delivery_receipt_without_overwri
     )
     .await
     .unwrap();
-
-    assert!(executor.process_next_item().await.unwrap());
-    assert!(executor.process_next_item().await.unwrap());
 
     let err = executor
         .process_next_item()

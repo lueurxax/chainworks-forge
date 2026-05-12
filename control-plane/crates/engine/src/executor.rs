@@ -53,7 +53,6 @@ use domain::discovery::{
     PrePromptExpectedOutputMetadata, SourceGenerationOwner, StdDiscoveryFilesystem,
     DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
 };
-use domain::error_sanitizer::sanitize_error_for_storage;
 use domain::ids::RunId;
 use domain::provider::ProviderFamily;
 use domain::run::DeliveryConfiguration;
@@ -81,15 +80,11 @@ use crate::session::policy::{
     invalidate_generation_after_missing_required_outputs_tx, SessionPolicyDecision,
     SessionPolicyInput,
 };
-use crate::side_effects::{
-    run_unresolved_effects_preflight, side_effects_enabled, DurableEffectCoordinator,
-};
 use crate::work_queue::WorkQueue;
 use crate::worktree_fingerprint::{
     capture_worktree_fingerprint_v1, CapturePhase, WorkChangeKind, WorktreeFingerprintInput,
     WorktreeFingerprintV1,
 };
-use domain::side_effect::{EffectKind, PrepareEffectIntent};
 
 const ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS: i64 = 3;
 const APPROVED_PROPOSAL_OUTPUT_NAME: &str = "approved_proposal";
@@ -3645,7 +3640,6 @@ impl BackgroundExecutor {
         match item.kind {
             WorkItemKind::AdvanceRun => {
                 let run_id = self.extract_run_id(&item)?;
-                run_unresolved_effects_preflight(&self.pool, &run_id, "advance_run").await?;
                 self.orchestrator.advance_run(run_id).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
             }
@@ -6593,17 +6587,6 @@ impl BackgroundExecutor {
             }
 
             WorkItemKind::StartupRepair => {
-                let coordinator = DurableEffectCoordinator::new(
-                    self.pool.clone(),
-                    format!("startup-repair-{}", uuid::Uuid::new_v4()),
-                );
-                let transitioned = coordinator.watchdog_pass().await?;
-                if transitioned > 0 {
-                    warn!(
-                        transitioned,
-                        "P078 startup repair moved expired side effects to needs_reconciliation"
-                    );
-                }
                 let recovery = RecoveryService::new_with_db_writer(
                     self.pool.clone(),
                     self.work_queue.clone(),
@@ -6615,14 +6598,12 @@ impl BackgroundExecutor {
 
             WorkItemKind::TriggerNextStage => {
                 let run_id = self.extract_run_id(&item)?;
-                run_unresolved_effects_preflight(&self.pool, &run_id, "trigger_next_stage").await?;
                 self.orchestrator.advance_run(run_id).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
             }
 
             WorkItemKind::SettleStage => {
                 let run_id = self.extract_run_id(&item)?;
-                run_unresolved_effects_preflight(&self.pool, &run_id, "settle_stage").await?;
                 self.orchestrator.advance_run(run_id).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
             }
@@ -6696,23 +6677,7 @@ impl BackgroundExecutor {
         _worktree_strategy: Option<String>,
         _payload: serde_json::Value,
     ) -> Result<()> {
-        let now = chrono::Utc::now();
-        let mut delivery_config = match self.load_delivery_configuration(&run).await {
-            Ok(config) => config,
-            Err(error) => {
-                self.fail_release_agent_precondition(
-                    run_id,
-                    stage_execution_id,
-                    agent_exec_id,
-                    &stage_id,
-                    &agent_id,
-                    &provider,
-                    now,
-                )
-                .await?;
-                return Err(error);
-            }
-        };
+        let mut delivery_config = self.load_delivery_configuration(&run).await?;
         if let Some(run_target_branch) = run
             .target_branch
             .as_deref()
@@ -6729,51 +6694,14 @@ impl BackgroundExecutor {
             }
             delivery_config.target_branch = run_target_branch.to_string();
         }
-        let worktree_root = match run.worktree_root.clone() {
-            Some(root) => root,
-            None => {
-                let error = anyhow::anyhow!(
-                    "Release agent requires a provisioned worktree but none is available."
-                );
-                self.fail_release_agent_precondition(
-                    run_id,
-                    stage_execution_id,
-                    agent_exec_id,
-                    &stage_id,
-                    &agent_id,
-                    &provider,
-                    now,
-                )
-                .await?;
-                return Err(error);
-            }
-        };
+        let worktree_root = run.worktree_root.clone().ok_or_else(|| {
+            anyhow::anyhow!("Release agent requires a provisioned worktree but none is available.")
+        })?;
         let idea_title = ideas::find_by_id(&self.pool, run.idea_id)
             .await?
             .map(|idea| idea.title)
             .unwrap_or_else(|| "Unknown".to_string());
-
-        // P078: refuse external writes when the durable side-effects ledger is disabled
-        if !side_effects_enabled() {
-            let error = anyhow::anyhow!(
-                "release agent {} blocked: CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED is not set \
-                 (rollback mode — enable P078 before dispatching release agents)",
-                agent_id
-            );
-            self.fail_release_agent_precondition(
-                run_id,
-                stage_execution_id,
-                agent_exec_id,
-                &stage_id,
-                &agent_id,
-                &provider,
-                now,
-            )
-            .await?;
-            return Err(error);
-        }
-        let coordinator =
-            DurableEffectCoordinator::new(self.pool.clone(), uuid::Uuid::new_v4().to_string());
+        let now = chrono::Utc::now();
 
         let runtime_started = domain::events::DomainEvent::RuntimeStatusChanged {
             run_id,
@@ -6787,386 +6715,37 @@ impl BackgroundExecutor {
         if agent_id == "commit_and_push_to_github" {
             let commit_message = format!("[{}] {} :: {}", run_id, idea_title, stage_id);
             let git_service = GitReleaseService;
-            let commit_target_key = format!("git_commit://{}:{}", run_id, stage_execution_id);
-            let commit_idempotency_key = derive_p078_idempotency_key(
-                "git_commit",
-                run_id,
-                stage_execution_id,
-                Some(agent_exec_id),
-                &commit_target_key,
-                1,
-            );
-            let commit_request_fingerprint = derive_p078_request_fingerprint(
-                "git_commit",
-                &[
-                    ("target_branch", delivery_config.target_branch.as_str()),
-                    ("commit_message", commit_message.as_str()),
-                    ("worktree_root", worktree_root.as_str()),
-                ],
-            );
-            let commit_evidence_root = self.p078_side_effect_evidence_root(
-                &run,
-                stage_execution_id,
-                &agent_id,
-                &EffectKind::GitCommit,
-                &commit_idempotency_key,
-            )?;
-            let commit_expected_evidence_json = self.p078_expected_evidence_json(
-                &EffectKind::GitCommit,
-                &commit_target_key,
-                &commit_evidence_root,
-            )?;
-            let commit_intent = PrepareEffectIntent {
-                run_id,
-                stage_execution_id,
-                agent_execution_id: Some(agent_exec_id),
-                effect_kind: EffectKind::GitCommit,
-                target_key: commit_target_key,
-                idempotency_key: commit_idempotency_key,
-                idempotency_key_version: 1,
-                request_fingerprint: commit_request_fingerprint,
-                request_fingerprint_version: 1,
-                expected_evidence_json: Some(commit_expected_evidence_json),
-                evidence_root: Some(commit_evidence_root.clone()),
-                deadline_at: Some(
-                    chrono::Utc::now()
-                        + chrono::Duration::seconds(EffectKind::GitCommit.deadline_seconds()),
-                ),
-            };
-            let mut commit_lease = coordinator.prepare_and_lease(commit_intent).await?;
-            if !coordinator.mark_write_started(&commit_lease).await? {
-                return Err(anyhow::anyhow!(
-                    "side_effect_cas_lost: mark_write_started CAS missed for effect {}; release adapter not invoked",
-                    commit_lease.effect_id
-                ));
-            }
-
-            let commit_manifest = match coordinator
-                .run_with_lease_renewal(
-                    &mut commit_lease,
-                    &EffectKind::GitCommit,
-                    git_service.commit_changes(
-                        &worktree_root,
-                        &delivery_config.target_branch,
-                        &commit_message,
-                    ),
+            match git_service
+                .commit_and_push(
+                    &worktree_root,
+                    &delivery_config.target_branch,
+                    &commit_message,
                 )
                 .await
             {
-                Ok(manifest) => {
-                    let manifest_artifact = self.prepare_release_json_artifact(
-                        &run,
-                        &stage_id,
-                        &agent_id,
-                        &provider,
-                        model.clone(),
-                        "release_manifest",
-                        &manifest,
-                    )?;
-                    let manifest_artifact_id = manifest_artifact.id.to_string();
-                    let manifest_path = manifest_artifact.file_path.clone();
-                    let evidence_summary = self
-                        .write_p078_side_effect_evidence_manifest(
+                Ok((manifest, receipt)) => {
+                    let _manifest_path = self
+                        .persist_json_artifact(
                             &run,
-                            stage_execution_id,
                             &stage_id,
                             &agent_id,
-                            &commit_evidence_root,
-                            &EffectKind::GitCommit,
-                            &manifest_path,
-                            "settled",
-                        )
-                        .await?;
-                    let mut tx = self
-                        .begin_executor_transaction(
-                            "executor.release_git_commit_success",
-                            format!(
-                                "executor.release_git_commit_success:{}:{}",
-                                stage_execution_id, commit_lease.effect_id
-                            ),
-                        )
-                        .await?;
-                    artifacts::insert_tx(&mut tx, &manifest_artifact).await?;
-                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
-                        effect_id: &commit_lease.effect_id,
-                        owner_instance_id: &commit_lease.owner_instance_id,
-                        settlement_attempt_id: &commit_lease.attempt_id,
-                        observed_lease_renewed_at: commit_lease.lease_renewed_at,
-                        new_status: domain::side_effect::SideEffectStatus::Settled,
-                        observed_evidence_summary_json: Some(evidence_summary.as_str()),
-                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
-                        last_error_kind: None,
-                        last_error: None,
-                        now: chrono::Utc::now(),
-                        settlement_source: "executor",
-                        receipt_artifact_id: Some(manifest_artifact_id.as_str()),
-                        decision_json: None,
-                        decision_json_hash: None,
-                        disposition_id: None,
-                    };
-                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
-                        .await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_success CAS missed for effect {}; canonical release state not mutated",
-                            commit_lease.effect_id
-                        ));
-                    }
-                    tx.commit().await?;
-                    let _ = self
-                        .events
-                        .send(domain::events::DomainEvent::ArtifactCreated {
-                            run_id,
-                            artifact_id: manifest_artifact.id,
-                        });
-                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
-                    info!(
-                        run_id = %run_id,
-                        stage_id = %stage_id,
-                        artifact_path = %manifest_path,
-                        "Release git_commit step completed"
-                    );
-                    manifest
-                }
-                Err(error) => {
-                    let error_str = sanitize_release_error(&error.to_string());
-                    let release_result = ReleaseResult {
-                        git_manifest: None,
-                        git_receipt: None,
-                        bundle_manifest: None,
-                        upload_receipt: None,
-                        succeeded: false,
-                        failure_stage: Some("git_commit".to_string()),
-                        failure_reason: Some(error_str.clone()),
-                    };
-                    let delivery_artifact = self
-                        .prepare_delivery_receipt_artifact_if_absent(
-                            &run,
-                            &delivery_config,
-                            &release_result,
-                            &idea_title,
-                            None,
-                            &stage_id,
                             &provider,
                             model.clone(),
+                            "release_manifest",
+                            &manifest,
                         )
                         .await?;
-                    let mut tx = self
-                        .begin_executor_transaction(
-                            "executor.release_git_commit_failure",
-                            format!(
-                                "executor.release_git_commit_failure:{}:{}",
-                                stage_execution_id, commit_lease.effect_id
-                            ),
-                        )
-                        .await?;
-                    if let Some(artifact) = delivery_artifact.as_ref() {
-                        artifacts::insert_tx(&mut tx, artifact).await?;
-                    }
-                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
-                        effect_id: &commit_lease.effect_id,
-                        owner_instance_id: &commit_lease.owner_instance_id,
-                        attempt_id: &commit_lease.attempt_id,
-                        observed_lease_renewed_at: commit_lease.lease_renewed_at,
-                        last_error_kind: "git_commit_failed",
-                        last_error: &error_str,
-                        now: chrono::Utc::now(),
-                    };
-                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_failure CAS missed for effect {}; canonical release state not mutated",
-                            commit_lease.effect_id
-                        ));
-                    }
-                    agent_executions::update_completed_tx(
-                        &mut tx,
-                        agent_exec_id,
-                        AgentStatus::Failed,
-                        now,
-                    )
-                    .await?;
-                    stages::settle_tx(
-                        &mut tx,
-                        stage_execution_id,
-                        domain::stage::StageSettlementKind::Failed,
-                        now,
-                    )
-                    .await?;
-                    tx.commit().await?;
-                    if let Some(artifact) = delivery_artifact {
-                        let _ = self
-                            .events
-                            .send(domain::events::DomainEvent::ArtifactCreated {
-                                run_id,
-                                artifact_id: artifact.id,
-                            });
-                        info!(run_id = %run_id, receipt_path = %artifact.file_path, "delivery receipt persisted");
-                    }
-                    let _ = self
-                        .events
-                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
-                            run_id,
-                            stage_id: stage_id.clone(),
-                            agent_id: agent_id.clone(),
-                            provider: provider.clone(),
-                            event_kind: "session_failed".to_string(),
-                        });
-                    let _ = self
-                        .events
-                        .send(domain::events::DomainEvent::StageStatusChanged {
-                            run_id,
-                            stage_execution_id,
-                            status: domain::stage::StageStatus::Failed,
-                        });
-                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
-                    info!(
-                        run_id = %run_id,
-                        stage_id = %stage_id,
-                        error = %error,
-                        "Release git_commit step failed"
-                    );
-                    return Err(error);
-                }
-            };
-
-            let push_target_key = format!("refs/heads/{}", delivery_config.target_branch);
-            let push_idempotency_key = derive_p078_idempotency_key(
-                "git_push",
-                run_id,
-                stage_execution_id,
-                Some(agent_exec_id),
-                &push_target_key,
-                1,
-            );
-            let push_request_fingerprint = derive_p078_request_fingerprint(
-                "git_push",
-                &[
-                    ("target_branch", delivery_config.target_branch.as_str()),
-                    ("commit_sha", commit_manifest.commit_sha.as_str()),
-                    ("worktree_root", worktree_root.as_str()),
-                ],
-            );
-            let push_evidence_root = self.p078_side_effect_evidence_root(
-                &run,
-                stage_execution_id,
-                &agent_id,
-                &EffectKind::GitPush,
-                &push_idempotency_key,
-            )?;
-            let push_expected_evidence_json = self.p078_expected_evidence_json(
-                &EffectKind::GitPush,
-                &push_target_key,
-                &push_evidence_root,
-            )?;
-            let push_intent = PrepareEffectIntent {
-                run_id,
-                stage_execution_id,
-                agent_execution_id: Some(agent_exec_id),
-                effect_kind: EffectKind::GitPush,
-                target_key: push_target_key,
-                idempotency_key: push_idempotency_key,
-                idempotency_key_version: 1,
-                request_fingerprint: push_request_fingerprint,
-                request_fingerprint_version: 1,
-                expected_evidence_json: Some(push_expected_evidence_json),
-                evidence_root: Some(push_evidence_root.clone()),
-                deadline_at: Some(
-                    chrono::Utc::now()
-                        + chrono::Duration::seconds(EffectKind::GitPush.deadline_seconds()),
-                ),
-            };
-            let mut push_lease = coordinator.prepare_and_lease(push_intent).await?;
-            if !coordinator.mark_write_started(&push_lease).await? {
-                return Err(anyhow::anyhow!(
-                    "side_effect_cas_lost: mark_write_started CAS missed for effect {}; release adapter not invoked",
-                    push_lease.effect_id
-                ));
-            }
-
-            match coordinator
-                .run_with_lease_renewal(
-                    &mut push_lease,
-                    &EffectKind::GitPush,
-                    git_service.push_commit(&worktree_root, &delivery_config.target_branch),
-                )
-                .await
-            {
-                Ok(receipt) => {
-                    let receipt_artifact = self.prepare_release_json_artifact(
-                        &run,
-                        &stage_id,
-                        &agent_id,
-                        &provider,
-                        model.clone(),
-                        "git_push_receipt",
-                        &receipt,
-                    )?;
-                    let receipt_path = receipt_artifact.file_path.clone();
-                    let receipt_artifact_id = receipt_artifact.id.to_string();
-                    let evidence_summary = self
-                        .write_p078_side_effect_evidence_manifest(
+                    let _receipt_path = self
+                        .persist_json_artifact(
                             &run,
-                            stage_execution_id,
                             &stage_id,
                             &agent_id,
-                            &push_evidence_root,
-                            &EffectKind::GitPush,
-                            &receipt_path,
-                            "settled",
+                            &provider,
+                            model.clone(),
+                            "git_push_receipt",
+                            &receipt,
                         )
                         .await?;
-                    let advance_run = self.build_advance_run_work_item(run_id)?;
-                    let mut tx = self
-                        .begin_executor_transaction(
-                            "executor.release_git_push_success",
-                            format!(
-                                "executor.release_git_push_success:{}:{}",
-                                stage_execution_id, push_lease.effect_id
-                            ),
-                        )
-                        .await?;
-                    artifacts::insert_tx(&mut tx, &receipt_artifact).await?;
-                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
-                        effect_id: &push_lease.effect_id,
-                        owner_instance_id: &push_lease.owner_instance_id,
-                        settlement_attempt_id: &push_lease.attempt_id,
-                        observed_lease_renewed_at: push_lease.lease_renewed_at,
-                        new_status: domain::side_effect::SideEffectStatus::Settled,
-                        observed_evidence_summary_json: Some(evidence_summary.as_str()),
-                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
-                        last_error_kind: None,
-                        last_error: None,
-                        now,
-                        settlement_source: "executor",
-                        receipt_artifact_id: Some(receipt_artifact_id.as_str()),
-                        decision_json: None,
-                        decision_json_hash: None,
-                        disposition_id: None,
-                    };
-                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
-                        .await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_success CAS missed for effect {}; canonical release state not mutated",
-                            push_lease.effect_id
-                        ));
-                    }
-                    agent_executions::update_completed_tx(
-                        &mut tx,
-                        agent_exec_id,
-                        AgentStatus::Completed,
-                        now,
-                    )
-                    .await?;
-                    work_items::enqueue_tx(&mut tx, &advance_run).await?;
-                    tx.commit().await?;
-                    let _ = self
-                        .events
-                        .send(domain::events::DomainEvent::ArtifactCreated {
-                            run_id,
-                            artifact_id: receipt_artifact.id,
-                        });
                     let _ = self
                         .events
                         .send(domain::events::DomainEvent::RuntimeStatusChanged {
@@ -7176,29 +6755,42 @@ impl BackgroundExecutor {
                             provider: provider.clone(),
                             event_kind: "session_completed".to_string(),
                         });
+                    agent_executions::update_completed(
+                        &self.pool,
+                        agent_exec_id,
+                        AgentStatus::Completed,
+                        now,
+                    )
+                    .await?;
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    self.work_queue
+                        .enqueue(
+                            WorkItemKind::AdvanceRun,
+                            Some(run_id),
+                            None,
+                            serde_json::json!({ "run_id": run_id.to_string() }),
+                        )
+                        .await?;
                     info!(
                         run_id = %run_id,
                         stage_id = %stage_id,
-                        receipt_path = %receipt_path,
                         status = "completed",
-                        "Release git_push step completed"
+                        "Release agent completed"
                     );
                     return Ok(());
                 }
                 Err(error) => {
-                    let error_str = sanitize_release_error(&error.to_string());
                     let release_result = ReleaseResult {
-                        git_manifest: Some(commit_manifest),
+                        git_manifest: None,
                         git_receipt: None,
                         bundle_manifest: None,
                         upload_receipt: None,
                         succeeded: false,
-                        failure_stage: Some("git_push".to_string()),
-                        failure_reason: Some(error_str.clone()),
+                        failure_stage: Some("commit_and_push".to_string()),
+                        failure_reason: Some(error.to_string()),
                     };
-                    let delivery_artifact = self
-                        .prepare_delivery_receipt_artifact_if_absent(
+                    if let Some(receipt_path) = self
+                        .persist_delivery_receipt_if_absent(
                             &run,
                             &delivery_config,
                             &release_result,
@@ -7208,58 +6800,9 @@ impl BackgroundExecutor {
                             &provider,
                             model.clone(),
                         )
-                        .await?;
-                    let mut tx = self
-                        .begin_executor_transaction(
-                            "executor.release_git_push_failure",
-                            format!(
-                                "executor.release_git_push_failure:{}:{}",
-                                stage_execution_id, push_lease.effect_id
-                            ),
-                        )
-                        .await?;
-                    if let Some(artifact) = delivery_artifact.as_ref() {
-                        artifacts::insert_tx(&mut tx, artifact).await?;
-                    }
-                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
-                        effect_id: &push_lease.effect_id,
-                        owner_instance_id: &push_lease.owner_instance_id,
-                        attempt_id: &push_lease.attempt_id,
-                        observed_lease_renewed_at: push_lease.lease_renewed_at,
-                        last_error_kind: "git_push_failed",
-                        last_error: &error_str,
-                        now,
-                    };
-                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                        .await?
                     {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_failure CAS missed for effect {}; canonical release state not mutated",
-                            push_lease.effect_id
-                        ));
-                    }
-                    agent_executions::update_completed_tx(
-                        &mut tx,
-                        agent_exec_id,
-                        AgentStatus::Failed,
-                        now,
-                    )
-                    .await?;
-                    stages::settle_tx(
-                        &mut tx,
-                        stage_execution_id,
-                        domain::stage::StageSettlementKind::Failed,
-                        now,
-                    )
-                    .await?;
-                    tx.commit().await?;
-                    if let Some(artifact) = delivery_artifact {
-                        let _ = self
-                            .events
-                            .send(domain::events::DomainEvent::ArtifactCreated {
-                                run_id,
-                                artifact_id: artifact.id,
-                            });
-                        info!(run_id = %run_id, receipt_path = %artifact.file_path, "delivery receipt persisted");
+                        info!(run_id = %run_id, receipt_path = %receipt_path, "delivery receipt persisted");
                     }
 
                     let _ = self
@@ -7271,6 +6814,15 @@ impl BackgroundExecutor {
                             provider: provider.clone(),
                             event_kind: "session_failed".to_string(),
                         });
+                    agent_executions::update_completed(
+                        &self.pool,
+                        agent_exec_id,
+                        AgentStatus::Failed,
+                        now,
+                    )
+                    .await?;
+                    let settlement_kind = domain::stage::StageSettlementKind::Failed;
+                    stages::settle(&self.pool, stage_execution_id, settlement_kind, now).await?;
                     let _ = self
                         .events
                         .send(domain::events::DomainEvent::StageStatusChanged {
@@ -7296,338 +6848,38 @@ impl BackgroundExecutor {
                 .load_release_artifact(run_id, "release_manifest")
                 .await?;
             let publish_service = ConnectPublishService;
-            let build_target_key = format!("build_archive://{}:{}", run_id, stage_execution_id);
-            let build_idempotency_key = derive_p078_idempotency_key(
-                "build_archive",
-                run_id,
-                stage_execution_id,
-                Some(agent_exec_id),
-                &build_target_key,
-                1,
-            );
-            let build_request_fingerprint = derive_p078_request_fingerprint(
-                "build_archive",
-                &[
-                    ("commit_sha", git_receipt.commit_sha.as_str()),
-                    ("worktree_root", worktree_root.as_str()),
-                    ("target_branch", delivery_config.target_branch.as_str()),
-                ],
-            );
-            let build_evidence_root = self.p078_side_effect_evidence_root(
-                &run,
-                stage_execution_id,
-                &agent_id,
-                &EffectKind::BuildArchive,
-                &build_idempotency_key,
-            )?;
-            let build_expected_evidence_json = self.p078_expected_evidence_json(
-                &EffectKind::BuildArchive,
-                &build_target_key,
-                &build_evidence_root,
-            )?;
-            let build_intent = PrepareEffectIntent {
-                run_id,
-                stage_execution_id,
-                agent_execution_id: Some(agent_exec_id),
-                effect_kind: EffectKind::BuildArchive,
-                target_key: build_target_key,
-                idempotency_key: build_idempotency_key,
-                idempotency_key_version: 1,
-                request_fingerprint: build_request_fingerprint,
-                request_fingerprint_version: 1,
-                expected_evidence_json: Some(build_expected_evidence_json),
-                evidence_root: Some(build_evidence_root.clone()),
-                deadline_at: Some(
-                    chrono::Utc::now()
-                        + chrono::Duration::seconds(EffectKind::BuildArchive.deadline_seconds()),
-                ),
-            };
-            let mut build_lease = coordinator.prepare_and_lease(build_intent).await?;
-            if !coordinator.mark_write_started(&build_lease).await? {
-                return Err(anyhow::anyhow!(
-                    "side_effect_cas_lost: mark_write_started CAS missed for effect {}; release adapter not invoked",
-                    build_lease.effect_id
-                ));
-            }
-
-            let bundle_manifest = match coordinator
-                .run_with_lease_renewal(
-                    &mut build_lease,
-                    &EffectKind::BuildArchive,
-                    publish_service.build_archive(
-                        &worktree_root,
-                        &git_receipt,
-                        &release_manifest,
-                        &delivery_config,
-                    ),
+            match publish_service
+                .build_and_distribute(
+                    &worktree_root,
+                    &git_receipt,
+                    &release_manifest,
+                    &delivery_config,
                 )
                 .await
             {
-                Ok(bundle_manifest) => {
-                    let bundle_artifact = self.prepare_release_json_artifact(
-                        &run,
-                        &stage_id,
-                        &agent_id,
-                        &provider,
-                        model.clone(),
-                        "release_bundle_manifest",
-                        &bundle_manifest,
-                    )?;
-                    let bundle_artifact_id = bundle_artifact.id.to_string();
-                    let bundle_path = bundle_artifact.file_path.clone();
-                    let evidence_summary = self
-                        .write_p078_side_effect_evidence_manifest(
+                Ok((bundle_manifest, upload_receipt)) => {
+                    let bundle_path = self
+                        .persist_json_artifact(
                             &run,
-                            stage_execution_id,
                             &stage_id,
                             &agent_id,
-                            &build_evidence_root,
-                            &EffectKind::BuildArchive,
-                            &bundle_path,
-                            "settled",
-                        )
-                        .await?;
-                    let mut tx = self
-                        .begin_executor_transaction(
-                            "executor.release_build_archive_success",
-                            format!(
-                                "executor.release_build_archive_success:{}:{}",
-                                stage_execution_id, build_lease.effect_id
-                            ),
-                        )
-                        .await?;
-                    artifacts::insert_tx(&mut tx, &bundle_artifact).await?;
-                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
-                        effect_id: &build_lease.effect_id,
-                        owner_instance_id: &build_lease.owner_instance_id,
-                        settlement_attempt_id: &build_lease.attempt_id,
-                        observed_lease_renewed_at: build_lease.lease_renewed_at,
-                        new_status: domain::side_effect::SideEffectStatus::Settled,
-                        observed_evidence_summary_json: Some(evidence_summary.as_str()),
-                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
-                        last_error_kind: None,
-                        last_error: None,
-                        now: chrono::Utc::now(),
-                        settlement_source: "executor",
-                        receipt_artifact_id: Some(bundle_artifact_id.as_str()),
-                        decision_json: None,
-                        decision_json_hash: None,
-                        disposition_id: None,
-                    };
-                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
-                        .await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_success CAS missed for effect {}; canonical release state not mutated",
-                            build_lease.effect_id
-                        ));
-                    }
-                    tx.commit().await?;
-                    let _ = self
-                        .events
-                        .send(domain::events::DomainEvent::ArtifactCreated {
-                            run_id,
-                            artifact_id: bundle_artifact.id,
-                        });
-                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
-                    info!(
-                        run_id = %run_id,
-                        stage_id = %stage_id,
-                        bundle_path = %bundle_path,
-                        "Release build_archive step completed"
-                    );
-                    bundle_manifest
-                }
-                Err(error) => {
-                    let error_str = sanitize_release_error(&error.to_string());
-                    let release_result = ReleaseResult {
-                        git_manifest: Some(release_manifest.clone()),
-                        git_receipt: Some(git_receipt.clone()),
-                        bundle_manifest: None,
-                        upload_receipt: None,
-                        succeeded: false,
-                        failure_stage: Some("build_archive".to_string()),
-                        failure_reason: Some(error_str.clone()),
-                    };
-                    let delivery_artifact = self
-                        .prepare_delivery_receipt_artifact_if_absent(
-                            &run,
-                            &delivery_config,
-                            &release_result,
-                            &idea_title,
-                            None,
-                            &stage_id,
                             &provider,
                             model.clone(),
+                            "release_bundle_manifest",
+                            &bundle_manifest,
                         )
                         .await?;
-                    let mut tx = self
-                        .begin_executor_transaction(
-                            "executor.release_build_archive_failure",
-                            format!(
-                                "executor.release_build_archive_failure:{}:{}",
-                                stage_execution_id, build_lease.effect_id
-                            ),
+                    let upload_path = self
+                        .persist_json_artifact(
+                            &run,
+                            &stage_id,
+                            &agent_id,
+                            &provider,
+                            model.clone(),
+                            "connect_upload_receipt",
+                            &upload_receipt,
                         )
                         .await?;
-                    if let Some(artifact) = delivery_artifact.as_ref() {
-                        artifacts::insert_tx(&mut tx, artifact).await?;
-                    }
-                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
-                        effect_id: &build_lease.effect_id,
-                        owner_instance_id: &build_lease.owner_instance_id,
-                        attempt_id: &build_lease.attempt_id,
-                        observed_lease_renewed_at: build_lease.lease_renewed_at,
-                        last_error_kind: "build_archive_failed",
-                        last_error: &error_str,
-                        now,
-                    };
-                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_failure CAS missed for effect {}; canonical release state not mutated",
-                            build_lease.effect_id
-                        ));
-                    }
-                    agent_executions::update_completed_tx(
-                        &mut tx,
-                        agent_exec_id,
-                        AgentStatus::Failed,
-                        now,
-                    )
-                    .await?;
-                    stages::settle_tx(
-                        &mut tx,
-                        stage_execution_id,
-                        domain::stage::StageSettlementKind::Failed,
-                        now,
-                    )
-                    .await?;
-                    tx.commit().await?;
-                    if let Some(artifact) = delivery_artifact {
-                        let _ = self
-                            .events
-                            .send(domain::events::DomainEvent::ArtifactCreated {
-                                run_id,
-                                artifact_id: artifact.id,
-                            });
-                        info!(run_id = %run_id, receipt_path = %artifact.file_path, "delivery receipt persisted");
-                    }
-                    let _ = self
-                        .events
-                        .send(domain::events::DomainEvent::RuntimeStatusChanged {
-                            run_id,
-                            stage_id: stage_id.clone(),
-                            agent_id: agent_id.clone(),
-                            provider: provider.clone(),
-                            event_kind: "session_failed".to_string(),
-                        });
-                    let _ = self
-                        .events
-                        .send(domain::events::DomainEvent::StageStatusChanged {
-                            run_id,
-                            stage_execution_id,
-                            status: domain::stage::StageStatus::Failed,
-                        });
-                    projections::rebuild_all_for_run(&self.pool, run_id).await?;
-                    info!(
-                        run_id = %run_id,
-                        stage_id = %stage_id,
-                        error = %error,
-                        "Release build_archive step failed"
-                    );
-                    return Err(error);
-                }
-            };
-
-            let connect_target_key = format!(
-                "connect://{}:{}:{}",
-                delivery_config.release_mode.as_deref().unwrap_or(""),
-                delivery_config.release_target_id.as_deref().unwrap_or(""),
-                bundle_manifest.checksum_sha256
-            );
-            let connect_idempotency_key = derive_p078_idempotency_key(
-                "connect_upload",
-                run_id,
-                stage_execution_id,
-                Some(agent_exec_id),
-                &connect_target_key,
-                1,
-            );
-            let connect_request_fingerprint = derive_p078_request_fingerprint(
-                "connect_upload",
-                &[
-                    ("commit_sha", git_receipt.commit_sha.as_str()),
-                    ("bundle_checksum", bundle_manifest.checksum_sha256.as_str()),
-                    (
-                        "release_mode",
-                        delivery_config.release_mode.as_deref().unwrap_or(""),
-                    ),
-                    (
-                        "release_target_id",
-                        delivery_config.release_target_id.as_deref().unwrap_or(""),
-                    ),
-                ],
-            );
-            let connect_evidence_root = self.p078_side_effect_evidence_root(
-                &run,
-                stage_execution_id,
-                &agent_id,
-                &EffectKind::ConnectUpload,
-                &connect_idempotency_key,
-            )?;
-            let connect_expected_evidence_json = self.p078_expected_evidence_json(
-                &EffectKind::ConnectUpload,
-                &connect_target_key,
-                &connect_evidence_root,
-            )?;
-            let connect_intent = PrepareEffectIntent {
-                run_id,
-                stage_execution_id,
-                agent_execution_id: Some(agent_exec_id),
-                effect_kind: EffectKind::ConnectUpload,
-                target_key: connect_target_key,
-                idempotency_key: connect_idempotency_key,
-                idempotency_key_version: 1,
-                request_fingerprint: connect_request_fingerprint,
-                request_fingerprint_version: 1,
-                expected_evidence_json: Some(connect_expected_evidence_json),
-                evidence_root: Some(connect_evidence_root.clone()),
-                deadline_at: Some(
-                    chrono::Utc::now()
-                        + chrono::Duration::seconds(EffectKind::ConnectUpload.deadline_seconds()),
-                ),
-            };
-            let mut connect_lease = coordinator.prepare_and_lease(connect_intent).await?;
-            if !coordinator.mark_write_started(&connect_lease).await? {
-                return Err(anyhow::anyhow!(
-                    "side_effect_cas_lost: mark_write_started CAS missed for effect {}; release adapter not invoked",
-                    connect_lease.effect_id
-                ));
-            }
-
-            match coordinator
-                .run_with_lease_renewal(
-                    &mut connect_lease,
-                    &EffectKind::ConnectUpload,
-                    publish_service.upload_archive(
-                        &git_receipt,
-                        &bundle_manifest,
-                        &delivery_config,
-                    ),
-                )
-                .await
-            {
-                Ok(upload_receipt) => {
-                    let upload_artifact = self.prepare_release_json_artifact(
-                        &run,
-                        &stage_id,
-                        &agent_id,
-                        &provider,
-                        model.clone(),
-                        "connect_upload_receipt",
-                        &upload_receipt,
-                    )?;
                     let release_result = ReleaseResult {
                         git_manifest: Some(release_manifest),
                         git_receipt: Some(git_receipt),
@@ -7637,8 +6889,8 @@ impl BackgroundExecutor {
                         failure_stage: None,
                         failure_reason: None,
                     };
-                    let delivery_artifact = self
-                        .prepare_delivery_receipt_artifact_if_absent(
+                    let _ = self
+                        .persist_delivery_receipt_if_absent(
                             &run,
                             &delivery_config,
                             &release_result,
@@ -7649,89 +6901,6 @@ impl BackgroundExecutor {
                             model.clone(),
                         )
                         .await?;
-                    let upload_path = upload_artifact.file_path.clone();
-                    let upload_artifact_id = upload_artifact.id.to_string();
-                    let evidence_summary = self
-                        .write_p078_side_effect_evidence_manifest(
-                            &run,
-                            stage_execution_id,
-                            &stage_id,
-                            &agent_id,
-                            &connect_evidence_root,
-                            &EffectKind::ConnectUpload,
-                            &upload_path,
-                            "settled",
-                        )
-                        .await?;
-                    let advance_run = self.build_advance_run_work_item(run_id)?;
-                    let mut tx = self
-                        .begin_executor_transaction(
-                            "executor.release_connect_upload_success",
-                            format!(
-                                "executor.release_connect_upload_success:{}:{}",
-                                stage_execution_id, connect_lease.effect_id
-                            ),
-                        )
-                        .await?;
-                    artifacts::insert_tx(&mut tx, &upload_artifact).await?;
-                    if let Some(artifact) = delivery_artifact.as_ref() {
-                        artifacts::insert_tx(&mut tx, artifact).await?;
-                    }
-                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
-                        effect_id: &connect_lease.effect_id,
-                        owner_instance_id: &connect_lease.owner_instance_id,
-                        settlement_attempt_id: &connect_lease.attempt_id,
-                        observed_lease_renewed_at: connect_lease.lease_renewed_at,
-                        new_status: domain::side_effect::SideEffectStatus::Settled,
-                        observed_evidence_summary_json: Some(evidence_summary.as_str()),
-                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
-                        last_error_kind: None,
-                        last_error: None,
-                        now,
-                        settlement_source: "executor",
-                        receipt_artifact_id: Some(upload_artifact_id.as_str()),
-                        decision_json: None,
-                        decision_json_hash: None,
-                        disposition_id: None,
-                    };
-                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
-                        .await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_success CAS missed for effect {}; canonical release state not mutated",
-                            connect_lease.effect_id
-                        ));
-                    }
-                    agent_executions::update_completed_tx(
-                        &mut tx,
-                        agent_exec_id,
-                        AgentStatus::Completed,
-                        now,
-                    )
-                    .await?;
-                    stages::settle_tx(
-                        &mut tx,
-                        stage_execution_id,
-                        domain::stage::StageSettlementKind::Completed,
-                        now,
-                    )
-                    .await?;
-                    work_items::enqueue_tx(&mut tx, &advance_run).await?;
-                    tx.commit().await?;
-                    let _ = self
-                        .events
-                        .send(domain::events::DomainEvent::ArtifactCreated {
-                            run_id,
-                            artifact_id: upload_artifact.id,
-                        });
-                    if let Some(artifact) = delivery_artifact {
-                        let _ = self
-                            .events
-                            .send(domain::events::DomainEvent::ArtifactCreated {
-                                run_id,
-                                artifact_id: artifact.id,
-                            });
-                    }
                     let _ = self
                         .events
                         .send(domain::events::DomainEvent::RuntimeStatusChanged {
@@ -7741,6 +6910,20 @@ impl BackgroundExecutor {
                             provider: provider.clone(),
                             event_kind: "session_completed".to_string(),
                         });
+                    agent_executions::update_completed(
+                        &self.pool,
+                        agent_exec_id,
+                        AgentStatus::Completed,
+                        now,
+                    )
+                    .await?;
+                    stages::settle(
+                        &self.pool,
+                        stage_execution_id,
+                        domain::stage::StageSettlementKind::Completed,
+                        now,
+                    )
+                    .await?;
                     let _ = self
                         .events
                         .send(domain::events::DomainEvent::StageStatusChanged {
@@ -7749,27 +6932,35 @@ impl BackgroundExecutor {
                             status: domain::stage::StageStatus::Completed,
                         });
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    self.work_queue
+                        .enqueue(
+                            WorkItemKind::AdvanceRun,
+                            Some(run_id),
+                            None,
+                            serde_json::json!({ "run_id": run_id.to_string() }),
+                        )
+                        .await?;
                     info!(
                         run_id = %run_id,
                         stage_id = %stage_id,
+                        bundle_path = %bundle_path,
                         upload_path = %upload_path,
-                        "Release connect_upload step completed"
+                        "Release publish step completed"
                     );
                     return Ok(());
                 }
                 Err(error) => {
-                    let error_str = sanitize_release_error(&error.to_string());
                     let release_result = ReleaseResult {
                         git_manifest: Some(release_manifest),
                         git_receipt: Some(git_receipt),
-                        bundle_manifest: Some(bundle_manifest),
+                        bundle_manifest: None,
                         upload_receipt: None,
                         succeeded: false,
-                        failure_stage: Some("connect_upload".to_string()),
-                        failure_reason: Some(error_str.clone()),
+                        failure_stage: Some("build_archive_and_push".to_string()),
+                        failure_reason: Some(error.to_string()),
                     };
-                    let delivery_artifact = self
-                        .prepare_delivery_receipt_artifact_if_absent(
+                    if let Some(receipt_path) = self
+                        .persist_delivery_receipt_if_absent(
                             &run,
                             &delivery_config,
                             &release_result,
@@ -7779,58 +6970,9 @@ impl BackgroundExecutor {
                             &provider,
                             model.clone(),
                         )
-                        .await?;
-                    let mut tx = self
-                        .begin_executor_transaction(
-                            "executor.release_connect_upload_failure",
-                            format!(
-                                "executor.release_connect_upload_failure:{}:{}",
-                                stage_execution_id, connect_lease.effect_id
-                            ),
-                        )
-                        .await?;
-                    if let Some(artifact) = delivery_artifact.as_ref() {
-                        artifacts::insert_tx(&mut tx, artifact).await?;
-                    }
-                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
-                        effect_id: &connect_lease.effect_id,
-                        owner_instance_id: &connect_lease.owner_instance_id,
-                        attempt_id: &connect_lease.attempt_id,
-                        observed_lease_renewed_at: connect_lease.lease_renewed_at,
-                        last_error_kind: "connect_upload_failed",
-                        last_error: &error_str,
-                        now,
-                    };
-                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                        .await?
                     {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_failure CAS missed for effect {}; canonical release state not mutated",
-                            connect_lease.effect_id
-                        ));
-                    }
-                    agent_executions::update_completed_tx(
-                        &mut tx,
-                        agent_exec_id,
-                        AgentStatus::Failed,
-                        now,
-                    )
-                    .await?;
-                    stages::settle_tx(
-                        &mut tx,
-                        stage_execution_id,
-                        domain::stage::StageSettlementKind::Failed,
-                        now,
-                    )
-                    .await?;
-                    tx.commit().await?;
-                    if let Some(artifact) = delivery_artifact {
-                        let _ = self
-                            .events
-                            .send(domain::events::DomainEvent::ArtifactCreated {
-                                run_id,
-                                artifact_id: artifact.id,
-                            });
-                        info!(run_id = %run_id, receipt_path = %artifact.file_path, "delivery receipt persisted");
+                        info!(run_id = %run_id, receipt_path = %receipt_path, "delivery receipt persisted");
                     }
                     let _ = self
                         .events
@@ -7841,6 +6983,20 @@ impl BackgroundExecutor {
                             provider: provider.clone(),
                             event_kind: "session_failed".to_string(),
                         });
+                    agent_executions::update_completed(
+                        &self.pool,
+                        agent_exec_id,
+                        AgentStatus::Failed,
+                        now,
+                    )
+                    .await?;
+                    stages::settle(
+                        &self.pool,
+                        stage_execution_id,
+                        domain::stage::StageSettlementKind::Failed,
+                        now,
+                    )
+                    .await?;
                     let _ = self
                         .events
                         .send(domain::events::DomainEvent::StageStatusChanged {
@@ -7853,51 +7009,12 @@ impl BackgroundExecutor {
                         run_id = %run_id,
                         stage_id = %stage_id,
                         error = %error,
-                        "Release connect_upload step failed"
+                        "Release publish step failed"
                     );
                     return Err(error);
                 }
             }
         }
-    }
-
-    async fn fail_release_agent_precondition(
-        &self,
-        run_id: RunId,
-        stage_execution_id: domain::ids::StageExecutionId,
-        agent_exec_id: domain::ids::AgentExecutionId,
-        stage_id: &str,
-        agent_id: &str,
-        provider: &str,
-        at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
-        agent_executions::update_completed(&self.pool, agent_exec_id, AgentStatus::Failed, at)
-            .await?;
-        stages::settle(
-            &self.pool,
-            stage_execution_id,
-            domain::stage::StageSettlementKind::Failed,
-            at,
-        )
-        .await?;
-        let _ = self
-            .events
-            .send(domain::events::DomainEvent::RuntimeStatusChanged {
-                run_id,
-                stage_id: stage_id.to_string(),
-                agent_id: agent_id.to_string(),
-                provider: provider.to_string(),
-                event_kind: "session_failed".to_string(),
-            });
-        let _ = self
-            .events
-            .send(domain::events::DomainEvent::StageStatusChanged {
-                run_id,
-                stage_execution_id,
-                status: domain::stage::StageStatus::Failed,
-            });
-        projections::rebuild_all_for_run(&self.pool, run_id).await?;
-        Ok(())
     }
 
     async fn load_delivery_configuration(
@@ -9026,7 +8143,7 @@ impl BackgroundExecutor {
             .map_err(|e| anyhow::anyhow!("decode artifact {}: {}", artifact.file_path, e))
     }
 
-    fn prepare_release_json_artifact<T: Serialize>(
+    async fn persist_json_artifact<T: Serialize>(
         &self,
         run: &domain::run::Run,
         stage_id: &str,
@@ -9035,17 +8152,17 @@ impl BackgroundExecutor {
         model: Option<String>,
         name: &str,
         value: &T,
-    ) -> Result<Artifact> {
+    ) -> Result<String> {
         let path = self.resolve_release_artifact_path(run, name);
         if let Some(parent) = std::path::Path::new(&path).parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow::anyhow!("create artifact dir {}: {}", parent.display(), e))?;
         }
         let json = serde_json::to_string_pretty(value)?;
-        std::fs::write(&path, &json)
+        std::fs::write(&path, json)
             .map_err(|e| anyhow::anyhow!("write artifact {}: {}", path, e))?;
 
-        Ok(Artifact {
+        let artifact = domain::artifact::Artifact {
             id: domain::ids::ArtifactId::new(),
             run_id: run.id,
             stage_id: stage_id.to_string(),
@@ -9053,9 +8170,9 @@ impl BackgroundExecutor {
             name: name.to_string(),
             contract_id: name.to_string(),
             format: ArtifactFormat::Json,
-            file_path: path,
+            file_path: path.clone(),
             checksum_sha256: None,
-            size_bytes: Some(json.len() as i64),
+            size_bytes: None,
             provider: provider.to_string(),
             model,
             created_at: chrono::Utc::now(),
@@ -9063,385 +8180,18 @@ impl BackgroundExecutor {
             report_kind: None,
             report_version: None,
             agent_execution_id: None,
-        })
-    }
-
-    fn p078_side_effect_evidence_root(
-        &self,
-        run: &domain::run::Run,
-        stage_execution_id: domain::ids::StageExecutionId,
-        agent_id: &str,
-        effect_kind: &EffectKind,
-        idempotency_key: &str,
-    ) -> Result<String> {
-        let root = Path::new(&run.artifact_root)
-            .join("evidence")
-            .join("runs")
-            .join(run.id.to_string())
-            .join("stages")
-            .join(stage_execution_id.to_string())
-            .join("agents")
-            .join(agent_id)
-            .join("receipt")
-            .join("side-effects")
-            .join(effect_kind.to_string())
-            .join(idempotency_key.replace(['/', ':'], "_"));
-        std::fs::create_dir_all(&root).map_err(|e| {
-            anyhow::anyhow!("create side-effect evidence root {}: {}", root.display(), e)
-        })?;
-        Ok(root.to_string_lossy().into_owned())
-    }
-
-    fn p078_expected_evidence_json(
-        &self,
-        effect_kind: &EffectKind,
-        target_key: &str,
-        evidence_root: &str,
-    ) -> Result<String> {
-        serde_json::to_string(&serde_json::json!({
-            "schema_version": "p078_expected_side_effect_evidence_v1",
-            "effect_kind": effect_kind.to_string(),
-            "target_key": target_key,
-            "evidence_root": evidence_root,
-            "manifest_path": Path::new(evidence_root)
-                .join("evidence-manifest.json")
-                .to_string_lossy()
-                .to_string(),
-            "manifest_write_order": "manifest_last",
-            "durability_protocol": "p075_write_spool_file",
-            "required_files": [
-                { "kind": "release_receipt", "file_name": "release-receipt.json", "required": true, "checksum_required": true, "size_required": true },
-                { "kind": "stdout", "file_name": "stdout.log", "required": true, "checksum_required": true, "size_required": true },
-                { "kind": "stderr", "file_name": "stderr.log", "required": true, "checksum_required": true, "size_required": true },
-                { "kind": "git_ls_remote", "file_name": "git-ls-remote.json", "required": true, "checksum_required": true, "size_required": true },
-                { "kind": "upload_readback", "file_name": "upload-readback.json", "required": true, "checksum_required": true, "size_required": true },
-                { "kind": "archive_summary", "file_name": "archive-summary.json", "required": true, "checksum_required": true, "size_required": true },
-                { "kind": "reconciliation_report", "file_name": "reconciliation-report.json", "required": true, "checksum_required": true, "size_required": true },
-                { "kind": "evidence_manifest", "file_name": "evidence-manifest.json", "required": true, "checksum_required": true, "size_required": true, "write_order": "last" }
-            ]
-        }))
-        .map_err(Into::into)
-    }
-
-    async fn write_p078_side_effect_evidence_manifest(
-        &self,
-        run: &domain::run::Run,
-        stage_execution_id: domain::ids::StageExecutionId,
-        stage_id: &str,
-        agent_id: &str,
-        evidence_root: &str,
-        effect_kind: &EffectKind,
-        receipt_path: &str,
-        status: &str,
-    ) -> Result<String> {
-        let receipt_bytes = std::fs::read(receipt_path)
-            .map_err(|e| anyhow::anyhow!("read side-effect receipt {}: {}", receipt_path, e))?;
-        let receipt_sha = sha256_hex(&receipt_bytes);
-        let evidence_root_hash = sha256_hex(evidence_root.as_bytes());
-        let evidence_root_slug = &evidence_root_hash[..16];
-        let artifact_root = Path::new(&run.artifact_root);
-        tokio::fs::create_dir_all(artifact_root).await?;
-        let now = chrono::Utc::now();
-
-        struct SpoolInput {
-            kind: &'static str,
-            file_name: &'static str,
-            evidence_kind: evidence_spool_refs::EvidenceKind,
-            content_type: &'static str,
-            source_artifact_path: Option<String>,
-            bytes: Vec<u8>,
-        }
-
-        let json_bytes = |value: serde_json::Value| -> Result<Vec<u8>> {
-            serde_json::to_vec_pretty(&value).map_err(Into::into)
         };
-        let mut spool_inputs = vec![
-            SpoolInput {
-                kind: "release_receipt",
-                file_name: "release-receipt.json",
-                evidence_kind: evidence_spool_refs::EvidenceKind::Receipt,
-                content_type: "application/json",
-                source_artifact_path: Some(receipt_path.to_string()),
-                bytes: receipt_bytes,
-            },
-            SpoolInput {
-                kind: "stdout",
-                file_name: "stdout.log",
-                evidence_kind: evidence_spool_refs::EvidenceKind::Stdout,
-                content_type: "text/plain",
-                source_artifact_path: None,
-                bytes: format!(
-                    "P078 side-effect {} completed local evidence capture with status {}.\n",
-                    effect_kind, status
-                )
-                .into_bytes(),
-            },
-            SpoolInput {
-                kind: "stderr",
-                file_name: "stderr.log",
-                evidence_kind: evidence_spool_refs::EvidenceKind::Stderr,
-                content_type: "text/plain",
-                source_artifact_path: None,
-                bytes: Vec::new(),
-            },
-            SpoolInput {
-                kind: "git_ls_remote",
-                file_name: "git-ls-remote.json",
-                evidence_kind: evidence_spool_refs::EvidenceKind::DeliveryReadback,
-                content_type: "application/json",
-                source_artifact_path: None,
-                bytes: json_bytes(serde_json::json!({
-                    "schema_version": "p078_git_ls_remote_evidence_v1",
-                    "effect_kind": effect_kind.to_string(),
-                    "applicable": effect_kind == &EffectKind::GitPush,
-                    "readback_source": "local_fake_gate_or_release_receipt",
-                    "status": status
-                }))?,
-            },
-            SpoolInput {
-                kind: "upload_readback",
-                file_name: "upload-readback.json",
-                evidence_kind: evidence_spool_refs::EvidenceKind::DeliveryReadback,
-                content_type: "application/json",
-                source_artifact_path: None,
-                bytes: json_bytes(serde_json::json!({
-                    "schema_version": "p078_upload_readback_evidence_v1",
-                    "effect_kind": effect_kind.to_string(),
-                    "applicable": effect_kind == &EffectKind::ConnectUpload,
-                    "readback_source": "local_fake_gate_or_release_receipt",
-                    "status": status
-                }))?,
-            },
-            SpoolInput {
-                kind: "archive_summary",
-                file_name: "archive-summary.json",
-                evidence_kind: evidence_spool_refs::EvidenceKind::DeliveryReadback,
-                content_type: "application/json",
-                source_artifact_path: None,
-                bytes: json_bytes(serde_json::json!({
-                    "schema_version": "p078_archive_summary_evidence_v1",
-                    "effect_kind": effect_kind.to_string(),
-                    "applicable": effect_kind == &EffectKind::BuildArchive,
-                    "readback_source": "local_fake_gate_or_release_receipt",
-                    "status": status
-                }))?,
-            },
-            SpoolInput {
-                kind: "reconciliation_report",
-                file_name: "reconciliation-report.json",
-                evidence_kind: evidence_spool_refs::EvidenceKind::DeliveryReadback,
-                content_type: "application/json",
-                source_artifact_path: None,
-                bytes: json_bytes(serde_json::json!({
-                    "schema_version": "p078_reconciliation_report_v1",
-                    "effect_kind": effect_kind.to_string(),
-                    "status": "not_required_for_normal_settlement",
-                    "operator_next_action": null
-                }))?,
-            },
-        ];
-
-        #[derive(Clone)]
-        struct SpoolManifestEntry {
-            kind: String,
-            file_name: String,
-            path: String,
-            relative_path: String,
-            sha256: String,
-            size_bytes: u64,
-            source_artifact_path: Option<String>,
-        }
-
-        let mut manifest_entries = Vec::with_capacity(spool_inputs.len());
-        let mut spooled_bytes = 0u64;
-        for input in spool_inputs.drain(..) {
-            let relative_path = format!(
-                "evidence/runs/{}/stages/{}/agents/{}/receipt/side-effects/{}/{}/{}",
-                run.id,
-                stage_execution_id,
-                agent_id,
-                effect_kind,
-                evidence_root_slug,
-                input.file_name
-            );
-            let spool = db::evidence_spool::write_spool_file(
-                artifact_root,
-                &run.id.to_string(),
-                &relative_path,
-                &input.bytes,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("write P078 {} evidence spool: {e}", input.kind))?;
-            spooled_bytes += spool.size_bytes;
-            let spool_ref = evidence_spool_refs::EvidenceSpoolRef {
-                id: format!(
-                    "evsp_p078_{}_{}",
-                    input.kind,
-                    &sha256_hex(spool.relative_path.as_bytes())[..24]
-                ),
-                metadata_version: 1,
-                run_id: run.id.to_string(),
-                stage_execution_id: Some(stage_execution_id.to_string()),
-                stage_id: Some(stage_id.to_string()),
-                agent_execution_id: None,
-                agent_id: Some(agent_id.to_string()),
-                kind: input.evidence_kind,
-                relative_path: spool.relative_path.clone(),
-                size_bytes: spool.size_bytes as i64,
-                checksum_algorithm: spool.checksum_algorithm.to_string(),
-                checksum: spool.checksum.clone(),
-                producer_operation: format!("p078_side_effect_{}_spool_ref_insert", input.kind),
-                content_type: Some(input.content_type.to_string()),
-                summary_json: Some(
-                    serde_json::json!({
-                        "byte_count": spool.size_bytes,
-                        "producer_label": format!("p078_side_effect_{}", input.kind),
-                        "started_at": now.to_rfc3339(),
-                        "finished_at": now.to_rfc3339()
-                    })
-                    .to_string(),
-                ),
-                created_at: now,
-                status: evidence_spool_refs::EvidenceSpoolRefStatus::Available,
-            };
-            match evidence_spool_refs::insert_idempotent_via_dbwriter(&self.db_writer, spool_ref)
-                .await
-            {
-                WriteResult::Committed | WriteResult::Coalesced => {}
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "P078 {} evidence spool metadata was not committed: {other:?}",
-                        input.kind
-                    ));
-                }
-            }
-            manifest_entries.push(SpoolManifestEntry {
-                kind: input.kind.to_string(),
-                file_name: input.file_name.to_string(),
-                path: spool.absolute_path.to_string_lossy().to_string(),
-                relative_path: spool.relative_path.clone(),
-                sha256: spool.checksum.clone(),
-                size_bytes: spool.size_bytes,
-                source_artifact_path: input.source_artifact_path,
+        artifacts::insert(&self.pool, &artifact).await?;
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::ArtifactCreated {
+                run_id: run.id,
+                artifact_id: artifact.id,
             });
-        }
-        info!(
-            metric_name = "side_effect_evidence_spooled_bytes_total",
-            effect_kind = %effect_kind,
-            status,
-            bytes = spooled_bytes,
-            "p078_side_effect_metric"
-        );
-        info!(
-            metric_name = "side_effect_evidence_disk_bytes",
-            effect_kind = %effect_kind,
-            status,
-            bytes = spooled_bytes,
-            "p078_side_effect_metric"
-        );
-
-        let manifest = serde_json::json!({
-            "schema_version": "p078_side_effect_evidence_manifest_v1",
-            "effect_kind": effect_kind.to_string(),
-            "status": status,
-            "generated_at": now.to_rfc3339(),
-            "manifest_write_order": "manifest_last",
-            "durability_protocol": "p075_write_spool_file",
-            "files": manifest_entries.iter().map(|entry| serde_json::json!({
-                "kind": &entry.kind,
-                "path": &entry.path,
-                "relative_path": &entry.relative_path,
-                "source_artifact_path": &entry.source_artifact_path,
-                "file_name": &entry.file_name,
-                "sha256": &entry.sha256,
-                "size_bytes": entry.size_bytes
-            })).collect::<Vec<_>>()
-        });
-        let bytes = serde_json::to_vec_pretty(&manifest)?;
-        let manifest_relative_path = format!(
-            "evidence/runs/{}/stages/{}/agents/{}/receipt/side-effects/{}/{}/evidence-manifest.json",
-            run.id,
-            stage_execution_id,
-            agent_id,
-            effect_kind,
-            evidence_root_slug
-        );
-        let manifest_spool = db::evidence_spool::write_spool_file(
-            artifact_root,
-            &run.id.to_string(),
-            &manifest_relative_path,
-            &bytes,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("write P078 evidence manifest spool: {e}"))?;
-        let manifest_spool_ref = evidence_spool_refs::EvidenceSpoolRef {
-            id: format!(
-                "evsp_p078_manifest_{}",
-                &sha256_hex(manifest_spool.relative_path.as_bytes())[..24]
-            ),
-            metadata_version: 1,
-            run_id: run.id.to_string(),
-            stage_execution_id: Some(stage_execution_id.to_string()),
-            stage_id: Some(stage_id.to_string()),
-            agent_execution_id: None,
-            agent_id: Some(agent_id.to_string()),
-            kind: evidence_spool_refs::EvidenceKind::Receipt,
-            relative_path: manifest_spool.relative_path.clone(),
-            size_bytes: manifest_spool.size_bytes as i64,
-            checksum_algorithm: manifest_spool.checksum_algorithm.to_string(),
-            checksum: manifest_spool.checksum.clone(),
-            producer_operation: "p078_side_effect_manifest_spool_ref_insert".to_string(),
-            content_type: Some("application/json".to_string()),
-            summary_json: Some(
-                serde_json::json!({
-                    "byte_count": manifest_spool.size_bytes,
-                    "producer_label": "p078_side_effect_manifest",
-                    "started_at": now.to_rfc3339(),
-                    "finished_at": now.to_rfc3339()
-                })
-                .to_string(),
-            ),
-            created_at: now,
-            status: evidence_spool_refs::EvidenceSpoolRefStatus::Available,
-        };
-        match evidence_spool_refs::insert_idempotent_via_dbwriter(
-            &self.db_writer,
-            manifest_spool_ref,
-        )
-        .await
-        {
-            WriteResult::Committed | WriteResult::Coalesced => {}
-            other => {
-                return Err(anyhow::anyhow!(
-                    "P078 manifest evidence spool metadata was not committed: {other:?}"
-                ));
-            }
-        }
-        let receipt_entry = manifest_entries
-            .iter()
-            .find(|entry| entry.kind == "release_receipt")
-            .ok_or_else(|| {
-                anyhow::anyhow!("P078 evidence manifest missing release_receipt entry")
-            })?;
-        Ok(serde_json::to_string(&serde_json::json!({
-            "schema_version": "p078_observed_evidence_summary_v1",
-            "manifest_path": manifest_spool.absolute_path.to_string_lossy().to_string(),
-            "manifest_relative_path": manifest_spool.relative_path.clone(),
-            "manifest_sha256": manifest_spool.checksum.clone(),
-            "manifest_size_bytes": manifest_spool.size_bytes,
-            "receipt_path": receipt_path,
-            "receipt_spool_path": receipt_entry.path.clone(),
-            "receipt_spool_relative_path": receipt_entry.relative_path.clone(),
-            "receipt_sha256": receipt_sha,
-            "status": status,
-            "file_count": manifest_entries.len() + 1,
-            "manifest_file_count": manifest_entries.len(),
-            "spooled_bytes": spooled_bytes + manifest_spool.size_bytes,
-            "durability_protocol": "p075_write_spool_file"
-        }))?)
+        Ok(path)
     }
 
-    async fn prepare_delivery_receipt_artifact_if_absent(
+    async fn persist_delivery_receipt_if_absent(
         &self,
         run: &domain::run::Run,
         delivery_config: &DeliveryConfiguration,
@@ -9451,7 +8201,7 @@ impl BackgroundExecutor {
         stage_id: &str,
         provider: &str,
         model: Option<String>,
-    ) -> Result<Option<Artifact>> {
+    ) -> Result<Option<String>> {
         let rollout_contract_readback =
             rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
                 &self.pool,
@@ -9474,93 +8224,17 @@ impl BackgroundExecutor {
         if std::path::Path::new(&path).exists() {
             return Ok(None);
         }
-        self.prepare_release_json_artifact(
-            run,
-            stage_id,
-            "system_delivery",
-            provider,
-            model,
-            "delivery_receipt",
-            &receipt,
-        )
-        .map(Some)
-    }
-
-    fn build_advance_run_work_item(&self, run_id: RunId) -> Result<WorkItem> {
-        let now = chrono::Utc::now();
-        Ok(WorkItem {
-            id: uuid::Uuid::new_v4().to_string(),
-            kind: WorkItemKind::AdvanceRun,
-            payload_json: serde_json::to_string(&serde_json::json!({
-                "run_id": run_id.to_string(),
-            }))?,
-            status: WorkItemStatus::Pending,
-            run_id: Some(run_id),
-            stage_id: None,
-            created_at: now,
-            scheduled_at: now,
-            attempt_count: 0,
-            last_error: None,
-        })
-    }
-
-    async fn persist_json_artifact<T: Serialize>(
-        &self,
-        run: &domain::run::Run,
-        stage_id: &str,
-        agent_id: &str,
-        provider: &str,
-        model: Option<String>,
-        name: &str,
-        value: &T,
-    ) -> Result<String> {
-        let artifact = self
-            .prepare_release_json_artifact(run, stage_id, agent_id, provider, model, name, value)?;
-        let path = artifact.file_path.clone();
-        artifacts::insert(&self.pool, &artifact).await?;
         let _ = self
-            .events
-            .send(domain::events::DomainEvent::ArtifactCreated {
-                run_id: run.id,
-                artifact_id: artifact.id,
-            });
-        Ok(path)
-    }
-
-    async fn persist_delivery_receipt_if_absent(
-        &self,
-        run: &domain::run::Run,
-        delivery_config: &DeliveryConfiguration,
-        release_result: &ReleaseResult,
-        idea_title: &str,
-        review_status: Option<&str>,
-        stage_id: &str,
-        provider: &str,
-        model: Option<String>,
-    ) -> Result<Option<String>> {
-        let Some(artifact) = self
-            .prepare_delivery_receipt_artifact_if_absent(
+            .persist_json_artifact(
                 run,
-                delivery_config,
-                release_result,
-                idea_title,
-                review_status,
                 stage_id,
+                "system_delivery",
                 provider,
                 model,
+                "delivery_receipt",
+                &receipt,
             )
-            .await?
-        else {
-            return Ok(None);
-        };
-        let path = artifact.file_path.clone();
-        artifacts::insert(&self.pool, &artifact).await?;
-        let _ = self
-            .events
-            .send(domain::events::DomainEvent::ArtifactCreated {
-                run_id: run.id,
-                artifact_id: artifact.id,
-            });
+            .await?;
         Ok(Some(path))
     }
 
@@ -13461,37 +12135,4 @@ mod tests {
             domain::discovery::ExpectedOutputRole::Machine
         ));
     }
-}
-
-fn sanitize_release_error(s: &str) -> String {
-    const MAX_BYTES: usize = 512;
-    sanitize_error_for_storage(s, MAX_BYTES)
-}
-
-fn derive_p078_idempotency_key(
-    effect_kind: &str,
-    run_id: RunId,
-    stage_execution_id: domain::ids::StageExecutionId,
-    agent_execution_id: Option<domain::ids::AgentExecutionId>,
-    target_key: &str,
-    intent_version: u32,
-) -> String {
-    let agent = agent_execution_id
-        .map(|id| id.to_string())
-        .unwrap_or_default();
-    let input = format!(
-        "p078:v1:{effect_kind}:{run_id}:{stage_execution_id}:{agent}:{target_key}:{intent_version}"
-    );
-    format!("p078:v1:{effect_kind}:{}", sha256_hex(input.as_bytes()))
-}
-
-fn derive_p078_request_fingerprint(effect_kind: &str, pairs: &[(&str, &str)]) -> String {
-    let mut input = format!("p078:request:v1:{effect_kind}");
-    for (key, value) in pairs {
-        input.push('\n');
-        input.push_str(key);
-        input.push('=');
-        input.push_str(value);
-    }
-    sha256_hex(input.as_bytes())
 }

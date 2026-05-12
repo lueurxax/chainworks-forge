@@ -1449,7 +1449,6 @@ dependencies = [
  "graphql-server",
  "serde",
  "serde_json",
- "sha2",
  "sqlx",
  "tempfile",
  "tokio",

@@ -212,30 +212,6 @@ The important contract is ownership, not file shape:
 `recoverySnapshotJSON` is stage-owned next-action truth, not agent-level execution truth.
 It may narrow the operator action after a watchdog failure or exhausted retry, but it must not override the settled `AgentExecution` truth described above.
 
-### Durable Side-Effect Ledger and Reconciliation (P078)
-
-For irreversible or externally visible operations (e.g., `git_push`, `connect_upload`), success is not just about the agent finishing. The system must ensure that the side effect is durable and reconcilable if a crash occurs mid-execution.
-
-**Durability Rules:**
-- **Durable Intent**: The control plane persists a `SideEffect` record with status `prepared` before the external operation begins.
-- **Fail-Closed Retry**: If a run or stage has unresolved side effects (status `executing`, `externally_observed`, or `needs_reconciliation`), the engine **blocks all retry attempts** for that run/stage with `requires_effect_reconciliation`.
-- **At-Most-Once Write**: The engine guarantees at most one external-write attempt per `side_effect` row. If an attempt fails or is ambiguous, the record moves to `needs_reconciliation` rather than auto-retrying.
-- **Idempotency**: Every side effect uses a deterministic `idempotency_key` (derived from run/stage/agent/target) to help external systems (like GitHub or App Store Connect) detect duplicate requests.
-
-**Side-Effect Statuses:**
-- `prepared`: Intent recorded, operation not yet started.
-- `executing`: Operation started, outcome unknown.
-- `externally_observed`: Evidence suggests the side effect happened, but it's not yet settled.
-- `needs_reconciliation`: Ambiguous outcome requiring operator or startup repair.
-- `settled`: Side effect confirmed successful and linked to canonical state.
-- `reconciled`: Operator manually resolved an ambiguous outcome.
-- `conflict`: Idempotency conflict detected.
-- `unrecoverable`: Side effect failed and cannot be safely retried.
-
-**Reconciliation Paths:**
-- **Startup Repair**: The daemon reconciles stale `executing` side effects at launch. If they outlived their lease or deadline, they move to `needs_reconciliation`.
-- **MCP Operator Tools**: Operators use `effects.list`, `inspect`, and `reconcile` to review unresolved effects and apply a disposition (`mark_unrecoverable` or `clear_after_manual_verification`).
-
 ### Workflow Conflict Recovery
 
 When declarative graph authority fails to select a valid next state, the run

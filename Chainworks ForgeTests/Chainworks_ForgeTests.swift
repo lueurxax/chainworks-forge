@@ -753,7 +753,53 @@ struct RunTests {
     // MARK: - ARCH-PA-003: No direct Run construction outside RunRepository
 
     @Test func noDirectRunConstruction() throws {
-        #expect(true)
+        // ARCH-PA-006: recursive scan of ALL .swift files in app source tree.
+        // Mirrors the sanitization logic in scripts/test-gate.sh guard_direct_run_insertion():
+        // 1. Strip block comments (/* ... */)
+        // 2. Strip line comments (// ...)
+        // 3. Replace string literals with empty placeholders
+        // This prevents false positives from natural-language text like "Clone Run (Frozen Snapshot)".
+        let testFilePath = URL(fileURLWithPath: #filePath)
+        let sourceDir = testFilePath
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Chainworks Forge")
+        let directRunPattern = try Regex(#"\bRun\s*\("#)
+        let blockCommentPattern = try Regex(#"(?s)/\*.*?\*/"#)
+        let stringLiteralPattern = try Regex(#""(?:\\.|[^"\\])*""#)
+
+        let enumerator = FileManager.default.enumerator(
+            at: sourceDir,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )!
+
+        let exempted = Set(["RunRepository.swift", "Run.swift"])
+        var violations: [String] = []
+
+        for case let file as URL in enumerator where file.pathExtension == "swift" {
+            guard !exempted.contains(file.lastPathComponent) else { continue }
+            let raw = try String(contentsOf: file, encoding: .utf8)
+
+            // Strip block comments, then line comments, then string literals
+            var sanitized = raw.replacing(blockCommentPattern, with: "")
+            sanitized = sanitized
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map { line in
+                    let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+                    return trimmed.hasPrefix("//") ? "" : String(line)
+                }
+                .joined(separator: "\n")
+            sanitized = sanitized.replacing(stringLiteralPattern, with: #""""#)
+
+            if sanitized.contains(directRunPattern)
+                && !sanitized.contains("RunStatus")
+                && !sanitized.contains("RunRepositoryError")
+                && !raw.contains("// RunRepository-exempt") {
+                violations.append(file.lastPathComponent)
+            }
+        }
+        #expect(violations.isEmpty, "Direct Run construction outside RunRepository: \(violations)")
     }
 
     // MARK: - REQ-010: Stage execution relationships

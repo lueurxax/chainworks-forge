@@ -19,12 +19,6 @@ enum ImplementationSelfAssessmentSummaryProjection {
             return canonicalData(from: object)
         }
 
-        if artifactName == "implementation_self_assessment",
-            let summaryObject = canonicalSummaryObject(fromRawSelfAssessment: object)
-        {
-            return canonicalData(from: summaryObject)
-        }
-
         if artifactName == "implementation_review_summary",
             let summaryObject = object["implementation_self_assessment_summary"] as? [String: Any],
             isCanonicalSummaryObject(summaryObject)
@@ -77,87 +71,6 @@ enum ImplementationSelfAssessmentSummaryProjection {
             || object["target_stage_summaries"] != nil
             || object["validation_errors"] != nil
             || object["warnings"] != nil
-    }
-
-    private static func canonicalSummaryObject(fromRawSelfAssessment object: [String: Any]) -> [String: Any]? {
-        guard let status = object["status"] as? String,
-            knownStatuses.contains(status),
-            object["implementation_complete"] != nil,
-            object["verification_green"] != nil,
-            object["remaining_code_tasks"] is [Any],
-            object["handoff_tasks"] is [Any],
-            object["known_risks"] is [Any],
-            object["tests_run"] is [Any],
-            object["docs_impacted"] is [Any]
-        else {
-            return nil
-        }
-
-        var summary = object
-        let remainingCodeTasks = dictionaries(from: object["remaining_code_tasks"])
-        let handoffTasks = dictionaries(from: object["handoff_tasks"])
-        summary["remaining_code_task_count"] = remainingCodeTasks.count
-        summary["blocking_remaining_code_task_count"] = remainingCodeTasks.filter {
-            boolValue($0["blocking"]) == true
-        }.count
-        summary["handoff_task_count"] = handoffTasks.count
-        summary["blocking_review_handoff_task_count"] = handoffTasks.filter {
-            boolValue($0["blocking_review"]) == true
-        }.count
-        summary["owner_class_counts"] = ownerClassCounts(from: handoffTasks)
-        summary["target_stage_summaries"] = targetStageSummaries(from: handoffTasks)
-        summary["validation_errors"] = object["validation_errors"] ?? []
-        summary["warnings"] = object["warnings"] ?? []
-        return summary
-    }
-
-    private static func dictionaries(from value: Any?) -> [[String: Any]] {
-        value as? [[String: Any]] ?? []
-    }
-
-    private static func ownerClassCounts(from handoffTasks: [[String: Any]]) -> [String: Int] {
-        var counts: [String: Int] = [:]
-        for task in handoffTasks {
-            let ownerClass = (task["owner_class"] as? String) ?? "unknown"
-            counts[ownerClass, default: 0] += 1
-        }
-        return counts
-    }
-
-    private static func targetStageSummaries(from handoffTasks: [[String: Any]]) -> [[String: Any]] {
-        var counts: [String: (count: Int, blocking: Int)] = [:]
-        for task in handoffTasks {
-            guard let targetStage = task["target_stage"] as? String,
-                !targetStage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            else {
-                continue
-            }
-
-            let current = counts[targetStage] ?? (count: 0, blocking: 0)
-            counts[targetStage] = (
-                count: current.count + 1,
-                blocking: current.blocking + (boolValue(task["blocking_review"]) == true ? 1 : 0)
-            )
-        }
-
-        return counts.keys.sorted().map { targetStage in
-            let value = counts[targetStage] ?? (count: 0, blocking: 0)
-            return [
-                "target_stage": targetStage,
-                "count": value.count,
-                "blocking_review_count": value.blocking,
-            ]
-        }
-    }
-
-    private static func boolValue(_ value: Any?) -> Bool? {
-        if let bool = value as? Bool {
-            return bool
-        }
-        if let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() {
-            return number.boolValue
-        }
-        return nil
     }
 
     private static func canonicalData(from object: [String: Any]) -> Data? {

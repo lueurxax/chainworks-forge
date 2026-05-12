@@ -25,140 +25,6 @@
   "rollout_contract_cutover_policy_revision": "p078-cutover-v1",
   "rollout_contract_diagnostic_redaction": "none",
   "rollout_contract_next_steps": [],
-  "side_effect_readback": {
-    "schema_version": "p078_side_effect_readback_v1",
-    "blocked": true,
-    "unresolved_count": 1,
-    "readback_source": "side_effects_ledger",
-    "effects": [
-      {
-        "id": "effect-p078-fixture-001",
-        "run_id": "run-p078-fixture",
-        "stage_execution_id": "stage-p078-release-001",
-        "agent_execution_id": null,
-        "effect_kind": "git_push",
-        "status": "needs_reconciliation",
-        "target_key": "git_push://run-p078-fixture:stage-p078-release-001",
-        "external_write_attempted": true,
-        "evidence_root": ".chainworks/runs/run-p078-fixture/evidence/runs/run-p078-fixture/stages/stage-p078-release-001/agents/commit_and_push_to_github/receipt/side-effects/git_push",
-        "readback_source": "side_effects_ledger",
-        "report_path": ".chainworks/runs/run-p078-fixture/evidence/runs/run-p078-fixture/stages/stage-p078-release-001/agents/commit_and_push_to_github/receipt/side-effects/git_push/evidence-manifest.json",
-        "blocked_reason": "effect_needs_reconciliation",
-        "operator_next_action": "effects.reconcile",
-        "recommended_mcp_tool": "effects.reconcile",
-        "retry_forbidden": true,
-        "last_error_kind": "external_write_unsettled_deadline_expired",
-        "updated_at": "2026-05-12T13:00:00Z"
-      }
-    ]
-  },
-  "metrics": [
-    {
-      "name": "p078_release_side_effects_with_durable_intent_percent",
-      "kind": "gauge",
-      "effect_kind": "git_push",
-      "status": "prepared",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "side_effect_intent_total",
-      "kind": "counter",
-      "effect_kind": "git_push",
-      "status": "prepared",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "side_effect_transition_total",
-      "kind": "counter",
-      "effect_kind": "git_push",
-      "status": "executing",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "side_effect_retry_block_total",
-      "kind": "counter",
-      "effect_kind": "git_push",
-      "status": "needs_reconciliation",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "side_effect_unresolved",
-      "kind": "gauge",
-      "effect_kind": "git_push",
-      "status": "needs_reconciliation",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "side_effect_unresolved_age_seconds",
-      "kind": "histogram",
-      "effect_kind": "git_push",
-      "status": "needs_reconciliation",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "side_effect_recovery_transition_total",
-      "kind": "counter",
-      "effect_kind": "git_push",
-      "status": "needs_reconciliation",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "side_effect_settlement_latency_seconds",
-      "kind": "histogram",
-      "effect_kind": "git_push",
-      "status": "settled",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "startup_side_effect_recovery_total",
-      "kind": "counter",
-      "effect_kind": "git_push",
-      "status": "needs_reconciliation",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "startup_side_effect_recovery_duration_seconds",
-      "kind": "histogram",
-      "effect_kind": "git_push",
-      "status": "needs_reconciliation",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "side_effect_ledger_readback_error_total",
-      "kind": "counter",
-      "effect_kind": "git_push",
-      "status": "ledger_readback_error",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "side_effect_ledger_readback_circuit_open_total",
-      "kind": "counter",
-      "effect_kind": "git_push",
-      "status": "ledger_readback_error",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "side_effect_evidence_spooled_bytes_total",
-      "kind": "counter",
-      "effect_kind": "git_push",
-      "status": "settled",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "side_effect_evidence_disk_bytes",
-      "kind": "gauge",
-      "effect_kind": "git_push",
-      "status": "settled",
-      "cardinality_bound": "effect_kind_status"
-    },
-    {
-      "name": "side_effect_prepare_denied_total",
-      "kind": "counter",
-      "effect_kind": "git_push",
-      "status": "prepare_denied",
-      "cardinality_bound": "effect_kind_status"
-    }
-  ],
   "parity_lanes": {
     "mcp": {
       "rollout_contract_status": "pass",
@@ -181,34 +47,7 @@
       "rollout_contract_projection_integrity": "valid",
       "rollout_contract_cutover_policy_revision": "p078-cutover-v1",
       "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_next_steps": [],
-      "side_effect_readback": {
-        "schema_version": "p078_side_effect_readback_v1",
-        "blocked": true,
-        "unresolved_count": 1,
-        "readback_source": "side_effects_ledger",
-        "effects": [
-          {
-            "id": "effect-p078-fixture-001",
-            "run_id": "run-p078-fixture",
-            "stage_execution_id": "stage-p078-release-001",
-            "agent_execution_id": null,
-            "effect_kind": "git_push",
-            "status": "needs_reconciliation",
-            "target_key": "git_push://run-p078-fixture:stage-p078-release-001",
-            "external_write_attempted": true,
-            "evidence_root": ".chainworks/runs/run-p078-fixture/evidence/runs/run-p078-fixture/stages/stage-p078-release-001/agents/commit_and_push_to_github/receipt/side-effects/git_push",
-            "readback_source": "side_effects_ledger",
-            "report_path": ".chainworks/runs/run-p078-fixture/evidence/runs/run-p078-fixture/stages/stage-p078-release-001/agents/commit_and_push_to_github/receipt/side-effects/git_push/evidence-manifest.json",
-            "blocked_reason": "effect_needs_reconciliation",
-            "operator_next_action": "effects.reconcile",
-            "recommended_mcp_tool": "effects.reconcile",
-            "retry_forbidden": true,
-            "last_error_kind": "external_write_unsettled_deadline_expired",
-            "updated_at": "2026-05-12T13:00:00Z"
-          }
-        ]
-      }
+      "rollout_contract_next_steps": []
     },
     "release_receipt": {
       "rollout_contract_status": "pass",
@@ -231,34 +70,7 @@
       "rollout_contract_projection_integrity": "valid",
       "rollout_contract_cutover_policy_revision": "p078-cutover-v1",
       "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_next_steps": [],
-      "side_effect_readback": {
-        "schema_version": "p078_side_effect_readback_v1",
-        "blocked": true,
-        "unresolved_count": 1,
-        "readback_source": "side_effects_ledger",
-        "effects": [
-          {
-            "id": "effect-p078-fixture-001",
-            "run_id": "run-p078-fixture",
-            "stage_execution_id": "stage-p078-release-001",
-            "agent_execution_id": null,
-            "effect_kind": "git_push",
-            "status": "needs_reconciliation",
-            "target_key": "git_push://run-p078-fixture:stage-p078-release-001",
-            "external_write_attempted": true,
-            "evidence_root": ".chainworks/runs/run-p078-fixture/evidence/runs/run-p078-fixture/stages/stage-p078-release-001/agents/commit_and_push_to_github/receipt/side-effects/git_push",
-            "readback_source": "side_effects_ledger",
-            "report_path": ".chainworks/runs/run-p078-fixture/evidence/runs/run-p078-fixture/stages/stage-p078-release-001/agents/commit_and_push_to_github/receipt/side-effects/git_push/evidence-manifest.json",
-            "blocked_reason": "effect_needs_reconciliation",
-            "operator_next_action": "effects.reconcile",
-            "recommended_mcp_tool": "effects.reconcile",
-            "retry_forbidden": true,
-            "last_error_kind": "external_write_unsettled_deadline_expired",
-            "updated_at": "2026-05-12T13:00:00Z"
-          }
-        ]
-      }
+      "rollout_contract_next_steps": []
     },
     "graphql": {
       "rolloutContractStatus": "pass",
@@ -281,34 +93,7 @@
       "rolloutContractProjectionIntegrity": "valid",
       "rolloutContractCutoverPolicyRevision": "p078-cutover-v1",
       "rolloutContractDiagnosticRedaction": "none",
-      "rolloutContractNextSteps": [],
-      "sideEffectReadback": {
-        "schemaVersion": "p078_side_effect_readback_v1",
-        "blocked": true,
-        "unresolvedCount": 1,
-        "readbackSource": "side_effects_ledger",
-        "effects": [
-          {
-            "id": "effect-p078-fixture-001",
-            "runId": "run-p078-fixture",
-            "stageExecutionId": "stage-p078-release-001",
-            "agentExecutionId": null,
-            "effectKind": "git_push",
-            "status": "needs_reconciliation",
-            "targetKey": "git_push://run-p078-fixture:stage-p078-release-001",
-            "externalWriteAttempted": true,
-            "evidenceRoot": ".chainworks/runs/run-p078-fixture/evidence/runs/run-p078-fixture/stages/stage-p078-release-001/agents/commit_and_push_to_github/receipt/side-effects/git_push",
-            "readbackSource": "side_effects_ledger",
-            "reportPath": ".chainworks/runs/run-p078-fixture/evidence/runs/run-p078-fixture/stages/stage-p078-release-001/agents/commit_and_push_to_github/receipt/side-effects/git_push/evidence-manifest.json",
-            "blockedReason": "effect_needs_reconciliation",
-            "operatorNextAction": "effects.reconcile",
-            "recommendedMcpTool": "effects.reconcile",
-            "retryForbidden": true,
-            "lastErrorKind": "external_write_unsettled_deadline_expired",
-            "updatedAt": "2026-05-12T13:00:00Z"
-          }
-        ]
-      }
+      "rolloutContractNextSteps": []
     }
   }
 }

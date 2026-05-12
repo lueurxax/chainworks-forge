@@ -524,9 +524,6 @@ final class WorkflowOrchestrator {
             collectDeclaredOutputs(from: state.runBlock, into: &names)
             collectDeclaredOutputs(from: state.runAfterApproval, into: &names)
         }
-        if names.contains("implementation_self_assessment") {
-            names.insert("implementation_self_assessment_v2")
-        }
         return names
     }
 

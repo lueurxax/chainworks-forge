@@ -47,15 +47,34 @@ pub struct GitPushReceipt {
 pub struct GitReleaseService;
 
 impl GitReleaseService {
-    pub async fn commit_changes(
+    pub async fn commit_and_push(
         &self,
         worktree_root: &str,
         target_branch: &str,
         commit_message: &str,
-    ) -> Result<ReleaseManifest> {
-        let worktree = self
-            .validate_worktree_and_branch(worktree_root, target_branch)
-            .await?;
+    ) -> Result<(ReleaseManifest, GitPushReceipt)> {
+        let worktree = Path::new(worktree_root);
+        if !worktree.exists() {
+            bail!(GitReleaseError::WorktreeNotFound {
+                path: worktree_root.to_string(),
+            });
+        }
+
+        if matches!(target_branch, "main" | "master") {
+            bail!(GitReleaseError::UnsafeBranch(target_branch.to_string()));
+        }
+
+        let current_branch = self
+            .run_git(&["rev-parse", "--abbrev-ref", "HEAD"], worktree)
+            .await?
+            .trim()
+            .to_string();
+        if current_branch != target_branch {
+            bail!(GitReleaseError::NotOnExpectedBranch {
+                expected: target_branch.to_string(),
+                actual: current_branch,
+            });
+        }
 
         let status = self.run_git(&["status", "--porcelain"], worktree).await?;
         if status.trim().is_empty() {
@@ -105,106 +124,40 @@ impl GitReleaseService {
             .await?;
         let (files_changed, insertions, deletions) = parse_diff_stat(&diff_stat);
 
+        let remote = "origin";
+        self.run_git(&["push", remote, target_branch], worktree)
+            .await
+            .map_err(|e| anyhow::anyhow!(GitReleaseError::PushFailed(e.to_string())))?;
+
         let now = Utc::now();
         let manifest = ReleaseManifest {
             commit_sha: commit_sha.clone(),
             branch: target_branch.to_string(),
-            remote: "origin".to_string(),
+            remote: remote.to_string(),
             commit_message: commit_message.to_string(),
             files_changed,
             insertions,
             deletions,
             timestamp: now,
         };
-        Ok(manifest)
-    }
-
-    pub async fn push_commit(
-        &self,
-        worktree_root: &str,
-        target_branch: &str,
-    ) -> Result<GitPushReceipt> {
-        let worktree = self
-            .validate_worktree_and_branch(worktree_root, target_branch)
-            .await?;
-        let commit_sha = self
-            .run_git(&["rev-parse", "HEAD"], worktree)
-            .await?
-            .trim()
-            .to_string();
-
-        self.run_git(&["push", "origin", target_branch], worktree)
-            .await
-            .map_err(|e| anyhow::anyhow!(GitReleaseError::PushFailed(e.to_string())))?;
-
-        let now = Utc::now();
         let receipt = GitPushReceipt {
             commit_sha,
-            remote: "origin".to_string(),
+            remote: remote.to_string(),
             branch: target_branch.to_string(),
             status: "success".to_string(),
             failure_reason: None,
             timestamp: now,
         };
-        Ok(receipt)
-    }
 
-    pub async fn commit_and_push(
-        &self,
-        worktree_root: &str,
-        target_branch: &str,
-        commit_message: &str,
-    ) -> Result<(ReleaseManifest, GitPushReceipt)> {
-        let manifest = self
-            .commit_changes(worktree_root, target_branch, commit_message)
-            .await?;
-        let receipt = self.push_commit(worktree_root, target_branch).await?;
         Ok((manifest, receipt))
     }
 
-    async fn validate_worktree_and_branch<'a>(
-        &self,
-        worktree_root: &'a str,
-        target_branch: &str,
-    ) -> Result<&'a Path> {
-        let worktree = Path::new(worktree_root);
-        if !worktree.exists() {
-            bail!(GitReleaseError::WorktreeNotFound {
-                path: worktree_root.to_string(),
-            });
-        }
-
-        if matches!(target_branch, "main" | "master") {
-            bail!(GitReleaseError::UnsafeBranch(target_branch.to_string()));
-        }
-
-        let current_branch = self
-            .run_git(&["rev-parse", "--abbrev-ref", "HEAD"], worktree)
-            .await?
-            .trim()
-            .to_string();
-        if current_branch != target_branch {
-            bail!(GitReleaseError::NotOnExpectedBranch {
-                expected: target_branch.to_string(),
-                actual: current_branch,
-            });
-        }
-
-        Ok(worktree)
-    }
-
     async fn run_git(&self, args: &[&str], directory: &Path) -> Result<String> {
-        let args_owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-        let directory = directory.to_path_buf();
-        let output = tokio::task::spawn_blocking(move || {
-            Command::new("git")
-                .current_dir(directory)
-                .args(&args_owned)
-                .output()
-        })
-        .await
-        .context("join git process task")?
-        .with_context(|| format!("spawn git {:?}", args))?;
+        let output = Command::new("git")
+            .current_dir(directory)
+            .args(args)
+            .output()
+            .with_context(|| format!("spawn git {:?}", args))?;
 
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())

@@ -245,14 +245,6 @@ private func materializePortableSkillBundles(
 ) throws -> (triadPath: String, auditPath: String) {
     let repoRoot = testRepositoryRootURL(file: file)
     let sourceSkillsRoot = repoRoot.appendingPathComponent("examples/skills", isDirectory: true)
-    let triadSource = sourceSkillsRoot.appendingPathComponent("proposal-review-triad", isDirectory: true)
-    let auditSource = sourceSkillsRoot.appendingPathComponent("proposal-implementation-audit", isDirectory: true)
-
-    if FileManager.default.isReadableFile(atPath: triadSource.appendingPathComponent("SKILL.md").path),
-       FileManager.default.isReadableFile(atPath: auditSource.appendingPathComponent("SKILL.md").path) {
-        return (triadSource.path, auditSource.path)
-    }
-
     let localizedSkillsRoot = destinationURL.deletingLastPathComponent().appendingPathComponent(
         "portable-skills-\(destinationURL.deletingPathExtension().lastPathComponent)",
         isDirectory: true
@@ -269,11 +261,11 @@ private func materializePortableSkillBundles(
     }
 
     try FileManager.default.copyItem(
-        at: triadSource,
+        at: sourceSkillsRoot.appendingPathComponent("proposal-review-triad", isDirectory: true),
         to: triadDestination
     )
     try FileManager.default.copyItem(
-        at: auditSource,
+        at: sourceSkillsRoot.appendingPathComponent("proposal-implementation-audit", isDirectory: true),
         to: auditDestination
     )
 
