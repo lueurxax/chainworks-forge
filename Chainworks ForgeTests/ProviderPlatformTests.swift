@@ -56,11 +56,16 @@ struct ProviderPlatformTests {
         let repoRoot = testRepositoryRootURL()
         let workflowSourceURL = repoRoot.appendingPathComponent("examples/workflows/workflow.yaml")
         let catalogSourceURL = repoRoot.appendingPathComponent("examples/agents/agents.yaml")
+        let bundledWorkflowURL = Bundle(for: TestBundleMarker.self).url(forResource: "workflow", withExtension: "yaml")
+        let bundledCatalogURL = Bundle(for: TestBundleMarker.self).url(forResource: "agents", withExtension: "yaml")
         let workflowCopyURL = tempDirectory.appendingPathComponent("workflow.yaml")
         let catalogCopyURL = tempDirectory.appendingPathComponent("agents.yaml")
 
-        if fileManager.isReadableFile(atPath: workflowSourceURL.path) {
-            try fileManager.copyItem(at: workflowSourceURL, to: workflowCopyURL)
+        if let bundledWorkflowURL, let bundledCatalogURL {
+            try writePortableWorkflowCopy(from: bundledWorkflowURL, to: workflowCopyURL)
+            try writePortableCatalogCopy(from: bundledCatalogURL, to: catalogCopyURL)
+        } else if fileManager.isReadableFile(atPath: workflowSourceURL.path) {
+            try writePortableWorkflowCopy(from: workflowSourceURL, to: workflowCopyURL)
             try writePortableCatalogCopy(from: catalogSourceURL, to: catalogCopyURL)
         } else {
             // Source tree not accessible from sandboxed test process —
@@ -365,7 +370,7 @@ struct ProviderPlatformTests {
             )
         )
         let registry = retain(ProviderRegistry(settingsStore: settingsStore))
-        let catalog = try YAMLParser.loadAgentCatalog(from: testRepositoryRootURL().appendingPathComponent("examples/agents/agents.yaml"))
+        let catalog = try loadTestCanonicalCatalog()
 
         let service = ExecutionService(
             modelContext: context,

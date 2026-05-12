@@ -23,6 +23,7 @@ use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
@@ -78,9 +79,27 @@ fn test_agent_catalog_yaml_path() -> String {
     )
 }
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .unwrap();
+    pool
+}
+
+async fn file_backed_test_pool(db_path: &Path) -> sqlx::SqlitePool {
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .unwrap();
+    pool
+}
+
 #[tokio::test]
 async fn proposal_058_claim_start_precreates_execution_and_active_artifact_claim() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -276,7 +295,7 @@ async fn proposal_058_claim_start_precreates_execution_and_active_artifact_claim
 
 #[tokio::test]
 async fn proposal_058_claim_start_without_session_scope_does_not_fabricate_generation() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -412,7 +431,7 @@ async fn proposal_058_claim_start_without_session_scope_does_not_fabricate_gener
 
 #[tokio::test]
 async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -612,7 +631,7 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
 
 #[tokio::test]
 async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_with_fresh_execution() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -778,7 +797,7 @@ async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_with_fresh_exe
 
 #[tokio::test]
 async fn proposal_058_xcode_mcp_invoke_claim_respects_configured_xcode_capacity() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -898,7 +917,7 @@ async fn proposal_058_xcode_mcp_invoke_claim_respects_configured_xcode_capacity(
 
 #[tokio::test]
 async fn proposal_058_startup_repair_settles_terminal_preclaimed_invoke_execution() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1011,9 +1030,7 @@ async fn proposal_058_startup_repair_settles_terminal_preclaimed_invoke_executio
 async fn proposal_058_sessionless_invoke_agent_fails_closed_before_execution_creation() {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("sessionless-invoke.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1120,7 +1137,7 @@ async fn proposal_058_sessionless_invoke_agent_fails_closed_before_execution_cre
 
 #[tokio::test]
 async fn proposal_058_explicit_null_session_reuse_scope_claims_as_no_reuse() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1220,7 +1237,7 @@ async fn proposal_058_explicit_null_session_reuse_scope_claims_as_no_reuse() {
 
 #[tokio::test]
 async fn proposal_058_declared_output_claim_gets_durable_generation_without_reuse_scope() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1356,9 +1373,7 @@ async fn proposal_058_declared_output_claim_gets_durable_generation_without_reus
 async fn proposal_058_production_executor_fails_sessionless_invoke_before_processing() {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("sessionless-production-invoke.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1472,9 +1487,7 @@ async fn proposal_058_production_executor_fails_sessionless_invoke_before_proces
 async fn proposal_058_production_loop_claims_pending_invoke_agent_items() {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("production-loop-invoke.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1638,7 +1651,7 @@ async fn proposal_058_production_loop_claims_pending_invoke_agent_items() {
 
 #[tokio::test]
 async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_claimed() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let old_stage_execution_id = StageExecutionId::new();
@@ -1838,7 +1851,7 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
 
 #[tokio::test]
 async fn proposal_078_retry_release_stage_requires_effect_reconciliation_before_state_changes() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let old_stage_execution_id = StageExecutionId::new();
@@ -2019,7 +2032,7 @@ async fn proposal_078_retry_release_stage_requires_effect_reconciliation_before_
 
 #[tokio::test]
 async fn proposal_078_retry_manual_release_gate_checks_post_approval_release_tasks() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let old_stage_execution_id = StageExecutionId::new();
@@ -2111,7 +2124,7 @@ async fn proposal_078_retry_manual_release_gate_checks_post_approval_release_tas
 
 #[tokio::test]
 async fn proposal_078_targeted_release_retry_records_failed_journal_entry() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let old_stage_execution_id = StageExecutionId::new();
@@ -2248,7 +2261,7 @@ async fn proposal_078_targeted_release_retry_records_failed_journal_entry() {
 
 #[tokio::test]
 async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let old_stage_execution_id = StageExecutionId::new();

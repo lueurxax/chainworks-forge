@@ -546,6 +546,7 @@ final class ExecutionService {
             self?.refreshDockBadge()
         }
         activeOrchestrators[runID] = orchestrator
+        reconcileStalledOrchestratorsIfNeeded()
     }
 
     private func fetchRun(id: UUID) -> Run? {

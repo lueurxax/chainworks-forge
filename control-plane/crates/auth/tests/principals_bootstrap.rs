@@ -74,8 +74,26 @@ fn test_principals_bootstrap_token_logged_once_on_first_start() {
 fn test_principals_daemon_refuses_empty_principals_file() {
     let dir = tempfile::tempdir().expect("create tmp dir");
     let path = dir.path().join("principals.json");
-    // Well-formed JSON, zero principals.
-    std::fs::write(&path, r#"{"principals":[]}"#).expect("write empty principals file");
+    // Well-formed JSON, zero principals — must be written with 0600 so the
+    // HIGH-002 permission check does not fire before the empty-table check.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("create principals file with 0600");
+        f.write_all(br#"{"principals":[]}"#)
+            .expect("write empty principals file");
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, r#"{"principals":[]}"#).expect("write empty principals file");
+    }
 
     let err =
         PrincipalTable::load_or_bootstrap(&path).expect_err("zero-principal file must fail closed");
@@ -83,5 +101,71 @@ fn test_principals_daemon_refuses_empty_principals_file() {
     assert!(
         msg.contains("zero entries") || msg.contains("empty"),
         "error must clearly describe the empty-table failure, got {msg:?}"
+    );
+}
+
+/// HIGH-002 regression: principals.json with mode 0644 must be rejected.
+#[test]
+#[cfg(unix)]
+fn test_high_002_principals_file_with_loose_permissions_is_rejected() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().expect("create tmp dir");
+    let path = dir.path().join("principals.json");
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(&path)
+        .expect("create file with 0644");
+    // Write a valid-ish principals JSON so the rejection is purely about permissions.
+    f.write_all(br#"{"principals":[{"token":"t","id":"op","class":"operator"}]}"#)
+        .expect("write");
+    drop(f);
+
+    let err = PrincipalTable::load_or_bootstrap(&path)
+        .expect_err("0644 principals file must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("unsafe permissions") || msg.contains("0600"),
+        "error must mention unsafe permissions, got {msg:?}"
+    );
+}
+
+/// HIGH-002 regression: a symlinked principals.json must be rejected.
+#[test]
+#[cfg(unix)]
+fn test_high_002_symlinked_principals_file_is_rejected() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().expect("create tmp dir");
+
+    // Write a real target file with 0600 permissions.
+    let target = dir.path().join("real_principals.json");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&target)
+        .expect("create real file");
+    f.write_all(br#"{"principals":[{"token":"t","id":"op","class":"operator"}]}"#)
+        .expect("write");
+    drop(f);
+
+    // Create a symlink pointing to the real file.
+    let link = dir.path().join("principals.json");
+    std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+    let err = PrincipalTable::load_or_bootstrap(&link)
+        .expect_err("symlinked principals file must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("symlink"),
+        "error must mention symlink, got {msg:?}"
     );
 }
