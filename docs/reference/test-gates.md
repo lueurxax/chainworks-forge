@@ -1891,6 +1891,32 @@ Important:
 - `payload_deferred` must never collapse to `unavailable`; enforced by the Swift test slice
 - unknown GraphQL enum values must produce `.unknown` states; proved by `unknownPayloadStateFailsClosed` and `unknownFreshnessStateFailsClosed` tests
 
+### `proposal-088|p088`
+
+Code-writer completion handoff, output freshness, and repair diagnostics gate.
+
+Scope:
+
+- deterministic P088 evidence fixtures exist under `docs/evidence/088-code-writer-completion/`
+- fixtures cover P087 terminal-completed missing outputs, the 70c9-shaped preexisting dirty-work timeout negative case, large streamed prelude/tail capture, prompt-side evidence, public enum unknown handling, normal materialization without repair, mutation-guard failure, docs-only eligibility, generated-evidence-only ineligibility, ingestion-boundary failures, partial-write recovery, and `worktree_fingerprint_v1`
+- Rust focused tests cover ACP capture, typed code-writer completion session events, prompt-level runtime receipt persistence, canonical receipt-link readback, receipt linkage/conflict detection, worktree fingerprint classification, completion receipt readback, GraphQL/MCP/run-report `implementationCompletion` parity with closed vocabularies plus `known=false` unknown-value metadata, and a stale `implementation_active`/P037 idle-terminalization canary proving `code_writer` candidates enter P088 receipt readback instead of active-prompt auto-requeue
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-088
+./scripts/test-gate.sh p088
+```
+
+Important:
+
+- completion repair eligibility must require `work_change_kind=current_attempt_diff`; inherited dirty work must fail closed as ineligible
+- stale `implementation_active` proof is a focused executable engine canary for the actual `InvokeAgent` error branch; it does not claim a full live ACP supervisor timeout end-to-end
+- usable final `CHAINWORKS_OUTPUT` must materialize through normal settlement without completion repair
+- public readback must preserve known enum values and fail closed for unknown future values
+- `implementationCompletion` must be projected from canonical linked receipt truth, not from latest historical receipt by timestamp
+- required evidence write failures must surface as `completion_receipt_partial_write` / `storage_write_failed`, not clean missing fields
+
 ### `proposal-075|p075`
 
 Retained historical alias for the local persistence write budget, evidence spooling, storage diagnostics, and fail-closed registry gate. Operational truth lives in `docs/reference/rust-control-plane.md`.

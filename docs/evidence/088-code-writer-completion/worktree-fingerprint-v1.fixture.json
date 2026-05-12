@@ -1,0 +1,33 @@
+{
+  "schema_version": "worktree_fingerprint_v1",
+  "run_id": "b4edcf82-0d3f-4281-83b7-f8fe94721721",
+  "stage_execution_id": "fixture-stage",
+  "agent_execution_id": "70c9b120-fixture",
+  "session_generation_id": "fixture-generation",
+  "capture_phase": "post_original_prompt",
+  "classifier_version": "p088-v1",
+  "paths": [
+    {
+      "path": "control-plane/crates/mcp-server/src/tools/storage.rs",
+      "normalized_path": "control-plane/crates/mcp-server/src/tools/storage.rs",
+      "included": true,
+      "include_or_exclude_reason": "implementation_owned_path",
+      "path_status": "preexisting_dirty",
+      "content_sha256": "fixture",
+      "mode": "100644",
+      "size_bytes": 1,
+      "source": "git_diff"
+    }
+  ],
+  "summary": {
+    "included_path_count": 1,
+    "excluded_path_count": 0,
+    "current_attempt_changed_path_count": 0,
+    "preexisting_dirty_path_count": 1,
+    "control_plane_only_path_count": 0,
+    "generated_artifact_only_path_count": 0,
+    "deleted_path_count": 0,
+    "renamed_path_count": 0,
+    "work_change_kind": "preexisting_dirty_work"
+  }
+}

@@ -6,6 +6,7 @@ pub mod capabilities;
 pub mod closeout_readiness;
 pub mod closeout_readiness_mode;
 pub mod closeout_readiness_summary_accessor;
+pub mod code_writer_completion;
 pub mod commands;
 pub mod discovery;
 pub mod events;

@@ -342,6 +342,22 @@ pub struct AgentExecutionRuntimeReceiptRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentExecutionRuntimePromptReceiptRecord {
+    pub runtime_receipt_id: String,
+    pub agent_execution_id: AgentExecutionId,
+    pub prompt_kind: String,
+    pub turn_index: i64,
+    pub prompt_template_id: Option<String>,
+    pub prompt_template_version: Option<i64>,
+    pub prompt_sha256: Option<String>,
+    pub redacted_prompt_artifact_path: Option<String>,
+    pub expected_output_contract_snapshot_sha256: Option<String>,
+    pub expected_output_contract_snapshot_path: Option<String>,
+    pub repair_or_settlement_reason: Option<String>,
+    pub runtime_receipt: AgentExecutionRuntimeReceiptRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactSourceClaimState {
     Active,

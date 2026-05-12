@@ -6177,6 +6177,197 @@ PY
     run_targeted_tests "proposal-077-ui" "${P077_UI_TESTS[@]}"
     log "Proposal 077 remote macOS closeout-readiness UI gate passed"
     ;;
+  proposal-088|p088)
+    log "Proposal 088 gate: code-writer completion handoff and diagnostics"
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path.cwd()
+evidence = root / "docs/evidence/088-code-writer-completion"
+required = {
+    "p087-terminal-completed-missing-outputs.fixture.json": {
+        "scenario": "p087_terminal_completed_missing_outputs",
+        "expected_failure_class": "terminal_response_completed_missing_required_outputs",
+    },
+    "p087-70c9-dirty-worktree-timeout.fixture.json": {
+        "scenario": "p087_70c9_preexisting_dirty_timeout",
+        "work_change_kind": "preexisting_dirty_work",
+        "expected_next_operator_action": "do_not_retry_preexisting_dirty_timeout",
+    },
+    "large-streamed-prelude-tail-capture.fixture.json": {
+        "scenario": "large_streamed_prelude_tail_capture",
+        "completion_text_capture_source": "streamed_update_tail",
+        "extraction_input_truncated": False,
+    },
+    "public-enum-roundtrip.fixture.json": {
+        "scenario": "public_enum_roundtrip",
+    },
+    "worktree-fingerprint-v1.fixture.json": {
+        "schema_version": "worktree_fingerprint_v1",
+    },
+    "prompt-side-evidence.fixture.json": {
+        "scenario": "prompt_side_evidence",
+        "prompt_template_id": "code_writer_completion_repair_v1",
+    },
+    "normal-materialization-no-repair.fixture.json": {
+        "scenario": "normal_materialization_no_repair",
+        "expected_completion_turn_attempted": False,
+    },
+    "completion-repair-mutation-negative.fixture.json": {
+        "scenario": "completion_repair_mutation_negative",
+        "expected_completion_turn_result": "failed_unexpected_worktree_mutation",
+    },
+    "docs-only-implementation-change.fixture.json": {
+        "scenario": "docs_only_implementation_change",
+        "work_change_kind": "current_attempt_diff",
+    },
+    "generated-evidence-only-ineligible.fixture.json": {
+        "scenario": "generated_evidence_only_ineligible",
+        "expected_eligible_for_completion_repair": False,
+    },
+    "ingestion-boundary-failures.fixture.json": {
+        "scenario": "ingestion_boundary_failures",
+    },
+    "partial-write-recovery.fixture.json": {
+        "scenario": "completion_receipt_partial_write",
+        "expected_failure_class": "completion_receipt_partial_write",
+    },
+    "provider-independence.fixture.json": {
+        "scenario": "provider_independence_completion_contract",
+        "expected_failure_class": "work_completed_missing_current_attempt_outputs",
+        "provider_specific_truth_branch_allowed": False,
+    },
+}
+for name, expectations in required.items():
+    path = evidence / name
+    if not path.exists():
+        raise SystemExit(f"proposal-088: missing fixture {path}")
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"proposal-088: invalid JSON in {path}: {exc}") from exc
+    for key, expected in expectations.items():
+        actual = data.get(key)
+        if actual != expected:
+            raise SystemExit(
+                f"proposal-088: fixture {name} expected {key}={expected!r}, got {actual!r}"
+            )
+
+fingerprint = json.loads((evidence / "worktree-fingerprint-v1.fixture.json").read_text())
+paths = fingerprint.get("paths")
+summary = fingerprint.get("summary", {})
+if not isinstance(paths, list) or not paths:
+    raise SystemExit("proposal-088: worktree fingerprint fixture must contain paths")
+if paths != sorted(paths, key=lambda item: item.get("normalized_path", "")):
+    raise SystemExit("proposal-088: worktree fingerprint paths must be sorted")
+derived_preexisting = sum(1 for path in paths if path.get("path_status") == "preexisting_dirty")
+if summary.get("preexisting_dirty_path_count") != derived_preexisting:
+    raise SystemExit("proposal-088: fingerprint preexisting_dirty_path_count is not derived")
+if summary.get("work_change_kind") != "preexisting_dirty_work":
+    raise SystemExit("proposal-088: fingerprint fixture must prove preexisting dirty work")
+
+provider_fixture = json.loads((evidence / "provider-independence.fixture.json").read_text())
+providers = sorted(item.get("provider") for item in provider_fixture.get("providers", []))
+if providers != ["claude", "codex", "junie"]:
+    raise SystemExit(
+        f"proposal-088: provider independence fixture must cover claude/codex/junie, got {providers!r}"
+    )
+
+proposal = root / "docs/proposals/088-code-writer-completion-contract-and-output-freshness.md"
+if not proposal.exists():
+    raise SystemExit("proposal-088: missing proposal document")
+proposal_text = proposal.read_text()
+for required_term in [
+    "code_writer_completion_repair_v1",
+    "worktree_fingerprint_v1",
+    "terminal_response_capture_truncated_before_output",
+    "extraction_input_truncated",
+    "current_attempt_diff",
+    "preexisting_dirty_work",
+]:
+    if required_term not in proposal_text:
+        raise SystemExit(f"proposal-088: proposal missing required term {required_term!r}")
+
+gates_doc = root / "docs/reference/test-gates.md"
+if not gates_doc.exists():
+    raise SystemExit("proposal-088: missing docs/reference/test-gates.md")
+gates_text = gates_doc.read_text()
+for required_term in [
+    "### `proposal-088|p088`",
+    "worktree_fingerprint_v1",
+    "70c9",
+    "implementationCompletion",
+    "closed vocabularies",
+    "prompt-level runtime receipt persistence",
+]:
+    if required_term not in gates_text:
+        raise SystemExit(f"proposal-088: test-gates.md missing {required_term!r}")
+
+db_repo = root / "control-plane/crates/db/src/repos/code_writer_completion_receipts.rs"
+db_repo_text = db_repo.read_text()
+for required_term in [
+    "upsert_with_runtime_receipts",
+    "list_canonical_by_run",
+    "completion_receipt_conflict",
+    "code_writer_completion_receipt_links",
+]:
+    if required_term not in db_repo_text:
+        raise SystemExit(f"proposal-088: DB receipt repo missing {required_term!r}")
+
+engine_executor = root / "control-plane/crates/engine/src/executor.rs"
+engine_executor_text = engine_executor.read_text()
+for required_term in [
+    "skipped_no_live_session",
+    "p037_idle_terminalization",
+    "upsert_with_runtime_receipts",
+    "completion_receipt_partial_write",
+    "storage_write_failed",
+    "CodeWriterCompletionStarted",
+    "CodeWriterCompletionSucceeded",
+    "CodeWriterCompletionFailed",
+]:
+    if required_term not in engine_executor_text:
+        raise SystemExit(f"proposal-088: engine executor missing {required_term!r}")
+
+engine_integration = root / "control-plane/crates/engine/tests/integration.rs"
+engine_integration_text = engine_integration.read_text()
+for required_term in [
+    "proposal_088_code_writer_stale_implementation_active_enters_receipt_path_not_auto_requeue",
+    "p088_stale_implementation_active",
+    "acp_active_prompt_recovery",
+]:
+    if required_term not in engine_integration_text:
+        raise SystemExit(f"proposal-088: engine integration test missing {required_term!r}")
+
+sessions_domain = root / "control-plane/crates/domain/src/session.rs"
+sessions_repo = root / "control-plane/crates/db/src/repos/sessions.rs"
+for required_term in [
+    "CodeWriterCompletionStarted",
+    "CodeWriterCompletionSucceeded",
+    "CodeWriterCompletionFailed",
+    "code_writer_completion_started",
+    "code_writer_completion_succeeded",
+    "code_writer_completion_failed",
+]:
+    if required_term not in sessions_domain.read_text():
+        raise SystemExit(f"proposal-088: domain session events missing {required_term!r}")
+    if required_term not in sessions_repo.read_text():
+        raise SystemExit(f"proposal-088: DB session event mapping missing {required_term!r}")
+
+print("proposal-088 static fixture checks passed")
+PY
+    (
+      cd control-plane
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p acp proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p domain proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p db proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p engine proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p graphql-server proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p mcp-server proposal_088_ -- --nocapture
+    )
+    log "Proposal 088 gate passed"
+    ;;
   proposal-085|p085)
     log "Proposal 085 gate: thin-client read-model parity and affordance contract"
     python3 - <<'PY'

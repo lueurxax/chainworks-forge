@@ -1696,6 +1696,21 @@ impl Orchestrator {
                 &persisted_artifacts,
             )
             .await?;
+        if !approved_proposal_present {
+            if let Some(proposal_current) = persisted_artifacts
+                .iter()
+                .rev()
+                .find(|artifact| artifact.name == "proposal_current")
+            {
+                let _ = crate::rollout_contract_preflight::persist_proposal_current_rollout_contract_hold(
+                    &self.pool,
+                    run,
+                    proposal_current,
+                    0,
+                )
+                .await?;
+            }
+        }
 
         let preflight =
             crate::rollout_contract_preflight::implementation_run_start_rollout_contract_preflight(
@@ -1762,6 +1777,7 @@ impl Orchestrator {
         if run.status != RunStatus::Blocked {
             runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
         }
+        artifact_contracts::rebuild_projection_and_exports(&self.pool, run_id).await?;
         let _ = self.events.send(DomainEvent::StageStatusChanged {
             run_id,
             stage_execution_id: stage.id,

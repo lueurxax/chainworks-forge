@@ -1928,6 +1928,10 @@ fn check_starvation(
         WriteLane::TelemetryRollup,
     ];
     for (i, &lane) in lower_lanes.iter().enumerate() {
+        let lane_idx = lane.drain_order_index();
+        if heartbeat.lane_pending_count[lane_idx].load(Ordering::Relaxed) <= 0 {
+            continue;
+        }
         if let Some(last) = lower_last_drain[i] {
             let idle_secs = last.elapsed().as_secs();
             if idle_secs >= STARVATION_WATCHDOG_SECS {
@@ -2450,6 +2454,46 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
         writer.shutdown().await;
+    }
+
+    #[test]
+    fn starvation_watchdog_ignores_empty_lower_lane_after_prior_drain() {
+        let heartbeat = DbWriterHeartbeat::new();
+        let lower_last_drain = [
+            None,
+            Some(Instant::now() - Duration::from_secs(STARVATION_WATCHDOG_SECS + 1)),
+            None,
+            None,
+        ];
+
+        check_starvation(&lower_last_drain, false, &heartbeat);
+
+        assert_eq!(
+            heartbeat.starvation_total.load(Ordering::Relaxed),
+            0,
+            "idle lower lanes with no queued work must not be reported as starved"
+        );
+    }
+
+    #[test]
+    fn starvation_watchdog_reports_pending_lower_lane_after_timeout() {
+        let heartbeat = DbWriterHeartbeat::new();
+        let lane_idx = WriteLane::CoalescedProjection.drain_order_index();
+        heartbeat.lane_pending_count[lane_idx].store(1, Ordering::Relaxed);
+        let lower_last_drain = [
+            None,
+            Some(Instant::now() - Duration::from_secs(STARVATION_WATCHDOG_SECS + 1)),
+            None,
+            None,
+        ];
+
+        check_starvation(&lower_last_drain, false, &heartbeat);
+
+        assert_eq!(
+            heartbeat.starvation_total.load(Ordering::Relaxed),
+            1,
+            "pending lower-lane work that cannot drain past the watchdog must still be reported"
+        );
     }
 
     // -----------------------------------------------------------------------

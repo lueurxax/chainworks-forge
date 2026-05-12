@@ -293,7 +293,7 @@ Defined in `crates/acp/src/transport.rs`:
 
 ### Permission auto-grant
 
-When the subprocess sends `session/request_permission`, the transport auto-grants by selecting `allow_once` (or `approved` as fallback). This matches the autonomous execution model. See `build_permission_grant()` in `crates/acp/src/transport.rs`.
+When the subprocess sends `session/request_permission`, the transport auto-grants by selecting the narrowest stable autonomous option. Provider-declared read-only allowlist options win first, then `allow_once`, then `approved` as fallback. This avoids repeated fragile approval round-trips for safe read-only commands while keeping write-capable terminal actions one-shot. See `build_permission_grant()` in `crates/acp/src/transport.rs`.
 
 ### Artifact discovery
 
@@ -323,7 +323,7 @@ The `AcpRuntimeManager` (`crates/acp/src/manager.rs`) pre-registers five adapter
 | `AuggieAdapter` | `auggie` | `CHAINWORKS_AUGGIE_ACP_BINARY` |
 | `JunieAdapter` | `junie` | `CHAINWORKS_JUNIE_ACP_BINARY` |
 
-Each adapter reads its binary path from the environment at construction and spawns the subprocess with piped stdio in its own process group when `execute()` is called.
+Each adapter reads its binary path from the environment at construction and spawns the subprocess with piped stdio in its own process group when `execute()` is called. Runtime provider subprocesses are launched with cwd set to the run worktree when write-enabled, otherwise to `workspace_root`; capability probes remain cwd-neutral preflight checks.
 `JunieAdapter` passes `--acp true` at launch so the local Junie CLI enters ACP JSON-RPC mode.
 
 ### Timeouts
@@ -331,6 +331,21 @@ Each adapter reads its binary path from the environment at construction and spaw
 - Handshake: 90 seconds by default; 120 seconds for Gemini
 - Idle (no message): 300 seconds (reset on every received line)
 - Shutdown wait: 5 seconds
+
+Idle/progress timeouts are normalized by runtime facts before operator
+readback. When a provider times out after meaningful `session/update` progress
+and the final receipt events include streamed text or a diff update, while all
+permission requests have already been granted, the engine records a recoverable
+handoff gap instead of an ordinary provider timeout:
+
+- `failure_kind = missing_required_outputs`
+- `output_settlement = missing_required_outputs`
+- `supervision_classification = recoverable_handoff_gap_after_provider_progress`
+- `transport_error_code = ACP_HANDOFF_IDLE_AFTER_DIFF`
+
+This distinguishes “the agent changed the worktree but did not finish the
+required handoff files” from a generic provider timeout or a terminal permission
+wait.
 
 ## Persistence model
 
@@ -494,6 +509,12 @@ build and toolchain caches are mapped and isolated.
 The scheduler remains language-neutral: it allocates bounded execution capacity 
 and writable roots, while provider adapters map the generic toolchain root to 
 tool-specific environment variables or command arguments.
+
+Invocations that declare `requires_xcode_host_execution` or
+`xcode_shim_injection_signal` are promoted to a brokered `xcode` MCP request
+before ACP startup. The Xcode MCP broker lease and warm-up therefore run before
+the provider subprocess receives the task, and MCP registry/broker failures fail
+closed before launching the agent.
 
 **Diagnostics and Readback:**
 Each `AgentExecution` records `actualToolchainMappingDiagnostics` (GraphQL) / 

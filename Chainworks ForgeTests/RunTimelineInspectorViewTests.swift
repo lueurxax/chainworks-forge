@@ -59,6 +59,42 @@ struct RunTimelineInspectorViewTests {
         #expect(spine.contains { $0.detail.contains("/usr/bin/xcodebuild") })
     }
 
+    @Test("Focused timeline can surface implementation completion diagnostics")
+    func focusedTimelineCanSurfaceImplementationCompletionDiagnostics() {
+        let completion = P088ImplementationCompletionPresenter.presentation(
+            for: P088ImplementationCompletionReadModel(
+                status: .known(value: "failed"),
+                failureClass: "terminal_response_completed_missing_required_outputs",
+                workChangeKind: "current_attempt_diff",
+                activationSource: "p037_idle_terminalization",
+                ingestionBoundaryFailure: .known(value: "chainworks_output_not_extracted"),
+                completionTurnAttempted: true,
+                completionTurnResult: .known(value: "failed_missing_outputs"),
+                terminalResponseStatus: "completed",
+                completionTextCaptures: [],
+                freshRequiredOutputCount: 1,
+                staleRequiredOutputCount: 0,
+                missingRequiredOutputCount: 2,
+                controlPlaneOutputCount: 1,
+                receiptArtifactPath: ".chainworks/p088/receipt.json",
+                failedStageEvidencePath: ".chainworks/p088/failed-stage.json",
+                nextOperatorAction: .known(value: "fix_chainworks_output_extraction")
+            )
+        )
+
+        let spine = buildFocusedTimelineSpineEntries(
+            liveTimeline: [],
+            persistedTimeline: [],
+            implementationCompletion: completion,
+            implementationCompletionTimestamp: Date(timeIntervalSince1970: 300)
+        )
+
+        #expect(spine.first?.kind == .implementationCompletion)
+        #expect(spine.first?.surfaceLabel == "implementation_completion")
+        #expect(spine.first?.detail.contains("2 missing") == true)
+        #expect(spine.first?.detail.contains(".chainworks/p088/receipt.json") == true)
+    }
+
     @Test("Xcode runtime observations decode into structured inspector rows")
     func xcodeRuntimeObservationsDecodeIntoStructuredRows() throws {
         let agentExecutionID = try #require(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))

@@ -7,6 +7,7 @@ pub mod approvals;
 pub mod artifact_contracts;
 pub mod artifacts;
 pub mod closeout;
+pub mod code_writer_completion_receipts;
 pub mod command_journal;
 pub mod dynamic_materialization;
 pub mod evidence_spool_refs;

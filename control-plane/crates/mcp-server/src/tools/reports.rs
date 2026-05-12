@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
     agent_execution_runtime_receipts, agent_executions, artifact_contracts, artifacts, closeout,
-    lead_conflict_mediations, legacy_discovery_overrides, rollout_contract_checks, sessions,
-    validation, workflow_conflicts,
+    code_writer_completion_receipts, lead_conflict_mediations, legacy_discovery_overrides,
+    rollout_contract_checks, sessions, validation, workflow_conflicts,
 };
 use db::write_class::WriteLane;
 use db::writer::class_a_operation;
@@ -75,6 +75,9 @@ pub async fn execute(
                 }
             }
             let closeout_readiness_summary = closeout_readiness_summary_json(pool, run_id).await?;
+            let code_writer_completion_receipts =
+                code_writer_completion_receipts_json(pool, run_id).await?;
+            let implementation_completion = implementation_completion_json(pool, run_id).await?;
             reports.push(serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "run_id": run_id.to_string(),
@@ -98,6 +101,8 @@ pub async fn execute(
                     principal.class == auth::PrincipalClass::Operator,
                 )
                 .await?,
+                "code_writer_completion_receipts": code_writer_completion_receipts,
+                "implementationCompletion": implementation_completion,
                 "workflow_conflict": workflow_conflict_json(pool, cmd_handler, run_id).await?,
                 "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
@@ -540,6 +545,11 @@ pub(crate) async fn execution_mcp_truth_json(
         .into_iter()
         .map(|readback| (readback.diagnostics.agent_execution_id.clone(), readback))
         .collect::<HashMap<_, _>>();
+    let completion_receipts = code_writer_completion_receipts::list_by_run(pool, run_id).await?;
+    let completion_receipts_by_execution_id: HashMap<_, _> = completion_receipts
+        .iter()
+        .map(|readback| (readback.receipt.agent_execution_id.to_string(), readback))
+        .collect::<HashMap<_, _>>();
     let mut items = Vec::with_capacity(executions.len());
     for execution in executions.into_iter() {
         let execution_id = execution.id.to_string();
@@ -624,6 +634,15 @@ pub(crate) async fn execution_mcp_truth_json(
             "mcp_session_startup_latency_ms": execution.mcp_session_startup_latency_ms,
             "runtime_facts": runtime_facts,
             "discovery_diagnostics": discovery_diagnostics,
+            "code_writer_completion_receipt": completion_receipts_by_execution_id
+                .get(&execution_id)
+                .map(|readback| {
+                    serde_json::to_value(domain::code_writer_completion::project_implementation_completion(
+                        std::slice::from_ref(*readback),
+                    ))
+                })
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null),
             // P066: toolchain mapping diagnostics — always non-null, legacy rows synthesized.
             "actual_toolchain_mapping_diagnostics": toolchain_mapping_diagnostics_mcp(
                 execution.actual_toolchain_mapping_diagnostics_json.as_deref()
@@ -631,6 +650,29 @@ pub(crate) async fn execution_mcp_truth_json(
         }));
     }
     Ok(serde_json::Value::Array(items))
+}
+
+pub(crate) async fn code_writer_completion_receipts_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let receipts = code_writer_completion_receipts::list_by_run(pool, run_id).await?;
+    Ok(serde_json::Value::Array(
+        receipts
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<serde_json::Result<Vec<_>>>()?,
+    ))
+}
+
+pub(crate) async fn implementation_completion_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let receipts = code_writer_completion_receipts::list_canonical_by_run(pool, run_id).await?;
+    Ok(serde_json::to_value(
+        domain::code_writer_completion::project_implementation_completion(&receipts),
+    )?)
 }
 
 /// P066: Build the MCP-surface toolchain mapping diagnostics value.

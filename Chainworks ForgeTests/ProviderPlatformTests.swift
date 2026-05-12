@@ -1393,6 +1393,14 @@ struct ProviderPlatformTests {
                         endpoint: "https://127.0.0.1:51200",
                         authMode: .none,
                         defaultModel: "gemini-3.1-pro-preview"
+                    ),
+                    ConfiguredProvider(
+                        family: .junie,
+                        displayName: "Junie",
+                        transport: .cli,
+                        endpoint: "https://127.0.0.1:51200",
+                        authMode: .none,
+                        defaultModel: "junie-default"
                     )
                 ],
                 preferredProviderIDsByFamily: [:],

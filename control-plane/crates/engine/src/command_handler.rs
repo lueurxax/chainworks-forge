@@ -13,8 +13,9 @@ use tracing::{info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
-    artifact_contracts, closeout, command_journal, ideas, legacy_discovery_overrides, projections,
-    retry_operator_instructions, runs, scheduler, sessions, stages, work_items, workflow_conflicts,
+    artifact_contracts, closeout, code_writer_completion_receipts, command_journal, ideas,
+    legacy_discovery_overrides, projections, retry_operator_instructions, runs, scheduler,
+    sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
@@ -1292,6 +1293,26 @@ fn targeted_retry_provider_fallback(
     })
 }
 
+fn attach_p088_operator_retry_completion_recovery_payload(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    source_agent_execution_id: &str,
+    evidence_path: &str,
+) {
+    object.insert(
+        "p088".into(),
+        serde_json::json!({
+            "activation_source": "operator_retry_completion_recovery",
+            "operator_retry_completion_recovery": true,
+            "preserved_historical_evidence_packet_path": evidence_path,
+            "source_agent_execution_id": source_agent_execution_id,
+        }),
+    );
+    object.insert(
+        "retry_reason".into(),
+        serde_json::json!("operator_retry_completion_recovery"),
+    );
+}
+
 fn targeted_retry_fallback_profile_id<'a>(
     agent_id: &str,
     from_provider: &str,
@@ -1445,7 +1466,11 @@ fn validate_operator_selected_candidate(candidate: &CandidateTransitionEvaluatio
             if candidate
                 .sanitized_diagnostic
                 .as_deref()
-                .is_some_and(|diagnostic| diagnostic.contains("Loop budget exhausted")) =>
+                .is_some_and(|diagnostic| {
+                    diagnostic
+                        .to_ascii_lowercase()
+                        .contains("loop budget exhausted")
+                }) =>
         {
             Ok(())
         }
@@ -4308,6 +4333,16 @@ impl CommandHandler {
         let runtime_facts =
             agent_execution_runtime_facts::find_by_execution_id(&self.pool, agent_execution_id)
                 .await?;
+        let p088_completion_retry_evidence =
+            code_writer_completion_receipts::find_by_execution_id(&self.pool, agent_execution_id)
+                .await?
+                .and_then(|readback| {
+                    readback
+                        .receipt
+                        .failed_stage_evidence_path
+                        .clone()
+                        .or(readback.receipt.receipt_artifact_path.clone())
+                });
         let provider_fallback =
             targeted_retry_catalog_profile_override(&run, &target_exec.agent_id, &retry_payload)
                 .or_else(|| {
@@ -4367,6 +4402,13 @@ impl CommandHandler {
                     "reason": "operator_targeted_retry"
                 }),
             );
+            if let Some(evidence_path) = p088_completion_retry_evidence.as_deref() {
+                attach_p088_operator_retry_completion_recovery_payload(
+                    object,
+                    &agent_execution_id.to_string(),
+                    evidence_path,
+                );
+            }
             if let Some(fallback) = provider_fallback {
                 object.insert(
                     "backend_profile_id".into(),
@@ -5558,6 +5600,30 @@ reviewer_override:
     }
 
     #[test]
+    fn workflow_conflict_resolution_accepts_lowercase_loop_budget_exhausted_candidate() {
+        let candidate = CandidateTransitionEvaluation {
+            transition_id: "state_9_implementation_reviewed__to__state_10_implementation_refined__1"
+                .into(),
+            from_state_id: "state_9_implementation_reviewed".into(),
+            to_state_id: "state_10_implementation_refined".into(),
+            condition_expression_id: Some("transition_condition_1".into()),
+            result: CandidateTransitionResult::NotMatched,
+            required_artifacts: vec!["implementation_review_summary".into()],
+            missing_artifacts: vec![],
+            missing_fields: vec![],
+            source_artifact_ids: vec!["implementation_review_summary".into()],
+            source_agent_execution_id: None,
+            sanitized_diagnostic: Some(
+                "implementation_review_summary.status=needs_code_fixes requires refinement, but loop budget exhausted for implementation_revision_count: 12/12 iterations"
+                    .into(),
+            ),
+        };
+
+        validate_operator_selected_candidate(&candidate)
+            .expect("operator override should accept orchestrator loop-budget diagnostics");
+    }
+
+    #[test]
     fn p077_empty_capability_is_rejected() {
         let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
         cmd.capability = "".into();
@@ -5567,6 +5633,40 @@ reviewer_override:
             err.to_string().contains("empty capability")
                 || err.to_string().contains("invalid capability"),
             "error should describe the empty-capability rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn proposal_088_targeted_retry_payload_carries_completion_recovery_evidence() {
+        let mut payload = serde_json::json!({
+            "run_id": "run-1",
+            "stage_id": "state_7_implementation_started",
+            "agent_id": "code_writer"
+        });
+
+        attach_p088_operator_retry_completion_recovery_payload(
+            payload.as_object_mut().expect("payload object"),
+            "agent-exec-1",
+            ".chainworks/evidence/p088/failed-stage.json",
+        );
+
+        assert_eq!(
+            payload
+                .pointer("/p088/activation_source")
+                .and_then(serde_json::Value::as_str),
+            Some("operator_retry_completion_recovery")
+        );
+        assert_eq!(
+            payload
+                .pointer("/p088/preserved_historical_evidence_packet_path")
+                .and_then(serde_json::Value::as_str),
+            Some(".chainworks/evidence/p088/failed-stage.json")
+        );
+        assert_eq!(
+            payload
+                .get("retry_reason")
+                .and_then(serde_json::Value::as_str),
+            Some("operator_retry_completion_recovery")
         );
     }
 }

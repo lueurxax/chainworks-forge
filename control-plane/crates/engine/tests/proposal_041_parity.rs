@@ -1643,6 +1643,7 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
                 })
                 .collect(),
             pre_prompt_expected_outputs: Vec::new(),
+            completion_text_capture: Default::default(),
             transcript_text: None,
             cost_cents: None,
             usage: None,

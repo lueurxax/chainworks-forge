@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use std::time::Duration;
 use tracing::info;
 
 use crate::adapters::{AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
@@ -90,6 +91,7 @@ impl AcpAdapter for GeminiCliAdapter {
             config_options: Vec::new(),
             required_config_options: Vec::new(),
             set_mode_after_session_new: false,
+            permission_grant_debounce: Duration::ZERO,
         };
         Ok(AcpSessionNewSpec::from_config(config))
     }

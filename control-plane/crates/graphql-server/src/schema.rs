@@ -9,8 +9,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, info, warn};
 
 use db::repos::{
-    approvals, artifact_contracts, artifacts, closeout, ideas, projections,
-    rollout_contract_checks, runs, steward as steward_repo, workflow_conflicts,
+    approvals, artifact_contracts, artifacts, closeout, code_writer_completion_receipts, ideas,
+    projections, rollout_contract_checks, runs, steward as steward_repo, workflow_conflicts,
 };
 use db::writer::DbWriterHeartbeat;
 use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, ResolveApprovalCmd};
@@ -150,6 +150,19 @@ async fn enrich_run_with_artifact_contracts(
         rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
             .await?
             .map(|check| Json(check.operator_readback_json_for_lane("graphql")));
+    let code_writer_completion_readbacks =
+        code_writer_completion_receipts::list_by_run(pool, run_id).await?;
+    let canonical_code_writer_completion_readbacks =
+        code_writer_completion_receipts::list_canonical_by_run(pool, run_id).await?;
+    gql.implementation_completion =
+        domain::code_writer_completion::project_implementation_completion(
+            &canonical_code_writer_completion_readbacks,
+        )
+        .into();
+    gql.code_writer_completion_receipts = code_writer_completion_readbacks
+        .into_iter()
+        .map(Into::into)
+        .collect();
     gql.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
         .await?
         .map(Into::into);
@@ -879,6 +892,19 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
         artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
             .await?
             .map(|stored| stored.summary.into());
+    let code_writer_completion_readbacks =
+        code_writer_completion_receipts::list_by_run(pool, run_id).await?;
+    let canonical_code_writer_completion_readbacks =
+        code_writer_completion_receipts::list_canonical_by_run(pool, run_id).await?;
+    run.implementation_completion =
+        domain::code_writer_completion::project_implementation_completion(
+            &canonical_code_writer_completion_readbacks,
+        )
+        .into();
+    run.code_writer_completion_receipts = code_writer_completion_readbacks
+        .into_iter()
+        .map(Into::into)
+        .collect();
     run.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
         .await?
         .map(Into::into);

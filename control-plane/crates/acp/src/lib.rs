@@ -256,6 +256,10 @@ pub struct ExecutionResult {
     /// This is persisted by the engine as recovery evidence when present.
     #[serde(default)]
     pub transcript_text: Option<String>,
+    /// Prompt-level ACP completion text capture used for CHAINWORKS_OUTPUT
+    /// extraction and durable diagnostics.
+    #[serde(default)]
+    pub completion_text_capture: AcpCompletionTextCaptureMetadata,
     pub cost_cents: Option<i64>,
     #[serde(default)]
     pub usage: Option<UsageSnapshot>,
@@ -309,6 +313,71 @@ pub struct ExecutionResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpCompletionCaptureStatus {
+    Captured,
+    Absent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpCompletionCaptureSource {
+    TerminalFinalResponse,
+    StreamedUpdateTail,
+    CappedStream,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpCompletionAbsenceReason {
+    NoTerminalOrStreamText,
+    TerminalResponseWithoutText,
+    TerminalResponseCaptureTruncatedBeforeOutput,
+    ExtractionInputTruncated,
+    EmptyAfterSanitization,
+    RawCaptureDisabled,
+    RedactionFailed,
+    StorageWriteFailed,
+    RedactedStorageWriteFailed,
+    CaptureDisabled,
+    CaptureFailed,
+    SessionReuseWithoutTerminalCapture,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpCompletionTextCaptureMetadata {
+    pub capture_status: AcpCompletionCaptureStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_source: Option<AcpCompletionCaptureSource>,
+    #[serde(default, skip)]
+    pub captured_text: Option<String>,
+    pub raw_byte_limit: u64,
+    pub captured_byte_count: u64,
+    pub completion_text_truncated: bool,
+    pub extraction_input_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_input_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absence_reason: Option<AcpCompletionAbsenceReason>,
+}
+
+impl Default for AcpCompletionTextCaptureMetadata {
+    fn default() -> Self {
+        Self {
+            capture_status: AcpCompletionCaptureStatus::Absent,
+            capture_source: None,
+            captured_text: None,
+            raw_byte_limit: 0,
+            captured_byte_count: 0,
+            completion_text_truncated: false,
+            extraction_input_truncated: false,
+            extraction_input_sha256: None,
+            absence_reason: Some(AcpCompletionAbsenceReason::NoTerminalOrStreamText),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcpCloseDiagnostic {
     #[serde(default)]
     pub transport_error_code: Option<String>,
@@ -338,6 +407,8 @@ pub struct AcpRuntimeReceipt {
     pub requires_xcode_host_execution: bool,
     pub handshake: AcpRuntimeReceiptHandshake,
     pub counters: AcpRuntimeReceiptCounters,
+    #[serde(default)]
+    pub permission_roundtrips: Vec<AcpRuntimeReceiptPermissionRoundtrip>,
     #[serde(default)]
     pub first_events: Vec<AcpRuntimeReceiptEvent>,
     #[serde(default)]
@@ -382,6 +453,30 @@ pub struct AcpRuntimeReceiptEvent {
     pub kind: String,
     #[serde(default)]
     pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpRuntimeReceiptPermissionRoundtrip {
+    pub request_id: String,
+    pub requested_at_ms: u64,
+    #[serde(default)]
+    pub request_summary: Option<String>,
+    #[serde(default)]
+    pub request_payload: Option<String>,
+    #[serde(default)]
+    pub grant_sent_at_ms: Option<u64>,
+    #[serde(default)]
+    pub grant_summary: Option<String>,
+    #[serde(default)]
+    pub grant_payload: Option<String>,
+    #[serde(default)]
+    pub first_post_grant_event_at_ms: Option<u64>,
+    #[serde(default)]
+    pub first_post_grant_event_kind: Option<String>,
+    #[serde(default)]
+    pub first_post_grant_event_detail: Option<String>,
+    #[serde(default)]
+    pub outcome: Option<String>,
 }
 
 #[derive(Debug)]

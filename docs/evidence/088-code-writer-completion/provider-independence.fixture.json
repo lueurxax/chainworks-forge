@@ -1,0 +1,25 @@
+{
+  "scenario": "provider_independence_completion_contract",
+  "schema_version": "p088_provider_independence_fixture_v1",
+  "providers": [
+    {
+      "provider": "claude",
+      "agent_id": "code_writer",
+      "completion_contract": "same_required_outputs_same_readback"
+    },
+    {
+      "provider": "codex",
+      "agent_id": "code_writer",
+      "completion_contract": "same_required_outputs_same_readback"
+    },
+    {
+      "provider": "junie",
+      "agent_id": "code_writer",
+      "completion_contract": "same_required_outputs_same_readback"
+    }
+  ],
+  "expected_failure_class": "work_completed_missing_current_attempt_outputs",
+  "expected_ingestion_boundary_failure": "chainworks_output_not_extracted",
+  "expected_next_operator_action": "fix_chainworks_output_extraction",
+  "provider_specific_truth_branch_allowed": false
+}
