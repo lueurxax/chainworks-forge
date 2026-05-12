@@ -1643,6 +1643,7 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
                 })
                 .collect(),
             pre_prompt_expected_outputs: Vec::new(),
+            completion_text_capture: Default::default(),
             transcript_text: None,
             cost_cents: None,
             usage: None,
@@ -1673,6 +1674,7 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
             acp_pre_prompt_metadata_timeout: false,
             acp_pre_prompt_metadata_digest_bytes: 0,
             legacy_broad_discovery_snapshot: None,
+            runtime_receipt: None,
         })
     }
 }

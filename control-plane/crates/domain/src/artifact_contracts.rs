@@ -143,11 +143,203 @@ pub fn known_contract_id(contract_id: &str) -> bool {
             | "security_report_v1"
             | "prepush_review_v1"
             | "docs_report_v1"
+            | "proposal_review_summary_v2"
             | "implementation_self_assessment_v2"
             | "tests_result_v1"
             | "implementation_review_summary_v1"
             | "run_state_projection_v1"
     )
+}
+
+pub const PROPOSAL_REVIEW_SUMMARY_V2_CONTRACT_ID: &str = "proposal_review_summary_v2";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalReviewSummaryTransitionTruth {
+    pub contract_id: String,
+    pub pass: Option<bool>,
+    pub blocker_count: Option<u64>,
+    pub has_blocking_issues: bool,
+    pub has_required_changes: bool,
+    pub decision: Option<String>,
+}
+
+impl ProposalReviewSummaryTransitionTruth {
+    pub fn has_blocking_evidence(&self) -> bool {
+        self.blocker_count.is_some_and(|count| count > 0)
+            || self.has_blocking_issues
+            || self.has_required_changes
+    }
+}
+
+pub fn proposal_review_summary_v2_validation_error(raw_json: &Value) -> Option<String> {
+    let object = raw_json.as_object()?;
+
+    if object.get("pass").and_then(Value::as_bool).is_none() {
+        return Some("proposal_review_summary_v2 field 'pass' must be a boolean".into());
+    }
+    for field in ["average_score", "aggregate_score", "min_individual_score"] {
+        if object.get(field).and_then(Value::as_f64).is_none() {
+            return Some(format!(
+                "proposal_review_summary_v2 field '{field}' must be a number"
+            ));
+        }
+    }
+    if object
+        .get("blocker_count")
+        .and_then(Value::as_u64)
+        .is_none()
+    {
+        return Some(
+            "proposal_review_summary_v2 field 'blocker_count' must be a non-negative integer"
+                .into(),
+        );
+    }
+    for field in [
+        "blocking_issues",
+        "blocking_required_changes",
+        "advisory_follow_ups",
+        "recurring_themes",
+    ] {
+        if object.get(field).and_then(Value::as_array).is_none() {
+            return Some(format!(
+                "proposal_review_summary_v2 field '{field}' must be an array"
+            ));
+        }
+    }
+    for field in ["summary", "decision"] {
+        if object.get(field).and_then(Value::as_str).is_none() {
+            return Some(format!(
+                "proposal_review_summary_v2 field '{field}' must be a string"
+            ));
+        }
+    }
+
+    let truth = proposal_review_summary_transition_truth(raw_json);
+    if truth.contract_id != PROPOSAL_REVIEW_SUMMARY_V2_CONTRACT_ID {
+        return Some(
+            "proposal_review_summary_v2 payload could not be interpreted as a v2 proposal review summary"
+                .into(),
+        );
+    }
+
+    if let Some(error) = proposal_review_summary_transition_truth_conflict(raw_json) {
+        return Some(error);
+    }
+
+    None
+}
+
+pub fn proposal_review_summary_transition_truth(
+    raw_json: &Value,
+) -> ProposalReviewSummaryTransitionTruth {
+    let pass = raw_json.get("pass").and_then(Value::as_bool);
+    let blocker_count = raw_json.get("blocker_count").and_then(Value::as_u64);
+    let blocking_issues = raw_json.get("blocking_issues");
+    let decision = raw_json
+        .get("decision")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    if looks_like_proposal_review_summary_v2(raw_json) {
+        let blocking_required_changes = raw_json.get("blocking_required_changes");
+        ProposalReviewSummaryTransitionTruth {
+            contract_id: PROPOSAL_REVIEW_SUMMARY_V2_CONTRACT_ID.to_string(),
+            pass,
+            blocker_count,
+            has_blocking_issues: json_value_has_entries(blocking_issues),
+            has_required_changes: json_value_has_entries(blocking_required_changes),
+            decision,
+        }
+    } else {
+        let required_changes = raw_json.get("required_changes");
+        ProposalReviewSummaryTransitionTruth {
+            contract_id: "proposal_review_summary_v1".to_string(),
+            pass,
+            blocker_count,
+            has_blocking_issues: json_value_has_entries(blocking_issues),
+            has_required_changes: json_value_has_entries(required_changes),
+            decision,
+        }
+    }
+}
+
+pub fn proposal_review_summary_transition_truth_conflict(raw_json: &Value) -> Option<String> {
+    let truth = proposal_review_summary_transition_truth(raw_json);
+    let contract_label = truth.contract_id.as_str();
+    let has_blocking_evidence = truth.has_blocking_evidence();
+
+    if truth.pass == Some(true) && has_blocking_evidence {
+        return Some(format!(
+            "{contract_label} has pass=true while blocker evidence is non-empty"
+        ));
+    }
+
+    let explicitly_no_blocking_issues = raw_json
+        .get("blocking_issues")
+        .is_some_and(json_value_is_empty_collection);
+    let explicitly_no_required_changes =
+        if truth.contract_id == PROPOSAL_REVIEW_SUMMARY_V2_CONTRACT_ID {
+            raw_json
+                .get("blocking_required_changes")
+                .is_some_and(json_value_is_empty_collection)
+        } else {
+            raw_json
+                .get("required_changes")
+                .is_some_and(json_value_is_empty_collection)
+        };
+    if truth.pass == Some(false)
+        && truth.blocker_count == Some(0)
+        && explicitly_no_blocking_issues
+        && explicitly_no_required_changes
+    {
+        return Some(format!(
+            "{contract_label} has pass=false while blocker evidence is explicitly empty"
+        ));
+    }
+
+    if let Some(decision) = truth.decision.as_deref() {
+        let decision = decision.to_ascii_lowercase();
+        let decision_passes = decision.contains("pass")
+            || decision.contains("approve")
+            || decision.contains("approved");
+        let decision_blocks = decision.contains("fail")
+            || decision.contains("block")
+            || decision.contains("revise")
+            || decision.contains("changes_required");
+        if decision_passes && (truth.pass == Some(false) || has_blocking_evidence) {
+            return Some(format!(
+                "{contract_label} decision indicates pass while authoritative fields block"
+            ));
+        }
+        if decision_blocks && truth.pass == Some(true) && !has_blocking_evidence {
+            return Some(format!(
+                "{contract_label} decision indicates blocking while authoritative fields pass"
+            ));
+        }
+    }
+
+    None
+}
+
+fn looks_like_proposal_review_summary_v2(raw_json: &Value) -> bool {
+    raw_json.get("blocking_required_changes").is_some()
+        || raw_json.get("advisory_follow_ups").is_some()
+}
+
+fn json_value_has_entries(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::Object(entries)) => !entries.is_empty(),
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(Value::Bool(true)) => true,
+        Some(Value::Number(number)) => number.as_u64().is_some_and(|count| count > 0),
+        _ => false,
+    }
+}
+
+fn json_value_is_empty_collection(value: &Value) -> bool {
+    matches!(value, Value::Array(items) if items.is_empty())
+        || matches!(value, Value::Object(entries) if entries.is_empty())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

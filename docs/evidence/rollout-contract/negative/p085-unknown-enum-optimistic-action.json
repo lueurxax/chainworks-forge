@@ -1,12 +1,27 @@
 {
-  "schema_version": "rollout_contract_v1",
-  "applicability": "required",
-  "gate_aliases": [
-    "proposal-085",
-    "p085"
-  ],
-  "commands": {
-    "allowlist": []
+  "scenario": "p085-unknown-enum-optimistic-action",
+  "description": "The server introduces a new freshnessState value 'projection_rebuilding' in a schema upgrade. The Swift decoder receives this unknown value and, instead of failing closed to .unknown, maps it to the .live case (optimistic fallback). The approve button renders as actionable using live freshness semantics even though the actual freshness state is unknown. Violates unknown enum fail-closed requirement.",
+  "contract_violation": "unknown_enum_unsafe",
+  "hold_condition": "Unknown server enum values must fail closed to diagnostic/unknown presentation, not crash or enable actions.",
+  "simulated_server_response": {
+    "approval": {
+      "id": "appr-unknown-1",
+      "freshnessState": "projection_rebuilding",
+      "disabledReasonCode": null,
+      "writePathState": "available",
+      "availableActions": ["approve", "reject"]
+    }
   },
-  "placeholder_fixture_kind": "unknown_enum_optimistic_action"
+  "simulated_swift_behavior": {
+    "decoded_freshnessState": "live",
+    "description": "BUG: unknown enum value 'projection_rebuilding' silently mapped to .live by Swift decoder; presenter then renders approve button as actionable"
+  },
+  "expected_swift_behavior": {
+    "decoded_freshnessState": "unknown(rawValue: 'projection_rebuilding')",
+    "p085_freshnessState": "P085FreshnessState.unknown(rawValue: 'projection_rebuilding')",
+    "description": "P085FreshnessState.fromRaw('projection_rebuilding') returns .unknown; diagnostic badge shows 'Unknown'; approve actionability is determined by writePathState and availableActions, NOT by freshness — so approve may still be actionable, but freshness is reported honestly"
+  },
+  "note": "In P085, freshness state is diagnostic only and never drives approval actionability. The approval actionability is still determined by writePathState and availableActions. The violation here is the silent mapping of an unknown freshness enum to .live rather than .unknown.",
+  "p085_contract_rows": ["freshness.badge.approval", "freshness.badge.run"],
+  "p085_revision": "p085-r2-2026-05-08"
 }

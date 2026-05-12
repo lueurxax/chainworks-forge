@@ -1,0 +1,10 @@
+{
+  "schema_version": "p088_fixture_v1",
+  "scenario": "completion_repair_mutation_negative",
+  "agent_id": "code_writer",
+  "pre_repair_work_change_kind": "none",
+  "post_repair_work_change_kind": "current_attempt_diff",
+  "unexpected_changed_path_count": 1,
+  "expected_completion_turn_result": "failed_unexpected_worktree_mutation",
+  "expected_failure_kind": "unexpected_worktree_mutation_during_completion_repair"
+}

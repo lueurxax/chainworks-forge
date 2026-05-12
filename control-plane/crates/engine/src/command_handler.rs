@@ -8,12 +8,14 @@ use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use thiserror::Error as ThisError;
 use tracing::{info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
-    artifact_contracts, closeout, command_journal, ideas, legacy_discovery_overrides, projections,
-    retry_operator_instructions, runs, scheduler, sessions, stages, work_items, workflow_conflicts,
+    artifact_contracts, closeout, code_writer_completion_receipts, command_journal, ideas,
+    legacy_discovery_overrides, projections, retry_operator_instructions, runs, scheduler,
+    sessions, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
@@ -139,6 +141,23 @@ pub struct StartRunBlockedByDeliveryPreflight {
 pub struct Commanded {
     pub result: CommandResult,
     pub journal_id: String,
+}
+
+#[derive(Debug, ThisError)]
+pub enum ApprovalResolutionConflict {
+    #[error("Approval {approval_id} is not actionable (already resolved)")]
+    AlreadyResolved {
+        approval_id: ApprovalId,
+        journal_id: String,
+    },
+}
+
+impl ApprovalResolutionConflict {
+    pub fn journal_id(&self) -> &str {
+        match self {
+            Self::AlreadyResolved { journal_id, .. } => journal_id,
+        }
+    }
 }
 
 struct CommandJournalEntry {
@@ -1275,6 +1294,26 @@ fn targeted_retry_provider_fallback(
     })
 }
 
+fn attach_p088_operator_retry_completion_recovery_payload(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    source_agent_execution_id: &str,
+    evidence_path: &str,
+) {
+    object.insert(
+        "p088".into(),
+        serde_json::json!({
+            "activation_source": "operator_retry_completion_recovery",
+            "operator_retry_completion_recovery": true,
+            "preserved_historical_evidence_packet_path": evidence_path,
+            "source_agent_execution_id": source_agent_execution_id,
+        }),
+    );
+    object.insert(
+        "retry_reason".into(),
+        serde_json::json!("operator_retry_completion_recovery"),
+    );
+}
+
 fn targeted_retry_fallback_profile_id<'a>(
     agent_id: &str,
     from_provider: &str,
@@ -1428,7 +1467,11 @@ fn validate_operator_selected_candidate(candidate: &CandidateTransitionEvaluatio
             if candidate
                 .sanitized_diagnostic
                 .as_deref()
-                .is_some_and(|diagnostic| diagnostic.contains("Loop budget exhausted")) =>
+                .is_some_and(|diagnostic| {
+                    diagnostic
+                        .to_ascii_lowercase()
+                        .contains("loop budget exhausted")
+                }) =>
         {
             Ok(())
         }
@@ -3592,10 +3635,10 @@ impl CommandHandler {
                         a
                     }
                     Some(_) => {
-                        let error = anyhow!(
-                            "Approval {} is not actionable (already resolved)",
-                            c.approval_id
-                        );
+                        let error = ApprovalResolutionConflict::AlreadyResolved {
+                            approval_id: c.approval_id,
+                            journal_id: journal.id.clone(),
+                        };
                         command_journal::fail_entry_tx(
                             &mut tx,
                             &journal.id,
@@ -3605,7 +3648,7 @@ impl CommandHandler {
                         .await?;
                         tx.commit().await?;
                         db::pool::log_write_transaction("command.ResolveApproval", tx_started);
-                        return Err(error);
+                        return Err(error.into());
                     }
                     None => {
                         let error = anyhow!("Approval {} not found", c.approval_id);
@@ -4326,6 +4369,16 @@ impl CommandHandler {
         let runtime_facts =
             agent_execution_runtime_facts::find_by_execution_id(&self.pool, agent_execution_id)
                 .await?;
+        let p088_completion_retry_evidence =
+            code_writer_completion_receipts::find_by_execution_id(&self.pool, agent_execution_id)
+                .await?
+                .and_then(|readback| {
+                    readback
+                        .receipt
+                        .failed_stage_evidence_path
+                        .clone()
+                        .or(readback.receipt.receipt_artifact_path.clone())
+                });
         let provider_fallback =
             targeted_retry_catalog_profile_override(&run, &target_exec.agent_id, &retry_payload)
                 .or_else(|| {
@@ -4385,6 +4438,13 @@ impl CommandHandler {
                     "reason": "operator_targeted_retry"
                 }),
             );
+            if let Some(evidence_path) = p088_completion_retry_evidence.as_deref() {
+                attach_p088_operator_retry_completion_recovery_payload(
+                    object,
+                    &agent_execution_id.to_string(),
+                    evidence_path,
+                );
+            }
             if let Some(fallback) = provider_fallback {
                 object.insert(
                     "backend_profile_id".into(),
@@ -4633,17 +4693,9 @@ impl CommandHandler {
             }
         };
 
-        let workflow_path = match run.workflow_yaml_path.as_deref() {
-            Some(p) => p,
-            None => return false,
-        };
-        let catalog_path = match run.agent_catalog_yaml_path.as_deref() {
-            Some(p) => p,
-            None => return false,
-        };
-
-        let plan = match workflow::compiler::compile(workflow_path, catalog_path) {
-            Ok(p) => p,
+        let plan = match compile_run_plan_for_run(&run) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return false,
             Err(e) => {
                 warn!(
                     run_id = %run_id,
@@ -4983,6 +5035,7 @@ fn validate_accepted_risk_lineage(c: &SettleProposalGateCmd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::ids::{IdeaId, RunId};
 
     #[test]
     fn p060_idea_body_review_mode_and_reviewer_override_are_canonicalized() {
@@ -5207,6 +5260,63 @@ reviewer_override:
         assert_eq!(
             snapshot.evidence_source,
             "p017-phase-b-dogfood-exit-2026-04-26"
+        );
+    }
+
+    #[test]
+    fn compile_run_plan_prefers_frozen_snapshots_over_yaml_paths() {
+        let workflow_path =
+            "/Users/user/Documents/Chainworks Forge/examples/workflows/full-mvp-live.yaml";
+        let catalog_path = "/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml";
+        let frozen = workflow::compiler::compile(workflow_path, catalog_path)
+            .expect("example workflow should compile for snapshot fixture");
+
+        let run = Run {
+            id: RunId::new(),
+            idea_id: IdeaId::new(),
+            status: RunStatus::Running,
+            workflow_id: "full-mvp-live".into(),
+            workflow_title: "Full MVP Live".into(),
+            workspace_root: "/tmp".into(),
+            artifact_root: "/tmp".into(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("state_11_manual_release".into()),
+            workflow_yaml_path: Some("/definitely/missing/workflow.yaml".into()),
+            agent_catalog_yaml_path: Some("/definitely/missing/agents.yaml".into()),
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: Some(frozen.workflow_snapshot_hash.clone()),
+            catalog_snapshot_hash: Some(frozen.catalog_snapshot_hash.clone()),
+            workflow_snapshot_json: Some(frozen.workflow_snapshot_json.clone()),
+            catalog_snapshot_json: Some(frozen.catalog_snapshot_json.clone()),
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: None,
+            review_routing_json: None,
+            closeout_readiness_mode: None,
+        };
+
+        let plan = compile_run_plan_for_run(&run)
+            .expect("snapshot-backed run should compile")
+            .expect("plan should exist");
+
+        assert!(
+            plan.states
+                .get("state_11_manual_release")
+                .is_some_and(|state| !state.post_approval_tasks.is_empty()),
+            "snapshot-backed compile should not depend on YAML paths once the run is frozen"
         );
     }
 
@@ -5526,6 +5636,30 @@ reviewer_override:
     }
 
     #[test]
+    fn workflow_conflict_resolution_accepts_lowercase_loop_budget_exhausted_candidate() {
+        let candidate = CandidateTransitionEvaluation {
+            transition_id: "state_9_implementation_reviewed__to__state_10_implementation_refined__1"
+                .into(),
+            from_state_id: "state_9_implementation_reviewed".into(),
+            to_state_id: "state_10_implementation_refined".into(),
+            condition_expression_id: Some("transition_condition_1".into()),
+            result: CandidateTransitionResult::NotMatched,
+            required_artifacts: vec!["implementation_review_summary".into()],
+            missing_artifacts: vec![],
+            missing_fields: vec![],
+            source_artifact_ids: vec!["implementation_review_summary".into()],
+            source_agent_execution_id: None,
+            sanitized_diagnostic: Some(
+                "implementation_review_summary.status=needs_code_fixes requires refinement, but loop budget exhausted for implementation_revision_count: 12/12 iterations"
+                    .into(),
+            ),
+        };
+
+        validate_operator_selected_candidate(&candidate)
+            .expect("operator override should accept orchestrator loop-budget diagnostics");
+    }
+
+    #[test]
     fn p077_empty_capability_is_rejected() {
         let mut cmd = p077_settle_cmd(domain::commands::ProposalGateSettlementAction::Execute);
         cmd.capability = "".into();
@@ -5535,6 +5669,40 @@ reviewer_override:
             err.to_string().contains("empty capability")
                 || err.to_string().contains("invalid capability"),
             "error should describe the empty-capability rejection: {err}"
+        );
+    }
+
+    #[test]
+    fn proposal_088_targeted_retry_payload_carries_completion_recovery_evidence() {
+        let mut payload = serde_json::json!({
+            "run_id": "run-1",
+            "stage_id": "state_7_implementation_started",
+            "agent_id": "code_writer"
+        });
+
+        attach_p088_operator_retry_completion_recovery_payload(
+            payload.as_object_mut().expect("payload object"),
+            "agent-exec-1",
+            ".chainworks/evidence/p088/failed-stage.json",
+        );
+
+        assert_eq!(
+            payload
+                .pointer("/p088/activation_source")
+                .and_then(serde_json::Value::as_str),
+            Some("operator_retry_completion_recovery")
+        );
+        assert_eq!(
+            payload
+                .pointer("/p088/preserved_historical_evidence_packet_path")
+                .and_then(serde_json::Value::as_str),
+            Some(".chainworks/evidence/p088/failed-stage.json")
+        );
+        assert_eq!(
+            payload
+                .get("retry_reason")
+                .and_then(serde_json::Value::as_str),
+            Some("operator_retry_completion_recovery")
         );
     }
 }

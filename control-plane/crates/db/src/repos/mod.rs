@@ -1,11 +1,13 @@
 pub mod agent_execution_discovery_diagnostics;
 pub mod agent_execution_runtime_facts;
+pub mod agent_execution_runtime_receipts;
 pub mod agent_executions;
 pub mod agent_retry_budget_ledger;
 pub mod approvals;
 pub mod artifact_contracts;
 pub mod artifacts;
 pub mod closeout;
+pub mod code_writer_completion_receipts;
 pub mod command_journal;
 pub mod dynamic_materialization;
 pub mod evidence_spool_refs;

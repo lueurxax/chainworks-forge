@@ -4,6 +4,7 @@ use chrono::Utc;
 use domain::workflow_conflict::{
     candidate_transition_hash, classify_workflow_conflict_reason,
     proposal_review_summary_v1_authority_table, proposal_review_summary_v1_field_authority,
+    proposal_review_summary_v2_authority_table, proposal_review_summary_v2_field_authority,
     workflow_conflict_fingerprint, AdvisoryHintExtraction, AggregateFieldAuthority,
     CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowAdvisoryRejectionRecord,
     WorkflowConflictReason, WorkflowConflictRecord, WorkflowConflictStatus,
@@ -275,6 +276,44 @@ fn proposal_017_proposal_review_summary_field_authority_is_deterministic() {
         Some(AggregateFieldAuthority::NonAuthoritative)
     );
     assert_eq!(proposal_review_summary_v1_field_authority("score"), None);
+}
+
+#[test]
+fn proposal_017_proposal_review_summary_v2_field_authority_is_deterministic() {
+    let table = proposal_review_summary_v2_authority_table();
+    assert_eq!(table.len(), 8);
+    assert_eq!(
+        proposal_review_summary_v2_field_authority("pass"),
+        Some(AggregateFieldAuthority::TransitionAuthoritative)
+    );
+    assert_eq!(
+        proposal_review_summary_v2_field_authority("blocker_count"),
+        Some(AggregateFieldAuthority::TransitionAuthoritative)
+    );
+    assert_eq!(
+        proposal_review_summary_v2_field_authority("blocking_issues"),
+        Some(AggregateFieldAuthority::TransitionAuthoritative)
+    );
+    assert_eq!(
+        proposal_review_summary_v2_field_authority("blocking_required_changes"),
+        Some(AggregateFieldAuthority::TransitionAuthoritative)
+    );
+    assert_eq!(
+        proposal_review_summary_v2_field_authority("advisory_follow_ups"),
+        Some(AggregateFieldAuthority::AdvisoryOnly)
+    );
+    assert_eq!(
+        proposal_review_summary_v2_field_authority("decision"),
+        Some(AggregateFieldAuthority::ContradictionBearing)
+    );
+    assert_eq!(
+        proposal_review_summary_v2_field_authority("summary"),
+        Some(AggregateFieldAuthority::NonAuthoritative)
+    );
+    assert_eq!(
+        proposal_review_summary_v2_field_authority("required_changes"),
+        None
+    );
 }
 
 #[test]

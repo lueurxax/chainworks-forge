@@ -190,6 +190,9 @@ struct RunsHomeView: View {
                             )
                             .id(P077CloseoutReadinessAnchor.card)
                         }
+                        if let implementationCompletion = runDetail.implementationCompletion {
+                            P088ImplementationCompletionCard(presentation: implementationCompletion)
+                        }
                         P031IdeaContextCard(presentation: runDetail.ideaContext)
                         P031CatalogContextCard(presentation: runDetail.catalogContext)
                     case .stages:
@@ -476,6 +479,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
                     progressLabel: "13 stages, 48 artifacts",
                     pendingApprovalsLabel: nil,
                     closeoutReadinessSignalLabel: closeoutSignal,
+                    implementationCompletionSignalLabel: detail.implementationCompletion?.compactSignalLabel,
                     freshnessState: .live,
                     accessibilityLabel: "Proposal review run, running"
                 ),
@@ -569,6 +573,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 stageTitle: "Proposal reviewed",
                 statusText: "Skipped",
                 attemptText: "Iteration 11, attempt 1",
+                startedLabel: "Started: 2026-05-09 09:12",
+                completedLabel: "Completed: 2026-05-09 09:12",
+                durationLabel: "Duration: 8s",
                 connectorState: .pending,
                 evidenceLabels: ["Artifacts", "Skipped"],
                 accessibilityLabel: "Proposal reviewed, iteration 11 attempt 1, skipped"
@@ -578,6 +585,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 stageTitle: "Proposal reviewed",
                 statusText: "Completed",
                 attemptText: "Iteration 11, attempt 6",
+                startedLabel: "Started: 2026-05-09 09:30",
+                completedLabel: "Completed: 2026-05-09 09:34",
+                durationLabel: "Duration: 4m 18s",
                 connectorState: .completed,
                 evidenceLabels: ["Artifacts", "Validation", "Completed"],
                 accessibilityLabel: "Proposal reviewed, iteration 11 attempt 6, completed"
@@ -587,6 +597,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 stageTitle: "Proposal reviewed",
                 statusText: "Running",
                 attemptText: "Iteration 13, attempt 1",
+                startedLabel: "Started: 2026-05-09 10:02",
+                completedLabel: nil,
+                durationLabel: "Duration: 2m 41s",
                 connectorState: .running,
                 evidenceLabels: ["Artifacts"],
                 accessibilityLabel: "Proposal reviewed, iteration 13 attempt 1, running"
@@ -609,7 +622,6 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 archivedAt: nil,
                 accessibilityLabel: "Improve artifact navigation"
             ),
-            stageRows: [],
             stageTransitions: transitions,
             approvalRows: [],
             artifactRows: [],
@@ -626,6 +638,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
             closeoutReadiness: includeCloseoutReadiness
                 ? previewCloseoutReadiness(runID: runID)
                 : nil,
+            implementationCompletion: previewImplementationCompletion(),
             freshness: freshness,
             refreshFeedbackText: "Live projection",
             emptyStateTitle: nil,
@@ -665,6 +678,29 @@ final class P031ThinReadDashboardModel: ObservableObject {
         return P077CloseoutReadinessPresenter.presentation(for: summary)
     }
 
+    private static func previewImplementationCompletion() -> P088ImplementationCompletionPresentation {
+        P088ImplementationCompletionPresenter.presentation(
+            for: P088ImplementationCompletionReadModel(
+                status: .known(value: "partial_evidence"),
+                failureClass: "work_completed_missing_current_attempt_outputs",
+                workChangeKind: "current_attempt_diff",
+                activationSource: "declared_output_settlement_failed",
+                ingestionBoundaryFailure: .known(value: "chainworks_output_not_extracted"),
+                completionTurnAttempted: true,
+                completionTurnResult: .known(value: "failed_missing_outputs"),
+                terminalResponseStatus: "completed",
+                completionTextCaptures: [],
+                freshRequiredOutputCount: 1,
+                staleRequiredOutputCount: 1,
+                missingRequiredOutputCount: 2,
+                controlPlaneOutputCount: 1,
+                receiptArtifactPath: ".chainworks/p088/receipt.json",
+                failedStageEvidencePath: ".chainworks/p088/failed-stage.json",
+                nextOperatorAction: .known(value: "fix_chainworks_output_extraction")
+            )
+        )
+    }
+
     private static func previewArtifacts(
         freshness: P031FreshnessSnapshot
     ) -> [P031ArtifactViewerPresentation] {
@@ -676,7 +712,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 iteration: 11,
                 attempt: 1,
                 title: "proposal_review_summary",
-                contractID: "proposal_review_summary_v1",
+                contractID: "proposal_review_summary_v2",
                 content: "# Review summary\n\nSkipped attempt retained its artifact set for audit history.",
                 freshness: freshness
             ),
@@ -687,7 +723,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 iteration: 11,
                 attempt: 6,
                 title: "proposal_review_summary",
-                contractID: "proposal_review_summary_v1",
+                contractID: "proposal_review_summary_v2",
                 content: "# Review summary\n\nThe latest completed attempt includes validation and closeout notes.",
                 freshness: freshness
             ),
@@ -709,7 +745,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 iteration: 13,
                 attempt: 1,
                 title: "proposal_review_summary",
-                contractID: "proposal_review_summary_v1",
+                contractID: "proposal_review_summary_v2",
                 content: "# Running review\n\nThis attempt is still collecting artifacts.",
                 freshness: freshness
             ),
@@ -1075,6 +1111,12 @@ private struct P031RunsHomeRowCard: View {
                     .foregroundStyle(.secondary)
                     .accessibilityIdentifier("p077-closeout-readiness-sidebar-signal")
             }
+            if let implementationCompletionSignalLabel = row.implementationCompletionSignalLabel {
+                Label(implementationCompletionSignalLabel, systemImage: "wrench.and.screwdriver")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("p088-implementation-completion-sidebar-signal")
+            }
             if let progressLabel = row.progressLabel {
                 Text(progressLabel)
                     .font(.caption)
@@ -1154,6 +1196,124 @@ private struct P031RunDetailSummaryCard: View {
     private var rolloutDecisionText: String? {
         guard let rollout = presentation.rolloutDecisionSummary else { return nil }
         return "Rollout \(rollout.backendDecision)"
+    }
+}
+
+private struct P088ImplementationCompletionCard: View {
+    let presentation: P088ImplementationCompletionPresentation
+    @State private var copyFeedback: String?
+
+    var body: some View {
+        P031CalloutCard(
+            title: "Implementation Completion",
+            bodyText: presentation.outputFreshnessLabel,
+            accentColor: accentColor
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                Label(presentation.statusLabel, systemImage: statusSymbolName)
+                    .font(.caption.weight(.semibold))
+                    .accessibilityIdentifier("p088-implementation-completion-status")
+
+                if let failureClassLabel = presentation.failureClassLabel {
+                    Label(failureClassLabel, systemImage: "xmark.octagon")
+                        .font(.caption)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("p088-implementation-completion-failure-class")
+                }
+
+                if let workChangeKindLabel = presentation.workChangeKindLabel {
+                    Label(workChangeKindLabel, systemImage: "arrow.triangle.branch")
+                        .font(.caption)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("p088-implementation-completion-work-change-kind")
+                }
+
+                Label(presentation.outputFreshnessLabel, systemImage: "checklist")
+                    .font(.caption)
+                    .accessibilityIdentifier("p088-implementation-completion-output-freshness")
+
+                if let evidencePathLabel = presentation.evidencePathLabel {
+                    Label(evidencePathLabel, systemImage: "doc.text.magnifyingglass")
+                        .font(.caption)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("p088-implementation-completion-evidence-path")
+                }
+
+                Label(presentation.nextOperatorActionLabel, systemImage: "arrow.right.circle")
+                    .font(.caption.weight(.medium))
+                    .accessibilityIdentifier("p088-implementation-completion-next-action")
+
+                if !presentation.diagnosticRows.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(presentation.diagnosticRows, id: \.self) { row in
+                            Text(row)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .accessibilityIdentifier("p088-implementation-completion-diagnostics")
+                }
+
+                if !presentation.copyItems.isEmpty {
+                    HStack(spacing: 8) {
+                        ForEach(presentation.copyItems, id: \.label) { item in
+                            Button {
+                                copy(item)
+                            } label: {
+                                Label(item.label, systemImage: "doc.on.doc")
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                }
+
+                if let copyFeedback {
+                    Text(copyFeedback)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("p088-implementation-completion-copy-feedback")
+                }
+            }
+            .accessibilityLabel(presentation.accessibilityLabel)
+            .accessibilityIdentifier("p088-implementation-completion-card")
+        }
+    }
+
+    private var accentColor: Color {
+        switch presentation.visualState {
+        case .positive:
+            return .green
+        case .warning:
+            return .orange
+        case .blocking:
+            return .red
+        case .neutral:
+            return .secondary
+        }
+    }
+
+    private var statusSymbolName: String {
+        switch presentation.visualState {
+        case .positive:
+            return "checkmark.seal"
+        case .warning:
+            return "exclamationmark.triangle"
+        case .blocking:
+            return "xmark.octagon"
+        case .neutral:
+            return "questionmark.circle"
+        }
+    }
+
+    private func copy(_ item: P031DiagnosticCopyItem) {
+#if os(macOS)
+        NSPasteboard.general.clearContents()
+        let didCopy = NSPasteboard.general.setString(item.value, forType: .string)
+        copyFeedback = didCopy ? "Copied \(item.label.lowercased())" : "Copy failed"
+#else
+        copyFeedback = "Copied \(item.label.lowercased())"
+#endif
     }
 }
 
@@ -1543,44 +1703,6 @@ private struct P077CloseoutReadinessDiagnosticsSheet: View {
     }
 }
 
-private struct P031StageListCard: View {
-    let rows: [P031StageSummaryPresentation]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Stages")
-                .font(.headline)
-            if rows.isEmpty {
-                P031EmptySectionRow(title: "No stages", detail: "No stage projections returned.")
-            } else {
-                ForEach(rows, id: \.stageExecutionID) { row in
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text(row.title)
-                                .font(.subheadline.weight(.semibold))
-                            Spacer()
-                            P031FreshnessBadge(state: row.freshnessState)
-                        }
-                        Text(row.statusLabel)
-                            .font(.caption.weight(.medium))
-                        if let iterationLabel = row.iterationLabel {
-                            Text(iterationLabel)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        if !row.badgeLabels.isEmpty {
-                            P031BadgeRow(labels: row.badgeLabels)
-                        }
-                    }
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-                }
-            }
-        }
-    }
-}
-
 private struct P031IdeaContextCard: View {
     let presentation: P031IdeaContextPresentation?
 
@@ -1668,6 +1790,21 @@ private struct P031StageTransitionMapCard: View {
                                 }
                                 if let attemptText = row.attemptText {
                                     Text(attemptText)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if let startedLabel = row.startedLabel {
+                                    Text(startedLabel)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if let completedLabel = row.completedLabel {
+                                    Text(completedLabel)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if let durationLabel = row.durationLabel {
+                                    Text(durationLabel)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }

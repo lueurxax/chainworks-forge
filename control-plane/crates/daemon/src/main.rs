@@ -387,6 +387,7 @@ async fn main() -> Result<()> {
             // 4000→ephemeral fallback + `daemon.port` write runs before the
             // GraphQL server takes the socket.
             let (listener, port) = packaging::bind_with_fallback(&paths).await?;
+            packaging::write_daemon_endpoint_snapshot(&paths, std::process::id(), port, build_sha)?;
             info!(port, "bound HTTP listener; handing off to graphql-server");
 
             let xcode_broker_pool =
@@ -887,6 +888,12 @@ async fn serve_failed(
     paths: &ModePaths,
 ) -> Result<()> {
     let (listener, port) = packaging::bind_with_fallback(paths).await?;
+    packaging::write_daemon_endpoint_snapshot(
+        paths,
+        std::process::id(),
+        port,
+        packaging::resolved_build_sha(),
+    )?;
     info!(
         port,
         bind_addr = %paths.bind_addr,

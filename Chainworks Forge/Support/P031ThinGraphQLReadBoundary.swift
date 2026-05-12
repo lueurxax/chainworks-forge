@@ -484,10 +484,24 @@ enum P072ApprovalDecisionAction: Equatable, Sendable {
 struct P072ApprovalMutationResult: Decodable, Equatable, Sendable {
   let approval: P031ApprovalReadModel
   let journalID: String
+  /// Typed conflict/idempotency result code when the server supports it; nil for success.
+  let conflictResultCode: P085MutationConflictResultCode?
 
   enum CodingKeys: String, CodingKey {
     case approval
     case journalID = "journalId"
+    case conflictResultCodeRaw = "conflictResultCode"
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.approval = try container.decode(P031ApprovalReadModel.self, forKey: .approval)
+    self.journalID = try container.decode(String.self, forKey: .journalID)
+    if let rawCode = try container.decodeIfPresent(String.self, forKey: .conflictResultCodeRaw) {
+      self.conflictResultCode = P085MutationConflictResultCode.fromRaw(rawCode)
+    } else {
+      self.conflictResultCode = nil
+    }
   }
 }
 
@@ -881,6 +895,12 @@ enum P031FreshnessState: String, Codable, CaseIterable, Equatable, Sendable {
   case stale
   case unavailable
   case unauthorized
+
+  // Fail-closed: unknown server values decode to .unavailable, never to optimistic states.
+  init(from decoder: Decoder) throws {
+    let raw = try decoder.singleValueContainer().decode(String.self)
+    self = Self(rawValue: raw) ?? .unavailable
+  }
 }
 
 enum P031DisabledReasonCode: String, Codable, CaseIterable, Equatable, Sendable {
@@ -891,6 +911,12 @@ enum P031DisabledReasonCode: String, Codable, CaseIterable, Equatable, Sendable 
   case projectionLag = "PROJECTION_LAG"
   case unauthorized = "UNAUTHORIZED"
   case unsupportedAction = "UNSUPPORTED_ACTION"
+
+  // Fail-closed: unknown server values decode to .writePathNotAvailable (most restrictive).
+  init(from decoder: Decoder) throws {
+    let raw = try decoder.singleValueContainer().decode(String.self)
+    self = Self(rawValue: raw) ?? .writePathNotAvailable
+  }
 }
 
 enum P031WritePathState: String, Codable, CaseIterable, Equatable, Sendable {
@@ -899,6 +925,12 @@ enum P031WritePathState: String, Codable, CaseIterable, Equatable, Sendable {
   case writePathNotAvailable = "write_path_not_available"
   case externalTransportRequired = "external_transport_required"
   case hidden
+
+  // Fail-closed: unknown server values decode to .writePathNotAvailable (disables mutations).
+  init(from decoder: Decoder) throws {
+    let raw = try decoder.singleValueContainer().decode(String.self)
+    self = Self(rawValue: raw) ?? .writePathNotAvailable
+  }
 }
 
 enum P031PayloadAvailabilityState: String, Codable, CaseIterable, Equatable, Sendable {
@@ -907,6 +939,12 @@ enum P031PayloadAvailabilityState: String, Codable, CaseIterable, Equatable, Sen
   case payloadDeferred = "payload_deferred"
   case generating
   case unavailable
+
+  // Fail-closed: unknown server values decode to .unavailable, not to actionable states.
+  init(from decoder: Decoder) throws {
+    let raw = try decoder.singleValueContainer().decode(String.self)
+    self = Self(rawValue: raw) ?? .unavailable
+  }
 }
 
 enum P031PayloadUnavailableReasonCode: String, Codable, CaseIterable, Equatable, Sendable {
@@ -916,6 +954,12 @@ enum P031PayloadUnavailableReasonCode: String, Codable, CaseIterable, Equatable,
   case notAuthorized = "NOT_AUTHORIZED"
   case notAvailable = "NOT_AVAILABLE"
   case unknown = "UNKNOWN"
+
+  // Fail-closed: unknown server values decode to .unknown (already defined sentinel).
+  init(from decoder: Decoder) throws {
+    let raw = try decoder.singleValueContainer().decode(String.self)
+    self = Self(rawValue: raw) ?? .unknown
+  }
 }
 
 struct P031FreshnessSnapshot: Equatable, Sendable {
@@ -1246,11 +1290,15 @@ struct P031ApprovalReadModel: Decodable, Equatable, Sendable {
   }
 
   nonisolated var canApprove: Bool {
-    availableActions.contains("approve") && writePathState == .available
+    isActionableDecision && availableActions.contains("approve") && writePathState == .available
   }
 
   nonisolated var canReject: Bool {
-    availableActions.contains("reject") && writePathState == .available
+    isActionableDecision && availableActions.contains("reject") && writePathState == .available
+  }
+
+  private nonisolated var isActionableDecision: Bool {
+    decision == nil || decision == "pending" || decision == "requested"
   }
 }
 
@@ -1286,6 +1334,209 @@ struct P031ReportMetadataReadModel: Decodable, Equatable, Sendable {
   }
 }
 
+struct P088PublicEnumReadback: Decodable, Equatable, Sendable {
+  let value: String
+  let raw: String?
+  let known: Bool
+
+  nonisolated init(value: String, raw: String? = nil, known: Bool) {
+    self.value = value
+    self.raw = raw
+    self.known = known
+  }
+
+  nonisolated static func known(value: String) -> P088PublicEnumReadback {
+    P088PublicEnumReadback(value: value, raw: value, known: true)
+  }
+}
+
+struct P088ImplementationCompletionTextCaptureReadModel: Decodable, Equatable, Sendable {
+  let promptKind: String
+  let turnIndex: Int
+  let terminalResponseStatus: String?
+  let completionTextStatus: String
+  let completionTextCaptureSource: String?
+  let completionTextRawByteLimit: Int?
+  let completionTextCapturedByteCount: Int?
+  let completionTextTruncated: Bool
+  let extractionInputTruncated: Bool
+  let extractionInputSha256: String?
+  let redactedTextArtifactPath: String?
+  let textAbsenceReason: String?
+  let createdAt: String?
+}
+
+struct P088ImplementationCompletionReadModel: Decodable, Equatable, Sendable {
+  let status: P088PublicEnumReadback
+  let failureClass: String?
+  let workChangeKind: String?
+  let activationSource: String?
+  let ingestionBoundaryFailure: P088PublicEnumReadback
+  let completionTurnAttempted: Bool
+  let completionTurnResult: P088PublicEnumReadback
+  let terminalResponseStatus: String?
+  let completionTextCaptures: [P088ImplementationCompletionTextCaptureReadModel]
+  let freshRequiredOutputCount: Int
+  let staleRequiredOutputCount: Int
+  let missingRequiredOutputCount: Int
+  let controlPlaneOutputCount: Int
+  let receiptArtifactPath: String?
+  let failedStageEvidencePath: String?
+  let nextOperatorAction: P088PublicEnumReadback
+
+  nonisolated init(
+    status: P088PublicEnumReadback,
+    failureClass: String?,
+    workChangeKind: String?,
+    activationSource: String?,
+    ingestionBoundaryFailure: P088PublicEnumReadback,
+    completionTurnAttempted: Bool,
+    completionTurnResult: P088PublicEnumReadback,
+    terminalResponseStatus: String?,
+    completionTextCaptures: [P088ImplementationCompletionTextCaptureReadModel],
+    freshRequiredOutputCount: Int,
+    staleRequiredOutputCount: Int,
+    missingRequiredOutputCount: Int,
+    controlPlaneOutputCount: Int,
+    receiptArtifactPath: String?,
+    failedStageEvidencePath: String?,
+    nextOperatorAction: P088PublicEnumReadback
+  ) {
+    self.status = status
+    self.failureClass = failureClass
+    self.workChangeKind = workChangeKind
+    self.activationSource = activationSource
+    self.ingestionBoundaryFailure = ingestionBoundaryFailure
+    self.completionTurnAttempted = completionTurnAttempted
+    self.completionTurnResult = completionTurnResult
+    self.terminalResponseStatus = terminalResponseStatus
+    self.completionTextCaptures = completionTextCaptures
+    self.freshRequiredOutputCount = freshRequiredOutputCount
+    self.staleRequiredOutputCount = staleRequiredOutputCount
+    self.missingRequiredOutputCount = missingRequiredOutputCount
+    self.controlPlaneOutputCount = controlPlaneOutputCount
+    self.receiptArtifactPath = receiptArtifactPath
+    self.failedStageEvidencePath = failedStageEvidencePath
+    self.nextOperatorAction = nextOperatorAction
+  }
+}
+
+enum P088ImplementationCompletionVisualState: Equatable, Sendable {
+  case neutral
+  case positive
+  case warning
+  case blocking
+}
+
+struct P088ImplementationCompletionPresentation: Equatable, Sendable {
+  let compactSignalLabel: String
+  let statusLabel: String
+  let failureClassLabel: String?
+  let workChangeKindLabel: String?
+  let outputFreshnessLabel: String
+  let primaryEvidencePath: String?
+  let evidencePathLabel: String?
+  let nextOperatorActionLabel: String
+  let diagnosticRows: [String]
+  let copyItems: [P031DiagnosticCopyItem]
+  let accessibilityLabel: String
+  let visualState: P088ImplementationCompletionVisualState
+}
+
+enum P088ImplementationCompletionPresenter {
+  nonisolated static func presentationIfPresent(
+    for readback: P088ImplementationCompletionReadModel?
+  ) -> P088ImplementationCompletionPresentation? {
+    guard let readback, readback.status.value != "not_attempted" else {
+      return nil
+    }
+    return presentation(for: readback)
+  }
+
+  nonisolated static func presentation(
+    for readback: P088ImplementationCompletionReadModel
+  ) -> P088ImplementationCompletionPresentation {
+    let statusLabel = P031ThinPresentationFormatting.titleCase(readback.status.value)
+    let compactSignalLabel = "Implementation Completion: \(statusLabel)"
+    let failureClassLabel = normalizedText(readback.failureClass).map { "Failure class: \($0)" }
+    let workChangeKindLabel = normalizedText(readback.workChangeKind).map { "Work change: \($0)" }
+    let outputFreshnessLabel = [
+      "\(readback.freshRequiredOutputCount) fresh",
+      "\(readback.staleRequiredOutputCount) stale",
+      "\(readback.missingRequiredOutputCount) missing",
+      "\(readback.controlPlaneOutputCount) control-plane",
+    ].joined(separator: ", ")
+    let evidencePath = normalizedText(readback.receiptArtifactPath)
+      ?? normalizedText(readback.failedStageEvidencePath)
+    let evidencePathLabel = evidencePath.map { "Evidence: \($0)" }
+    let nextOperatorActionLabel =
+      "Next: \(P031ThinPresentationFormatting.titleCase(readback.nextOperatorAction.value))"
+    let capturedCount = readback.completionTextCaptures.filter {
+      $0.completionTextStatus == "captured"
+    }.count
+    let absentCount = readback.completionTextCaptures.filter {
+      $0.completionTextStatus != "captured"
+    }.count
+
+    let diagnosticRows = [
+      failureClassLabel,
+      workChangeKindLabel,
+      normalizedText(readback.activationSource).map { "Activation: \($0)" },
+      "Ingestion boundary: \(readback.ingestionBoundaryFailure.value)",
+      "Completion turn: \(readback.completionTurnAttempted ? "attempted" : "not attempted") / \(readback.completionTurnResult.value)",
+      normalizedText(readback.terminalResponseStatus).map { "Terminal response: \($0)" },
+      "Outputs: \(readback.freshRequiredOutputCount) fresh, \(readback.staleRequiredOutputCount) stale, \(readback.missingRequiredOutputCount) missing, \(readback.controlPlaneOutputCount) control-plane",
+      "Capture: \(capturedCount) captured, \(absentCount) absent",
+      evidencePathLabel,
+      nextOperatorActionLabel,
+    ].compactMap { $0 }
+
+    let copyItems = [
+      readback.receiptArtifactPath.map {
+        P031DiagnosticCopyItem(label: "Receipt path", value: $0)
+      },
+      readback.failedStageEvidencePath.map {
+        P031DiagnosticCopyItem(label: "Failed-stage evidence path", value: $0)
+      },
+    ].compactMap { $0 }
+
+    return P088ImplementationCompletionPresentation(
+      compactSignalLabel: compactSignalLabel,
+      statusLabel: statusLabel,
+      failureClassLabel: failureClassLabel,
+      workChangeKindLabel: workChangeKindLabel,
+      outputFreshnessLabel: "Outputs: \(outputFreshnessLabel)",
+      primaryEvidencePath: evidencePath,
+      evidencePathLabel: evidencePathLabel,
+      nextOperatorActionLabel: nextOperatorActionLabel,
+      diagnosticRows: diagnosticRows,
+      copyItems: copyItems,
+      accessibilityLabel: ([compactSignalLabel, failureClassLabel, workChangeKindLabel,
+                            "Outputs: \(outputFreshnessLabel)", evidencePathLabel,
+                            nextOperatorActionLabel] as [String?]).compactMap { $0 }.joined(separator: ", "),
+      visualState: visualState(for: readback.status.value)
+    )
+  }
+
+  private nonisolated static func visualState(for status: String) -> P088ImplementationCompletionVisualState {
+    switch status {
+    case "succeeded", "not_attempted":
+      return .positive
+    case "partial_evidence", "repair_succeeded":
+      return .warning
+    case "failed", "repair_failed":
+      return .blocking
+    default:
+      return .neutral
+    }
+  }
+
+  private nonisolated static func normalizedText(_ value: String?) -> String? {
+    let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed?.isEmpty == false ? trimmed : nil
+  }
+}
+
 struct P031RunRowReadModel: Decodable, Equatable, Sendable {
   let id: String
   let status: String
@@ -1303,6 +1554,7 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
   let pendingApprovals: Int?
   let closeoutReadinessSummary: P077CloseoutReadinessSummaryReadModel?
   let rolloutDecisionSummary: RolloutDecisionSummary?
+  let implementationCompletion: P088ImplementationCompletionReadModel?
 
   nonisolated init(
     id: String,
@@ -1320,7 +1572,8 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     failedStages: Int?,
     pendingApprovals: Int?,
     closeoutReadinessSummary: P077CloseoutReadinessSummaryReadModel? = nil,
-    rolloutDecisionSummary: RolloutDecisionSummary? = nil
+    rolloutDecisionSummary: RolloutDecisionSummary? = nil,
+    implementationCompletion: P088ImplementationCompletionReadModel? = nil
   ) {
     self.id = id
     self.status = status
@@ -1338,6 +1591,7 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     self.pendingApprovals = pendingApprovals
     self.closeoutReadinessSummary = closeoutReadinessSummary
     self.rolloutDecisionSummary = rolloutDecisionSummary
+    self.implementationCompletion = implementationCompletion
   }
 
   enum CodingKeys: String, CodingKey {
@@ -1355,6 +1609,7 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
     case completedStages
     case failedStages
     case pendingApprovals
+    case implementationCompletion
     case implementationCloseoutReadinessSummary
     case closeoutReadinessSummaryJson
     case rolloutDecisionSummary = "rolloutContractReadbackJson"
@@ -1385,7 +1640,14 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
           P077CloseoutReadinessSummaryReadModel.self,
           forKey: .closeoutReadinessSummaryJson
         ),
-      rolloutDecisionSummary: try container.decodeIfPresent(RolloutDecisionSummary.self, forKey: .rolloutDecisionSummary)
+      rolloutDecisionSummary: try container.decodeIfPresent(
+        RolloutDecisionSummary.self,
+        forKey: .rolloutDecisionSummary
+      ),
+      implementationCompletion: try container.decodeIfPresent(
+        P088ImplementationCompletionReadModel.self,
+        forKey: .implementationCompletion
+      )
     )
   }
 
@@ -1406,7 +1668,8 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
       failedStages: failedStages,
       pendingApprovals: pendingApprovals,
       closeoutReadinessSummary: closeoutReadinessSummary,
-      rolloutDecisionSummary: rolloutDecisionSummary
+      rolloutDecisionSummary: rolloutDecisionSummary,
+      implementationCompletion: implementationCompletion
     )
   }
 }
@@ -1959,6 +2222,38 @@ enum P031GraphQLDocuments {
         completedStages
         failedStages
         pendingApprovals
+        implementationCompletion {
+          status { value raw known }
+          failureClass
+          workChangeKind
+          activationSource
+          ingestionBoundaryFailure { value raw known }
+          completionTurnAttempted
+          completionTurnResult { value raw known }
+          terminalResponseStatus
+          completionTextCaptures {
+            promptKind
+            turnIndex
+            terminalResponseStatus
+            completionTextStatus
+            completionTextCaptureSource
+            completionTextRawByteLimit
+            completionTextCapturedByteCount
+            completionTextTruncated
+            extractionInputTruncated
+            extractionInputSha256
+            redactedTextArtifactPath
+            textAbsenceReason
+            createdAt
+          }
+          freshRequiredOutputCount
+          staleRequiredOutputCount
+          missingRequiredOutputCount
+          controlPlaneOutputCount
+          receiptArtifactPath
+          failedStageEvidencePath
+          nextOperatorAction { value raw known }
+        }
         implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson
         rolloutContractReadbackJson
       }
@@ -1981,6 +2276,38 @@ enum P031GraphQLDocuments {
         completedStages
         failedStages
         pendingApprovals
+        implementationCompletion {
+          status { value raw known }
+          failureClass
+          workChangeKind
+          activationSource
+          ingestionBoundaryFailure { value raw known }
+          completionTurnAttempted
+          completionTurnResult { value raw known }
+          terminalResponseStatus
+          completionTextCaptures {
+            promptKind
+            turnIndex
+            terminalResponseStatus
+            completionTextStatus
+            completionTextCaptureSource
+            completionTextRawByteLimit
+            completionTextCapturedByteCount
+            completionTextTruncated
+            extractionInputTruncated
+            extractionInputSha256
+            redactedTextArtifactPath
+            textAbsenceReason
+            createdAt
+          }
+          freshRequiredOutputCount
+          staleRequiredOutputCount
+          missingRequiredOutputCount
+          controlPlaneOutputCount
+          receiptArtifactPath
+          failedStageEvidencePath
+          nextOperatorAction { value raw known }
+        }
         implementationCloseoutReadinessSummary: closeoutReadinessSummaryJson
         rolloutContractReadbackJson
       }
@@ -2123,6 +2450,7 @@ enum P031GraphQLDocuments {
           serverDebugDetail
         }
         journalId
+        conflictResultCode
       }
     }
     """
@@ -2144,6 +2472,7 @@ enum P031GraphQLDocuments {
           serverDebugDetail
         }
         journalId
+        conflictResultCode
       }
     }
     """
@@ -2401,7 +2730,7 @@ struct P031GraphQLWorkflowReadStore<
         throw P031GraphQLReadBoundaryError.missingData("P031ArtifactPayload")
       }
       ForgeLogger.ui.info(
-        "P031ArtifactPayload response artifactID=\(artifact.id) payloadState=\(artifact.payloadAvailabilityState.rawValue) hasPayload=\((artifact.payloadText?.isEmpty == false)) reason=\(artifact.payloadUnavailableReasonCode?.rawValue ?? "nil") debug=\(artifact.serverDebugDetail ?? "nil")"
+        "P031ArtifactPayload response artifactID=\(artifact.id) payloadState=\(artifact.payloadAvailabilityState.rawValue) hasPayload=\((artifact.payloadText?.isEmpty == false)) reason=\(artifact.payloadUnavailableReasonCode?.rawValue ?? "nil")"
       )
       return artifact
     } catch {
@@ -3527,6 +3856,7 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
   let progressLabel: String?
   let pendingApprovalsLabel: String?
   let closeoutReadinessSignalLabel: String?
+  let implementationCompletionSignalLabel: String?
   let freshnessState: P031FreshnessState
   let accessibilityLabel: String
 
@@ -3538,6 +3868,7 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
     progressLabel: String?,
     pendingApprovalsLabel: String?,
     closeoutReadinessSignalLabel: String? = nil,
+    implementationCompletionSignalLabel: String? = nil,
     freshnessState: P031FreshnessState,
     accessibilityLabel: String
   ) {
@@ -3548,6 +3879,7 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
     self.progressLabel = progressLabel
     self.pendingApprovalsLabel = pendingApprovalsLabel
     self.closeoutReadinessSignalLabel = closeoutReadinessSignalLabel
+    self.implementationCompletionSignalLabel = implementationCompletionSignalLabel
     self.freshnessState = freshnessState
     self.accessibilityLabel = accessibilityLabel
   }
@@ -3596,6 +3928,9 @@ struct P031StageSummaryPresentation: Equatable, Sendable {
   let title: String
   let statusLabel: String
   let iterationLabel: String?
+  let startedLabel: String?
+  let completedLabel: String?
+  let durationLabel: String?
   let badgeLabels: [String]
   let freshnessState: P031FreshnessState
   let accessibilityLabel: String
@@ -3637,6 +3972,9 @@ struct P031StageTransitionPresentation: Equatable, Sendable {
   let stageTitle: String
   let statusText: String
   let attemptText: String?
+  let startedLabel: String?
+  let completedLabel: String?
+  let durationLabel: String?
   let connectorState: P031StageConnectorState
   let evidenceLabels: [String]
   let accessibilityLabel: String
@@ -3809,7 +4147,6 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let pendingApprovalsLabel: String?
   let rolloutDecisionSummary: RolloutDecisionSummary?
   let ideaContext: P031IdeaContextPresentation?
-  let stageRows: [P031StageSummaryPresentation]
   let stageTransitions: [P031StageTransitionPresentation]
   let approvalRows: [P031ApprovalInboxRowPresentation]
   let artifactRows: [P031ArtifactSummaryPresentation]
@@ -3817,6 +4154,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let reportRows: [P031ReportMetadataRowPresentation]
   let catalogContext: P031CatalogContextPresentation?
   let closeoutReadiness: P077CloseoutReadinessPresentation?
+  let implementationCompletion: P088ImplementationCompletionPresentation?
   let freshness: P031FreshnessSnapshot
   let refreshFeedbackText: String
   let emptyStateTitle: String?
@@ -3830,7 +4168,6 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     pendingApprovalsLabel: String?,
     rolloutDecisionSummary: RolloutDecisionSummary? = nil,
     ideaContext: P031IdeaContextPresentation?,
-    stageRows: [P031StageSummaryPresentation],
     stageTransitions: [P031StageTransitionPresentation],
     approvalRows: [P031ApprovalInboxRowPresentation],
     artifactRows: [P031ArtifactSummaryPresentation],
@@ -3838,6 +4175,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     reportRows: [P031ReportMetadataRowPresentation],
     catalogContext: P031CatalogContextPresentation?,
     closeoutReadiness: P077CloseoutReadinessPresentation? = nil,
+    implementationCompletion: P088ImplementationCompletionPresentation? = nil,
     freshness: P031FreshnessSnapshot,
     refreshFeedbackText: String,
     emptyStateTitle: String?,
@@ -3849,7 +4187,6 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.progressLabel = progressLabel
     self.pendingApprovalsLabel = pendingApprovalsLabel
     self.ideaContext = ideaContext
-    self.stageRows = stageRows
     self.stageTransitions = stageTransitions
     self.approvalRows = approvalRows
     self.artifactRows = artifactRows
@@ -3858,6 +4195,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.catalogContext = catalogContext
     self.rolloutDecisionSummary = rolloutDecisionSummary
     self.closeoutReadiness = closeoutReadiness
+    self.implementationCompletion = implementationCompletion
     self.freshness = freshness
     self.refreshFeedbackText = refreshFeedbackText
     self.emptyStateTitle = emptyStateTitle
@@ -4284,14 +4622,6 @@ struct P031StageDetailPresentation: Equatable, Sendable {
   let errorDescription: String?
 }
 
-struct P031StageListPresentation: Equatable, Sendable {
-  let rows: [P031StageSummaryPresentation]
-  let freshness: P031FreshnessSnapshot
-  let refreshFeedbackText: String
-  let emptyStateTitle: String?
-  let errorDescription: String?
-}
-
 struct P031ArtifactListPresentation: Equatable, Sendable {
   let rows: [P031ArtifactSummaryPresentation]
   let freshness: P031FreshnessSnapshot
@@ -4395,6 +4725,9 @@ enum P031RunsHomePresenter {
     let closeoutReadiness = run.closeoutReadinessSummary.map {
       P077CloseoutReadinessPresenter.presentation(for: $0)
     }
+    let implementationCompletion = P088ImplementationCompletionPresenter.presentationIfPresent(
+      for: run.implementationCompletion
+    )
     let accessibilityParts = [
       displayTitle,
       workflowLabel,
@@ -4402,6 +4735,7 @@ enum P031RunsHomePresenter {
       progressLabel,
       pendingApprovalsLabel,
       closeoutReadiness?.compactSignalLabel,
+      implementationCompletion?.compactSignalLabel,
       P031ThinPresentationFormatting.freshnessAccessibilityLabel(run.freshnessState),
     ].compactMap { $0 }
 
@@ -4413,6 +4747,7 @@ enum P031RunsHomePresenter {
       progressLabel: progressLabel,
       pendingApprovalsLabel: pendingApprovalsLabel,
       closeoutReadinessSignalLabel: closeoutReadiness?.compactSignalLabel,
+      implementationCompletionSignalLabel: implementationCompletion?.compactSignalLabel,
       freshnessState: run.freshnessState,
       accessibilityLabel: accessibilityParts.joined(separator: ", ")
     )
@@ -4505,13 +4840,20 @@ enum P031ApprovalInboxPresenter {
       approval.runID,
       approval.stageID,
     ]
+    // P085: derive actionability through the canonical affordance presenter, which checks
+    // durable decision state, writePathState, and availableActions before granting actionable.
+    let p085Affordance = P085AffordancePresenter.approvalAffordance(for: approval)
+    let canApprove: Bool
+    if case .actionable = p085Affordance.approveAvailability { canApprove = true } else { canApprove = false }
+    let canReject: Bool
+    if case .actionable = p085Affordance.rejectAvailability { canReject = true } else { canReject = false }
 
     return P031ApprovalInboxRowPresentation(
       approvalID: approval.id,
       title: diagnostic.title,
       body: diagnostic.body,
-      canApprove: approval.canApprove,
-      canReject: approval.canReject,
+      canApprove: canApprove,
+      canReject: canReject,
       actionLabel: diagnostic.actionLabel,
       followUpID: diagnostic.followUpID,
       copyItems: diagnostic.copyItems,
@@ -4534,8 +4876,7 @@ enum P031RunDetailPresenter {
     let workflowLabel = runRow?.workflowLabel
     let statusLabel =
       run.map { P031ThinPresentationFormatting.titleCase($0.status) } ?? "Unavailable"
-    let stageRows = detail.stages.map(P031StagePresenter.presentation)
-    let stageTransitions = detail.stages.map(P031StageTransitionPresenter.presentation)
+    let stageTransitions = detail.stages.map { P031StageTransitionPresenter.presentation(for: $0) }
     let approvalRows = detail.approvalsForRun.map {
       P031ApprovalInboxPresenter.rowPresentation(
         for: $0,
@@ -4564,6 +4905,9 @@ enum P031RunDetailPresenter {
     let closeoutReadiness = run?.closeoutReadinessSummary.map {
       P077CloseoutReadinessPresenter.presentation(for: $0)
     }
+    let implementationCompletion = P088ImplementationCompletionPresenter.presentationIfPresent(
+      for: run?.implementationCompletion
+    )
     let emptyStateTitle: String?
     switch run {
     case .some:
@@ -4580,7 +4924,6 @@ enum P031RunDetailPresenter {
       pendingApprovalsLabel: pendingApprovalsLabel,
       rolloutDecisionSummary: run?.rolloutDecisionSummary,
       ideaContext: P031IdeaContextPresenter.presentation(for: detail.idea, fallbackRun: run),
-      stageRows: stageRows,
       stageTransitions: stageTransitions,
       approvalRows: approvalRows,
       artifactRows: artifactRows,
@@ -4588,6 +4931,7 @@ enum P031RunDetailPresenter {
       reportRows: reportRows,
       catalogContext: run.map(P031CatalogContextPresenter.presentation),
       closeoutReadiness: closeoutReadiness,
+      implementationCompletion: implementationCompletion,
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
         currentFreshness: currentFreshness,
         checkedAt: checkedAt,
@@ -4612,7 +4956,6 @@ enum P031RunDetailPresenter {
       pendingApprovalsLabel: nil,
       rolloutDecisionSummary: nil,
       ideaContext: nil,
-      stageRows: [],
       stageTransitions: [],
       approvalRows: [],
       artifactRows: [],
@@ -4620,6 +4963,7 @@ enum P031RunDetailPresenter {
       reportRows: [],
       catalogContext: nil,
       closeoutReadiness: nil,
+      implementationCompletion: nil,
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
         event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
@@ -4733,7 +5077,7 @@ enum P031StageDetailPresenter {
     }
 
     return P031StageDetailPresentation(
-      stage: detail.stage.map(P031StagePresenter.presentation),
+      stage: detail.stage.map { P031StagePresenter.presentation(for: $0) },
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
         currentFreshness: currentFreshness,
         checkedAt: checkedAt,
@@ -4764,7 +5108,10 @@ enum P031StageDetailPresenter {
 }
 
 enum P031StagePresenter {
-  nonisolated static func presentation(for stage: P031StageReadModel)
+  nonisolated static func presentation(
+    for stage: P031StageReadModel,
+    now: Date = Date()
+  )
     -> P031StageSummaryPresentation
   {
     let iterationLabel: String?
@@ -4782,10 +5129,22 @@ enum P031StagePresenter {
       stage.projectionLag ? "Projection lag" : nil,
     ].compactMap { $0 }
     let statusLabel = P031ThinPresentationFormatting.titleCase(stage.status)
+    let startedAt = P031ReadBoundaryDateParser.date(from: stage.startedAt)
+    let completedAt = P031ReadBoundaryDateParser.date(from: stage.completedAt)
+    let startedLabel = startedAt.map { "Started: \(P031ThinPresentationFormatting.timestamp($0))" }
+    let completedLabel = completedAt.map {
+      "Completed: \(P031ThinPresentationFormatting.timestamp($0))"
+    }
+    let durationLabel = P031ThinPresentationFormatting.durationLabel(
+      startedAt: startedAt,
+      completedAt: completedAt,
+      now: now
+    )
     var accessibilityParts = [stage.label, statusLabel]
     if let iterationLabel {
       accessibilityParts.append(iterationLabel)
     }
+    accessibilityParts.append(contentsOf: [startedLabel, completedLabel, durationLabel].compactMap { $0 })
     accessibilityParts.append(contentsOf: badgeLabels)
 
     return P031StageSummaryPresentation(
@@ -4793,6 +5152,9 @@ enum P031StagePresenter {
       title: stage.label,
       statusLabel: statusLabel,
       iterationLabel: iterationLabel,
+      startedLabel: startedLabel,
+      completedLabel: completedLabel,
+      durationLabel: durationLabel,
       badgeLabels: badgeLabels,
       freshnessState: stage.freshnessState,
       accessibilityLabel: accessibilityParts.joined(separator: ", ")
@@ -4833,7 +5195,10 @@ enum P031IdeaContextPresenter {
 }
 
 enum P031StageTransitionPresenter {
-  nonisolated static func presentation(for stage: P031StageReadModel)
+  nonisolated static func presentation(
+    for stage: P031StageReadModel,
+    now: Date = Date()
+  )
     -> P031StageTransitionPresentation
   {
     let statusText = P031ThinPresentationFormatting.titleCase(stage.status)
@@ -4845,19 +5210,40 @@ enum P031StageTransitionPresenter {
     } else {
       attemptText = nil
     }
+    let startedAt = P031ReadBoundaryDateParser.date(from: stage.startedAt)
+    let completedAt = P031ReadBoundaryDateParser.date(from: stage.completedAt)
+    let startedLabel = startedAt.map { "Started: \(P031ThinPresentationFormatting.timestamp($0))" }
+    let completedLabel = completedAt.map {
+      "Completed: \(P031ThinPresentationFormatting.timestamp($0))"
+    }
+    let durationLabel = P031ThinPresentationFormatting.durationLabel(
+      startedAt: startedAt,
+      completedAt: completedAt,
+      now: now
+    )
     let evidenceLabels = [
       stage.hasArtifacts == true ? "Artifacts" : nil,
       stage.hasPendingApproval == true ? "Approval" : nil,
       stage.hasValidationFailure == true ? "Validation" : nil,
       stage.settlementKind.map(P031ThinPresentationFormatting.titleCase),
     ].compactMap { $0 }
-    let accessibilityParts = [stage.label, statusText, attemptText].compactMap { $0 }
+    let accessibilityParts = [
+      stage.label,
+      statusText,
+      attemptText,
+      startedLabel,
+      completedLabel,
+      durationLabel,
+    ].compactMap { $0 }
       + evidenceLabels
     return P031StageTransitionPresentation(
       stageExecutionID: stage.id,
       stageTitle: stage.label,
       statusText: statusText,
       attemptText: attemptText,
+      startedLabel: startedLabel,
+      completedLabel: completedLabel,
+      durationLabel: durationLabel,
       connectorState: connectorState(for: stage),
       evidenceLabels: P031ThinPresentationFormatting.uniqueLabels(evidenceLabels),
       accessibilityLabel: accessibilityParts.joined(separator: ", ")
@@ -5054,44 +5440,6 @@ enum P031CatalogContextPresenter {
   }
 }
 
-enum P031StageListPresenter {
-  nonisolated static func presentation(
-    for stages: [P031StageReadModel],
-    currentFreshness: P031FreshnessSnapshot,
-    checkedAt: Date
-  ) -> P031StageListPresentation {
-    let rows = stages.map(P031StagePresenter.presentation)
-    return P031StageListPresentation(
-      rows: rows,
-      freshness: P031ThinPresentationFormatting.freshnessSnapshot(
-        currentFreshness: currentFreshness,
-        checkedAt: checkedAt,
-        states: stages.map(\.freshnessState)
-      ),
-      refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .stages),
-      emptyStateTitle: rows.isEmpty ? "No stages" : nil,
-      errorDescription: nil
-    )
-  }
-
-  nonisolated static func errorPresentation(
-    error: Error,
-    currentFreshness: P031FreshnessSnapshot,
-    checkedAt: Date
-  ) -> P031StageListPresentation {
-    P031StageListPresentation(
-      rows: [],
-      freshness: WorkflowFreshnessReducer.reduce(
-        currentFreshness,
-        event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
-      ),
-      refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .stages),
-      emptyStateTitle: nil,
-      errorDescription: P031ReadErrorPresenter.description(for: error)
-    )
-  }
-}
-
 enum P031ArtifactPresenter {
   nonisolated static func presentation(for artifact: P031ArtifactReadModel)
     -> P031ArtifactSummaryPresentation
@@ -5117,10 +5465,14 @@ enum P031ArtifactPresenter {
       value?.trimmingCharacters(in: .whitespacesAndNewlines)
     }.filter { !$0.isEmpty }
     let detailLabel = detailParts.joined(separator: " / ")
+    // P085: use the canonical affordance presenter for the list label so payload_deferred
+    // surfaces "Open to preview" rather than an Unavailable/generic fallback.
+    let p085Affordance = P085AffordancePresenter.artifactListAffordance(for: artifact)
+    let p085Label = p085Affordance.label
     let accessibilityParts = [
       artifact.name,
       detailLabel,
-      payload.title,
+      p085Label,
       P031ThinPresentationFormatting.freshnessAccessibilityLabel(artifact.freshnessState),
     ].compactMap { $0 }.filter { !$0.isEmpty }
 
@@ -5128,7 +5480,7 @@ enum P031ArtifactPresenter {
       artifactID: artifact.id,
       title: artifact.name,
       detailLabel: detailLabel,
-      payloadAvailabilityLabel: payload.title,
+      payloadAvailabilityLabel: p085Label,
       payloadAvailabilitySymbolName: payload.symbolName,
       canOpenPayload: payload.canOpenPayload,
       diagnosticCopyItems: payload.copyItems,
@@ -5408,27 +5760,6 @@ struct P031ThinWorkflowScreenCoordinator<Store: P031WorkflowReadStore>: Sendable
     }
   }
 
-  nonisolated func loadStages(
-    runID: String,
-    currentFreshness: P031FreshnessSnapshot,
-    checkedAt: Date = Date()
-  ) async -> P031StageListPresentation {
-    do {
-      let stages = try await store.fetchStages(runID: runID)
-      return P031StageListPresenter.presentation(
-        for: stages,
-        currentFreshness: currentFreshness,
-        checkedAt: checkedAt
-      )
-    } catch {
-      return P031StageListPresenter.errorPresentation(
-        error: error,
-        currentFreshness: currentFreshness,
-        checkedAt: checkedAt
-      )
-    }
-  }
-
   nonisolated func loadApprovalInbox(
     currentFreshness: P031FreshnessSnapshot,
     checkedAt: Date = Date()
@@ -5564,6 +5895,15 @@ struct P031ThinWorkflowSubscriptionCoordinator<Store: P031WorkflowReadStore>: Se
 }
 
 private enum P031ThinPresentationFormatting {
+  nonisolated private static let timestampFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "yyyy-MM-dd HH:mm"
+    return formatter
+  }()
+
   nonisolated static func freshnessSnapshot(
     currentFreshness: P031FreshnessSnapshot,
     checkedAt: Date,
@@ -5616,5 +5956,39 @@ private enum P031ThinPresentationFormatting {
     return labels.filter { label in
       seen.insert(label).inserted
     }
+  }
+
+  nonisolated static func timestamp(_ date: Date) -> String {
+    timestampFormatter.string(from: date)
+  }
+
+  nonisolated static func durationLabel(
+    startedAt: Date?,
+    completedAt: Date?,
+    now: Date
+  ) -> String? {
+    guard let startedAt else {
+      return nil
+    }
+    let end = completedAt ?? now
+    guard end >= startedAt else {
+      return nil
+    }
+    return "Duration: \(duration(end.timeIntervalSince(startedAt)))"
+  }
+
+  nonisolated private static func duration(_ interval: TimeInterval) -> String {
+    let totalSeconds = Int(interval.rounded(.down))
+    let hours = totalSeconds / 3600
+    let minutes = (totalSeconds % 3600) / 60
+    let seconds = totalSeconds % 60
+
+    if hours > 0 {
+      return "\(hours)h \(minutes)m \(seconds)s"
+    }
+    if minutes > 0 {
+      return "\(minutes)m \(seconds)s"
+    }
+    return "\(seconds)s"
   }
 }

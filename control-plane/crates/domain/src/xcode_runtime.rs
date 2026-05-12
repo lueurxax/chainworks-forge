@@ -58,6 +58,11 @@ impl XcodeRuntimeObservation {
                     event.cwd = redact_sensitive_text(&event.cwd);
                     event.policy_reason = redact_sensitive_text(&event.policy_reason);
                 }
+                XcodeShimEvent::ShimRuntimeAttached(event) => {
+                    event.shim_dir = redact_sensitive_text(&event.shim_dir);
+                    event.socket_path = redact_sensitive_text(&event.socket_path);
+                    event.workspace_root = redact_sensitive_text(&event.workspace_root);
+                }
                 XcodeShimEvent::Warning(event) => {
                     event.matched_substring = redact_sensitive_text(&event.matched_substring);
                     event.excerpt = redact_sensitive_text(&event.excerpt);
@@ -269,8 +274,21 @@ pub struct McpBrokerStatusUpdate {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum XcodeShimEvent {
+    ShimRuntimeAttached(XcodeShimRuntimeAttachedEvent),
     ShimInvocation(XcodeShimInvocationEvent),
     Warning(XcodeShimWarningEvent),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct XcodeShimRuntimeAttachedEvent {
+    pub ts: DateTime<Utc>,
+    pub source: String,
+    pub reason: String,
+    pub lease_id: String,
+    pub shim_dir: String,
+    pub socket_path: String,
+    pub workspace_root: String,
+    pub agent_execution_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -345,6 +363,12 @@ impl XcodeRuntimeObservationUpdate {
                 event.cwd = redact_sensitive_text(&event.cwd);
                 event.policy_reason = redact_sensitive_text(&event.policy_reason);
                 Self::XcodeShimEvent(XcodeShimEvent::ShimInvocation(event))
+            }
+            Self::XcodeShimEvent(XcodeShimEvent::ShimRuntimeAttached(mut event)) => {
+                event.shim_dir = redact_sensitive_text(&event.shim_dir);
+                event.socket_path = redact_sensitive_text(&event.socket_path);
+                event.workspace_root = redact_sensitive_text(&event.workspace_root);
+                Self::XcodeShimEvent(XcodeShimEvent::ShimRuntimeAttached(event))
             }
             Self::XcodeShimEvent(XcodeShimEvent::Warning(mut event)) => {
                 event.matched_substring = redact_sensitive_text(&event.matched_substring);

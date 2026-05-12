@@ -345,6 +345,9 @@ final class ExecutionService {
                 approvalAfter: updatedApproval.map(Self.makeApprovalSnapshot)
             )
             persistApprovalResolution(diagnostic, for: run, approvalID: approvalID)
+            if !granted {
+                scheduleRejectedApprovalDetachCheck(run: run, request: request)
+            }
             refreshDockBadge()
             return
         }
@@ -386,12 +389,55 @@ final class ExecutionService {
                     approvalAfter: updatedApproval.map(Self.makeApprovalSnapshot)
                 )
                 persistApprovalResolution(diagnostic, for: run, approvalID: approvalID)
+                if !granted {
+                    scheduleRejectedApprovalDetachCheck(run: run, request: request)
+                }
             } catch {
                 pendingApprovals[approvalID] = request
                 ForgeLogger.execution.error("Failed to resolve persisted approval \(approvalID): \(error.localizedDescription)")
             }
             refreshDockBadge()
         }
+    }
+
+    private func scheduleRejectedApprovalDetachCheck(run: Run, request: ApprovalRequest) {
+        Task { @MainActor in
+            for _ in 0..<30 {
+                if detachRejectedApprovalOrchestratorIfSettled(run: run, request: request) {
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+    }
+
+    @discardableResult
+    private func detachRejectedApprovalOrchestratorIfSettled(
+        run: Run,
+        request: ApprovalRequest
+    ) -> Bool {
+        guard activeOrchestrators[request.runID] != nil else { return true }
+        guard run.approvals.contains(where: {
+            ($0.id == request.id || $0.stageID == request.stageID) && $0.decision == .rejected
+        }) else {
+            return false
+        }
+        if run.status == .waitingApproval {
+            run.status = .blocked
+            run.driftDetectedAt = Date()
+            run.driftDetails =
+                "Approval was rejected but the active orchestrator did not settle the approval gate. Manual resume is required."
+        }
+        guard run.status != .running && run.status != .waitingApproval else {
+            return false
+        }
+
+        activeOrchestrators.removeValue(forKey: request.runID)
+        pendingApprovals = pendingApprovals.filter { $0.value.runID != request.runID }
+        synchronizeIdeaStatus(for: run)
+        try? modelContext.save()
+        refreshDockBadge()
+        return true
     }
 
     // MARK: - Cancel Run
@@ -488,7 +534,18 @@ final class ExecutionService {
     }
 
     func registerTestingOrchestrator(_ orchestrator: WorkflowOrchestrator) {
-        activeOrchestrators[orchestrator.run.id] = orchestrator
+        let run = orchestrator.run
+        let runID = run.id
+        orchestrator.onComplete = { [weak self] _ in
+            self?.activeOrchestrators.removeValue(forKey: runID)
+            self?.pendingApprovals = self?.pendingApprovals.filter {
+                $0.value.runID != runID
+            } ?? [:]
+            self?.synchronizeIdeaStatus(for: run)
+            try? self?.modelContext.save()
+            self?.refreshDockBadge()
+        }
+        activeOrchestrators[runID] = orchestrator
     }
 
     private func fetchRun(id: UUID) -> Run? {

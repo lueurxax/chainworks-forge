@@ -1543,6 +1543,7 @@ struct ResumeManagerTests {
             iteration: 1,
             attemptNumber: 1
         )
+        stage.startedAt = Date().addingTimeInterval(-301)
         stage.run = run
         context.insert(stage)
         try context.save()
@@ -1561,7 +1562,7 @@ struct ResumeManagerTests {
             agentID: "test_agent",
             event: ExecutionEvent(
                 type: .sessionClosed,
-                timestamp: Date().addingTimeInterval(-31),
+                timestamp: Date().addingTimeInterval(-301),
                 detail: "Session closed"
             )
         )
@@ -1632,6 +1633,7 @@ struct ResumeManagerTests {
             iteration: 1,
             attemptNumber: 1
         )
+        stage.startedAt = Date().addingTimeInterval(-301)
         stage.run = run
         context.insert(stage)
 
@@ -1663,7 +1665,7 @@ struct ResumeManagerTests {
             agentID: "code_writer",
             event: ExecutionEvent(
                 type: .sessionClosed,
-                timestamp: Date().addingTimeInterval(-31),
+                timestamp: Date().addingTimeInterval(-301),
                 detail: "Session closed"
             )
         )

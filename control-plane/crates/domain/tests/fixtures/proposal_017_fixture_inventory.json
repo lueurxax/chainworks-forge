@@ -88,6 +88,13 @@
       "contradiction_bearing": ["decision"],
       "advisory_only": ["next_action", "next_stage"],
       "non_authoritative": ["summary"]
+    },
+    {
+      "contract_id": "proposal_review_summary_v2",
+      "transition_authoritative": ["pass", "blocker_count", "blocking_issues", "blocking_required_changes"],
+      "contradiction_bearing": ["decision"],
+      "advisory_only": ["advisory_follow_ups"],
+      "non_authoritative": ["summary", "recurring_themes"]
     }
   ],
   "unknown_transition_input_fixtures": [

@@ -94,7 +94,8 @@ enum RunStageSnapshotLoader {
     }
 
     static func load(for run: Run) -> [RunStageSnapshot] {
-        if let cached = cachedSnapshots(for: run.id) {
+        if let cached = cachedSnapshots(for: run.id),
+           !(cached.isEmpty && !run.stageExecutions.isEmpty) {
             return cached
         }
 

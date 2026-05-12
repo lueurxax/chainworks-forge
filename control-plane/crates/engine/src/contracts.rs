@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use domain::artifact::ArtifactFormat;
 use domain::artifact_contracts::{
-    contract_status_allowed_values, parse_implementation_self_assessment_v2, ContractParseContext,
+    contract_status_allowed_values, parse_implementation_self_assessment_v2,
+    proposal_review_summary_v2_validation_error, ContractParseContext,
     ImplementationSelfAssessmentStatus, IMPLEMENTATION_SELF_ASSESSMENT_ARTIFACT_PATH,
-    IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+    IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID, PROPOSAL_REVIEW_SUMMARY_V2_CONTRACT_ID,
 };
 use domain::commands::{KnowledgeCapsulesMode, MainSyncMode};
 use domain::discovery::{
@@ -203,6 +204,20 @@ pub fn validate_output(
                     })
                     .collect::<Vec<_>>()
                     .join("; ");
+                return OutputValidationResult {
+                    output_name: output_name.to_string(),
+                    contract_id: Some(schema.contract_id.clone()),
+                    status: ValidationStatus::Failed,
+                    missing_fields: Vec::new(),
+                    validation_error: Some(validation_error),
+                    raw_payload_size: content.len(),
+                };
+            }
+        }
+        if schema.contract_id == PROPOSAL_REVIEW_SUMMARY_V2_CONTRACT_ID {
+            if let Some(validation_error) =
+                proposal_review_summary_v2_validation_error(&serde_json::Value::Object(obj.clone()))
+            {
                 return OutputValidationResult {
                     output_name: output_name.to_string(),
                     contract_id: Some(schema.contract_id.clone()),
@@ -1073,5 +1088,89 @@ mod tests {
             "nested missing boolean must fail closed: {:?}",
             result.validation_error
         );
+    }
+
+    #[test]
+    fn validate_output_accepts_v2_proposal_review_summary_with_advisories() {
+        let mut schema = structured_schema();
+        schema.contract_id = PROPOSAL_REVIEW_SUMMARY_V2_CONTRACT_ID.to_string();
+        schema.required_fields = vec![
+            "pass".into(),
+            "average_score".into(),
+            "aggregate_score".into(),
+            "min_individual_score".into(),
+            "blocker_count".into(),
+            "blocking_issues".into(),
+            "summary".into(),
+            "blocking_required_changes".into(),
+            "advisory_follow_ups".into(),
+            "recurring_themes".into(),
+            "decision".into(),
+        ];
+
+        let result = validate_output(
+            "proposal_review_summary",
+            br#"{
+                "pass": true,
+                "average_score": 8.5,
+                "aggregate_score": 8.5,
+                "min_individual_score": 8.0,
+                "blocker_count": 0,
+                "blocking_issues": [],
+                "summary": "approved",
+                "blocking_required_changes": [],
+                "advisory_follow_ups": ["carry rollout caution into implementation"],
+                "recurring_themes": ["durability"],
+                "decision": "approved"
+            }"#,
+            Some(&schema),
+        );
+
+        assert_eq!(result.status, ValidationStatus::Passed);
+        assert_eq!(result.validation_error, None);
+    }
+
+    #[test]
+    fn validate_output_rejects_v2_proposal_review_summary_with_blocking_changes_on_pass() {
+        let mut schema = structured_schema();
+        schema.contract_id = PROPOSAL_REVIEW_SUMMARY_V2_CONTRACT_ID.to_string();
+        schema.required_fields = vec![
+            "pass".into(),
+            "average_score".into(),
+            "aggregate_score".into(),
+            "min_individual_score".into(),
+            "blocker_count".into(),
+            "blocking_issues".into(),
+            "summary".into(),
+            "blocking_required_changes".into(),
+            "advisory_follow_ups".into(),
+            "recurring_themes".into(),
+            "decision".into(),
+        ];
+
+        let result = validate_output(
+            "proposal_review_summary",
+            br#"{
+                "pass": true,
+                "average_score": 8.5,
+                "aggregate_score": 8.5,
+                "min_individual_score": 8.0,
+                "blocker_count": 0,
+                "blocking_issues": [],
+                "summary": "approved",
+                "blocking_required_changes": ["fix schema mismatch"],
+                "advisory_follow_ups": [],
+                "recurring_themes": [],
+                "decision": "approved"
+            }"#,
+            Some(&schema),
+        );
+
+        assert_eq!(result.status, ValidationStatus::Failed);
+        assert!(result
+            .validation_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("pass=true while blocker evidence is non-empty"));
     }
 }

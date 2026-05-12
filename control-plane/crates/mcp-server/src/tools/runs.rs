@@ -2,8 +2,8 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use db::repos::{
-    artifact_contracts, closeout, legacy_discovery_overrides, projections, rollout_contract_checks,
-    runs,
+    artifact_contracts, closeout, code_writer_completion_receipts, legacy_discovery_overrides,
+    projections, rollout_contract_checks, runs,
 };
 use domain::commands::{
     CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
@@ -822,11 +822,45 @@ async fn attach_implementation_self_assessment_summary(
         .map(|check| check.operator_readback_json_for_lane("mcp")),
         None => None,
     };
+    let code_writer_completion_receipts = match run_id {
+        Some(run_id) => {
+            let receipts = code_writer_completion_receipts::list_by_run(pool, run_id).await?;
+            let canonical_receipts =
+                code_writer_completion_receipts::list_canonical_by_run(pool, run_id).await?;
+            Some((
+                serde_json::to_value(&receipts)?,
+                serde_json::to_value(
+                    domain::code_writer_completion::project_implementation_completion(
+                        &canonical_receipts,
+                    ),
+                )?,
+            ))
+        }
+        None => None,
+    };
 
     if let Some(object) = value.as_object_mut() {
         object.insert(
             "implementation_self_assessment_summary".to_string(),
             summary.unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "code_writer_completion_receipts".to_string(),
+            code_writer_completion_receipts
+                .as_ref()
+                .map(|(receipts, _)| receipts.clone())
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "implementationCompletion".to_string(),
+            code_writer_completion_receipts
+                .map(|(_, implementation_completion)| implementation_completion)
+                .unwrap_or_else(|| {
+                    serde_json::to_value(
+                        domain::code_writer_completion::project_implementation_completion(&[]),
+                    )
+                    .unwrap_or(serde_json::Value::Null)
+                }),
         );
         object.insert(
             "rollout_contract_readback".to_string(),

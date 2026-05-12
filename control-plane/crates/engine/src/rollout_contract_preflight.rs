@@ -881,7 +881,7 @@ async fn upsert_linted_contract_check(
     {
         Ok(path) => path,
         Err(error) => {
-            return upsert_invalid_approved_proposal_contract_check(
+            return upsert_invalid_rollout_contract_check_from_artifact(
                 pool,
                 run,
                 approved_proposal,
@@ -900,7 +900,7 @@ async fn upsert_linted_contract_check(
         Ok(data) => data,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return upsert_invalid_approved_proposal_contract_check(
+            return upsert_invalid_rollout_contract_check_from_artifact(
                 pool,
                 run,
                 approved_proposal,
@@ -919,7 +919,7 @@ async fn upsert_linted_contract_check(
     let proposal_value: serde_json::Value = match serde_json::from_slice(&data) {
         Ok(value) => value,
         Err(error) => {
-            return upsert_invalid_approved_proposal_contract_check(
+            return upsert_invalid_rollout_contract_check_from_artifact(
                 pool,
                 run,
                 approved_proposal,
@@ -1278,18 +1278,18 @@ async fn upsert_missing_contract_check(
     rollout_contract_checks::upsert_rollout_contract_check(pool, &input, now).await
 }
 
-async fn upsert_invalid_approved_proposal_contract_check(
+async fn upsert_invalid_rollout_contract_check_from_artifact(
     pool: &SqlitePool,
     run: &Run,
-    approved_proposal: &Artifact,
+    proposal_artifact: &Artifact,
     enforcement_mode: RolloutContractEnforcementMode,
     retry_count: i64,
     failure_reasons: Vec<String>,
     diagnostics: Vec<String>,
 ) -> Result<StoredRolloutContractCheck> {
     let now = Utc::now();
-    let metadata = proposal_metadata_from_artifact(run, approved_proposal)?
-        .unwrap_or_else(ProposalMetadata::unknown);
+    let metadata = proposal_metadata_from_artifact(run, proposal_artifact)?
+        .unwrap_or_else(|| ProposalMetadata::unknown_for_artifact(proposal_artifact));
     let status = RolloutContractStatus::Fail;
     let decision = RolloutContractDecision::Hold;
     let mut diagnostics = diagnostics;
@@ -1307,13 +1307,13 @@ async fn upsert_invalid_approved_proposal_contract_check(
         run_id: run.id.inner(),
         proposal_id: metadata.proposal_id,
         proposal_revision_id: metadata.proposal_revision_id,
-        proposal_content_hash: approved_proposal
+        proposal_content_hash: proposal_artifact
             .checksum_sha256
             .clone()
             .map(|hash| format!("sha256:{hash}"))
             .unwrap_or_else(|| DEFAULT_PROPOSAL_CONTENT_HASH.to_string()),
         contract_object_hash: metadata.contract_object_hash,
-        content_snapshot_id: approved_proposal.id.to_string(),
+        content_snapshot_id: proposal_artifact.id.to_string(),
         checker_version: CHECKER_VERSION.to_string(),
         status,
         decision,
@@ -1330,6 +1330,80 @@ async fn upsert_invalid_approved_proposal_contract_check(
         preflight_timeout_seconds: PREFLIGHT_TIMEOUT_SECONDS,
     };
     rollout_contract_checks::upsert_rollout_contract_check(pool, &input, now).await
+}
+
+pub(crate) async fn persist_proposal_current_rollout_contract_hold(
+    pool: &SqlitePool,
+    run: &Run,
+    proposal_current: &Artifact,
+    retry_count: i64,
+) -> Result<Option<StoredRolloutContractCheck>> {
+    let proposal_path = match safe_artifact_path(&proposal_current.file_path, &run.workspace_root) {
+        Ok(path) => path,
+        Err(error) => {
+            let mode = terminal_failure_enforcement_mode(pool, run).await;
+            let check = upsert_invalid_rollout_contract_check_from_artifact(
+                pool,
+                run,
+                proposal_current,
+                mode,
+                retry_count,
+                vec!["unsafe_proposal_current_artifact_path".to_string()],
+                vec![bounded_diagnostic(format!(
+                    "proposal_current artifact path rejected before approved_proposal snapshot: {error}"
+                ))],
+            )
+            .await?;
+            write_rollout_contract_check_projection(run, &check)?;
+            return Ok(Some(check));
+        }
+    };
+    let data = match read_bounded_rollout_contract_input(&proposal_path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            let mode = terminal_failure_enforcement_mode(pool, run).await;
+            let check = upsert_invalid_rollout_contract_check_from_artifact(
+                pool,
+                run,
+                proposal_current,
+                mode,
+                retry_count,
+                vec!["invalid_proposal_current_artifact".to_string()],
+                vec![bounded_diagnostic(format!(
+                    "read proposal_current artifact {} before approved_proposal snapshot: {error}",
+                    proposal_path.display()
+                ))],
+            )
+            .await?;
+            write_rollout_contract_check_projection(run, &check)?;
+            return Ok(Some(check));
+        }
+    };
+    let failures =
+        proposal_current_freeze_readiness_failures(&data, &proposal_path, &run.workspace_root)?;
+    if failures.is_empty() {
+        return Ok(None);
+    }
+
+    let mode = terminal_failure_enforcement_mode(pool, run).await;
+    let diagnostics = vec![bounded_diagnostic(format!(
+        "proposal_current failed implementation freeze readiness before approved_proposal snapshot path={} failures={}",
+        proposal_path.display(),
+        failures.join(",")
+    ))];
+    let check = upsert_invalid_rollout_contract_check_from_artifact(
+        pool,
+        run,
+        proposal_current,
+        mode,
+        retry_count,
+        failures,
+        diagnostics,
+    )
+    .await?;
+    write_rollout_contract_check_projection(run, &check)?;
+    Ok(Some(check))
 }
 
 async fn upsert_timeout_contract_check(
@@ -1634,6 +1708,30 @@ pub(crate) fn approved_proposal_rollout_contract_lint_failures(
     Ok(lint.failures)
 }
 
+pub(crate) fn proposal_current_freeze_readiness_failures(
+    data: &[u8],
+    proposal_path: &std::path::Path,
+    workspace_root: &str,
+) -> Result<Vec<String>> {
+    let proposal_value: serde_json::Value = match serde_json::from_slice(data) {
+        Ok(value) => value,
+        Err(_) => return Ok(vec!["invalid_proposal_current_artifact".to_string()]),
+    };
+    let Some(contract_source) =
+        extract_rollout_contract_source(&proposal_value, proposal_path, workspace_root)?
+    else {
+        return Ok(vec!["missing_rollout_contract_check".to_string()]);
+    };
+    let mut lint = lint_rollout_contract(&contract_source.contract, workspace_root);
+    lint.failures.extend(contract_source.extraction_failures);
+    filter_materializable_fixture_failures(
+        &mut lint.failures,
+        &contract_source.contract,
+        workspace_root,
+    );
+    Ok(lint.failures)
+}
+
 pub(crate) fn materialize_missing_rollout_contract_fixture_placeholders(
     data: &[u8],
     proposal_path: &std::path::Path,
@@ -1715,6 +1813,44 @@ pub(crate) fn materialize_missing_rollout_contract_fixture_placeholders(
     }
 
     Ok(materialized)
+}
+
+fn filter_materializable_fixture_failures(
+    failures: &mut Vec<String>,
+    contract: &serde_json::Value,
+    workspace_root: &str,
+) {
+    let Some(contract) = contract.as_object() else {
+        return;
+    };
+
+    let mut ignorable_prefixes = Vec::new();
+    if contract
+        .get("readback_fixture")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| missing_rollout_fixture_path_is_materializable(path, workspace_root))
+        .is_some()
+    {
+        ignorable_prefixes.push("missing_fixture_path: readback_fixture".to_string());
+    }
+    if let Some(negative_fixtures) = contract
+        .get("negative_fixtures")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, value) in negative_fixtures {
+            let Some(path) = value.as_str() else {
+                continue;
+            };
+            if missing_rollout_fixture_path_is_materializable(path, workspace_root) {
+                ignorable_prefixes.push(format!("missing_fixture_path: negative_fixtures.{key}"));
+            }
+        }
+    }
+    failures.retain(|failure| {
+        !ignorable_prefixes
+            .iter()
+            .any(|prefix| failure.starts_with(prefix))
+    });
 }
 
 #[derive(Clone, Debug)]
@@ -2974,27 +3110,7 @@ fn proposal_metadata_from_artifact(
         Err(_) => return Ok(Some(ProposalMetadata::unknown_for_artifact(artifact))),
     };
     let value: serde_json::Value = serde_json::from_slice(&data).unwrap_or(serde_json::Value::Null);
-    let proposal_revision_id = value
-        .get("proposal_revision_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or(DEFAULT_PROPOSAL_REVISION_ID)
-        .to_string();
-    let proposal_id = value
-        .get("source_proposal")
-        .and_then(|v| v.as_str())
-        .and_then(proposal_id_from_source_path)
-        .unwrap_or_else(|| DEFAULT_PROPOSAL_ID.to_string());
-    let contract_object_hash = value
-        .get("p084_self_contract")
-        .map(hash_json_value)
-        .unwrap_or_else(|| DEFAULT_CONTRACT_OBJECT_HASH.to_string());
-
-    Ok(Some(ProposalMetadata {
-        proposal_id,
-        proposal_revision_id,
-        contract_object_hash,
-        content_snapshot_id: artifact.id.to_string(),
-    }))
+    Ok(Some(proposal_metadata_from_value(artifact, &value)))
 }
 
 fn current_contract_identity(
@@ -3043,14 +3159,12 @@ fn proposal_metadata_from_value(
         .and_then(|v| v.as_str())
         .unwrap_or(DEFAULT_PROPOSAL_REVISION_ID)
         .to_string();
-    let proposal_id = value
-        .get("source_proposal")
-        .and_then(|v| v.as_str())
-        .and_then(proposal_id_from_source_path)
-        .unwrap_or_else(|| DEFAULT_PROPOSAL_ID.to_string());
+    let proposal_id =
+        proposal_id_from_value(value).unwrap_or_else(|| DEFAULT_PROPOSAL_ID.to_string());
     let contract_object_hash = value
-        .get("p084_self_contract")
+        .get("rollout_contract_v1")
         .map(hash_json_value)
+        .or_else(|| value.get("p084_self_contract").map(hash_json_value))
         .unwrap_or_else(|| DEFAULT_CONTRACT_OBJECT_HASH.to_string());
 
     ProposalMetadata {
@@ -3059,6 +3173,20 @@ fn proposal_metadata_from_value(
         contract_object_hash,
         content_snapshot_id: artifact.id.to_string(),
     }
+}
+
+fn proposal_id_from_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("source_proposal")
+        .and_then(|v| v.as_str())
+        .and_then(proposal_id_from_source_path)
+        .or_else(|| {
+            value
+                .get("proposal_id")
+                .and_then(|v| v.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        })
 }
 
 fn proposal_content_hash(_artifact: &Artifact, data: &[u8]) -> String {

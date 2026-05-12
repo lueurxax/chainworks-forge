@@ -1191,9 +1191,11 @@ struct RuntimeSessionBridgeTests {
         #expect(packet.taskDirective.contains("Do not add file extensions"))
         #expect(packet.taskDirective.contains("top-level JSON object"))
         #expect(packet.taskDirective.contains("Do not write markdown"))
-        #expect(packet.taskDirective.contains("#### proposal_review_summary -> proposal_review_summary_v1"))
+        #expect(packet.taskDirective.contains("#### proposal_review_summary -> proposal_review_summary_v2"))
         #expect(packet.taskDirective.contains("pass: Boolean"))
         #expect(packet.taskDirective.contains("average_score: Number"))
+        #expect(packet.taskDirective.contains("blocking_required_changes: Array of Strings"))
+        #expect(packet.taskDirective.contains("advisory_follow_ups: Array of Strings"))
         #expect(packet.taskDirective.contains("decision: String"))
     }
 

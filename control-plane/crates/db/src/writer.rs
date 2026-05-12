@@ -238,18 +238,13 @@ pub fn repository_transaction_operation(operation_name: &'static str) -> WriteOp
 
 static SHARED_WRITERS: OnceLock<Mutex<HashMap<String, Arc<DbWriter>>>> = OnceLock::new();
 
-async fn pool_registry_key(pool: &SqlitePool) -> Option<(String, bool)> {
-    let file: Option<String> =
-        sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-    let file = file.unwrap_or_default().trim().to_string();
-    if file.is_empty() {
-        Some((format!("in-memory:{:p}", pool), false))
+fn pool_registry_key(pool: &SqlitePool) -> Option<(String, bool)> {
+    let options = pool.connect_options();
+    let filename = options.get_filename().to_string_lossy().trim().to_string();
+    if filename.is_empty() || filename == ":memory:" {
+        Some((format!("in-memory:{:p}", Arc::as_ptr(&options)), false))
     } else {
-        Some((file, true))
+        Some((filename, true))
     }
 }
 
@@ -257,7 +252,7 @@ pub async fn register_shared_writer(
     pool: &SqlitePool,
     writer: Arc<DbWriter>,
 ) -> anyhow::Result<()> {
-    let Some((key, _file_backed)) = pool_registry_key(pool).await else {
+    let Some((key, _file_backed)) = pool_registry_key(pool) else {
         return Ok(());
     };
     SHARED_WRITERS
@@ -269,7 +264,7 @@ pub async fn register_shared_writer(
 }
 
 pub async fn shared_writer_for(pool: &SqlitePool) -> Option<Arc<DbWriter>> {
-    let (key, _file_backed) = pool_registry_key(pool).await?;
+    let (key, _file_backed) = pool_registry_key(pool)?;
     let registry = SHARED_WRITERS.get_or_init(|| Mutex::new(HashMap::new()));
     let guard = registry
         .lock()
@@ -291,7 +286,7 @@ pub async fn begin_registered_immediate_transaction<'pool>(
     if let Some(writer) = shared_writer_for(pool).await {
         return writer.begin_immediate_transaction(op, context).await;
     }
-    let Some((_key, file_backed)) = pool_registry_key(pool).await else {
+    let Some((_key, file_backed)) = pool_registry_key(pool) else {
         anyhow::bail!("P075 shared DbWriter registry key unavailable for {context}");
     };
     if file_backed {
@@ -330,7 +325,7 @@ pub async fn execute_repository_unit_operation(
     let result = if let Some(writer) = shared_writer_for(pool).await {
         writer.submit_work(op, work).await
     } else {
-        let Some((_key, file_backed)) = pool_registry_key(pool).await else {
+        let Some((_key, file_backed)) = pool_registry_key(pool) else {
             anyhow::bail!("P075 shared DbWriter registry key unavailable for {context}");
         };
         if file_backed {
@@ -379,7 +374,7 @@ pub async fn execute_repository_transaction_operation(
     if let Some(writer) = shared_writer_for(pool).await {
         return writer.submit_unit_transaction(op, context, work).await;
     }
-    let Some((_key, file_backed)) = pool_registry_key(pool).await else {
+    let Some((_key, file_backed)) = pool_registry_key(pool) else {
         anyhow::bail!("P075 shared DbWriter registry key unavailable for {context}");
     };
     if file_backed {
@@ -1933,6 +1928,10 @@ fn check_starvation(
         WriteLane::TelemetryRollup,
     ];
     for (i, &lane) in lower_lanes.iter().enumerate() {
+        let lane_idx = lane.drain_order_index();
+        if heartbeat.lane_pending_count[lane_idx].load(Ordering::Relaxed) <= 0 {
+            continue;
+        }
         if let Some(last) = lower_last_drain[i] {
             let idle_secs = last.elapsed().as_secs();
             if idle_secs >= STARVATION_WATCHDOG_SECS {
@@ -2046,6 +2045,29 @@ mod tests {
         )
         .await
         .expect("registered shared writer must admit file-backed transaction");
+        tx.commit().await.unwrap();
+        writer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shared_writer_lookup_works_for_cloned_file_backed_pool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("p075-shared-writer-clone.sqlite");
+        let pool = crate::pool::create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+            .await
+            .unwrap();
+        let pool_clone = pool.clone();
+
+        let writer = Arc::new(DbWriter::new(pool.clone()));
+        register_shared_writer(&pool, writer.clone()).await.unwrap();
+
+        let tx = begin_registered_immediate_transaction(
+            &pool_clone,
+            make_class_a_op(),
+            "p075_shared_writer_clone_lookup",
+        )
+        .await
+        .expect("registered shared writer must be found through cloned pool handles");
         tx.commit().await.unwrap();
         writer.shutdown().await;
     }
@@ -2432,6 +2454,46 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
         writer.shutdown().await;
+    }
+
+    #[test]
+    fn starvation_watchdog_ignores_empty_lower_lane_after_prior_drain() {
+        let heartbeat = DbWriterHeartbeat::new();
+        let lower_last_drain = [
+            None,
+            Some(Instant::now() - Duration::from_secs(STARVATION_WATCHDOG_SECS + 1)),
+            None,
+            None,
+        ];
+
+        check_starvation(&lower_last_drain, false, &heartbeat);
+
+        assert_eq!(
+            heartbeat.starvation_total.load(Ordering::Relaxed),
+            0,
+            "idle lower lanes with no queued work must not be reported as starved"
+        );
+    }
+
+    #[test]
+    fn starvation_watchdog_reports_pending_lower_lane_after_timeout() {
+        let heartbeat = DbWriterHeartbeat::new();
+        let lane_idx = WriteLane::CoalescedProjection.drain_order_index();
+        heartbeat.lane_pending_count[lane_idx].store(1, Ordering::Relaxed);
+        let lower_last_drain = [
+            None,
+            Some(Instant::now() - Duration::from_secs(STARVATION_WATCHDOG_SECS + 1)),
+            None,
+            None,
+        ];
+
+        check_starvation(&lower_last_drain, false, &heartbeat);
+
+        assert_eq!(
+            heartbeat.starvation_total.load(Ordering::Relaxed),
+            1,
+            "pending lower-lane work that cannot drain past the watchdog must still be reported"
+        );
     }
 
     // -----------------------------------------------------------------------

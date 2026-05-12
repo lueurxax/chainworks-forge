@@ -570,6 +570,11 @@ impl McpServer {
             }
             let closeout_readiness_summary =
                 tools::reports::closeout_readiness_summary_json(&self.pool, run_id_parsed).await?;
+            let code_writer_completion_receipts =
+                tools::reports::code_writer_completion_receipts_json(&self.pool, run_id_parsed)
+                    .await?;
+            let implementation_completion =
+                tools::reports::implementation_completion_json(&self.pool, run_id_parsed).await?;
 
             return Ok(serde_json::json!({
                 "run_id": run_id,
@@ -585,6 +590,8 @@ impl McpServer {
                     principal.class == auth::PrincipalClass::Operator,
                 )
                 .await?,
+                "code_writer_completion_receipts": code_writer_completion_receipts,
+                "implementationCompletion": implementation_completion,
                 "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, &self.cmd_handler, run_id_parsed).await?,
                 "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
                 "rollout_contract_readback": mcp_rollout_readback,

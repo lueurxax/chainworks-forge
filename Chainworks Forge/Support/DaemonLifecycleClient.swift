@@ -28,6 +28,7 @@
 import Combine
 import Darwin
 import Foundation
+import Darwin
 
 // MARK: - Wire types (mirror domain::lifecycle)
 
@@ -278,7 +279,7 @@ func daemonJSONDecoder() -> JSONDecoder {
 // MARK: - Port file (§7.3)
 
 private enum ChainworksUserHome {
-    static func url() -> URL {
+    nonisolated static func url() -> URL {
         if let entry = getpwuid(getuid()) {
             return URL(fileURLWithPath: String(cString: entry.pointee.pw_dir), isDirectory: true)
         }
@@ -343,6 +344,63 @@ nonisolated struct DaemonPortFile {
         let port = try read(at: url)
         return URL(string: "http://127.0.0.1:\(port)")!
     }
+
+    static func write(_ port: Int, at url: URL = defaultURL()) throws {
+        let data = Data("\(port)".utf8)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: url, options: .atomic)
+    }
+}
+
+nonisolated struct DaemonEndpointRecord: Decodable, Sendable {
+    let pid: Int32
+    let port: Int
+}
+
+nonisolated enum DaemonEndpointFile {
+    static func defaultURL() -> URL {
+        DaemonPortFile.appSupportDirectory()
+            .appendingPathComponent("daemon-endpoint.json", isDirectory: false)
+    }
+
+    static func baseURL(
+        at url: URL = defaultURL(),
+        isLiveDaemonPID: (Int32) -> Bool = defaultIsLiveDaemonPID
+    ) throws -> URL? {
+        guard let port = try readLivePort(at: url, isLiveDaemonPID: isLiveDaemonPID) else {
+            return nil
+        }
+        return URL(string: "http://127.0.0.1:\(port)")!
+    }
+
+    static func readLivePort(
+        at url: URL = defaultURL(),
+        isLiveDaemonPID: (Int32) -> Bool = defaultIsLiveDaemonPID
+    ) throws -> Int? {
+        guard let data = try? Data(contentsOf: url) else {
+            return nil
+        }
+        let record = try JSONDecoder().decode(DaemonEndpointRecord.self, from: data)
+        guard (1...65_535).contains(record.port) else {
+            return nil
+        }
+        guard isLiveDaemonPID(record.pid) else {
+            return nil
+        }
+        return record.port
+    }
+
+    static func defaultIsLiveDaemonPID(_ pid: Int32) -> Bool {
+        guard pid > 0, kill(pid, 0) == 0 else { return false }
+        var buffer = [CChar](repeating: 0, count: 4096)
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard length > 0 else { return false }
+        let path = String(cString: buffer)
+        return path.hasSuffix("/chainworks-forge-daemon")
+    }
 }
 
 // MARK: - HTTP client
@@ -389,7 +447,8 @@ struct DaemonClientEndpoint: Sendable, Equatable {
         let bearer = DaemonOperatorTokenStore.resolveOperatorToken() ?? "unset"
         let base: URL
         do {
-            base = try DaemonPortFile.baseURL()
+            base = try DaemonEndpointFile.baseURL()
+                ?? DaemonPortFile.baseURL()
         } catch {
             base = URL(string: "http://127.0.0.1:\(DaemonPortFile.defaultPort)")!
         }

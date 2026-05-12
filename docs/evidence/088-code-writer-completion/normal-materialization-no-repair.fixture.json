@@ -1,0 +1,10 @@
+{
+  "schema_version": "p088_fixture_v1",
+  "scenario": "normal_materialization_no_repair",
+  "agent_id": "code_writer",
+  "work_change_kind": "current_attempt_diff",
+  "usable_final_chainworks_output": true,
+  "expected_completion_turn_attempted": false,
+  "expected_completion_turn_result": "skipped_usable_final_output_settled",
+  "expected_status": "succeeded"
+}

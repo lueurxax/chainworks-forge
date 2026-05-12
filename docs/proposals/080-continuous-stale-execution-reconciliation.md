@@ -6,7 +6,7 @@
 | Status | Draft |
 | Author | Codex |
 | Depends on | P037 ACP supervision, P058 claim/start ownership, P061 scheduler/write coordination, P065 retry instructions, P076 auto-retry observation ledger |
-| Related | P051 Xcode MCP bridge pool, P075 local persistence write budget, P078 side-effect reconciliation, `docs/reference/rust-control-plane.md`, `docs/reference/session-lineage-reuse-and-operator-reset.md` |
+| Related | P051 Xcode MCP bridge pool, [local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), P078 side-effect reconciliation, `docs/reference/rust-control-plane.md`, `docs/reference/session-lineage-reuse-and-operator-reset.md` |
 | Scope | Add a continuous reconciliation subsystem for stale running execution truth, provider/session ownership, and helper-process lifecycle. |
 | Non-goal | No automatic human approval, no blind retry of release side effects, and no replacement for existing startup repair or provider idle supervision. |
 
@@ -146,7 +146,7 @@ Run a low-frequency reconciliation loop while the executor is idle or on a bound
 5. refresh scheduler health/projections;
 6. emit typed P076 observations.
 
-The loop must be write-budget aware and compatible with P075 spooling.
+The loop must be write-budget aware and compatible with the implemented spooling contract.
 
 ### 6.3 Repair Transactions
 

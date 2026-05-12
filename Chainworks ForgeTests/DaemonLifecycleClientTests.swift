@@ -278,6 +278,47 @@ final class DaemonLifecycleClientTests: XCTestCase {
         XCTAssertEqual(url.absoluteString, "http://127.0.0.1:4321")
     }
 
+    func test_DaemonEndpointFile_prefers_live_endpoint_record_over_port_file() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let endpointFile = tmp.appendingPathComponent("daemon-endpoint.json")
+        let portFile = tmp.appendingPathComponent("daemon.port")
+        try Data(#"{"pid":4242,"port":64446}"#.utf8).write(to: endpointFile)
+        try Data("4000".utf8).write(to: portFile)
+
+        let endpointURL = try XCTUnwrap(
+            try DaemonEndpointFile.baseURL(
+                at: endpointFile,
+                isLiveDaemonPID: { $0 == 4242 }
+            )
+        )
+        XCTAssertEqual(endpointURL.absoluteString, "http://127.0.0.1:64446")
+    }
+
+    func test_DaemonEndpointFile_ignores_stale_record_and_falls_back_to_port_file() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let endpointFile = tmp.appendingPathComponent("daemon-endpoint.json")
+        let portFile = tmp.appendingPathComponent("daemon.port")
+        try Data(#"{"pid":4242,"port":64446}"#.utf8).write(to: endpointFile)
+        try Data("4000".utf8).write(to: portFile)
+
+        XCTAssertNil(
+            try DaemonEndpointFile.baseURL(
+                at: endpointFile,
+                isLiveDaemonPID: { _ in false }
+            )
+        )
+        let portURL = try DaemonPortFile.baseURL(at: portFile)
+        XCTAssertEqual(portURL.absoluteString, "http://127.0.0.1:4000")
+    }
+
     // MARK: - Lifecycle state predicates
 
     func test_DaemonLifecycleState_is_live_matches_rust_contract() {

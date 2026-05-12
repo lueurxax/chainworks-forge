@@ -211,6 +211,17 @@ enum OutputContractResolverV2 {
                         rawPayloadSize: data.count
                     )
                 }
+                if schema.contractID == "proposal_review_summary_v2",
+                   let validationError = proposalReviewSummaryV2ValidationError(in: dict) {
+                    return OutputValidationResult(
+                        outputName: name,
+                        contractID: schema.contractID,
+                        status: .failed,
+                        missingFields: [],
+                        validationError: validationError,
+                        rawPayloadSize: data.count
+                    )
+                }
 
                 return OutputValidationResult(
                     outputName: name,
@@ -351,6 +362,69 @@ enum OutputContractResolverV2 {
         return nil
     }
 
+    static func proposalReviewSummaryV2ValidationError(in json: [String: Any]) -> String? {
+        guard strictBool(json["pass"]) != nil else {
+            return "proposal_review_summary_v2 field 'pass' must be a boolean"
+        }
+        for field in ["average_score", "aggregate_score", "min_individual_score"] {
+            guard strictDouble(json[field]) != nil else {
+                return "proposal_review_summary_v2 field '\(field)' must be a number"
+            }
+        }
+        guard strictInt(json["blocker_count"]) != nil else {
+            return "proposal_review_summary_v2 field 'blocker_count' must be an integer"
+        }
+        guard let blockingIssues = json["blocking_issues"] as? [Any] else {
+            return "proposal_review_summary_v2 field 'blocking_issues' must be an array"
+        }
+        guard let blockingRequiredChanges = json["blocking_required_changes"] as? [Any] else {
+            return "proposal_review_summary_v2 field 'blocking_required_changes' must be an array"
+        }
+        guard json["advisory_follow_ups"] is [Any] else {
+            return "proposal_review_summary_v2 field 'advisory_follow_ups' must be an array"
+        }
+        guard json["recurring_themes"] is [Any] else {
+            return "proposal_review_summary_v2 field 'recurring_themes' must be an array"
+        }
+        guard nonEmptyString(json["summary"]) != nil else {
+            return "proposal_review_summary_v2 field 'summary' must be a non-empty string"
+        }
+        guard nonEmptyString(json["decision"]) != nil else {
+            return "proposal_review_summary_v2 field 'decision' must be a non-empty string"
+        }
+
+        let pass = strictBool(json["pass"]) ?? false
+        let blockerCount = strictInt(json["blocker_count"]) ?? 0
+        let hasBlockingEvidence = blockerCount > 0
+            || blockingIssues.isEmpty == false
+            || blockingRequiredChanges.isEmpty == false
+
+        if pass && hasBlockingEvidence {
+            return "proposal_review_summary_v2 has pass=true while blocker evidence is non-empty"
+        }
+        if pass == false && blockerCount == 0 && blockingIssues.isEmpty && blockingRequiredChanges.isEmpty {
+            return "proposal_review_summary_v2 has pass=false while blocker evidence is explicitly empty"
+        }
+
+        if let decision = nonEmptyString(json["decision"])?.lowercased() {
+            let decisionPasses = decision.contains("pass")
+                || decision.contains("approve")
+                || decision.contains("approved")
+            let decisionBlocks = decision.contains("fail")
+                || decision.contains("block")
+                || decision.contains("revise")
+                || decision.contains("changes_required")
+            if decisionPasses && (pass == false || hasBlockingEvidence) {
+                return "proposal_review_summary_v2 decision indicates pass while authoritative fields block"
+            }
+            if decisionBlocks && pass && hasBlockingEvidence == false {
+                return "proposal_review_summary_v2 decision indicates blocking while authoritative fields pass"
+            }
+        }
+
+        return nil
+    }
+
     private static func strictBool(_ value: Any?) -> Bool? {
         if let boolValue = value as? Bool {
             return boolValue
@@ -366,6 +440,23 @@ enum OutputContractResolverV2 {
         guard let string = value as? String else { return nil }
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func strictDouble(_ value: Any?) -> Double? {
+        guard let number = value as? NSNumber else { return nil }
+        if CFGetTypeID(number) == CFBooleanGetTypeID() {
+            return nil
+        }
+        return number.doubleValue
+    }
+
+    private static func strictInt(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber else { return nil }
+        if CFGetTypeID(number) == CFBooleanGetTypeID() {
+            return nil
+        }
+        let intValue = number.intValue
+        return Double(intValue) == number.doubleValue ? intValue : nil
     }
 
     private static func repairedJSONDataIfLikelyQuotedStringIssue(_ data: Data) -> Data? {

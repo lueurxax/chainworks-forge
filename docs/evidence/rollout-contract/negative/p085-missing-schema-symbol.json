@@ -1,12 +1,20 @@
 {
-  "schema_version": "rollout_contract_v1",
-  "applicability": "required",
-  "gate_aliases": [
-    "proposal-085",
-    "p085"
-  ],
-  "commands": {
-    "allowlist": []
+  "scenario": "p085-missing-schema-symbol",
+  "description": "The p085 gate checks SDL/introspection for all GraphQL fields and enum domains named by contract rows. This fixture represents a failure where payloadUnavailableReasonCode is consumed by Swift via P031ArtifactReadModel.payloadUnavailableReasonCode but the SDL snapshot does not include its enum domain (PAYLOAD_DEFERRED_BY_P031, GENERATING, NOT_INDEXED, NOT_AUTHORIZED, NOT_AVAILABLE, UNKNOWN). Without schema proof, Swift presenters may depend on undocumented enum vocabulary.",
+  "contract_violation": "missing_schema_proof",
+  "hold_condition": "The p085 gate must snapshot or introspect every field and enum domain consumed by the row matrix so Swift presenters do not depend on undocumented vocabulary.",
+  "missing_symbol": {
+    "graphql_type": "PayloadUnavailableReasonCode",
+    "expected_values": [
+      "PAYLOAD_DEFERRED_BY_P031",
+      "GENERATING",
+      "NOT_INDEXED",
+      "NOT_AUTHORIZED",
+      "NOT_AVAILABLE",
+      "UNKNOWN"
+    ],
+    "gate_check": "p085 gate must verify this enum exists in SDL with at least these values before Swift decoding tests run"
   },
-  "placeholder_fixture_kind": "missing_schema_symbol"
+  "resolution": "Add SDL introspection assertion for PayloadUnavailableReasonCode to the p085 gate or add the symbol to an existing schema snapshot referenced by the gate.",
+  "p085_revision": "p085-r2-2026-05-08"
 }
