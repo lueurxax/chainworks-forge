@@ -790,6 +790,20 @@ fn extract_text_chunk(parsed: &Value) -> Option<String> {
         .find_map(extract_text_from_value)
 }
 
+fn extract_agent_message_chunk(parsed: &Value) -> Option<String> {
+    if parsed.get("method").and_then(Value::as_str) != Some("session/update") {
+        return None;
+    }
+    let update = parsed.pointer("/params/update")?;
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("agent_message_chunk") {
+        return None;
+    }
+    update
+        .get("content")
+        .and_then(extract_text_from_value)
+        .filter(|text| !strip_ansi(text).trim().is_empty())
+}
+
 fn extract_int_from_value(value: &Value, keys: &[&str]) -> Option<i64> {
     match value {
         Value::Array(items) => items
@@ -3180,6 +3194,8 @@ impl AcpTransportSession {
         let mut last_prompt_progress_reported = Some(Instant::now());
         let mut streamed_text = String::new();
         let mut streamed_text_truncated = false;
+        let mut completion_streamed_text = String::new();
+        let mut completion_streamed_text_truncated = false;
         let mut completion_capture = CompletionTextCapture::default();
         let mut latest_usage_snapshot = None;
         let mut xcode_shim_warning_events = Vec::new();
@@ -3598,6 +3614,13 @@ impl AcpTransportSession {
                                 &chunk,
                                 &mut streamed_text_truncated,
                             );
+                        }
+                        if let Some(chunk) = extract_agent_message_chunk(&parsed) {
+                            push_streamed_transcript_chunk(
+                                &mut completion_streamed_text,
+                                &chunk,
+                                &mut completion_streamed_text_truncated,
+                            );
                             completion_capture.push_streamed_update(&chunk);
                         }
                         continue;
@@ -3812,8 +3835,8 @@ impl AcpTransportSession {
         }
 
         let completion_selection = completion_capture.select_extraction_input_with_capped_stream(
-            non_empty_transcript(streamed_text.clone()).as_deref(),
-            streamed_text_truncated,
+            non_empty_transcript(completion_streamed_text.clone()).as_deref(),
+            completion_streamed_text_truncated,
         );
         let mut discovered_artifacts = completion_selection
             .text
@@ -4559,6 +4582,54 @@ mod tests {
         let chunk = extract_text_chunk(&parsed).expect("final output text should be captured");
 
         assert!(chunk.contains("<<<CHAINWORKS_OUTPUT:implementation_progress>>>"));
+    }
+
+    #[test]
+    fn proposal_089_completion_capture_uses_agent_message_chunks_only() {
+        let thought = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "junie-session",
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "Task: Return JSON object"}
+                }
+            }
+        });
+        let tool = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "junie-session",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": "Open CHAINWORKS_OUTPUT",
+                    "content": [{"type": "content", "content": {"type": "text", "text": "CHAINWORKS_OUTPUT"}}]
+                }
+            }
+        });
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "junie-session",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": "{\"CHAINWORKS_OUTPUT\":{\"tests_result\":{\"status\":\"not_run\",\"commands\":[]}}}"
+                    }
+                }
+            }
+        });
+
+        assert_eq!(extract_agent_message_chunk(&thought), None);
+        assert_eq!(extract_agent_message_chunk(&tool), None);
+        assert_eq!(
+            extract_agent_message_chunk(&message).as_deref(),
+            Some("{\"CHAINWORKS_OUTPUT\":{\"tests_result\":{\"status\":\"not_run\",\"commands\":[]}}}")
+        );
     }
 
     #[test]

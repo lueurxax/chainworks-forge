@@ -2224,6 +2224,7 @@ Available gates:
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
   proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
+  proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -6556,6 +6557,424 @@ PY
       CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p mcp-server proposal_088_ -- --nocapture
     )
     log "Proposal 088 gate passed"
+    ;;
+  proposal-089|p089)
+    log "Proposal 089 gate: Junie structured-output proof and ACP canary evidence"
+    if [[ "${CHAINWORKS_PROPOSAL_089_ALLOW_DIRTY:-0}" == "1" ]]; then
+      log "Proposal 089 diagnostic dirty-work mode requested; this mode cannot produce signoff evidence"
+      mkdir -p "$ROOT_DIR/docs/evidence/089/junie-structured-output-canary/acp-canary"
+      cat >"$ROOT_DIR/docs/evidence/089/junie-structured-output-canary/acp-canary/mutation-guard-result.json" <<'JSON'
+{
+  "schema_version": "p089_mutation_guard_result_v1",
+  "verdict": "evidence_incomplete",
+  "overall_status": "evidence_incomplete",
+  "preexisting_dirty_work_non_canary_safe": true,
+  "safety_violations": [],
+  "diagnostic_mode": "allow_dirty",
+  "signoff_eligible": false
+}
+JSON
+      echo "proposal-089: CHAINWORKS_PROPOSAL_089_ALLOW_DIRTY=1 is diagnostic-only and must not pass signoff" >&2
+      exit 1
+    fi
+    if [[ "${CHAINWORKS_PROPOSAL_089_LIVE:-0}" == "1" ]]; then
+      log "Proposal 089 live mode: running canonical Junie ACP canary"
+      mkdir -p "$ROOT_DIR/.chainworks/tmp"
+      mkdir -p "$ROOT_DIR/docs/evidence/089/junie-structured-output-canary"
+      p089_live_log="$ROOT_DIR/docs/evidence/089/junie-structured-output-canary/live-gate.log.redacted"
+      if [[ ! -d "$ROOT_DIR/.chainworks/tmp/p089-acp-canary-worktree/.git" && ! -f "$ROOT_DIR/.chainworks/tmp/p089-acp-canary-worktree/.git" ]]; then
+        git worktree add --detach "$ROOT_DIR/.chainworks/tmp/p089-acp-canary-worktree" HEAD
+      fi
+      {
+        printf '%s\n' '$ CHAINWORKS_PROPOSAL_089_LIVE=1 ./scripts/test-gate.sh proposal-089'
+        printf '%s\n' '==> Proposal 089 live mode: running canonical Junie ACP canary'
+        (
+          cd "$ROOT_DIR/control-plane"
+          P089_WORKTREE_ROOT="$ROOT_DIR/.chainworks/tmp/p089-acp-canary-worktree" \
+            P089_ACP_EVIDENCE_DIR="$ROOT_DIR/docs/evidence/089/junie-structured-output-canary/acp-canary" \
+            cargo run -p engine --example p089_acp_live_canary
+        )
+      } >"$p089_live_log" 2>&1
+      cat "$p089_live_log"
+      python3 "$ROOT_DIR/scripts/proposal-089-refresh-evidence.py"
+    fi
+    python3 - <<'PY'
+import hashlib
+import json
+from pathlib import Path
+
+root = Path.cwd()
+evidence = root / "docs/evidence/089/junie-structured-output-canary"
+native_root = evidence / "native"
+acp_root = evidence / "acp-canary"
+index_path = evidence / "evidence-index.json"
+live_path = evidence / "live-gate-run.json"
+
+STATUSES = {
+    "passed",
+    "environment_unavailable",
+    "native_capability_failed",
+    "acp_launch_failed",
+    "acp_handshake_failed",
+    "completion_capture_failed",
+    "completion_capture_truncated",
+    "extraction_failed",
+    "settlement_failed",
+    "unexpected_completion_repair",
+    "unexpected_repo_mutation",
+    "evidence_incomplete",
+}
+
+def fail(message):
+    raise SystemExit(f"proposal-089: {message}")
+
+def load_json(path):
+    if not path.exists():
+        fail(f"missing {path}")
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {path}: {exc}")
+
+def sha256_file(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def file_meta(path):
+    if not path.exists():
+        fail(f"missing file {path}")
+    return {"sha256": sha256_file(path), "size_bytes": path.stat().st_size}
+
+def assert_file_record(path, record):
+    meta = file_meta(path)
+    if record.get("sha256") != meta["sha256"] or record.get("size_bytes") != meta["size_bytes"]:
+        fail(f"hash/size mismatch for {path}")
+
+def file_record_matches(path, record):
+    meta = file_meta(path)
+    return record.get("sha256") == meta["sha256"] and record.get("size_bytes") == meta["size_bytes"]
+
+def assert_status(value, context):
+    if value not in STATUSES:
+        fail(f"{context} has unknown status {value!r}")
+
+def require(condition, message):
+    if not condition:
+        fail(message)
+
+def manifest_row_is_valid_control_plane(row):
+    return (
+        row.get("settlement_decision") == "accepted"
+        and row.get("source_kind") is None
+        and row.get("reason") == "control_plane_generated"
+        and row.get("provenance") == "control_plane_generated"
+        and row.get("generated_by") == "control_plane"
+        and row.get("contributes_to_junie_capability") is False
+    )
+
+def broad_allowed_root_is_rejected(root_value):
+    root_text = str(root_value)
+    candidate = Path(root_text)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        resolved = candidate.absolute()
+    forbidden = [
+        root,
+        root / "Chainworks Forge",
+        root / "Chainworks ForgeTests",
+        root / "Chainworks ForgeUITests",
+        root / "control-plane",
+        root / "examples",
+        root / "scripts",
+        root / "docs/reference",
+        root / ".chainworks",
+        root / ".chainworks/runs",
+    ]
+    for forbidden_path in forbidden:
+        forbidden_resolved = forbidden_path.resolve(strict=False)
+        if resolved == forbidden_resolved or forbidden_resolved in resolved.parents:
+            return True
+        if resolved in forbidden_resolved.parents:
+            return True
+    return False
+
+def validate_negative_fixtures():
+    negative_root = evidence / "negative"
+    broad_roots = load_json(negative_root / "broad-allowed-roots.fail.json")
+    require(broad_roots.get("expected_status") == "evidence_incomplete", "broad root fixture expected_status mismatch")
+    for case in broad_roots.get("cases") or []:
+        require(
+            broad_allowed_root_is_rejected(case.get("root")),
+            f"broad root fixture did not reject {case.get('root')!r}",
+        )
+
+    drift = load_json(negative_root / "proof-critical-drift.fail.json")
+    require(drift.get("expected_status") == "evidence_incomplete", "proof-critical drift fixture expected_status mismatch")
+    drift_path = root / drift.get("path", "")
+    drift_record = drift.get("record") or {}
+    require(not file_record_matches(drift_path, drift_record), "proof-critical drift fixture unexpectedly matched current file")
+
+    bad_manifest = load_json(negative_root / "changed-files-manifest-agent-source.fail.json")
+    require(bad_manifest.get("expected_status") == "evidence_incomplete", "bad manifest fixture expected_status mismatch")
+    require(
+        not manifest_row_is_valid_control_plane(bad_manifest.get("row") or {}),
+        "bad manifest fixture unexpectedly validated",
+    )
+
+    dirty = load_json(negative_root / "allow-dirty-diagnostic.fail.json")
+    require(dirty.get("expected_status") == "evidence_incomplete", "allow dirty fixture expected_status mismatch")
+    require(dirty.get("env", {}).get("CHAINWORKS_PROPOSAL_089_ALLOW_DIRTY") == "1", "allow dirty fixture env mismatch")
+    require(dirty.get("signoff_eligible") is False, "allow dirty fixture must be non-signoff")
+
+def validate_native_experiment(name, expected):
+    directory = native_root / name
+    required = [
+        "prompt.txt",
+        "command.json",
+        "environment.json",
+        "final-output.raw.txt",
+        "parser-result.json",
+        "conclusion.json",
+    ]
+    for filename in required:
+        if not (directory / filename).exists():
+            fail(f"native {name} missing {filename}")
+    command = load_json(directory / "command.json")
+    parser = load_json(directory / "parser-result.json")
+    conclusion = load_json(directory / "conclusion.json")
+    assert_status(conclusion.get("status"), f"native {name} conclusion")
+    prompt_bytes = (directory / "prompt.txt").read_bytes()
+    final_bytes = (directory / "final-output.raw.txt").read_bytes()
+    require(command.get("schema_version") == "p089_native_command_v1", f"native {name} command schema")
+    require(command.get("output_mode") == "stdout_text", f"native {name} output_mode must be stdout_text")
+    require(command.get("input_mode") == "task_arg", f"native {name} input_mode must be task_arg")
+    require(command.get("prompt_sha256") == hashlib.sha256(prompt_bytes).hexdigest(), f"native {name} prompt_sha256 mismatch")
+    args = command.get("args") or []
+    require("--acp" not in args and "--json-output-file" not in args, f"native {name} used forbidden Junie args")
+    require(parser.get("success") is True, f"native {name} parser did not pass")
+    require(conclusion.get("status") == "passed", f"native {name} conclusion is not passed")
+    require(conclusion.get("final_output_sha256") == hashlib.sha256(final_bytes).hexdigest(), f"native {name} final-output hash mismatch")
+    try:
+        parsed = json.loads(final_bytes.decode())
+    except json.JSONDecodeError as exc:
+        fail(f"native {name} final-output is not strict JSON: {exc}")
+    require(parsed == expected, f"native {name} final-output contract mismatch")
+
+validate_native_experiment(
+    "exact-json",
+    {"p089_native_probe": "exact_json", "status": "passed", "value": 1},
+)
+validate_native_experiment(
+    "exact-chainworks-output",
+    {"CHAINWORKS_OUTPUT": {"native_chainworks_output": {"status": "passed", "value": 1}}},
+)
+validate_native_experiment(
+    "repair-style-minimal",
+    {
+        "CHAINWORKS_OUTPUT": {
+            "tests_result": {"status": "not_run", "commands": []},
+            "implementation_self_assessment": {
+                "implementation_complete": True,
+                "verification_green": True,
+                "remaining_code_tasks": [],
+                "handoff_tasks": [],
+                "known_risks": [],
+                "tests_run": [],
+                "docs_impacted": [],
+            },
+        }
+    },
+)
+
+for filename in [
+    "preflight.json",
+    "receipt.json",
+    "terminal-completion.raw.txt",
+    "extraction-result.json",
+    "settled-outputs.json",
+    "run-report.json",
+    "worktree-fingerprint-pre.json",
+    "worktree-fingerprint-post.json",
+    "mutation-guard-result.json",
+    "conclusion.json",
+]:
+    if not (acp_root / filename).exists():
+        fail(f"ACP canary missing {filename}")
+
+preflight = load_json(acp_root / "preflight.json")
+receipt = load_json(acp_root / "receipt.json")
+extraction = load_json(acp_root / "extraction-result.json")
+settled = load_json(acp_root / "settled-outputs.json")
+mutation = load_json(acp_root / "mutation-guard-result.json")
+conclusion = load_json(acp_root / "conclusion.json")
+terminal_text = (acp_root / "terminal-completion.raw.txt").read_text()
+
+assert_status(preflight.get("status"), "ACP preflight")
+assert_status(conclusion.get("status"), "ACP conclusion")
+require(preflight.get("status") == "passed", "ACP preflight did not pass")
+require(conclusion.get("status") == "passed", "ACP conclusion did not pass")
+require(receipt.get("provider") == "junie", "ACP receipt provider must be junie")
+require(receipt.get("runtime_profile") == "junie_cli_acp", "ACP receipt runtime_profile mismatch")
+require(receipt.get("agent_id") == "code_writer", "ACP receipt agent_id must be code_writer")
+require(receipt.get("backend_profile") == "junie_code_editor_acp", "ACP receipt backend_profile mismatch")
+require(receipt.get("model") == "junie-default", "ACP receipt model must come from production backend profile")
+require(receipt.get("effort") == "high", "ACP receipt effort must come from production backend profile")
+require(receipt.get("adapter_family") == "JunieAdapter", "ACP receipt adapter_family mismatch")
+require(receipt.get("launch_mode") == "--acp true", "ACP receipt launch mode mismatch")
+require(receipt.get("output_set_mode") == "full_production", "ACP receipt output_set_mode mismatch")
+require(receipt.get("stage_id") == "p089_acp_canary", "ACP receipt stage_id mismatch")
+require(receipt.get("stage_execution_id"), "ACP receipt stage_execution_id missing")
+require(receipt.get("agent_execution_id"), "ACP receipt agent_execution_id missing")
+require(receipt.get("session_generation_id"), "ACP receipt session_generation_id missing")
+catalog_binding = receipt.get("catalog_binding") or {}
+require(catalog_binding.get("agent_id") == "code_writer", "catalog binding agent_id mismatch")
+require(catalog_binding.get("backend_profile") == "junie_code_editor_acp", "catalog binding backend_profile mismatch")
+require(catalog_binding.get("provider") == "junie", "catalog binding provider mismatch")
+require(catalog_binding.get("model") == "junie-default", "catalog binding model mismatch")
+require(catalog_binding.get("effort") == "high", "catalog binding effort mismatch")
+require(catalog_binding.get("runtime_profile") == "junie_cli_acp", "catalog binding runtime_profile mismatch")
+require(catalog_binding.get("outputs") == [
+    "implementation_progress",
+    "implementation_self_assessment",
+    "changed_files_manifest",
+    "tests_result",
+], "catalog binding outputs mismatch")
+catalog_path = catalog_binding.get("catalog_path")
+require(catalog_path, "catalog binding catalog_path missing")
+catalog_abs = Path(catalog_path)
+if not catalog_abs.is_absolute():
+    catalog_abs = root / catalog_abs
+require(catalog_abs.resolve(strict=False) == (root / "examples/agents/agents.yaml").resolve(strict=False), "catalog binding path mismatch")
+require(catalog_binding.get("catalog_sha256") == sha256_file(root / "examples/agents/agents.yaml"), "catalog binding hash mismatch")
+
+expected_contracts = {
+    "implementation_progress": "implementation_progress",
+    "implementation_self_assessment": "implementation_self_assessment_v2",
+    "changed_files_manifest": "changed_files_manifest",
+    "tests_result": "tests_result",
+}
+require(catalog_binding.get("contract_ids") == expected_contracts, "catalog binding contract_ids mismatch")
+compiled = {item.get("name"): item for item in receipt.get("compiled_task_outputs") or []}
+require(set(compiled) == set(expected_contracts), "ACP compiled outputs must match production code_writer output set")
+for name, expected_contract in expected_contracts.items():
+    actual_contract = compiled[name].get("contract_id")
+    require(actual_contract == expected_contract, f"ACP output {name} contract_id expected {expected_contract!r}, got {actual_contract!r}")
+    require(compiled[name].get("required") is True, f"ACP output {name} must be required")
+
+repair = receipt.get("repair_metadata") or {}
+require(repair.get("completion_turn_attempted") is False, "ACP completion_turn_attempted must be false")
+require(repair.get("completion_repair_turn_count") == 0, "ACP completion_repair_turn_count must be 0")
+require(repair.get("generic_repair_turn_count") == 0, "ACP generic_repair_turn_count must be 0")
+require(repair.get("completion_repair_runtime_receipt_present") is False, "ACP completion repair runtime receipt must be absent")
+runtime_receipt = receipt.get("runtime_receipt") or {}
+require(runtime_receipt.get("status") == "completed", "ACP runtime receipt must be completed")
+
+require(extraction.get("completion_text_sha256") == hashlib.sha256(terminal_text.encode()).hexdigest(), "ACP terminal completion hash mismatch")
+require(extraction.get("completion_text_truncated") is False, "ACP completion text must not be truncated")
+require(extraction.get("extraction_input_truncated") is False, "ACP extraction input must not be truncated")
+require(extraction.get("raw_completion_has_non_json_prefix") is False, "ACP terminal completion must be strict CHAINWORKS_OUTPUT JSON with no prefix")
+try:
+    terminal_json = json.loads(terminal_text)
+except json.JSONDecodeError as exc:
+    fail(f"ACP terminal completion is not strict JSON: {exc}")
+require(set((terminal_json.get("CHAINWORKS_OUTPUT") or {}).keys()) == {
+    "implementation_progress",
+    "implementation_self_assessment",
+    "tests_result",
+}, "ACP CHAINWORKS_OUTPUT must contain exactly the Junie-authored outputs")
+require((extraction.get("parser_result") or {}).get("success") is True, "ACP extraction parser did not pass")
+
+rows = {row.get("output_name"): row for row in settled.get("declared_outputs") or []}
+require(set(rows) == set(expected_contracts), "settled outputs must match full production output set")
+require(settled.get("settlement_boundary") == "engine::executor::generate_changed_files_manifest_if_declared_then_settle_agent_outputs_from_discovery_decisions", "settled outputs must come from production executor settlement boundary")
+require(settled.get("materialization_owner") == "engine_executor", "settled outputs materialization_owner mismatch")
+require(settled.get("changed_files_manifest_status") in {"available", "not_git_repository"}, "changed_files_manifest status mismatch")
+require(settled.get("decisions"), "settled outputs must include production discovery decisions")
+for name in ["implementation_progress", "implementation_self_assessment", "tests_result"]:
+    row = rows[name]
+    require(row.get("settlement_decision") == "accepted", f"{name} settlement not accepted")
+    require(row.get("freshness") == "current_attempt", f"{name} not current_attempt")
+    require(row.get("source_kind") == "chainworks_output", f"{name} source_kind must be chainworks_output")
+    require(row.get("source_generation_owner") == "agent", f"{name} source_generation_owner must be agent")
+    require(row.get("contributes_to_junie_capability") is True, f"{name} must contribute to Junie capability")
+manifest = rows["changed_files_manifest"]
+require(manifest_row_is_valid_control_plane(manifest), "changed_files_manifest control-plane row mismatch")
+require(settled.get("all_required_outputs_accepted") is True, "not all required outputs accepted")
+require(settled.get("junie_capability_outputs_accepted") is True, "Junie capability outputs not accepted")
+
+require(mutation.get("verdict") == "passed", "mutation guard verdict must be passed")
+require(mutation.get("safety_violations") == [], "mutation guard has safety violations")
+require(mutation.get("canonicalized_allowed_roots_valid") is True, "allowed roots were not canonicalized/valid")
+post_summary = load_json(acp_root / "worktree-fingerprint-post.json").get("summary") or {}
+require(post_summary.get("current_attempt_changed_path_count") == 0, "post fingerprint has current-attempt repo changes")
+require(post_summary.get("preexisting_dirty_path_count") == 0, "post fingerprint has preexisting dirty work")
+
+if not index_path.exists() or not live_path.exists():
+    fail("missing evidence-index.json or live-gate-run.json")
+index = load_json(index_path)
+live = load_json(live_path)
+require(index.get("schema_version") == "p089_evidence_index_v1", "invalid evidence-index schema")
+require(live.get("schema_version") == "p089_live_gate_run_v1", "invalid live-gate-run schema")
+for field in ["native_phase_status", "acp_canary_status", "overall_status"]:
+    assert_status(index.get(field), f"evidence-index {field}")
+    require(index.get(field) == "passed", f"evidence-index {field} must be passed")
+require(live.get("exit_code") == 0, "live-gate-run exit_code must be 0")
+require(live.get("result") == "passed", "live-gate-run result must be passed")
+require(live.get("working_directory") == str(root), "live-gate-run working_directory mismatch")
+require(live.get("started_at"), "live-gate-run started_at missing")
+require(live.get("completed_at"), "live-gate-run completed_at missing")
+require(live.get("native_timeout_ms") == 120000, "live-gate-run native_timeout_ms mismatch")
+require(live.get("native_phase_status") == "passed", "live-gate-run native_phase_status must be passed")
+require(live.get("acp_canary_status") == "passed", "live-gate-run acp_canary_status must be passed")
+require(live.get("overall_status") == "passed", "live-gate-run overall_status must be passed")
+require(live.get("audited_git_sha") == index.get("audited_git_sha"), "audited git sha mismatch")
+require(index.get("live_gate_run", {}).get("path") == str(live_path.relative_to(root)), "live_gate_run path mismatch")
+assert_file_record(live_path, index.get("live_gate_run", {}))
+require(live.get("command") == "./scripts/test-gate.sh proposal-089", "live-gate-run command mismatch")
+live_env = live.get("environment") or {}
+require(live_env.get("CHAINWORKS_PROPOSAL_089_LIVE") == "1", "live-gate-run must prove live mode")
+require(live_env.get("recorded_env_names") == ["CHAINWORKS_JUNIE_ACP_BINARY"], "live-gate-run recorded_env_names mismatch")
+require(live_env.get("redacted_env") is True, "live-gate-run redacted_env must be true")
+log_record = live.get("log") or {}
+assert_file_record(root / log_record.get("path", ""), log_record)
+
+proof_index = index.get("proof_critical_files") or []
+proof_live = live.get("proof_critical_files") or []
+require(proof_index == proof_live, "proof_critical_files mismatch between index and live receipt")
+required_proof_paths = {
+    "scripts/test-gate.sh",
+    "scripts/proposal-089-refresh-evidence.py",
+    "control-plane/crates/acp/src/adapters/junie.rs",
+    "control-plane/crates/acp/src/transport.rs",
+    "control-plane/crates/engine/examples/p089_acp_live_canary.rs",
+    "control-plane/crates/engine/src/executor.rs",
+    "control-plane/crates/engine/src/worktree_fingerprint.rs",
+    "examples/agents/agents.yaml",
+}
+actual_proof_paths = {entry.get("path") for entry in proof_index}
+require(required_proof_paths.issubset(actual_proof_paths), f"proof-critical files missing {sorted(required_proof_paths - actual_proof_paths)}")
+for entry in proof_index:
+    assert_file_record(root / entry.get("path", ""), entry)
+
+for native_record in index.get("native_experiments") or []:
+    directory = root / native_record.get("directory", "")
+    for filename, record in (native_record.get("files") or {}).items():
+        assert_file_record(directory / filename, record)
+for filename, record in ((index.get("acp_canary") or {}).get("files") or {}).items():
+    assert_file_record(acp_root / filename, record)
+require((index.get("acp_canary") or {}).get("status") == "passed", "evidence-index acp_canary.status must be passed")
+require((index.get("acp_canary") or {}).get("safety_violations") == [], "evidence-index safety violations must be empty")
+negative_index = index.get("negative_fixtures") or {}
+require(negative_index.get("directory") == str((evidence / "negative").relative_to(root)), "negative fixture directory mismatch")
+for filename, record in (negative_index.get("files") or {}).items():
+    assert_file_record(evidence / "negative" / filename, record)
+validate_negative_fixtures()
+
+print("proposal-089 default evidence validation passed")
+PY
+    log "Proposal 089 gate passed"
     ;;
   proposal-085|p085)
     log "Proposal 085 gate: thin-client read-model parity and affordance contract"

@@ -53,6 +53,15 @@ Agent-authored required outputs should enter the system through the final `CHAIN
 
 The executor then binds those payloads to the compiled output declarations, validates them against `AgentCatalog.contracts`, and materializes canonical artifact files. Exact-path filesystem outputs and legacy block envelopes remain accepted as compatibility evidence, but they do not create a second contract authority and do not bypass validation.
 
+The retained `proposal-089|p089` gate is the focused Junie proof for this
+materialization path. It validates that the production `code_writer` Junie ACP
+binding can return the agent-authored output set through `CHAINWORKS_OUTPUT`
+without completion repair, while the executor generates
+`changed_files_manifest` as control-plane evidence and settles all declared
+outputs through the normal discovery-decision materialization functions. That
+gate is provider-specific proof, not a broader replacement for this contract or
+for the P088 completion-repair boundary.
+
 ### Missing outputs get one same-session repair turn
 
 When an agent turn finishes without required outputs, the runtime must try one narrow repair turn in the same live ACP session before it invalidates that session or blocks the run for `missing_required_outputs`.

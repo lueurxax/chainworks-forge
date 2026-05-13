@@ -374,6 +374,9 @@ The `AcpRuntimeManager` (`crates/acp/src/manager.rs`) pre-registers five adapter
 
 Each adapter reads its binary path from the environment at construction and spawns the subprocess with piped stdio in its own process group when `execute()` is called. Runtime provider subprocesses are launched with cwd set to the run worktree when write-enabled, otherwise to `workspace_root`; capability probes remain cwd-neutral preflight checks.
 `JunieAdapter` passes `--acp true` at launch so the local Junie CLI enters ACP JSON-RPC mode.
+The retained `proposal-089|p089` gate exercises Junie through this adapter with
+the production `code_writer` binding, full declared output set, and engine
+settlement/materialization path.
 
 ### Timeouts
 

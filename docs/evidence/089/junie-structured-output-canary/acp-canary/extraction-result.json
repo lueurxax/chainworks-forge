@@ -1,0 +1,21 @@
+{
+  "completion_text_sha256": "ee2765c9e919c49dd07d65173c33ccdc8e0bab3c37e655d865de58d4777a60ae",
+  "completion_text_truncated": false,
+  "extracted_payload_sha256": "951185738fed764ec4c01555804f4e5486aba15574a6d738f4f0388de65146fc",
+  "extraction_input_truncated": false,
+  "extraction_source": "capped_stream",
+  "failure_reason": null,
+  "parser_result": {
+    "extracted_output_names": [
+      "implementation_progress",
+      "implementation_self_assessment",
+      "tests_result"
+    ],
+    "parse_error": null,
+    "success": true,
+    "top_level_shape": "object",
+    "trailing_after_json": ""
+  },
+  "raw_completion_has_non_json_prefix": false,
+  "schema_version": "p089_acp_extraction_result_v1"
+}

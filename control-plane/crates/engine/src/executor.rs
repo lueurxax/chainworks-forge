@@ -1228,6 +1228,86 @@ fn settle_agent_outputs_from_discovery_decisions(
     Ok(settlement)
 }
 
+pub async fn run_production_declared_output_settlement_for_canary(
+    declared_outputs: &[DeclaredOutput],
+    expected_outputs: &[ExpectedOutputSpec],
+    discovered_artifacts: &[acp::DiscoveredArtifact],
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+    worktree_root: Option<&str>,
+    worktree_write_enabled: bool,
+) -> Result<serde_json::Value> {
+    let manifest_status = generate_changed_files_manifest_if_declared(
+        declared_outputs,
+        worktree_root,
+        worktree_write_enabled,
+    )
+    .await?;
+    let settlement = settle_agent_outputs_from_discovery_decisions(
+        declared_outputs,
+        expected_outputs,
+        discovered_artifacts,
+        pre_prompt_expected_outputs,
+    )?;
+    let decisions_by_name: HashMap<&str, &OutputDiscoveryDecision> = settlement
+        .decisions
+        .iter()
+        .map(|decision| (decision.output_name.as_str(), decision))
+        .collect();
+    let declared_outputs_readback = declared_outputs
+        .iter()
+        .map(|declared| {
+            let decision = decisions_by_name
+                .get(declared.output_name.as_str())
+                .copied();
+            let (materialized, size_bytes, sha256) = std::fs::read(&declared.target_path)
+                .map(|bytes| (true, Some(bytes.len() as u64), Some(sha256_digest(&bytes))))
+                .unwrap_or((false, None, None));
+            serde_json::json!({
+                "output_name": declared.output_name,
+                "canonical_path": declared.target_path,
+                "contract_id": declared.schema.as_ref().map(|schema| schema.contract_id.as_str()),
+                "required": true,
+                "materialized": materialized,
+                "settlement_decision": decision.map(|decision| enum_snake_value(decision.status)),
+                "freshness": decision.and_then(|decision| {
+                    (decision.reason == OutputDiscoveryReason::ProviderEnvelope
+                        || decision.reason == OutputDiscoveryReason::ControlPlaneGenerated
+                        || decision.reason == OutputDiscoveryReason::ExactPathChanged)
+                        .then_some("current_attempt")
+                }),
+                "source_kind": decision.and_then(|decision| decision.diagnostics.get("source_kind").cloned()),
+                "reason": decision.map(|decision| enum_snake_value(decision.reason)),
+                "provenance": decision.and_then(|decision| decision.provenance.map(enum_snake_value)),
+                "generated_by": decision.and_then(|decision| decision.generated_by.clone()),
+                "source_generation_owner": if expected_outputs
+                    .iter()
+                    .find(|spec| spec.output_name == declared.output_name)
+                    .map(|spec| spec.source_generation_owner == SourceGenerationOwner::ControlPlane)
+                    .unwrap_or(false)
+                {
+                    "control_plane"
+                } else {
+                    "agent"
+                },
+                "contributes_to_junie_capability": declared.output_name != "changed_files_manifest",
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "schema_version": "p089_production_declared_output_settlement_v1",
+        "settlement_boundary": "engine::executor::generate_changed_files_manifest_if_declared_then_settle_agent_outputs_from_discovery_decisions",
+        "materialization_owner": "engine_executor",
+        "changed_files_manifest_status": manifest_status.map(|status| enum_snake_value(status)),
+        "decisions": settlement.decisions,
+        "declared_outputs": declared_outputs_readback,
+        "accepted_aggregate_bytes": settlement.accepted_aggregate_bytes,
+        "aggregate_cap_hit": settlement.aggregate_cap_hit,
+        "idempotency_key": settlement.idempotency_key,
+    }))
+}
+
 fn exact_path_rejection_for_spec(
     spec: &ExpectedOutputSpec,
     source_path: Option<&str>,
@@ -10034,6 +10114,19 @@ fn chainworks_output_contract_example(
     outputs
 }
 
+fn chainworks_output_contract_example_by_output_name(
+    declared_outputs: &[DeclaredOutput],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut outputs = serde_json::Map::new();
+    for output in declared_outputs {
+        outputs.insert(
+            output.output_name.clone(),
+            declared_output_contract_example_value(output),
+        );
+    }
+    outputs
+}
+
 fn declared_output_contract_example_value(output: &DeclaredOutput) -> serde_json::Value {
     let Some(schema) = output.schema.as_ref() else {
         return serde_json::Value::String(format!("<{} content>", output.output_name));
@@ -11090,7 +11183,8 @@ fn code_writer_completion_repair_prompt(
         prompt.push('\n');
     }
     prompt.push_str(
-        "\nReturn exactly one JSON object. Use canonical target paths as `CHAINWORKS_OUTPUT` keys:\n",
+        "\nReturn exactly one JSON object. Use output names as `CHAINWORKS_OUTPUT` keys. \
+         Canonical target paths are accepted as fallback only:\n",
     );
     let failed_outputs: Vec<DeclaredOutput> = declared_outputs
         .iter()
@@ -11110,7 +11204,7 @@ fn code_writer_completion_repair_prompt(
     for output in &outputs_for_example {
         append_status_allowed_values_for_declared_output(&mut prompt, output);
     }
-    let example_outputs = chainworks_output_contract_example(&outputs_for_example);
+    let example_outputs = chainworks_output_contract_example_by_output_name(&outputs_for_example);
     let example = serde_json::json!({ "CHAINWORKS_OUTPUT": example_outputs });
     if let Ok(example) = serde_json::to_string(&example) {
         prompt.push_str(&example);
@@ -11670,6 +11764,91 @@ mod tests {
         assert!(prompt.contains("\"summary\":\"\""));
         assert!(prompt.contains("\"status\":\"green\""));
         assert!(!prompt.contains("{\"status\":\"complete\"}"));
+    }
+
+    #[test]
+    fn code_writer_completion_repair_prompt_prefers_output_name_keys() {
+        let declared_outputs = vec![
+            DeclaredOutput {
+                output_name: "implementation_progress".to_string(),
+                target_path: "/workspace/.chainworks/implementation/progress.json".to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "implementation_progress".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec![
+                        "status".to_string(),
+                        "current_phase".to_string(),
+                        "completed_items".to_string(),
+                        "deferred_items".to_string(),
+                        "notes".to_string(),
+                    ],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "implementation_self_assessment".to_string(),
+                target_path: "/workspace/.chainworks/implementation/self-assessment.json"
+                    .to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "implementation_self_assessment_v2".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec![
+                        "implementation_complete".to_string(),
+                        "verification_green".to_string(),
+                        "remaining_code_tasks".to_string(),
+                        "handoff_tasks".to_string(),
+                        "known_risks".to_string(),
+                        "tests_run".to_string(),
+                        "docs_impacted".to_string(),
+                    ],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let validation = TaskValidationSummary {
+            output_results: declared_outputs
+                .iter()
+                .map(|output| domain::validation::OutputValidationResult {
+                    output_name: output.output_name.clone(),
+                    contract_id: output
+                        .schema
+                        .as_ref()
+                        .map(|schema| schema.contract_id.clone()),
+                    status: domain::validation::ValidationStatus::Failed,
+                    missing_fields: vec![],
+                    validation_error: Some("required output was not produced".to_string()),
+                    raw_payload_size: 0,
+                })
+                .collect(),
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some("required output was not produced".to_string()),
+        };
+
+        let prompt = code_writer_completion_repair_prompt(&validation, &declared_outputs);
+
+        assert!(prompt.contains("Use output names as `CHAINWORKS_OUTPUT` keys"));
+        assert!(prompt.contains("{\"CHAINWORKS_OUTPUT\":{\"implementation_progress\""));
+        assert!(prompt.contains("\"implementation_self_assessment\""));
+        assert!(prompt.contains("Canonical target paths are accepted as fallback"));
+        assert!(!prompt.contains(
+            "{\"CHAINWORKS_OUTPUT\":{\"/workspace/.chainworks/implementation/progress.json\""
+        ));
     }
 
     #[test]

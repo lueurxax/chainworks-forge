@@ -1969,6 +1969,58 @@ Important:
 - `implementationCompletion` must be projected from canonical linked receipt truth, not from latest historical receipt by timestamp
 - required evidence write failures must surface as `completion_receipt_partial_write` / `storage_write_failed`, not clean missing fields
 
+### `proposal-089|p089`
+
+Retained historical alias for the Junie structured-output capability and ACP
+`code_writer` canary evidence gate. Operational truth lives in
+[acp-runtime-transport.md](acp-runtime-transport.md) and
+[structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md).
+
+Scope:
+
+- native Junie standard CLI evidence under `docs/evidence/089/junie-structured-output-canary/native/` for strict JSON, strict `CHAINWORKS_OUTPUT`, and repair-style minimal synthesis
+- ACP canary evidence under `docs/evidence/089/junie-structured-output-canary/acp-canary/`
+- production `code_writer` catalog binding readback: `agent_id=code_writer`, `backend_profile=junie_code_editor_acp`, `provider=junie`, `runtime_profile=junie_cli_acp`, `model=junie-default`, and `effort=high`
+- full production output set: `implementation_progress`, `implementation_self_assessment`, `changed_files_manifest`, and `tests_result`
+- ACP completion capture, extraction, no-truncation, and no-repair metadata
+- engine-owned settlement/materialization through `generate_changed_files_manifest_if_declared` and `settle_agent_outputs_from_discovery_decisions`
+- `changed_files_manifest` classification as control-plane-generated evidence that does not contribute to Junie capability
+- `worktree_fingerprint_v1` mutation guard readback, clean-worktree signoff semantics, and diagnostic dirty-work mode
+- one-way hash linkage between `evidence-index.json` and `live-gate-run.json`
+- proof-critical file hash validation for the gate, refresh script, Junie adapter, ACP transport, canary harness, executor, fingerprint classifier, and production agent catalog
+- negative fixtures for broad allowed roots, proof-critical drift, invalid `changed_files_manifest` source attribution, and dirty diagnostic mode
+
+Host policy:
+
+- default mode is local evidence validation; no live provider invocation is required
+- live mode requires the configured Junie toolchain and writes refreshed evidence
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-089
+./scripts/test-gate.sh p089
+```
+
+Live evidence refresh:
+
+```bash
+CHAINWORKS_PROPOSAL_089_LIVE=1 ./scripts/test-gate.sh proposal-089
+```
+
+Diagnostic dirty-work mode:
+
+```bash
+CHAINWORKS_PROPOSAL_089_ALLOW_DIRTY=1 ./scripts/test-gate.sh proposal-089
+```
+
+Important:
+
+- the live canary uses a disposable worktree rooted under `.chainworks/tmp/p089-*`
+- diagnostic dirty-work mode writes non-signoff mutation readback and must exit non-zero
+- a default-mode pass requires checked-in evidence from a prior successful live-mode gate
+- the proof is intentionally narrow: it proves Junie structured-output capability plus the small ACP `code_writer` handoff boundary, not full scheduler/projection behavior and not a blanket fix for long-running P036-family failures
+
 ### `proposal-075|p075`
 
 Retained historical alias for the local persistence write budget, evidence spooling, storage diagnostics, and fail-closed registry gate. Operational truth lives in `docs/reference/rust-control-plane.md`.

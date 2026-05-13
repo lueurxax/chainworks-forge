@@ -45,7 +45,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 ### ACP transport and sessions
 
-- [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — ACP transport contract, adapter families (Claude/Gemini/Codex/Auggie/Junie), runtime selection, and capacity management
+- [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — ACP transport contract, adapter families (Claude/Gemini/Codex/Auggie/Junie), runtime selection, Junie structured-output canary proof, and capacity management
 - [reference/acp-runtime-transport.md#toolchain-cache-mapping](reference/acp-runtime-transport.md#toolchain-cache-mapping) — Provider toolchain cache mapping: Xcode/Go isolation, environment redirection, and exclusive serialization
 - [reference/xcode-mcp-bridge-pool.md](reference/xcode-mcp-bridge-pool.md) — Brokered Xcode MCP leases, host-user Xcode boundary, shim dispatch, runtime observations, and broker health
 - [reference/session-lineage-reuse-and-operator-reset.md](reference/session-lineage-reuse-and-operator-reset.md) — Session reuse, invocation-owner keys, binding fingerprints, context budget, checkpoint rehydration, operator reset
@@ -53,8 +53,8 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 ### Outputs, contracts, and feedback
 
-- [reference/structured-output-envelope-and-contract-validation.md](reference/structured-output-envelope-and-contract-validation.md) — Named envelopes, contract binding, validation, failure substrate
-- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, implementation self-assessment and handoff, failed-stage evidence, narrow recovery
+- [reference/structured-output-envelope-and-contract-validation.md](reference/structured-output-envelope-and-contract-validation.md) — Named envelopes, contract binding, validation, Junie canary proof, failure substrate
+- [reference/output-contracts-failure-evidence-and-recovery.md](reference/output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, implementation self-assessment and handoff, failed-stage evidence, Junie code-writer materialization proof, narrow recovery
 - [reference/implementation-closeout-readiness.md](reference/implementation-closeout-readiness.md) — Active closeout readiness authority, state-9 release routing, readback, rollout evidence, and retained gate aliases
 - [reference/proposal-loop-feedback-fidelity-and-rereview.md](reference/proposal-loop-feedback-fidelity-and-rereview.md) — Review-corpus fidelity, backlog carry-forward, targeted rereview
 - [reference/context-strategy-and-experiment-framework.md](reference/context-strategy-and-experiment-framework.md) — Strategy-profile freezing, handoff compilation, normalized telemetry

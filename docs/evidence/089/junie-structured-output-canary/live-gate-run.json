@@ -1,0 +1,69 @@
+{
+  "acp_canary_status": "passed",
+  "audited_git_sha": "6089a7b85ca524849ace1b4367eabbf71e424dfc",
+  "command": "./scripts/test-gate.sh proposal-089",
+  "completed_at": "2026-05-13T18:21:47.985986Z",
+  "environment": {
+    "CHAINWORKS_PROPOSAL_089_LIVE": "1",
+    "recorded_env_names": [
+      "CHAINWORKS_JUNIE_ACP_BINARY"
+    ],
+    "redacted_env": true
+  },
+  "exit_code": 0,
+  "log": {
+    "path": "docs/evidence/089/junie-structured-output-canary/live-gate.log.redacted",
+    "sha256": "97bc012c77b17d421f7ebb60db99a4b9a0a20a0e4c0795c046271b6d099bc723",
+    "size_bytes": 3624
+  },
+  "native_phase_status": "passed",
+  "native_timeout_ms": 120000,
+  "overall_status": "passed",
+  "proof_critical_files": [
+    {
+      "path": "scripts/test-gate.sh",
+      "sha256": "c531fc5de65352307629650dc1ea48f1d248c590ed019789e6c15130590a3cb1",
+      "size_bytes": 329735
+    },
+    {
+      "path": "scripts/proposal-089-refresh-evidence.py",
+      "sha256": "10d09d376d339f9a1e9198e1862df8c0592cdd108e8478a54a25403dd156cc1f",
+      "size_bytes": 18372
+    },
+    {
+      "path": "control-plane/crates/acp/src/adapters/junie.rs",
+      "sha256": "7e294ce50d43af05aef95b855475f7391c966f8802e216e23ebc234f255d9cfe",
+      "size_bytes": 8253
+    },
+    {
+      "path": "control-plane/crates/acp/src/transport.rs",
+      "sha256": "62e5b2605ced582a9fed682f93f4164878894d5d246c5e8f2fb7650bf9dc1212",
+      "size_bytes": 187671
+    },
+    {
+      "path": "control-plane/crates/engine/examples/p089_acp_live_canary.rs",
+      "sha256": "e8b40386be47be0e08b4141ed395e59bf8f1cc76372aa682f1982f9724465e12",
+      "size_bytes": 14425
+    },
+    {
+      "path": "control-plane/crates/engine/src/executor.rs",
+      "sha256": "9133eda5f5b509cd324cc315284e72729803b7146b4a509c25e4b37d2532e5fc",
+      "size_bytes": 601389
+    },
+    {
+      "path": "control-plane/crates/engine/src/worktree_fingerprint.rs",
+      "sha256": "41ef1065e7e91fec3293a100db0713e88e3aa0810a7227006cc2137580bd54ce",
+      "size_bytes": 25991
+    },
+    {
+      "path": "examples/agents/agents.yaml",
+      "sha256": "71e5abf4fbad0b061878dfaa0193434c041aeace90419b84f2a89528fa4e3815",
+      "size_bytes": 72649
+    }
+  ],
+  "recorded_at": "2026-05-13T18:22:10.806886+00:00",
+  "result": "passed",
+  "schema_version": "p089_live_gate_run_v1",
+  "started_at": "2026-05-13T18:20:55.322254Z",
+  "working_directory": "/Users/user/Documents/Chainworks Forge"
+}
