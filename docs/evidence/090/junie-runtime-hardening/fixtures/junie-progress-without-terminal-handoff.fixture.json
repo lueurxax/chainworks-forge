@@ -1,0 +1,20 @@
+{
+  "schema_version": "p090_subtype_fixture_v1",
+  "subtype": "junie_progress_without_terminal_handoff",
+  "fixture_type": "synthetic",
+  "status": "accepted_for_proposal_readiness",
+  "proves": [
+    "subtype_coverage",
+    "progress_without_handoff"
+  ],
+  "receipt_shape": {
+    "provider_runtime_family": "junie_acp",
+    "completion_status": "missing_required_outputs",
+    "completion_boundary_subtype": "junie_progress_without_terminal_handoff",
+    "final_payload_status": "missing",
+    "progress_before_handoff": "worktree_diff_detected",
+    "provider_launched": true,
+    "required_outputs_fresh": false
+  },
+  "expected_gate_behavior": "implementation_gate_must_replace_with_acp_progress_without_terminal_fixture"
+}

@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::adapters::{AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, LaunchResourceGuard};
+use crate::adapters::{
+    AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec, CleanupPathSpec, LaunchResourceGuard,
+};
 use crate::ExecutionRequest;
 
 const BINARY_ENV_VAR: &str = "CHAINWORKS_CODEX_ACP_BINARY";
@@ -75,7 +77,7 @@ impl AcpAdapter for CodexAdapter {
         // EnvFilter::from_default_env(). Only show warnings and errors.
         env.push(("RUST_LOG".into(), "warn".into()));
 
-        resources.add_cleanup_path(runtime_home);
+        resources.add_cleanup_spec(CleanupPathSpec::stage_codex_session_store(runtime_home));
         Ok(AcpLaunchSpec::new(&self.binary_path).with_envs(env))
     }
 

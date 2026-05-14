@@ -370,9 +370,13 @@ async fn fixture_pool(path: &Path) -> Result<SqlitePool> {
                 .with_context(|| format!("remove stale {}", candidate.display()))?;
         }
     }
-    create_pool(&format!("sqlite://{}", path.to_string_lossy()))
+    let pool = create_pool(&format!("sqlite://{}", path.to_string_lossy()))
         .await
-        .with_context(|| format!("create fixture DB {}", path.display()))
+        .with_context(|| format!("create fixture DB {}", path.display()))?;
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .with_context(|| format!("register fixture DB writer {}", path.display()))?;
+    Ok(pool)
 }
 
 fn make_idea(id: IdeaId, fixture_id: &str) -> Idea {
@@ -1614,7 +1618,10 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
         "claude"
     }
 
-    async fn open_session(&self, _req: &acp::ExecutionRequest) -> Result<acp::AcpSessionHandle> {
+    async fn open_session(
+        &self,
+        _req: &acp::ExecutionRequest,
+    ) -> Result<acp::adapters::OpenedAcpAdapterSession> {
         Err(anyhow!(
             "P041 fixture adapter is execute-only and does not open transport sessions"
         ))
@@ -1666,6 +1673,7 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
             mcp_session_startup_latency_ms: Some(0),
             xcode_shim_warning_events: Vec::new(),
             close_diagnostic: None,
+            provider_session_store_capture: None,
             acp_pre_initialize_local_latency_ms: None,
             acp_initialize_latency_ms: None,
             acp_session_new_latency_ms: None,
@@ -1675,6 +1683,7 @@ impl acp::adapters::AcpAdapter for FixtureAcpAdapter {
             acp_pre_prompt_metadata_digest_bytes: 0,
             legacy_broad_discovery_snapshot: None,
             runtime_receipt: None,
+            runtime_tool_path_preflight_json: None,
         })
     }
 }

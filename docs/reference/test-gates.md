@@ -2021,6 +2021,64 @@ Important:
 - a default-mode pass requires checked-in evidence from a prior successful live-mode gate
 - the proof is intentionally narrow: it proves Junie structured-output capability plus the small ACP `code_writer` handoff boundary, not full scheduler/projection behavior and not a blanket fix for long-running P036-family failures
 
+### `proposal-090|p090`
+
+Proposal-readiness gate for Junie `code_writer` runtime-hardening evidence inventory.
+Short label: Junie runtime-hardening evidence inventory.
+
+Scope:
+
+- validates `docs/evidence/090/junie-runtime-hardening/evidence-index.json`
+- verifies every P090 completion-boundary subtype has one historical or synthetic evidence row
+- verifies every fixture path exists, has schema `p090_subtype_fixture_v1`, and matches its SHA-256 in the evidence index
+- verifies the public subtype contract is a provider-neutral wrapper with unknown/raw round-trip behavior
+- verifies required negative fixture classes have concrete files and SHA-256 entries for provider-authored failure spoofing, identity mismatch, unknown envelope schema, malformed repair sibling overwrite, and permission-denied preflight no-launch behavior
+- verifies checked-in long-running Junie refine-like canary evidence produced through `BackgroundExecutor.process_next_item`, with strict final payload, enforced preflight, fresh settled outputs, and Junie ACP receipt readback
+- verifies the P090 proposal names the engine-owned failure authority, durable per-output settlement rows, preflight lifecycle, and canonical gate
+- runs focused Rust proof tests for receipt/readback subtype persistence, settlement-row idempotency, provider-authored failure-envelope spoof rejection, Junie no-launch preflight classification, staged repair materialization, and GraphQL/MCP readback parity
+
+Command:
+
+```bash
+CHAINWORKS_JUNIE_ACP_BINARY=/Users/user/.local/bin/junie CHAINWORKS_PROPOSAL_090_LIVE=1 ./scripts/test-gate.sh proposal-090
+./scripts/test-gate.sh proposal-090
+./scripts/test-gate.sh p090
+```
+
+Important:
+
+- this gate now combines evidence inventory validation with focused implementation checks; it is not a substitute for full workspace `cargo test` or the broader app gates
+- live mode refreshes `docs/evidence/090/junie-runtime-hardening/refine-like-canary/`; default mode requires that checked-in evidence and fails closed if it is missing or stale
+- the Rust checks are intentionally scoped to P090 contract behavior and the P088 readback surfaces that expose it
+- P090 keeps `completion_boundary_subtype` as a provider-neutral public wrapper; the initial known values are Junie-prefixed because the first covered failure family is Junie ACP
+
+### `proposal-091|p091`
+
+Proposal-readiness gate for targeted retry authority evidence inventory.
+Short label: targeted retry authority evidence inventory.
+
+Scope:
+
+- validates `docs/evidence/091/targeted-retry-authority/evidence-index.json`
+- verifies the P086 orphaned retry readback fixture exists, has schema `p091_orphaned_retry_readback_fixture.v1`, and matches its SHA-256 in the evidence index
+- verifies the fixture preserves the historical orphan shape: pending retry, no live work items, no active agent executions
+- verifies the P091 proposal includes the closed contract decisions for targeted-agent `InvokeAgent`-first lifecycle, historical orphan recovery provenance, `stale_retry_recovered`, DB-enforced active authority uniqueness, target-aware work-item repository semantics, authority history readback, startup recovery ordering before projection rebuild/catch-up enqueue, partial-target payload fail-closed semantics, and canonical gate naming
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-091
+./scripts/test-gate.sh p091
+```
+
+Important:
+
+- this is a readiness/inventory gate, not proof that targeted retry authority is implemented
+- implementation work must upgrade this same gate with focused DB, engine, recovery, work-item repository, GraphQL/MCP, and typed payload tests
+- full-stage retry is `AdvanceRun`-first; targeted-agent retry is `InvokeAgent`-first
+- historical orphan recovery settles as `status = skipped` with `terminal_reason = stale_retry_recovered` and a non-active recovered authority provenance row
+- `terminal_reason` is stage-owned and authority-history-owned for recovered orphan rows
+
 ### `proposal-075|p075`
 
 Retained historical alias for the local persistence write budget, evidence spooling, storage diagnostics, and fail-closed registry gate. Operational truth lives in `docs/reference/rust-control-plane.md`.

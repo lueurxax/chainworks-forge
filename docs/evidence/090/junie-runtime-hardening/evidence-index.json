@@ -1,0 +1,154 @@
+{
+  "schema_version": "p090_junie_runtime_hardening_evidence_index_v1",
+  "proposal_id": "090",
+  "status": "implementation_evidence_inventory",
+  "gate": "./scripts/test-gate.sh proposal-090",
+  "capability_baseline": {
+    "proposal": "089",
+    "evidence_index": "docs/evidence/089/junie-structured-output-canary/evidence-index.json",
+    "live_gate_run": "docs/evidence/089/junie-structured-output-canary/live-gate-run.json"
+  },
+  "public_subtype_contract": {
+    "field": "completion_boundary_subtype",
+    "scope": "provider_neutral_wrapper",
+    "initial_known_values_are_provider_specific": true,
+    "unknown_values_round_trip_raw": true
+  },
+  "subtype_coverage": [
+    {
+      "subtype": "junie_final_response_missing",
+      "evidence_source": "synthetic",
+      "fixture_path": "docs/evidence/090/junie-runtime-hardening/fixtures/junie-final-response-missing.fixture.json",
+      "fixture_sha256": "2892afaacf12a893b281e53f3c447955880d389be48556d83c625a9703c9cfa6",
+      "implementation_replacement_required": true
+    },
+    {
+      "subtype": "junie_final_response_truncated",
+      "evidence_source": "synthetic",
+      "fixture_path": "docs/evidence/090/junie-runtime-hardening/fixtures/junie-final-response-truncated.fixture.json",
+      "fixture_sha256": "675fb234c26ff5ba28fdd0a4aa5689c763f789062d98d61f38947def4c97aa56",
+      "implementation_replacement_required": true
+    },
+    {
+      "subtype": "junie_progress_without_terminal_handoff",
+      "evidence_source": "synthetic",
+      "fixture_path": "docs/evidence/090/junie-runtime-hardening/fixtures/junie-progress-without-terminal-handoff.fixture.json",
+      "fixture_sha256": "d574d9ff0da9eb3f676bf740f4b9526f704c7f1ff1f55a59db4323c3e98942b9",
+      "implementation_replacement_required": true
+    },
+    {
+      "subtype": "junie_repair_returned_narrative",
+      "evidence_source": "synthetic",
+      "fixture_path": "docs/evidence/090/junie-runtime-hardening/fixtures/junie-repair-returned-narrative.fixture.json",
+      "fixture_sha256": "50c22aac3a6e62e7578ff7251d833e611658e24d49bb21c39e4d976619af52e5",
+      "implementation_replacement_required": true
+    },
+    {
+      "subtype": "junie_repair_returned_malformed_json",
+      "evidence_source": "synthetic",
+      "fixture_path": "docs/evidence/090/junie-runtime-hardening/fixtures/junie-repair-returned-malformed-json.fixture.json",
+      "fixture_sha256": "a5fcac65892a39285040a05c5921d37330acafd2019a6e4f7df6091f905af48d",
+      "implementation_replacement_required": true
+    },
+    {
+      "subtype": "junie_repair_outputs_partially_materialized",
+      "evidence_source": "synthetic",
+      "fixture_path": "docs/evidence/090/junie-runtime-hardening/fixtures/junie-repair-outputs-partially-materialized.fixture.json",
+      "fixture_sha256": "83f62b2cf3349a19376774b7be98a4b557d6476b805c840f2e73928417d1b1c7",
+      "implementation_replacement_required": true
+    },
+    {
+      "subtype": "junie_runtime_tool_path_failure_before_publication",
+      "evidence_source": "synthetic",
+      "fixture_path": "docs/evidence/090/junie-runtime-hardening/fixtures/junie-runtime-tool-path-failure-before-publication.fixture.json",
+      "fixture_sha256": "147e1517c7fb71d57d505cd3137a535980e37cf6d2cbbe3c8735bc4c61a6c89d",
+      "implementation_replacement_required": true
+    }
+  ],
+  "required_negative_fixture_classes": [
+    "provider_authored_engine_failure_spoof_rejected",
+    "provider_envelope_identity_mismatch_rejected",
+    "unknown_provider_envelope_schema_rejected",
+    "malformed_repair_sibling_does_not_overwrite_canonical_truth",
+    "permission_denied_preflight_does_not_launch_provider"
+  ],
+  "negative_fixtures": [
+    {
+      "fixture_class": "provider_authored_engine_failure_spoof_rejected",
+      "path": "docs/evidence/090/junie-runtime-hardening/negative/provider-authored-engine-failure-spoof-rejected.fail.json",
+      "sha256": "1442d0b8ebe39baf320bf05f4ad080dd40b3fb132ca0e717a31dc6b173f7d0ce"
+    },
+    {
+      "fixture_class": "provider_envelope_identity_mismatch_rejected",
+      "path": "docs/evidence/090/junie-runtime-hardening/negative/provider-envelope-identity-mismatch-rejected.fail.json",
+      "sha256": "4c2461425f429ce7b3d1a7b39ae3507f4f9b6bcbce122705b82e3c65dd7425d0"
+    },
+    {
+      "fixture_class": "unknown_provider_envelope_schema_rejected",
+      "path": "docs/evidence/090/junie-runtime-hardening/negative/unknown-provider-envelope-schema-rejected.fail.json",
+      "sha256": "e3c7a7e431a18cdc6ccd5e3ba31e65b01f3d396bdd5c75816f5b9a71f1d179d4"
+    },
+    {
+      "fixture_class": "malformed_repair_sibling_does_not_overwrite_canonical_truth",
+      "path": "docs/evidence/090/junie-runtime-hardening/negative/malformed-repair-sibling-does-not-overwrite-canonical-truth.fail.json",
+      "sha256": "a02c33625e63daaae707868db6994ccdf782f7947c7825615a6a467a7daa8628"
+    },
+    {
+      "fixture_class": "permission_denied_preflight_does_not_launch_provider",
+      "path": "docs/evidence/090/junie-runtime-hardening/negative/permission-denied-preflight-does-not-launch-provider.fail.json",
+      "sha256": "7688d79e030b7365152feea576be18abd1fa9e14abc77605f6c11161b9482e49"
+    }
+  ],
+  "implementation_gate_upgrade_required": false,
+  "staged_repair_proof": {
+    "proof_type": "focused_runtime_and_startup_recovery_tests",
+    "live_canary_exercises_repair": false,
+    "tests": [
+      "executor::tests::proposal_090_repair_materializes_valid_outputs_without_overwriting_malformed_sibling",
+      "executor::tests::proposal_090_committed_repair_rows_publish_only_accepted_active_artifacts",
+      "integration::proposal_090_startup_repair_publishes_recovered_committed_active_pointer"
+    ]
+  },
+  "long_running_refine_like_canary": {
+    "status": "passed",
+    "execution_path": "BackgroundExecutor.process_next_item",
+    "provider": "junie",
+    "provider_runtime_family": "junie_acp",
+    "hardened_flags": {
+      "CHAINWORKS_P090_STRICT_FINAL_PAYLOAD": "1",
+      "CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE": "1",
+      "CHAINWORKS_P090_STAGED_REPAIR_SETTLEMENT": "1"
+    },
+    "directory": "docs/evidence/090/junie-runtime-hardening/refine-like-canary",
+    "files": {
+      "harness-result.json": {
+        "sha256": "fa93a70c838499adf80dbc526f487eb453722a84e9a488e73dd5f36a1733df39",
+        "size_bytes": 17787
+      },
+      "artifacts/implementation_progress.json": {
+        "sha256": "a04548b3413b702dbfbcd5d7b3a73795ffe0d4892c5a263c345f72eefd75ea9f",
+        "size_bytes": 202
+      },
+      "artifacts/implementation_self_assessment.json": {
+        "sha256": "fb3b32acd44315211f5e9bae288ce868d6f4c778b9c736c1899c97e9927d480a",
+        "size_bytes": 197
+      },
+      "artifacts/tests_result.json": {
+        "sha256": "1248ad119938cc033a96201911761be6a02af55c54240934add30a89e9b2e140",
+        "size_bytes": 62
+      },
+      "artifacts/changed_files_manifest.json": {
+        "sha256": "602e35a92eec4bc0a2ec6ae113f07bfc6933322fb69fe8dee416e5a67217e2a2",
+        "size_bytes": 12
+      },
+      "meta/artifacts/active-index.json": {
+        "sha256": "230400870c340ed1cc7cfbb78c7d56525e978cadc20143cb7e40bcda28876b65",
+        "size_bytes": 1816
+      },
+      "meta/state/run-state.json": {
+        "sha256": "7a38d281a0d61594d098db48a0097a1ae4f4a858ae3a130bbeca44bfbbcd9a12",
+        "size_bytes": 1843
+      }
+    }
+  }
+}

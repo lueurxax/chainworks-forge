@@ -2318,6 +2318,8 @@ mod tests {
     #[tokio::test]
     async fn registered_repository_transaction_commits_through_queued_writer() {
         let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let writer = Arc::new(DbWriter::new(pool.clone()));
+        register_shared_writer(&pool, writer.clone()).await.unwrap();
         let mut tx = begin_repository_transaction(&pool, "test_registered_repository_transaction")
             .await
             .unwrap();
@@ -2336,6 +2338,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+        writer.shutdown().await;
     }
 
     // -----------------------------------------------------------------------

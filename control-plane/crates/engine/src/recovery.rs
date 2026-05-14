@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
@@ -329,6 +330,25 @@ impl RecoveryService {
                     );
                 }
             }
+            match self.recover_p090_output_settlement_rows(run).await {
+                Ok(recovered_rows) => {
+                    if recovered_rows > 0 {
+                        repaired_run = true;
+                        info!(
+                            run_id = %run.id,
+                            recovered_rows = recovered_rows,
+                            "Startup recovery reconciled P090 output settlement rows"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run.id,
+                        error = %e,
+                        "Failed to recover P090 output settlement rows during startup"
+                    );
+                }
+            }
             match artifact_contracts::repair_contract_status_normalization_and_rebuild(
                 &self.pool, run.id,
             )
@@ -572,6 +592,135 @@ impl RecoveryService {
             recovered += 1;
         }
         Ok(recovered)
+    }
+
+    async fn recover_p090_output_settlement_rows(&self, run: &Run) -> Result<usize> {
+        let rows = code_writer_completion_receipts::list_p090_recoverable_settlement_rows_by_run(
+            &self.pool, run.id,
+        )
+        .await?;
+        let mut recovered = 0usize;
+        for row in rows {
+            match row.materialization_state.as_str() {
+                "staged" => {
+                    let canonical_sha = sha256_file_if_exists(&row.canonical_path)?;
+                    let staging_sha = row
+                        .staging_path
+                        .as_deref()
+                        .map(sha256_file_if_exists)
+                        .transpose()?
+                        .flatten();
+                    let expected_sha = row
+                        .candidate_digest
+                        .as_deref()
+                        .or(staging_sha.as_deref())
+                        .map(str::to_string);
+                    if canonical_sha.is_some() && canonical_sha == expected_sha {
+                        let mut recovered_row = row.clone();
+                        recovered_row.materialization_state = "committed".to_string();
+                        recovered_row.canonical_after_sha256 = canonical_sha.clone();
+                        recovered_row.committed_at = Some(Utc::now());
+                        code_writer_completion_receipts::update_p090_settlement_row_recovery_state(
+                            &self.pool,
+                            &row.id,
+                            "committed",
+                            canonical_sha.as_deref(),
+                            recovered_row.committed_at,
+                            None,
+                        )
+                        .await?;
+                        self.publish_p090_recovered_active_artifact_generation(&recovered_row)
+                            .await?;
+                        recovered += 1;
+                    } else if canonical_sha == row.canonical_before_sha256 {
+                        code_writer_completion_receipts::update_p090_settlement_row_recovery_state(
+                            &self.pool,
+                            &row.id,
+                            "failed",
+                            canonical_sha.as_deref(),
+                            None,
+                            Some("startup_recovery_left_staged_output_unpromoted"),
+                        )
+                        .await?;
+                        recovered += 1;
+                    } else {
+                        code_writer_completion_receipts::update_p090_settlement_row_recovery_state(
+                            &self.pool,
+                            &row.id,
+                            "failed",
+                            canonical_sha.as_deref(),
+                            None,
+                            Some("startup_recovery_detected_unverifiable_canonical_change"),
+                        )
+                        .await?;
+                        recovered += 1;
+                    }
+                }
+                "committed" if row.canonical_after_sha256.is_none() => {
+                    let canonical_sha = sha256_file_if_exists(&row.canonical_path)?;
+                    let mut recovered_row = row.clone();
+                    recovered_row.canonical_after_sha256 = canonical_sha.clone();
+                    recovered_row.committed_at = row.committed_at.or(Some(Utc::now()));
+                    code_writer_completion_receipts::update_p090_settlement_row_recovery_state(
+                        &self.pool,
+                        &row.id,
+                        "committed",
+                        canonical_sha.as_deref(),
+                        recovered_row.committed_at,
+                        None,
+                    )
+                    .await?;
+                    self.publish_p090_recovered_active_artifact_generation(&recovered_row)
+                        .await?;
+                    recovered += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok(recovered)
+    }
+
+    async fn publish_p090_recovered_active_artifact_generation(
+        &self,
+        row: &domain::code_writer_completion::CodeWriterOutputSettlementRow,
+    ) -> Result<()> {
+        if row.decision != "accepted" || row.materialization_state != "committed" {
+            return Ok(());
+        }
+        if row.canonical_after_sha256.is_none()
+            || !domain::artifact_contracts::known_contract_id(&row.contract_id)
+        {
+            return Ok(());
+        }
+        let raw_status = extract_p090_recovered_contract_status(&row.canonical_path)
+            .unwrap_or_else(|| "unknown".to_string());
+        artifact_contracts::upsert_generation_and_rebuild(
+            &self.pool,
+            domain::artifact_contracts::ActiveArtifactGenerationInput {
+                run_id: row.run_id,
+                artifact_id: domain::ids::ArtifactId::new(),
+                contract_id: row.contract_id.clone(),
+                canonical_path: row.output_name.clone(),
+                raw_path: row.canonical_path.clone(),
+                raw_status,
+                generation_id: row
+                    .active_pointer_generation_id
+                    .clone()
+                    .unwrap_or_else(|| row.id.clone()),
+                source_agent_execution_id: Some(row.agent_execution_id.to_string()),
+                source_stage_execution_id: Some(row.stage_execution_id.to_string()),
+                source_session_generation_id: row.session_generation_id.clone(),
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: AgentOutputSettlement::ValidOutputsFromFailedExecution,
+                partial: true,
+                warnings: vec![
+                    "P090 startup recovery published accepted staged repair settlement row"
+                        .to_string(),
+                ],
+            },
+        )
+        .await
     }
 
     async fn repair_run(&self, run: &Run) -> Result<usize> {
@@ -867,6 +1016,26 @@ impl RecoveryService {
             ))
         }
     }
+}
+
+fn sha256_file_if_exists(path: &str) -> Result<Option<String>> {
+    let path = Path::new(path);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(std::fs::read(path)?);
+    Ok(Some(format!("{:x}", hasher.finalize())))
+}
+
+fn extract_p090_recovered_contract_status(path: &str) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("implementation_status")
+        .or_else(|| value.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// P066 T14: Scan TOOLCHAIN_HOME at daemon startup and:

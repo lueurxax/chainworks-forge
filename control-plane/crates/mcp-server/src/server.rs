@@ -1452,9 +1452,16 @@ mod tests {
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
-        create_pool("sqlite::memory:")
+        let pool = create_pool("sqlite::memory:")
             .await
-            .expect("in-memory pool failed")
+            .expect("in-memory pool failed");
+        db::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
+        pool
     }
 
     async fn seed_validation_attempt(
@@ -1912,6 +1919,12 @@ mod tests {
             let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
                 .await
                 .expect("open P041 fixture DB");
+            db::writer::register_shared_writer(
+                &pool,
+                std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+            )
+            .await
+            .expect("register P041 fixture shared writer");
             let handler = make_command_handler(pool.clone());
             let tool_value = crate::tools::reports::execute(
                 "reports.get",

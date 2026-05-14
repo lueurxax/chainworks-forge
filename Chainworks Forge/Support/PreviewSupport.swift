@@ -24,21 +24,6 @@ enum PreviewSupport {
     }
 
     @MainActor
-    static func makeAppConfigurationStore() -> AppConfigurationStore {
-        AppConfigurationStore(
-            fileURL: FileManager.default.temporaryDirectory.appendingPathComponent("preview-app-configuration.json"),
-            initialConfiguration: AppConfiguration(
-                runStorageBasePath: previewApplicationSupportURL("runs").path,
-                worktreeBasePath: previewApplicationSupportURL("worktrees").path,
-                workflowSourcePath: repoExampleURL("workflows/workflow.yaml").path,
-                agentCatalogSourcePath: repoExampleURL("agents/agents.yaml").path,
-                supportBundleExportPath: previewApplicationSupportURL("exports").path,
-                activeConfigurationSource: .persistedSettings
-            )
-        )
-    }
-
-    @MainActor
     static func makeProviderSettingsStore() -> ProviderSettingsStore {
         let claudeProvider = ConfiguredProvider(
             family: .claudeACP,
@@ -82,24 +67,6 @@ enum PreviewSupport {
         ProviderRegistry(
             settingsStore: settingsStore,
             secretStore: KeychainSecretStore(useInMemoryStore: true)
-        )
-    }
-
-    @MainActor
-    static func makeExecutionService(
-        modelContext: ModelContext,
-        liveConfigured: Bool = true
-    ) -> ExecutionService {
-        let runtimeConfiguration = liveConfigured ? LiveRuntimeConfiguration(
-            override: nil,
-            transportMode: .fixtureProposalLoopSuccess
-        ) : nil
-
-        return ExecutionService(
-            modelContext: modelContext,
-            executor: SimulatedAgentExecutor(),
-            liveRuntimeConfiguration: runtimeConfiguration,
-            notificationService: NotificationService()
         )
     }
 

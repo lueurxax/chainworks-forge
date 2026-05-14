@@ -6,16 +6,16 @@ use db::pool::create_pool;
 use db::repos::{code_writer_completion_receipts, ideas, runs, stages, work_items};
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentExecution, AgentStatus};
-use domain::commands::{CallerContext, CallerSurface, Command, RetryStageCmd};
 use domain::code_writer_completion::{
     CodeWriterCompletionOutputDecisionRecord, CodeWriterCompletionReceiptRecord,
-    CodeWriterCompletionTextCaptureRecord,
+    CodeWriterCompletionTextCaptureRecord, CodeWriterOutputSettlementRow,
 };
+use domain::commands::{CallerContext, CallerSurface, Command, RetryStageCmd};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
-use domain::PrincipalClass;
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
+use domain::PrincipalClass;
 use engine::command_handler::{CommandHandler, CommandResult};
 use engine::event_bus;
 use engine::lifecycle_reporter::LifecycleReporter;
@@ -112,8 +112,8 @@ async fn seed_receipt(
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
             owner_agent: Some("code_writer".into()),
-            provider: Some("codex".into()),
-            model: Some("gpt-5".into()),
+            provider: Some("junie".into()),
+            model: Some("junie-default".into()),
             stage_type: None,
             validation_failure_json: None,
             evidence_packet_json: None,
@@ -129,8 +129,8 @@ async fn seed_receipt(
             id: agent_execution_id,
             stage_execution_id: Some(stage_execution_id),
             agent_id: "code_writer".into(),
-            provider: "codex".into(),
-            model: Some("gpt-5".into()),
+            provider: "junie".into(),
+            model: Some("junie-default".into()),
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
             status: AgentStatus::Failed,
@@ -177,8 +177,8 @@ async fn seed_receipt(
         session_generation_id: Some("session-generation-p088".into()),
         original_runtime_receipt_id: Some("runtime-original".into()),
         completion_repair_runtime_receipt_id: Some("runtime-repair".into()),
-        provider: "codex".into(),
-        model: Some("gpt-5".into()),
+        provider: "junie".into(),
+        model: Some("junie-default".into()),
         completion_mode: Some("code_writer_completion_repair_turn".into()),
         published_at: None,
         activation_source: "p037_idle_terminalization".into(),
@@ -194,6 +194,35 @@ async fn seed_receipt(
         preexisting_dirty_path_count: 1,
         completion_status: "missing_required_outputs".into(),
         failure_class: Some("terminal_response_completed_missing_required_outputs".into()),
+        provider_runtime_family: Some("junie_acp".into()),
+        completion_boundary_subtype: Some("junie_repair_outputs_partially_materialized".into()),
+        final_payload_status: Some("present".into()),
+        progress_before_handoff: Some("worktree_diff_detected".into()),
+        runtime_preflight_phase: Some("passed".into()),
+        runtime_tool_path_preflight_json: Some(
+            serde_json::json!({"status": "passed", "provider_launched": true}).to_string(),
+        ),
+        final_completion_payload_capture_json: Some(
+            serde_json::json!({
+                "schema": "p090_final_completion_payload_capture_v1",
+                "status": "captured",
+                "capture_record_ref": "original:0",
+                "redacted_text_artifact_path": ".chainworks/p090/final-payload.redacted.txt",
+                "failure_envelope_authority": "provider_claim_rejected"
+            })
+            .to_string(),
+        ),
+        repair_materialization_summary_json: Some(
+            serde_json::json!({
+                "schema": "p090_repair_materialization_summary_v1",
+                "fresh_count": 1,
+                "malformed_count": 1
+            })
+            .to_string(),
+        ),
+        repair_materialization_mode: Some("staged_per_output".into()),
+        strict_final_payload_enabled: true,
+        staged_repair_settlement_enabled: true,
         terminal_response_status: Some("completed".into()),
         completion_turn_attempted: true,
         completion_turn_result: Some("unknown_future_completion_result".into()),
@@ -229,8 +258,8 @@ async fn seed_receipt(
         completion_text_truncated: false,
         extraction_input_truncated: true,
         extraction_input_sha256: Some("sha256:input".into()),
-        raw_text_artifact_path: Some(".chainworks/p088/raw.txt".into()),
-        redacted_text_artifact_path: Some(".chainworks/p088/redacted.txt".into()),
+        raw_text_artifact_path: Some(".chainworks/p090/final-payload.raw.txt".into()),
+        redacted_text_artifact_path: Some(".chainworks/p090/final-payload.redacted.txt".into()),
         text_absence_reason: None,
         created_at: Utc::now(),
     };
@@ -246,9 +275,69 @@ async fn seed_receipt(
         validation_status: Some("fresh".into()),
         rejection_reason: Some("unknown_future_rejection".into()),
     };
-    code_writer_completion_receipts::upsert(pool, &receipt, &[text_capture], &[output_decision])
-        .await
-        .unwrap();
+    let rows = vec![
+        CodeWriterOutputSettlementRow {
+            id: format!("{receipt_id}:implementation_progress"),
+            receipt_id: receipt_id.clone(),
+            run_id,
+            stage_id: "state_code".into(),
+            stage_execution_id,
+            agent_execution_id,
+            session_generation_id: Some("session-generation-p088".into()),
+            repair_attempt: 1,
+            output_name: "implementation_progress".into(),
+            contract_id: "implementation_progress".into(),
+            source_kind: "chainworks_output".into(),
+            source_generation_owner: "agent".into(),
+            candidate_digest: Some("sha256:progress".into()),
+            staging_path: Some(".chainworks/p090/staged/progress.md".into()),
+            canonical_path: "implementation/progress.md".into(),
+            canonical_before_sha256: None,
+            canonical_after_sha256: Some("sha256:progress".into()),
+            decision: "accepted".into(),
+            rejection_reason: None,
+            materialization_state: "committed".into(),
+            active_pointer_generation_id: Some("session-generation-p090".into()),
+            created_at: Utc::now(),
+            committed_at: Some(Utc::now()),
+        },
+        CodeWriterOutputSettlementRow {
+            id: format!("{receipt_id}:implementation_self_assessment"),
+            receipt_id: receipt_id.clone(),
+            run_id,
+            stage_id: "state_code".into(),
+            stage_execution_id,
+            agent_execution_id,
+            session_generation_id: Some("session-generation-p088".into()),
+            repair_attempt: 1,
+            output_name: "implementation_self_assessment".into(),
+            contract_id: "implementation_self_assessment_v2".into(),
+            source_kind: "chainworks_output".into(),
+            source_generation_owner: "agent".into(),
+            candidate_digest: Some("sha256:malformed".into()),
+            staging_path: Some(".chainworks/p090/staged/self-assessment.json".into()),
+            canonical_path: "implementation/self-assessment.json".into(),
+            canonical_before_sha256: Some("sha256:old".into()),
+            canonical_after_sha256: None,
+            decision: "rejected".into(),
+            rejection_reason: Some("malformed_json".into()),
+            materialization_state: "not_materialized".into(),
+            active_pointer_generation_id: None,
+            created_at: Utc::now(),
+            committed_at: None,
+        },
+    ];
+    code_writer_completion_receipts::upsert_with_runtime_receipts_and_settlement_rows(
+        pool,
+        &receipt,
+        &[text_capture],
+        &[output_decision],
+        &rows,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     (run_id, stage_execution_id, agent_execution_id, receipt_id)
 }
@@ -365,8 +454,7 @@ async fn proposal_088_targeted_retry_recovery_carries_preserved_evidence_to_acti
             item.kind == WorkItemKind::InvokeAgent && item.status == WorkItemStatus::Pending
         })
         .expect("targeted retry should enqueue one pending InvokeAgent item");
-    let retry_payload: serde_json::Value =
-        serde_json::from_str(&retry_item.payload_json).unwrap();
+    let retry_payload: serde_json::Value = serde_json::from_str(&retry_item.payload_json).unwrap();
     let source_agent_execution_id = agent_execution_id.to_string();
     assert_eq!(
         retry_payload
@@ -510,6 +598,16 @@ async fn proposal_088_graphql_exposes_code_writer_completion_receipts_by_run_and
                             status {{ value raw known }}
                             ingestionBoundaryFailure {{ value raw known }}
                             completionTurnResult {{ value raw known }}
+                            providerRuntimeFamily
+                            completionBoundarySubtype {{ value raw known }}
+                            finalPayloadStatus
+                            runtimePreflightPhase
+                            runtimeToolPathPreflightJson
+                            finalCompletionPayloadCaptureJson
+                            failureEnvelopeAuthority
+                            repairMaterializationMode
+                            strictFinalPayloadEnabled
+                            stagedRepairSettlementEnabled
                             nextOperatorAction {{ value raw known }}
                             completionTurnAttempted
                             promptTemplateId
@@ -534,6 +632,14 @@ async fn proposal_088_graphql_exposes_code_writer_completion_receipts_by_run_and
                             workChangeKind
                             completionStatus
                             failureClass
+                            providerRuntimeFamily
+                            completionBoundarySubtype
+                            finalPayloadStatus
+                            runtimePreflightPhase
+                            runtimeToolPathPreflightJson
+                            repairMaterializationMode
+                            strictFinalPayloadEnabled
+                            stagedRepairSettlementEnabled
                             terminalResponseStatus
                             completionTurnAttempted
                             completionTurnResult
@@ -556,6 +662,14 @@ async fn proposal_088_graphql_exposes_code_writer_completion_receipts_by_run_and
                                 canonicalPath
                                 settlementSource
                                 validationStatus
+                                rejectionReason
+                            }}
+                            settlementRows {{
+                                outputName
+                                decision
+                                sourceGenerationOwner
+                                materializationState
+                                activePointerGenerationId
                                 rejectionReason
                             }}
                         }}
@@ -606,6 +720,47 @@ async fn proposal_088_graphql_exposes_code_writer_completion_receipts_by_run_and
         false
     );
     assert_eq!(
+        implementation_completion["providerRuntimeFamily"],
+        "junie_acp"
+    );
+    assert_eq!(
+        implementation_completion["completionBoundarySubtype"]["value"],
+        "junie_repair_outputs_partially_materialized"
+    );
+    assert_eq!(
+        implementation_completion["completionBoundarySubtype"]["raw"],
+        "junie_repair_outputs_partially_materialized"
+    );
+    assert_eq!(
+        implementation_completion["completionBoundarySubtype"]["known"],
+        true
+    );
+    assert_eq!(implementation_completion["finalPayloadStatus"], "present");
+    assert_eq!(implementation_completion["runtimePreflightPhase"], "passed");
+    assert_eq!(
+        implementation_completion["failureEnvelopeAuthority"],
+        "provider_claim_rejected"
+    );
+    let final_payload: serde_json::Value = serde_json::from_str(
+        implementation_completion["finalCompletionPayloadCaptureJson"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        final_payload["redacted_text_artifact_path"],
+        ".chainworks/p090/final-payload.redacted.txt"
+    );
+    assert_eq!(
+        implementation_completion["repairMaterializationMode"],
+        "staged_per_output"
+    );
+    assert_eq!(implementation_completion["strictFinalPayloadEnabled"], true);
+    assert_eq!(
+        implementation_completion["stagedRepairSettlementEnabled"],
+        true
+    );
+    assert_eq!(
         implementation_completion["nextOperatorAction"]["value"],
         "unknown"
     );
@@ -629,6 +784,35 @@ async fn proposal_088_graphql_exposes_code_writer_completion_receipts_by_run_and
     assert_eq!(
         receipt["failureClass"],
         "terminal_response_completed_missing_required_outputs"
+    );
+    assert_eq!(receipt["providerRuntimeFamily"], "junie_acp");
+    assert_eq!(
+        receipt["completionBoundarySubtype"],
+        "junie_repair_outputs_partially_materialized"
+    );
+    assert_eq!(receipt["runtimePreflightPhase"], "passed");
+    let settlement_rows = receipt["settlementRows"].as_array().unwrap();
+    assert_eq!(settlement_rows.len(), 2);
+    let accepted = settlement_rows
+        .iter()
+        .find(|row| row["outputName"] == "implementation_progress")
+        .unwrap();
+    assert_eq!(accepted["decision"], "accepted");
+    assert_eq!(accepted["sourceGenerationOwner"], "agent");
+    assert_eq!(accepted["materializationState"], "committed");
+    assert_eq!(
+        accepted["activePointerGenerationId"],
+        "session-generation-p090"
+    );
+    let rejected = settlement_rows
+        .iter()
+        .find(|row| row["outputName"] == "implementation_self_assessment")
+        .unwrap();
+    assert_eq!(rejected["decision"], "rejected");
+    assert_eq!(rejected["rejectionReason"], "malformed_json");
+    assert_eq!(
+        rejected["activePointerGenerationId"],
+        serde_json::Value::Null
     );
     assert_eq!(
         receipt["completionTurnResult"],

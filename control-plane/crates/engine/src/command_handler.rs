@@ -52,7 +52,7 @@ use crate::event_bus::EventSender;
 use crate::preflight::{
     missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
 };
-use crate::side_effects::{retry_preflight_within_tx, run_cancel_preflight};
+use crate::side_effects::{retry_preflight_within_tx, run_cancel_preflight_within_tx};
 use crate::synthesizers::closeout_readiness::{
     synthesize_implementation_closeout_readiness_for_state9, SynthesizerInputs,
 };
@@ -2201,7 +2201,7 @@ impl CommandHandler {
                     approval_id: approval.id,
                     decision: ApprovalDecision::Granted,
                 });
-                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
+                projections::rebuild_approval_inbox(&self.pool, c.run_id).await?;
 
                 Ok(CommandResult::StageApproved {
                     approval_id: approval.id,
@@ -2692,9 +2692,6 @@ impl CommandHandler {
                 self.work_queue
                     .publish_scheduler_notification(scheduler_refresh);
 
-                // Refresh projections so reads reflect the retry.
-                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
-
                 Ok(CommandResult::StageRetryScheduled {
                     run_id: c.run_id,
                     stage_id: c.stage_id,
@@ -3114,7 +3111,7 @@ impl CommandHandler {
 
                 // Ledger-backed preflight: block cancel when any unresolved side effects exist
                 // for this run, regardless of CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED.
-                if let Err(ledger_err) = run_cancel_preflight(&self.pool, &c.run_id).await {
+                if let Err(ledger_err) = run_cancel_preflight_within_tx(&mut tx, &c.run_id).await {
                     command_journal::fail_entry_tx(
                         &mut tx,
                         &journal.id,
@@ -3154,8 +3151,6 @@ impl CommandHandler {
                         );
                     }
                 }
-
-                projections::rebuild_all_for_run(&self.pool, c.run_id).await?;
 
                 let _ = self.events.send(DomainEvent::RunStatusChanged {
                     run_id: c.run_id,

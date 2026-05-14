@@ -3,6 +3,15 @@ use db::pool::create_pool;
 use db::repos::work_items;
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+    db::writer::register_shared_writer(&pool, writer)
+        .await
+        .expect("test shared DbWriter registration failed");
+    pool
+}
+
 fn work_item(id: &str, kind: WorkItemKind) -> WorkItem {
     let now = Utc::now();
     WorkItem {
@@ -21,7 +30,7 @@ fn work_item(id: &str, kind: WorkItemKind) -> WorkItem {
 
 #[tokio::test]
 async fn proposal_058_generic_claim_skips_invoke_agent_items() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     work_items::enqueue(&pool, &work_item("invoke-1", WorkItemKind::InvokeAgent))
         .await
         .unwrap();
@@ -48,7 +57,7 @@ async fn proposal_058_generic_claim_skips_invoke_agent_items() {
 
 #[tokio::test]
 async fn proposal_058_invoke_claim_helpers_select_then_mark_in_one_transaction() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     work_items::enqueue(&pool, &work_item("invoke-1", WorkItemKind::InvokeAgent))
         .await
         .unwrap();

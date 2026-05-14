@@ -66,9 +66,23 @@ impl Drop for EnvVarRestore {
 }
 
 async fn test_pool() -> sqlx::SqlitePool {
-    create_pool("sqlite::memory:")
+    let pool = create_pool("sqlite::memory:")
         .await
-        .expect("in-memory pool failed")
+        .expect("in-memory pool failed");
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .expect("test shared DbWriter registration failed");
+    pool
+}
+
+async fn file_backed_test_pool(db_path: &std::path::Path) -> sqlx::SqlitePool {
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .expect("file-backed pool failed");
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .expect("test shared DbWriter registration failed");
+    pool
 }
 
 fn make_idea(id: IdeaId) -> Idea {
@@ -4146,6 +4160,7 @@ states:
         &catalog_path,
         r#"
 artifacts:
+  approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
   implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/self-assessment.json
 backend_profiles:
   worker_profile:
@@ -4534,13 +4549,10 @@ agents:
 async fn test_code_writer_prompt_scopes_seemingly_complete_to_code_owned_work() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("prompt-scope.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
 
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
@@ -4564,9 +4576,9 @@ states:
             - implementation_self_assessment
     transitions:
       - to: reviewed
-        when: implementation_self_assessment.seemingly_complete == true
+        when: implementation_self_assessment.implementation_complete == true
       - to: implementation
-        when: implementation_self_assessment.seemingly_complete == false
+        when: implementation_self_assessment.implementation_complete == false
   reviewed:
     label: Reviewed
     type: end
@@ -4582,19 +4594,38 @@ artifacts:
 backend_profiles:
   code_writer_profile:
     provider: codex
+  lead_profile:
+    provider: claude
+permission_profiles:
+  ORCH: {}
 contracts:
-  implementation_self_assessment_v1:
+  implementation_self_assessment_v2:
     format: json
     required_fields:
-      - seemingly_complete
-      - remaining_tasks
+      - status
+      - implementation_complete
+      - verification_green
+      - remaining_code_tasks
+      - handoff_tasks
       - known_risks
       - tests_run
       - docs_impacted
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
 agents:
+  - id: lead
+    system_role: lead
+    backend_profile: lead_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
   - id: code_writer
     backend_profile: code_writer_profile
-    output_contract: implementation_self_assessment_v1
+    output_contract: implementation_self_assessment_v2
 "#,
     )
     .unwrap();
@@ -4609,15 +4640,86 @@ agents:
             .to_string_lossy()
             .into_owned(),
     );
-    run.worktree_root = Some(temp.path().join("worktree").to_string_lossy().into_owned());
+    let worktree_root = temp.path().join("worktree");
+    std::fs::create_dir_all(&worktree_root).unwrap();
+    run.worktree_root = Some(worktree_root.to_string_lossy().into_owned());
     run.workflow_yaml_path = Some(workflow_path.to_string_lossy().into_owned());
     run.agent_catalog_yaml_path = Some(catalog_path.to_string_lossy().into_owned());
     runs::insert(&pool, &run).await.unwrap();
 
-    let mut pending_stage = make_stage(stage_execution_id, run_id, StageStatus::Pending);
-    pending_stage.stage_id = "implementation".into();
-    pending_stage.label = "Implementation".into();
-    stages::insert(&pool, &pending_stage).await.unwrap();
+    let approved_path = temp
+        .path()
+        .join(".chainworks/proposals/approved/proposal.md");
+    std::fs::create_dir_all(approved_path.parent().unwrap()).unwrap();
+    let readback = temp
+        .path()
+        .join("docs/evidence/rollout-contract/operator-readback/prompt-scope.fixture.json");
+    let negative = temp
+        .path()
+        .join("docs/evidence/rollout-contract/negative/prompt-scope-unsafe-path.json");
+    std::fs::create_dir_all(readback.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(negative.parent().unwrap()).unwrap();
+    std::fs::write(&readback, br#"{"schema_version":"operator_readback_v1"}"#).unwrap();
+    std::fs::write(&negative, br#"{"schema_version":"rollout_contract_v1"}"#).unwrap();
+    std::fs::write(
+        &approved_path,
+        serde_json::json!({
+            "schema_version": "proposal_document_v1",
+            "proposal_id": "prompt-scope",
+            "proposal_revision_id": "prompt-scope-r1",
+            "rollout_contract_v1": {
+                "schema_version": "rollout_contract_v1",
+                "applicability": "not_applicable",
+                "not_applicable_justification": "Prompt-scope fixture does not exercise rollout.",
+                "gate_aliases": ["prompt-scope"],
+                "commands": {"allowlist": ["./scripts/test-gate.sh proposal-017"]},
+                "migrations": {"not_applicable": true, "justification": "Prompt fixture."},
+                "metrics": {
+                    "adoption_metric": "prompt_scope_fixture",
+                    "operational_metrics": ["prompt_scope_fixture_total"]
+                },
+                "readback_lanes": ["run_report"],
+                "readback_fields": ["rollout_contract_status"],
+                "readback_fixture": "docs/evidence/rollout-contract/operator-readback/prompt-scope.fixture.json",
+                "operator_report_fields": ["rollout_contract_status"],
+                "hold_conditions": [],
+                "rollback_disposition": {
+                    "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+                    "data_loss_risk": "none"
+                },
+                "decision_vocabulary": ["pass", "fail", "waived", "not_applicable", "timeout"],
+                "negative_fixtures": {
+                    "unsafe_path_and_command": "docs/evidence/rollout-contract/negative/prompt-scope-unsafe-path.json"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    artifacts::insert(
+        &pool,
+        &Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "implementation".into(),
+            agent_id: "engine".into(),
+            name: "approved_proposal".into(),
+            contract_id: "approved_proposal".into(),
+            format: ArtifactFormat::Markdown,
+            file_path: ".chainworks/proposals/approved/proposal.md".into(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "engine".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: true,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: None,
+        },
+    )
+    .await
+    .unwrap();
 
     let events = event_bus::new_bus(64);
     let work_queue = WorkQueue::new(pool.clone());
@@ -4637,7 +4739,7 @@ agents:
         .expect("InvokeAgent payload must include prompt");
 
     assert!(
-        prompt.contains("Set `seemingly_complete` based only on remaining code-writer-owned source or test work."),
+        prompt.contains("do not use legacy self-assessment field names"),
         "code_writer prompt must prevent non-code/manual/release evidence blockers from forcing implementation self-loops"
     );
     assert!(
@@ -4654,9 +4756,7 @@ agents:
 async fn test_proposal_017_code_writer_start_missing_handoff_blocks_before_invoke() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("missing-handoff.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
 
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
@@ -4807,9 +4907,7 @@ agents:
 async fn test_proposal_017_invalid_proposal_current_surfaces_fail_and_blocked_projection() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("invalid-proposal-current.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
         .await
         .unwrap();
@@ -4973,9 +5071,7 @@ agents:
 async fn test_proposal_017_code_writer_start_snapshots_proposal_current_before_invoke() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("snapshot-handoff.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
         .await
         .unwrap();
@@ -6088,9 +6184,22 @@ states:
 backend_profiles:
   lead_profile:
     provider: claude
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
 agents:
   - id: lead
+    system_role: lead
     backend_profile: lead_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
 "#,
     )
     .unwrap();
@@ -6164,9 +6273,22 @@ states:
 backend_profiles:
   lead_profile:
     provider: claude
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
 agents:
   - id: lead
+    system_role: lead
     backend_profile: lead_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
 "#,
     )
     .unwrap();
@@ -6366,7 +6488,15 @@ async fn mcp_resolution_persistence_tests() {
     let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let registry_path = tmp.path().join("mcp-config.yaml");
-    std::fs::write(&registry_path, "mcp: {}\n").unwrap();
+    std::fs::write(
+        &registry_path,
+        r#"
+mcp:
+  xcode:
+    type: xcode_broker
+"#,
+    )
+    .unwrap();
     let _env_guard = CODEX_CONFIG_ENV_LOCK.lock().await;
     let previous_registry = std::env::var("CHAINWORKS_CODEX_CONFIG_PATH").ok();
     std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", &registry_path);
@@ -6417,6 +6547,7 @@ async fn mcp_resolution_persistence_tests() {
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "mcp-agent",
                 "provider": "claude",
+                "session_reuse_scope": serde_json::Value::Null,
                 "backend_profile_id": "codex_with_missing_mcp",
                 "requested_mcp_server_ids": ["missing-extension"]
             }),
@@ -6906,6 +7037,7 @@ sys.exit(0)
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "fixture-agent",
                 "provider": "claude",
+                "session_reuse_scope": serde_json::Value::Null,
                 "legacy_broad_discovery_policy": "workflow_opt_in",
             }),
         )
@@ -7025,6 +7157,7 @@ async fn test_invoke_agent_startup_error_marks_agent_execution_failed() {
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "startup-agent",
                 "provider": "missing-provider",
+                "session_reuse_scope": serde_json::Value::Null,
             }),
         )
         .await
@@ -7200,6 +7333,7 @@ sys.exit(0)
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "fixture-agent",
                 "provider": "claude",
+                "session_reuse_scope": serde_json::Value::Null,
             }),
         )
         .await
@@ -7355,6 +7489,7 @@ sys.exit(0)
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "fixture-agent",
                 "provider": "claude",
+                "session_reuse_scope": serde_json::Value::Null,
                 "declared_outputs": [{
                     "output_name": "review_alias",
                     "target_path": target_path.to_string_lossy(),
@@ -7407,38 +7542,39 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
         async fn open_session(
             &self,
             _req: &ExecutionRequest,
-        ) -> anyhow::Result<acp::AcpSessionHandle> {
+        ) -> anyhow::Result<acp::adapters::OpenedAcpAdapterSession> {
             anyhow::bail!("P057 fixture adapter does not provide reusable sessions")
         }
 
-        async fn execute(&self, _req: ExecutionRequest) -> anyhow::Result<ExecutionResult> {
+        async fn execute(&self, req: ExecutionRequest) -> anyhow::Result<ExecutionResult> {
             Ok(ExecutionResult {
                 agent_execution_id: AgentExecutionId::new(),
                 status: AgentStatus::Completed,
                 artifact_paths: Vec::new(),
                 discovered_artifacts: vec![acp::DiscoveredArtifact {
                     name: "prepush_review_report".into(),
-                    content: br#"{"status":"PASS_WITH_NOTES"}"#.to_vec(),
+                    content: br#"{"status":"pass"}"#.to_vec(),
                     source_path: None,
                 source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
                 }],
                 pre_prompt_expected_outputs: Vec::new(),
                 completion_text_capture: Default::default(),
                 transcript_text: Some(
-                    r#"<<<CHAINWORKS_OUTPUT:prepush_review_report>>>{"status":"PASS_WITH_NOTES"}<<<END_CHAINWORKS_OUTPUT>>>"#
+                    r#"<<<CHAINWORKS_OUTPUT:prepush_review_report>>>{"status":"pass"}<<<END_CHAINWORKS_OUTPUT>>>"#
                         .into(),
                 ),
                 cost_cents: None,
                 usage: None,
                 provider_session_id: Some("p057-fixture-session".into()),
                 reused_existing_session: false,
-                session_generation_id: None,
+                session_generation_id: req.session_generation_id,
                 mcp_observation: None,
                 actual_mcp_extensions: Vec::new(),
                 actual_mcp_runtime_ids: Vec::new(),
                 mcp_session_startup_latency_ms: None,
                 xcode_shim_warning_events: Vec::new(),
                 close_diagnostic: None,
+                provider_session_store_capture: None,
                 acp_pre_initialize_local_latency_ms: None,
                 acp_initialize_latency_ms: None,
                 acp_session_new_latency_ms: None,
@@ -7448,6 +7584,7 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                 acp_pre_prompt_metadata_digest_bytes: 0,
                 legacy_broad_discovery_snapshot: None,
                 runtime_receipt: None,
+                runtime_tool_path_preflight_json: None,
             })
         }
     }
@@ -7611,18 +7748,18 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
         async fn open_session(
             &self,
             _req: &ExecutionRequest,
-        ) -> anyhow::Result<acp::AcpSessionHandle> {
+        ) -> anyhow::Result<acp::adapters::OpenedAcpAdapterSession> {
             anyhow::bail!("P057 failed fixture adapter does not provide reusable sessions")
         }
 
-        async fn execute(&self, _req: ExecutionRequest) -> anyhow::Result<ExecutionResult> {
+        async fn execute(&self, req: ExecutionRequest) -> anyhow::Result<ExecutionResult> {
             Ok(ExecutionResult {
                 agent_execution_id: AgentExecutionId::new(),
                 status: AgentStatus::Failed,
                 artifact_paths: Vec::new(),
                 discovered_artifacts: vec![acp::DiscoveredArtifact {
                     name: "prepush_review_report".into(),
-                    content: br#"{"status":"PASS_WITH_NOTES"}"#.to_vec(),
+                    content: br#"{"status":"pass"}"#.to_vec(),
                     source_path: None,
                     source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
                 }],
@@ -7635,13 +7772,14 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                 usage: None,
                 provider_session_id: Some("p057-failed-fixture-session".into()),
                 reused_existing_session: false,
-                session_generation_id: None,
+                session_generation_id: req.session_generation_id,
                 mcp_observation: None,
                 actual_mcp_extensions: Vec::new(),
                 actual_mcp_runtime_ids: Vec::new(),
                 mcp_session_startup_latency_ms: None,
                 xcode_shim_warning_events: Vec::new(),
                 close_diagnostic: None,
+                provider_session_store_capture: None,
                 acp_pre_initialize_local_latency_ms: None,
                 acp_initialize_latency_ms: None,
                 acp_session_new_latency_ms: None,
@@ -7651,6 +7789,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                 acp_pre_prompt_metadata_digest_bytes: 0,
                 legacy_broad_discovery_snapshot: None,
                 runtime_receipt: None,
+                runtime_tool_path_preflight_json: None,
             })
         }
     }
@@ -7742,6 +7881,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "fixture-agent",
                 "provider": "failed_fixture",
+                "session_reuse_scope": serde_json::Value::Null,
                 "stage_degraded_output_policy": {
                     "mode": "allow_valid_contract_outputs",
                     "contracts": ["prepush_review_v1"],
@@ -8303,9 +8443,7 @@ async fn test_invoke_agent_reuses_live_session_generation_end_to_end() {
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("reuse.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_reuse_fixture.py");
@@ -8544,9 +8682,7 @@ async fn invoke_agent_repairs_missing_required_output_in_same_live_session() {
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("contract-repair.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let workspace_root = tmp.path().to_string_lossy().into_owned();
     let output_path = tmp
         .path()
@@ -8734,9 +8870,7 @@ async fn test_invoke_agent_persists_budget_snapshot_and_next_policy_uses_it() {
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("budget.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_budget_fixture.py");
@@ -8992,9 +9126,7 @@ async fn test_invoke_agent_persists_runtime_cost_and_next_policy_invalidates_on_
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("budget-cost.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_budget_cost_fixture.py");
@@ -9915,9 +10047,7 @@ async fn test_invoke_agent_missing_live_handle_falls_back_to_fresh_generation() 
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("missing-live-handle.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_missing_live_handle_fixture.py");
@@ -10190,6 +10320,7 @@ impl acp::adapters::AcpAdapter for ActivePromptCloseOnceAdapter {
             mcp_session_startup_latency_ms: None,
             xcode_shim_warning_events: Vec::new(),
             close_diagnostic: None,
+            provider_session_store_capture: None,
             acp_pre_initialize_local_latency_ms: None,
             acp_initialize_latency_ms: None,
             acp_session_new_latency_ms: None,
@@ -10199,6 +10330,7 @@ impl acp::adapters::AcpAdapter for ActivePromptCloseOnceAdapter {
             acp_pre_prompt_metadata_digest_bytes: 0,
             legacy_broad_discovery_snapshot: None,
             runtime_receipt: None,
+            runtime_tool_path_preflight_json: None,
         })
     }
 }
@@ -10388,9 +10520,7 @@ async fn proposal_088_code_writer_stale_implementation_active_enters_receipt_pat
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("p088-stale-implementation-active.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
         .await
         .expect("test shared DbWriter registration failed");
@@ -10549,9 +10679,7 @@ async fn proposal_088_startup_repair_recovers_receipt_artifact_without_db_row() 
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("p088-startup-recovery.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
         .await
         .expect("test shared DbWriter registration failed");
@@ -10594,6 +10722,17 @@ async fn proposal_088_startup_repair_recovers_receipt_artifact_without_db_row() 
         preexisting_dirty_path_count: 0,
         completion_status: "missing_required_outputs".into(),
         failure_class: None,
+        provider_runtime_family: Some("codex_acp".into()),
+        completion_boundary_subtype: Some("none".into()),
+        final_payload_status: Some("missing".into()),
+        progress_before_handoff: Some("none".into()),
+        runtime_preflight_phase: Some("ready".into()),
+        runtime_tool_path_preflight_json: None,
+        final_completion_payload_capture_json: None,
+        repair_materialization_summary_json: None,
+        repair_materialization_mode: Some("legacy_all_or_nothing".into()),
+        strict_final_payload_enabled: false,
+        staged_repair_settlement_enabled: false,
         terminal_response_status: Some("completed".into()),
         completion_turn_attempted: false,
         completion_turn_result: Some("not_attempted".into()),
@@ -10688,6 +10827,153 @@ async fn proposal_088_startup_repair_recovers_receipt_artifact_without_db_row() 
         recovered.receipt_artifact_path.as_deref(),
         Some(artifact_path.to_string_lossy().as_ref())
     );
+}
+
+#[tokio::test]
+async fn proposal_090_startup_repair_publishes_recovered_committed_active_pointer() {
+    use domain::code_writer_completion::{
+        CodeWriterCompletionReceiptRecord, CodeWriterOutputSettlementRow,
+    };
+    use sha2::{Digest, Sha256};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("p090-startup-recovery.sqlite");
+    let pool = file_backed_test_pool(&db_path).await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.artifact_root = tmp.path().to_string_lossy().into_owned();
+    runs::insert(&pool, &run).await.unwrap();
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.owner_agent = Some("code_writer".into());
+    stages::insert(&pool, &stage).await.unwrap();
+    let mut execution = make_agent_execution(stage_exec_id, AgentStatus::Failed);
+    execution.agent_id = "code_writer".into();
+    execution.provider = "junie".into();
+    execution.completed_at = Some(Utc::now());
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let canonical_path = tmp.path().join("tests_result.json");
+    let canonical_bytes = br#"{"status":"green"}"#;
+    std::fs::write(&canonical_path, canonical_bytes).unwrap();
+    let canonical_sha = format!("{:x}", Sha256::digest(canonical_bytes));
+    let receipt = CodeWriterCompletionReceiptRecord {
+        id: format!("{}:code_writer_completion_receipt_v1", execution.id),
+        run_id,
+        stage_execution_id: stage_exec_id,
+        agent_execution_id: execution.id,
+        session_generation_id: Some("session-generation-p090".into()),
+        original_runtime_receipt_id: Some(format!("{}:original:0", execution.id)),
+        completion_repair_runtime_receipt_id: Some(format!("{}:repair:1", execution.id)),
+        provider: "junie".into(),
+        model: Some("junie-default".into()),
+        completion_mode: Some("acp_final_text_chainworks_output".into()),
+        published_at: Some(Utc::now()),
+        activation_source: "declared_output_settlement_failed".into(),
+        ingestion_boundary_failure: None,
+        work_change_kind: Some("current_attempt_diff".into()),
+        pre_prompt_worktree_fingerprint_path: None,
+        post_prompt_worktree_fingerprint_path: None,
+        pre_prompt_worktree_fingerprint_sha256: None,
+        post_prompt_worktree_fingerprint_sha256: None,
+        current_attempt_changed_path_count: 1,
+        preexisting_dirty_path_count: 0,
+        completion_status: "complete".into(),
+        failure_class: None,
+        provider_runtime_family: Some("junie_acp".into()),
+        completion_boundary_subtype: Some("none".into()),
+        final_payload_status: Some("present".into()),
+        progress_before_handoff: Some("meaningful_progress".into()),
+        runtime_preflight_phase: Some("passed".into()),
+        runtime_tool_path_preflight_json: None,
+        final_completion_payload_capture_json: None,
+        repair_materialization_summary_json: None,
+        repair_materialization_mode: Some("staged_per_output".into()),
+        strict_final_payload_enabled: true,
+        staged_repair_settlement_enabled: true,
+        terminal_response_status: Some("completed".into()),
+        completion_turn_attempted: true,
+        completion_turn_result: Some("succeeded".into()),
+        completion_text_capture_count: 1,
+        completion_text_absence_count: 0,
+        completion_repair_text_status: Some("captured".into()),
+        completion_repair_raw_text_artifact_path: None,
+        completion_repair_redacted_text_artifact_path: None,
+        completion_repair_text_absence_reason: None,
+        fresh_required_output_count: 1,
+        stale_required_output_count: 0,
+        missing_required_output_count: 0,
+        control_plane_output_count: 0,
+        completion_repair_turn_count: 1,
+        generic_repair_turn_count: 0,
+        missing_outputs: vec![],
+        stale_outputs: vec![],
+        transcript_status: Some("captured".into()),
+        transcript_absence_reason: None,
+        receipt_artifact_path: None,
+        failed_stage_evidence_path: None,
+        created_at: Utc::now(),
+    };
+    let settlement_row = CodeWriterOutputSettlementRow {
+        id: format!("{}:tests_result", receipt.id),
+        receipt_id: receipt.id.clone(),
+        run_id,
+        stage_id: "implementation".into(),
+        stage_execution_id: stage_exec_id,
+        agent_execution_id: execution.id,
+        session_generation_id: Some("session-generation-p090".into()),
+        repair_attempt: 1,
+        output_name: "tests_result".into(),
+        contract_id: "tests_result_v1".into(),
+        source_kind: "completion_chainworks_output".into(),
+        source_generation_owner: "agent".into(),
+        candidate_digest: Some(canonical_sha.clone()),
+        staging_path: Some(
+            tmp.path()
+                .join("repair-staging/tests_result.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        canonical_path: canonical_path.to_string_lossy().into_owned(),
+        canonical_before_sha256: None,
+        canonical_after_sha256: None,
+        decision: "accepted".into(),
+        rejection_reason: None,
+        materialization_state: "staged".into(),
+        active_pointer_generation_id: Some("recovered-tests-generation".into()),
+        created_at: Utc::now(),
+        committed_at: None,
+    };
+    code_writer_completion_receipts::upsert_with_settlement_rows(
+        &pool,
+        &receipt,
+        &[],
+        &[],
+        &[settlement_row],
+    )
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new_with_db_writer(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+        Arc::new(db::writer::DbWriter::new(pool.clone())),
+    );
+    let summary = recovery.run_startup_repair().await.unwrap();
+    assert_eq!(summary.runs_repaired, 1);
+
+    let active_generation: String = sqlx::query_scalar(
+        "SELECT generation_id FROM active_artifact_contracts WHERE run_id = ?1 AND contract_id = 'tests_result_v1'",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("startup recovery must publish accepted active pointer");
+    assert_eq!(active_generation, "recovered-tests-generation");
 }
 
 #[cfg(unix)]
@@ -11635,7 +11921,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
     // Use real workflow + catalog so advance_run can compile the plan and
-    // detect state_11_manual_release as a manual_gate with post_approval_tasks.
+    // detect state_6_implementation_approval as a manual_gate with post_approval_tasks.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let wf_path = format!(
         "{}/../../../examples/workflows/full-mvp-live.yaml",
@@ -11645,18 +11931,21 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
     run.workflow_yaml_path = Some(wf_path);
     run.agent_catalog_yaml_path = Some(cat_path);
-    run.current_state = Some("state_11_manual_release".into());
+    run.current_state = Some("state_6_implementation_approval".into());
     runs::insert(&pool, &run).await.unwrap();
 
-    // Simulate a failed post-approval stage with a resolved approval record
+    // Simulate a failed manual approval stage with a resolved approval record
     // from the first (failed) attempt.
     let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Failed);
-    stage.stage_id = "state_11_manual_release".into();
+    stage.stage_id = "state_6_implementation_approval".into();
     stage.stage_type = Some("manual_gate".into());
     stages::insert(&pool, &stage).await.unwrap();
 
-    let mut first_approval =
-        make_approval(run_id, "state_11_manual_release", ApprovalDecision::Granted);
+    let mut first_approval = make_approval(
+        run_id,
+        "state_6_implementation_approval",
+        ApprovalDecision::Granted,
+    );
     first_approval.decided_at = Some(Utc::now());
     approvals::insert(&pool, &first_approval).await.unwrap();
 
@@ -11667,7 +11956,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
         .handle(
             Command::RetryStage(RetryStageCmd {
                 run_id,
-                stage_id: "state_11_manual_release".into(),
+                stage_id: "state_6_implementation_approval".into(),
                 consume_quota_budget_now: false,
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
@@ -11692,7 +11981,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
     let retried_stage = all_stages
         .iter()
-        .find(|s| s.stage_id == "state_11_manual_release" && s.attempt_number == 2)
+        .find(|s| s.stage_id == "state_6_implementation_approval" && s.attempt_number == 2)
         .expect("retry must create new stage with attempt_number=2")
         .clone();
     assert_eq!(
@@ -11729,7 +12018,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     let post_advance_stages = stages::list_by_run(&pool, run_id).await.unwrap();
     let attempts_for_state_11: Vec<_> = post_advance_stages
         .iter()
-        .filter(|s| s.stage_id == "state_11_manual_release")
+        .filter(|s| s.stage_id == "state_6_implementation_approval")
         .collect();
     assert_eq!(
         attempts_for_state_11.len(),
@@ -11748,7 +12037,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     let fresh_requests: Vec<_> = all_approvals
         .iter()
         .filter(|a| {
-            a.stage_id == "state_11_manual_release"
+            a.stage_id == "state_6_implementation_approval"
                 && a.decision == ApprovalDecision::Requested
                 && a.id != first_approval.id
         })
@@ -11774,7 +12063,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     assert_eq!(
         refreshed_run.status,
         RunStatus::WaitingApproval,
-        "run status must be WaitingApproval after retried release gate awaits fresh approval"
+        "run status must be WaitingApproval after retried manual gate awaits fresh approval"
     );
 }
 

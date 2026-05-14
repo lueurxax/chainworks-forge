@@ -20,6 +20,15 @@ use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+    db::writer::register_shared_writer(&pool, writer)
+        .await
+        .expect("test shared DbWriter registration failed");
+    pool
+}
+
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
     Run {
         id: run_id,
@@ -290,7 +299,7 @@ fn discovery_payload(
 
 #[tokio::test]
 async fn proposal_053_discovery_diagnostics_roundtrip_and_list_by_run() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, agent_execution_id) = seed_execution(&pool).await;
     let now = Utc::now();
     let mut payload = discovery_payload(
@@ -432,7 +441,7 @@ async fn proposal_053_discovery_diagnostics_roundtrip_and_list_by_run() {
 
 #[tokio::test]
 async fn proposal_053_discovery_diagnostics_readback_marks_reconciliation_pending() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_run_id, agent_execution_id) = seed_execution(&pool).await;
     let now = Utc::now();
     let payload = discovery_payload(
@@ -489,7 +498,7 @@ async fn proposal_053_discovery_diagnostics_readback_marks_reconciliation_pendin
 
 #[tokio::test]
 async fn proposal_053_discovery_diagnostics_legacy_override_binds_and_consumes_pending_retry() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     ideas::insert(
@@ -604,7 +613,7 @@ async fn proposal_053_discovery_diagnostics_legacy_override_binds_and_consumes_p
 #[tokio::test]
 async fn proposal_053_discovery_diagnostics_legacy_override_rejects_duplicate_and_started_retry_targets(
 ) {
-    let pool = create_pool(":memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     ideas::insert(

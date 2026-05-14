@@ -800,6 +800,7 @@ fn extract_agent_message_chunk(parsed: &Value) -> Option<String> {
     }
     update
         .get("content")
+        .or_else(|| update.pointer("/message/content"))
         .and_then(extract_text_from_value)
         .filter(|text| !strip_ansi(text).trim().is_empty())
 }
@@ -2380,6 +2381,7 @@ fn session_update_observation(parsed: &Value) -> (&'static str, bool, Option<Str
         .as_deref()
         .map(str::trim)
         .is_some_and(|chunk| !chunk.is_empty());
+    let provider_activity_marker = provider_activity_type_marker(&type_markers);
     let kind = if type_markers
         .iter()
         .any(|marker| marker == "tool_call_update")
@@ -2401,6 +2403,8 @@ fn session_update_observation(parsed: &Value) -> (&'static str, bool, Option<Str
         "plan"
     } else if has_text_progress {
         "text_chunk"
+    } else if provider_activity_marker.is_some() {
+        "provider_activity"
     } else {
         "other"
     };
@@ -2411,12 +2415,24 @@ fn session_update_observation(parsed: &Value) -> (&'static str, bool, Option<Str
             | "agent_message_chunk"
             | "agent_thought_chunk"
             | "plan"
+            | "provider_activity"
             | "text_chunk"
     );
-    let detail = (!type_markers.is_empty())
-        .then(|| type_markers.join(","))
+    let detail = provider_activity_marker
+        .map(str::to_string)
+        .or_else(|| (!type_markers.is_empty()).then(|| type_markers.join(",")))
         .or_else(|| has_text_progress.then(|| "text_progress".to_string()));
     (kind, meaningful_progress, detail)
+}
+
+fn provider_activity_type_marker(type_markers: &[String]) -> Option<&'static str> {
+    if type_markers.iter().any(|marker| marker == "read") {
+        Some("read")
+    } else if type_markers.iter().any(|marker| marker == "search") {
+        Some("search")
+    } else {
+        None
+    }
 }
 
 fn collect_nested_type_markers(value: &Value, markers: &mut Vec<String>) {
@@ -3412,9 +3428,33 @@ impl AcpTransportSession {
                             continue;
                         }
                         AcpPromptReadOutcome::PollElapsed => {
+                            let effective_last_activity =
+                                max_instant_option(last_acp_activity, last_provider_local_activity);
+                            let idle = effective_last_activity.elapsed();
+                            if idle >= IDLE_TIMEOUT {
+                                failure_phase = Some("idle_timeout".to_string());
+                                break Err(anyhow::anyhow!(
+                                    "ACP session idle timeout: idle_hang_before_first_progress; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s=none, provider_local_activity=unavailable)",
+                                    IDLE_TIMEOUT.as_secs(),
+                                    session_id,
+                                    last_acp_activity.elapsed().as_secs()
+                                ));
+                            }
+                            let effective_last_progress =
+                                max_instant_option(last_acp_progress, last_provider_local_progress);
+                            let progress_idle = effective_last_progress.elapsed();
+                            if progress_idle >= PROGRESS_TIMEOUT {
+                                failure_phase = Some("progress_timeout".to_string());
+                                break Err(anyhow::anyhow!(
+                                    "ACP session progress timeout: idle_hang_before_first_progress; no meaningful progress for {}s (session={})",
+                                    PROGRESS_TIMEOUT.as_secs(),
+                                    session_id
+                                ));
+                            }
                             failure_phase = Some("read_poll_elapsed_without_message".to_string());
                             break Err(anyhow::anyhow!(
-                                "ACP session idle timeout — no message received"
+                                "ACP session read poll elapsed before idle or progress deadline (session={})",
+                                session_id
                             ));
                         }
                     }
@@ -4526,6 +4566,42 @@ mod tests {
     }
 
     #[test]
+    fn proposal_090_provider_authored_failure_envelope_is_not_extracted_as_output() {
+        let expected_outputs = vec![ExpectedOutputSpec {
+            output_name: "implementation_progress".to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: "/tmp/run/implementation/progress.md".to_string(),
+            companion_of: None,
+            display_label: "Implementation progress".to_string(),
+            contract_id: Some("implementation_progress".to_string()),
+            required: true,
+            reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+            max_bytes: 1024,
+            aggregate_acceptance_cap_bytes: 4096,
+            authorized_roots: vec![domain::discovery::AuthorizedRoot {
+                root_class: domain::discovery::OutputRootClass::ChainworksMetaRoot,
+                root_path: "/tmp/run".to_string(),
+            }],
+            source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+        }];
+        let provider_claim = r#"{
+          "code_writer_engine_failure_v1": {
+            "provider": "junie",
+            "completion_boundary_subtype": "junie_progress_without_terminal_handoff",
+            "public_message": "provider-authored claim"
+          }
+        }"#;
+        let unknown_schema = r#"{
+          "CHAINWORKS_OUTPUT_V2": {
+            "implementation_progress": "not authoritative"
+          }
+        }"#;
+
+        assert!(extract_output_envelopes(provider_claim, &expected_outputs).is_empty());
+        assert!(extract_output_envelopes(unknown_schema, &expected_outputs).is_empty());
+    }
+
+    #[test]
     fn streamed_transcript_accumulation_is_capped_with_marker() {
         let mut transcript = "a".repeat(MAX_STREAMED_TRANSCRIPT_BYTES - 4);
         let mut truncated = false;
@@ -4582,6 +4658,55 @@ mod tests {
         let chunk = extract_text_chunk(&parsed).expect("final output text should be captured");
 
         assert!(chunk.contains("<<<CHAINWORKS_OUTPUT:implementation_progress>>>"));
+    }
+
+    #[test]
+    fn codex_read_and_search_updates_count_as_meaningful_provider_activity() {
+        let read_update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "codex-session",
+                "update": {
+                    "type": "read",
+                    "path": "Chainworks Forge/Support/PreviewSupport.swift"
+                }
+            }
+        });
+        let search_update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "codex-session",
+                "update": {
+                    "type": "search",
+                    "query": "proposal_implementation_auditor"
+                }
+            }
+        });
+        let unknown_update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "codex-session",
+                "update": {
+                    "type": "unknown"
+                }
+            }
+        });
+
+        assert_eq!(
+            session_update_observation(&read_update),
+            ("provider_activity", true, Some("read".to_string()))
+        );
+        assert_eq!(
+            session_update_observation(&search_update),
+            ("provider_activity", true, Some("search".to_string()))
+        );
+        assert_eq!(
+            session_update_observation(&unknown_update),
+            ("other", false, Some("unknown".to_string()))
+        );
     }
 
     #[test]

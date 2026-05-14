@@ -2225,6 +2225,8 @@ Available gates:
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
   proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
+  proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
+  proposal-091|p091  Proposal 091 targeted retry authority evidence inventory gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -6975,6 +6977,360 @@ validate_negative_fixtures()
 print("proposal-089 default evidence validation passed")
 PY
     log "Proposal 089 gate passed"
+    ;;
+  proposal-090|p090)
+    log "Proposal 090 gate: Junie runtime-hardening evidence inventory"
+    if [[ "${CHAINWORKS_PROPOSAL_090_LIVE:-0}" == "1" ]]; then
+      log "Proposal 090 live mode: running Junie refine-like code_writer canary"
+      rm -rf "$ROOT_DIR/.chainworks/tmp/p090-refine-like-canary-worktree" \
+        "$ROOT_DIR/docs/evidence/090/junie-runtime-hardening/refine-like-canary"
+      mkdir -p "$ROOT_DIR/.chainworks/tmp/p090-refine-like-canary-worktree" \
+        "$ROOT_DIR/docs/evidence/090/junie-runtime-hardening/refine-like-canary"
+      (
+        cd "$ROOT_DIR/control-plane"
+        CHAINWORKS_P090_STRICT_FINAL_PAYLOAD=1 \
+        CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE=1 \
+        CHAINWORKS_P090_STAGED_REPAIR_SETTLEMENT=1 \
+        P090_WORKTREE_ROOT="$ROOT_DIR/.chainworks/tmp/p090-refine-like-canary-worktree" \
+        P090_EVIDENCE_DIR="$ROOT_DIR/docs/evidence/090/junie-runtime-hardening/refine-like-canary" \
+        CARGO_TARGET_DIR=target/proposal-090-gate \
+        cargo run -p engine --example p090_junie_refine_like_live_canary
+      )
+      python3 - "$ROOT_DIR" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+index_path = root / "docs/evidence/090/junie-runtime-hardening/evidence-index.json"
+canary_root = root / "docs/evidence/090/junie-runtime-hardening/refine-like-canary"
+index = json.loads(index_path.read_text())
+live = index.setdefault("long_running_refine_like_canary", {})
+files = live.setdefault("files", {})
+for filename, record in files.items():
+    path = canary_root / filename
+    if not path.exists():
+        raise SystemExit(f"proposal-090 live refresh: missing {path.relative_to(root)}")
+    record["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    record["size_bytes"] = path.stat().st_size
+index_path.write_text(json.dumps(index, indent=2, sort_keys=False) + "\n")
+PY
+    fi
+    python3 - "$ROOT_DIR" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+index_path = root / "docs/evidence/090/junie-runtime-hardening/evidence-index.json"
+proposal_path = root / "docs/proposals/090-junie-code-writer-runtime-hardening-after-capability-proof.md"
+gates_doc = root / "docs/reference/test-gates.md"
+
+required_subtypes = {
+    "junie_final_response_missing",
+    "junie_final_response_truncated",
+    "junie_progress_without_terminal_handoff",
+    "junie_repair_returned_narrative",
+    "junie_repair_returned_malformed_json",
+    "junie_repair_outputs_partially_materialized",
+    "junie_runtime_tool_path_failure_before_publication",
+}
+required_negative_classes = {
+    "provider_authored_engine_failure_spoof_rejected",
+    "provider_envelope_identity_mismatch_rejected",
+    "unknown_provider_envelope_schema_rejected",
+    "malformed_repair_sibling_does_not_overwrite_canonical_truth",
+    "permission_denied_preflight_does_not_launch_provider",
+}
+
+def fail(message):
+    raise SystemExit(f"proposal-090: {message}")
+
+def load_json(path):
+    if not path.exists():
+        fail(f"missing {path.relative_to(root)}")
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {path.relative_to(root)}: {exc}")
+
+def sha256_file(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+index = load_json(index_path)
+if index.get("schema_version") != "p090_junie_runtime_hardening_evidence_index_v1":
+    fail("invalid evidence-index schema_version")
+if index.get("proposal_id") != "090":
+    fail("evidence-index proposal_id must be 090")
+if index.get("gate") != "./scripts/test-gate.sh proposal-090":
+    fail("evidence-index gate must name ./scripts/test-gate.sh proposal-090")
+
+live = index.get("long_running_refine_like_canary") or fail("missing long_running_refine_like_canary evidence")
+if live.get("status") != "passed":
+    fail("long_running_refine_like_canary.status must be passed")
+if live.get("execution_path") != "BackgroundExecutor.process_next_item":
+    fail("long_running_refine_like_canary must prove BackgroundExecutor.process_next_item")
+live_files = live.get("files") or {}
+if "harness-result.json" not in live_files:
+    fail("long_running_refine_like_canary must hash harness-result.json")
+for filename, record in live_files.items():
+    path = root / "docs/evidence/090/junie-runtime-hardening/refine-like-canary" / filename
+    if not path.exists():
+        fail(f"missing live canary file {path.relative_to(root)}")
+    if record.get("sha256") != sha256_file(path):
+        fail(f"live canary file hash mismatch for {filename}")
+    if record.get("size_bytes") != path.stat().st_size:
+        fail(f"live canary size mismatch for {filename}")
+canary = load_json(root / "docs/evidence/090/junie-runtime-hardening/refine-like-canary/harness-result.json")
+if canary.get("schema_version") != "p090_refine_like_live_canary_v1":
+    fail("invalid P090 live canary schema_version")
+if canary.get("status") != "passed":
+    fail("P090 live canary did not pass")
+receipt = ((canary.get("receipt") or {}).get("receipt") or {})
+if receipt.get("provider") != "junie" or receipt.get("provider_runtime_family") != "junie_acp":
+    fail("P090 live canary must use Junie ACP")
+if receipt.get("completion_status") != "complete":
+    fail("P090 live canary receipt must complete")
+if receipt.get("completion_boundary_subtype") != "none":
+    fail("P090 live canary must not produce a failure subtype")
+if receipt.get("runtime_preflight_phase") != "passed":
+    fail("P090 live canary preflight must pass")
+if receipt.get("strict_final_payload_enabled") is not True:
+    fail("P090 live canary must run with strict final payload enabled")
+preflight = json.loads(receipt.get("runtime_tool_path_preflight_json") or "{}")
+if preflight.get("provider_launched") is not True or preflight.get("enforcement_enabled") is not True:
+    fail("P090 live canary must enforce preflight before provider launch")
+if preflight.get("attempt_count") is None or not preflight.get("lifecycle_phases"):
+    fail("P090 live canary must persist preflight attempt count and lifecycle phases")
+coverage = canary.get("coverage") or {}
+if coverage.get("live_canary_scope") != "junie_hardened_happy_path":
+    fail("P090 live canary must explicitly declare its hardened happy-path scope")
+if coverage.get("staged_repair_exercised") is not False:
+    fail("P090 live canary must not imply staged repair coverage unless a repair turn ran")
+staged_proof = index.get("staged_repair_proof") or {}
+if staged_proof.get("proof_type") != "focused_runtime_and_startup_recovery_tests":
+    fail("P090 staged repair proof must be separated from the live happy-path canary")
+required_staged_tests = {
+    "executor::tests::proposal_090_repair_materializes_valid_outputs_without_overwriting_malformed_sibling",
+    "executor::tests::proposal_090_committed_repair_rows_publish_only_accepted_active_artifacts",
+    "integration::proposal_090_startup_repair_publishes_recovered_committed_active_pointer",
+}
+if not required_staged_tests.issubset(set(staged_proof.get("tests") or [])):
+    fail("P090 staged repair proof is missing focused normal/recovery tests")
+required_outputs = {"implementation_progress", "implementation_self_assessment", "tests_result"}
+output_files = {row.get("output_name"): row for row in canary.get("output_files") or []}
+missing_outputs = [name for name in required_outputs if not (output_files.get(name) or {}).get("exists")]
+if missing_outputs:
+    fail(f"P090 live canary missing output files: {missing_outputs}")
+decisions = {
+    row.get("output_name"): row
+    for row in (canary.get("receipt") or {}).get("output_decisions") or []
+}
+for name in required_outputs:
+    decision = decisions.get(name) or {}
+    if decision.get("validation_status") != "passed":
+        fail(f"P090 live canary output {name} did not validate")
+settlement_rows = {
+    row.get("output_name"): row
+    for row in (canary.get("receipt") or {}).get("settlement_rows") or []
+}
+for name in required_outputs:
+    row = settlement_rows.get(name) or {}
+    if row.get("decision") != "accepted" or row.get("materialization_state") != "committed":
+        fail(f"P090 live canary output {name} did not settle fresh")
+
+contract = index.get("public_subtype_contract") or {}
+if contract.get("scope") != "provider_neutral_wrapper":
+    fail("public subtype contract must be provider_neutral_wrapper")
+if contract.get("unknown_values_round_trip_raw") is not True:
+    fail("unknown subtype values must round-trip raw")
+
+coverage = index.get("subtype_coverage") or []
+seen = {row.get("subtype") for row in coverage}
+missing = required_subtypes - seen
+extra = seen - required_subtypes
+if missing or extra:
+    fail(f"subtype coverage mismatch; missing={sorted(missing)} extra={sorted(extra)}")
+
+for row in coverage:
+    subtype = row.get("subtype")
+    fixture_rel = row.get("fixture_path")
+    if row.get("evidence_source") not in {"historical", "synthetic"}:
+        fail(f"{subtype}: invalid evidence_source")
+    if not fixture_rel:
+        fail(f"{subtype}: missing fixture_path")
+    fixture_path = root / fixture_rel
+    fixture = load_json(fixture_path)
+    if row.get("fixture_sha256") != sha256_file(fixture_path):
+        fail(f"{subtype}: fixture_sha256 mismatch")
+    if fixture.get("schema_version") != "p090_subtype_fixture_v1":
+        fail(f"{subtype}: invalid fixture schema")
+    if fixture.get("subtype") != subtype:
+        fail(f"{subtype}: fixture subtype mismatch")
+    if fixture.get("status") != "accepted_for_proposal_readiness":
+        fail(f"{subtype}: fixture status must be accepted_for_proposal_readiness")
+    proves = set(fixture.get("proves") or [])
+    if "subtype_coverage" not in proves:
+        fail(f"{subtype}: fixture must prove subtype_coverage")
+
+negative_classes = set(index.get("required_negative_fixture_classes") or [])
+missing_negative = required_negative_classes - negative_classes
+if missing_negative:
+    fail(f"missing negative fixture classes: {sorted(missing_negative)}")
+negative_fixtures = index.get("negative_fixtures") or []
+seen_negative_fixtures = {row.get("fixture_class") for row in negative_fixtures}
+if seen_negative_fixtures != required_negative_classes:
+    fail(
+        "negative fixture coverage mismatch; "
+        f"missing={sorted(required_negative_classes - seen_negative_fixtures)} "
+        f"extra={sorted(seen_negative_fixtures - required_negative_classes)}"
+    )
+for row in negative_fixtures:
+    fixture_class = row.get("fixture_class")
+    fixture_rel = row.get("path")
+    if not fixture_rel:
+        fail(f"{fixture_class}: missing negative fixture path")
+    fixture_path = root / fixture_rel
+    fixture = load_json(fixture_path)
+    if row.get("sha256") != sha256_file(fixture_path):
+        fail(f"{fixture_class}: negative fixture sha256 mismatch")
+    if fixture.get("schema_version") != "p090_negative_fixture_v1":
+        fail(f"{fixture_class}: invalid negative fixture schema")
+    if fixture.get("fixture_class") != fixture_class:
+        fail(f"{fixture_class}: fixture_class mismatch")
+    if fixture.get("status") != "accepted_for_proposal_readiness":
+        fail(f"{fixture_class}: invalid negative fixture status")
+    expected = fixture.get("expected") or {}
+    if fixture_class == "malformed_repair_sibling_does_not_overwrite_canonical_truth":
+        if expected.get("malformed_sibling_materializes") is not False:
+            fail(f"{fixture_class}: malformed sibling must not materialize")
+        if expected.get("active_pointer_from_accepted_rows_only") is not True:
+            fail(f"{fixture_class}: active pointers must come from accepted rows")
+    elif expected.get("materializes_outputs") is not False:
+        fail(f"{fixture_class}: negative fixture must prove outputs are not materialized")
+
+proposal_text = proposal_path.read_text()
+required_terms = [
+    "engine-synthesized",
+    "provider_claim_rejected",
+    "provider-neutral subtype wrapper",
+    "code_writer_output_settlement_rows",
+    "runtime_preflight_phase",
+    "provider capacity accounting starts only after preflight passes",
+    "CHAINWORKS_P090_STRICT_FINAL_PAYLOAD",
+    "CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE",
+    "CHAINWORKS_P090_STAGED_REPAIR_SETTLEMENT",
+    "CHAINWORKS_P090_DISABLE_STAGED_REPAIR_SETTLEMENT",
+    "receipt_id TEXT NOT NULL REFERENCES code_writer_completion_receipts",
+    "./scripts/test-gate.sh proposal-090",
+]
+for term in required_terms:
+    if term not in proposal_text:
+        fail(f"proposal missing required term {term!r}")
+
+gates_text = gates_doc.read_text()
+for term in ["proposal-090", "p090", "Junie runtime-hardening evidence inventory"]:
+    if term not in gates_text:
+        fail(f"docs/reference/test-gates.md missing {term!r}")
+
+print("proposal-090 evidence inventory validation passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p db proposal_090_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p acp proposal_090_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p engine proposal_090_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p graphql-server --test proposal_088_code_writer_completion_readback -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p mcp-server --test proposal_088_code_writer_completion_readback -- --nocapture
+    )
+    log "Proposal 090 gate passed"
+    ;;
+  proposal-091|p091)
+    log "Proposal 091 gate: targeted retry authority evidence inventory"
+    python3 - "$ROOT_DIR" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+index_path = root / "docs/evidence/091/targeted-retry-authority/evidence-index.json"
+proposal_path = root / "docs/proposals/091-targeted-retry-stage-execution-authority.md"
+gates_doc = root / "docs/reference/test-gates.md"
+
+required_terms = {
+    "entry_kind = targeted_agent_retry",
+    "historical_orphan_recovery",
+    "terminal_reason = stale_retry_recovered",
+    "retry_stage_execution_authorities_one_active",
+    "Target-aware work-item repository semantics",
+    "retryAuthorityHistory",
+    "startup orphan repair must run before projection rebuild",
+    "stage terminal metadata and authority history must agree",
+    "advance_run_payload_missing_target_for_authority",
+    "./scripts/test-gate.sh proposal-091",
+}
+
+def fail(message):
+    raise SystemExit(f"proposal-091: {message}")
+
+def load_json(path):
+    if not path.exists():
+        fail(f"missing {path.relative_to(root)}")
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {path.relative_to(root)}: {exc}")
+
+def sha256_file(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+index = load_json(index_path)
+if index.get("schema_version") != "p091_targeted_retry_authority_evidence_index_v1":
+    fail("invalid evidence-index schema_version")
+if index.get("proposal_id") != "091":
+    fail("evidence-index proposal_id must be 091")
+if index.get("gate") != "./scripts/test-gate.sh proposal-091":
+    fail("evidence-index gate must name ./scripts/test-gate.sh proposal-091")
+
+fixtures = index.get("fixtures") or []
+if {fixture.get("fixture_id") for fixture in fixtures} != {"p086_orphaned_retry_readback"}:
+    fail("expected exactly the P086 orphaned retry readback fixture")
+for fixture_record in fixtures:
+    fixture_path = root / fixture_record.get("path", "")
+    fixture = load_json(fixture_path)
+    if fixture_record.get("sha256") != sha256_file(fixture_path):
+        fail(f"{fixture_record.get('fixture_id')}: fixture sha256 mismatch")
+    if fixture.get("schema_version") != "p091_orphaned_retry_readback_fixture.v1":
+        fail(f"{fixture_record.get('fixture_id')}: invalid fixture schema")
+    facts = fixture.get("facts") or {}
+    if facts.get("retry_status") != "pending":
+        fail("P086 fixture must preserve pending orphan status")
+    if facts.get("live_work_items_for_retry") != 0:
+        fail("P086 fixture must prove no live work items for retry")
+    if facts.get("active_agent_executions_for_retry") != 0:
+        fail("P086 fixture must prove no active agent executions for retry")
+
+proposal_text = proposal_path.read_text()
+for term in required_terms:
+    if term not in proposal_text:
+        fail(f"proposal missing required term {term!r}")
+
+index_terms = set(index.get("required_contract_terms") or [])
+missing_index_terms = required_terms - index_terms
+if missing_index_terms:
+    fail(f"evidence index missing required contract terms {sorted(missing_index_terms)}")
+
+gates_text = gates_doc.read_text()
+for term in ["proposal-091", "p091", "targeted retry authority evidence inventory"]:
+    if term not in gates_text:
+        fail(f"docs/reference/test-gates.md missing {term!r}")
+
+print("proposal-091 evidence inventory validation passed")
+PY
+    log "Proposal 091 gate passed"
     ;;
   proposal-085|p085)
     log "Proposal 085 gate: thin-client read-model parity and affordance contract"

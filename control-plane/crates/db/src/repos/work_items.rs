@@ -2033,11 +2033,22 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
-    #[tokio::test]
-    async fn invoke_agent_failure_enqueues_advance_run_for_fan_in() {
+    async fn test_pool() -> SqlitePool {
         let pool = crate::pool::create_pool("sqlite::memory:")
             .await
             .expect("in-memory pool");
+        crate::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(crate::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
+        pool
+    }
+
+    #[tokio::test]
+    async fn invoke_agent_failure_enqueues_advance_run_for_fan_in() {
+        let pool = test_pool().await;
         let run_id = RunId::new();
         let now = Utc::now();
         enqueue(
@@ -2094,9 +2105,7 @@ mod tests {
 
     #[tokio::test]
     async fn proposal_061_host_interruption_requeue_strips_preclaim_and_reschedules() {
-        let pool = crate::pool::create_pool("sqlite::memory:")
-            .await
-            .expect("in-memory pool");
+        let pool = test_pool().await;
         let run_id = RunId::new();
         let stage_execution_id = StageExecutionId::new();
         let now = Utc::now();
@@ -2158,9 +2167,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_requeue_strips_preclaim_so_retry_gets_new_execution() {
-        let pool = crate::pool::create_pool("sqlite::memory:")
-            .await
-            .expect("in-memory pool");
+        let pool = test_pool().await;
         let run_id = RunId::new();
         let stage_execution_id = StageExecutionId::new();
         let now = Utc::now();
@@ -2231,9 +2238,7 @@ mod tests {
 
     #[tokio::test]
     async fn proposal_061_host_interruption_requeue_ignores_other_stage_attempts() {
-        let pool = crate::pool::create_pool("sqlite::memory:")
-            .await
-            .expect("in-memory pool");
+        let pool = test_pool().await;
         let run_id = RunId::new();
         let stage_execution_id = StageExecutionId::new();
         let other_stage_execution_id = StageExecutionId::new();

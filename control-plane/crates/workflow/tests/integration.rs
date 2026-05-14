@@ -34,27 +34,65 @@ fn catalog_with_default_system_lead(catalog_yaml: &str) -> String {
     let catalog_map = catalog
         .as_mapping_mut()
         .expect("test catalog fixture should be a mapping");
-    catalog_map
+    let permission_profiles = catalog_map
         .entry(serde_yaml::Value::String("permission_profiles".to_string()))
-        .or_insert_with(|| {
-            serde_yaml::from_str("ORCH: {}")
-                .expect("default test permission profile fixture should parse")
-        });
-    catalog_map
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+    let permission_profiles = permission_profiles
+        .as_mapping_mut()
+        .expect("permission_profiles must be a mapping");
+    permission_profiles
+        .entry(serde_yaml::Value::String("ORCH".to_string()))
+        .or_insert_with(|| serde_yaml::from_str("{}").expect("ORCH profile fixture should parse"));
+
+    let contracts = catalog_map
         .entry(serde_yaml::Value::String("contracts".to_string()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+    let contracts = contracts
+        .as_mapping_mut()
+        .expect("contracts must be a mapping");
+    contracts
+        .entry(serde_yaml::Value::String(
+            "LeadResolutionContract".to_string(),
+        ))
         .or_insert_with(|| {
             serde_yaml::from_str(
                 r#"
-LeadResolutionContract:
-  format: json
-  required_fields:
-    - resolution_mode
-    - requires_operator_confirmation
-    - recommended_action
-    - rationale_summary
+format: json
+required_fields:
+  - resolution_mode
+  - requires_operator_confirmation
+  - recommended_action
+  - rationale_summary
 "#,
             )
             .expect("default test lead contract fixture should parse")
+        });
+    contracts
+        .entry(serde_yaml::Value::String("proposal_review_v1".to_string()))
+        .or_insert_with(|| {
+            serde_yaml::from_str(
+                r#"
+format: json
+required_fields:
+  - agent_id
+  - verdict
+"#,
+            )
+            .expect("default test output contract fixture should parse")
+        });
+    contracts
+        .entry(serde_yaml::Value::String(
+            "implementation_review_summary_v1".to_string(),
+        ))
+        .or_insert_with(|| {
+            serde_yaml::from_str(
+                r#"
+format: json
+required_fields:
+  - status
+"#,
+            )
+            .expect("default test implementation review contract fixture should parse")
         });
 
     if let Some(agents) = catalog
@@ -812,15 +850,15 @@ fn test_compile_full_mvp_live_plan() {
         "agent_selection_plan_v1"
     );
 
-    // Verify code_writer → claude
+    // Verify code_writer -> Junie ACP
     let s7 = &plan.states["state_7_implementation_started"];
     let cw_task = s7.tasks.iter().find(|t| t.agent.agent_id == "code_writer");
     assert!(cw_task.is_some(), "state_7 should have code_writer task");
-    assert_eq!(cw_task.unwrap().agent.provider, "claude");
+    assert_eq!(cw_task.unwrap().agent.provider, "junie");
     assert_eq!(
         cw_task.unwrap().agent.requested_mcp_server_ids,
-        vec!["xcode".to_string()],
-        "code_writer MCP intent comes from claude_builder_high backend_profile"
+        Vec::<String>::new(),
+        "code_writer MCP intent comes from junie_code_editor_acp backend_profile"
     );
 
     let proposal_writer = &plan.states["state_2_proposal_drafted"].owner;
@@ -921,14 +959,14 @@ fn implementation_review_transitions_use_aggregate_review_summary_not_self_asses
         assert!(
             release_transition
                 .condition
-                .contains("implementation_review_summary.status"),
-            "{workflow_name} must not route to manual release from self-assessment alone"
+                .contains("implementation_closeout_readiness_v1.decision"),
+            "{workflow_name} must route manual release through closeout readiness truth"
         );
         assert!(
-            !release_transition
+            release_transition
                 .condition
-                .contains("release_evidence_blocked"),
-            "{workflow_name} must route release_evidence_blocked back to implementation refinement"
+                .contains("enter_manual_release"),
+            "{workflow_name} manual release transition must require enter_manual_release"
         );
         assert!(
             !release_transition
@@ -945,14 +983,14 @@ fn implementation_review_transitions_use_aggregate_review_summary_not_self_asses
         assert!(
             refine_transition
                 .condition
-                .contains("implementation_review_summary.status"),
-            "{workflow_name} refine transition must consume aggregate review truth"
+                .contains("implementation_closeout_readiness_v1.decision"),
+            "{workflow_name} refine transition must consume closeout readiness truth"
         );
         assert!(
-            !refine_transition
+            refine_transition
                 .condition
-                .contains("release_evidence_blocked"),
-            "{workflow_name} refine transition must not exclude release_evidence_blocked"
+                .contains("return_to_code_refine"),
+            "{workflow_name} refine transition must require return_to_code_refine"
         );
         assert!(
             !refine_transition
@@ -1645,8 +1683,10 @@ workflow:
 
     let workflow_a_path = write_temp_fixture("workflow-a.yaml", workflow_a);
     let workflow_b_path = write_temp_fixture("workflow-b.yaml", workflow_b);
-    let catalog_a_path = write_temp_fixture("catalog-a.yaml", catalog_a);
-    let catalog_b_path = write_temp_fixture("catalog-b.yaml", catalog_b);
+    let catalog_a = catalog_with_default_system_lead(catalog_a);
+    let catalog_b = catalog_with_default_system_lead(catalog_b);
+    let catalog_a_path = write_temp_fixture("catalog-a.yaml", &catalog_a);
+    let catalog_b_path = write_temp_fixture("catalog-b.yaml", &catalog_b);
     let plan_a = compiler::compile(&workflow_a_path, &catalog_a_path).expect("plan a compiles");
     let plan_b = compiler::compile(&workflow_b_path, &catalog_b_path).expect("plan b compiles");
 
@@ -1754,20 +1794,28 @@ fn test_compile_n_phase_ordering() {
         "phase 3 task must be lead_orchestrator (aggregate)"
     );
 
-    // ── state_4_proposal_reviewed: parallel(0) → then(1) ──
+    // ── state_4_proposal_reviewed: system router + dynamic reviewer fanout + aggregate ──
     let s4 = &plan.states["state_4_proposal_reviewed"];
+    assert_eq!(
+        s4.system_task
+            .as_ref()
+            .expect("state_4 has proposal review router")
+            .task_type,
+        "proposal_review_router"
+    );
+    assert_eq!(
+        s4.dynamic_parallel
+            .as_ref()
+            .expect("state_4 dynamically materializes reviewers")
+            .selector_artifact,
+        "agent_selection_plan_v1"
+    );
     let s4_phase_0: Vec<_> = s4.tasks.iter().filter(|t| t.phase == 0).collect();
     assert_eq!(
         s4_phase_0.len(),
-        4,
-        "state_4 must have 4 parallel tasks at phase 0"
+        0,
+        "state_4 must not keep the legacy static reviewer quartet at phase 0"
     );
-    for t in &s4_phase_0 {
-        assert!(
-            t.parallel,
-            "phase 0 tasks in state_4 must be marked parallel"
-        );
-    }
 
     let s4_phase_1: Vec<_> = s4.tasks.iter().filter(|t| t.phase == 1).collect();
     assert_eq!(

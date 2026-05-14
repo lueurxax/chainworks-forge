@@ -2300,17 +2300,31 @@ mod tests {
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
-        create_pool("sqlite::memory:")
+        let pool = create_pool("sqlite::memory:")
             .await
-            .expect("in-memory pool failed")
+            .expect("in-memory pool failed");
+        db::writer::register_shared_writer(
+            &pool,
+            Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
+        pool
     }
 
     async fn p043_test_pool() -> sqlx::SqlitePool {
         let path =
             std::env::temp_dir().join(format!("chainworks-p043-{}.sqlite", uuid::Uuid::new_v4()));
-        create_pool(&format!("sqlite://{}", path.to_string_lossy()))
+        let pool = create_pool(&format!("sqlite://{}", path.to_string_lossy()))
             .await
-            .expect("P043 file-backed pool failed")
+            .expect("P043 file-backed pool failed");
+        db::writer::register_shared_writer(
+            &pool,
+            Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
+        pool
     }
 
     fn make_command_handler(pool: sqlx::SqlitePool) -> Arc<CommandHandler> {
@@ -5767,6 +5781,12 @@ mod tests {
             let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
                 .await
                 .expect("open P041 fixture DB");
+            db::writer::register_shared_writer(
+                &pool,
+                Arc::new(db::writer::DbWriter::new(pool.clone())),
+            )
+            .await
+            .expect("register P041 fixture shared writer");
             let schema = build_schema(
                 pool.clone(),
                 make_command_handler(pool.clone()),

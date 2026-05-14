@@ -8,6 +8,14 @@ use engine::lifecycle_reporter::LifecycleReporter;
 use engine::work_queue::WorkQueue;
 use graphql_server::schema::{build_schema, AppSchema};
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .unwrap();
+    pool
+}
+
 fn make_schema(pool: sqlx::SqlitePool) -> AppSchema {
     let events = event_bus::new_bus(16);
     let handler = Arc::new(CommandHandler::new(
@@ -78,7 +86,7 @@ async fn assert_observer_subscription_forbidden(schema: &AppSchema, subscription
 
 #[tokio::test]
 async fn proposal_031_idea_queries_require_operator_read() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let schema = make_schema(pool);
 
     assert_observer_forbidden(&schema, "{ ideas { id title body } }").await;
@@ -91,7 +99,7 @@ async fn proposal_031_idea_queries_require_operator_read() {
 
 #[tokio::test]
 async fn proposal_031_steward_queries_require_operator_read() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let schema = make_schema(pool);
 
     assert_observer_forbidden(&schema, "{ stewardAnalyses { id status } }").await;
@@ -114,7 +122,7 @@ async fn proposal_031_steward_queries_require_operator_read() {
 
 #[tokio::test]
 async fn proposal_031_stage_detail_queries_require_operator_read() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let schema = make_schema(pool);
     let stage_execution_id = "00000000-0000-0000-0000-000000000000";
 
@@ -139,7 +147,7 @@ async fn proposal_031_stage_detail_queries_require_operator_read() {
 
 #[tokio::test]
 async fn proposal_031_queries_require_principal() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let schema = make_schema(pool);
     let stage_execution_id = "00000000-0000-0000-0000-000000000000";
     let queries = [
@@ -169,7 +177,7 @@ async fn proposal_031_queries_require_principal() {
 
 #[tokio::test]
 async fn proposal_031_sensitive_subscriptions_require_operator_read() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let schema = make_schema(pool);
     let run_id = "00000000-0000-0000-0000-000000000000";
 

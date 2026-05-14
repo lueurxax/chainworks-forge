@@ -1,6 +1,6 @@
 {
   "acp_canary_status": "passed",
-  "audited_git_sha": "6089a7b85ca524849ace1b4367eabbf71e424dfc",
+  "audited_git_sha": "225bac4e47b135d92c4fe2de243dd13c4647be19",
   "command": "./scripts/test-gate.sh proposal-089",
   "completed_at": "2026-05-13T18:21:47.985986Z",
   "environment": {
@@ -22,8 +22,8 @@
   "proof_critical_files": [
     {
       "path": "scripts/test-gate.sh",
-      "sha256": "c531fc5de65352307629650dc1ea48f1d248c590ed019789e6c15130590a3cb1",
-      "size_bytes": 329735
+      "sha256": "204c3c1b9f0324a413860d2237f98eac4e969d3a94e741bcfc1d64e63e241b5c",
+      "size_bytes": 346872
     },
     {
       "path": "scripts/proposal-089-refresh-evidence.py",
@@ -32,13 +32,13 @@
     },
     {
       "path": "control-plane/crates/acp/src/adapters/junie.rs",
-      "sha256": "7e294ce50d43af05aef95b855475f7391c966f8802e216e23ebc234f255d9cfe",
-      "size_bytes": 8253
+      "sha256": "06d5491dc5b8fc72b76a81efd83af3d802555dc0c9d305bed20629a43afe867e",
+      "size_bytes": 18086
     },
     {
       "path": "control-plane/crates/acp/src/transport.rs",
-      "sha256": "62e5b2605ced582a9fed682f93f4164878894d5d246c5e8f2fb7650bf9dc1212",
-      "size_bytes": 187671
+      "sha256": "e74238fc59abd55e7198e83a00455a64ea9e761497baa4f10ff15996ad154cc5",
+      "size_bytes": 193279
     },
     {
       "path": "control-plane/crates/engine/examples/p089_acp_live_canary.rs",
@@ -47,8 +47,8 @@
     },
     {
       "path": "control-plane/crates/engine/src/executor.rs",
-      "sha256": "9133eda5f5b509cd324cc315284e72729803b7146b4a509c25e4b37d2532e5fc",
-      "size_bytes": 601389
+      "sha256": "33a8eec691102c155bd4009ebe83945cd94bd2f694fcf37ec885137c3183792f",
+      "size_bytes": 687155
     },
     {
       "path": "control-plane/crates/engine/src/worktree_fingerprint.rs",
@@ -61,7 +61,7 @@
       "size_bytes": 72649
     }
   ],
-  "recorded_at": "2026-05-13T18:22:10.806886+00:00",
+  "recorded_at": "2026-05-14T19:50:41.896532+00:00",
   "result": "passed",
   "schema_version": "p089_live_gate_run_v1",
   "started_at": "2026-05-13T18:20:55.322254Z",

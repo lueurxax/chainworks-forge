@@ -1765,7 +1765,7 @@ impl Orchestrator {
             artifact_root: run.artifact_root.clone(),
             code_writer_start_status: "blocked_before_code".to_string(),
             status: "blocked_before_code".to_string(),
-            missing_handoff_outputs: missing_artifacts,
+            missing_handoff_outputs: missing_artifacts.clone(),
             last_handoff_agent_execution_id: None,
             retryable_from: Some(format!("rollout_contract_preflight:{current_state_id}")),
             blocked_before_code_reason: Some("rollout_contract_preflight_hold".to_string()),
@@ -1773,6 +1773,17 @@ impl Orchestrator {
         };
         workflow_conflicts::upsert_implementation_handoff_status(&self.pool, &handoff_status)
             .await?;
+        if !missing_artifacts.is_empty() {
+            self.persist_implementation_handoff_unavailable_conflict(
+                run_id,
+                current_state_id,
+                stage,
+                &handoff_status.required_input_artifacts,
+                &missing_artifacts,
+                now,
+            )
+            .await?;
+        }
         stages::update_status(&self.pool, stage.id, StageStatus::Blocked).await?;
         if run.status != RunStatus::Blocked {
             runs::update_status(&self.pool, run_id, RunStatus::Blocked).await?;
@@ -4223,7 +4234,10 @@ impl Orchestrator {
         let status_requires_refine = matches!(
             status,
             db::repos::artifact_contracts::CanonicalContractField::Resolved(ref value)
-                if matches!(value.as_str(), Some("needs_code_fixes" | "invalid"))
+                if matches!(
+                    value.as_str(),
+                    Some("needs_code_fixes" | "invalid" | "release_evidence_blocked")
+                )
         );
         if !release_matched && !status_requires_refine {
             return Ok(());
@@ -8962,7 +8976,7 @@ permission_profiles:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn proposal_017_orchestrator_persists_no_match_workflow_conflict() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),
@@ -9116,7 +9130,7 @@ permission_profiles:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn proposal_017_orchestrator_records_non_blocking_advisory_rejection() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),
@@ -9499,7 +9513,7 @@ permission_profiles:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn proposal_017_orchestrator_persists_terminal_unverifiable_conflict_history() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),
@@ -9610,7 +9624,7 @@ permission_profiles:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn proposal_017_orchestrator_resolves_current_conflict_on_later_legal_transition() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),
@@ -9732,7 +9746,7 @@ permission_profiles:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn proposal_017_candidate_transition_evaluation_classifies_unknown_and_missing_inputs() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let events = crate::event_bus::new_bus(16);
         let orchestrator = Orchestrator::new(
             pool.clone(),

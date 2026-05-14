@@ -257,9 +257,16 @@ mod tests {
     use domain::run::{Run, RunStatus};
 
     async fn setup_test_db() -> SqlitePool {
-        crate::pool::create_pool("sqlite::memory:")
+        let pool = crate::pool::create_pool("sqlite::memory:")
             .await
-            .expect("in-memory pool failed")
+            .expect("in-memory pool failed");
+        crate::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(crate::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
+        pool
     }
 
     async fn insert_test_run(pool: &SqlitePool, closeout_readiness_mode: Option<&str>) -> String {

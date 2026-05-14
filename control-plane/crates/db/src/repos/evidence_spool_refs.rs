@@ -1093,6 +1093,17 @@ mod tests {
     use crate::pool::create_pool;
     use chrono::Utc;
 
+    async fn test_pool() -> sqlx::SqlitePool {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        crate::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(crate::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
+        pool
+    }
+
     // Valid 64-char lowercase hex sha256 checksum for test fixtures.
     // P075-SEC-MED-004: test fixtures use the correct format so that Rust-side
     // checksum format validation passes in all round-trip and idempotency tests.
@@ -1125,7 +1136,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_and_find_by_id() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let spool_ref = make_ref("evsp_001", "run-1", "evidence/runs/run-1/transcript.jsonl");
         insert(&pool, &spool_ref).await.unwrap();
         let found = find_by_id(&pool, "evsp_001").await.unwrap().unwrap();
@@ -1137,7 +1148,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_and_find_by_run_and_path() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let spool_ref = make_ref("evsp_002", "run-2", "evidence/runs/run-2/tool.jsonl");
         insert(&pool, &spool_ref).await.unwrap();
         let found = find_by_run_and_path(&pool, "run-2", "evidence/runs/run-2/tool.jsonl")
@@ -1149,7 +1160,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_idempotent_same_checksum() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let spool_ref = make_ref("evsp_003", "run-3", "evidence/runs/run-3/ts.jsonl");
         let inserted = insert_idempotent(&pool, &spool_ref).await.unwrap();
         assert!(inserted, "first insert should return true");
@@ -1162,7 +1173,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_idempotent_checksum_mismatch_is_error() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let spool_ref = make_ref("evsp_004", "run-4", "evidence/runs/run-4/ts.jsonl");
         insert(&pool, &spool_ref).await.unwrap();
 
@@ -1175,7 +1186,7 @@ mod tests {
 
     #[tokio::test]
     async fn unique_constraint_on_run_id_relative_path() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let a = make_ref("evsp_010", "run-10", "evidence/runs/run-10/ts.jsonl");
         insert(&pool, &a).await.unwrap();
         let mut b = a.clone();
@@ -1189,7 +1200,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraint_rejects_invalid_kind() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = sqlx::query(
             r#"INSERT INTO evidence_spool_refs
                (id, metadata_version, run_id, kind, relative_path, size_bytes,
@@ -1203,7 +1214,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraint_rejects_invalid_status() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = sqlx::query(
             r#"INSERT INTO evidence_spool_refs
                (id, metadata_version, run_id, kind, relative_path, size_bytes,
@@ -1220,7 +1231,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraint_rejects_negative_size() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = sqlx::query(
             r#"INSERT INTO evidence_spool_refs
                (id, metadata_version, run_id, kind, relative_path, size_bytes,
@@ -1237,7 +1248,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraint_rejects_empty_relative_path() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = sqlx::query(
             r#"INSERT INTO evidence_spool_refs
                (id, metadata_version, run_id, kind, relative_path, size_bytes,
@@ -1254,7 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraint_rejects_summary_json_too_large() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         // Build a summary_json exceeding 8192 bytes.
         let large_json = format!(r#"{{"data":"{}"}}"#, "x".repeat(8200));
         let result = sqlx::query(
@@ -1276,7 +1287,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_status_changes_value() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let spool_ref = make_ref("evsp_020", "run-20", "evidence/runs/run-20/ts.jsonl");
         insert(&pool, &spool_ref).await.unwrap();
         update_status(&pool, "evsp_020", EvidenceSpoolRefStatus::PendingDelete)
@@ -1288,7 +1299,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_by_run_id_returns_ordered_results() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let r1 = make_ref("evsp_030", "run-30", "evidence/runs/run-30/a.jsonl");
         let r2 = make_ref("evsp_031", "run-30", "evidence/runs/run-30/b.jsonl");
         let r3 = make_ref("evsp_032", "run-99", "evidence/runs/run-99/c.jsonl");
@@ -1548,7 +1559,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_rejects_oversized_id_before_db() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let mut r = make_ref(
             "evsp_test_db_id",
             "run-test",
@@ -1570,7 +1581,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_idempotent_concurrent_same_checksum_is_safe() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let r1 = make_ref(
             "evsp_conc_001",
             "run-conc",
@@ -1713,7 +1724,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraint_rejects_absolute_path_at_db_level() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = sqlx::query(
             r#"INSERT INTO evidence_spool_refs
                (id, metadata_version, run_id, kind, relative_path, size_bytes,
@@ -1730,7 +1741,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraint_rejects_traversal_at_db_level() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = sqlx::query(
             r#"INSERT INTO evidence_spool_refs
                (id, metadata_version, run_id, kind, relative_path, size_bytes,
@@ -1747,7 +1758,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraint_rejects_dotdot_segment_at_db_level() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = sqlx::query(
             r#"INSERT INTO evidence_spool_refs
                (id, metadata_version, run_id, kind, relative_path, size_bytes,
@@ -1764,7 +1775,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraint_rejects_dot_segment_at_db_level() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = sqlx::query(
             r#"INSERT INTO evidence_spool_refs
                (id, metadata_version, run_id, kind, relative_path, size_bytes,
@@ -1781,7 +1792,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraint_rejects_double_slash_at_db_level() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = sqlx::query(
             r#"INSERT INTO evidence_spool_refs
                (id, metadata_version, run_id, kind, relative_path, size_bytes,
@@ -1798,7 +1809,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraint_accepts_valid_relative_path_at_db_level() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = sqlx::query(
             r#"INSERT INTO evidence_spool_refs
                (id, metadata_version, run_id, kind, relative_path, size_bytes,
@@ -1815,7 +1826,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_constraint_rejects_oversized_run_id_at_db_level() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let long_id = "r".repeat(513);
         let result = sqlx::query(
             r#"INSERT INTO evidence_spool_refs
@@ -1835,7 +1846,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_idempotent_concurrent_checksum_mismatch_errors() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let r_base = make_ref(
             "evsp_conc_002",
             "run-conc2",
@@ -2425,7 +2436,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_by_run_and_path_rejects_backslash_path() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = find_by_run_and_path(&pool, "run-1", "foo\\bar\\baz.jsonl").await;
         assert!(
             result.is_err(),
@@ -2435,7 +2446,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_by_run_and_path_rejects_traversal_path() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = find_by_run_and_path(&pool, "run-1", "foo/../bar.jsonl").await;
         assert!(
             result.is_err(),
@@ -2445,7 +2456,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_by_run_and_path_accepts_valid_path_returns_none_when_absent() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = find_by_run_and_path(&pool, "run-1", "evidence/runs/run-1/ts.jsonl").await;
         assert!(result.is_ok(), "valid path must not fail validation");
         assert!(result.unwrap().is_none(), "absent row must return None");
@@ -2512,7 +2523,7 @@ mod tests {
         // Regression for P075-SEC-HIGH-001: insert must persist the re-serialized Map.
         // We use a valid summary_json (serde_json preserves key order within the parsed Map)
         // and verify the stored value round-trips as valid compact JSON.
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let mut r = make_ref("evsp_dup_001", "run-dup", "evidence/runs/run-dup/ts.jsonl");
         // Valid summary with multiple allowed fields.
         r.summary_json = Some(r#"{"line_count":42,"truncated":false}"#.to_string());
@@ -2537,7 +2548,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_idempotent_persists_canonical_not_raw_summary_json() {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let mut r = make_ref(
             "evsp_dup_002",
             "run-dup2",

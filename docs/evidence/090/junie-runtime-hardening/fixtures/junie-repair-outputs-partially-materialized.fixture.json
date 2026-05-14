@@ -1,0 +1,34 @@
+{
+  "schema_version": "p090_subtype_fixture_v1",
+  "subtype": "junie_repair_outputs_partially_materialized",
+  "fixture_type": "synthetic",
+  "status": "accepted_for_proposal_readiness",
+  "proves": [
+    "subtype_coverage",
+    "staged_per_output_settlement",
+    "malformed_sibling_does_not_overwrite_canonical_truth"
+  ],
+  "settlement_rows": [
+    {
+      "output_name": "implementation_progress",
+      "contract_id": "implementation_progress",
+      "decision": "accepted",
+      "materialization_state": "committed"
+    },
+    {
+      "output_name": "tests_result",
+      "contract_id": "tests_result",
+      "decision": "accepted",
+      "materialization_state": "committed"
+    },
+    {
+      "output_name": "implementation_self_assessment",
+      "contract_id": "implementation_self_assessment_v2",
+      "decision": "rejected",
+      "rejection_reason": "malformed_json",
+      "materialization_state": "not_materialized",
+      "canonical_path_unchanged": true
+    }
+  ],
+  "expected_gate_behavior": "implementation_gate_must_prove_accepted_rows_drive_active_artifact_pointers"
+}

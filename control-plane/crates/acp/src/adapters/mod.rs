@@ -17,11 +17,42 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
-use crate::session::AcpSessionHandle;
+use crate::session::{
+    AcpSessionCloseBehavior, AcpSessionHandle, ProviderSessionStoreArchiveContext,
+};
 use crate::transport::AcpSessionConfig;
 #[cfg(unix)]
 use crate::{current_process_uid, inspect_xcode_shim_process_binding};
 use crate::{ExecutionRequest, ExecutionResult, XcodeShimGrantRecord, XcodeShimGrantStore};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupPathPolicy {
+    DeleteRecursively,
+    StageCodexSessionStore,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupPathSpec {
+    pub path: PathBuf,
+    pub policy: CleanupPathPolicy,
+}
+
+impl CleanupPathSpec {
+    pub fn delete(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            policy: CleanupPathPolicy::DeleteRecursively,
+        }
+    }
+
+    pub fn stage_codex_session_store(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            policy: CleanupPathPolicy::StageCodexSessionStore,
+        }
+    }
+}
 
 /// Process launch details prepared independently from `session/new` params.
 #[derive(Clone)]
@@ -29,7 +60,9 @@ pub struct AcpLaunchSpec {
     pub binary_path: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
-    pub cleanup_paths: Vec<PathBuf>,
+    pub cleanup_paths: Vec<CleanupPathSpec>,
+    pub current_dir_override: Option<PathBuf>,
+    pub runtime_tool_path_preflight_json: Option<String>,
     pub xcode_shim_runtime: Option<XcodeShimLaunchRuntime>,
     expected_capability_fingerprint: Option<CapabilitySliceFingerprint>,
 }
@@ -41,6 +74,11 @@ impl std::fmt::Debug for AcpLaunchSpec {
             .field("args", &self.args)
             .field("env", &self.env)
             .field("cleanup_paths", &self.cleanup_paths)
+            .field("current_dir_override", &self.current_dir_override)
+            .field(
+                "runtime_tool_path_preflight_json",
+                &self.runtime_tool_path_preflight_json,
+            )
             .field("xcode_shim_runtime", &self.xcode_shim_runtime)
             .field(
                 "expected_capability_fingerprint",
@@ -105,6 +143,8 @@ impl AcpLaunchSpec {
             args: Vec::new(),
             env: vec![("PATH".to_string(), default_provider_path_value())],
             cleanup_paths: Vec::new(),
+            current_dir_override: None,
+            runtime_tool_path_preflight_json: None,
             xcode_shim_runtime: None,
             expected_capability_fingerprint: None,
         }
@@ -626,16 +666,20 @@ impl AcpSessionNewSpec {
 /// a live session cleanup plan.
 #[derive(Debug, Default)]
 pub struct LaunchResourceGuard {
-    cleanup_paths: Vec<PathBuf>,
+    cleanup_paths: Vec<CleanupPathSpec>,
     committed: bool,
 }
 
 impl LaunchResourceGuard {
     pub fn add_cleanup_path(&mut self, path: impl Into<PathBuf>) {
-        self.cleanup_paths.push(path.into());
+        self.cleanup_paths.push(CleanupPathSpec::delete(path));
     }
 
-    pub fn commit(mut self) -> Vec<PathBuf> {
+    pub fn add_cleanup_spec(&mut self, spec: CleanupPathSpec) {
+        self.cleanup_paths.push(spec);
+    }
+
+    pub fn commit(mut self) -> Vec<CleanupPathSpec> {
         self.committed = true;
         std::mem::take(&mut self.cleanup_paths)
     }
@@ -646,14 +690,21 @@ impl Drop for LaunchResourceGuard {
         if self.committed {
             return;
         }
-        for path in self.cleanup_paths.drain(..) {
-            cleanup_path(&path);
+        for spec in self.cleanup_paths.drain(..) {
+            cleanup_path(&spec.path);
         }
     }
 }
 
 fn cleanup_path(path: &Path) {
     let _ = std::fs::remove_dir_all(path);
+}
+
+/// Opened session plus launch-time diagnostics that need to be copied onto the
+/// prompt result for durable engine readback.
+pub struct OpenedAcpAdapterSession {
+    pub session: AcpSessionHandle,
+    pub runtime_tool_path_preflight_json: Option<String>,
 }
 
 /// Common interface for all ACP provider adapters.
@@ -779,17 +830,31 @@ pub trait AcpAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Provider-specific no-launch checks that must pass before the ACP
+    /// subprocess is spawned.
+    fn preflight_launch(
+        &self,
+        _req: &ExecutionRequest,
+        _launch_spec: &mut AcpLaunchSpec,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Open a session from precomputed launch and session specs.
     async fn open_session_with_specs(
         &self,
         req: &ExecutionRequest,
         mut launch_spec: AcpLaunchSpec,
         session_new_spec: AcpSessionNewSpec,
-    ) -> Result<AcpSessionHandle> {
+    ) -> Result<OpenedAcpAdapterSession> {
         let mut command = Command::new(&launch_spec.binary_path);
         launch_spec.apply_chainworks_meta_root_env(req);
         ensure_chainworks_meta_root_launch_dir(req)?;
-        let execution_root = provider_execution_root(req);
+        self.preflight_launch(req, &mut launch_spec)?;
+        let execution_root = launch_spec
+            .current_dir_override
+            .clone()
+            .unwrap_or_else(|| provider_execution_root(req));
         ensure_provider_execution_root(&execution_root)?;
         launch_spec.verify_capability_fingerprint()?;
         command
@@ -816,8 +881,8 @@ pub trait AcpAdapter: Send + Sync {
         let child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
-                for path in launch_spec.cleanup_paths.drain(..) {
-                    cleanup_path(&path);
+                for spec in launch_spec.cleanup_paths.drain(..) {
+                    cleanup_path(&spec.path);
                 }
                 return Err(err).with_context(|| spawn_context);
             }
@@ -825,8 +890,8 @@ pub trait AcpAdapter: Send + Sync {
         let xcode_shim_grant = match launch_spec.register_xcode_shim_grant_for_child(&child) {
             Ok(grant) => grant,
             Err(err) => {
-                for path in launch_spec.cleanup_paths.drain(..) {
-                    cleanup_path(&path);
+                for spec in launch_spec.cleanup_paths.drain(..) {
+                    cleanup_path(&spec.path);
                 }
                 return Err(err);
             }
@@ -841,11 +906,14 @@ pub trait AcpAdapter: Send + Sync {
             xcode_shim_grant.into_iter().collect(),
         )
         .await?;
-        Ok(AcpSessionHandle::new(session))
+        Ok(OpenedAcpAdapterSession {
+            session: AcpSessionHandle::new(session),
+            runtime_tool_path_preflight_json: launch_spec.runtime_tool_path_preflight_json,
+        })
     }
 
     /// Open a live transport-backed ACP session.
-    async fn open_session(&self, req: &ExecutionRequest) -> Result<AcpSessionHandle> {
+    async fn open_session(&self, req: &ExecutionRequest) -> Result<OpenedAcpAdapterSession> {
         let capability_cache = ProviderCapabilityCache::default();
         self.open_session_with_capability_cache(req, &capability_cache)
             .await
@@ -857,7 +925,7 @@ pub trait AcpAdapter: Send + Sync {
         &self,
         req: &ExecutionRequest,
         capability_cache: &ProviderCapabilityCache,
-    ) -> Result<AcpSessionHandle> {
+    ) -> Result<OpenedAcpAdapterSession> {
         let mut resources = LaunchResourceGuard::default();
         let mut launch_spec = self.prepare_launch_spec(req, &mut resources)?;
         launch_spec.apply_chainworks_meta_root_env(req);
@@ -873,17 +941,60 @@ pub trait AcpAdapter: Send + Sync {
 
     /// Execute an agent session and return the result.
     async fn execute(&self, req: ExecutionRequest) -> Result<ExecutionResult> {
-        let session = self.open_session(&req).await?;
+        let opened = self.open_session(&req).await?;
+        let session = opened.session;
         let mut result = match session.prompt(&req).await {
             Ok(result) => result,
             Err(err) => {
-                let _ = session.close().await;
+                let _ = session
+                    .close_with_behavior(AcpSessionCloseBehavior::ArchiveFailure(
+                        archive_context_for_failed_request(&req, "acp_prompt_error"),
+                    ))
+                    .await;
                 return Err(err);
             }
         };
-        session.close().await?;
+        let close_outcome = session
+            .close_with_behavior(AcpSessionCloseBehavior::StageForOutcome)
+            .await?;
+        result.close_diagnostic = close_outcome.diagnostic;
+        result.provider_session_store_capture = close_outcome.provider_session_store_capture;
         result.session_generation_id = None;
+        result.runtime_tool_path_preflight_json =
+            mark_runtime_tool_path_preflight_provider_launched(
+                opened.runtime_tool_path_preflight_json,
+            );
         Ok(result)
+    }
+}
+
+pub(crate) fn mark_runtime_tool_path_preflight_provider_launched(
+    json: Option<String>,
+) -> Option<String> {
+    json.map(|json| {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json) else {
+            return json;
+        };
+        if let Some(object) = value.as_object_mut() {
+            object.insert("provider_launched".to_string(), serde_json::json!(true));
+        }
+        serde_json::to_string(&value).unwrap_or(json)
+    })
+}
+
+fn archive_context_for_failed_request(
+    req: &ExecutionRequest,
+    failure_kind: &str,
+) -> ProviderSessionStoreArchiveContext {
+    ProviderSessionStoreArchiveContext {
+        provider: req.provider.clone(),
+        run_id: req.run_id.to_string(),
+        stage_id: req.stage_id.clone(),
+        agent_id: req.agent_id.clone(),
+        agent_execution_id: req.agent_execution_id.as_ref().map(ToString::to_string),
+        session_generation_id: req.session_generation_id.clone(),
+        provider_session_id: req.provider_session_id.clone(),
+        failure_kind: failure_kind.to_string(),
     }
 }
 

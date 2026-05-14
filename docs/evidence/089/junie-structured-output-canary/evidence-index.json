@@ -19,7 +19,7 @@
         "size_bytes": 1972
       },
       "preflight.json": {
-        "sha256": "173ccca6bc1b4e20da42545cdbacc005e08ec921a370c3d15a563d9a1a4f714c",
+        "sha256": "7ccaa9588553ffd97f3b44717b3e74c85b08d21f1a674fb3bbd3ab7c090c7b0f",
         "size_bytes": 557
       },
       "receipt.json": {
@@ -51,11 +51,11 @@
     "status": "passed"
   },
   "acp_canary_status": "passed",
-  "audited_git_sha": "6089a7b85ca524849ace1b4367eabbf71e424dfc",
+  "audited_git_sha": "225bac4e47b135d92c4fe2de243dd13c4647be19",
   "live_gate_run": {
     "path": "docs/evidence/089/junie-structured-output-canary/live-gate-run.json",
-    "sha256": "5bd6f85a614483cc3f734e512646ad19b2f43ba42d4280424140f12125e1494e",
-    "size_bytes": 2411
+    "sha256": "168ca0c8c351e1fd73981954b3a925014d69e44b78e4a1a10d193d789cd479d0",
+    "size_bytes": 2412
   },
   "native_experiments": [
     {
@@ -187,8 +187,8 @@
   "proof_critical_files": [
     {
       "path": "scripts/test-gate.sh",
-      "sha256": "c531fc5de65352307629650dc1ea48f1d248c590ed019789e6c15130590a3cb1",
-      "size_bytes": 329735
+      "sha256": "204c3c1b9f0324a413860d2237f98eac4e969d3a94e741bcfc1d64e63e241b5c",
+      "size_bytes": 346872
     },
     {
       "path": "scripts/proposal-089-refresh-evidence.py",
@@ -197,13 +197,13 @@
     },
     {
       "path": "control-plane/crates/acp/src/adapters/junie.rs",
-      "sha256": "7e294ce50d43af05aef95b855475f7391c966f8802e216e23ebc234f255d9cfe",
-      "size_bytes": 8253
+      "sha256": "06d5491dc5b8fc72b76a81efd83af3d802555dc0c9d305bed20629a43afe867e",
+      "size_bytes": 18086
     },
     {
       "path": "control-plane/crates/acp/src/transport.rs",
-      "sha256": "62e5b2605ced582a9fed682f93f4164878894d5d246c5e8f2fb7650bf9dc1212",
-      "size_bytes": 187671
+      "sha256": "e74238fc59abd55e7198e83a00455a64ea9e761497baa4f10ff15996ad154cc5",
+      "size_bytes": 193279
     },
     {
       "path": "control-plane/crates/engine/examples/p089_acp_live_canary.rs",
@@ -212,8 +212,8 @@
     },
     {
       "path": "control-plane/crates/engine/src/executor.rs",
-      "sha256": "9133eda5f5b509cd324cc315284e72729803b7146b4a509c25e4b37d2532e5fc",
-      "size_bytes": 601389
+      "sha256": "33a8eec691102c155bd4009ebe83945cd94bd2f694fcf37ec885137c3183792f",
+      "size_bytes": 687155
     },
     {
       "path": "control-plane/crates/engine/src/worktree_fingerprint.rs",
@@ -226,6 +226,6 @@
       "size_bytes": 72649
     }
   ],
-  "recorded_at": "2026-05-13T18:22:10.808666+00:00",
+  "recorded_at": "2026-05-14T19:50:41.901467+00:00",
   "schema_version": "p089_evidence_index_v1"
 }
