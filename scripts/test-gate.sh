@@ -1425,6 +1425,51 @@ if violations:
 PY
 }
 
+guard_xcode_cargo_cache_policy() {
+  log "Guard: Xcode Rust builds use shared Cargo cache policy"
+  python3 - "$ROOT_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+helper = root / "scripts" / "cargo-cache-env.sh"
+embed = root / "scripts" / "embed-control-plane-daemon.sh"
+violations = []
+
+if not helper.exists():
+    violations.append("missing scripts/cargo-cache-env.sh")
+else:
+    helper_text = helper.read_text(encoding="utf-8")
+    required_helper_fragments = [
+        "Library/Caches/Chainworks Forge/cargo-target",
+        "CHAINWORKS_XCODE_CARGO_TARGET_DIR",
+        "CHAINWORKS_SHARED_CARGO_TARGET_DIR",
+        "RUSTC_WRAPPER",
+        "sccache",
+    ]
+    for fragment in required_helper_fragments:
+        if fragment not in helper_text:
+            violations.append(f"cargo-cache-env.sh missing {fragment!r}")
+
+if not embed.exists():
+    violations.append("missing scripts/embed-control-plane-daemon.sh")
+else:
+    embed_text = embed.read_text(encoding="utf-8")
+    if 'source "${SRCROOT}/scripts/cargo-cache-env.sh"' not in embed_text:
+        violations.append("embed-control-plane-daemon.sh does not source cargo-cache-env.sh")
+    if "${TARGET_TEMP_DIR}/cargo-target" in embed_text:
+        violations.append("embed-control-plane-daemon.sh still defaults Cargo target to TARGET_TEMP_DIR")
+    if "${CARGO_TARGET_DIR}/${PROFILE_DIR}/control-plane" not in embed_text:
+        violations.append("embed-control-plane-daemon.sh does not copy from CARGO_TARGET_DIR profile output")
+
+if violations:
+    print("Xcode Cargo cache policy violations:", file=sys.stderr)
+    for violation in violations:
+        print(f"  {violation}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 guard_portability_paths() {
   log "Guard: portability-sensitive sources avoid hardcoded user paths"
   python3 - "$ROOT_DIR/Chainworks Forge" "$ROOT_DIR/Chainworks ForgeTests" <<'PY'
@@ -2261,6 +2306,7 @@ case "$GATE" in
       log "No prior Chainworks Forge crash logs found"
     fi
     guard_direct_run_insertion
+    guard_xcode_cargo_cache_policy
     guard_plan_tag_sync
     ;;
   build)

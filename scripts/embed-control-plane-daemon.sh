@@ -7,7 +7,7 @@
 # the same Developer-ID + notarization pass as the app itself.
 #
 # Behavior:
-#   1. Build `control-plane/target/${profile}/control-plane` via cargo.
+#   1. Build `${CARGO_TARGET_DIR}/${profile}/control-plane` via cargo.
 #      Profile follows Xcode's CONFIGURATION: Debug → dev profile,
 #      everything else → release.
 #   2. Copy the resulting binary to
@@ -92,18 +92,24 @@ if [ "${#PREBUILT_CANDIDATES[@]}" -gt 0 ]; then
     done
 fi
 
-# Cargo locks its `target/` directory, so a concurrent `cargo test`
-# from the terminal or test-gate.sh blocks this build phase. Redirect
-# Xcode's cargo output into DerivedData so the two never contend.
-# Trade-off: a Clean Build re-downloads/compiles from scratch (cache
-# lives outside the repo). That's the right choice for an Xcode-owned
-# build step — terminal cargo stays fast with its own cache.
-#
-# Proposal gates that intentionally compose an Xcode build with Rust
-# control-plane checks may opt into a pre-warmed target directory to
-# avoid recompiling the daemon from scratch inside a prerequisite gate.
-export CARGO_TARGET_DIR="${CHAINWORKS_XCODE_CARGO_TARGET_DIR:-${TARGET_TEMP_DIR}/cargo-target}"
-mkdir -p "${CARGO_TARGET_DIR}"
+# Xcode build phases do NOT inherit the user's shell profile, so Cargo
+# and optional wrappers installed by rustup/homebrew may be absent from
+# PATH. Add standard locations before applying the cache helper so it can
+# discover `sccache` when present.
+for candidate in "$HOME/.cargo/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
+    if [ -d "$candidate" ]; then
+        PATH="$candidate:$PATH"
+    fi
+done
+export PATH
+
+# Keep Xcode-triggered Rust builds in a stable cache instead of
+# DerivedData/TARGET_TEMP_DIR so Swift test runs do not rebuild Rust
+# dependencies from scratch. The helper also enables sccache when it is
+# installed. CHAINWORKS_XCODE_CARGO_TARGET_DIR remains the explicit
+# override for CI/proposal gates that want a different pre-warmed target.
+# shellcheck source=scripts/cargo-cache-env.sh
+source "${SRCROOT}/scripts/cargo-cache-env.sh"
 
 # R12 OPS-001 / REQ-008: the daemon reads its build SHA via
 # `option_env!("GIT_SHA")`, which is resolved at *Rust compile time*.
@@ -127,16 +133,6 @@ echo "                           GIT_SHA=${GIT_SHA}"
 if [ -n "${SOURCE_BIN}" ]; then
     echo "embed-control-plane-daemon: using prebuilt daemon ${SOURCE_BIN}"
 else
-    # Xcode build phases do NOT inherit the user's shell profile, so `cargo`
-    # (installed by rustup into `~/.cargo/bin/`) is not on PATH by default.
-    # Add the standard rustup paths if they exist before anything else.
-    for candidate in "$HOME/.cargo/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
-        if [ -d "$candidate" ]; then
-            PATH="$candidate:$PATH"
-        fi
-    done
-    export PATH
-
     if ! command -v cargo >/dev/null 2>&1; then
         echo "error: cargo not found on PATH ($PATH)" >&2
         echo "       no prebuilt daemon was found in:" >&2
