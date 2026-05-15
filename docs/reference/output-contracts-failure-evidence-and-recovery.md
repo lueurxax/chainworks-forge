@@ -19,6 +19,7 @@ This reference covers:
 - the structured-output envelope and contract-validation substrate used by the Rust control plane,
 - catalog-backed output-contract authority,
 - strict proposal-review and aggregate summary contract enforcement,
+- Junie `code_writer` completion-boundary subtypes, engine-owned failure envelopes, and staged repair settlement,
 - canonical validation-failure and failed-stage evidence,
 - same-run retry lineage and artifact namespace rules,
 - narrow recovery and report/export evidence references,
@@ -53,6 +54,15 @@ Agent-authored required outputs should enter the system through the final `CHAIN
 
 The executor then binds those payloads to the compiled output declarations, validates them against `AgentCatalog.contracts`, and materializes canonical artifact files. Exact-path filesystem outputs and legacy block envelopes remain accepted as compatibility evidence, but they do not create a second contract authority and do not bypass validation.
 
+The retained `proposal-089|p089` gate is the focused Junie proof for this
+materialization path. It validates that the production `code_writer` Junie ACP
+binding can return the agent-authored output set through `CHAINWORKS_OUTPUT`
+without completion repair, while the executor generates
+`changed_files_manifest` as control-plane evidence and settles all declared
+outputs through the normal discovery-decision materialization functions. That
+gate is provider-specific proof, not a broader replacement for this contract or
+for the P088 completion-repair boundary.
+
 ### Missing outputs get one same-session repair turn
 
 When an agent turn finishes without required outputs, the runtime must try one narrow repair turn in the same live ACP session before it invalidates that session or blocks the run for `missing_required_outputs`.
@@ -81,6 +91,89 @@ the next normal retry should still follow the `code_writer` implementation famil
 [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md#family-reuse-is-opt-in-only).
 
 `AcpRuntimeManager` therefore keeps a requested live session alive after both `completed` and `failed` prompt statuses. A failed prompt is preserved only so the executor can make this bounded repair attempt; normal cross-invocation reuse still follows the session-lineage policy in [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md).
+
+### Junie code-writer completion boundary
+
+Junie `code_writer` uses the same structured-output substrate as other
+providers, with additional runtime facts for long-running ACP attempts. A
+`code_writer` attempt with required outputs has one authoritative terminal
+completion shape:
+
+- a valid final `CHAINWORKS_OUTPUT` payload;
+- an engine-synthesized `code_writer_engine_failure.v1` receipt section;
+- an engine-synthesized `code_writer_repair_failure.v1` receipt section; or
+- an explicit narrative, missing, truncated, repair, or runtime subtype in
+  `completion_boundary_subtype`.
+
+Free-form final prose is not ordinary success for this path. Provider-authored
+JSON that looks like a failure envelope is untrusted input. It can be diagnostic
+extraction text, but persisted failure-envelope truth is synthesized from
+engine-owned runtime facts, execution/session identity, preflight facts,
+settlement decisions, and repair validation. Provider failure claims that spoof
+engine-owned envelopes are read back as `provider_claim_rejected` and must not
+materialize outputs.
+
+The public subtype field is a provider-neutral subtype wrapper:
+
+- receipt: `code_writer_completion_receipt_v1.completion_boundary_subtype`;
+- GraphQL: `implementationCompletion.completionBoundarySubtype`;
+- MCP: `runs.get.implementationCompletion.completion_boundary_subtype`;
+- run report: `implementation_completion.completion_boundary_subtype`.
+
+The first known values are Junie-specific because the covered runtime family is
+Junie ACP: `junie_final_response_missing`,
+`junie_final_response_truncated`, `junie_progress_without_terminal_handoff`,
+`junie_repair_returned_narrative`, `junie_repair_returned_malformed_json`,
+`junie_repair_outputs_partially_materialized`, and
+`junie_runtime_tool_path_failure_before_publication`. Unknown subtype values
+round-trip as raw values in the existing enum-wrapper style.
+
+The receipt stores runtime and forensic detail in additive fields:
+
+- `provider_runtime_family`
+- `final_payload_status`
+- `progress_before_handoff`
+- `runtime_preflight_phase`
+- `runtime_tool_path_preflight_json`
+- `final_completion_payload_capture_json`
+- `engine_failure_envelope_json`
+- `repair_failure_envelope_json`
+- `repair_materialization_summary_json`
+- `repair_materialization_mode`
+
+`runtime_preflight_phase` values such as `preflight_running`,
+`preflight_remediating`, `passed`, and `failed_no_launch` are runtime facts, not
+new `AgentStatus` values. Public preflight JSON records attempt count,
+remediation, provider launch state, and redacted operation/path/failure classes.
+
+### Staged per-output repair settlement
+
+When Junie repair returns multiple outputs, the engine validates and settles each
+declared output independently. Valid siblings may commit even when another
+sibling is malformed, stale, or absent. Invalid siblings remain rejected with
+typed reasons and must not overwrite canonical files or active artifact
+pointers.
+
+The durable settlement table is `code_writer_output_settlement_rows`. Each row
+belongs to exactly one `code_writer_completion_receipts.id` through
+`receipt_id TEXT NOT NULL REFERENCES code_writer_completion_receipts`, and
+`(receipt_id, output_name)` remains the receipt readback key. The replay
+idempotency key is `(agent_execution_id, repair_attempt, output_name,
+candidate_digest)` for non-null candidate digests.
+
+Accepted rows are the only source for canonical mutation and active artifact
+pointer publication. Staged rows without accepted settlement may be retried or
+discarded; committed rows are recovered from their canonical digest; failed rows
+preserve the prior digest and failure reason.
+
+Rollout controls:
+
+| Control | Default | Stable behavior |
+|---|---|---|
+| `CHAINWORKS_P090_STRICT_FINAL_PAYLOAD` | `0` | Records strict completion-boundary diagnostics while preserving legacy enforcement until enabled. |
+| `CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE` | `0` | Runs Junie preflight in diagnostic mode by default; when enabled, non-remediable path failures fail before provider launch. |
+| `CHAINWORKS_P090_STAGED_REPAIR_SETTLEMENT` | `0` | Enables staged per-output repair settlement when strict final payload is also enabled. |
+| `CHAINWORKS_P090_DISABLE_STAGED_REPAIR_SETTLEMENT` | `0` | Emergency kill switch for staged repair materialization; readback reports the disabled mode. |
 
 ### One contract authority
 

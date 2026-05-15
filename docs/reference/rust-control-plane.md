@@ -122,6 +122,9 @@ Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`.
 **Implementation self-assessment summary extension:**
 The `Run` type includes a nullable `implementationSelfAssessmentSummary` field that exposes structured assessment truth (status, verification, code tasks, handoff tasks) without requiring raw artifact parsing.
 
+**Targeted retry authority readback:**
+The `Run` type includes `retryAuthorityJson`, `retryAuthorityHistoryJson`, and `p091OrphanRepairReadbackJson`. Stage summaries expose `terminalReason`, `retryAuthorityId`, `isRetryAuthoritative`, and `retryAuthorityState` from the projection layer.
+
 Mutations: `approveApproval`, `rejectApproval`.
 
 GraphQL is the macOS UI read/subscription surface plus the approval-gate
@@ -160,6 +163,9 @@ Tools are namespaced:
 
 **Toolchain Mapping Readback:**
 `reports.get` includes a `toolchain_mapping` summary for each execution, detailing mapping status, effective scope, and relative root suffixes.
+
+**Targeted Retry Authority Readback:**
+`runs.get` includes `retry_authority`, `retry_authority_history`, and `p091_orphan_repair_readback`. `reports.get` includes the same truth as `retryAuthority`, `retryAuthorityHistory`, and `p091OrphanRepairReadback`.
 
 Resources follow two URI families:
 
@@ -374,6 +380,20 @@ The `AcpRuntimeManager` (`crates/acp/src/manager.rs`) pre-registers five adapter
 
 Each adapter reads its binary path from the environment at construction and spawns the subprocess with piped stdio in its own process group when `execute()` is called. Runtime provider subprocesses are launched with cwd set to the run worktree when write-enabled, otherwise to `workspace_root`; capability probes remain cwd-neutral preflight checks.
 `JunieAdapter` passes `--acp true` at launch so the local Junie CLI enters ACP JSON-RPC mode.
+The retained `proposal-089|p089` gate exercises Junie through this adapter with
+the production `code_writer` binding, full declared output set, and engine
+settlement/materialization path.
+
+Junie `code_writer` launch is guarded by adapter preflight over the execution
+root, project readability, required output parent writeability, runtime cache,
+and temporary directory. Enforced preflight fails closed with
+`runtime_preflight_phase = failed_no_launch` before provider spawn; diagnostic
+mode records the same lifecycle facts while allowing launch. Runtime-cache and
+wrong-cwd failures get one remediation attempt and preserve
+`preflight_remediating` as a durable receipt fact. After preflight passes, the
+engine persists the provider launch lease before spawning Junie, so
+preflight-only rows are excluded from capacity and launched rows count against
+the canonical `junie` provider cap.
 
 ### Timeouts
 
@@ -685,6 +705,33 @@ The work queue (`crates/engine/src/work_queue.rs`) wraps the `work_items` SQLite
 
 The background executor (`crates/engine/src/executor.rs`) polls the queue in a loop with 100ms sleep when idle. `InvokeAgent` items are spawned as concurrent tasks; all other kinds run inline on the executor loop.
 
+## Targeted retry authority
+
+The control plane records retry-stage authority in `retry_stage_execution_authorities`. A retry authority binds a logical workflow `stage_id` to the concrete `stage_execution_id` that a retry command created, so later orchestration, work-item recovery, and readback do not fall back to sibling stage executions.
+
+Authority rows use `entry_kind` values `full_stage_retry`, `targeted_agent_retry`, and `historical_orphan_recovery`; the retained contract spelling `entry_kind = targeted_agent_retry` identifies the targeted-agent path. Active authority uniqueness is enforced by the partial index `retry_stage_execution_authorities_one_active` on `(run_id, stage_id)` where `authority_state = active`. Later retries supersede the previous active row before creating the next active row.
+
+Full-stage retry creates the replacement stage execution and enqueues a targeted `AdvanceRun` payload first. Targeted-agent retry creates the running replacement stage execution, records active authority, and enqueues `InvokeAgent` first; post-invoke completion and failure enqueue the targeted `AdvanceRun`. `AdvanceRunPayloadV1` accepts targeted payloads only for retry-stage, post-invoke, startup-recovery, and abandoned-requeue reasons. A direct targeted-agent `AdvanceRun` reason is invalid because targeted-agent retry starts with `InvokeAgent`.
+
+**Target-aware work-item repository semantics**:
+
+- targeted `AdvanceRun` payloads carry `schema_version = advance_run_payload.v1`, `stage_id`, `target_stage_execution_id`, `retry_authority_id`, and source work fields when they are derived from an invoke;
+- post-invoke payload construction resolves the target from explicit work-item fields, targeted-retry hints, or the source `agent_execution` stage, then verifies the active authority before enqueueing follow-up work;
+- cancel, requeue, and abandoned-work recovery helpers filter by authority and target rather than collapsing targeted work back to run scope;
+- malformed or partially targeted payloads fail closed with typed errors such as `advance_run_payload_missing_target_for_authority`, `advance_run_payload_target_lost`, and `advance_run_payload_target_required`;
+- a payload that has only `source_work_item_id` for retry-linked work is quarantined instead of being treated as a valid targeted retry advance.
+
+Historical orphan repair handles pre-authority retry attempts that are still pending or running after their retry driver disappeared. A candidate must have no live work item, no active agent execution, no active authority, no legitimate wait exclusion, and a progression predicate such as `settled_sibling_without_live_retry_driver`. Enforce mode settles the orphan as `status = skipped`, writes `terminal_reason = stale_retry_recovered`, and creates a non-active `historical_orphan_recovery` authority row with matching terminal reason; stage terminal metadata and authority history must agree.
+
+The startup ordering invariant is: startup orphan repair must run before projection rebuild and before generic startup catch-up enqueue. When the only remaining blocker was a recovered retry orphan, startup recovery suppresses the generic run-scoped `startup_catchup` `AdvanceRun` so it cannot resurrect the recovered stage execution.
+
+Startup repair is controlled by two environment variables:
+
+- `CHAINWORKS_P091_STARTUP_ORPHAN_REPAIR_MODE=diagnostic|enforce` controls whether candidates are recorded only or also terminalized. The default is `diagnostic`.
+- `CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR=1` disables mutation and records disabled readback.
+
+Each startup repair pass writes `p091_orphan_repair_passes` with mode, kill-switch state, candidate/exclusion/repair counts, and bounded samples. Public readback surfaces those counters through `p091_orphan_repair_readback`; the retained counter vocabulary includes `p091_orphan_repair_candidates_total`. The retained gate alias `./scripts/test-gate.sh proposal-091` proves the evidence fixture, typed payload parser, DB authority repository, work-item semantics, runtime settlement, recovery exclusions, GraphQL readback, and MCP `retryAuthorityHistory` readback.
+
 ## Capacity-aware Scheduling
 
 The executor uses a capacity-aware claim/start gate for `InvokeAgent`: it checks global,
@@ -692,6 +739,10 @@ provider, and per-run active execution caps before mutating ownership, and leave
 capacity-blocked work pending.
 
 - **Default Caps**: Global 20, per-run 4, Claude 8, Gemini 4, Codex 10, Auggie 1, Junie 1.
+- **Junie Preflight Boundary**: Junie `code_writer` rows with
+  `runtime_preflight_provider_launched=false` do not consume provider capacity;
+  the ACP provider launch gate persists launch state after preflight and before
+  subprocess spawn.
 - **Backpressure Visibility**: Blocked work remains `pending` and is exposed via
   `scheduler_queue_summaries` and `scheduler_health_snapshots` projections.
 - **Wake-up**: `InvokeAgent` completion inserts an idempotent post-completion

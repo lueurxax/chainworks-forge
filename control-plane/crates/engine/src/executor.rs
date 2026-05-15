@@ -18,6 +18,7 @@ use crate::release::{
     git::{GitPushReceipt, GitReleaseService, ReleaseManifest},
     receipt::DeliveryReceiptBuilder,
 };
+use acp::session::{finalize_provider_session_store_capture, ProviderSessionStoreArchiveContext};
 use acp::AcpRuntimeManager;
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
@@ -43,7 +44,7 @@ use domain::artifact_contracts::{
 };
 use domain::code_writer_completion::{
     CodeWriterCompletionOutputDecisionRecord, CodeWriterCompletionReceiptRecord,
-    CodeWriterCompletionTextCaptureRecord,
+    CodeWriterCompletionTextCaptureRecord, CodeWriterOutputSettlementRow,
 };
 use domain::discovery::{
     AgentExecutionDiscoveryDiagnostics, DiscoveryDiagnosticsV1, DiscoveryFilesystem,
@@ -56,6 +57,7 @@ use domain::discovery::{
 use domain::error_sanitizer::sanitize_error_for_storage;
 use domain::ids::RunId;
 use domain::provider::ProviderFamily;
+use domain::retry_authority::AdvanceRunPayloadV1;
 use domain::run::DeliveryConfiguration;
 use workflow::catalog::{AgentCatalogFile, AgentEntry};
 
@@ -92,6 +94,7 @@ use crate::worktree_fingerprint::{
 use domain::side_effect::{EffectKind, PrepareEffectIntent};
 
 const ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS: i64 = 3;
+const JUNIE_PROVIDER_CAPACITY_RETRY_DELAY_SECONDS: i64 = 15;
 const APPROVED_PROPOSAL_OUTPUT_NAME: &str = "approved_proposal";
 const IMPLEMENTATION_STARTED_STAGE_ID: &str = "state_7_implementation_started";
 const FREEZE_PROPOSAL_TASK_NAME: &str = "freeze_proposal_and_provision_worktree";
@@ -225,6 +228,41 @@ impl acp::AcpPromptProgressSink for DbAcpPromptProgressSink {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+struct DbAcpProviderLaunchGate {
+    pool: SqlitePool,
+    capacity: domain::provider::InvokeAgentCapacityConfig,
+}
+
+#[async_trait::async_trait]
+impl acp::adapters::AcpProviderLaunchGate for DbAcpProviderLaunchGate {
+    async fn before_provider_launch(
+        &self,
+        req: &acp::ExecutionRequest,
+        runtime_tool_path_preflight_json: Option<&str>,
+    ) -> Result<()> {
+        if req.provider != "junie" {
+            return Ok(());
+        }
+        let Some(agent_execution_id) = req.agent_execution_id else {
+            return Ok(());
+        };
+        let capacity = invoke_agent_start_capacity_from_domain(&self.capacity);
+        let acquired = p090_claim_junie_provider_launch_lease(
+            &self.pool,
+            agent_execution_id,
+            &capacity,
+            runtime_tool_path_preflight_json,
+        )
+        .await?;
+        if !acquired {
+            anyhow::bail!(
+                "p090_junie_provider_capacity_exhausted_after_preflight: provider cap reached before launch"
+            );
         }
         Ok(())
     }
@@ -411,11 +449,20 @@ async fn invoke_item_has_start_capacity(
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
 
     let running_status = AgentStatus::Running.to_string();
-    let total_active: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_executions WHERE status = ?1")
-            .bind(&running_status)
-            .fetch_one(pool)
-            .await?;
+    let total_active: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM agent_executions ae
+           LEFT JOIN agent_execution_runtime_facts arf ON arf.agent_execution_id = ae.id
+           WHERE ae.status = ?1
+             AND NOT (
+               COALESCE(ae.provider_family, ae.provider) = 'junie'
+               AND arf.runtime_preflight_phase IN ('preflight_running', 'preflight_remediating')
+               AND COALESCE(arf.runtime_preflight_provider_launched, 0) = 0
+             )"#,
+    )
+    .bind(&running_status)
+    .fetch_one(pool)
+    .await?;
     if total_active as usize >= capacity.max_active_total {
         return Ok(false);
     }
@@ -425,7 +472,13 @@ async fn invoke_item_has_start_capacity(
             r#"SELECT COUNT(*)
                FROM agent_executions ae
                INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
-               WHERE ae.status = ?1 AND se.run_id = ?2"#,
+               LEFT JOIN agent_execution_runtime_facts arf ON arf.agent_execution_id = ae.id
+               WHERE ae.status = ?1 AND se.run_id = ?2
+                 AND NOT (
+                   COALESCE(ae.provider_family, ae.provider) = 'junie'
+                   AND arf.runtime_preflight_phase IN ('preflight_running', 'preflight_remediating')
+                   AND COALESCE(arf.runtime_preflight_provider_launched, 0) = 0
+                 )"#,
         )
         .bind(&running_status)
         .bind(run_id.to_string())
@@ -438,7 +491,15 @@ async fn invoke_item_has_start_capacity(
 
     if let Some(provider_cap) = capacity.provider_caps.get(&provider_family) {
         let provider_active: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_executions WHERE status = ?1 AND COALESCE(provider_family, provider) = ?2",
+            r#"SELECT COUNT(*)
+               FROM agent_executions ae
+               LEFT JOIN agent_execution_runtime_facts arf ON arf.agent_execution_id = ae.id
+               WHERE ae.status = ?1 AND COALESCE(ae.provider_family, ae.provider) = ?2
+                 AND NOT (
+                   COALESCE(ae.provider_family, ae.provider) = 'junie'
+                   AND arf.runtime_preflight_phase IN ('preflight_running', 'preflight_remediating')
+                   AND COALESCE(arf.runtime_preflight_provider_launched, 0) = 0
+                 )"#,
         )
         .bind(&running_status)
         .bind(&provider_family)
@@ -659,7 +720,7 @@ async fn claim_invoke_agent_work_item_with_start(
             id: agent_execution_id,
             stage_execution_id: Some(stage_execution_id),
             agent_id,
-            provider,
+            provider: provider.clone(),
             model,
             status: AgentStatus::Running,
             started_at: now,
@@ -701,6 +762,22 @@ async fn claim_invoke_agent_work_item_with_start(
     let mut facts =
         domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
     facts.session_reuse_reason = Some("legacy_unknown".into());
+    if p090_junie_preflight_records_diagnostics(&provider) {
+        facts.runtime_preflight_phase = Some("preflight_running".into());
+        facts.runtime_preflight_attempt_count = Some(1);
+        facts.runtime_preflight_provider_launched = Some(false);
+        facts.runtime_preflight_json = Some(
+            serde_json::json!({
+                "schema": "p090_runtime_tool_path_preflight_v1",
+                "status": "preflight_running",
+                "attempt_count": 1,
+                "provider_launched": false,
+                "enforcement_enabled": p090_junie_preflight_enforce_enabled(&provider),
+                "lifecycle_phases": ["preflight_running"]
+            })
+            .to_string(),
+        );
+    }
     agent_execution_runtime_facts::upsert(pool, &facts).await?;
 
     let artifact_claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
@@ -999,12 +1076,26 @@ fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct DeclaredOutputDiscoverySettlement {
     decisions: Vec<OutputDiscoveryDecision>,
     accepted_payloads: HashMap<String, Vec<u8>>,
     idempotency_key: Option<String>,
     accepted_aggregate_bytes: u64,
     aggregate_cap_hit: bool,
+}
+
+#[derive(Clone)]
+struct P090StagedRepairMaterialization {
+    rows: Vec<CodeWriterOutputSettlementRow>,
+    commits: Vec<P090StagedRepairCommit>,
+}
+
+#[derive(Clone)]
+struct P090StagedRepairCommit {
+    output_name: String,
+    staging_path: String,
+    canonical_path: String,
 }
 
 fn build_declared_output_discovery_settlement(
@@ -1226,6 +1317,449 @@ fn settle_agent_outputs_from_discovery_decisions(
     }
 
     Ok(settlement)
+}
+
+fn materialize_validated_discovery_decisions(
+    declared_outputs: &[DeclaredOutput],
+    settlement: &DeclaredOutputDiscoverySettlement,
+    validation: &TaskValidationSummary,
+) -> Result<()> {
+    let valid_output_names: HashSet<&str> = validation
+        .output_results
+        .iter()
+        .filter(|result| {
+            result.status == domain::validation::ValidationStatus::Passed
+                || result.status == domain::validation::ValidationStatus::NoContractDeclared
+        })
+        .map(|result| result.output_name.as_str())
+        .collect();
+
+    for declared in declared_outputs {
+        materialize_validated_output_candidate(
+            &declared.output_name,
+            &declared.target_path,
+            settlement,
+            &valid_output_names,
+        )?;
+
+        if let (Some(companion_name), Some(companion_path)) = (
+            declared.companion_output_name.as_deref(),
+            declared.companion_path.as_deref(),
+        ) {
+            materialize_validated_output_candidate(
+                companion_name,
+                companion_path,
+                settlement,
+                &valid_output_names,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn materialize_validated_output_candidate(
+    output_name: &str,
+    target_path: &str,
+    settlement: &DeclaredOutputDiscoverySettlement,
+    valid_output_names: &HashSet<&str>,
+) -> Result<()> {
+    if !valid_output_names.contains(output_name) {
+        return Ok(());
+    }
+    let Some(decision) = settlement
+        .decisions
+        .iter()
+        .find(|decision| decision.output_name == output_name)
+    else {
+        return Ok(());
+    };
+    if decision.status != OutputDiscoveryStatus::Accepted {
+        return Ok(());
+    }
+    if decision.reason == OutputDiscoveryReason::ControlPlaneGenerated {
+        return Ok(());
+    }
+    let Some(payload_ref) = decision.accepted_payload_ref.as_ref() else {
+        return Ok(());
+    };
+    let Some(bytes) = settlement.accepted_payloads.get(payload_ref) else {
+        return Ok(());
+    };
+    write_discovered_output(target_path, bytes)
+}
+
+fn merge_repair_captured_outputs(
+    original: &[CapturedOutput],
+    repair: &[CapturedOutput],
+) -> Vec<CapturedOutput> {
+    original
+        .iter()
+        .map(|original_output| {
+            let repair_output = repair.iter().find(|candidate| {
+                candidate.declared.output_name == original_output.declared.output_name
+            });
+            CapturedOutput {
+                declared: original_output.declared.clone(),
+                machine_bytes: repair_output
+                    .and_then(|output| output.machine_bytes.clone())
+                    .or_else(|| original_output.machine_bytes.clone()),
+                companion_bytes: repair_output
+                    .and_then(|output| output.companion_bytes.clone())
+                    .or_else(|| original_output.companion_bytes.clone()),
+            }
+        })
+        .collect()
+}
+
+fn merge_repair_discovery_settlements(
+    original: &DeclaredOutputDiscoverySettlement,
+    repair: &DeclaredOutputDiscoverySettlement,
+) -> DeclaredOutputDiscoverySettlement {
+    let mut decisions = original.decisions.clone();
+    for repair_decision in &repair.decisions {
+        if let Some(existing) = decisions.iter_mut().find(|decision| {
+            decision.output_name == repair_decision.output_name
+                && decision.output_role == repair_decision.output_role
+        }) {
+            *existing = repair_decision.clone();
+        } else {
+            decisions.push(repair_decision.clone());
+        }
+    }
+
+    let mut accepted_payloads = original.accepted_payloads.clone();
+    accepted_payloads.extend(repair.accepted_payloads.clone());
+
+    DeclaredOutputDiscoverySettlement {
+        decisions,
+        accepted_aggregate_bytes: accepted_payloads
+            .values()
+            .map(|bytes| bytes.len() as u64)
+            .sum(),
+        accepted_payloads,
+        idempotency_key: repair
+            .idempotency_key
+            .clone()
+            .or_else(|| original.idempotency_key.clone()),
+        aggregate_cap_hit: original.aggregate_cap_hit || repair.aggregate_cap_hit,
+    }
+}
+
+fn stage_p090_repair_materialization(
+    artifact_root: &str,
+    run_id: RunId,
+    stage_id: &str,
+    stage_execution_id: domain::ids::StageExecutionId,
+    agent_execution_id: domain::ids::AgentExecutionId,
+    session_generation_id: Option<&str>,
+    repair_attempt: i64,
+    receipt_id: &str,
+    declared_outputs: &[DeclaredOutput],
+    settlement: &DeclaredOutputDiscoverySettlement,
+    validation: &TaskValidationSummary,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<P090StagedRepairMaterialization> {
+    let mut commits = Vec::new();
+    let rows = settlement
+        .decisions
+        .iter()
+        .map(|decision| {
+            let validation_result = validation
+                .output_results
+                .iter()
+                .find(|result| result.output_name == decision.output_name);
+            let valid = validation_result.is_none_or(|result| {
+                result.status == domain::validation::ValidationStatus::Passed
+                    || result.status == domain::validation::ValidationStatus::NoContractDeclared
+            });
+            let payload = decision
+                .accepted_payload_ref
+                .as_ref()
+                .and_then(|payload_ref| settlement.accepted_payloads.get(payload_ref));
+            let candidate_digest = payload.map(|bytes| sha256_digest(bytes));
+            let canonical_path = declared_outputs
+                .iter()
+                .find_map(|declared| {
+                    if declared.output_name == decision.output_name {
+                        Some(declared.target_path.clone())
+                    } else if declared.companion_output_name.as_deref()
+                        == Some(decision.output_name.as_str())
+                    {
+                        declared.companion_path.clone()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    decision
+                        .canonical_path
+                        .clone()
+                        .unwrap_or_else(|| decision.target_path.clone())
+                });
+            let canonical_before_sha256 = file_sha256_if_exists(&canonical_path)?;
+            let staging_path = if let Some(bytes) = payload {
+                let path = p090_repair_staging_path(
+                    artifact_root,
+                    agent_execution_id,
+                    repair_attempt,
+                    &decision.output_name,
+                );
+                write_discovered_output(&path, bytes)?;
+                Some(path)
+            } else {
+                None
+            };
+            let materializes = decision.status == OutputDiscoveryStatus::Accepted
+                && valid
+                && staging_path.is_some();
+            if materializes {
+                commits.push(P090StagedRepairCommit {
+                    output_name: decision.output_name.clone(),
+                    staging_path: staging_path.clone().expect("checked above"),
+                    canonical_path: canonical_path.clone(),
+                });
+            }
+            Ok(CodeWriterOutputSettlementRow {
+                id: format!("{receipt_id}:{}", decision.output_name),
+                receipt_id: receipt_id.to_string(),
+                run_id,
+                stage_id: stage_id.to_string(),
+                stage_execution_id,
+                agent_execution_id,
+                session_generation_id: Some(
+                    session_generation_id
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "none".to_string()),
+                ),
+                repair_attempt,
+                output_name: decision.output_name.clone(),
+                contract_id: validation_result
+                    .and_then(|result| result.contract_id.clone())
+                    .unwrap_or_else(|| decision.output_name.clone()),
+                source_kind: p090_settlement_source_kind(decision, true),
+                source_generation_owner: decision
+                    .generated_by
+                    .as_deref()
+                    .map(|_| "control_plane")
+                    .unwrap_or("agent")
+                    .to_string(),
+                candidate_digest: candidate_digest.clone(),
+                staging_path,
+                canonical_path,
+                canonical_before_sha256,
+                canonical_after_sha256: None,
+                decision: p090_settlement_decision(decision, valid).to_string(),
+                rejection_reason: p090_settlement_rejection_reason(decision, validation_result),
+                materialization_state: if materializes {
+                    "staged".to_string()
+                } else {
+                    "not_materialized".to_string()
+                },
+                active_pointer_generation_id: materializes.then(|| {
+                    format!(
+                        "{agent_execution_id}:{}:{}",
+                        repair_attempt, decision.output_name
+                    )
+                }),
+                created_at,
+                committed_at: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(P090StagedRepairMaterialization { rows, commits })
+}
+
+fn commit_p090_staged_repair_materialization(
+    staged: P090StagedRepairMaterialization,
+    committed_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<CodeWriterOutputSettlementRow>> {
+    let mut committed_after_sha256 = HashMap::new();
+    for commit in &staged.commits {
+        let bytes = std::fs::read(&commit.staging_path).with_context(|| {
+            format!(
+                "read staged P090 repair output {} for {}",
+                commit.staging_path, commit.output_name
+            )
+        })?;
+        write_discovered_output(&commit.canonical_path, &bytes).with_context(|| {
+            format!(
+                "commit staged P090 repair output {} to {}",
+                commit.output_name, commit.canonical_path
+            )
+        })?;
+        committed_after_sha256.insert(commit.output_name.clone(), sha256_digest(&bytes));
+    }
+    let mut rows = staged.rows;
+    for row in &mut rows {
+        if let Some(after_sha256) = committed_after_sha256.get(row.output_name.as_str()) {
+            row.materialization_state = "committed".to_string();
+            row.canonical_after_sha256 = Some(after_sha256.clone());
+            row.committed_at = Some(committed_at);
+        }
+    }
+    Ok(rows)
+}
+
+async fn publish_p090_committed_repair_artifact_generations(
+    pool: &SqlitePool,
+    rows: &[CodeWriterOutputSettlementRow],
+) -> Result<()> {
+    for row in rows {
+        if row.decision != "accepted" || row.materialization_state != "committed" {
+            continue;
+        }
+        if row.canonical_after_sha256.is_none() || !known_contract_id(&row.contract_id) {
+            continue;
+        }
+        let raw_status = extract_contract_status_from_file(&row.contract_id, &row.canonical_path)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string());
+        artifact_contracts::upsert_generation_and_rebuild(
+            pool,
+            ActiveArtifactGenerationInput {
+                run_id: row.run_id,
+                artifact_id: domain::ids::ArtifactId::new(),
+                contract_id: row.contract_id.clone(),
+                canonical_path: row.output_name.clone(),
+                raw_path: row.canonical_path.clone(),
+                raw_status,
+                generation_id: row
+                    .active_pointer_generation_id
+                    .clone()
+                    .unwrap_or_else(|| row.id.clone()),
+                source_agent_execution_id: Some(row.agent_execution_id.to_string()),
+                source_stage_execution_id: Some(row.stage_execution_id.to_string()),
+                source_session_generation_id: row.session_generation_id.clone(),
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: AgentOutputSettlement::ValidOutputsFromFailedExecution,
+                partial: true,
+                warnings: vec![
+                    "P090 accepted staged repair settlement row published this active generation"
+                        .to_string(),
+                ],
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn p090_repair_staging_path(
+    artifact_root: &str,
+    agent_execution_id: domain::ids::AgentExecutionId,
+    repair_attempt: i64,
+    output_name: &str,
+) -> String {
+    Path::new(artifact_root)
+        .join("repair-staging")
+        .join(agent_execution_id.to_string())
+        .join(repair_attempt.to_string())
+        .join(p090_safe_staging_filename(output_name))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn p090_safe_staging_filename(output_name: &str) -> String {
+    output_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn file_sha256_if_exists(path: &str) -> Result<Option<String>> {
+    let path = Path::new(path);
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(sha256_digest(&std::fs::read(path)?)))
+}
+
+pub async fn run_production_declared_output_settlement_for_canary(
+    declared_outputs: &[DeclaredOutput],
+    expected_outputs: &[ExpectedOutputSpec],
+    discovered_artifacts: &[acp::DiscoveredArtifact],
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+    worktree_root: Option<&str>,
+    worktree_write_enabled: bool,
+) -> Result<serde_json::Value> {
+    let manifest_status = generate_changed_files_manifest_if_declared(
+        declared_outputs,
+        worktree_root,
+        worktree_write_enabled,
+    )
+    .await?;
+    let settlement = settle_agent_outputs_from_discovery_decisions(
+        declared_outputs,
+        expected_outputs,
+        discovered_artifacts,
+        pre_prompt_expected_outputs,
+    )?;
+    let decisions_by_name: HashMap<&str, &OutputDiscoveryDecision> = settlement
+        .decisions
+        .iter()
+        .map(|decision| (decision.output_name.as_str(), decision))
+        .collect();
+    let declared_outputs_readback = declared_outputs
+        .iter()
+        .map(|declared| {
+            let decision = decisions_by_name
+                .get(declared.output_name.as_str())
+                .copied();
+            let (materialized, size_bytes, sha256) = std::fs::read(&declared.target_path)
+                .map(|bytes| (true, Some(bytes.len() as u64), Some(sha256_digest(&bytes))))
+                .unwrap_or((false, None, None));
+            serde_json::json!({
+                "output_name": declared.output_name,
+                "canonical_path": declared.target_path,
+                "contract_id": declared.schema.as_ref().map(|schema| schema.contract_id.as_str()),
+                "required": true,
+                "materialized": materialized,
+                "settlement_decision": decision.map(|decision| enum_snake_value(decision.status)),
+                "freshness": decision.and_then(|decision| {
+                    (decision.reason == OutputDiscoveryReason::ProviderEnvelope
+                        || decision.reason == OutputDiscoveryReason::ControlPlaneGenerated
+                        || decision.reason == OutputDiscoveryReason::ExactPathChanged)
+                        .then_some("current_attempt")
+                }),
+                "source_kind": decision.and_then(|decision| decision.diagnostics.get("source_kind").cloned()),
+                "reason": decision.map(|decision| enum_snake_value(decision.reason)),
+                "provenance": decision.and_then(|decision| decision.provenance.map(enum_snake_value)),
+                "generated_by": decision.and_then(|decision| decision.generated_by.clone()),
+                "source_generation_owner": if expected_outputs
+                    .iter()
+                    .find(|spec| spec.output_name == declared.output_name)
+                    .map(|spec| spec.source_generation_owner == SourceGenerationOwner::ControlPlane)
+                    .unwrap_or(false)
+                {
+                    "control_plane"
+                } else {
+                    "agent"
+                },
+                "contributes_to_junie_capability": declared.output_name != "changed_files_manifest",
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "schema_version": "p089_production_declared_output_settlement_v1",
+        "settlement_boundary": "engine::executor::generate_changed_files_manifest_if_declared_then_settle_agent_outputs_from_discovery_decisions",
+        "materialization_owner": "engine_executor",
+        "changed_files_manifest_status": manifest_status.map(|status| enum_snake_value(status)),
+        "decisions": settlement.decisions,
+        "declared_outputs": declared_outputs_readback,
+        "accepted_aggregate_bytes": settlement.accepted_aggregate_bytes,
+        "aggregate_cap_hit": settlement.aggregate_cap_hit,
+        "idempotency_key": settlement.idempotency_key,
+    }))
 }
 
 fn exact_path_rejection_for_spec(
@@ -1940,6 +2474,11 @@ fn is_active_prompt_closed_transport_error(message: &str) -> bool {
         .contains("session closed during active prompt")
 }
 
+fn is_junie_post_preflight_provider_capacity_error(provider: &str, message: &str) -> bool {
+    provider == "junie"
+        && message.contains("p090_junie_provider_capacity_exhausted_after_preflight")
+}
+
 fn is_work_item_requeued(error: &Error) -> bool {
     error.downcast_ref::<WorkItemRequeued>().is_some()
 }
@@ -1962,6 +2501,7 @@ fn runtime_facts_for_execution_result(
     now: chrono::DateTime<chrono::Utc>,
     close_diagnostic: Option<&acp::AcpCloseDiagnostic>,
     runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
+    runtime_tool_path_preflight_json: Option<&str>,
 ) -> AgentExecutionRuntimeFacts {
     let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
     facts.valid_required_outputs = validation_summary.is_some_and(|summary| {
@@ -2052,6 +2592,7 @@ fn runtime_facts_for_execution_result(
     if let Some(receipt) = runtime_receipt {
         enrich_runtime_facts_with_receipt(&mut facts, receipt);
     }
+    p090_enrich_runtime_facts_with_preflight_json(&mut facts, runtime_tool_path_preflight_json);
     facts
 }
 
@@ -2918,6 +3459,10 @@ impl BackgroundExecutor {
             pool: pool.clone(),
             events: events.clone(),
         }));
+        acp.set_provider_launch_gate(Arc::new(DbAcpProviderLaunchGate {
+            pool: pool.clone(),
+            capacity: work_queue.invoke_agent_capacity_config(),
+        }));
         let db_writer = Arc::new(DbWriter::new(pool.clone()));
         Self {
             pool,
@@ -2965,6 +3510,10 @@ impl BackgroundExecutor {
         acp.set_prompt_progress_sink(Arc::new(DbAcpPromptProgressSink {
             pool: pool.clone(),
             events: events.clone(),
+        }));
+        acp.set_provider_launch_gate(Arc::new(DbAcpProviderLaunchGate {
+            pool: pool.clone(),
+            capacity: work_queue.invoke_agent_capacity_config(),
         }));
         let db_writer = db_writer.unwrap_or_else(|| Arc::new(DbWriter::new(pool.clone())));
         Self {
@@ -3485,6 +4034,70 @@ impl BackgroundExecutor {
         Ok(true)
     }
 
+    async fn auto_requeue_junie_provider_capacity_after_preflight(
+        &self,
+        item: &WorkItem,
+        claimed: &ClaimedInvokeAgentStart,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        error: &Error,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let message = error.to_string();
+        if !is_junie_post_preflight_provider_capacity_error(provider, &message) {
+            return Ok(false);
+        }
+
+        let retry_at =
+            completed_at + chrono::Duration::seconds(JUNIE_PROVIDER_CAPACITY_RETRY_DELAY_SECONDS);
+        let mut runtime_facts =
+            runtime_facts_for_acp_error(claimed.agent_execution_id, error, completed_at);
+        runtime_facts.retry_after = Some(retry_at);
+        agent_executions::update_completed(
+            &self.pool,
+            claimed.agent_execution_id,
+            AgentStatus::Failed,
+            completed_at,
+        )
+        .await?;
+        agent_execution_runtime_facts::upsert(&self.pool, &runtime_facts).await?;
+
+        let requeued = work_items::requeue_running_invoke_agent_after_provider_capacity_wait(
+            &self.pool,
+            &item.id,
+            &claimed.artifact_claim_key,
+            retry_at,
+            "junie_provider_capacity_after_preflight",
+        )
+        .await?;
+        if !requeued {
+            return Ok(false);
+        }
+
+        self.work_queue.refresh_scheduler_projection().await?;
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                run_id,
+                stage_id: stage_id.to_string(),
+                agent_id: agent_id.to_string(),
+                provider: provider.to_string(),
+                event_kind: "provider_capacity_requeued_after_preflight".to_string(),
+            });
+        warn!(
+            run_id = %run_id,
+            stage_id = %stage_id,
+            agent_id = %agent_id,
+            agent_execution_id = %claimed.agent_execution_id,
+            work_item_id = %item.id,
+            retry_at = %retry_at,
+            "Junie post-preflight provider capacity exhausted; requeued InvokeAgent instead of failing stage"
+        );
+        Ok(true)
+    }
+
     async fn run_loop(self: &Arc<Self>) {
         info!("BackgroundExecutor: starting work loop");
         loop {
@@ -3646,8 +4259,11 @@ impl BackgroundExecutor {
             WorkItemKind::AdvanceRun => {
                 let run_id = self.extract_run_id(&item)?;
                 run_unresolved_effects_preflight(&self.pool, &run_id, "advance_run").await?;
-                self.orchestrator.advance_run(run_id).await?;
+                let payload = AdvanceRunPayloadV1::parse_json(&item.payload_json)
+                    .with_context(|| format!("parse AdvanceRun payload {}", item.id))?;
+                self.orchestrator.advance_run_from_payload(&payload).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
+                projections::rebuild_all_for_run(&self.pool, run_id).await?;
             }
 
             WorkItemKind::InvokeAgent => {
@@ -3859,6 +4475,19 @@ impl BackgroundExecutor {
                     .as_ref()
                     .map(|claimed| claimed.agent_execution_id)
                     .unwrap_or_else(domain::ids::AgentExecutionId::new);
+                if preclaimed_start.is_some() {
+                    agent_executions::update_mcp_provenance(
+                        &self.pool,
+                        agent_exec_id,
+                        backend_profile_id.as_deref(),
+                        Some(&requested_mcp_extensions_json),
+                        Some(&predicted_mcp_extensions_json),
+                        Some(&predicted_mcp_runtime_ids_json),
+                        Some(&denied_mcp_extensions_json),
+                        Some(&mcp_blocking_issues_json),
+                    )
+                    .await?;
+                }
                 // P017: Owner-aware lineage. For mediation-owned executions, the
                 // owner_id (mediation record id) is the lineage anchor; for stage-owned
                 // executions, the stage_execution_id remains the lineage anchor.
@@ -4527,10 +5156,44 @@ impl BackgroundExecutor {
                         event_kind: "session_started".to_string(),
                     });
 
+                if let Err(error) =
+                    p090_prepare_junie_preflight_remediation(&self.pool, agent_exec_id, &req).await
+                {
+                    warn!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        agent_id = %agent_id,
+                        agent_execution_id = %agent_exec_id,
+                        error = %error,
+                        "P090 Junie preflight remediation preparation failed; adapter preflight will enforce final launch decision"
+                    );
+                }
+
                 let mut result = match self.acp.execute(req.clone()).await {
                     Ok(result) => result,
                     Err(error) => {
                         let completed_at = chrono::Utc::now();
+                        if let Some(claimed) = preclaimed_start.as_ref() {
+                            if self
+                                .auto_requeue_junie_provider_capacity_after_preflight(
+                                    &item,
+                                    claimed,
+                                    run_id,
+                                    &stage_id,
+                                    &agent_id,
+                                    &provider,
+                                    &error,
+                                    completed_at,
+                                )
+                                .await?
+                            {
+                                return Err(WorkItemRequeued {
+                                    work_item_id: item.id.clone(),
+                                    reason: "junie_provider_capacity_after_preflight",
+                                }
+                                .into());
+                            }
+                        }
                         if !p088_code_writer_completion_candidate {
                             if let Some(claimed) = preclaimed_start.as_ref() {
                                 if self
@@ -4555,8 +5218,14 @@ impl BackgroundExecutor {
                                 }
                             }
                         }
-                        let runtime_facts =
+                        let mut runtime_facts =
                             runtime_facts_for_acp_error(agent_exec_id, &error, completed_at);
+                        let p090_error_preflight_json =
+                            p090_runtime_tool_path_preflight_json_from_error(&provider, &error);
+                        p090_enrich_runtime_facts_with_preflight_json(
+                            &mut runtime_facts,
+                            p090_error_preflight_json.as_deref(),
+                        );
                         if let Err(update_error) = agent_executions::update_completed(
                             &self.pool,
                             agent_exec_id,
@@ -4683,6 +5352,7 @@ impl BackgroundExecutor {
                                         &run.artifact_root,
                                         run_id,
                                         stage_execution_id,
+                                        &stage_id,
                                         agent_exec_id,
                                         req.session_generation_id.as_deref(),
                                         &provider,
@@ -4698,6 +5368,8 @@ impl BackgroundExecutor {
                                         acp::runtime_receipt_from_error(&error),
                                         None,
                                         None,
+                                        None,
+                                        p090_error_preflight_json,
                                         false,
                                         0,
                                         p088_operator_retry_completion_recovery,
@@ -5136,6 +5808,9 @@ impl BackgroundExecutor {
                 let mut p088_completion_repair_runtime_prompt_receipt: Option<
                     AgentExecutionRuntimePromptReceiptRecord,
                 > = None;
+                let mut p090_staged_repair_materialization: Option<
+                    P090StagedRepairMaterialization,
+                > = None;
                 if let Some(settlement) = declared_output_settlement.as_ref() {
                     let captured = build_captured_outputs_from_discovery_decisions(
                         &declared_outputs,
@@ -5511,11 +6186,12 @@ impl BackgroundExecutor {
                                             .await;
                                             }
                                         } else {
-                                            match settle_agent_outputs_from_discovery_decisions(
-                                                &declared_outputs,
-                                                &expected_outputs,
-                                                &repair_result.discovered_artifacts,
-                                                &repair_result.pre_prompt_expected_outputs,
+                                            match Ok::<_, anyhow::Error>(
+                                                build_declared_output_discovery_settlement(
+                                                    &expected_outputs,
+                                                    &repair_result.discovered_artifacts,
+                                                    &repair_result.pre_prompt_expected_outputs,
+                                                ),
                                             ) {
                                                 Ok(repair_settlement) => {
                                                     let repair_captured =
@@ -5524,6 +6200,23 @@ impl BackgroundExecutor {
                                                         &repair_settlement.decisions,
                                                         &repair_settlement.accepted_payloads,
                                                     );
+                                                    let merged_repair_settlement =
+                                                        declared_output_settlement
+                                                            .as_ref()
+                                                            .map(|original_settlement| {
+                                                                merge_repair_discovery_settlements(
+                                                                    original_settlement,
+                                                                    &repair_settlement,
+                                                                )
+                                                            })
+                                                            .unwrap_or_else(|| {
+                                                                repair_settlement.clone()
+                                                            });
+                                                    let merged_repair_captured =
+                                                        merge_repair_captured_outputs(
+                                                            &captured,
+                                                            &repair_captured,
+                                                        );
                                                     let (
                                                         repair_found_count,
                                                         repair_missing_count,
@@ -5537,9 +6230,58 @@ impl BackgroundExecutor {
                                                     run_id,
                                                     &stage_id,
                                                     &agent_id,
-                                                    &repair_captured,
+                                                    &merged_repair_captured,
                                                 )
                                                 .await?;
+                                                    let staged_repair_materialization =
+                                                        if p090_staged_repair_settlement_enabled(
+                                                            &provider,
+                                                        ) && stage_execution_id.is_some()
+                                                        {
+                                                            Some(stage_p090_repair_materialization(
+                                                                &run.artifact_root,
+                                                                run_id,
+                                                                &stage_id,
+                                                                stage_execution_id
+                                                                    .expect("checked above"),
+                                                                agent_exec_id,
+                                                                result
+                                                                    .session_generation_id
+                                                                    .as_deref()
+                                                                    .or(Some(
+                                                                        session_generation_id
+                                                                            .as_str(),
+                                                                    )),
+                                                                output_contract_repair_turn_count,
+                                                                &format!(
+                                                                    "{}:code_writer_completion_receipt_v1",
+                                                                    agent_exec_id
+                                                                ),
+                                                                &declared_outputs,
+                                                                &repair_settlement,
+                                                                &repair_validation,
+                                                                chrono::Utc::now(),
+                                                            )?)
+                                                        } else if repair_validation
+                                                            .failure_class
+                                                            .is_none()
+                                                        {
+                                                            materialize_validated_discovery_decisions(
+                                                                &declared_outputs,
+                                                                &repair_settlement,
+                                                                &repair_validation,
+                                                            )?;
+                                                            None
+                                                        } else {
+                                                            None
+                                                        };
+                                                    let repair_materialized_partially =
+                                                        repair_validation.failure_class.is_some()
+                                                            && repair_found_count > 0;
+                                                    p090_staged_repair_materialization =
+                                                        staged_repair_materialization;
+                                                    declared_output_settlement =
+                                                        Some(merged_repair_settlement);
                                                     if repair_validation.failure_class.is_none() {
                                                         if p088_completion_eligible {
                                                             p088_completion_turn_result =
@@ -5549,8 +6291,6 @@ impl BackgroundExecutor {
                                                             &mut result,
                                                             repair_result,
                                                         );
-                                                        declared_output_settlement =
-                                                            Some(repair_settlement);
                                                         info!(
                                                             run_id = %run_id,
                                                             stage_id = %stage_id,
@@ -5602,8 +6342,12 @@ impl BackgroundExecutor {
                                                     } else {
                                                         if p088_completion_eligible {
                                                             p088_completion_turn_result = Some(
-                                                                "failed_missing_outputs"
-                                                                    .to_string(),
+                                                                if repair_materialized_partially {
+                                                                    "partial_outputs_materialized_missing_outputs".to_string()
+                                                                } else {
+                                                                    "failed_missing_outputs"
+                                                                        .to_string()
+                                                                },
                                                             );
                                                         }
                                                         let repair_failed_outputs =
@@ -6371,6 +7115,7 @@ impl BackgroundExecutor {
                         ),
                         result.close_diagnostic.as_ref(),
                         result.runtime_receipt.as_ref(),
+                        result.runtime_tool_path_preflight_json.as_deref(),
                         discovery_diagnostics.as_ref(),
                         &stage_degraded_output_policy,
                         validation_summary_override,
@@ -6380,6 +7125,40 @@ impl BackgroundExecutor {
                 let validation_summary = import_result.validation_summary;
                 let final_agent_status = import_result.final_agent_status;
                 let _degraded_outputs_satisfy_stage = import_result.degraded_outputs_satisfy_stage;
+                if let Some(capture) = result.provider_session_store_capture.as_ref() {
+                    let preserve_failure = final_agent_status == AgentStatus::Failed;
+                    let archive_context = ProviderSessionStoreArchiveContext {
+                        provider: provider.clone(),
+                        run_id: run_id.to_string(),
+                        stage_id: stage_id.clone(),
+                        agent_id: agent_id.clone(),
+                        agent_execution_id: Some(agent_exec_id.to_string()),
+                        session_generation_id: source_session_generation_id.map(str::to_string),
+                        provider_session_id: result.provider_session_id.clone().or_else(|| {
+                            result
+                                .runtime_receipt
+                                .as_ref()
+                                .and_then(|receipt| receipt.provider_session_id.clone())
+                        }),
+                        failure_kind: if preserve_failure {
+                            final_agent_status.to_string()
+                        } else {
+                            "completed".to_string()
+                        },
+                    };
+                    if let Err(error) = finalize_provider_session_store_capture(
+                        capture,
+                        preserve_failure,
+                        &archive_context,
+                    ) {
+                        warn!(
+                            agent_execution_id = %agent_exec_id,
+                            stage_execution_id = %stage_execution_id,
+                            error = %error,
+                            "Failed to finalize provider session-store capture"
+                        );
+                    }
+                }
 
                 if p088_code_writer_completion_candidate {
                     if let Err(error) = persist_p088_code_writer_completion_receipt(
@@ -6387,6 +7166,7 @@ impl BackgroundExecutor {
                         &run.artifact_root,
                         run_id,
                         stage_execution_id,
+                        &stage_id,
                         agent_exec_id,
                         result.session_generation_id.as_deref(),
                         &provider,
@@ -6402,6 +7182,10 @@ impl BackgroundExecutor {
                         result.runtime_receipt.as_ref(),
                         p088_completion_repair_runtime_receipt.as_ref(),
                         p088_completion_repair_runtime_prompt_receipt.as_ref(),
+                        p090_staged_repair_materialization,
+                        result.runtime_tool_path_preflight_json.clone().or_else(|| {
+                            p090_runtime_tool_path_preflight_json_for_success(&provider)
+                        }),
                         p088_completion_turn_attempted,
                         output_contract_repair_turn_count,
                         p088_operator_retry_completion_recovery,
@@ -8004,6 +8788,7 @@ impl BackgroundExecutor {
         observed_failure_classification: Option<RuntimeFailureClassification>,
         close_diagnostic: Option<&acp::AcpCloseDiagnostic>,
         runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
+        runtime_tool_path_preflight_json: Option<&str>,
         discovery_diagnostics: Option<&AgentExecutionDiscoveryDiagnostics>,
         stage_degraded_output_policy: &workflow::plan::DegradedOutputPolicy,
         validation_summary_override: Option<TaskValidationSummary>,
@@ -8024,6 +8809,7 @@ impl BackgroundExecutor {
             completed_at,
             close_diagnostic,
             runtime_receipt,
+            runtime_tool_path_preflight_json,
         );
         let policy_failure_kind = runtime_facts
             .failure_kind
@@ -9943,6 +10729,12 @@ fn append_status_allowed_values_for_declared_output(prompt: &mut String, output:
     let Some(schema) = output.schema.as_ref() else {
         return;
     };
+    if schema.contract_id == IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID {
+        prompt.push_str(
+            "  Allowed `handoff_tasks[*].owner_class` values: `docs`, `manual_evidence`, \
+             `release`, `ops`, `product`, `human_operator`, `unknown`.\n",
+        );
+    }
     if !schema.required_fields.iter().any(|field| field == "status") {
         return;
     }
@@ -10028,6 +10820,19 @@ fn chainworks_output_contract_example(
     for output in declared_outputs {
         outputs.insert(
             output.target_path.clone(),
+            declared_output_contract_example_value(output),
+        );
+    }
+    outputs
+}
+
+fn chainworks_output_contract_example_by_output_name(
+    declared_outputs: &[DeclaredOutput],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut outputs = serde_json::Map::new();
+    for output in declared_outputs {
+        outputs.insert(
+            output.output_name.clone(),
             declared_output_contract_example_value(output),
         );
     }
@@ -10282,6 +11087,7 @@ async fn persist_p088_code_writer_completion_receipt(
     artifact_root: &str,
     run_id: RunId,
     stage_execution_id: domain::ids::StageExecutionId,
+    stage_id: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     session_generation_id: Option<&str>,
     provider: &str,
@@ -10297,6 +11103,8 @@ async fn persist_p088_code_writer_completion_receipt(
     original_runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
     repair_runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
     repair_runtime_prompt_receipt: Option<&AgentExecutionRuntimePromptReceiptRecord>,
+    p090_staged_repair_materialization: Option<P090StagedRepairMaterialization>,
+    runtime_tool_path_preflight_json: Option<String>,
     completion_turn_attempted: bool,
     generic_repair_turn_count: i64,
     operator_retry_completion_recovery: bool,
@@ -10349,6 +11157,26 @@ async fn persist_p088_code_writer_completion_receipt(
     };
     let decisions = settlement
         .map(|settlement| p088_output_decisions(&receipt_id, &settlement.decisions, validation))
+        .unwrap_or_default();
+    let mut settlement_rows = p090_staged_repair_materialization
+        .as_ref()
+        .map(|staged| staged.rows.clone())
+        .or_else(|| {
+            settlement.map(|settlement| {
+                p090_output_settlement_rows(
+                    &receipt_id,
+                    run_id,
+                    stage_id,
+                    stage_execution_id,
+                    agent_exec_id,
+                    session_generation_id,
+                    settlement,
+                    validation,
+                    completion_turn_attempted,
+                    created_at,
+                )
+            })
+        })
         .unwrap_or_default();
     let (fresh, missing, stale, control_plane) = settlement
         .map(|settlement| p088_decision_counts(&settlement.decisions))
@@ -10450,6 +11278,63 @@ async fn persist_p088_code_writer_completion_receipt(
         .count() as i64;
     let (transcript_status, transcript_absence_reason) =
         p088_transcript_status(transcript_text, transcript_artifact_path);
+    let provider_failure_envelope_claim = p090_provider_failure_envelope_claim(
+        provider,
+        original_capture,
+        repair_capture,
+        run_id,
+        stage_execution_id,
+        agent_exec_id,
+        session_generation_id,
+    );
+    let completion_boundary_subtype = p090_completion_boundary_subtype(
+        provider,
+        original_capture,
+        settlement,
+        missing,
+        validation,
+        repair_capture,
+        completion_turn_attempted,
+        completion_status,
+        runtime_tool_path_preflight_json.as_deref(),
+        provider_failure_envelope_claim,
+    );
+    let failure_envelope_authority = p090_failure_envelope_authority(
+        provider,
+        &completion_boundary_subtype,
+        provider_failure_envelope_claim,
+    );
+    let engine_failure_envelope_json = if failure_envelope_authority.as_deref()
+        == Some("engine_synthesized")
+        && !completion_boundary_subtype.starts_with("junie_repair_")
+    {
+        p090_engine_failure_envelope_json(
+            run_id,
+            stage_execution_id,
+            agent_exec_id,
+            session_generation_id,
+            &completion_boundary_subtype,
+            "completion_boundary_subtype",
+        )
+    } else {
+        None
+    };
+    let repair_failure_envelope_json = if failure_envelope_authority.as_deref()
+        == Some("engine_synthesized")
+        && completion_boundary_subtype.starts_with("junie_repair_")
+    {
+        p090_repair_failure_envelope_json(
+            run_id,
+            stage_execution_id,
+            agent_exec_id,
+            session_generation_id,
+            i64::from(completion_turn_attempted),
+            &completion_boundary_subtype,
+            "completion_repair_boundary",
+        )
+    } else {
+        None
+    };
     let mut receipt = CodeWriterCompletionReceiptRecord {
         id: receipt_id.clone(),
         run_id,
@@ -10475,7 +11360,7 @@ async fn persist_p088_code_writer_completion_receipt(
             settlement,
             missing,
         ),
-        work_change_kind,
+        work_change_kind: work_change_kind.clone(),
         pre_prompt_worktree_fingerprint_path: pre_fingerprint_path.map(str::to_string),
         post_prompt_worktree_fingerprint_path: post_fingerprint_path.map(str::to_string),
         pre_prompt_worktree_fingerprint_sha256: pre_fingerprint
@@ -10494,6 +11379,52 @@ async fn persist_p088_code_writer_completion_receipt(
             .unwrap_or_default(),
         completion_status: completion_status.to_string(),
         failure_class,
+        provider_runtime_family: p090_provider_runtime_family(provider),
+        completion_boundary_subtype: Some(completion_boundary_subtype),
+        final_payload_status: Some(p090_final_payload_status(original_capture, repair_capture)),
+        progress_before_handoff: Some(p090_progress_before_handoff(
+            work_change_kind.as_deref(),
+            missing,
+            completion_status,
+        )),
+        runtime_preflight_phase: Some(p090_runtime_preflight_phase(
+            provider,
+            runtime_tool_path_preflight_json.as_deref(),
+        )),
+        runtime_tool_path_preflight_json,
+        final_completion_payload_capture_json: p090_final_payload_capture_json(
+            original_capture,
+            original_text_artifacts
+                .as_ref()
+                .and_then(|paths| paths.raw_path.as_deref()),
+            original_text_artifacts
+                .as_ref()
+                .and_then(|paths| paths.redacted_path.as_deref()),
+            captures.len() as i64,
+            absence_count,
+            failure_envelope_authority.as_deref(),
+        ),
+        engine_failure_envelope_json,
+        repair_failure_envelope_json,
+        repair_materialization_summary_json:
+            p090_repair_materialization_summary_json_with_config_warning(
+                completion_turn_attempted,
+                &settlement_rows,
+                p090_staged_repair_missing_strict_warning(provider),
+            ),
+        repair_materialization_mode: Some(
+            p090_repair_materialization_mode_for_flags(
+                provider,
+                completion_turn_attempted,
+                p090_strict_final_payload_enabled(provider),
+                p090_staged_repair_settlement_requested(provider),
+                p090_staged_repair_disabled(provider),
+            )
+            .to_string(),
+        ),
+        strict_final_payload_enabled: p090_strict_final_payload_enabled(provider),
+        staged_repair_settlement_enabled: completion_turn_attempted
+            && p090_staged_repair_settlement_enabled(provider),
         terminal_response_status,
         completion_turn_attempted,
         completion_turn_result: normalized_completion_turn_result,
@@ -10587,11 +11518,38 @@ async fn persist_p088_code_writer_completion_receipt(
             runtime_receipt_record_from_receipt(agent_exec_id, runtime_receipt, created_at)
         })
         .transpose()?;
-    code_writer_completion_receipts::upsert_with_runtime_receipts(
+    if let Some(staged) = p090_staged_repair_materialization {
+        code_writer_completion_receipts::upsert_with_runtime_receipts_and_settlement_rows(
+            pool,
+            &receipt,
+            &captures,
+            &decisions,
+            &settlement_rows,
+            original_runtime_receipt_record.as_ref(),
+            repair_runtime_prompt_receipt,
+        )
+        .await?;
+        settlement_rows = commit_p090_staged_repair_materialization(staged, chrono::Utc::now())?;
+        publish_p090_committed_repair_artifact_generations(pool, &settlement_rows).await?;
+        receipt.repair_materialization_summary_json =
+            p090_repair_materialization_summary_json(completion_turn_attempted, &settlement_rows);
+        return code_writer_completion_receipts::upsert_with_runtime_receipts_and_settlement_rows(
+            pool,
+            &receipt,
+            &captures,
+            &decisions,
+            &settlement_rows,
+            original_runtime_receipt_record.as_ref(),
+            repair_runtime_prompt_receipt,
+        )
+        .await;
+    }
+    code_writer_completion_receipts::upsert_with_runtime_receipts_and_settlement_rows(
         pool,
         &receipt,
         &captures,
         &decisions,
+        &settlement_rows,
         original_runtime_receipt_record.as_ref(),
         repair_runtime_prompt_receipt,
     )
@@ -10699,6 +11657,190 @@ fn p088_output_decisions(
             }
         })
         .collect()
+}
+
+fn p090_output_settlement_rows(
+    receipt_id: &str,
+    run_id: RunId,
+    stage_id: &str,
+    stage_execution_id: domain::ids::StageExecutionId,
+    agent_execution_id: domain::ids::AgentExecutionId,
+    session_generation_id: Option<&str>,
+    settlement: &DeclaredOutputDiscoverySettlement,
+    validation: Option<&TaskValidationSummary>,
+    completion_turn_attempted: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Vec<CodeWriterOutputSettlementRow> {
+    settlement
+        .decisions
+        .iter()
+        .map(|decision| {
+            let validation_result = validation.and_then(|summary| {
+                summary
+                    .output_results
+                    .iter()
+                    .find(|result| result.output_name == decision.output_name)
+            });
+            let accepted = decision.status == OutputDiscoveryStatus::Accepted;
+            let valid = validation_result.is_none_or(|result| {
+                result.status == domain::validation::ValidationStatus::Passed
+                    || result.status == domain::validation::ValidationStatus::NoContractDeclared
+            });
+            let materializes = accepted && valid;
+            let candidate_digest = decision
+                .accepted_bytes_sha256
+                .clone()
+                .or_else(|| decision.content_digest.clone());
+            CodeWriterOutputSettlementRow {
+                id: format!("{receipt_id}:{}", decision.output_name),
+                receipt_id: receipt_id.to_string(),
+                run_id,
+                stage_id: stage_id.to_string(),
+                stage_execution_id,
+                agent_execution_id,
+                session_generation_id: Some(
+                    session_generation_id
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "none".to_string()),
+                ),
+                repair_attempt: if completion_turn_attempted { 1 } else { 0 },
+                output_name: decision.output_name.clone(),
+                contract_id: validation_result
+                    .and_then(|result| result.contract_id.clone())
+                    .unwrap_or_else(|| decision.output_name.clone()),
+                source_kind: p090_settlement_source_kind(decision, completion_turn_attempted),
+                source_generation_owner: decision
+                    .generated_by
+                    .as_deref()
+                    .map(|_| "control_plane")
+                    .unwrap_or("agent")
+                    .to_string(),
+                candidate_digest: candidate_digest.clone(),
+                staging_path: None,
+                canonical_path: decision
+                    .canonical_path
+                    .clone()
+                    .unwrap_or_else(|| decision.target_path.clone()),
+                canonical_before_sha256: None,
+                canonical_after_sha256: materializes.then_some(candidate_digest).flatten(),
+                decision: p090_settlement_decision(decision, valid).to_string(),
+                rejection_reason: p090_settlement_rejection_reason(decision, validation_result),
+                materialization_state: if materializes {
+                    "committed".to_string()
+                } else {
+                    "not_materialized".to_string()
+                },
+                active_pointer_generation_id: None,
+                created_at,
+                committed_at: materializes.then_some(created_at),
+            }
+        })
+        .collect()
+}
+
+fn p090_settlement_source_kind(
+    decision: &OutputDiscoveryDecision,
+    completion_turn_attempted: bool,
+) -> String {
+    if decision.reason == OutputDiscoveryReason::ControlPlaneGenerated {
+        "control_plane_generated".to_string()
+    } else if completion_turn_attempted {
+        "repair_chainworks_output".to_string()
+    } else {
+        "completion_chainworks_output".to_string()
+    }
+}
+
+fn p090_settlement_decision(decision: &OutputDiscoveryDecision, valid: bool) -> &'static str {
+    match decision.status {
+        OutputDiscoveryStatus::Accepted if valid => "accepted",
+        OutputDiscoveryStatus::Accepted => "rejected",
+        OutputDiscoveryStatus::Missing
+            if decision.reason == OutputDiscoveryReason::StaleExpectedOutput =>
+        {
+            "stale"
+        }
+        OutputDiscoveryStatus::Missing => "absent",
+        OutputDiscoveryStatus::Rejected => "rejected",
+    }
+}
+
+fn p090_settlement_rejection_reason(
+    decision: &OutputDiscoveryDecision,
+    validation_result: Option<&domain::validation::OutputValidationResult>,
+) -> Option<String> {
+    if let Some(validation_error) =
+        validation_result.and_then(|result| result.validation_error.clone())
+    {
+        return Some(validation_error);
+    }
+    let valid = validation_result.is_none_or(|result| {
+        result.status == domain::validation::ValidationStatus::Passed
+            || result.status == domain::validation::ValidationStatus::NoContractDeclared
+    });
+    match p090_settlement_decision(decision, valid) {
+        "accepted" => None,
+        _ => Some(enum_snake_value(decision.reason)),
+    }
+}
+
+fn p090_repair_materialization_summary_json(
+    completion_turn_attempted: bool,
+    settlement_rows: &[CodeWriterOutputSettlementRow],
+) -> Option<String> {
+    p090_repair_materialization_summary_json_with_config_warning(
+        completion_turn_attempted,
+        settlement_rows,
+        None,
+    )
+}
+
+fn p090_repair_materialization_summary_json_with_config_warning(
+    completion_turn_attempted: bool,
+    settlement_rows: &[CodeWriterOutputSettlementRow],
+    config_warning: Option<&str>,
+) -> Option<String> {
+    if !completion_turn_attempted {
+        return None;
+    }
+    let fresh_count = settlement_rows
+        .iter()
+        .filter(|row| row.decision == "accepted")
+        .count();
+    let stale_count = settlement_rows
+        .iter()
+        .filter(|row| row.decision == "stale")
+        .count();
+    let malformed_count = settlement_rows
+        .iter()
+        .filter(|row| row.decision == "rejected")
+        .count();
+    let absent_count = settlement_rows
+        .iter()
+        .filter(|row| row.decision == "absent")
+        .count();
+    let config_warnings = config_warning.into_iter().collect::<Vec<_>>();
+    serde_json::to_string(&serde_json::json!({
+        "schema": "p090_repair_materialization_summary_v1",
+        "fresh_count": fresh_count,
+        "stale_count": stale_count,
+        "malformed_count": malformed_count,
+        "absent_count": absent_count,
+        "config_warnings": config_warnings,
+        "output_decisions": settlement_rows.iter().map(|row| {
+            serde_json::json!({
+                "output_name": &row.output_name,
+                "contract_id": &row.contract_id,
+                "decision": &row.decision,
+                "source_kind": &row.source_kind,
+                "canonical_path": &row.canonical_path,
+                "content_sha256": &row.canonical_after_sha256,
+                "rejection_reason": &row.rejection_reason,
+                "materialization_state": &row.materialization_state,
+            })
+        }).collect::<Vec<_>>()
+    }))
+    .ok()
 }
 
 fn p088_text_capture_record(
@@ -10890,6 +12032,749 @@ fn p088_ingestion_boundary_failure(
         return Some("chainworks_output_not_extracted".to_string());
     }
     None
+}
+
+fn p090_provider_runtime_family(provider: &str) -> Option<String> {
+    Some(format!("{provider}_acp"))
+}
+
+fn p090_strict_final_payload_enabled(provider: &str) -> bool {
+    provider == "junie" && p090_env_flag("CHAINWORKS_P090_STRICT_FINAL_PAYLOAD", false)
+}
+
+fn p090_staged_repair_settlement_requested(provider: &str) -> bool {
+    provider == "junie" && p090_env_flag("CHAINWORKS_P090_STAGED_REPAIR_SETTLEMENT", false)
+}
+
+fn p090_staged_repair_settlement_enabled(provider: &str) -> bool {
+    provider == "junie"
+        && p090_strict_final_payload_enabled(provider)
+        && p090_staged_repair_settlement_requested(provider)
+        && !p090_env_flag("CHAINWORKS_P090_DISABLE_STAGED_REPAIR_SETTLEMENT", false)
+}
+
+fn p090_junie_preflight_enforce_enabled(provider: &str) -> bool {
+    provider == "junie" && p090_env_flag("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE", false)
+}
+
+fn p090_junie_preflight_records_diagnostics(provider: &str) -> bool {
+    provider == "junie"
+}
+
+fn p090_staged_repair_disabled(provider: &str) -> bool {
+    provider == "junie" && p090_env_flag("CHAINWORKS_P090_DISABLE_STAGED_REPAIR_SETTLEMENT", false)
+}
+
+fn p090_staged_repair_missing_strict_warning(provider: &str) -> Option<&'static str> {
+    (provider == "junie"
+        && p090_staged_repair_settlement_requested(provider)
+        && !p090_strict_final_payload_enabled(provider)
+        && !p090_staged_repair_disabled(provider))
+    .then_some("staged_repair_requested_without_strict_final_payload")
+}
+
+fn p090_repair_materialization_mode_for_flags(
+    provider: &str,
+    completion_turn_attempted: bool,
+    strict_final_payload_enabled: bool,
+    staged_repair_requested: bool,
+    staged_repair_disabled: bool,
+) -> &'static str {
+    if !completion_turn_attempted {
+        return "legacy_all_or_nothing";
+    }
+    if provider == "junie" && staged_repair_disabled {
+        return "staged_repair_disabled";
+    }
+    if provider == "junie" && staged_repair_requested && !strict_final_payload_enabled {
+        return "staged_repair_disabled_missing_strict_final_payload";
+    }
+    if provider == "junie" && staged_repair_requested && strict_final_payload_enabled {
+        return "staged_per_output";
+    }
+    "legacy_all_or_nothing"
+}
+
+fn p090_env_flag(name: &str, default: bool) -> bool {
+    p090_parse_flag(std::env::var(name).ok().as_deref(), default)
+}
+
+fn p090_parse_flag(raw: Option<&str>, default: bool) -> bool {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => default,
+    }
+}
+
+fn p090_completion_boundary_subtype(
+    provider: &str,
+    original_capture: &acp::AcpCompletionTextCaptureMetadata,
+    settlement: Option<&DeclaredOutputDiscoverySettlement>,
+    missing_required_output_count: usize,
+    validation: Option<&TaskValidationSummary>,
+    repair_capture: Option<&acp::AcpCompletionTextCaptureMetadata>,
+    completion_turn_attempted: bool,
+    completion_status: &str,
+    runtime_tool_path_preflight_json: Option<&str>,
+    provider_failure_envelope_claim: P090ProviderFailureEnvelopeClaim,
+) -> String {
+    if provider != "junie" {
+        return "none".to_string();
+    }
+    match provider_failure_envelope_claim {
+        P090ProviderFailureEnvelopeClaim::IdentityMismatch => {
+            return "provider_envelope_identity_mismatch".to_string();
+        }
+        P090ProviderFailureEnvelopeClaim::UnknownSchema => {
+            return "provider_envelope_unrecognized".to_string();
+        }
+        P090ProviderFailureEnvelopeClaim::Recognized => {
+            return "provider_authored_engine_failure_spoof_rejected".to_string();
+        }
+        P090ProviderFailureEnvelopeClaim::None => {}
+    }
+    if p090_preflight_status(runtime_tool_path_preflight_json).as_deref()
+        == Some("failed_no_launch")
+    {
+        return "junie_runtime_tool_path_failure_before_publication".to_string();
+    }
+    if original_capture.extraction_input_truncated || original_capture.completion_text_truncated {
+        return "junie_final_response_truncated".to_string();
+    }
+    if original_capture.capture_status == acp::AcpCompletionCaptureStatus::Absent {
+        return "junie_final_response_missing".to_string();
+    }
+    if completion_turn_attempted {
+        if let Some(validation) = validation {
+            let passed = validation
+                .output_results
+                .iter()
+                .filter(|result| {
+                    result.status == domain::validation::ValidationStatus::Passed
+                        || result.status == domain::validation::ValidationStatus::NoContractDeclared
+                })
+                .count();
+            let failed = validation
+                .output_results
+                .iter()
+                .filter(|result| result.status == domain::validation::ValidationStatus::Failed)
+                .count();
+            if passed > 0 && failed > 0 {
+                return "junie_repair_outputs_partially_materialized".to_string();
+            }
+            if failed > 0 {
+                return "junie_repair_returned_malformed_json".to_string();
+            }
+        }
+        if let Some(settlement) = settlement {
+            let accepted = settlement
+                .decisions
+                .iter()
+                .filter(|decision| decision.status == OutputDiscoveryStatus::Accepted)
+                .filter(|decision| decision.reason != OutputDiscoveryReason::ControlPlaneGenerated)
+                .count();
+            let rejected = settlement
+                .decisions
+                .iter()
+                .filter(|decision| decision.status == OutputDiscoveryStatus::Rejected)
+                .count();
+            let missing_or_stale = settlement
+                .decisions
+                .iter()
+                .filter(|decision| {
+                    decision.status == OutputDiscoveryStatus::Missing
+                        || decision.reason == OutputDiscoveryReason::StaleExpectedOutput
+                })
+                .count();
+            if accepted > 0 && (rejected > 0 || missing_or_stale > 0) {
+                return "junie_repair_outputs_partially_materialized".to_string();
+            }
+            if rejected > 0 {
+                return "junie_repair_returned_malformed_json".to_string();
+            }
+            if missing_or_stale > 0
+                && repair_capture.is_some_and(|capture| {
+                    capture.capture_status == acp::AcpCompletionCaptureStatus::Captured
+                })
+            {
+                return "junie_repair_returned_narrative".to_string();
+            }
+        }
+    }
+    if missing_required_output_count > 0 && completion_status != "complete" {
+        if settlement.is_some_and(|settlement| {
+            settlement
+                .decisions
+                .iter()
+                .any(|decision| decision.status == OutputDiscoveryStatus::Rejected)
+        }) {
+            return "provider_envelope_unrecognized".to_string();
+        }
+        if repair_capture.is_some_and(|capture| {
+            capture.capture_status == acp::AcpCompletionCaptureStatus::Captured
+                && (capture.extraction_input_truncated || capture.completion_text_truncated)
+        }) {
+            return "junie_repair_returned_malformed_json".to_string();
+        }
+        return "junie_progress_without_terminal_handoff".to_string();
+    }
+    "none".to_string()
+}
+
+fn p090_runtime_preflight_phase(
+    provider: &str,
+    runtime_tool_path_preflight_json: Option<&str>,
+) -> String {
+    if provider != "junie" {
+        return "not_recorded".to_string();
+    }
+    p090_preflight_status(runtime_tool_path_preflight_json).unwrap_or_else(|| "passed".to_string())
+}
+
+fn p090_preflight_status(runtime_tool_path_preflight_json: Option<&str>) -> Option<String> {
+    runtime_tool_path_preflight_json.and_then(|json| p090_preflight_status_from_json(json))
+}
+
+fn p090_preflight_status_from_json(json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn p090_preflight_attempt_count_from_json(json: &str) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("attempt_count")
+                .and_then(serde_json::Value::as_i64)
+        })
+}
+
+fn p090_preflight_remediation_from_json(json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("remediation_applied")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn p090_enrich_runtime_facts_with_preflight_json(
+    facts: &mut AgentExecutionRuntimeFacts,
+    runtime_tool_path_preflight_json: Option<&str>,
+) {
+    let Some(json) = runtime_tool_path_preflight_json else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return;
+    };
+    facts.runtime_preflight_json = Some(json.to_string());
+    facts.runtime_preflight_phase = value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| facts.runtime_preflight_phase.clone());
+    facts.runtime_preflight_attempt_count = value
+        .get("attempt_count")
+        .and_then(serde_json::Value::as_i64)
+        .or(facts.runtime_preflight_attempt_count);
+    facts.runtime_preflight_remediation = value
+        .get("remediation_applied")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| facts.runtime_preflight_remediation.clone());
+    facts.runtime_preflight_provider_launched = value
+        .get("provider_launched")
+        .and_then(serde_json::Value::as_bool)
+        .or(facts.runtime_preflight_provider_launched);
+}
+
+async fn p090_prepare_junie_preflight_remediation(
+    pool: &SqlitePool,
+    agent_execution_id: domain::ids::AgentExecutionId,
+    req: &acp::ExecutionRequest,
+) -> Result<()> {
+    if req.provider != "junie" {
+        return Ok(());
+    }
+
+    let remediation = if req.worktree_write_enabled
+        && req
+            .worktree_root
+            .as_deref()
+            .is_some_and(|root| !Path::new(root).is_dir())
+        && Path::new(&req.workspace_root).is_dir()
+    {
+        Some("wrong_cwd_workspace_root")
+    } else if let Some(runtime_cache) = p090_junie_runtime_cache_dir(req) {
+        if !runtime_cache.is_dir() {
+            std::fs::create_dir_all(&runtime_cache).with_context(|| {
+                format!(
+                    "create P090 Junie runtime cache directory {}",
+                    runtime_cache.display()
+                )
+            })?;
+            Some("runtime_home_cache_rebuilt")
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let Some(remediation) = remediation else {
+        return Ok(());
+    };
+
+    let now = chrono::Utc::now();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.runtime_preflight_phase = Some("preflight_remediating".into());
+    facts.runtime_preflight_attempt_count = Some(2);
+    facts.runtime_preflight_remediation = Some(remediation.to_string());
+    facts.runtime_preflight_provider_launched = Some(false);
+    facts.runtime_preflight_json = Some(
+        serde_json::json!({
+            "schema": "p090_runtime_tool_path_preflight_v1",
+            "status": "preflight_remediating",
+            "attempt_count": 2,
+            "remediation_applied": remediation,
+            "provider_launched": false,
+            "enforcement_enabled": p090_junie_preflight_enforce_enabled("junie"),
+            "failed_operation_class": if remediation == "runtime_home_cache_rebuilt" { "read_runtime_home" } else { "read_project_file" },
+            "redacted_path_class": if remediation == "runtime_home_cache_rebuilt" { "junie_runtime_cache" } else { "provider_execution_root" },
+            "failure_category": if remediation == "runtime_home_cache_rebuilt" { "runtime_home_unwritable" } else { "wrong_cwd_or_missing_project_root" },
+            "remediation_hint": if remediation == "runtime_home_cache_rebuilt" { "rebuilt Junie ACP runtime cache directory" } else { "retry with canonical workspace root" },
+            "lifecycle_phases": ["preflight_running", "preflight_remediating"]
+        })
+        .to_string(),
+    );
+    agent_execution_runtime_facts::upsert(pool, &facts).await?;
+    Ok(())
+}
+
+fn p090_junie_runtime_cache_dir(req: &acp::ExecutionRequest) -> Option<PathBuf> {
+    req.chainworks_meta_root
+        .as_deref()
+        .map(PathBuf::from)
+        .map(|root| root.join("acp-runtime/junie/cache"))
+}
+
+async fn p090_claim_junie_provider_launch_lease(
+    pool: &SqlitePool,
+    agent_execution_id: domain::ids::AgentExecutionId,
+    capacity: &InvokeAgentCapacityConfig,
+    runtime_tool_path_preflight_json: Option<&str>,
+) -> Result<bool> {
+    let mut tx =
+        db::writer::begin_repository_transaction(pool, "p090.claim_junie_provider_launch_lease")
+            .await?;
+    let running_status = AgentStatus::Running.to_string();
+    let execution = sqlx::query(
+        r#"SELECT status, COALESCE(provider_family, provider) AS provider_family
+           FROM agent_executions
+           WHERE id = ?1"#,
+    )
+    .bind(agent_execution_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(execution) = execution else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let status: String = execution.get("status");
+    let provider_family: String = execution.get("provider_family");
+    if status != running_status || provider_family != "junie" {
+        tx.commit().await?;
+        return Ok(true);
+    }
+
+    if let Some(provider_cap) = capacity.provider_caps.get("junie") {
+        let provider_active: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM agent_executions ae
+               LEFT JOIN agent_execution_runtime_facts arf ON arf.agent_execution_id = ae.id
+               WHERE ae.status = ?1
+                 AND COALESCE(ae.provider_family, ae.provider) = 'junie'
+                 AND ae.id != ?2
+                 AND NOT (
+                   arf.runtime_preflight_phase IN ('preflight_running', 'preflight_remediating')
+                   AND COALESCE(arf.runtime_preflight_provider_launched, 0) = 0
+                 )"#,
+        )
+        .bind(&running_status)
+        .bind(agent_execution_id.to_string())
+        .fetch_one(&mut **tx)
+        .await?;
+        if provider_active as usize >= *provider_cap {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+    }
+
+    let now = chrono::Utc::now();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    let launch_json = p090_runtime_tool_path_preflight_json_mark_provider_launched(
+        runtime_tool_path_preflight_json,
+    );
+    facts.runtime_preflight_phase = launch_json
+        .as_deref()
+        .and_then(p090_preflight_status_from_json)
+        .or_else(|| Some("passed".to_string()));
+    facts.runtime_preflight_attempt_count = launch_json
+        .as_deref()
+        .and_then(p090_preflight_attempt_count_from_json);
+    facts.runtime_preflight_remediation = launch_json
+        .as_deref()
+        .and_then(p090_preflight_remediation_from_json);
+    facts.runtime_preflight_provider_launched = Some(true);
+    facts.runtime_preflight_json = launch_json;
+    agent_execution_runtime_facts::upsert_tx(&mut tx, &facts).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+fn p090_runtime_tool_path_preflight_json_mark_provider_launched(
+    runtime_tool_path_preflight_json: Option<&str>,
+) -> Option<String> {
+    runtime_tool_path_preflight_json.map(|json| {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json) else {
+            return json.to_string();
+        };
+        if let Some(object) = value.as_object_mut() {
+            object.insert("provider_launched".to_string(), serde_json::json!(true));
+        }
+        serde_json::to_string(&value).unwrap_or_else(|_| json.to_string())
+    })
+}
+
+fn p090_runtime_tool_path_preflight_json_for_success(provider: &str) -> Option<String> {
+    (provider == "junie").then(|| {
+        serde_json::json!({
+            "schema": "p090_runtime_tool_path_preflight_v1",
+            "status": "passed",
+            "attempt_count": 1,
+            "remediation_applied": null,
+            "provider_launched": true,
+            "enforcement_enabled": p090_junie_preflight_enforce_enabled(provider),
+            "failed_operation_class": null,
+            "redacted_path_class": null,
+            "failure_category": null,
+            "remediation_hint": null,
+            "lifecycle_phases": ["preflight_running", "passed"]
+        })
+        .to_string()
+    })
+}
+
+fn p090_runtime_tool_path_preflight_json_from_error(
+    provider: &str,
+    error: &anyhow::Error,
+) -> Option<String> {
+    if provider != "junie" {
+        return None;
+    }
+    let message = error.to_string();
+    let (operation, path_class, category, hint) =
+        if message.contains("missing_provider_execution_root") {
+            (
+                "read_project_file",
+                "provider_execution_root",
+                "wrong_cwd_or_missing_project_root",
+                "retry with the canonical worktree/project root",
+            )
+        } else if message.contains("missing_chainworks_meta_root") {
+            (
+                "write_output_dir",
+                "chainworks_meta_root",
+                "runtime_home_unwritable",
+                "repair or recreate the run metadata directory",
+            )
+        } else if message.contains("Operation not permitted") {
+            (
+                "read_project_file",
+                "project_root",
+                "operation_not_permitted",
+                "repair macOS privacy/sandbox access for the project root",
+            )
+        } else if message.to_ascii_lowercase().contains("permission denied") {
+            (
+                "read_project_file",
+                "project_root",
+                "permission_denied",
+                "repair filesystem permissions for the project root",
+            )
+        } else {
+            return None;
+        };
+    Some(
+        serde_json::json!({
+            "schema": "p090_runtime_tool_path_preflight_v1",
+            "status": "failed_no_launch",
+            "attempt_count": 1,
+            "remediation_applied": null,
+            "provider_launched": false,
+            "enforcement_enabled": p090_junie_preflight_enforce_enabled(provider),
+            "failed_operation_class": operation,
+            "redacted_path_class": path_class,
+            "failure_category": category,
+            "remediation_hint": hint,
+            "lifecycle_phases": ["preflight_running", "failed_no_launch"]
+        })
+        .to_string(),
+    )
+}
+
+fn p090_final_payload_status(
+    original_capture: &acp::AcpCompletionTextCaptureMetadata,
+    repair_capture: Option<&acp::AcpCompletionTextCaptureMetadata>,
+) -> String {
+    let selected = repair_capture.unwrap_or(original_capture);
+    if selected.extraction_input_truncated || selected.completion_text_truncated {
+        "truncated".to_string()
+    } else if selected.capture_status == acp::AcpCompletionCaptureStatus::Captured {
+        "present".to_string()
+    } else {
+        "missing".to_string()
+    }
+}
+
+fn p090_progress_before_handoff(
+    work_change_kind: Option<&str>,
+    missing_required_output_count: usize,
+    completion_status: &str,
+) -> String {
+    if completion_status == "complete" {
+        "none".to_string()
+    } else if missing_required_output_count > 0 && work_change_kind == Some("current_attempt_diff")
+    {
+        "worktree_diff_detected".to_string()
+    } else if work_change_kind.is_some() {
+        "meaningful_progress".to_string()
+    } else {
+        "none".to_string()
+    }
+}
+
+fn p090_final_payload_capture_json(
+    original_capture: &acp::AcpCompletionTextCaptureMetadata,
+    raw_text_artifact_path: Option<&str>,
+    redacted_text_artifact_path: Option<&str>,
+    capture_count: i64,
+    absence_count: i64,
+    failure_envelope_authority: Option<&str>,
+) -> Option<String> {
+    serde_json::to_string(&serde_json::json!({
+        "schema": "p090_final_completion_payload_capture_v1",
+        "status": p090_capture_status_value(original_capture),
+        "capture_source": original_capture
+            .capture_source
+            .as_ref()
+            .map(p088_capture_source),
+        "capture_record_ref": "original:0",
+        "raw_text_artifact_path": raw_text_artifact_path,
+        "redacted_text_artifact_path": redacted_text_artifact_path,
+        "raw_byte_limit": original_capture.raw_byte_limit,
+        "captured_byte_count": original_capture.captured_byte_count,
+        "completion_text_truncated": original_capture.completion_text_truncated,
+        "extraction_input_truncated": original_capture.extraction_input_truncated,
+        "extraction_input_sha256": original_capture.extraction_input_sha256,
+        "failure_envelope_authority": failure_envelope_authority,
+        "capture_count": capture_count,
+        "absence_count": absence_count,
+    }))
+    .ok()
+}
+
+fn p090_engine_failure_envelope_json(
+    run_id: RunId,
+    stage_execution_id: domain::ids::StageExecutionId,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    session_generation_id: Option<&str>,
+    completion_boundary_subtype: &str,
+    reason: &str,
+) -> Option<String> {
+    serde_json::to_string(&serde_json::json!({
+        "schema_version": "code_writer_engine_failure.v1",
+        "source": "engine_synthesized",
+        "run_id": run_id.to_string(),
+        "stage_execution_id": stage_execution_id.to_string(),
+        "agent_execution_id": agent_exec_id.to_string(),
+        "session_generation_id": session_generation_id,
+        "completion_boundary_subtype": completion_boundary_subtype,
+        "reason": reason,
+    }))
+    .ok()
+}
+
+fn p090_repair_failure_envelope_json(
+    run_id: RunId,
+    stage_execution_id: domain::ids::StageExecutionId,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    session_generation_id: Option<&str>,
+    repair_attempt: i64,
+    completion_boundary_subtype: &str,
+    reason: &str,
+) -> Option<String> {
+    serde_json::to_string(&serde_json::json!({
+        "schema_version": "code_writer_repair_failure.v1",
+        "source": "engine_synthesized",
+        "run_id": run_id.to_string(),
+        "stage_execution_id": stage_execution_id.to_string(),
+        "agent_execution_id": agent_exec_id.to_string(),
+        "session_generation_id": session_generation_id,
+        "repair_attempt": repair_attempt,
+        "completion_boundary_subtype": completion_boundary_subtype,
+        "reason": reason,
+    }))
+    .ok()
+}
+
+fn p090_failure_envelope_authority(
+    provider: &str,
+    completion_boundary_subtype: &str,
+    provider_failure_envelope_claim: P090ProviderFailureEnvelopeClaim,
+) -> Option<String> {
+    if provider != "junie" {
+        return None;
+    }
+    if provider_failure_envelope_claim != P090ProviderFailureEnvelopeClaim::None {
+        return Some("provider_claim_rejected".to_string());
+    }
+    (completion_boundary_subtype != "none").then(|| "engine_synthesized".to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum P090ProviderFailureEnvelopeClaim {
+    None,
+    Recognized,
+    IdentityMismatch,
+    UnknownSchema,
+}
+
+fn p090_provider_failure_envelope_claim(
+    provider: &str,
+    original_capture: &acp::AcpCompletionTextCaptureMetadata,
+    repair_capture: Option<&acp::AcpCompletionTextCaptureMetadata>,
+    run_id: RunId,
+    stage_execution_id: domain::ids::StageExecutionId,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    session_generation_id: Option<&str>,
+) -> P090ProviderFailureEnvelopeClaim {
+    if provider != "junie" {
+        return P090ProviderFailureEnvelopeClaim::None;
+    }
+    [Some(original_capture), repair_capture]
+        .into_iter()
+        .flatten()
+        .filter_map(|capture| capture.captured_text.as_deref())
+        .map(|text| {
+            p090_provider_failure_envelope_claim_from_text(
+                text,
+                run_id,
+                stage_execution_id,
+                agent_exec_id,
+                session_generation_id,
+            )
+        })
+        .find(|claim| *claim != P090ProviderFailureEnvelopeClaim::None)
+        .unwrap_or(P090ProviderFailureEnvelopeClaim::None)
+}
+
+fn p090_provider_failure_envelope_claim_from_text(
+    text: &str,
+    run_id: RunId,
+    stage_execution_id: domain::ids::StageExecutionId,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    session_generation_id: Option<&str>,
+) -> P090ProviderFailureEnvelopeClaim {
+    let Some(value) = p090_provider_failure_envelope_json(text) else {
+        if text.contains("CHAINWORKS_OUTPUT_V2") {
+            return P090ProviderFailureEnvelopeClaim::UnknownSchema;
+        }
+        return P090ProviderFailureEnvelopeClaim::None;
+    };
+    let schema = value
+        .get("schema")
+        .or_else(|| value.get("schema_version"))
+        .and_then(serde_json::Value::as_str);
+    match schema {
+        Some(
+            "code_writer_engine_failure_v1"
+            | "code_writer_repair_failure_v1"
+            | "code_writer_engine_failure.v1"
+            | "code_writer_repair_failure.v1",
+        ) => {
+            let expected = [
+                ("run_id", run_id.to_string()),
+                ("stage_execution_id", stage_execution_id.to_string()),
+                ("agent_execution_id", agent_exec_id.to_string()),
+            ];
+            let ids_match = expected.iter().all(|(field, expected)| {
+                value
+                    .get(*field)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|actual| actual == expected)
+            }) && match session_generation_id {
+                Some(expected) => value
+                    .get("session_generation_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|actual| actual == expected),
+                None => true,
+            };
+            if ids_match {
+                P090ProviderFailureEnvelopeClaim::Recognized
+            } else {
+                P090ProviderFailureEnvelopeClaim::IdentityMismatch
+            }
+        }
+        Some(schema)
+            if schema.contains("code_writer") && schema.contains("failure")
+                || schema == "CHAINWORKS_OUTPUT_V2" =>
+        {
+            P090ProviderFailureEnvelopeClaim::UnknownSchema
+        }
+        _ => P090ProviderFailureEnvelopeClaim::None,
+    }
+}
+
+fn p090_provider_failure_envelope_json(text: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .or_else(|| {
+            let start = text.find('{')?;
+            let end = text.rfind('}')?;
+            (end > start)
+                .then(|| serde_json::from_str::<serde_json::Value>(&text[start..=end]).ok())
+                .flatten()
+        })
+        .and_then(|value| {
+            let schema = value
+                .get("schema")
+                .or_else(|| value.get("schema_version"))
+                .and_then(serde_json::Value::as_str);
+            let has_failure_shape = schema.is_some_and(|schema| {
+                schema.contains("code_writer") && schema.contains("failure")
+                    || schema == "CHAINWORKS_OUTPUT_V2"
+            });
+            has_failure_shape.then_some(value)
+        })
+}
+
+fn p090_capture_status_value(capture: &acp::AcpCompletionTextCaptureMetadata) -> &'static str {
+    match capture.capture_status {
+        acp::AcpCompletionCaptureStatus::Captured => "captured",
+        acp::AcpCompletionCaptureStatus::Absent => "absent",
+    }
 }
 
 fn p088_activation_source(
@@ -11090,7 +12975,8 @@ fn code_writer_completion_repair_prompt(
         prompt.push('\n');
     }
     prompt.push_str(
-        "\nReturn exactly one JSON object. Use canonical target paths as `CHAINWORKS_OUTPUT` keys:\n",
+        "\nReturn exactly one JSON object. Use output names as `CHAINWORKS_OUTPUT` keys. \
+         Canonical target paths are accepted as fallback only:\n",
     );
     let failed_outputs: Vec<DeclaredOutput> = declared_outputs
         .iter()
@@ -11110,7 +12996,7 @@ fn code_writer_completion_repair_prompt(
     for output in &outputs_for_example {
         append_status_allowed_values_for_declared_output(&mut prompt, output);
     }
-    let example_outputs = chainworks_output_contract_example(&outputs_for_example);
+    let example_outputs = chainworks_output_contract_example_by_output_name(&outputs_for_example);
     let example = serde_json::json!({ "CHAINWORKS_OUTPUT": example_outputs });
     if let Ok(example) = serde_json::to_string(&example) {
         prompt.push_str(&example);
@@ -11151,6 +13037,9 @@ fn merge_contract_repair_result(initial: &mut acp::ExecutionResult, repair: acp:
         .xcode_shim_warning_events
         .extend(repair.xcode_shim_warning_events);
     initial.close_diagnostic = repair.close_diagnostic.or(initial.close_diagnostic.take());
+    initial.provider_session_store_capture = repair
+        .provider_session_store_capture
+        .or_else(|| initial.provider_session_store_capture.clone());
     initial.acp_prompt_duration_ms = repair
         .acp_prompt_duration_ms
         .or(initial.acp_prompt_duration_ms);
@@ -11670,6 +13559,272 @@ mod tests {
         assert!(prompt.contains("\"summary\":\"\""));
         assert!(prompt.contains("\"status\":\"green\""));
         assert!(!prompt.contains("{\"status\":\"complete\"}"));
+    }
+
+    #[test]
+    fn code_writer_completion_repair_prompt_prefers_output_name_keys() {
+        let declared_outputs = vec![
+            DeclaredOutput {
+                output_name: "implementation_progress".to_string(),
+                target_path: "/workspace/.chainworks/implementation/progress.json".to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "implementation_progress".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec![
+                        "status".to_string(),
+                        "current_phase".to_string(),
+                        "completed_items".to_string(),
+                        "deferred_items".to_string(),
+                        "notes".to_string(),
+                    ],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "implementation_self_assessment".to_string(),
+                target_path: "/workspace/.chainworks/implementation/self-assessment.json"
+                    .to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "implementation_self_assessment_v2".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec![
+                        "implementation_complete".to_string(),
+                        "verification_green".to_string(),
+                        "remaining_code_tasks".to_string(),
+                        "handoff_tasks".to_string(),
+                        "known_risks".to_string(),
+                        "tests_run".to_string(),
+                        "docs_impacted".to_string(),
+                    ],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let validation = TaskValidationSummary {
+            output_results: declared_outputs
+                .iter()
+                .map(|output| domain::validation::OutputValidationResult {
+                    output_name: output.output_name.clone(),
+                    contract_id: output
+                        .schema
+                        .as_ref()
+                        .map(|schema| schema.contract_id.clone()),
+                    status: domain::validation::ValidationStatus::Failed,
+                    missing_fields: vec![],
+                    validation_error: Some("required output was not produced".to_string()),
+                    raw_payload_size: 0,
+                })
+                .collect(),
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some("required output was not produced".to_string()),
+        };
+
+        let prompt = code_writer_completion_repair_prompt(&validation, &declared_outputs);
+
+        assert!(prompt.contains("Use output names as `CHAINWORKS_OUTPUT` keys"));
+        assert!(prompt.contains("{\"CHAINWORKS_OUTPUT\":{\"implementation_progress\""));
+        assert!(prompt.contains("\"implementation_self_assessment\""));
+        assert!(prompt.contains("Canonical target paths are accepted as fallback"));
+        assert!(!prompt.contains(
+            "{\"CHAINWORKS_OUTPUT\":{\"/workspace/.chainworks/implementation/progress.json\""
+        ));
+    }
+
+    #[test]
+    fn code_writer_completion_repair_prompt_lists_allowed_handoff_owner_classes() {
+        let declared_outputs = vec![DeclaredOutput {
+            output_name: "implementation_self_assessment".to_string(),
+            target_path: "/workspace/.chainworks/implementation/self-assessment.json".to_string(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id: "implementation_self_assessment_v2".to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec![
+                    "implementation_complete".to_string(),
+                    "verification_green".to_string(),
+                    "remaining_code_tasks".to_string(),
+                    "handoff_tasks".to_string(),
+                    "known_risks".to_string(),
+                    "tests_run".to_string(),
+                    "docs_impacted".to_string(),
+                ],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+        let validation = TaskValidationSummary {
+            output_results: vec![domain::validation::OutputValidationResult {
+                output_name: "implementation_self_assessment".to_string(),
+                contract_id: Some("implementation_self_assessment_v2".to_string()),
+                status: domain::validation::ValidationStatus::Failed,
+                missing_fields: vec![],
+                validation_error: Some(
+                    "invalid handoff owner_class: code_writer is not allowed".to_string(),
+                ),
+                raw_payload_size: 128,
+            }],
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: Some(domain::validation::ValidationFailureClass::OutputContractMismatch),
+            failure_summary: Some("invalid handoff owner_class".to_string()),
+        };
+
+        let prompt = code_writer_completion_repair_prompt(&validation, &declared_outputs);
+
+        assert!(prompt.contains("Allowed `handoff_tasks[*].owner_class` values"));
+        assert!(prompt.contains("docs"));
+        assert!(prompt.contains("manual_evidence"));
+        assert!(prompt.contains("release"));
+        assert!(prompt.contains("ops"));
+        assert!(prompt.contains("product"));
+        assert!(prompt.contains("human_operator"));
+        assert!(prompt.contains("unknown"));
+        assert!(prompt.contains("invalid handoff owner_class: code_writer is not allowed"));
+    }
+
+    #[test]
+    fn proposal_090_repair_validation_merges_repaired_outputs_with_original_passes() {
+        let declared_outputs = vec![
+            DeclaredOutput {
+                output_name: "implementation_progress".to_string(),
+                target_path: "/workspace/.chainworks/implementation/progress.json".to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "implementation_progress".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec![
+                        "status".to_string(),
+                        "current_phase".to_string(),
+                        "completed_items".to_string(),
+                        "deferred_items".to_string(),
+                        "notes".to_string(),
+                    ],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "implementation_self_assessment".to_string(),
+                target_path: "/workspace/.chainworks/implementation/self-assessment.json"
+                    .to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "implementation_self_assessment_v2".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec![
+                        "status".to_string(),
+                        "implementation_complete".to_string(),
+                        "verification_green".to_string(),
+                        "remaining_code_tasks".to_string(),
+                        "handoff_tasks".to_string(),
+                        "known_risks".to_string(),
+                        "tests_run".to_string(),
+                        "docs_impacted".to_string(),
+                    ],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "tests_result".to_string(),
+                target_path: "/workspace/.chainworks/implementation/tests.json".to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "tests_result_v1".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec!["status".to_string(), "summary".to_string()],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+
+        let original = vec![
+            CapturedOutput {
+                declared: declared_outputs[0].clone(),
+                machine_bytes: Some(
+                    br#"{"status":"complete","current_phase":"implementation","completed_items":[],"deferred_items":[],"notes":""}"#
+                        .to_vec(),
+                ),
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: declared_outputs[1].clone(),
+                machine_bytes: None,
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: declared_outputs[2].clone(),
+                machine_bytes: Some(br#"{"status":"green","summary":""}"#.to_vec()),
+                companion_bytes: None,
+            },
+        ];
+        let repair = vec![
+            CapturedOutput {
+                declared: declared_outputs[0].clone(),
+                machine_bytes: None,
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: declared_outputs[1].clone(),
+                machine_bytes: Some(
+                    br#"{"status":"complete","implementation_complete":true,"verification_green":true,"remaining_code_tasks":[],"handoff_tasks":[{"owner_class":"ops","target_stage":"pre_push","blocking_review":false,"summary":"clean up","evidence":"validation failure repaired through completion repair"}],"known_risks":[],"tests_run":["./scripts/test-gate.sh proposal-058"],"docs_impacted":[]}"#
+                        .to_vec(),
+                ),
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: declared_outputs[2].clone(),
+                machine_bytes: None,
+                companion_bytes: None,
+            },
+        ];
+
+        let merged = merge_repair_captured_outputs(&original, &repair);
+        let validation = validate_task_outputs(&merged);
+
+        assert!(validation.failure_class.is_none());
+        assert_eq!(validation.output_results.len(), 3);
+        assert!(validation
+            .output_results
+            .iter()
+            .all(|result| result.status == domain::validation::ValidationStatus::Passed));
     }
 
     #[test]
@@ -12386,6 +14541,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None,
+            None,
         );
         assert_eq!(facts.failure_kind, Some(AgentFailureKind::ProviderQuota));
         assert!(degraded_policy_allows_valid_failed_outputs(
@@ -12418,6 +14574,7 @@ mod tests {
                 },
             )),
             chrono::Utc::now(),
+            None,
             None,
             None,
         );
@@ -12683,6 +14840,617 @@ mod tests {
     }
 
     #[test]
+    fn proposal_090_junie_preflight_permission_error_maps_to_no_launch_subtype() {
+        let error = anyhow::anyhow!(
+            "missing_provider_execution_root: ACP provider cwd /private/project does not exist or is not a directory"
+        );
+        let preflight_json =
+            p090_runtime_tool_path_preflight_json_from_error("junie", &error).unwrap();
+        let preflight: serde_json::Value = serde_json::from_str(&preflight_json).unwrap();
+
+        assert_eq!(preflight["status"], "failed_no_launch");
+        assert_eq!(preflight["provider_launched"], false);
+        assert_eq!(preflight["redacted_path_class"], "provider_execution_root");
+        assert_eq!(
+            p090_runtime_preflight_phase("junie", Some(&preflight_json)),
+            "failed_no_launch"
+        );
+        assert_eq!(
+            p090_completion_boundary_subtype(
+                "junie",
+                &acp::AcpCompletionTextCaptureMetadata::default(),
+                None,
+                1,
+                None,
+                None,
+                false,
+                "missing_required_outputs",
+                Some(preflight_json.as_str()),
+                P090ProviderFailureEnvelopeClaim::None,
+            ),
+            "junie_runtime_tool_path_failure_before_publication"
+        );
+    }
+
+    #[test]
+    fn proposal_090_successful_junie_receipt_records_passed_preflight_without_new_agent_status() {
+        let preflight_json = p090_runtime_tool_path_preflight_json_for_success("junie").unwrap();
+        let preflight: serde_json::Value = serde_json::from_str(&preflight_json).unwrap();
+
+        assert_eq!(preflight["status"], "passed");
+        assert_eq!(preflight["provider_launched"], true);
+        assert_eq!(preflight["enforcement_enabled"], false);
+        assert_eq!(
+            p090_runtime_preflight_phase("junie", Some(&preflight_json)),
+            "passed"
+        );
+        assert_eq!(p090_runtime_preflight_phase("codex", None), "not_recorded");
+    }
+
+    #[tokio::test]
+    async fn proposal_090_runtime_cache_remediation_persists_intermediate_preflight_phase() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        db::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .unwrap();
+        let agent_execution_id = domain::ids::AgentExecutionId::new();
+        let now = chrono::Utc::now();
+        agent_executions::insert(
+            &pool,
+            &domain::agent::AgentExecution {
+                id: agent_execution_id,
+                stage_execution_id: None,
+                agent_id: "code_writer".into(),
+                provider: "junie".into(),
+                model: Some("junie".into()),
+                status: AgentStatus::Running,
+                started_at: now,
+                completed_at: None,
+                owner_execution_lineage_id: None,
+                session_lineage_id: None,
+                session_generation_id: Some("session-generation-p090".into()),
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: Some("code_writer".into()),
+                session_reuse_scope: None,
+                session_family_id: None,
+                session_reuse_disposition: Some("fresh".into()),
+                session_reset_reason: None,
+                backend_profile_id: None,
+                requested_mcp_extensions_json: None,
+                predicted_mcp_extensions_json: None,
+                predicted_mcp_runtime_ids_json: None,
+                actual_mcp_extensions_json: None,
+                actual_mcp_runtime_ids_json: None,
+                denied_mcp_extensions_json: None,
+                mcp_blocking_issues_json: None,
+                actual_mcp_observation_json: None,
+                actual_xcode_runtime_observation_json: None,
+                mcp_session_startup_latency_ms: None,
+                owner_kind: Some("lead_conflict_mediation".into()),
+                owner_id: Some("mediation-p090".into()),
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
+                total_cost_cents: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let meta_root = tmp.path().join(".chainworks/runs/run-1");
+        let req = acp::ExecutionRequest {
+            agent_execution_id: Some(agent_execution_id),
+            run_id: RunId::new(),
+            stage_execution_id: None,
+            stage_id: "implementation".into(),
+            attempt_number: 1,
+            agent_id: "code_writer".into(),
+            provider: "junie".into(),
+            model: Some("junie".into()),
+            effort: None,
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            prompt: "test".into(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: Some("session-generation-p090".into()),
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: Some(meta_root.to_string_lossy().into_owned()),
+            legacy_broad_discovery_policy: Default::default(),
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".into(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
+        };
+
+        p090_prepare_junie_preflight_remediation(&pool, agent_execution_id, &req)
+            .await
+            .unwrap();
+
+        let facts = agent_execution_runtime_facts::find_by_execution_id(&pool, agent_execution_id)
+            .await
+            .unwrap()
+            .expect("runtime facts must be persisted");
+        assert_eq!(
+            facts.runtime_preflight_phase.as_deref(),
+            Some("preflight_remediating")
+        );
+        assert_eq!(facts.runtime_preflight_attempt_count, Some(2));
+        assert_eq!(
+            facts.runtime_preflight_remediation.as_deref(),
+            Some("runtime_home_cache_rebuilt")
+        );
+        assert_eq!(facts.runtime_preflight_provider_launched, Some(false));
+        assert!(meta_root.join("acp-runtime/junie/cache").is_dir());
+    }
+
+    #[tokio::test]
+    async fn proposal_090_junie_provider_launch_lease_is_atomic_after_preflight() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        db::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let first_execution_id = domain::ids::AgentExecutionId::new();
+        let second_execution_id = domain::ids::AgentExecutionId::new();
+        for agent_execution_id in [first_execution_id, second_execution_id] {
+            agent_executions::insert(
+                &pool,
+                &domain::agent::AgentExecution {
+                    id: agent_execution_id,
+                    stage_execution_id: None,
+                    agent_id: "code_writer".into(),
+                    provider: "junie".into(),
+                    model: Some("junie".into()),
+                    status: AgentStatus::Running,
+                    started_at: now,
+                    completed_at: None,
+                    owner_execution_lineage_id: None,
+                    session_lineage_id: None,
+                    session_generation_id: Some(format!("session-{agent_execution_id}")),
+                    rehydrated_from_checkpoint_artifact_id: None,
+                    invocation_owner_key: Some("code_writer".into()),
+                    session_reuse_scope: None,
+                    session_family_id: None,
+                    session_reuse_disposition: Some("fresh".into()),
+                    session_reset_reason: None,
+                    backend_profile_id: None,
+                    requested_mcp_extensions_json: None,
+                    predicted_mcp_extensions_json: None,
+                    predicted_mcp_runtime_ids_json: None,
+                    actual_mcp_extensions_json: None,
+                    actual_mcp_runtime_ids_json: None,
+                    denied_mcp_extensions_json: None,
+                    mcp_blocking_issues_json: None,
+                    actual_mcp_observation_json: None,
+                    actual_xcode_runtime_observation_json: None,
+                    mcp_session_startup_latency_ms: None,
+                    owner_kind: Some("lead_conflict_mediation".into()),
+                    owner_id: Some("mediation-p090".into()),
+                    lead_mediation_record_id: None,
+                    origin_stage_execution_id: None,
+                    total_cost_cents: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cached_input_tokens: None,
+                    transcript_artifact_id: None,
+                    actual_toolchain_mapping_diagnostics_json: None,
+                },
+            )
+            .await
+            .unwrap();
+            let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+            facts.runtime_preflight_phase = Some("preflight_running".into());
+            facts.runtime_preflight_attempt_count = Some(1);
+            facts.runtime_preflight_provider_launched = Some(false);
+            agent_execution_runtime_facts::upsert(&pool, &facts)
+                .await
+                .unwrap();
+        }
+
+        let capacity = InvokeAgentCapacityConfig {
+            max_active_total: 10,
+            max_active_per_run: 10,
+            max_active_xcode_mcp: 10,
+            provider_caps: HashMap::from([("junie".to_string(), 1)]),
+        };
+        let preflight_json = p090_runtime_tool_path_preflight_json_for_success("junie").unwrap();
+
+        assert!(
+            p090_claim_junie_provider_launch_lease(
+                &pool,
+                first_execution_id,
+                &capacity,
+                Some(&preflight_json)
+            )
+            .await
+            .unwrap(),
+            "first Junie execution should acquire the provider launch lease"
+        );
+        assert!(
+            !p090_claim_junie_provider_launch_lease(
+                &pool,
+                second_execution_id,
+                &capacity,
+                Some(&preflight_json)
+            )
+            .await
+            .unwrap(),
+            "second Junie execution must wait while provider cap=1 is leased"
+        );
+
+        let first_facts =
+            agent_execution_runtime_facts::find_by_execution_id(&pool, first_execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+        let second_facts =
+            agent_execution_runtime_facts::find_by_execution_id(&pool, second_execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(first_facts.runtime_preflight_provider_launched, Some(true));
+        assert_eq!(
+            second_facts.runtime_preflight_provider_launched,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn proposal_090_rollout_flags_default_off_and_parse_explicit_values() {
+        assert!(!p090_parse_flag(None, false));
+        assert!(p090_parse_flag(Some("1"), false));
+        assert!(p090_parse_flag(Some("true"), false));
+        assert!(!p090_parse_flag(Some("0"), true));
+        assert!(!p090_parse_flag(Some("off"), true));
+        assert!(p090_parse_flag(Some("unexpected"), true));
+    }
+
+    #[test]
+    fn proposal_090_staged_repair_without_strict_is_explicitly_reported() {
+        let mode = p090_repair_materialization_mode_for_flags("junie", true, false, true, false);
+        assert_eq!(mode, "staged_repair_disabled_missing_strict_final_payload");
+        let summary = p090_repair_materialization_summary_json_with_config_warning(
+            true,
+            &[],
+            Some("staged_repair_requested_without_strict_final_payload"),
+        )
+        .expect("summary json");
+        let value: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(
+            value["config_warnings"],
+            serde_json::json!(["staged_repair_requested_without_strict_final_payload"])
+        );
+    }
+
+    #[test]
+    fn proposal_090_completion_boundary_subtype_distinguishes_partial_and_narrative_repair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let declared = vec![
+            DeclaredOutput {
+                output_name: "implementation_progress".to_string(),
+                target_path: tmp
+                    .path()
+                    .join("implementation/progress.md")
+                    .to_string_lossy()
+                    .into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "implementation_self_assessment".to_string(),
+                target_path: tmp
+                    .path()
+                    .join("implementation/self-assessment.json")
+                    .to_string_lossy()
+                    .into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let specs =
+            build_expected_output_specs(&declared, tmp.path().to_str().unwrap(), None, None, false);
+        let discovered = vec![
+            acp::DiscoveredArtifact {
+                name: "implementation_progress".to_string(),
+                content: b"new progress".to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+            },
+            acp::DiscoveredArtifact {
+                name: "implementation_self_assessment".to_string(),
+                content: b"{ malformed".to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+            },
+        ];
+        let settlement = build_declared_output_discovery_settlement(&specs, &discovered, &[]);
+        let validation = TaskValidationSummary {
+            output_results: vec![
+                domain::validation::OutputValidationResult {
+                    output_name: "implementation_progress".into(),
+                    contract_id: Some("implementation_progress".into()),
+                    status: domain::validation::ValidationStatus::Passed,
+                    missing_fields: vec![],
+                    validation_error: None,
+                    raw_payload_size: 12,
+                },
+                domain::validation::OutputValidationResult {
+                    output_name: "implementation_self_assessment".into(),
+                    contract_id: Some("implementation_self_assessment_v2".into()),
+                    status: domain::validation::ValidationStatus::Failed,
+                    missing_fields: vec![],
+                    validation_error: Some("malformed_json".into()),
+                    raw_payload_size: 11,
+                },
+            ],
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: Some(domain::validation::ValidationFailureClass::OutputContractMismatch),
+            failure_summary: Some("self assessment malformed".into()),
+        };
+        let captured = acp::AcpCompletionTextCaptureMetadata {
+            capture_status: acp::AcpCompletionCaptureStatus::Captured,
+            captured_text: Some("CHAINWORKS_OUTPUT".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            p090_completion_boundary_subtype(
+                "junie",
+                &captured,
+                Some(&settlement),
+                1,
+                Some(&validation),
+                Some(&captured),
+                true,
+                "partial",
+                None,
+                P090ProviderFailureEnvelopeClaim::None,
+            ),
+            "junie_repair_outputs_partially_materialized"
+        );
+
+        let narrative_settlement = build_declared_output_discovery_settlement(&specs, &[], &[]);
+        assert_eq!(
+            p090_completion_boundary_subtype(
+                "junie",
+                &captured,
+                Some(&narrative_settlement),
+                2,
+                None,
+                Some(&captured),
+                true,
+                "missing_required_outputs",
+                None,
+                P090ProviderFailureEnvelopeClaim::None,
+            ),
+            "junie_repair_returned_narrative"
+        );
+    }
+
+    #[test]
+    fn proposal_090_provider_failure_envelope_identity_mismatch_fails_closed() {
+        let run_id = RunId::new();
+        let stage_execution_id = domain::ids::StageExecutionId::new();
+        let agent_exec_id = domain::ids::AgentExecutionId::new();
+        let captured = acp::AcpCompletionTextCaptureMetadata {
+            capture_status: acp::AcpCompletionCaptureStatus::Captured,
+            captured_text: Some(
+                serde_json::json!({
+                    "schema": "code_writer_engine_failure_v1",
+                    "run_id": "spoofed-run",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "agent_execution_id": agent_exec_id.to_string(),
+                    "session_generation_id": "session-generation-1",
+                    "subtype": "provider_claimed_failure"
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let claim = p090_provider_failure_envelope_claim(
+            "junie",
+            &captured,
+            None,
+            run_id,
+            stage_execution_id,
+            agent_exec_id,
+            Some("session-generation-1"),
+        );
+
+        assert_eq!(claim, P090ProviderFailureEnvelopeClaim::IdentityMismatch);
+        assert_eq!(
+            p090_completion_boundary_subtype(
+                "junie",
+                &captured,
+                None,
+                1,
+                None,
+                None,
+                false,
+                "missing_required_outputs",
+                None,
+                claim,
+            ),
+            "provider_envelope_identity_mismatch"
+        );
+        assert_eq!(
+            p090_failure_envelope_authority("junie", "provider_envelope_identity_mismatch", claim,)
+                .as_deref(),
+            Some("provider_claim_rejected")
+        );
+    }
+
+    #[test]
+    fn proposal_090_provider_authored_dotted_failure_schema_is_rejected_as_spoof() {
+        let run_id = RunId::new();
+        let stage_execution_id = domain::ids::StageExecutionId::new();
+        let agent_exec_id = domain::ids::AgentExecutionId::new();
+        let captured = acp::AcpCompletionTextCaptureMetadata {
+            capture_status: acp::AcpCompletionCaptureStatus::Captured,
+            captured_text: Some(
+                serde_json::json!({
+                    "schema_version": "code_writer_engine_failure.v1",
+                    "run_id": run_id.to_string(),
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "agent_execution_id": agent_exec_id.to_string(),
+                    "session_generation_id": "session-generation-1",
+                    "completion_boundary_subtype": "junie_progress_without_terminal_handoff"
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let claim = p090_provider_failure_envelope_claim(
+            "junie",
+            &captured,
+            None,
+            run_id,
+            stage_execution_id,
+            agent_exec_id,
+            Some("session-generation-1"),
+        );
+
+        assert_eq!(claim, P090ProviderFailureEnvelopeClaim::Recognized);
+        assert_eq!(
+            p090_completion_boundary_subtype(
+                "junie",
+                &captured,
+                None,
+                1,
+                None,
+                None,
+                false,
+                "missing_required_outputs",
+                None,
+                claim,
+            ),
+            "provider_authored_engine_failure_spoof_rejected"
+        );
+        assert_eq!(
+            p090_failure_envelope_authority(
+                "junie",
+                "provider_authored_engine_failure_spoof_rejected",
+                claim,
+            )
+            .as_deref(),
+            Some("provider_claim_rejected")
+        );
+    }
+
+    #[test]
+    fn proposal_090_engine_owned_failure_envelope_sections_are_versioned_json() {
+        let run_id = RunId::new();
+        let stage_execution_id = domain::ids::StageExecutionId::new();
+        let agent_exec_id = domain::ids::AgentExecutionId::new();
+        let engine_json = p090_engine_failure_envelope_json(
+            run_id,
+            stage_execution_id,
+            agent_exec_id,
+            Some("session-generation-1"),
+            "junie_progress_without_terminal_handoff",
+            "terminal_response_missing",
+        )
+        .expect("engine envelope json");
+        let engine: serde_json::Value = serde_json::from_str(&engine_json).unwrap();
+
+        assert_eq!(engine["schema_version"], "code_writer_engine_failure.v1");
+        assert_eq!(engine["source"], "engine_synthesized");
+        assert_eq!(
+            engine["completion_boundary_subtype"],
+            "junie_progress_without_terminal_handoff"
+        );
+
+        let repair_json = p090_repair_failure_envelope_json(
+            run_id,
+            stage_execution_id,
+            agent_exec_id,
+            Some("session-generation-1"),
+            1,
+            "junie_repair_returned_malformed_json",
+            "repair_json_malformed",
+        )
+        .expect("repair envelope json");
+        let repair: serde_json::Value = serde_json::from_str(&repair_json).unwrap();
+
+        assert_eq!(repair["schema_version"], "code_writer_repair_failure.v1");
+        assert_eq!(repair["source"], "engine_synthesized");
+        assert_eq!(repair["repair_attempt"], 1);
+        assert_eq!(
+            repair["completion_boundary_subtype"],
+            "junie_repair_returned_malformed_json"
+        );
+    }
+
+    #[test]
+    fn proposal_090_unknown_provider_failure_envelope_schema_fails_closed() {
+        let captured = acp::AcpCompletionTextCaptureMetadata {
+            capture_status: acp::AcpCompletionCaptureStatus::Captured,
+            captured_text: Some(
+                serde_json::json!({
+                    "schema": "code_writer_future_failure_v99",
+                    "run_id": RunId::new().to_string()
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        };
+        let claim = p090_provider_failure_envelope_claim(
+            "junie",
+            &captured,
+            None,
+            RunId::new(),
+            domain::ids::StageExecutionId::new(),
+            domain::ids::AgentExecutionId::new(),
+            None,
+        );
+
+        assert_eq!(claim, P090ProviderFailureEnvelopeClaim::UnknownSchema);
+        assert_eq!(
+            p090_completion_boundary_subtype(
+                "junie",
+                &captured,
+                None,
+                1,
+                None,
+                None,
+                false,
+                "missing_required_outputs",
+                None,
+                claim,
+            ),
+            "provider_envelope_unrecognized"
+        );
+    }
+
+    #[test]
     fn proposal_088_completion_capture_status_uses_proposal_vocabulary() {
         let captured = acp::AcpCompletionTextCaptureMetadata {
             capture_status: acp::AcpCompletionCaptureStatus::Captured,
@@ -12877,6 +15645,7 @@ mod tests {
             chrono::Utc::now(),
             Some(&close_diagnostic),
             None,
+            None,
         );
 
         assert_eq!(
@@ -12956,6 +15725,321 @@ mod tests {
             std::fs::read_to_string(companion_path).unwrap(),
             "# Review\n"
         );
+    }
+
+    #[test]
+    fn proposal_090_repair_materializes_valid_outputs_without_overwriting_malformed_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let progress_path = tmp.path().join("implementation/progress.md");
+        let self_assessment_path = tmp.path().join("implementation/self-assessment.json");
+        std::fs::create_dir_all(progress_path.parent().unwrap()).unwrap();
+        std::fs::write(&self_assessment_path, br#"{"status":"old-valid"}"#).unwrap();
+        let declared = vec![
+            DeclaredOutput {
+                output_name: "implementation_progress".to_string(),
+                target_path: progress_path.to_string_lossy().into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "implementation_self_assessment".to_string(),
+                target_path: self_assessment_path.to_string_lossy().into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let specs =
+            build_expected_output_specs(&declared, tmp.path().to_str().unwrap(), None, None, false);
+        let discovered = vec![
+            acp::DiscoveredArtifact {
+                name: "implementation_progress".to_string(),
+                content: b"new progress".to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+            },
+            acp::DiscoveredArtifact {
+                name: "implementation_self_assessment".to_string(),
+                content: b"{ malformed".to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+            },
+        ];
+        let settlement = build_declared_output_discovery_settlement(&specs, &discovered, &[]);
+        let validation = TaskValidationSummary {
+            output_results: vec![
+                domain::validation::OutputValidationResult {
+                    output_name: "implementation_progress".into(),
+                    contract_id: Some("implementation_progress".into()),
+                    status: domain::validation::ValidationStatus::Passed,
+                    missing_fields: vec![],
+                    validation_error: None,
+                    raw_payload_size: 12,
+                },
+                domain::validation::OutputValidationResult {
+                    output_name: "implementation_self_assessment".into(),
+                    contract_id: Some("implementation_self_assessment_v2".into()),
+                    status: domain::validation::ValidationStatus::Failed,
+                    missing_fields: vec![],
+                    validation_error: Some("malformed_json".into()),
+                    raw_payload_size: 11,
+                },
+            ],
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: Some(domain::validation::ValidationFailureClass::OutputContractMismatch),
+            failure_summary: Some("self assessment malformed".into()),
+        };
+
+        let staged = stage_p090_repair_materialization(
+            tmp.path().to_str().unwrap(),
+            RunId::new(),
+            "state_implementation",
+            domain::ids::StageExecutionId::new(),
+            domain::ids::AgentExecutionId::new(),
+            Some("generation-1"),
+            1,
+            "receipt",
+            &declared,
+            &settlement,
+            &validation,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+
+        assert!(
+            !progress_path.exists(),
+            "staging must not create canonical outputs before durable rows are written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&self_assessment_path).unwrap(),
+            r#"{"status":"old-valid"}"#
+        );
+
+        let staged_progress = staged
+            .rows
+            .iter()
+            .find(|row| row.output_name == "implementation_progress")
+            .unwrap();
+        assert_eq!(staged_progress.materialization_state, "staged");
+        assert!(staged_progress.staging_path.is_some());
+        assert_eq!(staged_progress.canonical_after_sha256, None);
+        assert!(staged_progress.active_pointer_generation_id.is_some());
+
+        let malformed = staged
+            .rows
+            .iter()
+            .find(|row| row.output_name == "implementation_self_assessment")
+            .unwrap();
+        assert_eq!(malformed.decision, "rejected");
+        assert_eq!(malformed.materialization_state, "not_materialized");
+        assert_eq!(
+            malformed.rejection_reason.as_deref(),
+            Some("malformed_json")
+        );
+
+        let rows = commit_p090_staged_repair_materialization(staged, chrono::Utc::now()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(progress_path).unwrap(),
+            "new progress"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&self_assessment_path).unwrap(),
+            r#"{"status":"old-valid"}"#
+        );
+        let committed_progress = rows
+            .iter()
+            .find(|row| row.output_name == "implementation_progress")
+            .unwrap();
+        assert_eq!(committed_progress.materialization_state, "committed");
+        assert!(committed_progress.canonical_after_sha256.is_some());
+    }
+
+    #[tokio::test]
+    async fn proposal_090_committed_repair_rows_publish_only_accepted_active_artifacts() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        db::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = RunId::new();
+        let idea_id = domain::ids::IdeaId::new();
+        db::repos::ideas::insert(
+            &pool,
+            &domain::idea::Idea {
+                id: idea_id,
+                title: "P090".into(),
+                body: "P090 active pointer publication test".into(),
+                workspace_root_path: None,
+                project_key: None,
+                status: domain::idea::IdeaStatus::Active,
+                created_at: chrono::Utc::now(),
+                archived_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::repos::runs::insert(
+            &pool,
+            &domain::run::Run {
+                id: run_id,
+                idea_id,
+                status: domain::run::RunStatus::Running,
+                workflow_id: "wf".into(),
+                workflow_title: "Workflow".into(),
+                workspace_root: tmp.path().to_string_lossy().into_owned(),
+                artifact_root: tmp
+                    .path()
+                    .join(".chainworks")
+                    .to_string_lossy()
+                    .into_owned(),
+                started_at: chrono::Utc::now(),
+                completed_at: None,
+                cancellation_requested_at: None,
+                cancellation_settled_at: None,
+                cancellation_settlement_log: None,
+                current_state: None,
+                workflow_yaml_path: None,
+                agent_catalog_yaml_path: None,
+                worktree_root: None,
+                base_branch: None,
+                base_revision: None,
+                target_branch: None,
+                delivery_configuration_json: None,
+                delivery_preflight_json: None,
+                workflow_family: None,
+                project_key: None,
+                risk_class: None,
+                stack: None,
+                workflow_snapshot_hash: None,
+                catalog_snapshot_hash: None,
+                workflow_snapshot_json: None,
+                catalog_snapshot_json: None,
+                drift_detected_at: None,
+                drift_details_json: None,
+                chainworks_meta_root: None,
+                review_routing_json: None,
+                closeout_readiness_mode: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let old_self_assessment_path = tmp.path().join("old-self-assessment.json");
+        std::fs::write(
+            &old_self_assessment_path,
+            br#"{"implementation_complete":true,"verification_green":true,"remaining_code_tasks":[],"handoff_tasks":[],"known_risks":[],"tests_run":["focused"],"docs_impacted":[]}"#,
+        )
+        .unwrap();
+        artifact_contracts::upsert_generation_and_rebuild(
+            &pool,
+            ActiveArtifactGenerationInput {
+                run_id,
+                artifact_id: domain::ids::ArtifactId::new(),
+                contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.to_string(),
+                canonical_path: "implementation_self_assessment".into(),
+                raw_path: old_self_assessment_path.to_string_lossy().into_owned(),
+                raw_status: "complete".into(),
+                generation_id: "old-self-assessment-generation".into(),
+                source_agent_execution_id: None,
+                source_stage_execution_id: None,
+                source_session_generation_id: None,
+                source_work_item_id: None,
+                supersedes_generation_id: None,
+                output_settlement: AgentOutputSettlement::None,
+                partial: false,
+                warnings: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        let tests_path = tmp.path().join("tests-result.json");
+        std::fs::write(&tests_path, br#"{"status":"green"}"#).unwrap();
+        let stage_execution_id = domain::ids::StageExecutionId::new();
+        let agent_execution_id = domain::ids::AgentExecutionId::new();
+        let rows = vec![
+            CodeWriterOutputSettlementRow {
+                id: "receipt:tests_result".into(),
+                receipt_id: "receipt".into(),
+                run_id,
+                stage_id: "implementation".into(),
+                stage_execution_id,
+                agent_execution_id,
+                session_generation_id: Some("session-generation-1".into()),
+                repair_attempt: 1,
+                output_name: "tests_result".into(),
+                contract_id: "tests_result_v1".into(),
+                source_kind: "chainworks_output".into(),
+                source_generation_owner: "agent".into(),
+                candidate_digest: Some("digest".into()),
+                staging_path: None,
+                canonical_path: tests_path.to_string_lossy().into_owned(),
+                canonical_before_sha256: None,
+                canonical_after_sha256: Some("digest".into()),
+                decision: "accepted".into(),
+                rejection_reason: None,
+                materialization_state: "committed".into(),
+                active_pointer_generation_id: Some("new-tests-generation".into()),
+                created_at: chrono::Utc::now(),
+                committed_at: Some(chrono::Utc::now()),
+            },
+            CodeWriterOutputSettlementRow {
+                id: "receipt:self_assessment".into(),
+                receipt_id: "receipt".into(),
+                run_id,
+                stage_id: "implementation".into(),
+                stage_execution_id,
+                agent_execution_id,
+                session_generation_id: Some("session-generation-1".into()),
+                repair_attempt: 1,
+                output_name: "implementation_self_assessment".into(),
+                contract_id: IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID.to_string(),
+                source_kind: "chainworks_output".into(),
+                source_generation_owner: "agent".into(),
+                candidate_digest: Some("malformed".into()),
+                staging_path: None,
+                canonical_path: old_self_assessment_path.to_string_lossy().into_owned(),
+                canonical_before_sha256: None,
+                canonical_after_sha256: None,
+                decision: "rejected".into(),
+                rejection_reason: Some("malformed_json".into()),
+                materialization_state: "not_materialized".into(),
+                active_pointer_generation_id: Some("must-not-publish".into()),
+                created_at: chrono::Utc::now(),
+                committed_at: None,
+            },
+        ];
+
+        publish_p090_committed_repair_artifact_generations(&pool, &rows)
+            .await
+            .unwrap();
+
+        let tests_active: String = sqlx::query_scalar(
+            "SELECT generation_id FROM active_artifact_contracts WHERE run_id = ?1 AND contract_id = 'tests_result_v1'",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let self_active: String = sqlx::query_scalar(
+            "SELECT generation_id FROM active_artifact_contracts WHERE run_id = ?1 AND contract_id = ?2",
+        )
+        .bind(run_id.to_string())
+        .bind(IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(tests_active, "new-tests-generation");
+        assert_eq!(self_active, "old-self-assessment-generation");
     }
 
     #[test]

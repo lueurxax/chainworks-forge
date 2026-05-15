@@ -22,6 +22,14 @@ use engine::lifecycle_reporter::LifecycleReporter;
 use engine::work_queue::WorkQueue;
 use graphql_server::schema::build_schema;
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .unwrap();
+    pool
+}
+
 fn make_schema(pool: sqlx::SqlitePool) -> graphql_server::schema::AppSchema {
     let events = event_bus::new_bus(16);
     let handler = Arc::new(CommandHandler::new(
@@ -48,7 +56,7 @@ fn operator_request(query: &str) -> Request {
 /// T17: startupRecoverySummary returns None when no readback has been recorded.
 #[tokio::test]
 async fn p066_startup_recovery_summary_returns_none_when_empty() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let schema = make_schema(pool);
 
     let query = r#"{ startupRecoverySummary { id toolchainCache { sessionScopedRootsSeen } } }"#;
@@ -65,7 +73,7 @@ async fn p066_startup_recovery_summary_returns_none_when_empty() {
 /// T17: startupRecoverySummary.toolchainCache includes named fields when populated.
 #[tokio::test]
 async fn p066_startup_recovery_summary_includes_toolchain_cache_fields() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let now = Utc::now();
 
     let readback = StartupRecoveryReadback {
@@ -135,7 +143,7 @@ async fn p066_startup_recovery_summary_includes_toolchain_cache_fields() {
 /// T17: toolchainCache fields are None when no sweep has run (pre-P066 rows).
 #[tokio::test]
 async fn p066_startup_recovery_summary_toolchain_cache_is_empty_before_sweep() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let now = Utc::now();
 
     let readback = StartupRecoveryReadback {
@@ -179,7 +187,7 @@ async fn p066_startup_recovery_summary_toolchain_cache_is_empty_before_sweep() {
 /// T18: toolchainCacheHousekeepingSummary returns None before first sweep.
 #[tokio::test]
 async fn p066_toolchain_cache_housekeeping_summary_none_before_sweep() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let schema = make_schema(pool);
 
     let query = r#"{ toolchainCacheHousekeepingSummary { id lastSweepStartedAt } }"#;
@@ -196,7 +204,7 @@ async fn p066_toolchain_cache_housekeeping_summary_none_before_sweep() {
 /// T18: toolchainCacheHousekeepingSummary returns named fields after a sweep.
 #[tokio::test]
 async fn p066_toolchain_cache_housekeeping_summary_exposes_named_fields() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let now = Utc::now();
 
     let sweep = ToolchainCacheHousekeepingReadback {

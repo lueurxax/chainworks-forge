@@ -1,14 +1,19 @@
-use anyhow::Result;
-use std::path::PathBuf;
+use anyhow::{Context, Result};
+use chrono::Utc;
+use serde_json::json;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::adapters::XcodeShimGrantCleanup;
+use crate::adapters::{CleanupPathPolicy, CleanupPathSpec};
 use crate::transport::{AcpSessionConfig, AcpTransportSession};
 use crate::{
     AcpCloseDiagnostic, AcpExecutionError, AcpPromptProgressSink, ExecutionRequest,
-    ExecutionResult, NoopAcpPromptProgressSink,
+    ExecutionResult, NoopAcpPromptProgressSink, ProviderSessionStoreCapture,
 };
 use domain::ids::AgentExecutionId;
 
@@ -16,8 +21,33 @@ use domain::ids::AgentExecutionId;
 /// being closed.
 pub struct AcpSession {
     transport: AcpTransportSession,
-    cleanup_paths: Vec<PathBuf>,
+    cleanup_paths: Vec<CleanupPathSpec>,
     xcode_shim_grants: Vec<XcodeShimGrantCleanup>,
+}
+
+#[derive(Clone, Debug)]
+pub enum AcpSessionCloseBehavior {
+    Delete,
+    StageForOutcome,
+    ArchiveFailure(ProviderSessionStoreArchiveContext),
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderSessionStoreArchiveContext {
+    pub provider: String,
+    pub run_id: String,
+    pub stage_id: String,
+    pub agent_id: String,
+    pub agent_execution_id: Option<String>,
+    pub session_generation_id: Option<String>,
+    pub provider_session_id: Option<String>,
+    pub failure_kind: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AcpCloseOutcome {
+    pub diagnostic: Option<AcpCloseDiagnostic>,
+    pub provider_session_store_capture: Option<ProviderSessionStoreCapture>,
 }
 
 impl AcpSession {
@@ -38,7 +68,16 @@ impl AcpSession {
         config: &AcpSessionConfig<'_>,
         cleanup_path: Option<PathBuf>,
     ) -> Result<Self> {
-        Self::start_with_cleanup_paths(child, req, config, cleanup_path.into_iter().collect()).await
+        Self::start_with_cleanup_paths(
+            child,
+            req,
+            config,
+            cleanup_path
+                .into_iter()
+                .map(CleanupPathSpec::delete)
+                .collect(),
+        )
+        .await
     }
 
     /// Start a new transport-backed session and remove every cleanup path when
@@ -48,7 +87,7 @@ impl AcpSession {
         child: tokio::process::Child,
         req: &ExecutionRequest,
         config: &AcpSessionConfig<'_>,
-        cleanup_paths: Vec<PathBuf>,
+        cleanup_paths: Vec<CleanupPathSpec>,
     ) -> Result<Self> {
         Self::start_with_cleanup_paths_and_xcode_shim_grants(
             child,
@@ -64,13 +103,15 @@ impl AcpSession {
         child: tokio::process::Child,
         req: &ExecutionRequest,
         config: &AcpSessionConfig<'_>,
-        cleanup_paths: Vec<PathBuf>,
+        cleanup_paths: Vec<CleanupPathSpec>,
         xcode_shim_grants: Vec<XcodeShimGrantCleanup>,
     ) -> Result<Self> {
         let transport = match AcpTransportSession::start(child, req, config).await {
             Ok(transport) => transport,
             Err(err) => {
-                cleanup_paths.iter().for_each(cleanup_path);
+                cleanup_paths
+                    .iter()
+                    .for_each(|spec| cleanup_path(&spec.path));
                 xcode_shim_grants
                     .iter()
                     .for_each(XcodeShimGrantCleanup::remove);
@@ -196,6 +237,7 @@ impl AcpSession {
             mcp_session_startup_latency_ms: self.transport.mcp_session_startup_latency_ms(),
             xcode_shim_warning_events,
             close_diagnostic: None,
+            provider_session_store_capture: None,
             acp_pre_initialize_local_latency_ms: Some(acp_pre_initialize_local_latency_ms),
             acp_initialize_latency_ms: Some(acp_initialize_latency_ms),
             acp_session_new_latency_ms: Some(acp_session_new_latency_ms),
@@ -205,25 +247,44 @@ impl AcpSession {
             acp_pre_prompt_metadata_digest_bytes,
             legacy_broad_discovery_snapshot,
             runtime_receipt: self.transport.runtime_receipt().cloned(),
+            runtime_tool_path_preflight_json: None,
         })
     }
 
     /// Close the live ACP session and wait for the subprocess to exit.
     pub async fn close(&mut self) -> Result<Option<AcpCloseDiagnostic>> {
+        Ok(self
+            .close_with_behavior(AcpSessionCloseBehavior::Delete)
+            .await?
+            .diagnostic)
+    }
+
+    pub async fn close_with_behavior(
+        &mut self,
+        behavior: AcpSessionCloseBehavior,
+    ) -> Result<AcpCloseOutcome> {
         let close_result = self.transport.close().await;
-        for path in self.cleanup_paths.drain(..) {
-            if let Err(error) = std::fs::remove_dir_all(&path) {
-                warn!(
-                    cleanup_path = %path.display(),
+        let mut outcome = AcpCloseOutcome {
+            diagnostic: close_result?,
+            provider_session_store_capture: None,
+        };
+        for spec in self.cleanup_paths.drain(..) {
+            match finalize_cleanup_spec(&spec, &behavior) {
+                Ok(Some(capture)) => {
+                    outcome.provider_session_store_capture = Some(capture);
+                }
+                Ok(None) => {}
+                Err(error) => warn!(
+                    cleanup_path = %spec.path.display(),
                     error = %error,
-                    "Failed to remove ACP session cleanup path"
-                );
+                    "Failed to finalize ACP session cleanup path"
+                ),
             }
         }
         for grant in self.xcode_shim_grants.drain(..) {
             grant.remove();
         }
-        close_result
+        Ok(outcome)
     }
 
     pub fn is_live(&mut self) -> bool {
@@ -233,6 +294,185 @@ impl AcpSession {
 
 fn cleanup_path(path: &PathBuf) {
     let _ = std::fs::remove_dir_all(path);
+}
+
+fn finalize_cleanup_spec(
+    spec: &CleanupPathSpec,
+    behavior: &AcpSessionCloseBehavior,
+) -> Result<Option<ProviderSessionStoreCapture>> {
+    match spec.policy {
+        CleanupPathPolicy::DeleteRecursively => {
+            remove_cleanup_dir(&spec.path)?;
+            Ok(None)
+        }
+        CleanupPathPolicy::StageCodexSessionStore => match behavior {
+            AcpSessionCloseBehavior::Delete => {
+                remove_cleanup_dir(&spec.path)?;
+                Ok(None)
+            }
+            AcpSessionCloseBehavior::StageForOutcome => {
+                let capture = stage_codex_session_store(&spec.path)?;
+                remove_cleanup_dir(&spec.path)?;
+                Ok(capture)
+            }
+            AcpSessionCloseBehavior::ArchiveFailure(context) => {
+                let capture = stage_codex_session_store(&spec.path)?;
+                remove_cleanup_dir(&spec.path)?;
+                if let Some(capture) = capture.as_ref() {
+                    finalize_provider_session_store_capture(capture, true, context)?;
+                }
+                Ok(None)
+            }
+        },
+    }
+}
+
+fn remove_cleanup_dir(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(path).with_context(|| format!("remove cleanup path {}", path.display()))
+}
+
+fn app_support_runtime_root() -> PathBuf {
+    if let Ok(explicit) = std::env::var("CHAINWORKS_SESSION_STORE_ROOT") {
+        if !explicit.is_empty() {
+            return PathBuf::from(explicit);
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("Library")
+        .join("Application Support")
+        .join("Chainworks Forge")
+        .join("runtime")
+}
+
+fn stage_codex_session_store(runtime_home: &Path) -> Result<Option<ProviderSessionStoreCapture>> {
+    let mut captured_subdirs = Vec::new();
+    let staging_root = app_support_runtime_root()
+        .join("pending-session-stores")
+        .join("codex")
+        .join(Uuid::new_v4().to_string());
+
+    for subdir in ["sessions", "archived_sessions"] {
+        let source = runtime_home.join(subdir);
+        if !source.exists() {
+            continue;
+        }
+        let dest = staging_root.join(subdir);
+        copy_dir_recursive(&source, &dest)
+            .with_context(|| format!("copy provider session store {}", source.display()))?;
+        captured_subdirs.push(subdir.to_string());
+    }
+
+    if captured_subdirs.is_empty() {
+        if staging_root.exists() {
+            let _ = fs::remove_dir_all(&staging_root);
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(ProviderSessionStoreCapture {
+        provider: "codex".to_string(),
+        staging_root: staging_root.to_string_lossy().into_owned(),
+        captured_subdirs,
+    }))
+}
+
+pub fn finalize_provider_session_store_capture(
+    capture: &ProviderSessionStoreCapture,
+    preserve_failure: bool,
+    context: &ProviderSessionStoreArchiveContext,
+) -> Result<Option<PathBuf>> {
+    let staging_root = Path::new(&capture.staging_root);
+    if !staging_root.exists() {
+        return Ok(None);
+    }
+
+    if !preserve_failure {
+        fs::remove_dir_all(staging_root).with_context(|| {
+            format!(
+                "remove staged provider session store {}",
+                staging_root.display()
+            )
+        })?;
+        return Ok(None);
+    }
+
+    let archive_root = app_support_runtime_root()
+        .join("session-store-archives")
+        .join(&capture.provider)
+        .join(Utc::now().format("%Y-%m-%d").to_string())
+        .join(format!(
+            "{}-{}",
+            context
+                .agent_execution_id
+                .as_deref()
+                .unwrap_or("unknown-agent-execution"),
+            context
+                .session_generation_id
+                .as_deref()
+                .unwrap_or("unknown-session-generation")
+        ));
+    if let Some(parent) = archive_root.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create provider archive parent {}", parent.display()))?;
+    }
+    if archive_root.exists() {
+        fs::remove_dir_all(&archive_root).ok();
+    }
+    fs::rename(staging_root, &archive_root).or_else(|_| {
+        copy_dir_recursive(staging_root, &archive_root)?;
+        fs::remove_dir_all(staging_root)?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    let metadata_path = archive_root.join("metadata.json");
+    let metadata = json!({
+        "provider": capture.provider,
+        "run_id": context.run_id,
+        "stage_id": context.stage_id,
+        "agent_id": context.agent_id,
+        "agent_execution_id": context.agent_execution_id,
+        "session_generation_id": context.session_generation_id,
+        "provider_session_id": context.provider_session_id,
+        "failure_kind": context.failure_kind,
+        "captured_subdirs": capture.captured_subdirs,
+        "archived_at": Utc::now().to_rfc3339(),
+    });
+    fs::write(&metadata_path, serde_json::to_vec_pretty(&metadata)?).with_context(|| {
+        format!(
+            "write provider archive metadata {}",
+            metadata_path.display()
+        )
+    })?;
+    Ok(Some(archive_root))
+}
+
+fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest)
+        .with_context(|| format!("create destination directory {}", dest.display()))?;
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("read source directory {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &dest_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &dest_path).with_context(|| {
+                format!(
+                    "copy file from {} to {}",
+                    source_path.display(),
+                    dest_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Cloneable owned handle to a live ACP session.
@@ -281,6 +521,15 @@ impl AcpSessionHandle {
         Ok(())
     }
 
+    pub async fn close_with_behavior(
+        &self,
+        behavior: AcpSessionCloseBehavior,
+    ) -> Result<AcpCloseOutcome> {
+        let _ = self.close_tx.send(true);
+        let mut session = self.inner.lock().await;
+        session.close_with_behavior(behavior).await
+    }
+
     pub async fn provider_session_id(&self) -> String {
         let session = self.inner.lock().await;
         session.transport.session_id().to_string()
@@ -289,5 +538,134 @@ impl AcpSessionHandle {
     pub async fn is_live(&self) -> bool {
         let mut session = self.inner.lock().await;
         session.is_live()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    static SESSION_STORE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn write_file(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn stage_codex_session_store_copies_only_session_directories() {
+        let _guard = SESSION_STORE_ENV_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        let runtime_home = temp.path().join("runtime-home");
+        write_file(&runtime_home.join("sessions").join("a.json"), "a");
+        write_file(&runtime_home.join("archived_sessions").join("b.json"), "b");
+        write_file(&runtime_home.join("tmp").join("noise.txt"), "noise");
+
+        let capture = stage_codex_session_store(&runtime_home)
+            .unwrap()
+            .expect("capture expected");
+
+        let staging_root = Path::new(&capture.staging_root);
+        assert!(staging_root.join("sessions").join("a.json").exists());
+        assert!(staging_root
+            .join("archived_sessions")
+            .join("b.json")
+            .exists());
+        assert!(!staging_root.join("tmp").exists());
+        assert_eq!(
+            capture.captured_subdirs,
+            vec!["sessions".to_string(), "archived_sessions".to_string()]
+        );
+    }
+
+    #[test]
+    fn stage_codex_session_store_is_noop_when_no_session_dirs_exist() {
+        let _guard = SESSION_STORE_ENV_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        let runtime_home = temp.path().join("runtime-home");
+        write_file(&runtime_home.join("tmp").join("noise.txt"), "noise");
+
+        let capture = stage_codex_session_store(&runtime_home).unwrap();
+        assert!(capture.is_none());
+    }
+
+    #[test]
+    fn finalize_provider_session_store_capture_archives_failed_capture_with_metadata() {
+        let _guard = SESSION_STORE_ENV_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        std::env::set_var(
+            "CHAINWORKS_SESSION_STORE_ROOT",
+            temp.path()
+                .join("archive-root")
+                .to_string_lossy()
+                .to_string(),
+        );
+        let staging_root = temp.path().join("staging-root");
+        write_file(&staging_root.join("sessions").join("a.json"), "a");
+
+        let capture = ProviderSessionStoreCapture {
+            provider: "codex".into(),
+            staging_root: staging_root.to_string_lossy().into_owned(),
+            captured_subdirs: vec!["sessions".into()],
+        };
+        let context = ProviderSessionStoreArchiveContext {
+            provider: "codex".into(),
+            run_id: "run-1".into(),
+            stage_id: "state_9".into(),
+            agent_id: "proposal_implementation_auditor".into(),
+            agent_execution_id: Some("agent-exec-1".into()),
+            session_generation_id: Some("session-gen-1".into()),
+            provider_session_id: Some("provider-session-1".into()),
+            failure_kind: "provider_timeout".into(),
+        };
+
+        let archive_root = finalize_provider_session_store_capture(&capture, true, &context)
+            .unwrap()
+            .expect("archive root expected");
+        assert!(archive_root.join("sessions").join("a.json").exists());
+        assert!(archive_root.join("metadata.json").exists());
+        assert!(!staging_root.exists());
+        std::env::remove_var("CHAINWORKS_SESSION_STORE_ROOT");
+    }
+
+    #[test]
+    fn finalize_provider_session_store_capture_removes_staged_copy_on_success() {
+        let _guard = SESSION_STORE_ENV_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        std::env::set_var(
+            "CHAINWORKS_SESSION_STORE_ROOT",
+            temp.path()
+                .join("archive-root")
+                .to_string_lossy()
+                .to_string(),
+        );
+        let staging_root = temp.path().join("staging-root");
+        write_file(&staging_root.join("sessions").join("a.json"), "a");
+
+        let capture = ProviderSessionStoreCapture {
+            provider: "codex".into(),
+            staging_root: staging_root.to_string_lossy().into_owned(),
+            captured_subdirs: vec!["sessions".into()],
+        };
+        let context = ProviderSessionStoreArchiveContext {
+            provider: "codex".into(),
+            run_id: "run-1".into(),
+            stage_id: "state_9".into(),
+            agent_id: "proposal_implementation_auditor".into(),
+            agent_execution_id: Some("agent-exec-1".into()),
+            session_generation_id: Some("session-gen-1".into()),
+            provider_session_id: Some("provider-session-1".into()),
+            failure_kind: "completed".into(),
+        };
+
+        let archive_root =
+            finalize_provider_session_store_capture(&capture, false, &context).unwrap();
+        assert!(archive_root.is_none());
+        assert!(!staging_root.exists());
+        std::env::remove_var("CHAINWORKS_SESSION_STORE_ROOT");
     }
 }

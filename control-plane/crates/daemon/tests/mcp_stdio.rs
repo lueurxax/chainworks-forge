@@ -1,5 +1,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -140,11 +142,8 @@ fn test_mcp_stdio_rejects_initialize_with_unknown_principal_token() {
     let db_path = temp_db_path("mcp-stdio-unknown-token");
     let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
     let principal_path = temp_db_path("mcp-stdio-principals").with_extension("json");
-    fs::write(
-        &principal_path,
-        r#"{"principals":[{"token":"known-token","id":"operator","class":"operator"}]}"#,
-    )
-    .expect("write principal fixture");
+    fs::write(&principal_path, principal_fixture_json()).expect("write principal fixture");
+    set_owner_only_permissions(&principal_path);
 
     let mut child = Command::new(binary)
         .env("MODE", "mcp")
@@ -223,7 +222,7 @@ fn test_mcp_stdio_binds_principal_for_session_lifetime() {
     stdin.flush().expect("flush tools/list request");
     let tools_response = read_json_line(&mut stdout_reader);
     let tools = tools_response["result"]["tools"].as_array().unwrap();
-    assert!(tools.iter().any(|tool| tool["name"] == "runs.start"));
+    assert!(tools.iter().any(|tool| tool["name"] == "runs_start"));
 
     let _ = child.kill();
     let _ = child.wait();
@@ -286,12 +285,43 @@ fn read_json_line<R: BufRead>(reader: &mut R) -> serde_json::Value {
 
 fn write_principal_fixture(prefix: &str) -> PathBuf {
     let principal_path = temp_db_path(prefix).with_extension("json");
-    fs::write(
-        &principal_path,
-        r#"{"principals":[{"token":"known-token","id":"operator","class":"operator"}]}"#,
-    )
-    .expect("write principal fixture");
+    fs::write(&principal_path, principal_fixture_json()).expect("write principal fixture");
+    set_owner_only_permissions(&principal_path);
     principal_path
+}
+
+fn principal_fixture_json() -> &'static str {
+    r#"{
+      "schema_version": 2,
+      "principals": [
+        {
+          "token": "known-token",
+          "id": "default-operator",
+          "class": "operator",
+          "surface_policies": {
+            "graphql": {
+              "allow_queries": true,
+              "allow_subscriptions": true,
+              "allowed_mutations": ["approveApproval", "rejectApproval"]
+            },
+            "mcp": {
+              "allowed_tools": ["runs.start"]
+            }
+          }
+        }
+      ]
+    }"#
+}
+
+fn set_owner_only_permissions(path: &PathBuf) {
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)
+            .expect("principal fixture metadata")
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions).expect("set principal fixture permissions");
+    }
 }
 
 fn assert_child_exits(child: &mut std::process::Child, timeout: Duration) {

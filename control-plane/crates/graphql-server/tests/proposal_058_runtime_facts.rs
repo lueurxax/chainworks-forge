@@ -29,6 +29,14 @@ use engine::lifecycle_reporter::LifecycleReporter;
 use engine::work_queue::WorkQueue;
 use graphql_server::schema::build_schema;
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .unwrap();
+    pool
+}
+
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
     Run {
         id: run_id,
@@ -342,7 +350,7 @@ fn discovery_payload(
 
 #[tokio::test]
 async fn proposal_058_agent_execution_exposes_runtime_facts_and_session_provenance() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, stage_execution_id, agent_execution_id, _artifact_id) =
         seed_execution(&pool).await;
     let ledger = agent_retry_budget_ledger::upsert_quota_failure(
@@ -508,7 +516,7 @@ async fn proposal_058_agent_execution_exposes_runtime_facts_and_session_provenan
 
 #[tokio::test]
 async fn proposal_053_agent_execution_projects_discovery_reconciliation_pending() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_run_id, stage_execution_id, agent_execution_id, _artifact_id) =
         seed_execution(&pool).await;
     let now = Utc::now();
@@ -593,7 +601,7 @@ async fn proposal_053_agent_execution_projects_discovery_reconciliation_pending(
 
 #[tokio::test]
 async fn proposal_058_runtime_facts_exposes_operator_debug_on_operator_read_surface() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_run_id, stage_execution_id, agent_execution_id, _artifact_id) =
         seed_execution(&pool).await;
     let now = Utc::now();
@@ -693,7 +701,7 @@ async fn proposal_058_runtime_facts_exposes_operator_debug_on_operator_read_surf
 
 #[tokio::test]
 async fn proposal_058_runtime_facts_marks_fresh_after_budget_as_fresh_process() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_run_id, stage_execution_id, agent_execution_id, _artifact_id) =
         seed_execution(&pool).await;
     let facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, Utc::now());
@@ -743,7 +751,7 @@ async fn proposal_058_runtime_facts_marks_fresh_after_budget_as_fresh_process() 
 
 #[tokio::test]
 async fn proposal_058_artifact_projection_populates_source_generation_fields() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, stage_execution_id, agent_execution_id, _artifact_id) =
         seed_execution(&pool).await;
     let artifact_id = ArtifactId::new();

@@ -1,0 +1,12 @@
+{
+  "capture_rule": "stdout_task_result_block_after_last_marker",
+  "extracted_fields": [
+    "CHAINWORKS_OUTPUT"
+  ],
+  "parse_error": null,
+  "parser_input_sha256": "49f3699814eea7dd6083446ffd8b95ce47794a606f0d4d24b3839bf193123870",
+  "parser_version": "p089_native_parser_v1",
+  "stdout_sha256": "6abee25ac249e250fcf50ee59b6cfba90ea548d88b6d31fe5da7dac43bfe3ab9",
+  "success": true,
+  "top_level_shape": "object"
+}

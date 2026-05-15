@@ -1,0 +1,22 @@
+{
+  "agent_execution_id": "571080e2-f805-4296-9476-02a4092e1c44",
+  "capture_phase": "post_original_prompt",
+  "captured_at": "2026-05-13T18:21:48.119253Z",
+  "classifier_version": "worktree_fingerprint_classifier_v1",
+  "paths": [],
+  "run_id": "a4d1637d-610e-4587-99f2-14a1ba23fd2a",
+  "schema_version": "worktree_fingerprint_v1",
+  "session_generation_id": "p089-acp-canary-571080e2-f805-4296-9476-02a4092e1c44",
+  "stage_execution_id": "d87c183d-39fb-4253-aaa1-25d445900642",
+  "summary": {
+    "control_plane_only_path_count": 0,
+    "current_attempt_changed_path_count": 0,
+    "deleted_path_count": 0,
+    "excluded_path_count": 0,
+    "generated_artifact_only_path_count": 0,
+    "included_path_count": 0,
+    "preexisting_dirty_path_count": 0,
+    "renamed_path_count": 0,
+    "work_change_kind": "none"
+  }
+}

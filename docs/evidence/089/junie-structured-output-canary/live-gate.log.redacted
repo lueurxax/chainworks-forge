@@ -1,0 +1,95 @@
+$ CHAINWORKS_PROPOSAL_089_LIVE=1 ./scripts/test-gate.sh proposal-089
+==> Proposal 089 live mode: running canonical Junie ACP canary
+warning: field `registry` is never read
+  --> crates/acp/src/toolchain_lease.rs:34:5
+   |
+32 | pub struct XcodeRunLeaseGuard {
+   |            ------------------ field in this struct
+33 |     run_id: RunId,
+34 |     registry: XcodeRunLeaseRegistry,
+   |     ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `stderr_line_is_diagnostic_warning` is never used
+   --> crates/acp/src/transport.rs:705:4
+    |
+705 | fn stderr_line_is_diagnostic_warning(line: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `select_extraction_input` is never used
+    --> crates/acp/src/transport.rs:1045:8
+     |
+1030 | impl CompletionTextCapture {
+     | -------------------------- method in this implementation
+...
+1045 |     fn select_extraction_input(&self) -> SelectedCompletionTextCapture {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `acp` (lib) generated 3 warnings
+warning: method `drain_stale` is never used
+   --> crates/db/src/writer.rs:697:8
+    |
+677 | impl CoalescingBuffer {
+    | --------------------- method in this implementation
+...
+697 |     fn drain_stale(&mut self, max_age: Duration) -> Vec<CoalescedEntry> {
+    |        ^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `db` (lib) generated 1 warning
+   Compiling engine v0.1.0 (/Users/user/Documents/Chainworks Forge/control-plane/crates/engine)
+warning: method `retry_stage_latest_attempt` is never used
+    --> crates/engine/src/command_handler.rs:4020:14
+     |
+1489 | impl CommandHandler {
+     | ------------------- method in this implementation
+...
+4020 |     async fn retry_stage_latest_attempt(
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `is_reused_live_session_transport_error` is never used
+    --> crates/engine/src/executor.rs:1994:4
+     |
+1994 | fn is_reused_live_session_transport_error(message: &str) -> bool {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `discovered_artifact_matches_declared_output` is never used
+    --> crates/engine/src/executor.rs:2790:4
+     |
+2790 | fn discovered_artifact_matches_declared_output(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `mark_agent_execution_failed_if_running` and `persist_json_artifact` are never used
+    --> crates/engine/src/executor.rs:3350:14
+     |
+2972 | impl BackgroundExecutor {
+     | ----------------------- methods in this implementation
+...
+3350 |     async fn mark_agent_execution_failed_if_running(
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+9587 |     async fn persist_json_artifact<T: Serialize>(
+     |              ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `engine` (lib) generated 4 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.43s
+     Running `target/debug/examples/p089_acp_live_canary`
+{
+  "agent_execution_id": "571080e2-f805-4296-9476-02a4092e1c44",
+  "completion_capture": {
+    "capture_source": "capped_stream",
+    "capture_status": "captured",
+    "captured_byte_count": 505,
+    "completion_text_truncated": false,
+    "extraction_input_sha256": "ee2765c9e919c49dd07d65173c33ccdc8e0bab3c37e655d865de58d4777a60ae",
+    "extraction_input_truncated": false,
+    "raw_byte_limit": 1048576
+  },
+  "discovered_artifacts": 3,
+  "run_id": "a4d1637d-610e-4587-99f2-14a1ba23fd2a",
+  "status": "completed"
+}

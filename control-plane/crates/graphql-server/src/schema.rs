@@ -164,6 +164,7 @@ async fn enrich_run_with_artifact_contracts(
         .into_iter()
         .map(Into::into)
         .collect();
+    enrich_run_with_p091_retry_authority(pool, run_id, gql).await?;
     gql.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
         .await?
         .map(Into::into);
@@ -1035,6 +1036,7 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
         .into_iter()
         .map(Into::into)
         .collect();
+    enrich_run_with_p091_retry_authority(pool, run_id, &mut run).await?;
     run.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
         .await?
         .map(Into::into);
@@ -1070,6 +1072,102 @@ async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<G
     }
     run.side_effect_readback_json = Some(Json(side_effect_readback_json(pool, run_id).await?));
     Ok(run)
+}
+
+async fn enrich_run_with_p091_retry_authority(
+    pool: &SqlitePool,
+    run_id: RunId,
+    run: &mut GqlRun,
+) -> Result<()> {
+    let history = db::repos::retry_stage_execution_authorities::list_by_run(pool, run_id).await?;
+    let history_json: Vec<_> = history
+        .iter()
+        .map(|authority| {
+            serde_json::json!({
+                "id": authority.id,
+                "run_id": authority.run_id.to_string(),
+                "stage_id": authority.stage_id,
+                "target_stage_execution_id": authority.target_stage_execution_id.to_string(),
+                "entry_kind": authority.entry_kind.to_string(),
+                "source_command_journal_id": authority.source_command_journal_id,
+                "source_retry_work_item_id": authority.source_retry_work_item_id,
+                "source_invoke_work_item_id": authority.source_invoke_work_item_id,
+                "source_agent_execution_id": authority.source_agent_execution_id,
+                "authority_state": authority.authority_state.to_string(),
+                "created_at": authority.created_at.to_rfc3339(),
+                "updated_at": authority.updated_at.to_rfc3339(),
+                "terminal_reason": authority.terminal_reason,
+            })
+        })
+        .collect();
+    run.retry_authority_json = history
+        .iter()
+        .find(|authority| authority.authority_state.to_string() == "active")
+        .map(|authority| {
+            Json(serde_json::json!({
+                "id": authority.id,
+                "stage_id": authority.stage_id,
+                "target_stage_execution_id": authority.target_stage_execution_id.to_string(),
+                "entry_kind": authority.entry_kind.to_string(),
+                "authority_state": authority.authority_state.to_string(),
+                "terminal_reason": authority.terminal_reason,
+            }))
+        });
+    run.retry_authority_history_json = Some(Json(serde_json::Value::Array(history_json)));
+    run.p091_orphan_repair_readback_json =
+        Some(Json(p091_orphan_repair_readback(pool, run_id).await?));
+    Ok(())
+}
+
+async fn p091_orphan_repair_readback(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let row = sqlx::query(
+        r#"SELECT mode, disabled, candidates_total, excluded_total,
+                  would_repair_total, repaired_total, disabled_total,
+                  bounded_samples_json, created_at
+           FROM p091_orphan_repair_passes
+           WHERE run_id IS NULL OR run_id = ?1
+           ORDER BY created_at DESC
+           LIMIT 1"#,
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let disabled_by_env = std::env::var("CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let configured_mode = std::env::var("CHAINWORKS_P091_STARTUP_ORPHAN_REPAIR_MODE")
+        .unwrap_or_else(|_| "diagnostic".to_string());
+    if let Some(row) = row {
+        let samples_raw: Option<String> = row.get("bounded_samples_json");
+        let samples = samples_raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or_else(|| serde_json::json!([]));
+        Ok(serde_json::json!({
+            "configured_mode": configured_mode,
+            "operator_disabled": disabled_by_env,
+            "latest_pass": {
+                "mode": row.get::<String, _>("mode"),
+                "disabled": row.get::<i64, _>("disabled") != 0,
+                "candidates_total": row.get::<i64, _>("candidates_total"),
+                "excluded_total": row.get::<i64, _>("excluded_total"),
+                "would_repair_total": row.get::<i64, _>("would_repair_total"),
+                "repaired_total": row.get::<i64, _>("repaired_total"),
+                "disabled_total": row.get::<i64, _>("disabled_total"),
+                "bounded_samples": samples,
+                "created_at": row.get::<String, _>("created_at"),
+            }
+        }))
+    } else {
+        Ok(serde_json::json!({
+            "configured_mode": configured_mode,
+            "operator_disabled": disabled_by_env,
+            "latest_pass": null,
+        }))
+    }
 }
 
 async fn side_effect_readback_json(pool: &SqlitePool, run_id: RunId) -> Result<serde_json::Value> {
@@ -2300,17 +2398,31 @@ mod tests {
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
-        create_pool("sqlite::memory:")
+        let pool = create_pool("sqlite::memory:")
             .await
-            .expect("in-memory pool failed")
+            .expect("in-memory pool failed");
+        db::writer::register_shared_writer(
+            &pool,
+            Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
+        pool
     }
 
     async fn p043_test_pool() -> sqlx::SqlitePool {
         let path =
             std::env::temp_dir().join(format!("chainworks-p043-{}.sqlite", uuid::Uuid::new_v4()));
-        create_pool(&format!("sqlite://{}", path.to_string_lossy()))
+        let pool = create_pool(&format!("sqlite://{}", path.to_string_lossy()))
             .await
-            .expect("P043 file-backed pool failed")
+            .expect("P043 file-backed pool failed");
+        db::writer::register_shared_writer(
+            &pool,
+            Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
+        pool
     }
 
     fn make_command_handler(pool: sqlx::SqlitePool) -> Arc<CommandHandler> {
@@ -5411,6 +5523,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_query_exposes_p091_retry_authority_history_and_repair_readback() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let stage_execution_id = domain::ids::StageExecutionId::new();
+        let now = Utc::now();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        db::repos::stages::insert(
+            &pool,
+            &domain::stage::StageExecution {
+                id: stage_execution_id,
+                run_id,
+                stage_id: "implement".to_string(),
+                label: "Implement".to_string(),
+                status: domain::stage::StageStatus::Running,
+                iteration: 0,
+                attempt_number: 2,
+                settlement_kind: None,
+                started_at: now,
+                completed_at: None,
+                owner_agent: Some("code_writer".to_string()),
+                provider: Some("junie".to_string()),
+                model: None,
+                stage_type: None,
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::repos::retry_stage_execution_authorities::create_active(
+            &pool,
+            &domain::retry_authority::RetryStageExecutionAuthority {
+                id: "p091-auth-test".to_string(),
+                run_id,
+                stage_id: "implement".to_string(),
+                target_stage_execution_id: stage_execution_id,
+                entry_kind: domain::retry_authority::RetryAuthorityEntryKind::FullStageRetry,
+                source_command_journal_id: Some("journal-1".to_string()),
+                source_retry_work_item_id: Some("advance-1".to_string()),
+                source_invoke_work_item_id: None,
+                source_agent_execution_id: None,
+                authority_state: domain::retry_authority::RetryAuthorityState::Active,
+                created_at: now,
+                updated_at: now,
+                terminal_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO p091_orphan_repair_passes
+               (id, mode, disabled, run_id, candidates_total, excluded_total,
+                would_repair_total, repaired_total, disabled_total,
+                bounded_samples_json, created_at)
+               VALUES ('pass-1', 'diagnostic', 0, ?1, 2, 1, 1, 0, 0, ?2, ?3)"#,
+        )
+        .bind(run_id.to_string())
+        .bind(
+            serde_json::json!([
+                {"stage_execution_id": stage_execution_id.to_string(), "reason": "pending_approval"}
+            ])
+            .to_string(),
+        )
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                query RunById {{
+                  run(id: "{run_id}") {{
+                    retryAuthorityJson
+                    retryAuthorityHistoryJson
+                    p091OrphanRepairReadbackJson
+                  }}
+                }}
+                "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(
+            json["run"]["retryAuthorityJson"]["id"],
+            serde_json::json!("p091-auth-test")
+        );
+        assert_eq!(
+            json["run"]["retryAuthorityHistoryJson"][0]["target_stage_execution_id"],
+            serde_json::json!(stage_execution_id.to_string())
+        );
+        assert_eq!(
+            json["run"]["p091OrphanRepairReadbackJson"]["latest_pass"]["excluded_total"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test]
     async fn runs_query_exposes_cancellation_settlement_summary_only() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
@@ -5767,6 +5997,12 @@ mod tests {
             let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
                 .await
                 .expect("open P041 fixture DB");
+            db::writer::register_shared_writer(
+                &pool,
+                Arc::new(db::writer::DbWriter::new(pool.clone())),
+            )
+            .await
+            .expect("register P041 fixture shared writer");
             let schema = build_schema(
                 pool.clone(),
                 make_command_handler(pool.clone()),

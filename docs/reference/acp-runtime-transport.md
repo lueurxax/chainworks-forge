@@ -153,6 +153,33 @@ Shared ACP plumbing lives in `control-plane/crates/acp/src/transport.rs`.
 Junie must be launched in explicit ACP mode with `--acp true`; plain `junie`
 does not enter the JSON-RPC ACP handshake.
 
+Junie structured-output capability is covered by the retained
+`proposal-089|p089` gate alias. That gate preserves native Junie CLI proof for
+strict JSON and strict `CHAINWORKS_OUTPUT`, then validates a tiny ACP
+`code_writer` canary through the production `junie_code_editor_acp` backend
+profile, `JunieAdapter`, the full production code-writer output set, and the
+engine-owned settlement/materialization path. The proof is intentionally
+bounded: it establishes Junie viability for structured output and the small ACP
+handoff boundary, but it is not a guarantee that long-running implementation
+attempts cannot regress or that a broader P036-class failure is fixed.
+
+Junie `code_writer` execution has an adapter preflight before provider launch.
+The preflight validates the execution root, project readability, write access to
+required output parents, runtime cache, and temporary directory. Diagnostic mode
+records the same lifecycle facts without blocking launch; enforced mode fails
+closed before the subprocess is spawned when a non-remediable path problem is
+found. Wrong-cwd and runtime-cache failures get one remediation attempt, and
+the durable lifecycle records `preflight_running`, `preflight_remediating`,
+`passed`, or `failed_no_launch` in the runtime receipt.
+
+The rule is: provider capacity accounting starts only after preflight passes. The
+post-preflight provider launch gate persists the launch lease before spawning
+the ACP subprocess, so preflight-only rows with
+`runtime_preflight_provider_launched=false` do not consume the Junie provider
+cap, while launched rows do. Completion-boundary receipt fields, failure
+envelopes, and per-output settlement rows are owned by
+[output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md#junie-code-writer-completion-boundary).
+
 When an invocation declares `requires_xcode_host_execution` or
 `xcode_shim_injection_signal`, the engine treats that as a brokered `xcode` MCP
 requirement before ACP startup. This forces Xcode MCP lease acquisition and
@@ -263,7 +290,9 @@ The implemented ACP baseline currently guarantees:
 2. runtime profile choice is frozen into run-start binding truth,
 3. operator/report/recovery surfaces read persisted Forge truth rather than adapter-local heuristics,
 4. unknown adapter families fail closed,
-5. repo-owned catalog data can target Claude, Gemini, Codex, Auggie, and Junie ACP families.
+5. repo-owned catalog data can target Claude, Gemini, Codex, Auggie, and Junie ACP families,
+6. Junie has a retained structured-output canary gate that validates native structured-output capability and the ACP `code_writer` settlement/materialization handoff on current proof-critical files.
+7. Junie `code_writer` preflight rows do not consume provider capacity until the post-preflight launch lease is persisted.
 
 ## Current implementation owners
 
@@ -288,6 +317,8 @@ The implemented ACP baseline currently guarantees:
 Current stable verification for this slice is:
 
 - dedicated Rust ACP adapter and transport regression coverage on the current tree
+- retained `proposal-089|p089` evidence validation for Junie native structured-output capability and ACP `code_writer` canary proof
+- retained `proposal-090|p090` evidence validation for Junie `code_writer` runtime preflight, launch gating, and completion-boundary hardening
 - current focused verification summary `71/71` passed
 - capability verification includes both canonical ACP-backed proof flows:
   - proposal loop

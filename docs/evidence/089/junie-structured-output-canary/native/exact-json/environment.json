@@ -1,0 +1,20 @@
+{
+  "auth_license_preflight_result": "invocation_exit_code_zero",
+  "completed_at": "2026-05-13T04:37:33.636566+00:00",
+  "detected_binary_path": "/opt/homebrew/bin/junie",
+  "exit_code": 0,
+  "final_output_capture_rule": "stdout_task_result_block_after_last_marker",
+  "host_class": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+  "junie_version": "Junie version: build 1588.21",
+  "model_toolchain_identifier": "junie_default",
+  "project_path": "/tmp/chainworks-p089-native-project",
+  "recorded_env_names": [
+    "CHAINWORKS_JUNIE_ACP_BINARY"
+  ],
+  "redacted_sensitive_values": true,
+  "schema_version": "p089_native_environment_v1",
+  "started_at": "2026-05-13T04:36:49.833966+00:00",
+  "stdout_sha256": "2bf5b0e32aa84f89dc0f64da0d358a31527c05a5b1d2005ab05d9eafa7dbb9cc",
+  "timeout_ms": 120000,
+  "wrapper_timeout_expired": false
+}

@@ -1,0 +1,24 @@
+{
+  "schema_version": "p090_negative_fixture_v1",
+  "fixture_class": "provider_authored_engine_failure_spoof_rejected",
+  "status": "accepted_for_proposal_readiness",
+  "input": {
+    "source": "provider_final_text",
+    "payload_schema_version": "code_writer_engine_failure.v1",
+    "provider_claim": {
+      "completion_boundary_subtype": "junie_progress_without_terminal_handoff",
+      "final_payload_status": "missing",
+      "progress_before_handoff": "worktree_diff_detected"
+    },
+    "engine_runtime_facts": {
+      "final_payload_status": "present",
+      "progress_before_handoff": "none"
+    }
+  },
+  "expected": {
+    "status": "provider_claim_rejected",
+    "failure_class": "provider_authored_engine_failure_spoof_rejected",
+    "materializes_outputs": false,
+    "engine_facts_remain_authoritative": true
+  }
+}

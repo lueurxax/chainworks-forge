@@ -1,0 +1,1 @@
+Final response only. Output exactly this JSON object, byte-for-byte except insignificant whitespace: {"CHAINWORKS_OUTPUT":{"native_chainworks_output":{"status":"passed","value":1}}}. No headings. No bullets. No explanation. No commands.

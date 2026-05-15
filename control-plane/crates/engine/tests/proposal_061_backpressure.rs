@@ -41,6 +41,14 @@ use engine::host_interruption::{
 };
 use engine::{event_bus, recovery::RecoveryService, work_queue::WorkQueue};
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .unwrap();
+    pool
+}
+
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
     Run {
         id: run_id,
@@ -391,7 +399,7 @@ fn assert_command_latency_bounds(command: &str, samples: Vec<StdDuration>) {
 #[tokio::test]
 async fn approve_retry_cancel_p95_latency_stays_below_two_seconds_under_twenty_active_fake_agents()
 {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = seed_active_fake_agents(&pool, 20).await;
     let handler = CommandHandler::new(
         pool.clone(),
@@ -462,7 +470,7 @@ async fn approve_retry_cancel_p95_latency_stays_below_two_seconds_under_twenty_a
 
 #[tokio::test]
 async fn command_handler_refreshes_scheduler_projection_with_configured_capacity() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = seed_active_fake_agents(&pool, 0).await;
     let approval_stage_id = "approval_with_custom_capacity";
     let (approval_run_id, _) = insert_pending_approval(&pool, idea_id, approval_stage_id).await;
@@ -548,7 +556,7 @@ async fn command_handler_refreshes_scheduler_projection_with_configured_capacity
 
 #[tokio::test]
 async fn cancel_run_closes_journal_with_cancellation_settlement_and_scheduler_refresh() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -660,7 +668,7 @@ async fn cancel_run_closes_journal_with_cancellation_settlement_and_scheduler_re
 
 #[tokio::test]
 async fn reset_session_closes_journal_with_repair_wake_and_scheduler_refresh() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -744,7 +752,7 @@ async fn reset_session_closes_journal_with_repair_wake_and_scheduler_refresh() {
 
 #[tokio::test]
 async fn startup_repair_blocks_stale_running_stage_enqueues_wake_and_scheduler_refresh() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -851,7 +859,7 @@ async fn startup_repair_blocks_stale_running_stage_enqueues_wake_and_scheduler_r
 
 #[tokio::test]
 async fn startup_repair_readback_counts_requeued_invoke_backpressure() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -941,7 +949,7 @@ async fn startup_repair_readback_counts_requeued_invoke_backpressure() {
 
 #[tokio::test]
 async fn startup_repair_requeues_abandoned_running_invoke_agent() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1014,7 +1022,7 @@ async fn startup_repair_requeues_abandoned_running_invoke_agent() {
 
 #[tokio::test]
 async fn startup_repair_requeues_stale_acp_startup_without_provider_session() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1177,7 +1185,7 @@ async fn startup_repair_requeues_stale_acp_startup_without_provider_session() {
 
 #[tokio::test]
 async fn startup_repair_preserves_xcode_acp_startup_until_modal_grace_expires() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1323,7 +1331,7 @@ async fn startup_repair_preserves_xcode_acp_startup_until_modal_grace_expires() 
 
 #[tokio::test]
 async fn startup_repair_preserves_xcode_pre_session_startup_until_modal_grace_expires() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1412,7 +1420,7 @@ async fn startup_repair_preserves_xcode_pre_session_startup_until_modal_grace_ex
 
 #[tokio::test]
 async fn startup_repair_requeues_non_xcode_pre_session_startup_after_short_grace() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1494,7 +1502,7 @@ async fn startup_repair_requeues_non_xcode_pre_session_startup_after_short_grace
 
 #[tokio::test]
 async fn retry_stage_capacity_refresh_clears_superseded_invoke_backpressure() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let old_stage_execution_id = StageExecutionId::new();
@@ -1643,7 +1651,7 @@ async fn retry_stage_injected_crashes_roll_back_and_startup_repair_clears_stale_
     ];
 
     for failpoint in failpoints {
-        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
         let old_stage_execution_id = StageExecutionId::new();
@@ -1778,7 +1786,7 @@ async fn retry_stage_injected_crashes_roll_back_and_startup_repair_clears_stale_
 
 #[tokio::test]
 async fn approve_and_reject_stage_close_journal_with_stage_mutation_and_scheduler_refresh() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let approve_run_id = RunId::new();
     let reject_run_id = RunId::new();
@@ -1933,7 +1941,7 @@ async fn approve_and_reject_stage_close_journal_with_stage_mutation_and_schedule
 
 #[tokio::test]
 async fn start_run_closes_journal_with_run_wake_and_scheduler_refresh() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let now = Utc::now();
 
@@ -2062,7 +2070,7 @@ async fn start_run_closes_journal_with_run_wake_and_scheduler_refresh() {
 
 #[tokio::test]
 async fn invoke_agent_claim_skips_provider_at_capacity_and_claims_next_eligible_provider() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let running_gemini_stage = StageExecutionId::new();
@@ -2175,7 +2183,7 @@ async fn invoke_agent_claim_skips_provider_at_capacity_and_claims_next_eligible_
 
 #[tokio::test]
 async fn xcode_mcp_capacity_backpressure_is_reported_as_its_own_reason() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let running_xcode_stage = StageExecutionId::new();
@@ -2260,7 +2268,7 @@ async fn xcode_mcp_capacity_backpressure_is_reported_as_its_own_reason() {
 
 #[tokio::test]
 async fn invoke_agent_capacity_precheck_reports_when_all_pending_work_is_blocked() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let running_gemini_stage = StageExecutionId::new();
@@ -2353,7 +2361,7 @@ async fn invoke_agent_capacity_precheck_reports_when_all_pending_work_is_blocked
 
 #[tokio::test]
 async fn invoke_agent_claim_prefers_least_recently_served_run_within_candidate_window() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let recently_served_run_id = RunId::new();
     let unserved_run_id = RunId::new();
@@ -2467,7 +2475,7 @@ async fn invoke_agent_claim_prefers_least_recently_served_run_within_candidate_w
 
 #[tokio::test]
 async fn work_queue_refresh_publishes_scheduler_backpressure_domain_event_on_transition() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let events = event_bus::new_bus(16);
     let mut rx = events.subscribe();
     let work_queue = WorkQueue::with_events(pool.clone(), events);
@@ -2529,7 +2537,7 @@ async fn work_queue_refresh_publishes_scheduler_backpressure_domain_event_on_tra
 
 #[tokio::test]
 async fn host_interruption_records_epoch_cancels_execution_and_requeues_invoke_work() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -2680,7 +2688,7 @@ async fn host_interruption_records_epoch_cancels_execution_and_requeues_invoke_w
 
 #[tokio::test]
 async fn network_migration_records_epoch_without_cancelling_active_prompt() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -2797,7 +2805,7 @@ async fn network_migration_records_epoch_without_cancelling_active_prompt() {
 #[tokio::test]
 async fn host_interruption_late_output_from_superseded_attempt_cannot_promote_over_retry_generation(
 ) {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -3020,7 +3028,7 @@ async fn host_interruption_late_output_from_superseded_attempt_cannot_promote_ov
 
 #[tokio::test]
 async fn host_interruption_requires_runtime_cleanup_before_retry_enqueue() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -3142,7 +3150,7 @@ async fn host_interruption_requires_runtime_cleanup_before_retry_enqueue() {
 
 #[tokio::test]
 async fn host_interruption_retry_does_not_consume_provider_quota_budget() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -3227,7 +3235,7 @@ async fn host_interruption_retry_does_not_consume_provider_quota_budget() {
 
 #[tokio::test]
 async fn transient_persistence_contention_requeues_running_work_without_failure_settlement() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();

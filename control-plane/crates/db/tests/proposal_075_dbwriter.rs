@@ -21,6 +21,37 @@ use db::writer::{make_work, DbWriter, HIGH_PRIORITY_LANES, LANE_DRAIN_ORDER};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+async fn register_test_shared_writer(
+    pool: &sqlx::SqlitePool,
+    writer: Arc<DbWriter>,
+) -> Arc<DbWriter> {
+    db::writer::register_shared_writer(pool, writer.clone())
+        .await
+        .expect("test shared DbWriter registration failed");
+    writer
+}
+
+async fn insert_pressure_snapshot_raw(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    payload_json: serde_json::Value,
+) {
+    sqlx::query(
+        r#"INSERT INTO storage_write_pressure_snapshots
+           (id, window_start, window_end, payload_json, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5)"#,
+    )
+    .bind(id)
+    .bind((now - chrono::Duration::seconds(60)).to_rfc3339())
+    .bind(now.to_rfc3339())
+    .bind(payload_json.to_string())
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await
+    .expect("raw pressure snapshot insert must succeed");
+}
+
 fn class_a_op(name: &'static str) -> WriteOperation {
     WriteOperation {
         class: WriteClass::A,
@@ -235,6 +266,7 @@ async fn class_d_telemetry_drop_counter_is_observable_via_storage_health() {
 async fn class_d_rollup_producer_persists_bounded_snapshot_and_purges_retention() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let writer = Arc::new(DbWriter::new(pool.clone()));
+    register_test_shared_writer(&pool, writer.clone()).await;
 
     let committed = writer
         .submit(class_a_op("rollup_probe"), |pool| async move {
@@ -309,6 +341,7 @@ async fn class_d_rollup_producer_persists_bounded_snapshot_and_purges_retention(
 async fn class_d_duplicate_window_rollups_merge_counters_and_max_gauges() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let writer = Arc::new(DbWriter::new(pool.clone()));
+    register_test_shared_writer(&pool, writer.clone()).await;
     let window_start = chrono::Utc::now() - chrono::Duration::minutes(5);
     let window_end = chrono::Utc::now();
 
@@ -799,6 +832,7 @@ async fn evidence_spool_file_write_checksum_fsync_ordering() {
 async fn startup_orphan_sweep_recovers_intact_active_run_files() {
     let dir = tempfile::TempDir::new().unwrap();
     let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = register_test_shared_writer(&pool, Arc::new(DbWriter::new(pool.clone()))).await;
     let content = b"orphan evidence content";
 
     // Write the file (simulates: crash after fsync but before metadata enqueue).
@@ -875,6 +909,7 @@ async fn startup_orphan_sweep_recovers_intact_active_run_files() {
         output.checksum,
         "orphan file checksum must be stable"
     );
+    writer.shutdown().await;
 }
 
 /// Phase 3: high-volume producer — one metadata row per logical object, not per retry.
@@ -1112,6 +1147,7 @@ async fn coalescing_buffer_saturation_counter_is_observable_via_heartbeat() {
 #[tokio::test]
 async fn sec_p075_001_cross_run_path_rejected_at_insert() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = register_test_shared_writer(&pool, Arc::new(DbWriter::new(pool.clone()))).await;
 
     // relative_path is under run-A, but the spool_ref claims run-B.
     let cross_run_ref = EvidenceSpoolRef {
@@ -1146,6 +1182,7 @@ async fn sec_p075_001_cross_run_path_rejected_at_insert() {
         err_chain.contains("ownership") || err_chain.contains("run_id"),
         "error chain must reference ownership/run_id binding; got: {err_chain}"
     );
+    writer.shutdown().await;
 }
 
 /// SEC-P075-001 regression: validate_path_ownership rejects path for a different run.
@@ -1238,26 +1275,21 @@ async fn sec_p075_002_write_spool_file_idempotent_on_same_content() {
 async fn storagehealth_graphql_exposes_units_freshness_killswitches() {
     let pool = create_pool("sqlite::memory:").await.unwrap();
     let now = chrono::Utc::now();
-    db::repos::storage_health::insert_write_pressure_snapshot(
+    insert_pressure_snapshot_raw(
         &pool,
-        &db::repos::storage_health::StorageWritePressureSnapshot {
-            id: "pressure-1".to_string(),
-            window_start: now - chrono::Duration::seconds(60),
-            window_end: now,
-            payload_json: serde_json::json!({
-                "lanes": {
-                    "critical_barrier": {
-                        "queueDepth": 0,
-                        "oldestQueuedMs": 0
-                    }
-                },
-                "dbWriterWaitP95Ms": 7
-            }),
-            created_at: now,
-        },
+        "pressure-1",
+        now,
+        serde_json::json!({
+            "lanes": {
+                "critical_barrier": {
+                    "queueDepth": 0,
+                    "oldestQueuedMs": 0
+                }
+            },
+            "dbWriterWaitP95Ms": 7
+        }),
     )
-    .await
-    .expect("snapshot insert must succeed");
+    .await;
 
     let health = db::repos::storage_health::storage_health(&pool)
         .await
@@ -1443,6 +1475,7 @@ async fn sweep_evidence_orphans_truncates_at_max_bytes() {
 async fn sweep_evidence_orphans_filters_by_run_id() {
     let dir = tempfile::TempDir::new().unwrap();
     let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = register_test_shared_writer(&pool, Arc::new(DbWriter::new(pool.clone()))).await;
 
     // Write 1 file for run-a and 1 file for run-b (neither has metadata).
     write_spool_file(
@@ -1500,6 +1533,7 @@ async fn sweep_evidence_orphans_filters_by_run_id() {
         row_b.is_none(),
         "run-b orphan must NOT be backfilled when filter is run-a"
     );
+    writer.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1579,18 +1613,7 @@ async fn storage_health_fails_closed_without_live_writer() {
 
     // Insert a fresh pressure snapshot so only the writer.alive gate matters.
     let now = chrono::Utc::now();
-    db::repos::storage_health::insert_write_pressure_snapshot(
-        &pool,
-        &db::repos::storage_health::StorageWritePressureSnapshot {
-            id: "pressure-sec003".to_string(),
-            window_start: now - chrono::Duration::seconds(60),
-            window_end: now,
-            payload_json: serde_json::json!({}),
-            created_at: now,
-        },
-    )
-    .await
-    .expect("snapshot insert must succeed");
+    insert_pressure_snapshot_raw(&pool, "pressure-sec003", now, serde_json::json!({})).await;
 
     let health = db::repos::storage_health::storage_health(&pool)
         .await

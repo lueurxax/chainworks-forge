@@ -1,0 +1,25 @@
+{
+  "acp_canary_status": "passed",
+  "agent_execution_id": "571080e2-f805-4296-9476-02a4092e1c44",
+  "completed_at": "2026-05-13T18:21:47.985986Z",
+  "control_plane_generated_outputs": [
+    "changed_files_manifest"
+  ],
+  "junie_authored_outputs": [
+    "implementation_progress",
+    "implementation_self_assessment",
+    "tests_result"
+  ],
+  "native_phase_status": "passed",
+  "overall_status": "passed",
+  "provider_session_id": "session-260513-212059-1xwt",
+  "run_id": "a4d1637d-610e-4587-99f2-14a1ba23fd2a",
+  "safety_violations": [],
+  "schema_version": "p089_acp_run_report_v1",
+  "session_generation_id": "p089-acp-canary-571080e2-f805-4296-9476-02a4092e1c44",
+  "stage_execution_id": "d87c183d-39fb-4253-aaa1-25d445900642",
+  "stage_id": "p089_acp_canary",
+  "started_at": "2026-05-13T18:20:55.322254Z",
+  "status": "passed",
+  "strict_output_only": true
+}

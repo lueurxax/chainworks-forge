@@ -1,0 +1,23 @@
+{
+  "schema_version": "p089_negative_fixture_v1",
+  "fixture_kind": "broad_allowed_roots",
+  "expected_status": "evidence_incomplete",
+  "cases": [
+    {
+      "name": "repo_root",
+      "root": "."
+    },
+    {
+      "name": "control_plane_source_root",
+      "root": "control-plane"
+    },
+    {
+      "name": "scripts_source_root",
+      "root": "scripts"
+    },
+    {
+      "name": "parent_chainworks_root",
+      "root": ".chainworks"
+    }
+  ]
+}

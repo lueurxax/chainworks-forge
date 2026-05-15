@@ -326,6 +326,12 @@ mod tests {
     #[tokio::test]
     async fn workflow_conflicts_resolve_response_includes_retry_instruction_binding_id() {
         let pool = create_pool("sqlite::memory:").await.unwrap();
+        db::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .unwrap();
 
         let idea_id = IdeaId::new();
         let run_id = RunId::new();

@@ -1,0 +1,32 @@
+{
+  "args": [
+    "--project",
+    "/tmp/chainworks-p089-native-project",
+    "--task",
+    "Do not run shell commands. Do not inspect files. Do not summarize. Do not use Markdown. The final task result must be exactly this JSON object and nothing else: {\"CHAINWORKS_OUTPUT\":{\"tests_result\":{\"status\":\"not_run\",\"commands\":[]},\"implementation_self_assessment\":{\"implementation_complete\":true,\"verification_green\":true,\"remaining_code_tasks\":[],\"handoff_tasks\":[],\"known_risks\":[],\"tests_run\":[],\"docs_impacted\":[]}}}",
+    "--output-format",
+    "text",
+    "--timeout",
+    "120000",
+    "--skip-update-check"
+  ],
+  "binary_resolution": {
+    "env_var": "CHAINWORKS_JUNIE_ACP_BINARY",
+    "fallback_binary": "junie",
+    "resolved_path": "/opt/homebrew/bin/junie"
+  },
+  "exit_code_policy": "exit_code_zero_required_for_pass",
+  "forbidden_args": [
+    "--acp",
+    "--json-output-file"
+  ],
+  "input_mode": "task_arg",
+  "output_mode": "stdout_text",
+  "parser_input_source": "stdout_after_process_exit",
+  "project_path": "/tmp/chainworks-p089-native-project",
+  "prompt_sha256": "84632e83ab08e32500be29be0a017fdc8fd645b850de858825ccb0b9802faa98",
+  "schema_version": "p089_native_command_v1",
+  "stderr_role": "diagnostics_only",
+  "timeout_ms": 120000,
+  "working_directory": "/tmp/chainworks-p089-native-project"
+}

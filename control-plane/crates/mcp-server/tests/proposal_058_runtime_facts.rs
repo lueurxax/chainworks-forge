@@ -26,6 +26,17 @@ use engine::work_queue::WorkQueue;
 use mcp_server::protocol::JsonRpcRequest;
 use mcp_server::server::McpServer;
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(
+        &pool,
+        std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+    )
+    .await
+    .unwrap();
+    pool
+}
+
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
     Run {
         id: run_id,
@@ -325,7 +336,7 @@ fn discovery_payload(
 
 #[tokio::test]
 async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, stage_execution_id, agent_execution_id) = seed_execution(&pool).await;
     sqlx::query("UPDATE agent_executions SET session_reuse_disposition = ?1 WHERE id = ?2")
         .bind("fresh_after_transport_error")
@@ -505,7 +516,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
 
 #[tokio::test]
 async fn proposal_053_reports_get_projects_discovery_reconciliation_pending() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _stage_execution_id, agent_execution_id) = seed_execution(&pool).await;
     let now = Utc::now();
     let diagnostics = AgentExecutionDiscoveryDiagnostics::from_payload(

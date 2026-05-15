@@ -6,6 +6,17 @@ use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{ArtifactId, IdeaId, RunId};
 use domain::run::{Run, RunStatus};
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(
+        &pool,
+        std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+    )
+    .await
+    .unwrap();
+    pool
+}
+
 fn principal(class: auth::PrincipalClass) -> auth::Principal {
     auth::Principal::new("p", class)
 }
@@ -51,7 +62,7 @@ fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
 
 #[tokio::test]
 async fn proposal_057_reports_get_exposes_canonical_statuses_and_overrides() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     ideas::insert(
@@ -144,7 +155,7 @@ async fn proposal_057_reports_get_exposes_canonical_statuses_and_overrides() {
 
 #[tokio::test]
 async fn proposal_057_runs_get_exposes_canonical_artifact_contract_parity() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     ideas::insert(
@@ -255,7 +266,7 @@ async fn proposal_057_override_tool_is_operator_only() {
     )
     .is_empty());
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let result = mcp_server::tools::artifacts::execute(
         "artifacts.override_contract",
         serde_json::json!({
@@ -294,7 +305,7 @@ async fn proposal_057_override_tool_is_operator_only() {
 async fn artifacts_override_contract_attaches_ambient_mcp_request_id_to_journal() {
     use mcp_server::request_context::scope_request_id;
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     ideas::insert(

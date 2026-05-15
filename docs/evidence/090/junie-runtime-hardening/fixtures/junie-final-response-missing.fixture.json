@@ -1,0 +1,19 @@
+{
+  "schema_version": "p090_subtype_fixture_v1",
+  "subtype": "junie_final_response_missing",
+  "fixture_type": "synthetic",
+  "status": "accepted_for_proposal_readiness",
+  "proves": [
+    "subtype_coverage",
+    "final_payload_absence"
+  ],
+  "receipt_shape": {
+    "provider_runtime_family": "junie_acp",
+    "completion_status": "missing_required_outputs",
+    "completion_boundary_subtype": "junie_final_response_missing",
+    "final_payload_status": "missing",
+    "provider_launched": true,
+    "required_outputs_fresh": false
+  },
+  "expected_gate_behavior": "accepted_as_synthetic_fixture_until_implementation_fixture_replaces_it"
+}

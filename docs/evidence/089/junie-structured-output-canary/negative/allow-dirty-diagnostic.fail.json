@@ -1,0 +1,10 @@
+{
+  "schema_version": "p089_negative_fixture_v1",
+  "fixture_kind": "allow_dirty_diagnostic",
+  "expected_status": "evidence_incomplete",
+  "env": {
+    "CHAINWORKS_PROPOSAL_089_ALLOW_DIRTY": "1"
+  },
+  "preexisting_dirty_work_non_canary_safe": true,
+  "signoff_eligible": false
+}
