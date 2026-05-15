@@ -6,22 +6,22 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 ## Foundation Layer
 
-- [domain-model.md](domain-model.md) — SwiftData persistence: `Idea`, `Run`, `StageExecution`, `AgentExecution`, `Approval`, `Artifact`, Steward records, provenance snapshots, drift detection, cost tracking; plus Rust-only **lead mediation and confirmation** models
+- [domain-model.md](domain-model.md) — SwiftData persistence: `Idea`, `Run`, `StageExecution`, `AgentExecution`, `Approval`, `Artifact`, Steward records, provenance snapshots, drift detection, cost tracking; plus Rust-only **lead mediation, side effects, and confirmation** models
 - [yaml-dsl-parser.md](yaml-dsl-parser.md) — YAML parsing, validation (10 check categories), compact workflow normalization, provenance hashing, verification scaffold
 - [architecture-decisions.md](architecture-decisions.md) — Key AD decisions: CodingKeys, single-active-run, drift detection, snapshot storage, integer cost, derived currentStageID, and **owner-aware execution identity**
 
 ## Execution Engine
 
-- [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service, and **lead conflict mediation**
+- [workflow-execution-engine.md](workflow-execution-engine.md) — RunPlan compiler, Workflow Orchestrator, Agent Executor protocol, Artifact Manager, Transition Evaluator, Resume Manager, Execution Service, **durable side effects**, and **lead conflict mediation**
 - [artifact-discovery-and-settlement-optimization.md](artifact-discovery-and-settlement-optimization.md) — Bounded discovery, settlement pipeline, and pre-prompt metadata
 - [runtime-contract.md](runtime-contract.md) — Frozen run snapshots, state machines, artifact model, storage boundaries, resume/retry rules, and **mediation-owned execution identity**
-- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, atomic transition settlement, cursor-driven resume, stage-owned recovery evidence, approval restore, runtime binding truth, host interruption, **mediation settlement**, and startup recovery progress readback
+- [execution-truth-and-recovery.md](execution-truth-and-recovery.md) — Canonical terminal outcomes, atomic transition settlement, cursor-driven resume, stage-owned recovery evidence, approval restore, runtime binding truth, host interruption, **side-effect reconciliation**, **mediation settlement**, and startup recovery progress readback
 - [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md) — Skill resolution, role specialization, runtime injection, frozen skill truth, and operator readback
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) — Per-agent MCP profiles, requested/predicted/actual/denied truth, runtime validation, and MCP telemetry
 - [failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](failed-stage-evidence-delivery-preflight-and-mcp-resolution.md) — Rust failed-stage evidence packets, delivery preflight, execution-time MCP resolution, ACP `mcpServers`, and northbound readback
-- [acp-runtime-transport.md](acp-runtime-transport.md) — ACP transport contract, runtime selection, adapter families (Claude/Gemini/Codex/Auggie/Junie), persisted runtime truth, provider toolchain cache mapping, and capacity management
-- [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md) — Named ACP output envelopes, canonical contract binding, validation modes, normalized artifact identity, and durable validation-failure substrate
-- [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, canonical artifact-contract transition truth, implementation self-assessment and handoff, generated run-state projection, failed-stage evidence, same-run retry truth, declarative Tier 1 enforcement, and bounded proposal compaction
+- [acp-runtime-transport.md](acp-runtime-transport.md) — ACP transport contract, runtime selection, adapter families (Claude/Gemini/Codex/Auggie/Junie), persisted runtime truth, Junie structured-output canary proof, Junie code-writer preflight/launch gating, provider toolchain cache mapping, and capacity management
+- [structured-output-envelope-and-contract-validation.md](structured-output-envelope-and-contract-validation.md) — Named ACP output envelopes, canonical contract binding, validation modes, normalized artifact identity, Junie canary proof, and durable validation-failure substrate
+- [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md) — Catalog-backed output contracts, canonical artifact-contract transition truth, implementation self-assessment and handoff, generated run-state projection, failed-stage evidence, same-run retry truth, Junie code-writer completion-boundary subtypes, staged repair settlement, declarative Tier 1 enforcement, and bounded proposal compaction
 - [implementation-closeout-readiness.md](implementation-closeout-readiness.md) — Active closeout readiness authority, state-9 release routing, GraphQL/MCP/macOS readback, rollout evidence, and retained gate aliases
 - [p077-rollout-dependency-evidence.md](p077-rollout-dependency-evidence.md) — Retained historical alias evidence file for closeout readiness dependency checklist, rollout metric ledger, expansion decision fields, and rollback evidence contract
 - [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md) — Reusable session lineage, invocation owner keys, binding fingerprints, reuse policy taxonomy, live ACP session ownership, context budget evaluation, checkpoint rehydration, and shell-owned per-agent reset
@@ -31,15 +31,13 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 ## Control Plane
 
-- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, boundary shape, configuration, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, **mediation settlement**, and generated-state housekeeping
+- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, side-effect ledger, targeted retry authority, boundary shape, configuration, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, **mediation settlement**, and generated-state housekeeping
 - [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md) — Local daemon lifecycle, supervision, health/readiness, packaged-mode paths, SQLite startup safety, failed-serve behavior, diagnostics, and packaging proof lanes
 - [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) — Bearer auth, caller-scoped capability filtering, per-command audit journaling, **mixed inbox (stage approvals + mediation confirmations)**, and `journal_id` surfacing on MCP + GraphQL northbound surfaces
 - [ui-action-boundary.md](ui-action-boundary.md) — Governed SwiftUI action boundary: GraphQL reads/subscriptions plus approval mutations; non-approval operations are MCP-only
 - [per-run-workspace-isolation.md](per-run-workspace-isolation.md) — Per-run meta-root derivation, path resolution, ACP env handoff, worktree exemption, transition/normalization isolation, and legacy fallback semantics
 - [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) — Canonical GraphQL projection read contract for the thin macOS client: implemented surfaces, projection freshness, freshness budgets, subscriptions, backpressure, and downstream UI consumption rules
-- [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md) — Boundary-First API and Auth Contract Matrix: P081 architectural overview, caller classification, policy evaluation, audit, idempotency, and macOS native boundary contracts
-- [boundary-first-api-auth-contract.json](boundary-first-api-auth-contract.json) — Boundary-First API and Auth Contract Matrix: executable fixture schema and contract
-
+- [thin-client-read-model-affordance-contract.md](thin-client-read-model-affordance-contract.md) — GraphQL-driven thin-client affordance rows, payload/freshness/actionability mapping, fallback copy, and proof gates
 
 ## Live Execution
 
@@ -53,7 +51,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [p077-closeout-readiness-ui-evidence.md](p077-closeout-readiness-ui-evidence.md) — Retained historical alias evidence file for closeout-readiness token, contrast, diagnostic, focus, recovery, and accessibility proof
 - [ui-quality-and-polish.md](ui-quality-and-polish.md) — UI readability, bounded accessibility, shared status semantics, and owner-surface proof contract
 - [run-control.md](run-control.md) — Stop vs archive boundary, two-phase cancellation settlement, operator-visible `cancelling`/`cancelled` truth, northbound reader split
-- [release-gate.md](release-gate.md) — Manual release gate: post-approval task execution, N-phase ordering, native deterministic git/publish, canonical release artifacts, and `delivery_receipt` settlement
+- [release-gate.md](release-gate.md) — Manual release gate: post-approval task execution, N-phase ordering, native deterministic git/publish, canonical release artifacts, **durable side-effect ledger**, and `delivery_receipt` settlement
 - [executable-rollout-gate-template.md](executable-rollout-gate-template.md) — `rollout_contract_v1` / `rollout_contract_check_v1` / `operator_readback_v1` schemas, run-start preflight contract, security/path/authorization guidance, and retained historical alias self-contract
 - [project-workspace-contract.md](project-workspace-contract.md) — `requires_project_access`, idea-owned workspace root, frozen run workspace contract
 - [provider-binding-truth.md](provider-binding-truth.md) — Frozen provider/model truth, provenance, and cross-family mismatch handling

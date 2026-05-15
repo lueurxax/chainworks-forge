@@ -296,6 +296,11 @@ pub struct AgentExecutionRuntimeFacts {
     pub ignored_late_output_count: i64,
     pub session_reuse_reason: Option<String>,
     pub quota_ledger_id: Option<String>,
+    pub runtime_preflight_phase: Option<String>,
+    pub runtime_preflight_attempt_count: Option<i64>,
+    pub runtime_preflight_remediation: Option<String>,
+    pub runtime_preflight_provider_launched: Option<bool>,
+    pub runtime_preflight_json: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -320,6 +325,11 @@ impl AgentExecutionRuntimeFacts {
             ignored_late_output_count: 0,
             session_reuse_reason: None,
             quota_ledger_id: None,
+            runtime_preflight_phase: None,
+            runtime_preflight_attempt_count: None,
+            runtime_preflight_remediation: None,
+            runtime_preflight_provider_launched: None,
+            runtime_preflight_json: None,
             created_at: now,
             updated_at: now,
         }

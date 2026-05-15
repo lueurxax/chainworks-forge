@@ -1,0 +1,40 @@
+{
+  "active_artifacts": {
+    "implementation_self_assessment_v2": {
+      "active_override_id": null,
+      "artifact_generation_id": "32eacce7-da94-4343-9251-53424d90300a:22b1a673-e884-4f4c-8bf7-6bd1fb812241",
+      "canonical_path": "implementation_self_assessment",
+      "created_at": "2026-05-14T20:39:42.280646+00:00",
+      "db_status": "complete",
+      "generation_id": "32eacce7-da94-4343-9251-53424d90300a:22b1a673-e884-4f4c-8bf7-6bd1fb812241",
+      "implementation_status": null,
+      "output_settlement": "valid_outputs_from_completed_execution",
+      "partial": false,
+      "raw_path": "/Users/user/Documents/Chainworks Forge/docs/evidence/090/junie-runtime-hardening/refine-like-canary/artifacts/implementation_self_assessment.json",
+      "raw_status": "complete",
+      "release_evidence_status": null,
+      "source_agent_execution_id": "32eacce7-da94-4343-9251-53424d90300a",
+      "source_generation_verified": true,
+      "source_session_generation_id": "714016bd-bcc1-440c-9850-5dc3b5cf1c2d",
+      "source_stage_execution_id": "9d45961b-c7f6-4af0-a612-6f8ccd4d3e20",
+      "source_work_item_id": "4aa6d60a-2e11-4385-a316-3adbec18de38",
+      "status": "complete",
+      "status_overridden": false,
+      "supersedes": [],
+      "supersedes_artifact_generation_id": null,
+      "valid": true,
+      "validation_errors": [],
+      "warnings": []
+    }
+  },
+  "active_index_owner": "sqlite",
+  "advisory_artifacts": [],
+  "current_state": "p090_refine_like_canary",
+  "exported_path": "/Users/user/Documents/Chainworks Forge/docs/evidence/090/junie-runtime-hardening/refine-like-canary/meta/state/run-state.json",
+  "invalid_required_artifacts": [],
+  "operator_overrides": [],
+  "run_id": "85dde5f0-72ed-4d4a-a48d-7a256b534ef6",
+  "schema_version": "run-state-projection.v1",
+  "status": "running",
+  "warnings": []
+}

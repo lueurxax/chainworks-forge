@@ -1,0 +1,10 @@
+{
+  "schema_version": "p089_negative_fixture_v1",
+  "fixture_kind": "proof_critical_drift",
+  "expected_status": "evidence_incomplete",
+  "path": "control-plane/crates/acp/src/transport.rs",
+  "record": {
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "size_bytes": 0
+  }
+}

@@ -208,6 +208,10 @@ PROPOSAL_084_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal084Tests"
 )
 
+PROPOSAL_085_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal085Tests"
+)
+
 P060_PROPOSAL_REVISION_ID="P060-r16-2026-04-22"
 PROPOSAL_060_CONTROL_ARTIFACT_DIR="docs/proposals/060-control-artifacts"
 PROPOSAL_060_CONTROL_ARTIFACT_SPECS=(
@@ -1829,7 +1833,7 @@ result = payload.get("result") or {}
 
 checks = [
     (result.get("proofAgentID") == "proposal_reviewer_product_owner", "proof agent id must be proposal_reviewer_product_owner"),
-    (result.get("reportSkillRef") == "proposal_review_triad", "report skill ref must be proposal_review_triad"),
+    (result.get("reportSkillRef") == "proposal_review_router_skill", "report skill ref must be proposal_review_router_skill"),
     (result.get("reportSkillRole") == "product_owner", "report skill role must be product_owner"),
     (result.get("comparisonSkillRole") == "architect", "comparison skill role must be architect"),
     (result.get("primaryArtifactName") == "proposal_current", "primary artifact must be proposal_current"),
@@ -2174,6 +2178,7 @@ Available gates:
   proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
   proposal-077,p077  Proposal 077 closeout readiness gates (Rust domain/db/engine plus GraphQL/MCP readback parity; UI remote evidence separate)
   proposal-077-ui,p077-ui  Proposal 077 remote macOS compact/focus/backlink/accessibility runtime proof
+  proposal-078,p078  Proposal 078 durable side-effect ledger gate (migration, CAS races, preflight, MCP tools)
   proposal-031-readiness,p031-readiness  Thin UI closeout readiness gate
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
@@ -2219,6 +2224,10 @@ Available gates:
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
   proposal-081|p081  Proposal 081 Phase 1 boundary-first API and auth contract matrix gate
+  proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
+  proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
+  proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
+  proposal-091|p091  Retained P091 targeted retry authority runtime proof gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -5491,6 +5500,7 @@ PLIST
       cargo test -p db p075_projection_rebuild_uses_production_class_b_coalescing --test integration -- --nocapture
       cargo test -p db class_d_telemetry_drop_counter_is_observable_via_storage_health --test proposal_075_dbwriter -- --nocapture
       cargo test -p db class_d_rollup_producer_persists_bounded_snapshot_and_purges_retention --test proposal_075_dbwriter -- --nocapture
+      cargo test -p db class_d_duplicate_window_rollups_merge_counters_and_max_gauges --test proposal_075_dbwriter -- --nocapture
 
       log "P075: engine producer adoption — failed-stage evidence spools full packet and stores compact SQLite pointer"
       cargo test -p engine failed_stage_evidence_packet_tests -- --nocapture
@@ -5725,12 +5735,16 @@ if "droppedTelemetryTotal" not in storage_health_text or "telemetryDroppedTotal"
     raise SystemExit("P075 storageHealth must report real Class D telemetry drop counters")
 for required in [
     "record_live_write_pressure_rollup",
+    "merge_write_pressure_payload",
     "TELEMETRY_SNAPSHOT_RETAIN_LATEST",
     "latestWindowLimit",
     "DELETE FROM storage_write_pressure_snapshots",
 ]:
     if required not in storage_health_text and required not in writer_text:
         raise SystemExit(f"P075 Class D rollup lifecycle is not wired: missing {required}")
+storage_pressure_migration = (root / "control-plane/crates/db/migrations/049_p075_storage_write_pressure_window_key.sql").read_text()
+if "idx_storage_write_pressure_window_unique" not in storage_pressure_migration or "window_start, window_end" not in storage_pressure_migration:
+    raise SystemExit("P075 Class D telemetry_merge requires a unique write-pressure window key")
 daemon_main = (root / "control-plane/crates/daemon/src/main.rs").read_text()
 if "spawn_storage_write_pressure_rollup(pool.clone(), db_writer.heartbeat.clone())" not in daemon_main:
     raise SystemExit("P075 daemon must start the production Class D write-pressure rollup producer")
@@ -6118,6 +6132,78 @@ PY
     run_targeted_tests "proposal-084" "${PROPOSAL_084_SWIFT_TESTS[@]}"
     log "Proposal 084 gate passed"
     ;;
+  proposal-081|p081)
+    log "Proposal 081 gate: boundary-first API and auth contract matrix (Phase 1)"
+
+    log "P081: boundary coverage guardrail"
+    "$ROOT_DIR/scripts/check-boundary-coverage.sh"
+
+    log "P081: fixture JSON validity - verify boundary-first-api-auth-contract.json exists and is valid JSON"
+    python3 - <<'PY'
+import json, sys, pathlib
+root = pathlib.Path(sys.argv[0]).parent.parent if sys.argv[0] != "-" else pathlib.Path(".")
+import os
+root = pathlib.Path(os.environ.get("ROOT_DIR", "."))
+fixture_path = root / "docs/reference/boundary-first-api-auth-contract.json"
+if not fixture_path.exists():
+    raise SystemExit("P081: missing docs/reference/boundary-first-api-auth-contract.json")
+try:
+    fixture = json.loads(fixture_path.read_text())
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"P081: invalid JSON in boundary-first-api-auth-contract.json: {exc}") from exc
+if fixture.get("schema_version") != 1:
+    raise SystemExit(f"P081: expected schema_version 1, got {fixture.get('schema_version')}")
+if "matrix_id" not in fixture:
+    raise SystemExit("P081: boundary fixture missing matrix_id")
+if not fixture.get("rows"):
+    raise SystemExit("P081: boundary fixture rows array is empty")
+REQUIRED_ROW_IDS = [
+    "p081.ui_operator.graphql_query.read",
+    "p081.ui_operator.graphql_subscription.subscribe",
+    "p081.ui_operator.graphql_mutation.approval_action",
+    "p081.agent_operator.mcp_initialize.capability",
+    "p081.agent_operator.mcp_tools_list.discovery",
+    "p081.agent_operator.mcp_tools_call.command",
+    "p081.automation.mcp_tools_list.discovery",
+    "p081.automation.mcp_tools_call.command",
+    "p081.observer.mcp_tools_call.compact_read",
+    "p081.observer.graphql_query.read_only_opt_in",
+    "p081.developer_break_glass.debug_endpoint.disabled",
+]
+present_ids = {row["row_id"] for row in fixture["rows"]}
+for required in REQUIRED_ROW_IDS:
+    if required not in present_ids:
+        raise SystemExit(f"P081: required row '{required}' missing from fixture")
+print(f"P081: fixture valid - {len(fixture['rows'])} rows, all {len(REQUIRED_ROW_IDS)} required rows present")
+PY
+
+    log "P081: doc exists - verify boundary-first-api-auth-contract.md exists"
+    if [[ ! -f "$ROOT_DIR/docs/reference/boundary-first-api-auth-contract.md" ]]; then
+      die "P081: missing docs/reference/boundary-first-api-auth-contract.md"
+    fi
+
+    log "P081: auth crate boundary module unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p auth boundary:: -- --nocapture
+    )
+
+    log "P081: db crate audit_log repo unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p db repos::audit_log:: -- --nocapture
+    )
+
+    log "P081: migration compile check - audit_log and audit_log_checkpoints migrations exist"
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/049_p081_audit_log.sql" ]]; then
+      die "P081: missing migration 049_p081_audit_log.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/050_p081_audit_log_checkpoints.sql" ]]; then
+      die "P081: missing migration 050_p081_audit_log_checkpoints.sql"
+    fi
+
+    log "Proposal 081 Phase 1 gate passed"
+    ;;
   full)
     check_idle_environment strict
     require_remote_ui_host
@@ -6168,78 +6254,1602 @@ PY
     run_targeted_tests "proposal-077-ui" "${P077_UI_TESTS[@]}"
     log "Proposal 077 remote macOS closeout-readiness UI gate passed"
     ;;
-  proposal-081|p081)
-    log "Proposal 081 gate: boundary-first API and auth contract matrix (Phase 1)"
-
-    log "P081: boundary coverage guardrail"
-    "$ROOT_DIR/scripts/check-boundary-coverage.sh"
-
-    log "P081: fixture JSON validity — verify boundary-first-api-auth-contract.json exists and is valid JSON"
+  proposal-078|p078)
+    # P078 durable side-effect ledger gate.
+    # Uses local/fake effect adapters. Must not perform live git pushes,
+    # Connect uploads, notarization, production daemon startup, simulator runs,
+    # or UI smoke tests.
+    log "Proposal 078 durable side-effect ledger gate"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p domain proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p db proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p engine --lib proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p engine --test proposal_058_claim_start proposal_078_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p engine --test release -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-078-gate cargo test -p mcp-server proposal_078_ -- --nocapture
+    )
     python3 - <<'PY'
-import json, sys, pathlib
-root = pathlib.Path(sys.argv[0]).parent.parent if sys.argv[0] != "-" else pathlib.Path(".")
-# Resolve from script location fallback
-import os
-root = pathlib.Path(os.environ.get("ROOT_DIR", "."))
-fixture_path = root / "docs/reference/boundary-first-api-auth-contract.json"
+import json
+from pathlib import Path
+
+root = Path.cwd()
+
+fixture_path = root / "docs/evidence/rollout-contract/operator-readback/p078-full-surface.fixture.json"
+negative_path = root / "docs/evidence/rollout-contract/negative/p078-missing-side-effect-readback.json"
+accessibility_path = root / "docs/evidence/rollout-contract/operator-readback/p078-macos-accessibility.fixture.json"
 if not fixture_path.exists():
-    raise SystemExit("P081: missing docs/reference/boundary-first-api-auth-contract.json")
-try:
-    fixture = json.loads(fixture_path.read_text())
-except json.JSONDecodeError as exc:
-    raise SystemExit(f"P081: invalid JSON in boundary-first-api-auth-contract.json: {exc}") from exc
-if fixture.get("schema_version") != 1:
-    raise SystemExit(f"P081: expected schema_version 1, got {fixture.get('schema_version')}")
-if "matrix_id" not in fixture:
-    raise SystemExit("P081: boundary fixture missing matrix_id")
-if not fixture.get("rows"):
-    raise SystemExit("P081: boundary fixture rows array is empty")
-REQUIRED_ROW_IDS = [
-    "p081.ui_operator.graphql_query.read",
-    "p081.ui_operator.graphql_subscription.subscribe",
-    "p081.ui_operator.graphql_mutation.approval_action",
-    "p081.agent_operator.mcp_initialize.capability",
-    "p081.agent_operator.mcp_tools_list.discovery",
-    "p081.agent_operator.mcp_tools_call.command",
-    "p081.automation.mcp_tools_list.discovery",
-    "p081.automation.mcp_tools_call.command",
-    "p081.observer.mcp_tools_call.compact_read",
-    "p081.observer.graphql_query.read_only_opt_in",
-    "p081.developer_break_glass.debug_endpoint.disabled",
-]
-present_ids = {row["row_id"] for row in fixture["rows"]}
-for required in REQUIRED_ROW_IDS:
-    if required not in present_ids:
-        raise SystemExit(f"P081: required row '{required}' missing from fixture")
-print(f"P081: fixture valid — {len(fixture['rows'])} rows, all {len(REQUIRED_ROW_IDS)} required rows present")
+    raise SystemExit("proposal-078: missing P078 operator-readback fixture")
+if not negative_path.exists():
+    raise SystemExit("proposal-078: missing P078 missing-readback negative fixture")
+if not accessibility_path.exists():
+    raise SystemExit("proposal-078: missing P078 macOS accessibility proof fixture")
+fixture = json.loads(fixture_path.read_text())
+negative = json.loads(negative_path.read_text())
+accessibility = json.loads(accessibility_path.read_text())
+
+def require_side_effect_readback(payload, field, label):
+    value = payload.get(field)
+    if not isinstance(value, dict):
+        raise SystemExit(f"proposal-078: {label} missing {field}")
+    if value.get("schema_version", value.get("schemaVersion")) != "p078_side_effect_readback_v1":
+        raise SystemExit(f"proposal-078: {label} has invalid side-effect readback schema")
+    for required in ["blocked", "effects"]:
+        if required not in value:
+            raise SystemExit(f"proposal-078: {label} side-effect readback missing {required}")
+    if not value.get("blocked"):
+        raise SystemExit(f"proposal-078: {label} side-effect readback must prove blocked unresolved state")
+    if value.get("unresolved_count", value.get("unresolvedCount")) != 1:
+        raise SystemExit(f"proposal-078: {label} side-effect readback must carry one unresolved effect")
+    effects = value.get("effects")
+    if not isinstance(effects, list) or not effects:
+        raise SystemExit(f"proposal-078: {label} side-effect readback must include non-empty effects")
+    first = effects[0]
+    action = first.get("operator_next_action", first.get("operatorNextAction"))
+    if action != "effects.reconcile":
+        raise SystemExit(f"proposal-078: {label} side-effect readback must expose effects.reconcile next action")
+
+require_side_effect_readback(fixture, "side_effect_readback", "run_report")
+lanes = fixture.get("parity_lanes") or {}
+require_side_effect_readback(lanes.get("mcp") or {}, "side_effect_readback", "mcp")
+require_side_effect_readback(lanes.get("release_receipt") or {}, "side_effect_readback", "release_receipt")
+require_side_effect_readback(lanes.get("graphql") or {}, "sideEffectReadback", "graphql")
+if "side_effect_readback" in negative or "sideEffectReadback" in negative:
+    raise SystemExit("proposal-078: negative fixture unexpectedly contains side-effect readback")
+metrics = fixture.get("metrics") or []
+metric_names = {item.get("name") for item in metrics if isinstance(item, dict)}
+for required_metric in [
+    "p078_release_side_effects_with_durable_intent_percent",
+    "side_effect_intent_total",
+    "side_effect_transition_total",
+    "side_effect_retry_block_total",
+    "side_effect_unresolved",
+    "side_effect_unresolved_age_seconds",
+    "side_effect_recovery_transition_total",
+    "side_effect_settlement_latency_seconds",
+    "startup_side_effect_recovery_total",
+    "startup_side_effect_recovery_duration_seconds",
+    "side_effect_ledger_readback_error_total",
+    "side_effect_ledger_readback_circuit_open_total",
+    "side_effect_evidence_spooled_bytes_total",
+    "side_effect_evidence_disk_bytes",
+    "side_effect_prepare_denied_total",
+]:
+    if required_metric not in metric_names:
+        raise SystemExit(f"proposal-078: rollout fixture missing operational metric {required_metric}")
+for item in metrics:
+    if item.get("cardinality_bound") != "effect_kind_status":
+        raise SystemExit("proposal-078: metric fixture must document effect_kind/status cardinality bound")
+
+side_effects_rs = (root / "control-plane/crates/engine/src/side_effects.rs").read_text()
+executor_rs = (root / "control-plane/crates/engine/src/executor.rs").read_text()
+effects_rs = (root / "control-plane/crates/mcp-server/src/tools/effects.rs").read_text()
+tools_mod_rs = (root / "control-plane/crates/mcp-server/src/tools/mod.rs").read_text()
+graphql_schema_rs = (root / "control-plane/crates/graphql-server/src/schema.rs").read_text()
+runs_rs = (root / "control-plane/crates/mcp-server/src/tools/runs.rs").read_text()
+swift_truth = (root / "Chainworks Forge/Models/ExecutionTruth.swift").read_text()
+swift_read_boundary = (root / "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift").read_text()
+swift_runs_home = (root / "Chainworks Forge/Views/RunsHomeView.swift").read_text()
+
+for metric in [
+    "p078_release_side_effects_with_durable_intent_percent",
+    "side_effect_intent_total",
+    "side_effect_transition_total",
+    "side_effect_retry_block_total",
+    "side_effect_ledger_readback_error_total",
+    "side_effect_ledger_readback_circuit_open_total",
+    "side_effect_recovery_transition_total",
+    "side_effect_settlement_latency_seconds",
+    "side_effect_unresolved",
+    "side_effect_unresolved_age_seconds",
+    "startup_side_effect_recovery_total",
+    "startup_side_effect_recovery_duration_seconds",
+    "side_effect_evidence_spooled_bytes_total",
+    "side_effect_evidence_disk_bytes",
+    "side_effect_prepare_denied_total",
+]:
+    if metric not in side_effects_rs + executor_rs:
+        raise SystemExit(f"proposal-078: missing metric literal {metric}")
+
+for required in [
+    "watchdog_pass().await",
+    "run_unresolved_effects_preflight",
+    "p078_expected_side_effect_evidence_v1",
+    "p078_side_effect_evidence_manifest_v1",
+    "p078_observed_evidence_summary_v1",
+    "manifest_write_order",
+    "run_with_lease_renewal",
+    "p075_write_spool_file",
+    "verify_p078_observed_evidence_summary",
+    "mark_settled_evidence_failed",
+    "P078_LEDGER_READBACK_CIRCUIT_THRESHOLD",
+    "ledger_readback_circuit_open_until",
+    "release-receipt.json",
+    "stdout.log",
+    "stderr.log",
+    "git-ls-remote.json",
+    "upload-readback.json",
+    "archive-summary.json",
+    "reconciliation-report.json",
+]:
+    if required not in executor_rs + side_effects_rs:
+        raise SystemExit(f"proposal-078: missing executor proof marker {required}")
+
+for required in [
+    "effects.mark_conflict",
+    "handle_effects_mark_conflict",
+]:
+    if required not in effects_rs or required not in tools_mod_rs + effects_rs:
+        raise SystemExit(f"proposal-078: missing MCP conflict disposition marker {required}")
+
+for required in [
+    "GqlSideEffectSummary",
+    "observed_evidence_summary_json",
+    "operator_next_action",
+    "side_effect_readback",
+    "SideEffectReadbackSummary",
+    "P078SideEffectReadbackPresenter",
+    "P078SideEffectReadbackCard",
+]:
+    haystack = "\n".join([graphql_schema_rs, runs_rs, swift_truth, swift_read_boundary, swift_runs_home])
+    if required not in haystack:
+        raise SystemExit(f"proposal-078: missing readback marker {required}")
+
+swift_tree = root / "Chainworks Forge"
+swift_text = "\n".join(path.read_text(errors="ignore") for path in swift_tree.rglob("*.swift"))
+for forbidden in ["effects.mark_conflict", "effects.mark_unrecoverable", "effects.clear_after_manual_verification"]:
+    if forbidden in swift_text:
+        raise SystemExit(f"proposal-078: Swift app must remain read-only for {forbidden}")
+
+if accessibility.get("schema_version") != "p078_macos_accessibility_view_hierarchy_v1":
+    raise SystemExit("proposal-078: invalid macOS accessibility proof schema")
+elements = accessibility.get("elements") or []
+ids = {item.get("accessibility_identifier") for item in elements if isinstance(item, dict)}
+for required_id in [
+    "p078-side-effect-readback-card",
+    "p078-side-effect-sidebar-signal",
+    "p078-side-effect-next-action",
+    "p078-side-effect-diagnostics",
+]:
+    if required_id not in ids:
+        raise SystemExit(f"proposal-078: macOS accessibility proof missing {required_id}")
+for item in elements:
+    if item.get("mutation_control"):
+        raise SystemExit("proposal-078: macOS accessibility proof contains mutation control")
+for forbidden in ["reconcile", "retry", "clear", "push", "upload", "publish", "mcp_launch"]:
+    if forbidden not in accessibility.get("forbidden_controls_absent", []):
+        raise SystemExit(f"proposal-078: macOS accessibility proof missing forbidden control check {forbidden}")
 PY
+    log "Proposal 078 durable side-effect ledger gate passed"
+    ;;
+  proposal-088|p088)
+    log "Proposal 088 gate: code-writer completion handoff and diagnostics"
+    python3 - <<'PY'
+import json
+from pathlib import Path
 
-    log "P081: doc exists — verify boundary-first-api-auth-contract.md exists"
-    if [[ ! -f "$ROOT_DIR/docs/reference/boundary-first-api-auth-contract.md" ]]; then
-      die "P081: missing docs/reference/boundary-first-api-auth-contract.md"
-    fi
+root = Path.cwd()
+evidence = root / "docs/evidence/088-code-writer-completion"
+required = {
+    "p087-terminal-completed-missing-outputs.fixture.json": {
+        "scenario": "p087_terminal_completed_missing_outputs",
+        "expected_failure_class": "terminal_response_completed_missing_required_outputs",
+    },
+    "p087-70c9-dirty-worktree-timeout.fixture.json": {
+        "scenario": "p087_70c9_preexisting_dirty_timeout",
+        "work_change_kind": "preexisting_dirty_work",
+        "expected_next_operator_action": "do_not_retry_preexisting_dirty_timeout",
+    },
+    "large-streamed-prelude-tail-capture.fixture.json": {
+        "scenario": "large_streamed_prelude_tail_capture",
+        "completion_text_capture_source": "streamed_update_tail",
+        "extraction_input_truncated": False,
+    },
+    "public-enum-roundtrip.fixture.json": {
+        "scenario": "public_enum_roundtrip",
+    },
+    "worktree-fingerprint-v1.fixture.json": {
+        "schema_version": "worktree_fingerprint_v1",
+    },
+    "prompt-side-evidence.fixture.json": {
+        "scenario": "prompt_side_evidence",
+        "prompt_template_id": "code_writer_completion_repair_v1",
+    },
+    "normal-materialization-no-repair.fixture.json": {
+        "scenario": "normal_materialization_no_repair",
+        "expected_completion_turn_attempted": False,
+    },
+    "completion-repair-mutation-negative.fixture.json": {
+        "scenario": "completion_repair_mutation_negative",
+        "expected_completion_turn_result": "failed_unexpected_worktree_mutation",
+    },
+    "docs-only-implementation-change.fixture.json": {
+        "scenario": "docs_only_implementation_change",
+        "work_change_kind": "current_attempt_diff",
+    },
+    "generated-evidence-only-ineligible.fixture.json": {
+        "scenario": "generated_evidence_only_ineligible",
+        "expected_eligible_for_completion_repair": False,
+    },
+    "ingestion-boundary-failures.fixture.json": {
+        "scenario": "ingestion_boundary_failures",
+    },
+    "partial-write-recovery.fixture.json": {
+        "scenario": "completion_receipt_partial_write",
+        "expected_failure_class": "completion_receipt_partial_write",
+    },
+    "provider-independence.fixture.json": {
+        "scenario": "provider_independence_completion_contract",
+        "expected_failure_class": "work_completed_missing_current_attempt_outputs",
+        "provider_specific_truth_branch_allowed": False,
+    },
+}
+for name, expectations in required.items():
+    path = evidence / name
+    if not path.exists():
+        raise SystemExit(f"proposal-088: missing fixture {path}")
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"proposal-088: invalid JSON in {path}: {exc}") from exc
+    for key, expected in expectations.items():
+        actual = data.get(key)
+        if actual != expected:
+            raise SystemExit(
+                f"proposal-088: fixture {name} expected {key}={expected!r}, got {actual!r}"
+            )
 
-    log "P081: auth crate boundary module unit tests"
-    (
-      cd "$ROOT_DIR/control-plane"
-      cargo test -p auth boundary:: -- --nocapture
+fingerprint = json.loads((evidence / "worktree-fingerprint-v1.fixture.json").read_text())
+paths = fingerprint.get("paths")
+summary = fingerprint.get("summary", {})
+if not isinstance(paths, list) or not paths:
+    raise SystemExit("proposal-088: worktree fingerprint fixture must contain paths")
+if paths != sorted(paths, key=lambda item: item.get("normalized_path", "")):
+    raise SystemExit("proposal-088: worktree fingerprint paths must be sorted")
+derived_preexisting = sum(1 for path in paths if path.get("path_status") == "preexisting_dirty")
+if summary.get("preexisting_dirty_path_count") != derived_preexisting:
+    raise SystemExit("proposal-088: fingerprint preexisting_dirty_path_count is not derived")
+if summary.get("work_change_kind") != "preexisting_dirty_work":
+    raise SystemExit("proposal-088: fingerprint fixture must prove preexisting dirty work")
+
+provider_fixture = json.loads((evidence / "provider-independence.fixture.json").read_text())
+providers = sorted(item.get("provider") for item in provider_fixture.get("providers", []))
+if providers != ["claude", "codex", "junie"]:
+    raise SystemExit(
+        f"proposal-088: provider independence fixture must cover claude/codex/junie, got {providers!r}"
     )
 
-    log "P081: db crate audit_log repo unit tests"
+proposal = root / "docs/proposals/088-code-writer-completion-contract-and-output-freshness.md"
+if not proposal.exists():
+    raise SystemExit("proposal-088: missing proposal document")
+proposal_text = proposal.read_text()
+for required_term in [
+    "code_writer_completion_repair_v1",
+    "worktree_fingerprint_v1",
+    "terminal_response_capture_truncated_before_output",
+    "extraction_input_truncated",
+    "current_attempt_diff",
+    "preexisting_dirty_work",
+]:
+    if required_term not in proposal_text:
+        raise SystemExit(f"proposal-088: proposal missing required term {required_term!r}")
+
+gates_doc = root / "docs/reference/test-gates.md"
+if not gates_doc.exists():
+    raise SystemExit("proposal-088: missing docs/reference/test-gates.md")
+gates_text = gates_doc.read_text()
+for required_term in [
+    "### `proposal-088|p088`",
+    "worktree_fingerprint_v1",
+    "70c9",
+    "implementationCompletion",
+    "closed vocabularies",
+    "prompt-level runtime receipt persistence",
+]:
+    if required_term not in gates_text:
+        raise SystemExit(f"proposal-088: test-gates.md missing {required_term!r}")
+
+db_repo = root / "control-plane/crates/db/src/repos/code_writer_completion_receipts.rs"
+db_repo_text = db_repo.read_text()
+for required_term in [
+    "upsert_with_runtime_receipts",
+    "list_canonical_by_run",
+    "completion_receipt_conflict",
+    "code_writer_completion_receipt_links",
+]:
+    if required_term not in db_repo_text:
+        raise SystemExit(f"proposal-088: DB receipt repo missing {required_term!r}")
+
+engine_executor = root / "control-plane/crates/engine/src/executor.rs"
+engine_executor_text = engine_executor.read_text()
+for required_term in [
+    "skipped_no_live_session",
+    "p037_idle_terminalization",
+    "upsert_with_runtime_receipts",
+    "completion_receipt_partial_write",
+    "storage_write_failed",
+    "CodeWriterCompletionStarted",
+    "CodeWriterCompletionSucceeded",
+    "CodeWriterCompletionFailed",
+]:
+    if required_term not in engine_executor_text:
+        raise SystemExit(f"proposal-088: engine executor missing {required_term!r}")
+
+engine_integration = root / "control-plane/crates/engine/tests/integration.rs"
+engine_integration_text = engine_integration.read_text()
+for required_term in [
+    "proposal_088_code_writer_stale_implementation_active_enters_receipt_path_not_auto_requeue",
+    "p088_stale_implementation_active",
+    "acp_active_prompt_recovery",
+]:
+    if required_term not in engine_integration_text:
+        raise SystemExit(f"proposal-088: engine integration test missing {required_term!r}")
+
+sessions_domain = root / "control-plane/crates/domain/src/session.rs"
+sessions_repo = root / "control-plane/crates/db/src/repos/sessions.rs"
+for required_term in [
+    "CodeWriterCompletionStarted",
+    "CodeWriterCompletionSucceeded",
+    "CodeWriterCompletionFailed",
+    "code_writer_completion_started",
+    "code_writer_completion_succeeded",
+    "code_writer_completion_failed",
+]:
+    if required_term not in sessions_domain.read_text():
+        raise SystemExit(f"proposal-088: domain session events missing {required_term!r}")
+    if required_term not in sessions_repo.read_text():
+        raise SystemExit(f"proposal-088: DB session event mapping missing {required_term!r}")
+
+print("proposal-088 static fixture checks passed")
+PY
     (
-      cd "$ROOT_DIR/control-plane"
-      cargo test -p db repos::audit_log:: -- --nocapture
+      cd control-plane
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p acp proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p domain proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p db proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p engine proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p graphql-server proposal_088_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-088-gate cargo test -p mcp-server proposal_088_ -- --nocapture
+    )
+    log "Proposal 088 gate passed"
+    ;;
+  proposal-089|p089)
+    log "Proposal 089 gate: Junie structured-output proof and ACP canary evidence"
+    if [[ "${CHAINWORKS_PROPOSAL_089_ALLOW_DIRTY:-0}" == "1" ]]; then
+      log "Proposal 089 diagnostic dirty-work mode requested; this mode cannot produce signoff evidence"
+      mkdir -p "$ROOT_DIR/docs/evidence/089/junie-structured-output-canary/acp-canary"
+      cat >"$ROOT_DIR/docs/evidence/089/junie-structured-output-canary/acp-canary/mutation-guard-result.json" <<'JSON'
+{
+  "schema_version": "p089_mutation_guard_result_v1",
+  "verdict": "evidence_incomplete",
+  "overall_status": "evidence_incomplete",
+  "preexisting_dirty_work_non_canary_safe": true,
+  "safety_violations": [],
+  "diagnostic_mode": "allow_dirty",
+  "signoff_eligible": false
+}
+JSON
+      echo "proposal-089: CHAINWORKS_PROPOSAL_089_ALLOW_DIRTY=1 is diagnostic-only and must not pass signoff" >&2
+      exit 1
+    fi
+    if [[ "${CHAINWORKS_PROPOSAL_089_LIVE:-0}" == "1" ]]; then
+      log "Proposal 089 live mode: running canonical Junie ACP canary"
+      mkdir -p "$ROOT_DIR/.chainworks/tmp"
+      mkdir -p "$ROOT_DIR/docs/evidence/089/junie-structured-output-canary"
+      p089_live_log="$ROOT_DIR/docs/evidence/089/junie-structured-output-canary/live-gate.log.redacted"
+      if [[ ! -d "$ROOT_DIR/.chainworks/tmp/p089-acp-canary-worktree/.git" && ! -f "$ROOT_DIR/.chainworks/tmp/p089-acp-canary-worktree/.git" ]]; then
+        git worktree add --detach "$ROOT_DIR/.chainworks/tmp/p089-acp-canary-worktree" HEAD
+      fi
+      {
+        printf '%s\n' '$ CHAINWORKS_PROPOSAL_089_LIVE=1 ./scripts/test-gate.sh proposal-089'
+        printf '%s\n' '==> Proposal 089 live mode: running canonical Junie ACP canary'
+        (
+          cd "$ROOT_DIR/control-plane"
+          P089_WORKTREE_ROOT="$ROOT_DIR/.chainworks/tmp/p089-acp-canary-worktree" \
+            P089_ACP_EVIDENCE_DIR="$ROOT_DIR/docs/evidence/089/junie-structured-output-canary/acp-canary" \
+            cargo run -p engine --example p089_acp_live_canary
+        )
+      } >"$p089_live_log" 2>&1
+      cat "$p089_live_log"
+      python3 "$ROOT_DIR/scripts/proposal-089-refresh-evidence.py"
+    fi
+    python3 - <<'PY'
+import hashlib
+import json
+from pathlib import Path
+
+root = Path.cwd()
+evidence = root / "docs/evidence/089/junie-structured-output-canary"
+native_root = evidence / "native"
+acp_root = evidence / "acp-canary"
+index_path = evidence / "evidence-index.json"
+live_path = evidence / "live-gate-run.json"
+
+STATUSES = {
+    "passed",
+    "environment_unavailable",
+    "native_capability_failed",
+    "acp_launch_failed",
+    "acp_handshake_failed",
+    "completion_capture_failed",
+    "completion_capture_truncated",
+    "extraction_failed",
+    "settlement_failed",
+    "unexpected_completion_repair",
+    "unexpected_repo_mutation",
+    "evidence_incomplete",
+}
+
+def fail(message):
+    raise SystemExit(f"proposal-089: {message}")
+
+def load_json(path):
+    if not path.exists():
+        fail(f"missing {path}")
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {path}: {exc}")
+
+def sha256_file(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def file_meta(path):
+    if not path.exists():
+        fail(f"missing file {path}")
+    return {"sha256": sha256_file(path), "size_bytes": path.stat().st_size}
+
+def assert_file_record(path, record):
+    meta = file_meta(path)
+    if record.get("sha256") != meta["sha256"] or record.get("size_bytes") != meta["size_bytes"]:
+        fail(f"hash/size mismatch for {path}")
+
+def file_record_matches(path, record):
+    meta = file_meta(path)
+    return record.get("sha256") == meta["sha256"] and record.get("size_bytes") == meta["size_bytes"]
+
+def assert_status(value, context):
+    if value not in STATUSES:
+        fail(f"{context} has unknown status {value!r}")
+
+def require(condition, message):
+    if not condition:
+        fail(message)
+
+def manifest_row_is_valid_control_plane(row):
+    return (
+        row.get("settlement_decision") == "accepted"
+        and row.get("source_kind") is None
+        and row.get("reason") == "control_plane_generated"
+        and row.get("provenance") == "control_plane_generated"
+        and row.get("generated_by") == "control_plane"
+        and row.get("contributes_to_junie_capability") is False
     )
 
-    log "P081: migration compile check — audit_log and audit_log_checkpoints migrations exist"
-    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/049_p081_audit_log.sql" ]]; then
-      die "P081: missing migration 049_p081_audit_log.sql"
-    fi
-    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/050_p081_audit_log_checkpoints.sql" ]]; then
-      die "P081: missing migration 050_p081_audit_log_checkpoints.sql"
-    fi
+def broad_allowed_root_is_rejected(root_value):
+    root_text = str(root_value)
+    candidate = Path(root_text)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        resolved = candidate.absolute()
+    forbidden = [
+        root,
+        root / "Chainworks Forge",
+        root / "Chainworks ForgeTests",
+        root / "Chainworks ForgeUITests",
+        root / "control-plane",
+        root / "examples",
+        root / "scripts",
+        root / "docs/reference",
+        root / ".chainworks",
+        root / ".chainworks/runs",
+    ]
+    for forbidden_path in forbidden:
+        forbidden_resolved = forbidden_path.resolve(strict=False)
+        if resolved == forbidden_resolved or forbidden_resolved in resolved.parents:
+            return True
+        if resolved in forbidden_resolved.parents:
+            return True
+    return False
 
-    log "Proposal 081 Phase 1 gate passed"
+def validate_negative_fixtures():
+    negative_root = evidence / "negative"
+    broad_roots = load_json(negative_root / "broad-allowed-roots.fail.json")
+    require(broad_roots.get("expected_status") == "evidence_incomplete", "broad root fixture expected_status mismatch")
+    for case in broad_roots.get("cases") or []:
+        require(
+            broad_allowed_root_is_rejected(case.get("root")),
+            f"broad root fixture did not reject {case.get('root')!r}",
+        )
+
+    drift = load_json(negative_root / "proof-critical-drift.fail.json")
+    require(drift.get("expected_status") == "evidence_incomplete", "proof-critical drift fixture expected_status mismatch")
+    drift_path = root / drift.get("path", "")
+    drift_record = drift.get("record") or {}
+    require(not file_record_matches(drift_path, drift_record), "proof-critical drift fixture unexpectedly matched current file")
+
+    bad_manifest = load_json(negative_root / "changed-files-manifest-agent-source.fail.json")
+    require(bad_manifest.get("expected_status") == "evidence_incomplete", "bad manifest fixture expected_status mismatch")
+    require(
+        not manifest_row_is_valid_control_plane(bad_manifest.get("row") or {}),
+        "bad manifest fixture unexpectedly validated",
+    )
+
+    dirty = load_json(negative_root / "allow-dirty-diagnostic.fail.json")
+    require(dirty.get("expected_status") == "evidence_incomplete", "allow dirty fixture expected_status mismatch")
+    require(dirty.get("env", {}).get("CHAINWORKS_PROPOSAL_089_ALLOW_DIRTY") == "1", "allow dirty fixture env mismatch")
+    require(dirty.get("signoff_eligible") is False, "allow dirty fixture must be non-signoff")
+
+def validate_native_experiment(name, expected):
+    directory = native_root / name
+    required = [
+        "prompt.txt",
+        "command.json",
+        "environment.json",
+        "final-output.raw.txt",
+        "parser-result.json",
+        "conclusion.json",
+    ]
+    for filename in required:
+        if not (directory / filename).exists():
+            fail(f"native {name} missing {filename}")
+    command = load_json(directory / "command.json")
+    parser = load_json(directory / "parser-result.json")
+    conclusion = load_json(directory / "conclusion.json")
+    assert_status(conclusion.get("status"), f"native {name} conclusion")
+    prompt_bytes = (directory / "prompt.txt").read_bytes()
+    final_bytes = (directory / "final-output.raw.txt").read_bytes()
+    require(command.get("schema_version") == "p089_native_command_v1", f"native {name} command schema")
+    require(command.get("output_mode") == "stdout_text", f"native {name} output_mode must be stdout_text")
+    require(command.get("input_mode") == "task_arg", f"native {name} input_mode must be task_arg")
+    require(command.get("prompt_sha256") == hashlib.sha256(prompt_bytes).hexdigest(), f"native {name} prompt_sha256 mismatch")
+    args = command.get("args") or []
+    require("--acp" not in args and "--json-output-file" not in args, f"native {name} used forbidden Junie args")
+    require(parser.get("success") is True, f"native {name} parser did not pass")
+    require(conclusion.get("status") == "passed", f"native {name} conclusion is not passed")
+    require(conclusion.get("final_output_sha256") == hashlib.sha256(final_bytes).hexdigest(), f"native {name} final-output hash mismatch")
+    try:
+        parsed = json.loads(final_bytes.decode())
+    except json.JSONDecodeError as exc:
+        fail(f"native {name} final-output is not strict JSON: {exc}")
+    require(parsed == expected, f"native {name} final-output contract mismatch")
+
+validate_native_experiment(
+    "exact-json",
+    {"p089_native_probe": "exact_json", "status": "passed", "value": 1},
+)
+validate_native_experiment(
+    "exact-chainworks-output",
+    {"CHAINWORKS_OUTPUT": {"native_chainworks_output": {"status": "passed", "value": 1}}},
+)
+validate_native_experiment(
+    "repair-style-minimal",
+    {
+        "CHAINWORKS_OUTPUT": {
+            "tests_result": {"status": "not_run", "commands": []},
+            "implementation_self_assessment": {
+                "implementation_complete": True,
+                "verification_green": True,
+                "remaining_code_tasks": [],
+                "handoff_tasks": [],
+                "known_risks": [],
+                "tests_run": [],
+                "docs_impacted": [],
+            },
+        }
+    },
+)
+
+for filename in [
+    "preflight.json",
+    "receipt.json",
+    "terminal-completion.raw.txt",
+    "extraction-result.json",
+    "settled-outputs.json",
+    "run-report.json",
+    "worktree-fingerprint-pre.json",
+    "worktree-fingerprint-post.json",
+    "mutation-guard-result.json",
+    "conclusion.json",
+]:
+    if not (acp_root / filename).exists():
+        fail(f"ACP canary missing {filename}")
+
+preflight = load_json(acp_root / "preflight.json")
+receipt = load_json(acp_root / "receipt.json")
+extraction = load_json(acp_root / "extraction-result.json")
+settled = load_json(acp_root / "settled-outputs.json")
+mutation = load_json(acp_root / "mutation-guard-result.json")
+conclusion = load_json(acp_root / "conclusion.json")
+terminal_text = (acp_root / "terminal-completion.raw.txt").read_text()
+
+assert_status(preflight.get("status"), "ACP preflight")
+assert_status(conclusion.get("status"), "ACP conclusion")
+require(preflight.get("status") == "passed", "ACP preflight did not pass")
+require(conclusion.get("status") == "passed", "ACP conclusion did not pass")
+require(receipt.get("provider") == "junie", "ACP receipt provider must be junie")
+require(receipt.get("runtime_profile") == "junie_cli_acp", "ACP receipt runtime_profile mismatch")
+require(receipt.get("agent_id") == "code_writer", "ACP receipt agent_id must be code_writer")
+require(receipt.get("backend_profile") == "junie_code_editor_acp", "ACP receipt backend_profile mismatch")
+require(receipt.get("model") == "junie-default", "ACP receipt model must come from production backend profile")
+require(receipt.get("effort") == "high", "ACP receipt effort must come from production backend profile")
+require(receipt.get("adapter_family") == "JunieAdapter", "ACP receipt adapter_family mismatch")
+require(receipt.get("launch_mode") == "--acp true", "ACP receipt launch mode mismatch")
+require(receipt.get("output_set_mode") == "full_production", "ACP receipt output_set_mode mismatch")
+require(receipt.get("stage_id") == "p089_acp_canary", "ACP receipt stage_id mismatch")
+require(receipt.get("stage_execution_id"), "ACP receipt stage_execution_id missing")
+require(receipt.get("agent_execution_id"), "ACP receipt agent_execution_id missing")
+require(receipt.get("session_generation_id"), "ACP receipt session_generation_id missing")
+catalog_binding = receipt.get("catalog_binding") or {}
+require(catalog_binding.get("agent_id") == "code_writer", "catalog binding agent_id mismatch")
+require(catalog_binding.get("backend_profile") == "junie_code_editor_acp", "catalog binding backend_profile mismatch")
+require(catalog_binding.get("provider") == "junie", "catalog binding provider mismatch")
+require(catalog_binding.get("model") == "junie-default", "catalog binding model mismatch")
+require(catalog_binding.get("effort") == "high", "catalog binding effort mismatch")
+require(catalog_binding.get("runtime_profile") == "junie_cli_acp", "catalog binding runtime_profile mismatch")
+require(catalog_binding.get("outputs") == [
+    "implementation_progress",
+    "implementation_self_assessment",
+    "changed_files_manifest",
+    "tests_result",
+], "catalog binding outputs mismatch")
+catalog_path = catalog_binding.get("catalog_path")
+require(catalog_path, "catalog binding catalog_path missing")
+catalog_abs = Path(catalog_path)
+if not catalog_abs.is_absolute():
+    catalog_abs = root / catalog_abs
+require(catalog_abs.resolve(strict=False) == (root / "examples/agents/agents.yaml").resolve(strict=False), "catalog binding path mismatch")
+require(catalog_binding.get("catalog_sha256") == sha256_file(root / "examples/agents/agents.yaml"), "catalog binding hash mismatch")
+
+expected_contracts = {
+    "implementation_progress": "implementation_progress",
+    "implementation_self_assessment": "implementation_self_assessment_v2",
+    "changed_files_manifest": "changed_files_manifest",
+    "tests_result": "tests_result",
+}
+require(catalog_binding.get("contract_ids") == expected_contracts, "catalog binding contract_ids mismatch")
+compiled = {item.get("name"): item for item in receipt.get("compiled_task_outputs") or []}
+require(set(compiled) == set(expected_contracts), "ACP compiled outputs must match production code_writer output set")
+for name, expected_contract in expected_contracts.items():
+    actual_contract = compiled[name].get("contract_id")
+    require(actual_contract == expected_contract, f"ACP output {name} contract_id expected {expected_contract!r}, got {actual_contract!r}")
+    require(compiled[name].get("required") is True, f"ACP output {name} must be required")
+
+repair = receipt.get("repair_metadata") or {}
+require(repair.get("completion_turn_attempted") is False, "ACP completion_turn_attempted must be false")
+require(repair.get("completion_repair_turn_count") == 0, "ACP completion_repair_turn_count must be 0")
+require(repair.get("generic_repair_turn_count") == 0, "ACP generic_repair_turn_count must be 0")
+require(repair.get("completion_repair_runtime_receipt_present") is False, "ACP completion repair runtime receipt must be absent")
+runtime_receipt = receipt.get("runtime_receipt") or {}
+require(runtime_receipt.get("status") == "completed", "ACP runtime receipt must be completed")
+
+require(extraction.get("completion_text_sha256") == hashlib.sha256(terminal_text.encode()).hexdigest(), "ACP terminal completion hash mismatch")
+require(extraction.get("completion_text_truncated") is False, "ACP completion text must not be truncated")
+require(extraction.get("extraction_input_truncated") is False, "ACP extraction input must not be truncated")
+require(extraction.get("raw_completion_has_non_json_prefix") is False, "ACP terminal completion must be strict CHAINWORKS_OUTPUT JSON with no prefix")
+try:
+    terminal_json = json.loads(terminal_text)
+except json.JSONDecodeError as exc:
+    fail(f"ACP terminal completion is not strict JSON: {exc}")
+require(set((terminal_json.get("CHAINWORKS_OUTPUT") or {}).keys()) == {
+    "implementation_progress",
+    "implementation_self_assessment",
+    "tests_result",
+}, "ACP CHAINWORKS_OUTPUT must contain exactly the Junie-authored outputs")
+require((extraction.get("parser_result") or {}).get("success") is True, "ACP extraction parser did not pass")
+
+rows = {row.get("output_name"): row for row in settled.get("declared_outputs") or []}
+require(set(rows) == set(expected_contracts), "settled outputs must match full production output set")
+require(settled.get("settlement_boundary") == "engine::executor::generate_changed_files_manifest_if_declared_then_settle_agent_outputs_from_discovery_decisions", "settled outputs must come from production executor settlement boundary")
+require(settled.get("materialization_owner") == "engine_executor", "settled outputs materialization_owner mismatch")
+require(settled.get("changed_files_manifest_status") in {"available", "not_git_repository"}, "changed_files_manifest status mismatch")
+require(settled.get("decisions"), "settled outputs must include production discovery decisions")
+for name in ["implementation_progress", "implementation_self_assessment", "tests_result"]:
+    row = rows[name]
+    require(row.get("settlement_decision") == "accepted", f"{name} settlement not accepted")
+    require(row.get("freshness") == "current_attempt", f"{name} not current_attempt")
+    require(row.get("source_kind") == "chainworks_output", f"{name} source_kind must be chainworks_output")
+    require(row.get("source_generation_owner") == "agent", f"{name} source_generation_owner must be agent")
+    require(row.get("contributes_to_junie_capability") is True, f"{name} must contribute to Junie capability")
+manifest = rows["changed_files_manifest"]
+require(manifest_row_is_valid_control_plane(manifest), "changed_files_manifest control-plane row mismatch")
+require(settled.get("all_required_outputs_accepted") is True, "not all required outputs accepted")
+require(settled.get("junie_capability_outputs_accepted") is True, "Junie capability outputs not accepted")
+
+require(mutation.get("verdict") == "passed", "mutation guard verdict must be passed")
+require(mutation.get("safety_violations") == [], "mutation guard has safety violations")
+require(mutation.get("canonicalized_allowed_roots_valid") is True, "allowed roots were not canonicalized/valid")
+post_summary = load_json(acp_root / "worktree-fingerprint-post.json").get("summary") or {}
+require(post_summary.get("current_attempt_changed_path_count") == 0, "post fingerprint has current-attempt repo changes")
+require(post_summary.get("preexisting_dirty_path_count") == 0, "post fingerprint has preexisting dirty work")
+
+if not index_path.exists() or not live_path.exists():
+    fail("missing evidence-index.json or live-gate-run.json")
+index = load_json(index_path)
+live = load_json(live_path)
+require(index.get("schema_version") == "p089_evidence_index_v1", "invalid evidence-index schema")
+require(live.get("schema_version") == "p089_live_gate_run_v1", "invalid live-gate-run schema")
+for field in ["native_phase_status", "acp_canary_status", "overall_status"]:
+    assert_status(index.get(field), f"evidence-index {field}")
+    require(index.get(field) == "passed", f"evidence-index {field} must be passed")
+require(live.get("exit_code") == 0, "live-gate-run exit_code must be 0")
+require(live.get("result") == "passed", "live-gate-run result must be passed")
+require(live.get("working_directory") == str(root), "live-gate-run working_directory mismatch")
+require(live.get("started_at"), "live-gate-run started_at missing")
+require(live.get("completed_at"), "live-gate-run completed_at missing")
+require(live.get("native_timeout_ms") == 120000, "live-gate-run native_timeout_ms mismatch")
+require(live.get("native_phase_status") == "passed", "live-gate-run native_phase_status must be passed")
+require(live.get("acp_canary_status") == "passed", "live-gate-run acp_canary_status must be passed")
+require(live.get("overall_status") == "passed", "live-gate-run overall_status must be passed")
+require(live.get("audited_git_sha") == index.get("audited_git_sha"), "audited git sha mismatch")
+require(index.get("live_gate_run", {}).get("path") == str(live_path.relative_to(root)), "live_gate_run path mismatch")
+assert_file_record(live_path, index.get("live_gate_run", {}))
+require(live.get("command") == "./scripts/test-gate.sh proposal-089", "live-gate-run command mismatch")
+live_env = live.get("environment") or {}
+require(live_env.get("CHAINWORKS_PROPOSAL_089_LIVE") == "1", "live-gate-run must prove live mode")
+require(live_env.get("recorded_env_names") == ["CHAINWORKS_JUNIE_ACP_BINARY"], "live-gate-run recorded_env_names mismatch")
+require(live_env.get("redacted_env") is True, "live-gate-run redacted_env must be true")
+log_record = live.get("log") or {}
+assert_file_record(root / log_record.get("path", ""), log_record)
+
+proof_index = index.get("proof_critical_files") or []
+proof_live = live.get("proof_critical_files") or []
+require(proof_index == proof_live, "proof_critical_files mismatch between index and live receipt")
+required_proof_paths = {
+    "scripts/test-gate.sh",
+    "scripts/proposal-089-refresh-evidence.py",
+    "control-plane/crates/acp/src/adapters/junie.rs",
+    "control-plane/crates/acp/src/transport.rs",
+    "control-plane/crates/engine/examples/p089_acp_live_canary.rs",
+    "control-plane/crates/engine/src/executor.rs",
+    "control-plane/crates/engine/src/worktree_fingerprint.rs",
+    "examples/agents/agents.yaml",
+}
+actual_proof_paths = {entry.get("path") for entry in proof_index}
+require(required_proof_paths.issubset(actual_proof_paths), f"proof-critical files missing {sorted(required_proof_paths - actual_proof_paths)}")
+for entry in proof_index:
+    assert_file_record(root / entry.get("path", ""), entry)
+
+for native_record in index.get("native_experiments") or []:
+    directory = root / native_record.get("directory", "")
+    for filename, record in (native_record.get("files") or {}).items():
+        assert_file_record(directory / filename, record)
+for filename, record in ((index.get("acp_canary") or {}).get("files") or {}).items():
+    assert_file_record(acp_root / filename, record)
+require((index.get("acp_canary") or {}).get("status") == "passed", "evidence-index acp_canary.status must be passed")
+require((index.get("acp_canary") or {}).get("safety_violations") == [], "evidence-index safety violations must be empty")
+negative_index = index.get("negative_fixtures") or {}
+require(negative_index.get("directory") == str((evidence / "negative").relative_to(root)), "negative fixture directory mismatch")
+for filename, record in (negative_index.get("files") or {}).items():
+    assert_file_record(evidence / "negative" / filename, record)
+validate_negative_fixtures()
+
+print("proposal-089 default evidence validation passed")
+PY
+    log "Proposal 089 gate passed"
+    ;;
+  proposal-090|p090)
+    log "Proposal 090 gate: Junie runtime-hardening evidence inventory"
+    if [[ "${CHAINWORKS_PROPOSAL_090_LIVE:-0}" == "1" ]]; then
+      log "Proposal 090 live mode: running Junie refine-like code_writer canary"
+      rm -rf "$ROOT_DIR/.chainworks/tmp/p090-refine-like-canary-worktree" \
+        "$ROOT_DIR/docs/evidence/090/junie-runtime-hardening/refine-like-canary"
+      mkdir -p "$ROOT_DIR/.chainworks/tmp/p090-refine-like-canary-worktree" \
+        "$ROOT_DIR/docs/evidence/090/junie-runtime-hardening/refine-like-canary"
+      (
+        cd "$ROOT_DIR/control-plane"
+        CHAINWORKS_P090_STRICT_FINAL_PAYLOAD=1 \
+        CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE=1 \
+        CHAINWORKS_P090_STAGED_REPAIR_SETTLEMENT=1 \
+        P090_WORKTREE_ROOT="$ROOT_DIR/.chainworks/tmp/p090-refine-like-canary-worktree" \
+        P090_EVIDENCE_DIR="$ROOT_DIR/docs/evidence/090/junie-runtime-hardening/refine-like-canary" \
+        CARGO_TARGET_DIR=target/proposal-090-gate \
+        cargo run -p engine --example p090_junie_refine_like_live_canary
+      )
+      python3 - "$ROOT_DIR" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+index_path = root / "docs/evidence/090/junie-runtime-hardening/evidence-index.json"
+canary_root = root / "docs/evidence/090/junie-runtime-hardening/refine-like-canary"
+index = json.loads(index_path.read_text())
+live = index.setdefault("long_running_refine_like_canary", {})
+files = live.setdefault("files", {})
+for filename, record in files.items():
+    path = canary_root / filename
+    if not path.exists():
+        raise SystemExit(f"proposal-090 live refresh: missing {path.relative_to(root)}")
+    record["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    record["size_bytes"] = path.stat().st_size
+index_path.write_text(json.dumps(index, indent=2, sort_keys=False) + "\n")
+PY
+    fi
+    python3 - "$ROOT_DIR" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+index_path = root / "docs/evidence/090/junie-runtime-hardening/evidence-index.json"
+gates_doc = root / "docs/reference/test-gates.md"
+stable_doc_paths = [
+    root / "docs/reference/output-contracts-failure-evidence-and-recovery.md",
+    root / "docs/reference/acp-runtime-transport.md",
+    root / "docs/reference/rust-control-plane.md",
+    gates_doc,
+]
+
+required_subtypes = {
+    "junie_final_response_missing",
+    "junie_final_response_truncated",
+    "junie_progress_without_terminal_handoff",
+    "junie_repair_returned_narrative",
+    "junie_repair_returned_malformed_json",
+    "junie_repair_outputs_partially_materialized",
+    "junie_runtime_tool_path_failure_before_publication",
+}
+required_negative_classes = {
+    "provider_authored_engine_failure_spoof_rejected",
+    "provider_envelope_identity_mismatch_rejected",
+    "unknown_provider_envelope_schema_rejected",
+    "malformed_repair_sibling_does_not_overwrite_canonical_truth",
+    "permission_denied_preflight_does_not_launch_provider",
+}
+
+def fail(message):
+    raise SystemExit(f"proposal-090: {message}")
+
+def load_json(path):
+    if not path.exists():
+        fail(f"missing {path.relative_to(root)}")
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {path.relative_to(root)}: {exc}")
+
+def sha256_file(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+index = load_json(index_path)
+if index.get("schema_version") != "p090_junie_runtime_hardening_evidence_index_v1":
+    fail("invalid evidence-index schema_version")
+if index.get("proposal_id") != "090":
+    fail("evidence-index proposal_id must be 090")
+if index.get("gate") != "./scripts/test-gate.sh proposal-090":
+    fail("evidence-index gate must name ./scripts/test-gate.sh proposal-090")
+
+live = index.get("long_running_refine_like_canary") or fail("missing long_running_refine_like_canary evidence")
+if live.get("status") != "passed":
+    fail("long_running_refine_like_canary.status must be passed")
+if live.get("execution_path") != "BackgroundExecutor.process_next_item":
+    fail("long_running_refine_like_canary must prove BackgroundExecutor.process_next_item")
+live_files = live.get("files") or {}
+if "harness-result.json" not in live_files:
+    fail("long_running_refine_like_canary must hash harness-result.json")
+for filename, record in live_files.items():
+    path = root / "docs/evidence/090/junie-runtime-hardening/refine-like-canary" / filename
+    if not path.exists():
+        fail(f"missing live canary file {path.relative_to(root)}")
+    if record.get("sha256") != sha256_file(path):
+        fail(f"live canary file hash mismatch for {filename}")
+    if record.get("size_bytes") != path.stat().st_size:
+        fail(f"live canary size mismatch for {filename}")
+canary = load_json(root / "docs/evidence/090/junie-runtime-hardening/refine-like-canary/harness-result.json")
+if canary.get("schema_version") != "p090_refine_like_live_canary_v1":
+    fail("invalid P090 live canary schema_version")
+if canary.get("status") != "passed":
+    fail("P090 live canary did not pass")
+receipt = ((canary.get("receipt") or {}).get("receipt") or {})
+if receipt.get("provider") != "junie" or receipt.get("provider_runtime_family") != "junie_acp":
+    fail("P090 live canary must use Junie ACP")
+if receipt.get("completion_status") != "complete":
+    fail("P090 live canary receipt must complete")
+if receipt.get("completion_boundary_subtype") != "none":
+    fail("P090 live canary must not produce a failure subtype")
+if receipt.get("runtime_preflight_phase") != "passed":
+    fail("P090 live canary preflight must pass")
+if receipt.get("strict_final_payload_enabled") is not True:
+    fail("P090 live canary must run with strict final payload enabled")
+preflight = json.loads(receipt.get("runtime_tool_path_preflight_json") or "{}")
+if preflight.get("provider_launched") is not True or preflight.get("enforcement_enabled") is not True:
+    fail("P090 live canary must enforce preflight before provider launch")
+if preflight.get("attempt_count") is None or not preflight.get("lifecycle_phases"):
+    fail("P090 live canary must persist preflight attempt count and lifecycle phases")
+coverage = canary.get("coverage") or {}
+if coverage.get("live_canary_scope") != "junie_hardened_happy_path":
+    fail("P090 live canary must explicitly declare its hardened happy-path scope")
+if coverage.get("staged_repair_exercised") is not False:
+    fail("P090 live canary must not imply staged repair coverage unless a repair turn ran")
+staged_proof = index.get("staged_repair_proof") or {}
+if staged_proof.get("proof_type") != "focused_runtime_and_startup_recovery_tests":
+    fail("P090 staged repair proof must be separated from the live happy-path canary")
+required_staged_tests = {
+    "executor::tests::proposal_090_repair_materializes_valid_outputs_without_overwriting_malformed_sibling",
+    "executor::tests::proposal_090_committed_repair_rows_publish_only_accepted_active_artifacts",
+    "integration::proposal_090_startup_repair_publishes_recovered_committed_active_pointer",
+}
+if not required_staged_tests.issubset(set(staged_proof.get("tests") or [])):
+    fail("P090 staged repair proof is missing focused normal/recovery tests")
+required_outputs = {"implementation_progress", "implementation_self_assessment", "tests_result"}
+output_files = {row.get("output_name"): row for row in canary.get("output_files") or []}
+missing_outputs = [name for name in required_outputs if not (output_files.get(name) or {}).get("exists")]
+if missing_outputs:
+    fail(f"P090 live canary missing output files: {missing_outputs}")
+decisions = {
+    row.get("output_name"): row
+    for row in (canary.get("receipt") or {}).get("output_decisions") or []
+}
+for name in required_outputs:
+    decision = decisions.get(name) or {}
+    if decision.get("validation_status") != "passed":
+        fail(f"P090 live canary output {name} did not validate")
+settlement_rows = {
+    row.get("output_name"): row
+    for row in (canary.get("receipt") or {}).get("settlement_rows") or []
+}
+for name in required_outputs:
+    row = settlement_rows.get(name) or {}
+    if row.get("decision") != "accepted" or row.get("materialization_state") != "committed":
+        fail(f"P090 live canary output {name} did not settle fresh")
+
+contract = index.get("public_subtype_contract") or {}
+if contract.get("scope") != "provider_neutral_wrapper":
+    fail("public subtype contract must be provider_neutral_wrapper")
+if contract.get("unknown_values_round_trip_raw") is not True:
+    fail("unknown subtype values must round-trip raw")
+
+coverage = index.get("subtype_coverage") or []
+seen = {row.get("subtype") for row in coverage}
+missing = required_subtypes - seen
+extra = seen - required_subtypes
+if missing or extra:
+    fail(f"subtype coverage mismatch; missing={sorted(missing)} extra={sorted(extra)}")
+
+for row in coverage:
+    subtype = row.get("subtype")
+    fixture_rel = row.get("fixture_path")
+    if row.get("evidence_source") not in {"historical", "synthetic"}:
+        fail(f"{subtype}: invalid evidence_source")
+    if not fixture_rel:
+        fail(f"{subtype}: missing fixture_path")
+    fixture_path = root / fixture_rel
+    fixture = load_json(fixture_path)
+    if row.get("fixture_sha256") != sha256_file(fixture_path):
+        fail(f"{subtype}: fixture_sha256 mismatch")
+    if fixture.get("schema_version") != "p090_subtype_fixture_v1":
+        fail(f"{subtype}: invalid fixture schema")
+    if fixture.get("subtype") != subtype:
+        fail(f"{subtype}: fixture subtype mismatch")
+    if fixture.get("status") != "accepted_for_proposal_readiness":
+        fail(f"{subtype}: fixture status must be accepted_for_proposal_readiness")
+    proves = set(fixture.get("proves") or [])
+    if "subtype_coverage" not in proves:
+        fail(f"{subtype}: fixture must prove subtype_coverage")
+
+negative_classes = set(index.get("required_negative_fixture_classes") or [])
+missing_negative = required_negative_classes - negative_classes
+if missing_negative:
+    fail(f"missing negative fixture classes: {sorted(missing_negative)}")
+negative_fixtures = index.get("negative_fixtures") or []
+seen_negative_fixtures = {row.get("fixture_class") for row in negative_fixtures}
+if seen_negative_fixtures != required_negative_classes:
+    fail(
+        "negative fixture coverage mismatch; "
+        f"missing={sorted(required_negative_classes - seen_negative_fixtures)} "
+        f"extra={sorted(seen_negative_fixtures - required_negative_classes)}"
+    )
+for row in negative_fixtures:
+    fixture_class = row.get("fixture_class")
+    fixture_rel = row.get("path")
+    if not fixture_rel:
+        fail(f"{fixture_class}: missing negative fixture path")
+    fixture_path = root / fixture_rel
+    fixture = load_json(fixture_path)
+    if row.get("sha256") != sha256_file(fixture_path):
+        fail(f"{fixture_class}: negative fixture sha256 mismatch")
+    if fixture.get("schema_version") != "p090_negative_fixture_v1":
+        fail(f"{fixture_class}: invalid negative fixture schema")
+    if fixture.get("fixture_class") != fixture_class:
+        fail(f"{fixture_class}: fixture_class mismatch")
+    if fixture.get("status") != "accepted_for_proposal_readiness":
+        fail(f"{fixture_class}: invalid negative fixture status")
+    expected = fixture.get("expected") or {}
+    if fixture_class == "malformed_repair_sibling_does_not_overwrite_canonical_truth":
+        if expected.get("malformed_sibling_materializes") is not False:
+            fail(f"{fixture_class}: malformed sibling must not materialize")
+        if expected.get("active_pointer_from_accepted_rows_only") is not True:
+            fail(f"{fixture_class}: active pointers must come from accepted rows")
+    elif expected.get("materializes_outputs") is not False:
+        fail(f"{fixture_class}: negative fixture must prove outputs are not materialized")
+
+valid_envelope_fixtures = index.get("valid_failure_envelope_fixtures") or []
+required_valid_envelopes = {
+    "valid_code_writer_engine_failure_v1",
+    "valid_code_writer_repair_failure_v1",
+}
+seen_valid_envelopes = {row.get("fixture_class") for row in valid_envelope_fixtures}
+if seen_valid_envelopes != required_valid_envelopes:
+    fail(
+        "valid failure envelope fixture coverage mismatch; "
+        f"missing={sorted(required_valid_envelopes - seen_valid_envelopes)} "
+        f"extra={sorted(seen_valid_envelopes - required_valid_envelopes)}"
+    )
+for row in valid_envelope_fixtures:
+    fixture_class = row.get("fixture_class")
+    fixture_path = root / (row.get("path") or "")
+    fixture = load_json(fixture_path)
+    if row.get("sha256") != sha256_file(fixture_path):
+        fail(f"{fixture_class}: valid failure envelope fixture sha256 mismatch")
+    if fixture.get("schema_version") != "p090_valid_failure_envelope_fixture_v1":
+        fail(f"{fixture_class}: invalid valid-envelope fixture schema")
+    if fixture.get("fixture_class") != fixture_class:
+        fail(f"{fixture_class}: fixture_class mismatch")
+    envelope = fixture.get("envelope") or {}
+    if fixture_class == "valid_code_writer_engine_failure_v1":
+        if envelope.get("schema_version") != "code_writer_engine_failure.v1":
+            fail(f"{fixture_class}: engine failure envelope must use dotted schema")
+    if fixture_class == "valid_code_writer_repair_failure_v1":
+        if envelope.get("schema_version") != "code_writer_repair_failure.v1":
+            fail(f"{fixture_class}: repair failure envelope must use dotted schema")
+        if envelope.get("repair_attempt") != 1:
+            fail(f"{fixture_class}: repair failure envelope must include repair_attempt")
+    if envelope.get("source") != "engine_synthesized":
+        fail(f"{fixture_class}: valid failure envelope source must be engine_synthesized")
+    if "proposal_090_engine_owned_failure_envelope_sections_are_versioned_json" not in (row.get("executable_test") or ""):
+        fail(f"{fixture_class}: valid envelope fixture must name executable test")
+
+preflight_capacity = index.get("preflight_capacity_proof") or {}
+if preflight_capacity.get("provider_capacity_counts_after_provider_launched") is not True:
+    fail("preflight capacity proof must assert provider capacity starts after launch")
+if preflight_capacity.get("preflight_running_provider_launched_false_excluded_from_provider_capacity") is not True:
+    fail("preflight capacity proof must exclude preflight_running/provider_launched=false")
+if preflight_capacity.get("provider_cap_one_atomic_after_preflight") is not True:
+    fail("preflight capacity proof must assert provider cap=1 atomic launch lease")
+if preflight_capacity.get("launch_lease_persisted_before_provider_spawn") is not True:
+    fail("preflight capacity proof must assert launch lease is persisted before provider spawn")
+if "proposal_090_junie_preflight_running_does_not_consume_provider_capacity_until_launch" not in (
+    preflight_capacity.get("executable_test") or ""
+):
+    fail("preflight capacity proof must name executable focused test")
+if "proposal_090_junie_provider_launch_lease_is_atomic_after_preflight" not in (
+    preflight_capacity.get("launch_lease_executable_test") or ""
+):
+    fail("preflight capacity proof must name provider launch lease test")
+
+preflight_lifecycle = index.get("preflight_lifecycle_proof") or {}
+if preflight_lifecycle.get("diagnostic_mode_runs_preflight_when_enforce_false") is not True:
+    fail("preflight lifecycle proof must assert diagnostic mode runs real preflight")
+if preflight_lifecycle.get("runtime_home_cache_remediation_attempt_count") != 2:
+    fail("preflight lifecycle proof must assert one runtime-home/cache remediation retry")
+if preflight_lifecycle.get("preflight_remediating_is_durable_runtime_fact") is not True:
+    fail("preflight lifecycle proof must assert durable preflight_remediating facts")
+if preflight_lifecycle.get("nonnull_envelope_readback_asserted") is not True:
+    fail("preflight lifecycle proof must assert non-null envelope readback")
+required_lifecycle_tests = [
+    ("diagnostic_mode_executable_test", "proposal_090_tool_path_preflight_runs_in_diagnostic_mode_when_enforce_is_off"),
+    ("runtime_cache_remediation_executable_test", "proposal_090_tool_path_preflight_remediates_missing_runtime_cache_once"),
+    ("durable_remediating_phase_executable_test", "proposal_090_runtime_cache_remediation_persists_intermediate_preflight_phase"),
+]
+for field, expected in required_lifecycle_tests:
+    if expected not in (preflight_lifecycle.get(field) or ""):
+        fail(f"preflight lifecycle proof missing executable test {expected}")
+readback_tests = set(preflight_lifecycle.get("nonnull_envelope_readback_tests") or [])
+for expected in [
+    "graphql-server::proposal_088_graphql_exposes_code_writer_completion_receipts_by_run_and_execution",
+    "mcp-server::proposal_088_mcp_runs_get_and_list_expose_implementation_completion",
+    "mcp-server::proposal_088_mcp_report_exposes_code_writer_completion_receipts",
+]:
+    if expected not in readback_tests:
+        fail(f"preflight lifecycle proof missing readback test {expected}")
+
+stable_text_parts = []
+for doc_path in stable_doc_paths:
+    if not doc_path.exists():
+        fail(f"missing stable reference doc {doc_path.relative_to(root)}")
+    stable_text_parts.append(doc_path.read_text())
+stable_text = "\n".join(stable_text_parts)
+required_terms = [
+    "engine-synthesized",
+    "provider_claim_rejected",
+    "provider-neutral subtype wrapper",
+    "code_writer_output_settlement_rows",
+    "runtime_preflight_phase",
+    "provider capacity accounting starts only after preflight passes",
+    "code_writer_engine_failure.v1",
+    "code_writer_repair_failure.v1",
+    "CHAINWORKS_P090_STRICT_FINAL_PAYLOAD",
+    "CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE",
+    "CHAINWORKS_P090_STAGED_REPAIR_SETTLEMENT",
+    "CHAINWORKS_P090_DISABLE_STAGED_REPAIR_SETTLEMENT",
+    "receipt_id TEXT NOT NULL REFERENCES code_writer_completion_receipts",
+    "./scripts/test-gate.sh proposal-090",
+]
+for term in required_terms:
+    if term not in stable_text:
+        fail(f"stable reference docs missing required term {term!r}")
+
+gates_text = gates_doc.read_text()
+for term in ["proposal-090", "p090", "Junie runtime-hardening evidence inventory"]:
+    if term not in gates_text:
+        fail(f"docs/reference/test-gates.md missing {term!r}")
+
+print("proposal-090 evidence inventory validation passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p db proposal_090_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p acp proposal_090_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p engine proposal_090_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p engine --test proposal_058_claim_start proposal_090_junie_preflight_running_does_not_consume_provider_capacity_until_launch -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p engine proposal_090_junie_provider_launch_lease_is_atomic_after_preflight -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p graphql-server --test proposal_088_code_writer_completion_readback -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p mcp-server --test proposal_088_code_writer_completion_readback -- --nocapture
+    )
+    log "Proposal 090 gate passed"
+    ;;
+  proposal-091|p091)
+    log "P091 retained gate: targeted retry authority evidence inventory and runtime proof"
+    python3 - "$ROOT_DIR" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+index_path = root / "docs/evidence/091/targeted-retry-authority/evidence-index.json"
+stable_doc_paths = [
+    root / "docs/reference/rust-control-plane.md",
+    root / "docs/reference/test-gates.md",
+]
+gates_doc = root / "docs/reference/test-gates.md"
+
+required_terms = {
+    "entry_kind = targeted_agent_retry",
+    "historical_orphan_recovery",
+    "terminal_reason = stale_retry_recovered",
+    "retry_stage_execution_authorities_one_active",
+    "Target-aware work-item repository semantics",
+    "retryAuthorityHistory",
+    "startup orphan repair must run before projection rebuild",
+    "stage terminal metadata and authority history must agree",
+    "advance_run_payload_missing_target_for_authority",
+    "settled_sibling_without_live_retry_driver",
+    "CHAINWORKS_P091_STARTUP_ORPHAN_REPAIR_MODE",
+    "CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR",
+    "p091_orphan_repair_candidates_total",
+    "./scripts/test-gate.sh proposal-091",
+}
+
+def fail(message):
+    raise SystemExit(f"proposal-091: {message}")
+
+def load_json(path):
+    if not path.exists():
+        fail(f"missing {path.relative_to(root)}")
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {path.relative_to(root)}: {exc}")
+
+def sha256_file(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+index = load_json(index_path)
+if index.get("schema_version") != "p091_targeted_retry_authority_evidence_index_v1":
+    fail("invalid evidence-index schema_version")
+if index.get("proposal_id") != "091":
+    fail("evidence-index proposal_id must be 091")
+if index.get("gate") != "./scripts/test-gate.sh proposal-091":
+    fail("evidence-index gate must name ./scripts/test-gate.sh proposal-091")
+
+fixtures = index.get("fixtures") or []
+if {fixture.get("fixture_id") for fixture in fixtures} != {"p086_orphaned_retry_readback"}:
+    fail("expected exactly the P086 orphaned retry readback fixture")
+for fixture_record in fixtures:
+    fixture_path = root / fixture_record.get("path", "")
+    fixture = load_json(fixture_path)
+    if fixture_record.get("sha256") != sha256_file(fixture_path):
+        fail(f"{fixture_record.get('fixture_id')}: fixture sha256 mismatch")
+    if fixture.get("schema_version") != "p091_orphaned_retry_readback_fixture.v1":
+        fail(f"{fixture_record.get('fixture_id')}: invalid fixture schema")
+    facts = fixture.get("facts") or {}
+    if facts.get("retry_status") != "pending":
+        fail("P086 fixture must preserve pending orphan status")
+    if facts.get("live_work_items_for_retry") != 0:
+        fail("P086 fixture must prove no live work items for retry")
+    if facts.get("active_agent_executions_for_retry") != 0:
+        fail("P086 fixture must prove no active agent executions for retry")
+    if facts.get("durable_retry_authority_active_for_retry") is not False:
+        fail("P086 fixture must prove no active retry authority for retry")
+    if facts.get("qualifying_predicate") != "settled_sibling_without_live_retry_driver":
+        fail("P086 fixture must classify the explicit section 8.9 qualifying predicate")
+    if facts.get("historical_timestamp_evidence") != "unavailable":
+        fail("P086 historical fixture must not pretend to prove sibling recency")
+    predicate_inputs = facts.get("predicate_inputs") or {}
+    for field, expected in {
+        "live_work_items_for_retry": 0,
+        "active_agent_executions_for_retry": 0,
+        "durable_retry_authority_active_for_retry": False,
+        "settled_sibling_status": "completed",
+        "stage_summaries_surface_retry_as_pending": True,
+        "blocked_truth_preserved_orphan": True,
+    }.items():
+        if predicate_inputs.get(field) != expected:
+            fail(f"P086 fixture predicate_inputs missing {field}={expected!r}")
+
+stable_text_parts = []
+for doc_path in stable_doc_paths:
+    if not doc_path.exists():
+        fail(f"missing stable reference doc {doc_path.relative_to(root)}")
+    stable_text_parts.append(doc_path.read_text())
+stable_text = "\n".join(stable_text_parts)
+for term in required_terms:
+    if term not in stable_text:
+        fail(f"stable reference docs missing required term {term!r}")
+
+index_terms = set(index.get("required_contract_terms") or [])
+missing_index_terms = required_terms - index_terms
+if missing_index_terms:
+    fail(f"evidence index missing required contract terms {sorted(missing_index_terms)}")
+
+gates_text = gates_doc.read_text()
+for term in ["proposal-091", "p091", "targeted retry authority evidence inventory"]:
+    if term not in gates_text:
+        fail(f"docs/reference/test-gates.md missing {term!r}")
+
+print("proposal-091 evidence inventory validation passed")
+PY
+    log "Proposal 091 runtime authority tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p domain --lib retry_authority
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p db --lib p091_
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p db --test proposal_091_retry_authority
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p engine --test integration p091_
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p engine --test integration test_retry_stage_creates_new_attempt_and_skips_old
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p engine --test integration test_retry_stage_with_agent_execution_id_schedules_single_invoke_attempt
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p graphql-server --lib run_query_exposes_p091_retry_authority_history_and_repair_readback
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p mcp-server --test proposal_091_retry_authority_readback -- --list | grep -q "retry_authority_history_and_current_readback_include_active_authority"
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p mcp-server --test proposal_091_retry_authority_readback retry_authority_history_and_current_readback_include_active_authority
+    )
+    log "Proposal 091 gate passed"
+    ;;
+  proposal-085|p085)
+    log "Proposal 085 gate: thin-client read-model parity and affordance contract"
+    python3 - <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path.cwd()
+
+# 1. Contract document exists and contains required sections
+contract_doc = root / "docs/reference/thin-client-read-model-affordance-contract.md"
+if not contract_doc.exists():
+    raise SystemExit(
+        "proposal-085: missing docs/reference/thin-client-read-model-affordance-contract.md"
+    )
+contract_text = contract_doc.read_text()
+for required in [
+    "thin_client_affordance_contract_v1",
+    "artifact.preview.listLabel",
+    "artifact.preview.detail",
+    "report.payload.metadata",
+    "freshness.badge.run",
+    "freshness.badge.stage",
+    "freshness.badge.approval",
+    "freshness.badge.artifact",
+    "approval.resolve.approve",
+    "approval.resolve.reject",
+    "diagnostic.copy",
+    "external.command.placeholder",
+    "approveApproval",
+    "rejectApproval",
+    "payload_deferred",
+    "metadata_only",
+    "payloadAvailabilityState",
+    "freshnessState",
+    "disabledReasonCode",
+    "writePathState",
+    "diagnosticId",
+    "P085AffordancePresenter",
+    "canDrivePayloadAvailability",
+    "canDriveApprovalActionability",
+    "P081-UI-APPROVAL-APPROVE",
+    "P081-UI-APPROVAL-REJECT",
+    "P081-UI-READ-ONLY",
+    "P081-UI-EXTERNAL-COMMANDS",
+]:
+    if required not in contract_text:
+        raise SystemExit(
+            f"proposal-085: contract doc missing required term: {required!r}"
+        )
+
+required_rows = [
+    "artifact.preview.listLabel",
+    "artifact.preview.detail",
+    "report.payload.metadata",
+    "freshness.badge.run",
+    "freshness.badge.stage",
+    "freshness.badge.approval",
+    "freshness.badge.artifact",
+    "approval.resolve.approve",
+    "approval.resolve.reject",
+    "diagnostic.copy",
+    "external.command.placeholder",
+]
+required_row_fields = [
+    "affordance_id",
+    "source_graphql_fields",
+    "local_presentation_state",
+    "actionable_state",
+    "disabled_reason_code",
+    "fallback_text",
+    "mutation_availability",
+    "mutation_idempotency",
+    "staleness_deadline",
+    "cancellation_policy",
+    "stale_list_detail_behavior",
+    "unauthorized_behavior",
+    "supported_interactions",
+    "proof_tests",
+]
+for row in required_rows:
+    marker = f"### `{row}`"
+    start = contract_text.find(marker)
+    if start < 0:
+        raise SystemExit(f"proposal-085: missing contract row {row!r}")
+    end = contract_text.find("\n---", start)
+    section = contract_text[start:] if end < 0 else contract_text[start:end]
+    for field in required_row_fields:
+        if f"**{field}**" not in section:
+            raise SystemExit(
+                f"proposal-085: contract row {row!r} missing required field {field!r}"
+            )
+
+# 2. Negative fixtures exist as valid JSON
+p085_negative_fixtures = [
+    "docs/evidence/rollout-contract/negative/p085-approval-actionability-mismatch.json",
+    "docs/evidence/rollout-contract/negative/p085-approval-stale-double-submit-conflict.json",
+    "docs/evidence/rollout-contract/negative/p085-missing-affordance-row.json",
+    "docs/evidence/rollout-contract/negative/p085-missing-schema-symbol.json",
+    "docs/evidence/rollout-contract/negative/p085-payload-deferred-marked-unavailable.json",
+    "docs/evidence/rollout-contract/negative/p085-payload-deferred-no-deadline.json",
+    "docs/evidence/rollout-contract/negative/p085-unknown-enum-optimistic-action.json",
+    "docs/evidence/rollout-contract/negative/p085-unsafe-local-truth-fallback.json",
+]
+for fixture_path in p085_negative_fixtures:
+    full = root / fixture_path
+    if not full.exists():
+        raise SystemExit(f"proposal-085: missing negative fixture {fixture_path}")
+    try:
+        data = json.loads(full.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"proposal-085: invalid JSON in {fixture_path}: {exc}") from exc
+    if "contract_violation" not in data:
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} missing 'contract_violation' field"
+        )
+    if "hold_condition" not in data:
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} missing 'hold_condition' field"
+        )
+    if "state_conflict" in json.dumps(data):
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} references removed conflict code 'state_conflict'"
+        )
+
+p085_semantic_expectations = {
+    "p085-approval-actionability-mismatch": {
+        "contract_violation": "approval_parity_mismatch",
+        "p085_contract_row": "approval.resolve.approve",
+        "expected_presenter_output.approveAvailability": "disabled",
+        "expected_presenter_output.reasonCode": "WRITE_PATH_NOT_AVAILABLE",
+    },
+    "p085-approval-stale-double-submit-conflict": {
+        "contract_violation": "approval_conflict_missing",
+        "p085_contract_row": "approval.resolve.approve",
+        "simulated_mutation_response.approveApproval.conflictResultCode": "already_resolved",
+        "expected_presenter_output.approveAvailability": "disabled",
+    },
+    "p085-missing-affordance-row": {
+        "contract_violation": "missing_affordance_row",
+        "expected_contract_row_status": "missing",
+    },
+    "p085-missing-schema-symbol": {
+        "contract_violation": "missing_schema_proof",
+        "missing_symbol.graphql_type": "PayloadUnavailableReasonCode",
+    },
+    "p085-payload-deferred-marked-unavailable": {
+        "contract_violation": "payload_state_mismatch",
+        "p085_contract_row": "artifact.preview.listLabel",
+        "expected_presenter_output.payloadPresentation": "deferred",
+    },
+    "p085-payload-deferred-no-deadline": {
+        "contract_violation": "payload_deadline_missing",
+        "p085_contract_row": "artifact.preview.listLabel",
+        "simulated_read_model.artifact.payloadAvailabilityState": "generating",
+        "expected_server_owned_evidence": "deadline_or_stalled_diagnostic",
+    },
+    "p085-unknown-enum-optimistic-action": {
+        "contract_violation": "unknown_enum_unsafe",
+        "p085_contract_rows": ["freshness.badge.approval", "freshness.badge.run"],
+        "expected_swift_behavior.p085_freshnessState": "P085FreshnessState.unknown(rawValue: 'projection_rebuilding')",
+    },
+    "p085-unsafe-local-truth-fallback": {
+        "contract_violation": "unauthorized_fallback_violation",
+        "p085_contract_rows": ["artifact.preview.detail", "artifact.preview.listLabel"],
+        "expected_swift_behavior.payloadPresentation": "unavailable(reasonCode: .notAuthorized)",
+    },
+}
+
+def p085_lookup(data, dotted):
+    value = data
+    for segment in dotted.split("."):
+        if not isinstance(value, dict) or segment not in value:
+            raise KeyError(dotted)
+        value = value[segment]
+    return value
+
+for fixture_path in p085_negative_fixtures:
+    full = root / fixture_path
+    data = json.loads(full.read_text())
+    scenario = data.get("scenario")
+    if scenario not in p085_semantic_expectations:
+        raise SystemExit(
+            f"proposal-085: negative fixture {fixture_path} has unexpected scenario {scenario!r}"
+        )
+    for dotted, expected in p085_semantic_expectations[scenario].items():
+        try:
+            actual = p085_lookup(data, dotted)
+        except KeyError as exc:
+            raise SystemExit(
+                f"proposal-085: negative fixture {fixture_path} missing semantic field {exc.args[0]!r}"
+            ) from exc
+        if actual != expected:
+            raise SystemExit(
+                f"proposal-085: negative fixture {fixture_path} expected {dotted}={expected!r}, got {actual!r}"
+            )
+
+# 3. test-gates.md documents the gate
+gates_doc = root / "docs/reference/test-gates.md"
+if not gates_doc.exists():
+    raise SystemExit("proposal-085: missing docs/reference/test-gates.md")
+gates_text = gates_doc.read_text()
+for required in [
+    "### `proposal-085|p085`",
+    "thin_client_affordance_contract_v1",
+    "P085AffordancePresenter",
+    "negative fixture",
+]:
+    if required not in gates_text:
+        raise SystemExit(
+            f"proposal-085: docs/reference/test-gates.md missing required content: {required!r}"
+        )
+
+# 4. Swift presenter file exists and contains required P085 symbols
+presenter = root / "Chainworks Forge/Support/P085AffordancePresenter.swift"
+if not presenter.exists():
+    raise SystemExit(
+        "proposal-085: missing Chainworks Forge/Support/P085AffordancePresenter.swift"
+    )
+presenter_text = presenter.read_text()
+for required in [
+    "P085AffordancePresenter",
+    "P085ArtifactAffordanceState",
+    "P085ApprovalAffordanceState",
+    "P085FreshnessAffordanceState",
+    "P085DiagnosticAffordanceState",
+    "P085MutationConflictResultCode",
+    "canDrivePayloadAvailability",
+    "canDriveApprovalActionability",
+    "mergedAffordance",
+    "payloadPresentation(fromRaw",
+    "static func fromRaw",
+    "case .unknown",
+    # Decision-state gating: approval checks durable decision (pending/requested = actionable)
+    "d != \"pending\"",
+    "Approval is already resolved",
+    # Conflict codes: typed idempotency/conflict result vocabulary
+    "alreadyResolved",
+]:
+    if required not in presenter_text:
+        raise SystemExit(
+            f"proposal-085: P085AffordancePresenter.swift missing required term: {required!r}"
+        )
+
+# 5. P031 enums have fail-closed decoding (custom init(from decoder:) for unknown values)
+boundary_file = root / "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift"
+if not boundary_file.exists():
+    raise SystemExit(
+        "proposal-085: missing Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift"
+    )
+boundary_text = boundary_file.read_text()
+for required in [
+    # Fail-closed init(from decoder:) must be present for all P031 enums
+    "P031FreshnessState",
+    "P031DisabledReasonCode",
+    "P031WritePathState",
+    "P031PayloadAvailabilityState",
+    "P031PayloadUnavailableReasonCode",
+    # P085 wired into production approval path
+    "P085AffordancePresenter.approvalAffordance",
+    # P085 wired into production artifact path
+    "P085AffordancePresenter.artifactListAffordance",
+    # P031 canApprove/canReject check durable decision state via isActionableDecision
+    "isActionableDecision",
+    # Typed conflict result on mutation result
+    "conflictResultCode",
+]:
+    if required not in boundary_text:
+        raise SystemExit(
+            f"proposal-085: P031ThinGraphQLReadBoundary.swift missing required term: {required!r}"
+        )
+
+# 6. Backend GraphQL path must use typed engine conflicts, not string-matched
+# error text or dummy journal IDs.
+graphql_schema = root / "control-plane/crates/graphql-server/src/schema.rs"
+command_handler = root / "control-plane/crates/engine/src/command_handler.rs"
+schema_text = graphql_schema.read_text()
+handler_text = command_handler.read_text()
+for required in [
+    "ApprovalResolutionConflict",
+    "approval_resolution_conflict_code",
+    "proposal_085_approval_conflict_result_code_uses_real_failed_journal_id",
+    "proposal_085_reject_conflict_result_code_uses_real_failed_journal_id",
+    "proposal_085_backend_artifact_projection_state_matrix",
+    "proposal_085_conflict_enum_matches_backend_emitted_codes",
+    "proposal_085_graphql_backend_projection_and_authorization_contract",
+]:
+    if required not in schema_text + handler_text:
+        raise SystemExit(
+            f"proposal-085: backend proof missing required term: {required!r}"
+        )
+for forbidden in [
+    "msg.contains(\"not actionable\")",
+    "msg.contains(\"already resolved\")",
+    "ID::from(\"00000000-0000-0000-0000-000000000000\")",
+]:
+    if forbidden in schema_text:
+        raise SystemExit(
+            f"proposal-085: GraphQL backend still contains forbidden brittle conflict handling: {forbidden!r}"
+        )
+
+print("proposal-085 all gate checks passed")
+PY
+    (
+      cd control-plane
+      CARGO_TARGET_DIR=target/proposal-085-gate cargo test -p graphql-server --lib proposal_085_ -- --test-threads=1 --nocapture
+    )
+    run_targeted_tests "proposal-085" "${PROPOSAL_085_SWIFT_TESTS[@]}"
+    log "Proposal 085 gate passed"
     ;;
   *)
     print_usage >&2

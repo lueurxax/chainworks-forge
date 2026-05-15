@@ -1,0 +1,20 @@
+{
+  "schema_version": "p090_subtype_fixture_v1",
+  "subtype": "junie_final_response_truncated",
+  "fixture_type": "synthetic",
+  "status": "accepted_for_proposal_readiness",
+  "proves": [
+    "subtype_coverage",
+    "bounded_final_payload_capture"
+  ],
+  "receipt_shape": {
+    "provider_runtime_family": "junie_acp",
+    "completion_status": "missing_required_outputs",
+    "completion_boundary_subtype": "junie_final_response_truncated",
+    "final_payload_status": "truncated",
+    "completion_text_truncated": true,
+    "extraction_input_truncated": true,
+    "required_outputs_fresh": false
+  },
+  "expected_gate_behavior": "implementation_gate_must_replace_with_large_narrative_fixture"
+}

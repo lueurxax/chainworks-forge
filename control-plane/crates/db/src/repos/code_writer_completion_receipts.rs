@@ -6,7 +6,7 @@ use domain::agent::{AgentExecutionRuntimePromptReceiptRecord, AgentExecutionRunt
 use domain::code_writer_completion::{
     CodeWriterCompletionOutputDecisionRecord, CodeWriterCompletionPromptEvidenceReadback,
     CodeWriterCompletionReceiptReadback, CodeWriterCompletionReceiptRecord,
-    CodeWriterCompletionTextCaptureRecord,
+    CodeWriterCompletionTextCaptureRecord, CodeWriterOutputSettlementRow,
 };
 use domain::ids::{AgentExecutionId, RunId};
 
@@ -37,6 +37,26 @@ pub async fn upsert(
         crate::writer::begin_repository_transaction(pool, "code_writer_completion_receipts.upsert")
             .await?;
     upsert_tx(&mut tx, receipt, text_captures, output_decisions).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn upsert_with_settlement_rows(
+    pool: &SqlitePool,
+    receipt: &CodeWriterCompletionReceiptRecord,
+    text_captures: &[CodeWriterCompletionTextCaptureRecord],
+    output_decisions: &[CodeWriterCompletionOutputDecisionRecord],
+    settlement_rows: &[CodeWriterOutputSettlementRow],
+) -> Result<()> {
+    validate_settlement_rows_belong_to_receipt(receipt, settlement_rows)?;
+    detect_settlement_digest_conflict(pool, receipt, settlement_rows).await?;
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "code_writer_completion_receipts.upsert_with_settlement_rows",
+    )
+    .await?;
+    upsert_tx(&mut tx, receipt, text_captures, output_decisions).await?;
+    replace_settlement_rows_tx(&mut tx, &receipt.id, settlement_rows).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -76,6 +96,44 @@ pub async fn upsert_with_runtime_receipts(
     Ok(())
 }
 
+pub async fn upsert_with_runtime_receipts_and_settlement_rows(
+    pool: &SqlitePool,
+    receipt: &CodeWriterCompletionReceiptRecord,
+    text_captures: &[CodeWriterCompletionTextCaptureRecord],
+    output_decisions: &[CodeWriterCompletionOutputDecisionRecord],
+    settlement_rows: &[CodeWriterOutputSettlementRow],
+    original_runtime_receipt: Option<&AgentExecutionRuntimeReceiptRecord>,
+    repair_runtime_receipt: Option<&AgentExecutionRuntimePromptReceiptRecord>,
+) -> Result<()> {
+    validate_settlement_rows_belong_to_receipt(receipt, settlement_rows)?;
+    if let Some(existing) = find_by_execution_id(pool, receipt.agent_execution_id).await? {
+        if existing.receipt.id != receipt.id
+            || existing.text_captures != text_captures
+            || existing.output_decisions != output_decisions
+        {
+            return Err(anyhow!("completion_receipt_conflict"));
+        }
+    }
+    detect_settlement_digest_conflict(pool, receipt, settlement_rows).await?;
+
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "code_writer_completion_receipts.upsert_with_runtime_receipts_and_settlement_rows",
+    )
+    .await?;
+    if let Some(original_runtime_receipt) = original_runtime_receipt {
+        agent_execution_runtime_receipts::upsert_tx(&mut tx, original_runtime_receipt).await?;
+    }
+    if let Some(repair_runtime_receipt) = repair_runtime_receipt {
+        agent_execution_runtime_receipts::upsert_prompt_receipt_tx(&mut tx, repair_runtime_receipt)
+            .await?;
+    }
+    upsert_tx(&mut tx, receipt, text_captures, output_decisions).await?;
+    replace_settlement_rows_tx(&mut tx, &receipt.id, settlement_rows).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn upsert_tx(
     tx: &mut Transaction<'_, Sqlite>,
     receipt: &CodeWriterCompletionReceiptRecord,
@@ -92,7 +150,13 @@ pub async fn upsert_tx(
             pre_prompt_worktree_fingerprint_path, post_prompt_worktree_fingerprint_path,
             pre_prompt_worktree_fingerprint_sha256, post_prompt_worktree_fingerprint_sha256,
             current_attempt_changed_path_count, preexisting_dirty_path_count, completion_status,
-            failure_class, terminal_response_status, completion_turn_attempted,
+            failure_class, provider_runtime_family, completion_boundary_subtype,
+            final_payload_status, progress_before_handoff, runtime_preflight_phase,
+            runtime_tool_path_preflight_json, final_completion_payload_capture_json,
+            engine_failure_envelope_json, repair_failure_envelope_json,
+            repair_materialization_summary_json, repair_materialization_mode,
+            strict_final_payload_enabled, staged_repair_settlement_enabled,
+            terminal_response_status, completion_turn_attempted,
             completion_turn_result, completion_text_capture_count, completion_text_absence_count,
             completion_repair_text_status, completion_repair_raw_text_artifact_path,
             completion_repair_redacted_text_artifact_path, completion_repair_text_absence_reason,
@@ -103,7 +167,8 @@ pub async fn upsert_tx(
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                    ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
                    ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41,
-                   ?42, ?43, ?44)
+                   ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54,
+                   ?55, ?56, ?57)
            ON CONFLICT(agent_execution_id) DO UPDATE SET
              id = excluded.id,
              run_id = excluded.run_id,
@@ -126,6 +191,19 @@ pub async fn upsert_tx(
              preexisting_dirty_path_count = excluded.preexisting_dirty_path_count,
              completion_status = excluded.completion_status,
              failure_class = excluded.failure_class,
+             provider_runtime_family = excluded.provider_runtime_family,
+             completion_boundary_subtype = excluded.completion_boundary_subtype,
+             final_payload_status = excluded.final_payload_status,
+             progress_before_handoff = excluded.progress_before_handoff,
+             runtime_preflight_phase = excluded.runtime_preflight_phase,
+             runtime_tool_path_preflight_json = excluded.runtime_tool_path_preflight_json,
+             final_completion_payload_capture_json = excluded.final_completion_payload_capture_json,
+             engine_failure_envelope_json = excluded.engine_failure_envelope_json,
+             repair_failure_envelope_json = excluded.repair_failure_envelope_json,
+             repair_materialization_summary_json = excluded.repair_materialization_summary_json,
+             repair_materialization_mode = excluded.repair_materialization_mode,
+             strict_final_payload_enabled = excluded.strict_final_payload_enabled,
+             staged_repair_settlement_enabled = excluded.staged_repair_settlement_enabled,
              terminal_response_status = excluded.terminal_response_status,
              completion_turn_attempted = excluded.completion_turn_attempted,
              completion_turn_result = excluded.completion_turn_result,
@@ -171,6 +249,19 @@ pub async fn upsert_tx(
     .bind(receipt.preexisting_dirty_path_count)
     .bind(&receipt.completion_status)
     .bind(&receipt.failure_class)
+    .bind(&receipt.provider_runtime_family)
+    .bind(&receipt.completion_boundary_subtype)
+    .bind(&receipt.final_payload_status)
+    .bind(&receipt.progress_before_handoff)
+    .bind(&receipt.runtime_preflight_phase)
+    .bind(&receipt.runtime_tool_path_preflight_json)
+    .bind(&receipt.final_completion_payload_capture_json)
+    .bind(&receipt.engine_failure_envelope_json)
+    .bind(&receipt.repair_failure_envelope_json)
+    .bind(&receipt.repair_materialization_summary_json)
+    .bind(&receipt.repair_materialization_mode)
+    .bind(receipt.strict_final_payload_enabled)
+    .bind(receipt.staged_repair_settlement_enabled)
     .bind(&receipt.terminal_response_status)
     .bind(receipt.completion_turn_attempted)
     .bind(&receipt.completion_turn_result)
@@ -233,6 +324,116 @@ pub async fn upsert_tx(
     Ok(())
 }
 
+fn validate_settlement_rows_belong_to_receipt(
+    receipt: &CodeWriterCompletionReceiptRecord,
+    settlement_rows: &[CodeWriterOutputSettlementRow],
+) -> Result<()> {
+    for row in settlement_rows {
+        if row.receipt_id != receipt.id
+            || row.run_id != receipt.run_id
+            || row.stage_execution_id != receipt.stage_execution_id
+            || row.agent_execution_id != receipt.agent_execution_id
+            || row.session_generation_id.is_none()
+        {
+            return Err(anyhow!("code_writer_output_settlement_receipt_mismatch"));
+        }
+    }
+    Ok(())
+}
+
+async fn detect_settlement_digest_conflict(
+    pool: &SqlitePool,
+    receipt: &CodeWriterCompletionReceiptRecord,
+    settlement_rows: &[CodeWriterOutputSettlementRow],
+) -> Result<()> {
+    for row in settlement_rows {
+        let Some(candidate_digest) = row.candidate_digest.as_deref() else {
+            continue;
+        };
+        let existing = sqlx::query(
+            r#"SELECT id, candidate_digest
+               FROM code_writer_output_settlement_rows
+               WHERE agent_execution_id = ?1
+                 AND repair_attempt = ?2
+                 AND output_name = ?3
+                 AND candidate_digest IS NOT NULL"#,
+        )
+        .bind(receipt.agent_execution_id.to_string())
+        .bind(row.repair_attempt)
+        .bind(&row.output_name)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(existing) = existing {
+            let existing_id: String = existing.get("id");
+            let existing_digest: String = existing.get("candidate_digest");
+            if existing_id != row.id || existing_digest != candidate_digest {
+                return Err(anyhow!("code_writer_output_settlement_conflict"));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn replace_settlement_rows_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    receipt_id: &str,
+    settlement_rows: &[CodeWriterOutputSettlementRow],
+) -> Result<()> {
+    sqlx::query("DELETE FROM code_writer_output_settlement_rows WHERE receipt_id = ?1")
+        .bind(receipt_id)
+        .execute(&mut **tx)
+        .await?;
+    for row in settlement_rows {
+        insert_settlement_row_tx(tx, row).await?;
+    }
+    Ok(())
+}
+
+async fn insert_settlement_row_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    row: &CodeWriterOutputSettlementRow,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO code_writer_output_settlement_rows
+           (id, receipt_id, run_id, stage_id, stage_execution_id, agent_execution_id,
+            session_generation_id, repair_attempt, output_name, contract_id, source_kind,
+            source_generation_owner, candidate_digest, staging_path, canonical_path,
+            canonical_before_sha256, canonical_after_sha256, decision, rejection_reason,
+            materialization_state, active_pointer_generation_id, created_at, committed_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                   ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)"#,
+    )
+    .bind(&row.id)
+    .bind(&row.receipt_id)
+    .bind(row.run_id.to_string())
+    .bind(&row.stage_id)
+    .bind(row.stage_execution_id.to_string())
+    .bind(row.agent_execution_id.to_string())
+    .bind(&row.session_generation_id)
+    .bind(row.repair_attempt)
+    .bind(&row.output_name)
+    .bind(&row.contract_id)
+    .bind(&row.source_kind)
+    .bind(&row.source_generation_owner)
+    .bind(&row.candidate_digest)
+    .bind(&row.staging_path)
+    .bind(&row.canonical_path)
+    .bind(&row.canonical_before_sha256)
+    .bind(&row.canonical_after_sha256)
+    .bind(&row.decision)
+    .bind(&row.rejection_reason)
+    .bind(&row.materialization_state)
+    .bind(&row.active_pointer_generation_id)
+    .bind(row.created_at.to_rfc3339())
+    .bind(
+        row.committed_at
+            .map(|committed_at| committed_at.to_rfc3339()),
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn find_by_execution_id(
     pool: &SqlitePool,
     agent_execution_id: AgentExecutionId,
@@ -291,11 +492,13 @@ async fn readback_for_row(
     let receipt = parse_receipt_row(row)?;
     let text_captures = list_text_captures(pool, &receipt.id).await?;
     let output_decisions = list_output_decisions(pool, &receipt.id).await?;
+    let settlement_rows = list_settlement_rows(pool, &receipt.id).await?;
     let prompt_evidence = completion_prompt_evidence(pool, receipt.agent_execution_id).await?;
     Ok(CodeWriterCompletionReceiptReadback {
         receipt,
         text_captures,
         output_decisions,
+        settlement_rows,
         prompt_evidence,
     })
 }
@@ -422,6 +625,73 @@ async fn list_output_decisions(
     rows.iter().map(parse_output_decision_row).collect()
 }
 
+async fn list_settlement_rows(
+    pool: &SqlitePool,
+    receipt_id: &str,
+) -> Result<Vec<CodeWriterOutputSettlementRow>> {
+    let rows = sqlx::query(
+        r#"SELECT id, receipt_id, run_id, stage_id, stage_execution_id, agent_execution_id,
+                  session_generation_id, repair_attempt, output_name, contract_id, source_kind,
+                  source_generation_owner, candidate_digest, staging_path, canonical_path,
+                  canonical_before_sha256, canonical_after_sha256, decision, rejection_reason,
+                  materialization_state, active_pointer_generation_id, created_at, committed_at
+           FROM code_writer_output_settlement_rows
+           WHERE receipt_id = ?1
+           ORDER BY output_name ASC"#,
+    )
+    .bind(receipt_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(parse_settlement_row).collect()
+}
+
+pub async fn list_p090_recoverable_settlement_rows_by_run(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+) -> Result<Vec<CodeWriterOutputSettlementRow>> {
+    let rows = sqlx::query(
+        r#"SELECT id, receipt_id, run_id, stage_id, stage_execution_id, agent_execution_id,
+                  session_generation_id, repair_attempt, output_name, contract_id, source_kind,
+                  source_generation_owner, candidate_digest, staging_path, canonical_path,
+                  canonical_before_sha256, canonical_after_sha256, decision, rejection_reason,
+                  materialization_state, active_pointer_generation_id, created_at, committed_at
+           FROM code_writer_output_settlement_rows
+           WHERE run_id = ?1
+             AND materialization_state IN ('staged', 'committed', 'failed')
+           ORDER BY created_at ASC, output_name ASC"#,
+    )
+    .bind(run_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(parse_settlement_row).collect()
+}
+
+pub async fn update_p090_settlement_row_recovery_state(
+    pool: &SqlitePool,
+    row_id: &str,
+    materialization_state: &str,
+    canonical_after_sha256: Option<&str>,
+    committed_at: Option<chrono::DateTime<chrono::Utc>>,
+    rejection_reason: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE code_writer_output_settlement_rows
+           SET materialization_state = ?2,
+               canonical_after_sha256 = ?3,
+               committed_at = ?4,
+               rejection_reason = COALESCE(?5, rejection_reason)
+           WHERE id = ?1"#,
+    )
+    .bind(row_id)
+    .bind(materialization_state)
+    .bind(canonical_after_sha256)
+    .bind(committed_at.map(|dt| dt.to_rfc3339()))
+    .bind(rejection_reason)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 fn receipt_select_sql(where_clause: &str) -> String {
     format!(
         r#"SELECT code_writer_completion_receipts.id,
@@ -446,6 +716,19 @@ fn receipt_select_sql(where_clause: &str) -> String {
                   code_writer_completion_receipts.preexisting_dirty_path_count,
                   code_writer_completion_receipts.completion_status,
                   code_writer_completion_receipts.failure_class,
+                  code_writer_completion_receipts.provider_runtime_family,
+                  code_writer_completion_receipts.completion_boundary_subtype,
+                  code_writer_completion_receipts.final_payload_status,
+                  code_writer_completion_receipts.progress_before_handoff,
+                  code_writer_completion_receipts.runtime_preflight_phase,
+                  code_writer_completion_receipts.runtime_tool_path_preflight_json,
+                  code_writer_completion_receipts.final_completion_payload_capture_json,
+                  code_writer_completion_receipts.engine_failure_envelope_json,
+                  code_writer_completion_receipts.repair_failure_envelope_json,
+                  code_writer_completion_receipts.repair_materialization_summary_json,
+                  code_writer_completion_receipts.repair_materialization_mode,
+                  code_writer_completion_receipts.strict_final_payload_enabled,
+                  code_writer_completion_receipts.staged_repair_settlement_enabled,
                   code_writer_completion_receipts.terminal_response_status,
                   code_writer_completion_receipts.completion_turn_attempted,
                   code_writer_completion_receipts.completion_turn_result,
@@ -503,6 +786,19 @@ fn parse_receipt_row(row: &sqlx::sqlite::SqliteRow) -> Result<CodeWriterCompleti
         preexisting_dirty_path_count: row.get("preexisting_dirty_path_count"),
         completion_status: row.get("completion_status"),
         failure_class: row.get("failure_class"),
+        provider_runtime_family: row.get("provider_runtime_family"),
+        completion_boundary_subtype: row.get("completion_boundary_subtype"),
+        final_payload_status: row.get("final_payload_status"),
+        progress_before_handoff: row.get("progress_before_handoff"),
+        runtime_preflight_phase: row.get("runtime_preflight_phase"),
+        runtime_tool_path_preflight_json: row.get("runtime_tool_path_preflight_json"),
+        final_completion_payload_capture_json: row.get("final_completion_payload_capture_json"),
+        engine_failure_envelope_json: row.get("engine_failure_envelope_json"),
+        repair_failure_envelope_json: row.get("repair_failure_envelope_json"),
+        repair_materialization_summary_json: row.get("repair_materialization_summary_json"),
+        repair_materialization_mode: row.get("repair_materialization_mode"),
+        strict_final_payload_enabled: row.get("strict_final_payload_enabled"),
+        staged_repair_settlement_enabled: row.get("staged_repair_settlement_enabled"),
         terminal_response_status: row.get("terminal_response_status"),
         completion_turn_attempted: row.get("completion_turn_attempted"),
         completion_turn_result: row.get("completion_turn_result"),
@@ -567,6 +863,39 @@ fn parse_output_decision_row(
         settlement_source: row.get("settlement_source"),
         validation_status: row.get("validation_status"),
         rejection_reason: row.get("rejection_reason"),
+    })
+}
+
+fn parse_settlement_row(row: &sqlx::sqlite::SqliteRow) -> Result<CodeWriterOutputSettlementRow> {
+    let run_id: String = row.get("run_id");
+    let stage_execution_id: String = row.get("stage_execution_id");
+    let agent_execution_id: String = row.get("agent_execution_id");
+    let created_at_raw: String = row.get("created_at");
+    let committed_at_raw: Option<String> = row.get("committed_at");
+    Ok(CodeWriterOutputSettlementRow {
+        id: row.get("id"),
+        receipt_id: row.get("receipt_id"),
+        run_id: run_id.parse()?,
+        stage_id: row.get("stage_id"),
+        stage_execution_id: stage_execution_id.parse()?,
+        agent_execution_id: agent_execution_id.parse()?,
+        session_generation_id: row.get("session_generation_id"),
+        repair_attempt: row.get("repair_attempt"),
+        output_name: row.get("output_name"),
+        contract_id: row.get("contract_id"),
+        source_kind: row.get("source_kind"),
+        source_generation_owner: row.get("source_generation_owner"),
+        candidate_digest: row.get("candidate_digest"),
+        staging_path: row.get("staging_path"),
+        canonical_path: row.get("canonical_path"),
+        canonical_before_sha256: row.get("canonical_before_sha256"),
+        canonical_after_sha256: row.get("canonical_after_sha256"),
+        decision: row.get("decision"),
+        rejection_reason: row.get("rejection_reason"),
+        materialization_state: row.get("materialization_state"),
+        active_pointer_generation_id: row.get("active_pointer_generation_id"),
+        created_at: parse_time(&created_at_raw)?,
+        committed_at: committed_at_raw.as_deref().map(parse_time).transpose()?,
     })
 }
 

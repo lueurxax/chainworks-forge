@@ -19,9 +19,12 @@ use crate::adapters::codex::CodexAdapter;
 use crate::adapters::gemini::GeminiCliAdapter;
 use crate::adapters::junie::JunieAdapter;
 use crate::adapters::{
-    AcpAdapter, LaunchResourceGuard, ProviderCapabilityCache, XcodeShimLaunchRuntime,
+    AcpAdapter, AcpProviderLaunchGate, LaunchResourceGuard, NoopAcpProviderLaunchGate,
+    ProviderCapabilityCache, XcodeShimLaunchRuntime,
 };
-use crate::session::AcpSessionHandle;
+use crate::session::{
+    AcpSessionCloseBehavior, AcpSessionHandle, ProviderSessionStoreArchiveContext,
+};
 use crate::{
     AcpPromptProgressSink, ExecutionRequest, ExecutionResult, NoopAcpPromptProgressSink,
     NoopXcodeRuntimeObservationSink, XcodeRuntimeObservationSink, XcodeShimGrantStore,
@@ -89,6 +92,7 @@ pub struct AcpRuntimeManager {
     live_xcode_leases: Mutex<HashMap<String, BrokeredXcodeLeaseCleanup>>,
     provider_capability_cache: ProviderCapabilityCache,
     prompt_progress_sink: RwLock<Arc<dyn AcpPromptProgressSink>>,
+    provider_launch_gate: RwLock<Arc<dyn AcpProviderLaunchGate>>,
     xcode_runtime_observation_sink: RwLock<Arc<dyn XcodeRuntimeObservationSink>>,
     xcode_broker_lease_attacher: RwLock<Arc<dyn XcodeBrokerLeaseAttacher>>,
     xcode_shim_runtime: RwLock<Option<XcodeShimRuntimeConfig>>,
@@ -135,6 +139,7 @@ impl AcpRuntimeManager {
             live_xcode_leases: Mutex::new(HashMap::new()),
             provider_capability_cache: ProviderCapabilityCache::default(),
             prompt_progress_sink: RwLock::new(Arc::new(NoopAcpPromptProgressSink)),
+            provider_launch_gate: RwLock::new(Arc::new(NoopAcpProviderLaunchGate)),
             xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
             xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
             xcode_shim_runtime: RwLock::new(None),
@@ -163,10 +168,25 @@ impl AcpRuntimeManager {
         *guard = sink;
     }
 
+    pub fn set_provider_launch_gate(&self, gate: Arc<dyn AcpProviderLaunchGate>) {
+        let mut guard = self
+            .provider_launch_gate
+            .write()
+            .expect("provider launch gate lock poisoned");
+        *guard = gate;
+    }
+
     fn prompt_progress_sink(&self) -> Arc<dyn AcpPromptProgressSink> {
         self.prompt_progress_sink
             .read()
             .expect("prompt progress sink lock poisoned")
+            .clone()
+    }
+
+    fn provider_launch_gate(&self) -> Arc<dyn AcpProviderLaunchGate> {
+        self.provider_launch_gate
+            .read()
+            .expect("provider launch gate lock poisoned")
             .clone()
     }
 
@@ -272,6 +292,7 @@ impl AcpRuntimeManager {
             }
             Err(err) => return Err(err),
         };
+        let runtime_tool_path_preflight_json = opened.runtime_tool_path_preflight_json.clone();
         let session = opened.session;
         let session_req = opened.session_req;
         let lease_cleanup = opened.lease_cleanup;
@@ -317,6 +338,10 @@ impl AcpRuntimeManager {
             })?;
             result.session_generation_id = Some(generation_id);
             result.reused_existing_session = false;
+            result.runtime_tool_path_preflight_json =
+                crate::adapters::mark_runtime_tool_path_preflight_provider_launched(
+                    runtime_tool_path_preflight_json.clone(),
+                );
             self.record_xcode_prompt_observations(&session_req, &result)
                 .await;
             return Ok(result);
@@ -334,6 +359,10 @@ impl AcpRuntimeManager {
         close_result?;
         result.session_generation_id = None;
         result.reused_existing_session = false;
+        result.runtime_tool_path_preflight_json =
+            crate::adapters::mark_runtime_tool_path_preflight_provider_launched(
+                runtime_tool_path_preflight_json,
+            );
         self.record_xcode_prompt_observations(&session_req, &result)
             .await;
         Ok(result)
@@ -346,6 +375,7 @@ impl AcpRuntimeManager {
     ) -> Result<OpenedAcpSession> {
         let mut resources = LaunchResourceGuard::default();
         let mut launch_spec = adapter.prepare_launch_spec(req, &mut resources)?;
+        launch_spec.provider_launch_gate = Some(self.provider_launch_gate());
         launch_spec.apply_chainworks_meta_root_env(req);
         let runtime_profile_id = req
             .brokered_xcode_intents()
@@ -438,20 +468,21 @@ impl AcpRuntimeManager {
             }
         }
         launch_spec.cleanup_paths.extend(resources.commit());
-        let session = match adapter
+        let opened = match adapter
             .open_session_with_specs(&session_req, launch_spec, session_new_spec)
             .await
         {
-            Ok(session) => session,
+            Ok(opened) => opened,
             Err(err) => {
                 self.release_xcode_leases(lease_cleanup).await;
                 return Err(err);
             }
         };
         Ok(OpenedAcpSession {
-            session,
+            session: opened.session,
             session_req,
             lease_cleanup,
+            runtime_tool_path_preflight_json: opened.runtime_tool_path_preflight_json,
         })
     }
 
@@ -576,7 +607,23 @@ impl AcpRuntimeManager {
                     .lock()
                     .await
                     .remove(session_generation_id);
-                let _ = session.close().await;
+                let _ = session
+                    .close_with_behavior(AcpSessionCloseBehavior::ArchiveFailure(
+                        ProviderSessionStoreArchiveContext {
+                            provider: req.provider.clone(),
+                            run_id: req.run_id.to_string(),
+                            stage_id: req.stage_id.clone(),
+                            agent_id: req.agent_id.clone(),
+                            agent_execution_id: req
+                                .agent_execution_id
+                                .as_ref()
+                                .map(ToString::to_string),
+                            session_generation_id: Some(session_generation_id.to_string()),
+                            provider_session_id: req.provider_session_id.clone(),
+                            failure_kind: "acp_prompt_error".to_string(),
+                        },
+                    ))
+                    .await;
                 self.release_xcode_leases(cleanup).await;
                 return Err(err);
             }
@@ -764,6 +811,7 @@ impl AcpRuntimeManager {
             live_xcode_leases: Mutex::new(HashMap::new()),
             provider_capability_cache: ProviderCapabilityCache::default(),
             prompt_progress_sink: RwLock::new(Arc::new(NoopAcpPromptProgressSink)),
+            provider_launch_gate: RwLock::new(Arc::new(NoopAcpProviderLaunchGate)),
             xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
             xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
             xcode_shim_runtime: RwLock::new(None),
@@ -787,6 +835,7 @@ struct OpenedAcpSession {
     session: AcpSessionHandle,
     session_req: ExecutionRequest,
     lease_cleanup: Option<BrokeredXcodeLeaseCleanup>,
+    runtime_tool_path_preflight_json: Option<String>,
 }
 
 fn xcode_failure_class_from_error(error: &anyhow::Error) -> XcodeRuntimeFailureClass {
@@ -835,6 +884,8 @@ mod tests {
     use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::AgentExecutionId;
     use tokio::sync::Mutex as TokioMutex;
+
+    static XCODE_BROKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct FixtureObservationSink;
 
@@ -1100,8 +1151,7 @@ mod tests {
 
     #[tokio::test]
     async fn broker_disabled_env_suppresses_xcode_shim_injection() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let _guard = XCODE_BROKER_ENV_LOCK.lock().expect("env lock poisoned");
         let previous = std::env::var("CHAINWORKS_XCODE_BROKER_DISABLED").ok();
         std::env::set_var("CHAINWORKS_XCODE_BROKER_DISABLED", "1");
 
@@ -1161,6 +1211,10 @@ mod tests {
 
     #[tokio::test]
     async fn xcode_shim_runtime_attachment_is_persisted_as_observation() {
+        let _guard = XCODE_BROKER_ENV_LOCK.lock().expect("env lock poisoned");
+        let previous = std::env::var("CHAINWORKS_XCODE_BROKER_DISABLED").ok();
+        std::env::remove_var("CHAINWORKS_XCODE_BROKER_DISABLED");
+
         let manager = AcpRuntimeManager::new_with_adapters(Vec::new());
         let sink = Arc::new(RecordingObservationSink::default());
         manager.set_xcode_runtime_observation_sink(sink.clone());
@@ -1235,6 +1289,10 @@ mod tests {
                 );
             }
             other => panic!("unexpected xcode observation update: {other:?}"),
+        }
+        match previous {
+            Some(value) => std::env::set_var("CHAINWORKS_XCODE_BROKER_DISABLED", value),
+            None => std::env::remove_var("CHAINWORKS_XCODE_BROKER_DISABLED"),
         }
     }
 

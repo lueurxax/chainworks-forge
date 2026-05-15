@@ -3743,11 +3743,20 @@ mod tests {
         .unwrap();
     }
 
+    async fn test_pool(url: &str) -> SqlitePool {
+        let pool = db::pool::create_pool(url).await.unwrap();
+        let writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .expect("test shared DbWriter registration failed");
+        pool
+    }
+
     #[tokio::test]
     async fn terminal_failure_mode_uses_run_stamped_enforce_policy() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         apply_enforce_policy(&mut run);
 
@@ -3761,7 +3770,7 @@ mod tests {
     async fn terminal_failure_mode_fails_closed_when_policy_parse_fails() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.delivery_preflight_json = Some("not json".to_string());
 
@@ -3819,7 +3828,7 @@ mod tests {
     async fn missing_contract_record_allows_in_permissive_with_would_block() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let run = test_run();
 
         let check = upsert_missing_contract_check(
@@ -3852,7 +3861,7 @@ mod tests {
     async fn missing_contract_holds_under_stamped_enforce_policy() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.artifact_root = dir
             .path()
@@ -3885,7 +3894,7 @@ mod tests {
     async fn timeout_record_holds_under_enforce() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let run = test_run();
 
         let check = upsert_timeout_contract_check(
@@ -3964,7 +3973,7 @@ mod tests {
     async fn retry_exhausted_record_holds_under_enforce_and_counts_attempts() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let run = test_run();
         let error = anyhow::anyhow!("upsert rollout_contract_checks: database is locked");
 
@@ -4000,7 +4009,7 @@ mod tests {
     async fn scheduling_time_waiver_allows_missing_contract_under_enforce() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.artifact_root = dir
             .path()
@@ -4052,7 +4061,7 @@ mod tests {
     async fn expired_scheduling_time_waiver_holds_under_enforce() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.artifact_root = dir
             .path()
@@ -4092,7 +4101,7 @@ mod tests {
     async fn cancellation_requested_holds_before_contract_linting() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir
@@ -4138,7 +4147,7 @@ mod tests {
     async fn p084_self_contract_normalizes_to_run_start_rollout_contract() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
 
@@ -4214,7 +4223,7 @@ mod tests {
     async fn inline_contract_creates_pass_record_before_enqueue() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
 
@@ -4280,7 +4289,7 @@ mod tests {
     async fn cutover_policy_grandfathers_pre_cutover_runs_as_not_applicable() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir
@@ -4337,7 +4346,7 @@ mod tests {
     async fn invalid_inline_contract_creates_hold_record_under_enforce() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
 
@@ -4533,7 +4542,7 @@ mod tests {
     async fn policy_record_requires_operator_start_run_journal_entry() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let principal_id = "operator:test";
         let audit_event_id = Uuid::new_v4().to_string();
         sqlx::query(
@@ -4575,7 +4584,7 @@ mod tests {
     async fn oversized_approved_proposal_creates_bounded_hold_record_under_enforce() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir
@@ -4615,7 +4624,7 @@ mod tests {
     async fn preflight_writes_rollout_contract_check_projection() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir
@@ -4668,7 +4677,7 @@ mod tests {
     async fn concurrent_preflight_reuses_same_terminal_record() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir
@@ -4710,7 +4719,7 @@ mod tests {
     async fn missing_existing_projection_self_heals_from_authoritative_record() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir
@@ -4770,7 +4779,7 @@ mod tests {
     async fn terminal_check_is_not_reused_after_approved_proposal_hash_drift() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir
@@ -4833,7 +4842,7 @@ mod tests {
     async fn missing_contract_check_recomputes_after_approved_proposal_repair() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir
@@ -4877,7 +4886,7 @@ mod tests {
     async fn stale_check_without_prior_green_recomputes_after_operator_repair() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir
@@ -4928,7 +4937,7 @@ mod tests {
     async fn proposal_content_hash_is_derived_from_current_artifact_bytes() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
 
@@ -4962,7 +4971,7 @@ mod tests {
     async fn absolute_approved_proposal_artifact_path_holds_and_scrubs_diagnostic() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir
@@ -5028,7 +5037,7 @@ mod tests {
     async fn sidecar_symlink_escape_creates_hold_record() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir
@@ -5076,7 +5085,7 @@ mod tests {
     async fn tampered_existing_projection_holds_under_enforce() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir
@@ -5145,7 +5154,7 @@ mod tests {
     async fn stale_existing_projection_allows_but_marks_would_block_under_permissive() {
         let dir = TempDir::new().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
-        let pool = db::pool::create_pool(&url).await.unwrap();
+        let pool = test_pool(&url).await;
         let mut run = test_run();
         run.workspace_root = dir.path().to_string_lossy().to_string();
         run.artifact_root = dir

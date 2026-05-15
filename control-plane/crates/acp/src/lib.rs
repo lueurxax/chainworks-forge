@@ -292,6 +292,11 @@ pub struct ExecutionResult {
     /// after the provider already returned a prompt result.
     #[serde(default)]
     pub close_diagnostic: Option<AcpCloseDiagnostic>,
+    /// Provider session-store directories preserved from an isolated runtime
+    /// home before cleanup. The engine either deletes these staged copies on
+    /// overall success or archives them durably when settlement later fails.
+    #[serde(default)]
+    pub provider_session_store_capture: Option<ProviderSessionStoreCapture>,
     #[serde(default)]
     pub acp_pre_initialize_local_latency_ms: Option<u64>,
     #[serde(default)]
@@ -310,6 +315,18 @@ pub struct ExecutionResult {
     pub legacy_broad_discovery_snapshot: Option<LegacyBroadDiscoverySnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_receipt: Option<AcpRuntimeReceipt>,
+    /// Provider launch preflight diagnostics captured before session spawn.
+    /// P090 uses this for Junie tool-path remediation readback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_tool_path_preflight_json: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSessionStoreCapture {
+    pub provider: String,
+    pub staging_root: String,
+    #[serde(default)]
+    pub captured_subdirs: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

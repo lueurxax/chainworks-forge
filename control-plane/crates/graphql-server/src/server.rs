@@ -518,9 +518,16 @@ mod tests {
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
-        create_pool("sqlite::memory:")
+        let pool = create_pool("sqlite::memory:")
             .await
-            .expect("in-memory pool failed")
+            .expect("in-memory pool failed");
+        db::writer::register_shared_writer(
+            &pool,
+            Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
+        pool
     }
 
     fn make_command_handler(pool: sqlx::SqlitePool) -> Arc<CommandHandler> {

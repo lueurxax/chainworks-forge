@@ -9,9 +9,9 @@ use tracing::{info, warn};
 
 use db::evidence_spool::{verify_spool_file, VerifyResult};
 use db::repos::side_effects::{
-    self, executor_fail_cas, executor_settle_cas, executor_start_cas, list_unresolved_for_stage_tx,
-    mark_external_write_started, mark_settled_evidence_failed, reaper_transition_cas,
-    ExecutorFailCasParams, ExecutorSettleCasParams, ExecutorStartCasParams,
+    self, executor_fail_cas, executor_settle_cas, executor_start_cas, list_unresolved_for_run_tx,
+    list_unresolved_for_stage_tx, mark_external_write_started, mark_settled_evidence_failed,
+    reaper_transition_cas, ExecutorFailCasParams, ExecutorSettleCasParams, ExecutorStartCasParams,
     ReaperTransitionCasParams,
 };
 use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
@@ -980,6 +980,64 @@ pub async fn run_unresolved_effects_preflight(
 /// Backward-compatible entry point used by CancelRun command handling.
 pub async fn run_cancel_preflight(pool: &SqlitePool, run_id: &RunId) -> Result<()> {
     run_unresolved_effects_preflight(pool, run_id, "cancel").await
+}
+
+pub async fn run_cancel_preflight_within_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &RunId,
+) -> Result<()> {
+    let call_site = "run_cancel_preflight_within_tx";
+    let now = Utc::now();
+    if let Some(open_until) = ledger_readback_circuit_open_until(call_site, now) {
+        warn!(
+            run_id = %run_id,
+            call_site = %call_site,
+            open_until = %open_until,
+            "side_effect_ledger_readback_circuit_open"
+        );
+        return Err(ledger_readback_circuit_error(call_site, open_until));
+    }
+    let unresolved = list_unresolved_for_run_tx(tx, &run_id.to_string())
+        .await
+        .map_err(|e| {
+            let open_until = record_ledger_readback_error(call_site, now);
+            emit_p078_metric("side_effect_ledger_readback_error_total", None, None);
+            warn!(
+                run_id = %run_id,
+                error = %e,
+                call_site = %call_site,
+                open_until = ?open_until.map(|v| v.to_rfc3339()),
+                "side_effect_ledger_readback_error during run cancel preflight"
+            );
+            anyhow!("ledger_readback_error: {}", e)
+        })?;
+    clear_ledger_readback_circuit(call_site);
+
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+
+    let effect_ids: Vec<String> = unresolved.iter().map(|e| e.id.to_string()).collect();
+    let reason = classify_unresolved_reason(&unresolved);
+    let stage_execution_id = &unresolved[0].stage_execution_id;
+    let envelope = RequiresEffectReconciliationEnvelope::new(
+        run_id,
+        stage_execution_id,
+        None,
+        effect_ids,
+        reason,
+    );
+
+    emit_p078_metric("side_effect_retry_block_total", None, None);
+    warn!(
+        run_id = %run_id,
+        "requires_effect_reconciliation_denied: unresolved effects block run cancel"
+    );
+
+    Err(anyhow!(
+        "requires_effect_reconciliation: {}",
+        serde_json::to_string(&envelope).unwrap_or_default()
+    ))
 }
 
 /// Transaction-scoped retry preflight. Equivalent to

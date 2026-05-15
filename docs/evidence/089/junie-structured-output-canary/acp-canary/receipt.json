@@ -1,0 +1,129 @@
+{
+  "adapter_family": "JunieAdapter",
+  "agent_execution_id": "571080e2-f805-4296-9476-02a4092e1c44",
+  "agent_id": "code_writer",
+  "backend_profile": "junie_code_editor_acp",
+  "catalog_binding": {
+    "agent_id": "code_writer",
+    "backend_profile": "junie_code_editor_acp",
+    "catalog_path": "/Users/user/Documents/Chainworks Forge/examples/agents/agents.yaml",
+    "catalog_sha256": "71e5abf4fbad0b061878dfaa0193434c041aeace90419b84f2a89528fa4e3815",
+    "contract_ids": {
+      "changed_files_manifest": "changed_files_manifest",
+      "implementation_progress": "implementation_progress",
+      "implementation_self_assessment": "implementation_self_assessment_v2",
+      "tests_result": "tests_result"
+    },
+    "effort": "high",
+    "model": "junie-default",
+    "outputs": [
+      "implementation_progress",
+      "implementation_self_assessment",
+      "changed_files_manifest",
+      "tests_result"
+    ],
+    "provider": "junie",
+    "runtime_profile": "junie_cli_acp"
+  },
+  "compiled_task_outputs": [
+    {
+      "canonical_path": "/Users/user/Documents/Chainworks Forge/.chainworks/tmp/p089-acp-canary-worktree/.chainworks/tmp/p089-acp-canary/a4d1637d-610e-4587-99f2-14a1ba23fd2a/artifacts/implementation_progress.json",
+      "contract_id": "implementation_progress",
+      "name": "implementation_progress",
+      "required": true,
+      "source_generation_owner": "agent"
+    },
+    {
+      "canonical_path": "/Users/user/Documents/Chainworks Forge/.chainworks/tmp/p089-acp-canary-worktree/.chainworks/tmp/p089-acp-canary/a4d1637d-610e-4587-99f2-14a1ba23fd2a/artifacts/implementation_self_assessment.json",
+      "contract_id": "implementation_self_assessment_v2",
+      "name": "implementation_self_assessment",
+      "required": true,
+      "source_generation_owner": "agent"
+    },
+    {
+      "canonical_path": "/Users/user/Documents/Chainworks Forge/.chainworks/tmp/p089-acp-canary-worktree/.chainworks/tmp/p089-acp-canary/a4d1637d-610e-4587-99f2-14a1ba23fd2a/artifacts/changed_files_manifest.json",
+      "contract_id": "changed_files_manifest",
+      "name": "changed_files_manifest",
+      "required": true,
+      "source_generation_owner": "control_plane"
+    },
+    {
+      "canonical_path": "/Users/user/Documents/Chainworks Forge/.chainworks/tmp/p089-acp-canary-worktree/.chainworks/tmp/p089-acp-canary/a4d1637d-610e-4587-99f2-14a1ba23fd2a/artifacts/tests_result.json",
+      "contract_id": "tests_result",
+      "name": "tests_result",
+      "required": true,
+      "source_generation_owner": "agent"
+    }
+  ],
+  "completion_capture_metadata": {
+    "capture_source": "capped_stream",
+    "capture_status": "captured",
+    "captured_byte_count": 505,
+    "completion_text_truncated": false,
+    "extraction_input_sha256": "ee2765c9e919c49dd07d65173c33ccdc8e0bab3c37e655d865de58d4777a60ae",
+    "extraction_input_truncated": false,
+    "raw_byte_limit": 1048576
+  },
+  "effort": "high",
+  "extraction_metadata": {
+    "completion_text_truncated": false,
+    "extracted_payload_sha256": "951185738fed764ec4c01555804f4e5486aba15574a6d738f4f0388de65146fc",
+    "extraction_input_truncated": false,
+    "raw_completion_has_non_json_prefix": false,
+    "source": "capped_stream"
+  },
+  "launch_mode": "--acp true",
+  "model": "junie-default",
+  "output_set_mode": "full_production",
+  "provider": "junie",
+  "provider_session_id": "session-260513-212059-1xwt",
+  "repair_metadata": {
+    "completion_repair_runtime_receipt_present": false,
+    "completion_repair_turn_count": 0,
+    "completion_turn_attempted": false,
+    "generic_repair_turn_count": 0
+  },
+  "run_id": "a4d1637d-610e-4587-99f2-14a1ba23fd2a",
+  "runtime_profile": "junie_cli_acp",
+  "runtime_receipt": {
+    "completed_at": "2026-05-13T18:21:47.985986Z",
+    "counters": {
+      "agent_message_chunk_count": 0,
+      "agent_thought_chunk_count": 0,
+      "meaningful_progress_count": 2,
+      "permission_grant_failed_count": 0,
+      "permission_grant_sent_count": 0,
+      "permission_request_count": 0,
+      "plan_update_count": 0,
+      "session_update_count": 5,
+      "tool_call_count": 0,
+      "tool_call_update_count": 0,
+      "total_messages": 6,
+      "unknown_notification_count": 5
+    },
+    "failure_phase": null,
+    "handshake": {
+      "initialize_received_at_ms": 4146,
+      "initialize_sent_at_ms": 0,
+      "prompt_sent_at_ms": 4173,
+      "session_new_received_at_ms": 4173,
+      "session_new_sent_at_ms": 4146,
+      "terminal_response_at_ms": 47602
+    },
+    "started_at": "2026-05-13T18:20:55.322254Z",
+    "status": "completed"
+  },
+  "schema_version": "p089_acp_receipt_v1",
+  "session_generation_id": "p089-acp-canary-571080e2-f805-4296-9476-02a4092e1c44",
+  "settlement_metadata": {
+    "accepted_aggregate_bytes": 688,
+    "aggregate_cap_hit": false,
+    "changed_files_manifest_status": "available",
+    "idempotency_key": "571080e2-f805-4296-9476-02a4092e1c44:9dd365bc-eb2a-4afa-b1ac-21d9f66a9456",
+    "materialization_owner": "engine_executor",
+    "schema_version": "p089_production_declared_output_settlement_v1",
+    "settlement_boundary": "engine::executor::generate_changed_files_manifest_if_declared_then_settle_agent_outputs_from_discovery_decisions"
+  },
+  "stage_execution_id": "d87c183d-39fb-4253-aaa1-25d445900642",
+  "stage_id": "p089_acp_canary"
+}

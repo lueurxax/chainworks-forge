@@ -1,0 +1,13 @@
+{
+  "schema_version": "p089_negative_fixture_v1",
+  "fixture_kind": "changed_files_manifest_source",
+  "expected_status": "evidence_incomplete",
+  "row": {
+    "output_name": "changed_files_manifest",
+    "settlement_decision": "accepted",
+    "freshness": "current_attempt",
+    "source_kind": "chainworks_output",
+    "source_generation_owner": "agent",
+    "contributes_to_junie_capability": true
+  }
+}

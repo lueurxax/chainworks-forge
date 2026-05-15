@@ -1,0 +1,32 @@
+{
+  "args": [
+    "--project",
+    "/tmp/chainworks-p089-native-project",
+    "--task",
+    "Final response only. Output exactly this JSON object, byte-for-byte except insignificant whitespace: {\"CHAINWORKS_OUTPUT\":{\"native_chainworks_output\":{\"status\":\"passed\",\"value\":1}}}. No headings. No bullets. No explanation. No commands.",
+    "--output-format",
+    "text",
+    "--timeout",
+    "120000",
+    "--skip-update-check"
+  ],
+  "binary_resolution": {
+    "env_var": "CHAINWORKS_JUNIE_ACP_BINARY",
+    "fallback_binary": "junie",
+    "resolved_path": "/opt/homebrew/bin/junie"
+  },
+  "exit_code_policy": "exit_code_zero_required_for_pass",
+  "forbidden_args": [
+    "--acp",
+    "--json-output-file"
+  ],
+  "input_mode": "task_arg",
+  "output_mode": "stdout_text",
+  "parser_input_source": "stdout_after_process_exit",
+  "project_path": "/tmp/chainworks-p089-native-project",
+  "prompt_sha256": "d9adf77977ab73d84f6c0faef18e5b3d5363135b7b5829a9b499eca78e967bd7",
+  "schema_version": "p089_native_command_v1",
+  "stderr_role": "diagnostics_only",
+  "timeout_ms": 120000,
+  "working_directory": "/tmp/chainworks-p089-native-project"
+}

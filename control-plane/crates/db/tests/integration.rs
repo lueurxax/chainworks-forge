@@ -29,9 +29,11 @@ use domain::xcode_runtime::{
 };
 
 async fn test_pool() -> sqlx::SqlitePool {
-    create_pool("sqlite::memory:")
+    let pool = create_pool("sqlite::memory:")
         .await
-        .expect("in-memory pool failed")
+        .expect("in-memory pool failed");
+    register_test_shared_writer(&pool).await;
+    pool
 }
 
 async fn register_test_shared_writer(pool: &sqlx::SqlitePool) {
@@ -2532,7 +2534,7 @@ async fn test_file_backed_sqlite_durability_across_restart() {
 /// All projection counts must exactly match the canonical table counts after rebuild.
 #[tokio::test]
 async fn test_projection_parity_matches_canonical_repo_values() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
 
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
@@ -2975,7 +2977,7 @@ async fn rebuild_all_for_run_refreshes_run_state_projection_status() {
 /// repo by decision ∈ {Pending, Requested}.
 #[tokio::test]
 async fn test_approval_inbox_projection_parity_vs_canonical() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
 
     let idea_id = IdeaId::new();
     let run_id = RunId::new();

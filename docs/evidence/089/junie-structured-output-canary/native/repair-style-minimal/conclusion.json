@@ -1,0 +1,8 @@
+{
+  "conclusion": "Junie final task result matched the requested structured payload.",
+  "exit_code": 0,
+  "experiment": "repair-style-minimal",
+  "final_output_sha256": "49f3699814eea7dd6083446ffd8b95ce47794a606f0d4d24b3839bf193123870",
+  "schema_version": "p089_native_conclusion_v1",
+  "status": "passed"
+}

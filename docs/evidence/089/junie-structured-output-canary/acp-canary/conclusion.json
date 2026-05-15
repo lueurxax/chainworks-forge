@@ -1,0 +1,8 @@
+{
+  "conclusion": "ACP Junie code_writer canary returned strict output-only CHAINWORKS_OUTPUT JSON through Junie ACP.",
+  "known_limitations": [
+    "changed_files_manifest is control-plane generated and does not contribute to Junie structured-output capability"
+  ],
+  "schema_version": "p089_acp_conclusion_v1",
+  "status": "passed"
+}

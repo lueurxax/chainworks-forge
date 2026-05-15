@@ -714,6 +714,43 @@ struct DaemonLifecycleClient {
           unit
           action
         }
+        projectionFreshness {
+          projectionName
+          sourceName
+          watermarkMs
+          isPoisoned
+          lastError
+          updatedAtMs
+          backlogRows
+          backlogBytes
+        }
+        hotReadGuards {
+          governedSurface
+          circuitStatus
+          consecutiveSuccesses
+          lastViolationKind
+          wouldOpen
+          lastOpenedAtMs
+          updatedAtMs
+          latencyMs
+        }
+        maintenanceOperations {
+          id
+          operationKind
+          status
+          idempotencyKey
+          slotGeneration
+          startedAtMs
+          completedAtMs
+          error
+          createdAtMs
+          updatedAtMs
+        }
+        degraded {
+          severity
+          reason
+          message
+        }
       }
     }
     """
