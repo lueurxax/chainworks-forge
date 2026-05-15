@@ -1,0 +1,20 @@
+{
+  "schema_version": "p090_valid_failure_envelope_fixture_v1",
+  "fixture_class": "valid_code_writer_engine_failure_v1",
+  "status": "accepted_for_implementation_gate",
+  "envelope": {
+    "schema_version": "code_writer_engine_failure.v1",
+    "source": "engine_synthesized",
+    "run_id": "fixture-run",
+    "stage_execution_id": "fixture-stage-execution",
+    "agent_execution_id": "fixture-agent-execution",
+    "session_generation_id": "fixture-session-generation",
+    "completion_boundary_subtype": "junie_progress_without_terminal_handoff",
+    "reason": "completion_boundary_subtype"
+  },
+  "proves": [
+    "engine_owned_failure_envelope",
+    "dotted_schema_version",
+    "provider_claims_do_not_override_engine_truth"
+  ]
+}

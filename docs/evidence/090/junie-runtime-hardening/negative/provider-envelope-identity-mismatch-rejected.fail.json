@@ -1,0 +1,19 @@
+{
+  "schema_version": "p090_negative_fixture_v1",
+  "fixture_class": "provider_envelope_identity_mismatch_rejected",
+  "status": "accepted_for_proposal_readiness",
+  "input": {
+    "source": "provider_final_text",
+    "payload_schema_version": "code_writer_repair_failure.v1",
+    "claimed_stage_execution_id": "00000000-0000-0000-0000-000000000001",
+    "actual_stage_execution_id": "00000000-0000-0000-0000-000000000002",
+    "claimed_agent_execution_id": "00000000-0000-0000-0000-000000000003",
+    "actual_agent_execution_id": "00000000-0000-0000-0000-000000000004"
+  },
+  "expected": {
+    "status": "provider_claim_rejected",
+    "failure_class": "provider_envelope_identity_mismatch",
+    "materializes_outputs": false,
+    "public_readback": "provider_claim_rejected"
+  }
+}

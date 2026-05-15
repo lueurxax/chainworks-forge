@@ -27,6 +27,19 @@ pub struct CodeWriterCompletionReceiptRecord {
     pub preexisting_dirty_path_count: i64,
     pub completion_status: String,
     pub failure_class: Option<String>,
+    pub provider_runtime_family: Option<String>,
+    pub completion_boundary_subtype: Option<String>,
+    pub final_payload_status: Option<String>,
+    pub progress_before_handoff: Option<String>,
+    pub runtime_preflight_phase: Option<String>,
+    pub runtime_tool_path_preflight_json: Option<String>,
+    pub final_completion_payload_capture_json: Option<String>,
+    pub engine_failure_envelope_json: Option<String>,
+    pub repair_failure_envelope_json: Option<String>,
+    pub repair_materialization_summary_json: Option<String>,
+    pub repair_materialization_mode: Option<String>,
+    pub strict_final_payload_enabled: bool,
+    pub staged_repair_settlement_enabled: bool,
     pub terminal_response_status: Option<String>,
     pub completion_turn_attempted: bool,
     pub completion_turn_result: Option<String>,
@@ -85,10 +98,38 @@ pub struct CodeWriterCompletionOutputDecisionRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeWriterOutputSettlementRow {
+    pub id: String,
+    pub receipt_id: String,
+    pub run_id: RunId,
+    pub stage_id: String,
+    pub stage_execution_id: StageExecutionId,
+    pub agent_execution_id: AgentExecutionId,
+    pub session_generation_id: Option<String>,
+    pub repair_attempt: i64,
+    pub output_name: String,
+    pub contract_id: String,
+    pub source_kind: String,
+    pub source_generation_owner: String,
+    pub candidate_digest: Option<String>,
+    pub staging_path: Option<String>,
+    pub canonical_path: String,
+    pub canonical_before_sha256: Option<String>,
+    pub canonical_after_sha256: Option<String>,
+    pub decision: String,
+    pub rejection_reason: Option<String>,
+    pub materialization_state: String,
+    pub active_pointer_generation_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub committed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeWriterCompletionReceiptReadback {
     pub receipt: CodeWriterCompletionReceiptRecord,
     pub text_captures: Vec<CodeWriterCompletionTextCaptureRecord>,
     pub output_decisions: Vec<CodeWriterCompletionOutputDecisionRecord>,
+    pub settlement_rows: Vec<CodeWriterOutputSettlementRow>,
     pub prompt_evidence: Option<CodeWriterCompletionPromptEvidenceReadback>,
 }
 
@@ -160,6 +201,20 @@ pub struct ImplementationCompletionTextCaptureReadback {
 pub struct ImplementationCompletionSummary {
     pub status: PublicEnumReadback,
     pub failure_class: Option<String>,
+    pub provider_runtime_family: Option<String>,
+    pub completion_boundary_subtype: PublicEnumReadback,
+    pub final_payload_status: Option<String>,
+    pub progress_before_handoff: Option<String>,
+    pub runtime_preflight_phase: Option<String>,
+    pub runtime_tool_path_preflight_json: Option<String>,
+    pub final_completion_payload_capture_json: Option<String>,
+    pub failure_envelope_authority: Option<String>,
+    pub engine_failure_envelope_json: Option<String>,
+    pub repair_failure_envelope_json: Option<String>,
+    pub repair_materialization_summary_json: Option<String>,
+    pub repair_materialization_mode: Option<String>,
+    pub strict_final_payload_enabled: bool,
+    pub staged_repair_settlement_enabled: bool,
     pub work_change_kind: Option<String>,
     pub activation_source: Option<String>,
     pub completion_mode: Option<String>,
@@ -243,6 +298,21 @@ const NEXT_OPERATOR_ACTION_VALUES: &[&str] = &[
     "unknown",
 ];
 
+const COMPLETION_BOUNDARY_SUBTYPE_VALUES: &[&str] = &[
+    "none",
+    "junie_final_response_missing",
+    "junie_final_response_truncated",
+    "junie_progress_without_terminal_handoff",
+    "junie_repair_returned_narrative",
+    "junie_repair_returned_malformed_json",
+    "junie_repair_outputs_partially_materialized",
+    "junie_runtime_tool_path_failure_before_publication",
+    "provider_envelope_unrecognized",
+    "provider_envelope_identity_mismatch",
+    "provider_authored_engine_failure_spoof_rejected",
+    "unknown",
+];
+
 pub fn project_implementation_completion(
     readbacks: &[CodeWriterCompletionReceiptReadback],
 ) -> ImplementationCompletionSummary {
@@ -279,6 +349,28 @@ pub fn project_implementation_completion(
     ImplementationCompletionSummary {
         status,
         failure_class: receipt.failure_class.clone(),
+        provider_runtime_family: receipt.provider_runtime_family.clone(),
+        completion_boundary_subtype: PublicEnumReadback::from_optional(
+            receipt.completion_boundary_subtype.as_deref(),
+            COMPLETION_BOUNDARY_SUBTYPE_VALUES,
+            "none",
+        ),
+        final_payload_status: receipt.final_payload_status.clone(),
+        progress_before_handoff: receipt.progress_before_handoff.clone(),
+        runtime_preflight_phase: receipt.runtime_preflight_phase.clone(),
+        runtime_tool_path_preflight_json: receipt.runtime_tool_path_preflight_json.clone(),
+        final_completion_payload_capture_json: receipt
+            .final_completion_payload_capture_json
+            .clone(),
+        failure_envelope_authority: p090_failure_envelope_authority_from_capture_json(
+            receipt.final_completion_payload_capture_json.as_deref(),
+        ),
+        engine_failure_envelope_json: receipt.engine_failure_envelope_json.clone(),
+        repair_failure_envelope_json: receipt.repair_failure_envelope_json.clone(),
+        repair_materialization_summary_json: receipt.repair_materialization_summary_json.clone(),
+        repair_materialization_mode: receipt.repair_materialization_mode.clone(),
+        strict_final_payload_enabled: receipt.strict_final_payload_enabled,
+        staged_repair_settlement_enabled: receipt.staged_repair_settlement_enabled,
         work_change_kind: receipt.work_change_kind.clone(),
         activation_source: Some(receipt.activation_source.clone()),
         completion_mode: receipt.completion_mode.clone(),
@@ -383,6 +475,23 @@ fn not_attempted_implementation_completion() -> ImplementationCompletionSummary 
     ImplementationCompletionSummary {
         status: PublicEnumReadback::from_required("not_attempted", STATUS_VALUES),
         failure_class: None,
+        provider_runtime_family: None,
+        completion_boundary_subtype: PublicEnumReadback::from_required(
+            "none",
+            COMPLETION_BOUNDARY_SUBTYPE_VALUES,
+        ),
+        final_payload_status: None,
+        progress_before_handoff: None,
+        runtime_preflight_phase: None,
+        runtime_tool_path_preflight_json: None,
+        final_completion_payload_capture_json: None,
+        failure_envelope_authority: None,
+        engine_failure_envelope_json: None,
+        repair_failure_envelope_json: None,
+        repair_materialization_summary_json: None,
+        repair_materialization_mode: None,
+        strict_final_payload_enabled: false,
+        staged_repair_settlement_enabled: false,
         work_change_kind: None,
         activation_source: None,
         completion_mode: None,
@@ -426,6 +535,14 @@ fn not_attempted_implementation_completion() -> ImplementationCompletionSummary 
             NEXT_OPERATOR_ACTION_VALUES,
         ),
     }
+}
+
+fn p090_failure_envelope_authority_from_capture_json(json: Option<&str>) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(json?).ok()?;
+    value
+        .get("failure_envelope_authority")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 fn derive_next_operator_action<'a>(

@@ -1,0 +1,54 @@
+{
+  "allowed_root_validation": [
+    {
+      "root": "docs/evidence/089/junie-structured-output-canary/**",
+      "valid": true
+    },
+    {
+      "root": "/Users/user/Documents/Chainworks Forge/.chainworks/tmp/p089-acp-canary-worktree/.chainworks/tmp/p089-acp-canary/a4d1637d-610e-4587-99f2-14a1ba23fd2a/artifacts",
+      "valid": true
+    },
+    {
+      "root": "/Users/user/Documents/Chainworks Forge/.chainworks/tmp/p089-acp-canary-worktree/.chainworks/tmp/p089-acp-canary/a4d1637d-610e-4587-99f2-14a1ba23fd2a",
+      "valid": true
+    },
+    {
+      "root": ".chainworks/tmp/p089-*",
+      "valid": true
+    }
+  ],
+  "allowed_roots": [
+    "docs/evidence/089/junie-structured-output-canary/**",
+    "/Users/user/Documents/Chainworks Forge/.chainworks/tmp/p089-acp-canary-worktree/.chainworks/tmp/p089-acp-canary/a4d1637d-610e-4587-99f2-14a1ba23fd2a/artifacts",
+    "/Users/user/Documents/Chainworks Forge/.chainworks/tmp/p089-acp-canary-worktree/.chainworks/tmp/p089-acp-canary/a4d1637d-610e-4587-99f2-14a1ba23fd2a",
+    ".chainworks/tmp/p089-*"
+  ],
+  "canonicalized_allowed_roots_valid": true,
+  "path_level_comparison": [],
+  "post_summary": {
+    "control_plane_only_path_count": 0,
+    "current_attempt_changed_path_count": 0,
+    "deleted_path_count": 0,
+    "excluded_path_count": 0,
+    "generated_artifact_only_path_count": 0,
+    "included_path_count": 0,
+    "preexisting_dirty_path_count": 0,
+    "renamed_path_count": 0,
+    "work_change_kind": "none"
+  },
+  "pre_summary": {
+    "control_plane_only_path_count": 0,
+    "current_attempt_changed_path_count": 0,
+    "deleted_path_count": 0,
+    "excluded_path_count": 0,
+    "generated_artifact_only_path_count": 0,
+    "included_path_count": 0,
+    "preexisting_dirty_path_count": 0,
+    "renamed_path_count": 0,
+    "work_change_kind": "none"
+  },
+  "preexisting_dirty_work_non_canary_safe": false,
+  "safety_violations": [],
+  "schema_version": "p089_mutation_guard_result_v1",
+  "verdict": "passed"
+}

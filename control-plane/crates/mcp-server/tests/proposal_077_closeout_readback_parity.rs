@@ -9,6 +9,17 @@ use domain::ids::{IdeaId, RunId};
 use domain::proposal_gate_result::{ProposalGateResult, ProposalGateStatus};
 use domain::run::{Run, RunStatus};
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(
+        &pool,
+        std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+    )
+    .await
+    .unwrap();
+    pool
+}
+
 fn principal(class: auth::PrincipalClass) -> auth::Principal {
     auth::Principal::new("p077-test", class)
 }
@@ -53,7 +64,7 @@ fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
 }
 
 async fn seed_run_with_closeout_summary() -> (sqlx::SqlitePool, RunId, String) {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     ideas::insert(

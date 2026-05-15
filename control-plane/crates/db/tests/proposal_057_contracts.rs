@@ -6,6 +6,15 @@ use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{ArtifactId, IdeaId, RunId};
 use domain::run::{Run, RunStatus};
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+    db::writer::register_shared_writer(&pool, writer)
+        .await
+        .expect("test shared DbWriter registration failed");
+    pool
+}
+
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
     Run {
         id: run_id,
@@ -75,7 +84,7 @@ async fn seed_run_with_meta(pool: &sqlx::SqlitePool, meta_root: Option<String>) 
 
 #[tokio::test]
 async fn proposal_057_active_index_is_sqlite_owned_and_json_export_is_rebuildable() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let (run_id, _) =
         seed_run_with_meta(&pool, Some(tmp.path().to_string_lossy().into_owned())).await;
@@ -149,7 +158,7 @@ async fn proposal_057_active_index_is_sqlite_owned_and_json_export_is_rebuildabl
 
 #[tokio::test]
 async fn proposal_057_repairs_legacy_invalid_contract_statuses_after_vocab_expansion() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _) = seed_run(&pool).await;
     let now = Utc::now().to_rfc3339();
 
@@ -221,7 +230,7 @@ async fn proposal_057_repairs_legacy_invalid_contract_statuses_after_vocab_expan
 
 #[tokio::test]
 async fn proposal_057_implementation_and_tests_contract_fields_are_canonical() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let (run_id, _) =
         seed_run_with_meta(&pool, Some(tmp.path().to_string_lossy().into_owned())).await;
@@ -296,7 +305,7 @@ async fn proposal_057_implementation_and_tests_contract_fields_are_canonical() {
 
 #[tokio::test]
 async fn proposal_057_operator_override_is_typed_expiring_and_visible() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _) = seed_run(&pool).await;
 
     artifact_contracts::create_override_and_rebuild(
@@ -365,7 +374,7 @@ async fn proposal_057_operator_override_is_typed_expiring_and_visible() {
 
 #[tokio::test]
 async fn proposal_057_operator_override_rejects_untyped_status_truth() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _) = seed_run(&pool).await;
 
     let result = artifact_contracts::create_override_and_rebuild(
@@ -393,7 +402,7 @@ async fn proposal_057_operator_override_rejects_untyped_status_truth() {
 
 #[tokio::test]
 async fn proposal_057_audit_report_splits_implementation_and_release_evidence_truth() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let audit_path = tmp.path().join("audit/proposal-vs-implementation.json");
     std::fs::create_dir_all(audit_path.parent().unwrap()).unwrap();
@@ -492,7 +501,7 @@ async fn proposal_057_audit_report_splits_implementation_and_release_evidence_tr
 
 #[tokio::test]
 async fn proposal_057_active_generation_records_supersession_edge() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _) = seed_run(&pool).await;
 
     artifact_contracts::upsert_generation_and_rebuild(
@@ -559,7 +568,7 @@ async fn proposal_057_active_generation_records_supersession_edge() {
 
 #[tokio::test]
 async fn proposal_057_invalid_contract_is_structured_block_and_disables_raw_fallback() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _) = seed_run(&pool).await;
 
     artifact_contracts::upsert_generation_and_rebuild(
@@ -613,7 +622,7 @@ async fn proposal_057_invalid_contract_is_structured_block_and_disables_raw_fall
 
 #[tokio::test]
 async fn proposal_057_superseded_invalid_contract_does_not_block_active_valid_contract() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _) = seed_run(&pool).await;
 
     artifact_contracts::upsert_generation_and_rebuild(
@@ -697,7 +706,7 @@ async fn proposal_057_superseded_invalid_contract_does_not_block_active_valid_co
 
 #[tokio::test]
 async fn proposal_057_agent_written_run_state_is_advisory_and_superseded() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let (run_id, _) =
         seed_run_with_meta(&pool, Some(tmp.path().to_string_lossy().into_owned())).await;

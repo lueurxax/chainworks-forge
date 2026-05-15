@@ -7,8 +7,8 @@ use domain::artifact_contracts::{
 use domain::code_writer_completion::{
     CodeWriterCompletionOutputDecisionRecord, CodeWriterCompletionReceiptReadback,
     CodeWriterCompletionReceiptRecord, CodeWriterCompletionTextCaptureRecord,
-    ImplementationCompletionSummary, ImplementationCompletionTextCaptureReadback,
-    PublicEnumReadback,
+    CodeWriterOutputSettlementRow, ImplementationCompletionSummary,
+    ImplementationCompletionTextCaptureReadback, PublicEnumReadback,
 };
 use domain::mediation::LeadConflictMediationRecord;
 use domain::run::Run;
@@ -73,6 +73,12 @@ pub struct GqlRun {
     pub code_writer_completion_receipts: Vec<GqlCodeWriterCompletionReceipt>,
     /// P088: Public implementation-completion summary with closed vocabularies and unknown metadata.
     pub implementation_completion: GqlImplementationCompletionSummary,
+    /// P091: Active retry-stage execution authority, when a targeted retry is in force.
+    pub retry_authority_json: Option<Json<serde_json::Value>>,
+    /// P091: Durable retry-stage authority history for this run.
+    pub retry_authority_history_json: Option<Json<serde_json::Value>>,
+    /// P091: Latest startup orphan-repair rollout counters and samples.
+    pub p091_orphan_repair_readback_json: Option<Json<serde_json::Value>>,
     /// P077: Active closeout readiness summary (via CloseoutReadinessSummaryAccessor).
     pub closeout_readiness_summary_json: Option<Json<serde_json::Value>>,
     /// P077: Documented alias for the implementation closeout readiness summary.
@@ -128,6 +134,9 @@ impl From<Run> for GqlRun {
             side_effect_readback_json: None,
             code_writer_completion_receipts: Vec::new(),
             implementation_completion: GqlImplementationCompletionSummary::not_attempted(),
+            retry_authority_json: None,
+            retry_authority_history_json: None,
+            p091_orphan_repair_readback_json: None,
             closeout_readiness_summary_json: None,
             implementation_closeout_readiness_summary: None,
         }
@@ -201,6 +210,9 @@ impl From<RunProjectionRow> for GqlRun {
             side_effect_readback_json: None,
             code_writer_completion_receipts: Vec::new(),
             implementation_completion: GqlImplementationCompletionSummary::not_attempted(),
+            retry_authority_json: None,
+            retry_authority_history_json: None,
+            p091_orphan_repair_readback_json: None,
             closeout_readiness_summary_json: None,
             implementation_closeout_readiness_summary: None,
         }
@@ -220,6 +232,20 @@ pub struct GqlPublicEnumReadback {
 pub struct GqlImplementationCompletionSummary {
     pub status: GqlPublicEnumReadback,
     pub failure_class: Option<String>,
+    pub provider_runtime_family: Option<String>,
+    pub completion_boundary_subtype: GqlPublicEnumReadback,
+    pub final_payload_status: Option<String>,
+    pub progress_before_handoff: Option<String>,
+    pub runtime_preflight_phase: Option<String>,
+    pub runtime_tool_path_preflight_json: Option<String>,
+    pub final_completion_payload_capture_json: Option<String>,
+    pub failure_envelope_authority: Option<String>,
+    pub engine_failure_envelope_json: Option<String>,
+    pub repair_failure_envelope_json: Option<String>,
+    pub repair_materialization_summary_json: Option<String>,
+    pub repair_materialization_mode: Option<String>,
+    pub strict_final_payload_enabled: bool,
+    pub staged_repair_settlement_enabled: bool,
     pub work_change_kind: Option<String>,
     pub activation_source: Option<String>,
     pub completion_mode: Option<String>,
@@ -297,6 +323,20 @@ impl From<ImplementationCompletionSummary> for GqlImplementationCompletionSummar
         Self {
             status: summary.status.into(),
             failure_class: summary.failure_class,
+            provider_runtime_family: summary.provider_runtime_family,
+            completion_boundary_subtype: summary.completion_boundary_subtype.into(),
+            final_payload_status: summary.final_payload_status,
+            progress_before_handoff: summary.progress_before_handoff,
+            runtime_preflight_phase: summary.runtime_preflight_phase,
+            runtime_tool_path_preflight_json: summary.runtime_tool_path_preflight_json,
+            final_completion_payload_capture_json: summary.final_completion_payload_capture_json,
+            failure_envelope_authority: summary.failure_envelope_authority,
+            engine_failure_envelope_json: summary.engine_failure_envelope_json,
+            repair_failure_envelope_json: summary.repair_failure_envelope_json,
+            repair_materialization_summary_json: summary.repair_materialization_summary_json,
+            repair_materialization_mode: summary.repair_materialization_mode,
+            strict_final_payload_enabled: summary.strict_final_payload_enabled,
+            staged_repair_settlement_enabled: summary.staged_repair_settlement_enabled,
             work_change_kind: summary.work_change_kind,
             activation_source: summary.activation_source,
             completion_mode: summary.completion_mode,
@@ -387,6 +427,19 @@ pub struct GqlCodeWriterCompletionReceipt {
     pub preexisting_dirty_path_count: i64,
     pub completion_status: String,
     pub failure_class: Option<String>,
+    pub provider_runtime_family: Option<String>,
+    pub completion_boundary_subtype: Option<String>,
+    pub final_payload_status: Option<String>,
+    pub progress_before_handoff: Option<String>,
+    pub runtime_preflight_phase: Option<String>,
+    pub runtime_tool_path_preflight_json: Option<String>,
+    pub final_completion_payload_capture_json: Option<String>,
+    pub engine_failure_envelope_json: Option<String>,
+    pub repair_failure_envelope_json: Option<String>,
+    pub repair_materialization_summary_json: Option<String>,
+    pub repair_materialization_mode: Option<String>,
+    pub strict_final_payload_enabled: bool,
+    pub staged_repair_settlement_enabled: bool,
     pub terminal_response_status: Option<String>,
     pub completion_turn_attempted: bool,
     pub completion_turn_result: Option<String>,
@@ -411,6 +464,7 @@ pub struct GqlCodeWriterCompletionReceipt {
     pub created_at: String,
     pub text_captures: Vec<GqlCodeWriterCompletionTextCapture>,
     pub output_decisions: Vec<GqlCodeWriterCompletionOutputDecision>,
+    pub settlement_rows: Vec<GqlCodeWriterOutputSettlementRow>,
 }
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -449,10 +503,43 @@ pub struct GqlCodeWriterCompletionOutputDecision {
     pub rejection_reason: Option<String>,
 }
 
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "CodeWriterOutputSettlementRow", rename_fields = "camelCase")]
+pub struct GqlCodeWriterOutputSettlementRow {
+    pub id: String,
+    pub receipt_id: String,
+    pub run_id: ID,
+    pub stage_id: String,
+    pub stage_execution_id: ID,
+    pub agent_execution_id: ID,
+    pub session_generation_id: Option<String>,
+    pub repair_attempt: i64,
+    pub output_name: String,
+    pub contract_id: String,
+    pub source_kind: String,
+    pub source_generation_owner: String,
+    pub candidate_digest: Option<String>,
+    pub staging_path: Option<String>,
+    pub canonical_path: String,
+    pub canonical_before_sha256: Option<String>,
+    pub canonical_after_sha256: Option<String>,
+    pub decision: String,
+    pub rejection_reason: Option<String>,
+    pub materialization_state: String,
+    pub active_pointer_generation_id: Option<String>,
+    pub created_at: String,
+    pub committed_at: Option<String>,
+}
+
 impl From<CodeWriterCompletionReceiptReadback> for GqlCodeWriterCompletionReceipt {
     fn from(readback: CodeWriterCompletionReceiptReadback) -> Self {
         let receipt = readback.receipt;
-        Self::from_parts(receipt, readback.text_captures, readback.output_decisions)
+        Self::from_parts(
+            receipt,
+            readback.text_captures,
+            readback.output_decisions,
+            readback.settlement_rows,
+        )
     }
 }
 
@@ -461,6 +548,7 @@ impl GqlCodeWriterCompletionReceipt {
         receipt: CodeWriterCompletionReceiptRecord,
         text_captures: Vec<CodeWriterCompletionTextCaptureRecord>,
         output_decisions: Vec<CodeWriterCompletionOutputDecisionRecord>,
+        settlement_rows: Vec<CodeWriterOutputSettlementRow>,
     ) -> Self {
         Self {
             id: receipt.id,
@@ -488,6 +576,19 @@ impl GqlCodeWriterCompletionReceipt {
             preexisting_dirty_path_count: receipt.preexisting_dirty_path_count,
             completion_status: receipt.completion_status,
             failure_class: receipt.failure_class,
+            provider_runtime_family: receipt.provider_runtime_family,
+            completion_boundary_subtype: receipt.completion_boundary_subtype,
+            final_payload_status: receipt.final_payload_status,
+            progress_before_handoff: receipt.progress_before_handoff,
+            runtime_preflight_phase: receipt.runtime_preflight_phase,
+            runtime_tool_path_preflight_json: receipt.runtime_tool_path_preflight_json,
+            final_completion_payload_capture_json: receipt.final_completion_payload_capture_json,
+            engine_failure_envelope_json: receipt.engine_failure_envelope_json,
+            repair_failure_envelope_json: receipt.repair_failure_envelope_json,
+            repair_materialization_summary_json: receipt.repair_materialization_summary_json,
+            repair_materialization_mode: receipt.repair_materialization_mode,
+            strict_final_payload_enabled: receipt.strict_final_payload_enabled,
+            staged_repair_settlement_enabled: receipt.staged_repair_settlement_enabled,
             terminal_response_status: receipt.terminal_response_status,
             completion_turn_attempted: receipt.completion_turn_attempted,
             completion_turn_result: receipt.completion_turn_result,
@@ -519,6 +620,10 @@ impl GqlCodeWriterCompletionReceipt {
             output_decisions: output_decisions
                 .into_iter()
                 .map(GqlCodeWriterCompletionOutputDecision::from)
+                .collect(),
+            settlement_rows: settlement_rows
+                .into_iter()
+                .map(GqlCodeWriterOutputSettlementRow::from)
                 .collect(),
         }
     }
@@ -557,6 +662,38 @@ impl From<CodeWriterCompletionOutputDecisionRecord> for GqlCodeWriterCompletionO
             settlement_source: decision.settlement_source,
             validation_status: decision.validation_status,
             rejection_reason: decision.rejection_reason,
+        }
+    }
+}
+
+impl From<CodeWriterOutputSettlementRow> for GqlCodeWriterOutputSettlementRow {
+    fn from(row: CodeWriterOutputSettlementRow) -> Self {
+        Self {
+            id: row.id,
+            receipt_id: row.receipt_id,
+            run_id: ID(row.run_id.to_string()),
+            stage_id: row.stage_id,
+            stage_execution_id: ID(row.stage_execution_id.to_string()),
+            agent_execution_id: ID(row.agent_execution_id.to_string()),
+            session_generation_id: row.session_generation_id,
+            repair_attempt: row.repair_attempt,
+            output_name: row.output_name,
+            contract_id: row.contract_id,
+            source_kind: row.source_kind,
+            source_generation_owner: row.source_generation_owner,
+            candidate_digest: row.candidate_digest,
+            staging_path: row.staging_path,
+            canonical_path: row.canonical_path,
+            canonical_before_sha256: row.canonical_before_sha256,
+            canonical_after_sha256: row.canonical_after_sha256,
+            decision: row.decision,
+            rejection_reason: row.rejection_reason,
+            materialization_state: row.materialization_state,
+            active_pointer_generation_id: row.active_pointer_generation_id,
+            created_at: row.created_at.to_rfc3339(),
+            committed_at: row
+                .committed_at
+                .map(|committed_at| committed_at.to_rfc3339()),
         }
     }
 }

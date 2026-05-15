@@ -33,6 +33,14 @@ use sqlx::{Row, SqlitePool};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+async fn test_pool() -> SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .unwrap();
+    pool
+}
+
 async fn make_idea(pool: &SqlitePool, id: IdeaId) {
     let idea = Idea {
         id,
@@ -237,7 +245,7 @@ async fn post_mutation(
 
 #[tokio::test]
 async fn inbound_request_id_propagates_through_graphql_into_command_journal() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let approval_id = make_pending_approval(&pool).await;
     let app = build_app(pool.clone()).await;
 
@@ -268,7 +276,7 @@ async fn inbound_request_id_propagates_through_graphql_into_command_journal() {
 
 #[tokio::test]
 async fn missing_inbound_request_id_still_produces_and_persists_a_fresh_uuid() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let approval_id = make_pending_approval(&pool).await;
     let app = build_app(pool.clone()).await;
 
@@ -310,7 +318,7 @@ async fn request_id_propagates_through_graphql_and_mcp_and_journal() {
     //
     // This test ties both legs into a single named fixture so the
     // proposal contract name appears in `cargo test` output.
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let approval_id = make_pending_approval(&pool).await;
     let app = build_app(pool.clone()).await;
 

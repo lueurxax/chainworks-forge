@@ -2167,14 +2167,14 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
         .any(|(name, value)| name == "RUST_LOG" && value == "warn"));
     let cleanup_paths = resources.commit();
     assert_eq!(cleanup_paths.len(), 1);
-    assert!(cleanup_paths[0].exists());
-    std::fs::remove_dir_all(&cleanup_paths[0]).unwrap();
+    assert!(cleanup_paths[0].path.exists());
+    std::fs::remove_dir_all(&cleanup_paths[0].path).unwrap();
 
     let gemini = GeminiCliAdapter::new_with_binary("/bin/gemini-fixture");
     let mut resources = LaunchResourceGuard::default();
     let launch_spec = gemini.prepare_launch_spec(&req, &mut resources).unwrap();
     assert_eq!(launch_spec.binary_path, "/bin/gemini-fixture");
-    assert_eq!(launch_spec.args, vec!["--acp"]);
+    assert_eq!(launch_spec.args, vec!["--acp", "--model", "gpt-5.4/high"]);
     assert!(resources.commit().is_empty());
 
     let claude = ClaudeAgentAdapter::new_with_binary("/bin/claude-fixture");
@@ -2258,7 +2258,7 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
     let mut launch_spec = adapter.prepare_launch_spec(&req, &mut resources).unwrap();
     let cleanup_paths = resources.commit();
     let cleanup_path = cleanup_paths[0].clone();
-    assert!(cleanup_path.exists());
+    assert!(cleanup_path.path.exists());
     launch_spec.cleanup_paths.extend(cleanup_paths);
 
     let session_spec = adapter.prepare_session_new_spec(&req).unwrap();
@@ -2271,7 +2271,7 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
     };
 
     assert!(err.to_string().contains("spawn codex ACP subprocess"));
-    assert!(!cleanup_path.exists());
+    assert!(!cleanup_path.path.exists());
 }
 
 #[cfg(unix)]
@@ -5157,14 +5157,19 @@ async fn runtime_manager_releases_brokered_xcode_lease_when_kept_session_fails()
                 .is_err_and(|error| error.to_string().contains("session/close")),
         "failed prompt should not be kept alive even if close reports process exit: {result:?}"
     );
+    assert!(
+        released.lock().await.is_empty(),
+        "failed kept session remains reusable for repair and must retain its brokered Xcode lease"
+    );
+    assert!(
+        manager.has_live_session("generation-failed", None).await,
+        "failed prompt should leave a reusable live session for repair"
+    );
+    manager.close_session("generation-failed").await.unwrap();
     assert_eq!(
         released.lock().await.as_slice(),
         ["lease-failed"],
-        "failed kept session must release its brokered Xcode lease"
-    );
-    assert!(
-        !manager.has_live_session("generation-failed", None).await,
-        "failed prompt must not leave a reusable live session"
+        "explicit close must release the retained brokered Xcode lease"
     );
 }
 

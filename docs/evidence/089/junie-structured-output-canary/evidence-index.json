@@ -1,0 +1,231 @@
+{
+  "acp_canary": {
+    "directory": "docs/evidence/089/junie-structured-output-canary/acp-canary",
+    "files": {
+      "conclusion.json": {
+        "sha256": "24ef044aa02eec1660af143e52d1ad00fd72127630bd8e1528ee27360f5c7b3b",
+        "size_bytes": 337
+      },
+      "extraction-result.json": {
+        "sha256": "416283965ca83ee2fa4c7aede1dc73bc9e621ebc36bcd5599d83c9e9e28ca147",
+        "size_bytes": 708
+      },
+      "harness-result.json": {
+        "sha256": "9f8fdcdd793e3f9ed4d174b5d60f7ecff8b312a5429ae1cd9ee14e3911eb21a1",
+        "size_bytes": 31857
+      },
+      "mutation-guard-result.json": {
+        "sha256": "4cabaa73935fe47a7db49babed424412e2313ee72e98238ff9c52d8ec63ee3ef",
+        "size_bytes": 1972
+      },
+      "preflight.json": {
+        "sha256": "169150733e2df043a88d0f67bf2694e69e9410d5c7fdc15190e4acb1ee34c8d4",
+        "size_bytes": 557
+      },
+      "receipt.json": {
+        "sha256": "cdfb30ae8baf3b0768a772e5dce058f92cea9d231aeb0fcc1f17944ed52a202f",
+        "size_bytes": 5299
+      },
+      "run-report.json": {
+        "sha256": "0cd68abb1a66386836ce880f5c12e8d35ebc30221ab3166d166507a4d2b3e29e",
+        "size_bytes": 869
+      },
+      "settled-outputs.json": {
+        "sha256": "ab527a7c5027e7e706050e7ff07d9e3c98fd62f90c4d8a16fd3cddbcc138f0f1",
+        "size_bytes": 8075
+      },
+      "terminal-completion.raw.txt": {
+        "sha256": "ee2765c9e919c49dd07d65173c33ccdc8e0bab3c37e655d865de58d4777a60ae",
+        "size_bytes": 505
+      },
+      "worktree-fingerprint-post.json": {
+        "sha256": "cf458c50c394f3416a47009d54e4793292fe7d660223cad98e0e4620a3367ef7",
+        "size_bytes": 819
+      },
+      "worktree-fingerprint-pre.json": {
+        "sha256": "5430881937dc745e7972cea8173f4b75eeebf5e5954e70e84b876ec8cb939201",
+        "size_bytes": 818
+      }
+    },
+    "safety_violations": [],
+    "status": "passed"
+  },
+  "acp_canary_status": "passed",
+  "audited_git_sha": "4e78ac642528945cec274c602d5fb1c410e7865e",
+  "live_gate_run": {
+    "path": "docs/evidence/089/junie-structured-output-canary/live-gate-run.json",
+    "sha256": "719703317b2e5899dc3c8a4132658df7252633638e30fc0086d33537672c76f7",
+    "size_bytes": 2412
+  },
+  "native_experiments": [
+    {
+      "directory": "docs/evidence/089/junie-structured-output-canary/native/exact-json",
+      "files": {
+        "command.json": {
+          "sha256": "ed329ce7ab38feb478367fc565118caf42289bca4f11284b558af36e07728609",
+          "size_bytes": 1132
+        },
+        "conclusion.json": {
+          "sha256": "8a3a70934b2ba03144ad68e6fcf0d050841b00fdf3c3d287967bd5542e0e893d",
+          "size_bytes": 300
+        },
+        "environment.json": {
+          "sha256": "feed9cfa9bd2b8861c8b66efebde34f42db6013fadcc6f8c74ba3cacb655683a",
+          "size_bytes": 832
+        },
+        "final-output.raw.txt": {
+          "sha256": "b84c115c0507f76876524c32884eeb8c09ab0465451894234407dc8224ec9f0e",
+          "size_bytes": 62
+        },
+        "parser-result.json": {
+          "sha256": "45efb9c5d48c7d849b951a80eafe54fb0cb0c550ec36a1773c35ca2b28c473fd",
+          "size_bytes": 445
+        },
+        "prompt.txt": {
+          "sha256": "5eb20eeb592741da76a6852e488304304930fe63900ea1c61a13a05c0f11094c",
+          "size_bytes": 223
+        },
+        "stdout.raw.txt": {
+          "sha256": "2bf5b0e32aa84f89dc0f64da0d358a31527c05a5b1d2005ab05d9eafa7dbb9cc",
+          "size_bytes": 144
+        }
+      },
+      "name": "exact-json"
+    },
+    {
+      "directory": "docs/evidence/089/junie-structured-output-canary/native/exact-chainworks-output",
+      "files": {
+        "command.json": {
+          "sha256": "3402831176701dd37da5c13a22bc67c7e1cca9dbaca9bb8d18ec2ef1b7d1cc49",
+          "size_bytes": 1145
+        },
+        "conclusion.json": {
+          "sha256": "d623599c43c243b00285292a9b0dd365f1b7ed877436e2d71f6e3d3b53df35ab",
+          "size_bytes": 320
+        },
+        "environment.json": {
+          "sha256": "237b69bd532b0e062c867f5d51581432d663367ce4ff2ced3d7212bc5349314e",
+          "size_bytes": 832
+        },
+        "final-output.raw.txt": {
+          "sha256": "6fd2a17db04510a9fb06d16de46051fbfa295092ca3b945fe4de989bfa49d9f7",
+          "size_bytes": 80
+        },
+        "parser-result.json": {
+          "sha256": "5615afa2ce6b906f58f32370f98afadda06bf24d0aa1a99cecf92b539f668b6c",
+          "size_bytes": 418
+        },
+        "prompt.txt": {
+          "sha256": "d9adf77977ab73d84f6c0faef18e5b3d5363135b7b5829a9b499eca78e967bd7",
+          "size_bytes": 236
+        },
+        "stdout.raw.txt": {
+          "sha256": "72b2f3f4935560dab8ca39df7532bf7981ffaf63b0f5b4137325b5f4e42d634c",
+          "size_bytes": 162
+        }
+      },
+      "name": "exact-chainworks-output"
+    },
+    {
+      "directory": "docs/evidence/089/junie-structured-output-canary/native/repair-style-minimal",
+      "files": {
+        "command.json": {
+          "sha256": "0431f3c7750dde8c7cf85e986d8ca89fb0855a37e8db2c43972e8c234ae7f56b",
+          "size_bytes": 1347
+        },
+        "conclusion.json": {
+          "sha256": "a7cfc1815f97acc76d395d833d52d0cfc9f3b5ba248ff40c72b53c8e6232f5aa",
+          "size_bytes": 310
+        },
+        "environment.json": {
+          "sha256": "e99988ea8b5ebe0134f9061da9a6ed304ebc6cd3a9684d79c07c65dab62e83b8",
+          "size_bytes": 832
+        },
+        "final-output.raw.txt": {
+          "sha256": "49f3699814eea7dd6083446ffd8b95ce47794a606f0d4d24b3839bf193123870",
+          "size_bytes": 261
+        },
+        "parser-result.json": {
+          "sha256": "9cb86e3c058d23eb03c51efade5669e8e15e812595815ec18e8052c2d13e68d3",
+          "size_bytes": 418
+        },
+        "prompt.txt": {
+          "sha256": "84632e83ab08e32500be29be0a017fdc8fd645b850de858825ccb0b9802faa98",
+          "size_bytes": 422
+        },
+        "stdout.raw.txt": {
+          "sha256": "6abee25ac249e250fcf50ee59b6cfba90ea548d88b6d31fe5da7dac43bfe3ab9",
+          "size_bytes": 343
+        }
+      },
+      "name": "repair-style-minimal"
+    }
+  ],
+  "native_phase_status": "passed",
+  "negative_fixtures": {
+    "directory": "docs/evidence/089/junie-structured-output-canary/negative",
+    "files": {
+      "allow-dirty-diagnostic.fail.json": {
+        "sha256": "02973a3f5571001c8b60f84bca75d6c0c7a3ec81989328c6d88c6195f0c5cf8e",
+        "size_bytes": 281
+      },
+      "broad-allowed-roots.fail.json": {
+        "sha256": "ee3a666245e94f270fe7d4b66d5a70d89f271b2c31933952b7ec26e1a1e8d2d5",
+        "size_bytes": 452
+      },
+      "changed-files-manifest-agent-source.fail.json": {
+        "sha256": "6061c4f24973abbc265ced07d19b54f5803f06ebb93bf064672264acf4f06d42",
+        "size_bytes": 406
+      },
+      "proof-critical-drift.fail.json": {
+        "sha256": "f1819473b426fbc1310f062ed06aebd977d608b9aa66587330394e560d569d0c",
+        "size_bytes": 313
+      }
+    }
+  },
+  "overall_status": "passed",
+  "proof_critical_files": [
+    {
+      "path": "scripts/test-gate.sh",
+      "sha256": "eacee969da24c04cae930c9b7cc3a4d74a857228612478a9f80a7983ee0e97da",
+      "size_bytes": 352513
+    },
+    {
+      "path": "scripts/proposal-089-refresh-evidence.py",
+      "sha256": "10d09d376d339f9a1e9198e1862df8c0592cdd108e8478a54a25403dd156cc1f",
+      "size_bytes": 18372
+    },
+    {
+      "path": "control-plane/crates/acp/src/adapters/junie.rs",
+      "sha256": "9ea5cad9c0aa1e04e5f6cabfda9633bc0bd810afaa850a5eba43e2e7a79e5f38",
+      "size_bytes": 27029
+    },
+    {
+      "path": "control-plane/crates/acp/src/transport.rs",
+      "sha256": "e74238fc59abd55e7198e83a00455a64ea9e761497baa4f10ff15996ad154cc5",
+      "size_bytes": 193279
+    },
+    {
+      "path": "control-plane/crates/engine/examples/p089_acp_live_canary.rs",
+      "sha256": "e8b40386be47be0e08b4141ed395e59bf8f1cc76372aa682f1982f9724465e12",
+      "size_bytes": 14425
+    },
+    {
+      "path": "control-plane/crates/engine/src/executor.rs",
+      "sha256": "5c86fba37e2a8a113ecfb597b12f725f9364226d04eefe8da50ae0a5cde2ecce",
+      "size_bytes": 716433
+    },
+    {
+      "path": "control-plane/crates/engine/src/worktree_fingerprint.rs",
+      "sha256": "41ef1065e7e91fec3293a100db0713e88e3aa0810a7227006cc2137580bd54ce",
+      "size_bytes": 25991
+    },
+    {
+      "path": "examples/agents/agents.yaml",
+      "sha256": "71e5abf4fbad0b061878dfaa0193434c041aeace90419b84f2a89528fa4e3815",
+      "size_bytes": 72649
+    }
+  ],
+  "recorded_at": "2026-05-15T05:35:44.621257+00:00",
+  "schema_version": "p089_evidence_index_v1"
+}

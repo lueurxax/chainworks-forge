@@ -1,0 +1,22 @@
+{
+  "schema_version": "p090_subtype_fixture_v1",
+  "subtype": "junie_runtime_tool_path_failure_before_publication",
+  "fixture_type": "synthetic",
+  "status": "accepted_for_proposal_readiness",
+  "proves": [
+    "subtype_coverage",
+    "preflight_lifecycle",
+    "redacted_permission_failure",
+    "no_provider_launch_on_unremediable_failure"
+  ],
+  "preflight": {
+    "status": "failed",
+    "attempt_count": 1,
+    "provider_launched": false,
+    "failed_operation_class": "read_project_file",
+    "redacted_path_class": "project_source_file",
+    "failure_category": "permission_denied",
+    "remediation_applied": null
+  },
+  "expected_gate_behavior": "implementation_gate_must_prove_permission_denied_fails_before_provider_launch"
+}

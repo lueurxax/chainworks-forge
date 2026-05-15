@@ -30,6 +30,8 @@ At the current baseline, the product includes:
 - catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
 - live ACP-backed execution for real provider sessions,
 - ACP-only runtime transport with adapter-specific subprocess execution,
+- Junie `code_writer` runtime hardening with strict completion-boundary subtypes, engine-synthesized failure envelopes, staged per-output repair settlement, runtime preflight/remediation, and post-preflight provider launch capacity leasing,
+- targeted retry authority with exact stage-execution retry settlement, authority-history readback, and startup orphan retry repair,
 - bounded artifact discovery and engine-owned settlement pipeline,
 - provider toolchain cache mapping for isolated Xcode and Go build roots,
 - per-agent MCP policy resolution with persisted requested/predicted/actual/denied truth,
@@ -67,6 +69,7 @@ Use these reference docs as the current source of truth:
 | Per-agent MCP policy and runtime validation | [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) |
 | ACP runtime transport | [acp-runtime-transport.md](acp-runtime-transport.md) |
 | Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
+| Rust control plane, scheduler, and targeted retry authority | [rust-control-plane.md](rust-control-plane.md) |
 | Proposal-loop feedback fidelity | [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) |
 | Live provider-backed proposal loop | [live-provider-execution-slice.md](live-provider-execution-slice.md) |
 | Operator shell | [operator-experience.md](operator-experience.md) |
@@ -180,7 +183,8 @@ The following flows should be treated as implemented system behavior:
 10. rejected implementation approval loopback to proposal refinement,
 11. evidence-pack export for repo-backed runs,
 12. benchmark/sign-off evaluation and export,
-13. durable side-effect ledger, release settlement, and reconciliation.
+13. durable side-effect ledger, release settlement, and reconciliation,
+14. targeted retry authority, exact retry-stage settlement, and startup orphan retry repair.
 
 ## Current review posture
 

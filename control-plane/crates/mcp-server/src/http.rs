@@ -267,6 +267,12 @@ mod tests {
 
     async fn test_server() -> Arc<McpServer> {
         let pool = create_pool("sqlite::memory:").await.unwrap();
+        db::writer::register_shared_writer(
+            &pool,
+            Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .unwrap();
         let events = event_bus::new_bus(64);
         let work_queue = WorkQueue::new(pool.clone());
         let command_handler = Arc::new(CommandHandler::new(pool.clone(), events, work_queue));

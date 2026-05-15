@@ -709,9 +709,16 @@ mod tests {
     use domain::risk_lineage::{RiskAcceptanceLineage, RiskAcceptanceSource, RiskClassification};
 
     async fn setup_test_db() -> SqlitePool {
-        crate::pool::create_pool("sqlite::memory:")
+        let pool = crate::pool::create_pool("sqlite::memory:")
             .await
-            .expect("in-memory pool failed")
+            .expect("in-memory pool failed");
+        crate::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(crate::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
+        pool
     }
 
     fn make_gate(run_id: &str, status: ProposalGateStatus) -> ProposalGateResult {

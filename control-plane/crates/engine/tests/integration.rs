@@ -7,12 +7,13 @@ use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
-    code_writer_completion_receipts, ideas, projections, retry_operator_instructions, runs,
-    sessions, stages, work_items, workflow_conflicts,
+    code_writer_completion_receipts, ideas, projections, retry_operator_instructions,
+    retry_stage_execution_authorities, runs, sessions, side_effects, stages, work_items,
+    workflow_conflicts,
 };
 use domain::agent::{
     AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
-    AgentStatus,
+    AgentStatus, OperatorActionHint,
 };
 use domain::approval::{Approval, ApprovalDecision};
 use domain::artifact::{Artifact, ArtifactFormat};
@@ -26,6 +27,7 @@ use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::retry_instruction::RetryInstructionScopeKind;
 use domain::run::{Run, RunStatus};
+use domain::side_effect::{EffectKind, SideEffect, SideEffectId, SideEffectStatus};
 use domain::stage::{StageExecution, StageStatus};
 use domain::workflow_conflict::{
     candidate_transition_hash, CandidateTransitionEvaluation, CandidateTransitionResult,
@@ -38,6 +40,7 @@ use engine::event_bus;
 use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
+use sqlx::Row;
 
 static CODEX_CONFIG_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static META_ROOT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -66,9 +69,23 @@ impl Drop for EnvVarRestore {
 }
 
 async fn test_pool() -> sqlx::SqlitePool {
-    create_pool("sqlite::memory:")
+    let pool = create_pool("sqlite::memory:")
         .await
-        .expect("in-memory pool failed")
+        .expect("in-memory pool failed");
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .expect("test shared DbWriter registration failed");
+    pool
+}
+
+async fn file_backed_test_pool(db_path: &std::path::Path) -> sqlx::SqlitePool {
+    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
+        .await
+        .expect("file-backed pool failed");
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .expect("test shared DbWriter registration failed");
+    pool
 }
 
 fn make_idea(id: IdeaId) -> Idea {
@@ -1964,6 +1981,352 @@ async fn test_reject_manual_gate_can_transition_on_rejected_approval() {
 /// Retrying a stage must settle the old execution as Skipped and produce a new
 /// execution for the same stage_id with attempt_number incremented by 1.
 #[tokio::test]
+async fn p091_startup_orphan_repair_enforce_settles_retry_with_recovered_authority() {
+    let _mode = EnvVarRestore::set("CHAINWORKS_P091_STARTUP_ORPHAN_REPAIR_MODE", "enforce");
+    let _disable = EnvVarRestore::set("CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR", "0");
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("stage_test".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let orphan_id = StageExecutionId::new();
+    let sibling_id = StageExecutionId::new();
+    let mut orphan = make_stage(orphan_id, run_id, StageStatus::Pending);
+    orphan.attempt_number = 2;
+    orphan.started_at = Utc::now();
+    let mut sibling = make_stage(sibling_id, run_id, StageStatus::Completed);
+    sibling.attempt_number = 3;
+    sibling.started_at = orphan.started_at + chrono::Duration::seconds(1);
+    sibling.completed_at = Some(sibling.started_at);
+    sibling.settlement_kind = Some(domain::stage::StageSettlementKind::Completed);
+    stages::insert(&pool, &orphan).await.unwrap();
+    stages::insert(&pool, &sibling).await.unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(8),
+    );
+    recovery.run_startup_repair().await.unwrap();
+
+    let row = sqlx::query(
+        "SELECT status, settlement_kind, terminal_reason FROM stage_executions WHERE id = ?",
+    )
+    .bind(orphan_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("status"), "skipped");
+    assert_eq!(row.get::<String, _>("settlement_kind"), "skipped");
+    assert_eq!(
+        row.get::<String, _>("terminal_reason"),
+        "stale_retry_recovered"
+    );
+
+    let authority = retry_stage_execution_authorities::find_by_id(
+        &pool,
+        &format!("p091-recovered-orphan:{orphan_id}"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(authority.authority_state.to_string(), "recovered_orphan");
+    assert_eq!(
+        authority.terminal_reason.as_deref(),
+        Some("stale_retry_recovered")
+    );
+    let work = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert!(
+        work.iter()
+            .all(|item| item.kind != db::work_item::WorkItemKind::AdvanceRun),
+        "generic startup_catchup must not resurrect a run solely because of the pre-repair orphan"
+    );
+}
+
+async fn seed_p091_orphan_candidate(
+    pool: &sqlx::SqlitePool,
+    suffix: &str,
+) -> (RunId, StageExecutionId) {
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("stage_test".into());
+    runs::insert(pool, &run).await.unwrap();
+    let orphan_id = StageExecutionId::new();
+    let sibling_id = StageExecutionId::new();
+    let mut orphan = make_stage(orphan_id, run_id, StageStatus::Pending);
+    orphan.attempt_number = 2;
+    orphan.started_at = Utc::now();
+    orphan.label = format!("Orphan {suffix}");
+    let mut sibling = make_stage(sibling_id, run_id, StageStatus::Completed);
+    sibling.attempt_number = 3;
+    sibling.started_at = orphan.started_at + chrono::Duration::seconds(1);
+    sibling.completed_at = Some(sibling.started_at);
+    sibling.settlement_kind = Some(domain::stage::StageSettlementKind::Completed);
+    stages::insert(pool, &orphan).await.unwrap();
+    stages::insert(pool, &sibling).await.unwrap();
+    (run_id, orphan_id)
+}
+
+fn make_p091_side_effect(run_id: RunId, stage_execution_id: StageExecutionId) -> SideEffect {
+    let now = Utc::now();
+    SideEffect {
+        id: SideEffectId::new(),
+        run_id,
+        stage_execution_id,
+        agent_execution_id: None,
+        effect_kind: EffectKind::GitPush,
+        target_key: format!("refs/heads/p091-{stage_execution_id}"),
+        idempotency_key: format!("idem-p091-{stage_execution_id}"),
+        idempotency_key_version: 1,
+        request_fingerprint: format!("fp-p091-{stage_execution_id}"),
+        request_fingerprint_version: 1,
+        status: SideEffectStatus::Prepared,
+        owner_instance_id: None,
+        lease_acquired_at: None,
+        lease_renewed_at: None,
+        lease_expires_at: None,
+        deadline_at: Some(now + chrono::Duration::seconds(120)),
+        external_write_started_at: None,
+        external_write_attempted: false,
+        attempt_budget_remaining: 3,
+        expected_evidence_json: None,
+        observed_evidence_summary_json: None,
+        evidence_root: None,
+        last_error_kind: None,
+        last_error: None,
+        settlement_txn_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+async fn p091_latest_repair_sample_reasons(pool: &sqlx::SqlitePool) -> Vec<String> {
+    let rows = sqlx::query("SELECT bounded_samples_json FROM p091_orphan_repair_passes")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    rows.into_iter()
+        .flat_map(|row| {
+            let raw: Option<String> = row.get("bounded_samples_json");
+            raw.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                .and_then(|value| value.as_array().cloned())
+                .unwrap_or_default()
+        })
+        .filter_map(|sample| {
+            sample
+                .get("reason")
+                .and_then(|reason| reason.as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn p091_startup_orphan_repair_preserves_legitimate_waits() {
+    let _mode = EnvVarRestore::set("CHAINWORKS_P091_STARTUP_ORPHAN_REPAIR_MODE", "enforce");
+    let _disable = EnvVarRestore::set("CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR", "0");
+    let pool = test_pool().await;
+
+    let (approval_run, approval_stage) = seed_p091_orphan_candidate(&pool, "approval").await;
+    approvals::insert(
+        &pool,
+        &make_approval(approval_run, "stage_test", ApprovalDecision::Pending),
+    )
+    .await
+    .unwrap();
+
+    let (side_effect_run, side_effect_stage) =
+        seed_p091_orphan_candidate(&pool, "side-effect").await;
+    side_effects::insert(
+        &pool,
+        &make_p091_side_effect(side_effect_run, side_effect_stage),
+    )
+    .await
+    .unwrap();
+
+    let (cursor_run, cursor_stage) = seed_p091_orphan_candidate(&pool, "cursor").await;
+    workflow_conflicts::upsert_transition_cursor(
+        &pool,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: cursor_run.to_string(),
+            current_state_id: "stage_test".into(),
+            cursor_status: "awaiting_conflict_resolution".into(),
+            resume_policy: "await_conflict_resolution".into(),
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some("p091-cursor".into()),
+            conflict_fingerprint: Some("sha256:p091-cursor".into()),
+            candidate_transition_hash: Some("sha256:p091-candidates".into()),
+            terminal_failure_reason: None,
+            updated_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let (live_work_run, live_work_stage) = seed_p091_orphan_candidate(&pool, "live-work").await;
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "p091-live-invoke".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": live_work_run.to_string(),
+                "stage_id": "stage_test",
+                "stage_execution_id": live_work_stage.to_string()
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Pending,
+            run_id: Some(live_work_run),
+            stage_id: Some("stage_test".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (_retry_after_run, retry_after_stage) =
+        seed_p091_orphan_candidate(&pool, "retry-after").await;
+    let mut execution = make_agent_execution(retry_after_stage, AgentStatus::Failed);
+    execution.completed_at = Some(Utc::now());
+    let execution_id = execution.id;
+    agent_executions::insert(&pool, &execution).await.unwrap();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(execution_id, Utc::now());
+    facts.retry_after = Some(Utc::now() + chrono::Duration::minutes(5));
+    facts.operator_action_hint = Some(OperatorActionHint::WaitUntilRetryAfter);
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+
+    let (_snapshot_run, snapshot_stage) = seed_p091_orphan_candidate(&pool, "snapshot").await;
+    sqlx::query(
+        r#"UPDATE stage_executions
+           SET recovery_snapshot_json = ?1
+           WHERE id = ?2"#,
+    )
+    .bind(r#"{"recovery_action":"wait_until_retry_after"}"#)
+    .bind(snapshot_stage.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(8),
+    );
+    recovery.run_startup_repair().await.unwrap();
+
+    for stage_id in [
+        approval_stage,
+        side_effect_stage,
+        cursor_stage,
+        live_work_stage,
+        retry_after_stage,
+        snapshot_stage,
+    ] {
+        let stage = stages::find_by_id(&pool, stage_id).await.unwrap().unwrap();
+        assert_eq!(
+            stage.status,
+            StageStatus::Pending,
+            "legitimate wait {stage_id} must not be repaired as stale"
+        );
+    }
+
+    let reasons = p091_latest_repair_sample_reasons(&pool).await;
+    for expected in [
+        "pending_approval",
+        "unresolved_side_effect",
+        "transition_cursor_parked",
+        "live_work_item",
+        "retry_after_or_quota_wait",
+        "recovery_snapshot_wait",
+    ] {
+        assert!(
+            reasons.iter().any(|reason| reason == expected),
+            "missing P091 exclusion reason {expected}; got {reasons:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn p091_startup_recovery_requeues_abandoned_targeted_advance_by_authority() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let target_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("stage_test".into());
+    runs::insert(&pool, &run).await.unwrap();
+    let mut target = make_stage(target_id, run_id, StageStatus::Pending);
+    target.attempt_number = 2;
+    stages::insert(&pool, &target).await.unwrap();
+    insert_p091_authority_row(
+        &pool,
+        "auth-requeue-targeted",
+        run_id,
+        "stage_test",
+        target_id,
+        "full_stage_retry",
+        "active",
+        None,
+    )
+    .await;
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "advance-targeted-running".into(),
+            kind: db::work_item::WorkItemKind::AdvanceRun,
+            payload_json: serde_json::json!({
+                "schema_version": "advance_run_payload.v1",
+                "run_id": run_id.to_string(),
+                "stage_id": "stage_test",
+                "target_stage_execution_id": target_id.to_string(),
+                "retry_authority_id": "auth-requeue-targeted",
+                "enqueue_reason": "abandoned_advance_requeue"
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("stage_test".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(8),
+    );
+    recovery.run_startup_repair().await.unwrap();
+
+    let item = work_items::find_by_id(&pool, "advance-targeted-running")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.status, db::work_item::WorkItemStatus::Pending);
+    assert_eq!(
+        item.last_error.as_deref(),
+        Some("startup_repair_abandoned_targeted_advance_run")
+    );
+}
+
+#[tokio::test]
 async fn test_retry_stage_creates_new_attempt_and_skips_old() {
     let pool = test_pool().await;
 
@@ -2038,6 +2401,506 @@ async fn test_retry_stage_creates_new_attempt_and_skips_old() {
         Some("flaky_stage"),
         "stage retry must make the requested stage the active workflow state"
     );
+}
+
+#[tokio::test]
+async fn p091_targeted_advance_uses_explicit_stage_execution_under_sibling_pressure() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let target_id = StageExecutionId::new();
+    let sibling_id = StageExecutionId::new();
+    let now = Utc::now();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("state_6_implementation_approval".into());
+    run.workflow_yaml_path = Some(test_workflow_yaml_path());
+    run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut target = make_stage(target_id, run_id, StageStatus::Pending);
+    target.stage_id = "state_6_implementation_approval".into();
+    target.stage_type = Some("manual_gate".into());
+    target.started_at = now;
+    target.attempt_number = 2;
+    stages::insert(&pool, &target).await.unwrap();
+
+    let mut sibling = make_stage(sibling_id, run_id, StageStatus::Pending);
+    sibling.stage_id = "state_6_implementation_approval".into();
+    sibling.stage_type = Some("manual_gate".into());
+    sibling.started_at = now + chrono::Duration::seconds(1);
+    sibling.attempt_number = 3;
+    stages::insert(&pool, &sibling).await.unwrap();
+
+    retry_stage_execution_authorities::create_active(
+        &pool,
+        &domain::retry_authority::RetryStageExecutionAuthority {
+            id: "p091-target-authority".to_string(),
+            run_id,
+            stage_id: "state_6_implementation_approval".to_string(),
+            target_stage_execution_id: target_id,
+            entry_kind: domain::retry_authority::RetryAuthorityEntryKind::FullStageRetry,
+            source_command_journal_id: None,
+            source_retry_work_item_id: Some("advance-target".to_string()),
+            source_invoke_work_item_id: None,
+            source_agent_execution_id: None,
+            authority_state: domain::retry_authority::RetryAuthorityState::Active,
+            created_at: now,
+            updated_at: now,
+            terminal_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let payload = domain::retry_authority::AdvanceRunPayloadV1::parse_value(&serde_json::json!({
+        "schema_version": "advance_run_payload.v1",
+        "run_id": run_id.to_string(),
+        "stage_id": "state_6_implementation_approval",
+        "target_stage_execution_id": target_id.to_string(),
+        "retry_authority_id": "p091-target-authority",
+        "enqueue_reason": "retry_stage",
+        "reason": "operator_full_stage_retry"
+    }))
+    .unwrap();
+    let orchestrator = Orchestrator::new(
+        pool.clone(),
+        event_bus::new_bus(64),
+        WorkQueue::new(pool.clone()),
+    );
+    orchestrator
+        .advance_run_from_payload(&payload)
+        .await
+        .unwrap();
+
+    let target_after = stages::find_by_id(&pool, target_id).await.unwrap().unwrap();
+    let sibling_after = stages::find_by_id(&pool, sibling_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(target_after.status, StageStatus::WaitingApproval);
+    assert_eq!(sibling_after.status, StageStatus::Pending);
+}
+
+async fn seed_p091_runtime_target_case(
+    pool: &sqlx::SqlitePool,
+    run_id: RunId,
+    idea_id: IdeaId,
+    target_id: StageExecutionId,
+    stage_id: &str,
+    status: StageStatus,
+) {
+    ideas::insert(pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some(stage_id.to_string());
+    run.workflow_yaml_path = Some(test_workflow_yaml_path());
+    run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    runs::insert(pool, &run).await.unwrap();
+    let mut target = make_stage(target_id, run_id, status);
+    target.stage_id = stage_id.to_string();
+    stages::insert(pool, &target).await.unwrap();
+}
+
+async fn insert_p091_authority_row(
+    pool: &sqlx::SqlitePool,
+    authority_id: &str,
+    run_id: RunId,
+    stage_id: &str,
+    target_stage_execution_id: StageExecutionId,
+    entry_kind: &str,
+    authority_state: &str,
+    source_invoke_work_item_id: Option<&str>,
+) {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"INSERT INTO retry_stage_execution_authorities
+           (id, run_id, stage_id, target_stage_execution_id, entry_kind,
+            source_invoke_work_item_id, authority_state, created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+    )
+    .bind(authority_id)
+    .bind(run_id.to_string())
+    .bind(stage_id)
+    .bind(target_stage_execution_id.to_string())
+    .bind(entry_kind)
+    .bind(source_invoke_work_item_id)
+    .bind(authority_state)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn p091_advance_payload(
+    run_id: RunId,
+    stage_id: &str,
+    target_stage_execution_id: StageExecutionId,
+    retry_authority_id: &str,
+) -> domain::retry_authority::AdvanceRunPayloadV1 {
+    domain::retry_authority::AdvanceRunPayloadV1::parse_value(&serde_json::json!({
+        "schema_version": "advance_run_payload.v1",
+        "run_id": run_id.to_string(),
+        "stage_id": stage_id,
+        "target_stage_execution_id": target_stage_execution_id.to_string(),
+        "retry_authority_id": retry_authority_id,
+        "enqueue_reason": "retry_stage",
+        "reason": "operator_full_stage_retry"
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn p091_runtime_advance_matrix_returns_typed_target_authority_outcomes() {
+    let pool = test_pool().await;
+    let orchestrator = Orchestrator::new(
+        pool.clone(),
+        event_bus::new_bus(64),
+        WorkQueue::new(pool.clone()),
+    );
+
+    let missing_run = RunId::new();
+    let missing_target = StageExecutionId::new();
+    let error = orchestrator
+        .advance_run_from_payload(&p091_advance_payload(
+            missing_run,
+            "implement",
+            missing_target,
+            "missing-authority",
+        ))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("advance_run_target_missing"));
+
+    let payload_run = RunId::new();
+    let payload_idea = IdeaId::new();
+    let other_run = RunId::new();
+    let other_idea = IdeaId::new();
+    let wrong_run_target = StageExecutionId::new();
+    seed_p091_runtime_target_case(
+        &pool,
+        payload_run,
+        payload_idea,
+        StageExecutionId::new(),
+        "implement",
+        StageStatus::Pending,
+    )
+    .await;
+    seed_p091_runtime_target_case(
+        &pool,
+        other_run,
+        other_idea,
+        wrong_run_target,
+        "implement",
+        StageStatus::Pending,
+    )
+    .await;
+    let error = orchestrator
+        .advance_run_from_payload(&p091_advance_payload(
+            payload_run,
+            "implement",
+            wrong_run_target,
+            "missing-authority",
+        ))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("advance_run_target_wrong_run"));
+
+    let wrong_stage_run = RunId::new();
+    let wrong_stage_target = StageExecutionId::new();
+    seed_p091_runtime_target_case(
+        &pool,
+        wrong_stage_run,
+        IdeaId::new(),
+        wrong_stage_target,
+        "other_stage",
+        StageStatus::Pending,
+    )
+    .await;
+    let error = orchestrator
+        .advance_run_from_payload(&p091_advance_payload(
+            wrong_stage_run,
+            "implement",
+            wrong_stage_target,
+            "missing-authority",
+        ))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("advance_run_target_wrong_stage"));
+
+    let terminal_run = RunId::new();
+    let terminal_target = StageExecutionId::new();
+    seed_p091_runtime_target_case(
+        &pool,
+        terminal_run,
+        IdeaId::new(),
+        terminal_target,
+        "implement",
+        StageStatus::Completed,
+    )
+    .await;
+    insert_p091_authority_row(
+        &pool,
+        "auth-terminal-active",
+        terminal_run,
+        "implement",
+        terminal_target,
+        "full_stage_retry",
+        "active",
+        None,
+    )
+    .await;
+    let error = orchestrator
+        .advance_run_from_payload(&p091_advance_payload(
+            terminal_run,
+            "implement",
+            terminal_target,
+            "auth-terminal-active",
+        ))
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("advance_run_target_unexpected_terminal"));
+
+    let superseded_run = RunId::new();
+    let superseded_target = StageExecutionId::new();
+    seed_p091_runtime_target_case(
+        &pool,
+        superseded_run,
+        IdeaId::new(),
+        superseded_target,
+        "implement",
+        StageStatus::Pending,
+    )
+    .await;
+    insert_p091_authority_row(
+        &pool,
+        "auth-superseded",
+        superseded_run,
+        "implement",
+        superseded_target,
+        "full_stage_retry",
+        "superseded",
+        None,
+    )
+    .await;
+    orchestrator
+        .advance_run_from_payload(&p091_advance_payload(
+            superseded_run,
+            "implement",
+            superseded_target,
+            "auth-superseded",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        stages::find_by_id(&pool, superseded_target)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        StageStatus::Pending
+    );
+
+    let mismatch_run = RunId::new();
+    let mismatch_target = StageExecutionId::new();
+    let authority_target = StageExecutionId::new();
+    seed_p091_runtime_target_case(
+        &pool,
+        mismatch_run,
+        IdeaId::new(),
+        mismatch_target,
+        "implement",
+        StageStatus::Pending,
+    )
+    .await;
+    let mut other_target = make_stage(authority_target, mismatch_run, StageStatus::Pending);
+    other_target.stage_id = "implement".into();
+    stages::insert(&pool, &other_target).await.unwrap();
+    insert_p091_authority_row(
+        &pool,
+        "auth-target-mismatch",
+        mismatch_run,
+        "implement",
+        authority_target,
+        "full_stage_retry",
+        "active",
+        None,
+    )
+    .await;
+    let error = orchestrator
+        .advance_run_from_payload(&p091_advance_payload(
+            mismatch_run,
+            "implement",
+            mismatch_target,
+            "auth-target-mismatch",
+        ))
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("advance_run_authority_target_mismatch"));
+}
+
+async fn seed_p091_post_invoke_settlement_case(
+    pool: &sqlx::SqlitePool,
+    entry_kind: &str,
+    should_fail: bool,
+) -> (RunId, StageExecutionId, StageExecutionId, String) {
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let target_id = StageExecutionId::new();
+    let sibling_id = StageExecutionId::new();
+    let agent_execution_id = AgentExecutionId::new();
+    let invoke_id = format!("invoke-{entry_kind}-{should_fail}-{target_id}");
+    ideas::insert(pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("state_8_implementation_continued".into());
+    run.workflow_yaml_path = Some(test_workflow_yaml_path());
+    run.agent_catalog_yaml_path = Some(test_agent_catalog_yaml_path());
+    runs::insert(pool, &run).await.unwrap();
+
+    let now = Utc::now();
+    let mut target = make_stage(target_id, run_id, StageStatus::Running);
+    target.stage_id = "state_8_implementation_continued".into();
+    target.started_at = now;
+    target.attempt_number = 2;
+    stages::insert(pool, &target).await.unwrap();
+    let mut sibling = make_stage(sibling_id, run_id, StageStatus::Pending);
+    sibling.stage_id = "state_8_implementation_continued".into();
+    sibling.started_at = now + chrono::Duration::seconds(1);
+    sibling.attempt_number = 3;
+    stages::insert(pool, &sibling).await.unwrap();
+
+    insert_p091_authority_row(
+        pool,
+        "auth-post-invoke-e2e",
+        run_id,
+        "state_8_implementation_continued",
+        target_id,
+        entry_kind,
+        "active",
+        Some(&invoke_id),
+    )
+    .await;
+
+    let mut execution = make_agent_execution(
+        target_id,
+        if should_fail {
+            AgentStatus::Failed
+        } else {
+            AgentStatus::Completed
+        },
+    );
+    execution.id = agent_execution_id;
+    execution.agent_id = "code_writer".into();
+    execution.provider = "junie".into();
+    execution.completed_at = Some(now);
+    agent_executions::insert(pool, &execution).await.unwrap();
+
+    work_items::enqueue(
+        pool,
+        &db::work_item::WorkItem {
+            id: invoke_id.clone(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "state_8_implementation_continued",
+                "stage_execution_id": target_id.to_string(),
+                "task_name": "continue_implementation",
+                "agent_id": "code_writer",
+                "provider": "junie",
+                "task_index": 0,
+                "total_tasks": 1,
+                "target_stage_execution_id": target_id.to_string(),
+                "retry_authority_id": "auth-post-invoke-e2e",
+                "targeted_retry": {
+                    "retry_authority_id": "auth-post-invoke-e2e",
+                    "source_agent_execution_id": agent_execution_id.to_string()
+                },
+                "p058_claimed": {
+                    "agent_execution_id": agent_execution_id.to_string()
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("state_8_implementation_continued".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    (run_id, target_id, sibling_id, invoke_id)
+}
+
+#[tokio::test]
+async fn p091_post_invoke_completion_failure_settle_exact_retry_target_end_to_end() {
+    for (entry_kind, should_fail, expected_status) in [
+        ("full_stage_retry", false, StageStatus::Completed),
+        ("full_stage_retry", true, StageStatus::Failed),
+        ("targeted_agent_retry", false, StageStatus::Completed),
+        ("targeted_agent_retry", true, StageStatus::Failed),
+    ] {
+        let pool = test_pool().await;
+        let (run_id, target_id, sibling_id, invoke_id) =
+            seed_p091_post_invoke_settlement_case(&pool, entry_kind, should_fail).await;
+        let queue = WorkQueue::new(pool.clone());
+        if should_fail {
+            queue.fail(&invoke_id, "provider failed").await.unwrap();
+        } else {
+            queue.complete(&invoke_id).await.unwrap();
+        }
+
+        let advance = work_items::list_by_run(&pool, run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| {
+                item.kind == db::work_item::WorkItemKind::AdvanceRun
+                    && item.status == db::work_item::WorkItemStatus::Pending
+            })
+            .expect("post-invoke AdvanceRun should be enqueued");
+        let payload =
+            domain::retry_authority::AdvanceRunPayloadV1::parse_json(&advance.payload_json)
+                .unwrap();
+        assert_eq!(
+            payload.target_stage_execution_id,
+            Some(target_id),
+            "{entry_kind}/{should_fail} must preserve target"
+        );
+
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            event_bus::new_bus(64),
+            WorkQueue::new(pool.clone()),
+        );
+        orchestrator
+            .advance_run_from_payload(&payload)
+            .await
+            .unwrap();
+
+        let target = stages::find_by_id(&pool, target_id).await.unwrap().unwrap();
+        let sibling = stages::find_by_id(&pool, sibling_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            target.status, expected_status,
+            "{entry_kind}/{should_fail} must settle intended target"
+        );
+        assert_eq!(
+            sibling.status,
+            StageStatus::Pending,
+            "{entry_kind}/{should_fail} must not settle sibling retry execution"
+        );
+    }
 }
 
 #[tokio::test]
@@ -4153,6 +5016,7 @@ states:
         &catalog_path,
         r#"
 artifacts:
+  approved_proposal: ${CHAINWORKS_META_ROOT:-.chainworks}/proposals/approved/proposal.md
   implementation_self_assessment: ${CHAINWORKS_META_ROOT:-.chainworks}/self-assessment.json
 backend_profiles:
   worker_profile:
@@ -4541,13 +5405,10 @@ agents:
 async fn test_code_writer_prompt_scopes_seemingly_complete_to_code_owned_work() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("prompt-scope.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
 
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
 
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
@@ -4571,9 +5432,9 @@ states:
             - implementation_self_assessment
     transitions:
       - to: reviewed
-        when: implementation_self_assessment.seemingly_complete == true
+        when: implementation_self_assessment.implementation_complete == true
       - to: implementation
-        when: implementation_self_assessment.seemingly_complete == false
+        when: implementation_self_assessment.implementation_complete == false
   reviewed:
     label: Reviewed
     type: end
@@ -4589,19 +5450,38 @@ artifacts:
 backend_profiles:
   code_writer_profile:
     provider: codex
+  lead_profile:
+    provider: claude
+permission_profiles:
+  ORCH: {}
 contracts:
-  implementation_self_assessment_v1:
+  implementation_self_assessment_v2:
     format: json
     required_fields:
-      - seemingly_complete
-      - remaining_tasks
+      - status
+      - implementation_complete
+      - verification_green
+      - remaining_code_tasks
+      - handoff_tasks
       - known_risks
       - tests_run
       - docs_impacted
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
 agents:
+  - id: lead
+    system_role: lead
+    backend_profile: lead_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
   - id: code_writer
     backend_profile: code_writer_profile
-    output_contract: implementation_self_assessment_v1
+    output_contract: implementation_self_assessment_v2
 "#,
     )
     .unwrap();
@@ -4616,15 +5496,86 @@ agents:
             .to_string_lossy()
             .into_owned(),
     );
-    run.worktree_root = Some(temp.path().join("worktree").to_string_lossy().into_owned());
+    let worktree_root = temp.path().join("worktree");
+    std::fs::create_dir_all(&worktree_root).unwrap();
+    run.worktree_root = Some(worktree_root.to_string_lossy().into_owned());
     run.workflow_yaml_path = Some(workflow_path.to_string_lossy().into_owned());
     run.agent_catalog_yaml_path = Some(catalog_path.to_string_lossy().into_owned());
     runs::insert(&pool, &run).await.unwrap();
 
-    let mut pending_stage = make_stage(stage_execution_id, run_id, StageStatus::Pending);
-    pending_stage.stage_id = "implementation".into();
-    pending_stage.label = "Implementation".into();
-    stages::insert(&pool, &pending_stage).await.unwrap();
+    let approved_path = temp
+        .path()
+        .join(".chainworks/proposals/approved/proposal.md");
+    std::fs::create_dir_all(approved_path.parent().unwrap()).unwrap();
+    let readback = temp
+        .path()
+        .join("docs/evidence/rollout-contract/operator-readback/prompt-scope.fixture.json");
+    let negative = temp
+        .path()
+        .join("docs/evidence/rollout-contract/negative/prompt-scope-unsafe-path.json");
+    std::fs::create_dir_all(readback.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(negative.parent().unwrap()).unwrap();
+    std::fs::write(&readback, br#"{"schema_version":"operator_readback_v1"}"#).unwrap();
+    std::fs::write(&negative, br#"{"schema_version":"rollout_contract_v1"}"#).unwrap();
+    std::fs::write(
+        &approved_path,
+        serde_json::json!({
+            "schema_version": "proposal_document_v1",
+            "proposal_id": "prompt-scope",
+            "proposal_revision_id": "prompt-scope-r1",
+            "rollout_contract_v1": {
+                "schema_version": "rollout_contract_v1",
+                "applicability": "not_applicable",
+                "not_applicable_justification": "Prompt-scope fixture does not exercise rollout.",
+                "gate_aliases": ["prompt-scope"],
+                "commands": {"allowlist": ["./scripts/test-gate.sh proposal-017"]},
+                "migrations": {"not_applicable": true, "justification": "Prompt fixture."},
+                "metrics": {
+                    "adoption_metric": "prompt_scope_fixture",
+                    "operational_metrics": ["prompt_scope_fixture_total"]
+                },
+                "readback_lanes": ["run_report"],
+                "readback_fields": ["rollout_contract_status"],
+                "readback_fixture": "docs/evidence/rollout-contract/operator-readback/prompt-scope.fixture.json",
+                "operator_report_fields": ["rollout_contract_status"],
+                "hold_conditions": [],
+                "rollback_disposition": {
+                    "mode": "feature_flag_disable_or_enforcement_mode_permissive",
+                    "data_loss_risk": "none"
+                },
+                "decision_vocabulary": ["pass", "fail", "waived", "not_applicable", "timeout"],
+                "negative_fixtures": {
+                    "unsafe_path_and_command": "docs/evidence/rollout-contract/negative/prompt-scope-unsafe-path.json"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    artifacts::insert(
+        &pool,
+        &Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "implementation".into(),
+            agent_id: "engine".into(),
+            name: "approved_proposal".into(),
+            contract_id: "approved_proposal".into(),
+            format: ArtifactFormat::Markdown,
+            file_path: ".chainworks/proposals/approved/proposal.md".into(),
+            checksum_sha256: None,
+            size_bytes: None,
+            provider: "engine".into(),
+            model: None,
+            created_at: Utc::now(),
+            is_pinned: true,
+            report_kind: None,
+            report_version: None,
+            agent_execution_id: None,
+        },
+    )
+    .await
+    .unwrap();
 
     let events = event_bus::new_bus(64);
     let work_queue = WorkQueue::new(pool.clone());
@@ -4644,7 +5595,7 @@ agents:
         .expect("InvokeAgent payload must include prompt");
 
     assert!(
-        prompt.contains("Set `seemingly_complete` based only on remaining code-writer-owned source or test work."),
+        prompt.contains("do not use legacy self-assessment field names"),
         "code_writer prompt must prevent non-code/manual/release evidence blockers from forcing implementation self-loops"
     );
     assert!(
@@ -4661,9 +5612,7 @@ agents:
 async fn test_proposal_017_code_writer_start_missing_handoff_blocks_before_invoke() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("missing-handoff.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
 
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
@@ -4814,9 +5763,7 @@ agents:
 async fn test_proposal_017_invalid_proposal_current_surfaces_fail_and_blocked_projection() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("invalid-proposal-current.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
         .await
         .unwrap();
@@ -4980,9 +5927,7 @@ agents:
 async fn test_proposal_017_code_writer_start_snapshots_proposal_current_before_invoke() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("snapshot-handoff.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
         .await
         .unwrap();
@@ -6095,9 +7040,22 @@ states:
 backend_profiles:
   lead_profile:
     provider: claude
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
 agents:
   - id: lead
+    system_role: lead
     backend_profile: lead_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
 "#,
     )
     .unwrap();
@@ -6171,9 +7129,22 @@ states:
 backend_profiles:
   lead_profile:
     provider: claude
+permission_profiles:
+  ORCH: {}
+contracts:
+  LeadResolutionContract:
+    format: json
+    required_fields:
+      - resolution_mode
+      - requires_operator_confirmation
+      - recommended_action
+      - rationale_summary
 agents:
   - id: lead
+    system_role: lead
     backend_profile: lead_profile
+    permission_profile: ORCH
+    lead_resolution_contract: LeadResolutionContract
 "#,
     )
     .unwrap();
@@ -6373,7 +7344,15 @@ async fn mcp_resolution_persistence_tests() {
     let pool = test_pool().await;
     let tmp = tempfile::tempdir().unwrap();
     let registry_path = tmp.path().join("mcp-config.yaml");
-    std::fs::write(&registry_path, "mcp: {}\n").unwrap();
+    std::fs::write(
+        &registry_path,
+        r#"
+mcp:
+  xcode:
+    type: xcode_broker
+"#,
+    )
+    .unwrap();
     let _env_guard = CODEX_CONFIG_ENV_LOCK.lock().await;
     let previous_registry = std::env::var("CHAINWORKS_CODEX_CONFIG_PATH").ok();
     std::env::set_var("CHAINWORKS_CODEX_CONFIG_PATH", &registry_path);
@@ -6424,6 +7403,7 @@ async fn mcp_resolution_persistence_tests() {
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "mcp-agent",
                 "provider": "claude",
+                "session_reuse_scope": serde_json::Value::Null,
                 "backend_profile_id": "codex_with_missing_mcp",
                 "requested_mcp_server_ids": ["missing-extension"]
             }),
@@ -6913,6 +7893,7 @@ sys.exit(0)
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "fixture-agent",
                 "provider": "claude",
+                "session_reuse_scope": serde_json::Value::Null,
                 "legacy_broad_discovery_policy": "workflow_opt_in",
             }),
         )
@@ -7032,6 +8013,7 @@ async fn test_invoke_agent_startup_error_marks_agent_execution_failed() {
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "startup-agent",
                 "provider": "missing-provider",
+                "session_reuse_scope": serde_json::Value::Null,
             }),
         )
         .await
@@ -7207,6 +8189,7 @@ sys.exit(0)
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "fixture-agent",
                 "provider": "claude",
+                "session_reuse_scope": serde_json::Value::Null,
             }),
         )
         .await
@@ -7362,6 +8345,7 @@ sys.exit(0)
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "fixture-agent",
                 "provider": "claude",
+                "session_reuse_scope": serde_json::Value::Null,
                 "declared_outputs": [{
                     "output_name": "review_alias",
                     "target_path": target_path.to_string_lossy(),
@@ -7414,38 +8398,39 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
         async fn open_session(
             &self,
             _req: &ExecutionRequest,
-        ) -> anyhow::Result<acp::AcpSessionHandle> {
+        ) -> anyhow::Result<acp::adapters::OpenedAcpAdapterSession> {
             anyhow::bail!("P057 fixture adapter does not provide reusable sessions")
         }
 
-        async fn execute(&self, _req: ExecutionRequest) -> anyhow::Result<ExecutionResult> {
+        async fn execute(&self, req: ExecutionRequest) -> anyhow::Result<ExecutionResult> {
             Ok(ExecutionResult {
                 agent_execution_id: AgentExecutionId::new(),
                 status: AgentStatus::Completed,
                 artifact_paths: Vec::new(),
                 discovered_artifacts: vec![acp::DiscoveredArtifact {
                     name: "prepush_review_report".into(),
-                    content: br#"{"status":"PASS_WITH_NOTES"}"#.to_vec(),
+                    content: br#"{"status":"pass"}"#.to_vec(),
                     source_path: None,
                 source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
                 }],
                 pre_prompt_expected_outputs: Vec::new(),
                 completion_text_capture: Default::default(),
                 transcript_text: Some(
-                    r#"<<<CHAINWORKS_OUTPUT:prepush_review_report>>>{"status":"PASS_WITH_NOTES"}<<<END_CHAINWORKS_OUTPUT>>>"#
+                    r#"<<<CHAINWORKS_OUTPUT:prepush_review_report>>>{"status":"pass"}<<<END_CHAINWORKS_OUTPUT>>>"#
                         .into(),
                 ),
                 cost_cents: None,
                 usage: None,
                 provider_session_id: Some("p057-fixture-session".into()),
                 reused_existing_session: false,
-                session_generation_id: None,
+                session_generation_id: req.session_generation_id,
                 mcp_observation: None,
                 actual_mcp_extensions: Vec::new(),
                 actual_mcp_runtime_ids: Vec::new(),
                 mcp_session_startup_latency_ms: None,
                 xcode_shim_warning_events: Vec::new(),
                 close_diagnostic: None,
+                provider_session_store_capture: None,
                 acp_pre_initialize_local_latency_ms: None,
                 acp_initialize_latency_ms: None,
                 acp_session_new_latency_ms: None,
@@ -7455,6 +8440,7 @@ async fn proposal_057_invoke_agent_imports_declared_contract_output_into_active_
                 acp_pre_prompt_metadata_digest_bytes: 0,
                 legacy_broad_discovery_snapshot: None,
                 runtime_receipt: None,
+                runtime_tool_path_preflight_json: None,
             })
         }
     }
@@ -7618,18 +8604,18 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
         async fn open_session(
             &self,
             _req: &ExecutionRequest,
-        ) -> anyhow::Result<acp::AcpSessionHandle> {
+        ) -> anyhow::Result<acp::adapters::OpenedAcpAdapterSession> {
             anyhow::bail!("P057 failed fixture adapter does not provide reusable sessions")
         }
 
-        async fn execute(&self, _req: ExecutionRequest) -> anyhow::Result<ExecutionResult> {
+        async fn execute(&self, req: ExecutionRequest) -> anyhow::Result<ExecutionResult> {
             Ok(ExecutionResult {
                 agent_execution_id: AgentExecutionId::new(),
                 status: AgentStatus::Failed,
                 artifact_paths: Vec::new(),
                 discovered_artifacts: vec![acp::DiscoveredArtifact {
                     name: "prepush_review_report".into(),
-                    content: br#"{"status":"PASS_WITH_NOTES"}"#.to_vec(),
+                    content: br#"{"status":"pass"}"#.to_vec(),
                     source_path: None,
                     source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
                 }],
@@ -7642,13 +8628,14 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                 usage: None,
                 provider_session_id: Some("p057-failed-fixture-session".into()),
                 reused_existing_session: false,
-                session_generation_id: None,
+                session_generation_id: req.session_generation_id,
                 mcp_observation: None,
                 actual_mcp_extensions: Vec::new(),
                 actual_mcp_runtime_ids: Vec::new(),
                 mcp_session_startup_latency_ms: None,
                 xcode_shim_warning_events: Vec::new(),
                 close_diagnostic: None,
+                provider_session_store_capture: None,
                 acp_pre_initialize_local_latency_ms: None,
                 acp_initialize_latency_ms: None,
                 acp_session_new_latency_ms: None,
@@ -7658,6 +8645,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                 acp_pre_prompt_metadata_digest_bytes: 0,
                 legacy_broad_discovery_snapshot: None,
                 runtime_receipt: None,
+                runtime_tool_path_preflight_json: None,
             })
         }
     }
@@ -7749,6 +8737,7 @@ async fn proposal_057_failed_provider_result_settles_valid_outputs_by_degraded_p
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "fixture-agent",
                 "provider": "failed_fixture",
+                "session_reuse_scope": serde_json::Value::Null,
                 "stage_degraded_output_policy": {
                     "mode": "allow_valid_contract_outputs",
                     "contracts": ["prepush_review_v1"],
@@ -8310,9 +9299,7 @@ async fn test_invoke_agent_reuses_live_session_generation_end_to_end() {
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("reuse.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_reuse_fixture.py");
@@ -8551,9 +9538,7 @@ async fn invoke_agent_repairs_missing_required_output_in_same_live_session() {
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("contract-repair.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let workspace_root = tmp.path().to_string_lossy().into_owned();
     let output_path = tmp
         .path()
@@ -8741,9 +9726,7 @@ async fn test_invoke_agent_persists_budget_snapshot_and_next_policy_uses_it() {
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("budget.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_budget_fixture.py");
@@ -8999,9 +9982,7 @@ async fn test_invoke_agent_persists_runtime_cost_and_next_policy_invalidates_on_
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("budget-cost.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_budget_cost_fixture.py");
@@ -9929,9 +10910,7 @@ async fn test_invoke_agent_missing_live_handle_falls_back_to_fresh_generation() 
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("missing-live-handle.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     let workspace_root = tmp.path().to_string_lossy().into_owned();
 
     let script = tmp.path().join("acp_missing_live_handle_fixture.py");
@@ -10172,6 +11151,21 @@ struct ActivePromptCloseOnceAdapter {
     attempts: AtomicUsize,
 }
 
+struct JuniePostPreflightCapacityAdapter;
+
+#[async_trait::async_trait]
+impl acp::adapters::AcpAdapter for JuniePostPreflightCapacityAdapter {
+    fn provider_name(&self) -> &str {
+        "junie"
+    }
+
+    async fn execute(&self, _req: acp::ExecutionRequest) -> anyhow::Result<acp::ExecutionResult> {
+        anyhow::bail!(
+            "p090_junie_provider_capacity_exhausted_after_preflight: provider cap reached before launch"
+        )
+    }
+}
+
 #[async_trait::async_trait]
 impl acp::adapters::AcpAdapter for ActivePromptCloseOnceAdapter {
     fn provider_name(&self) -> &str {
@@ -10204,6 +11198,7 @@ impl acp::adapters::AcpAdapter for ActivePromptCloseOnceAdapter {
             mcp_session_startup_latency_ms: None,
             xcode_shim_warning_events: Vec::new(),
             close_diagnostic: None,
+            provider_session_store_capture: None,
             acp_pre_initialize_local_latency_ms: None,
             acp_initialize_latency_ms: None,
             acp_session_new_latency_ms: None,
@@ -10213,6 +11208,7 @@ impl acp::adapters::AcpAdapter for ActivePromptCloseOnceAdapter {
             acp_pre_prompt_metadata_digest_bytes: 0,
             legacy_broad_discovery_snapshot: None,
             runtime_receipt: None,
+            runtime_tool_path_preflight_json: None,
         })
     }
 }
@@ -10291,6 +11287,95 @@ impl acp::adapters::AcpAdapter for P088StaleImplementationActiveAdapter {
         )
         .into())
     }
+}
+
+#[tokio::test]
+async fn test_junie_post_preflight_capacity_requeues_without_failing_stage() {
+    use acp::AcpRuntimeManager;
+    use engine::executor::BackgroundExecutor;
+
+    let pool = test_pool().await;
+    let workspace_root = tempfile::tempdir().unwrap();
+    let workspace_root = workspace_root.path().display().to_string();
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    let now = Utc::now();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root.clone();
+    run.artifact_root = workspace_root.clone();
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.stage_id = "implementation_refined".into();
+    stage.started_at = now;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![Arc::new(
+        JuniePostPreflightCapacityAdapter,
+    )]));
+    let executor =
+        BackgroundExecutor::new(pool.clone(), work_queue.clone(), orchestrator, acp, events);
+
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::InvokeAgent,
+            Some(run_id),
+            Some("implementation_refined".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "implementation_refined",
+                "stage_execution_id": stage_exec_id.to_string(),
+                "agent_id": "code_writer",
+                "provider": "junie",
+                "prompt": "continue implementation",
+                "legacy_broad_discovery_policy": "workflow_opt_in",
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "code_writer",
+                "declared_outputs": [],
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(executor.process_next_item().await.unwrap());
+
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let invoke = items
+        .iter()
+        .find(|item| item.kind == db::work_item::WorkItemKind::InvokeAgent)
+        .expect("InvokeAgent work item should remain available for retry");
+    assert_eq!(invoke.status, db::work_item::WorkItemStatus::Pending);
+    assert!(
+        !items
+            .iter()
+            .any(|item| item.id.starts_with("advance-after-invoke:")),
+        "capacity backpressure must not enqueue post-failure AdvanceRun"
+    );
+
+    let payload: serde_json::Value = serde_json::from_str(&invoke.payload_json).unwrap();
+    assert!(payload.get("p058_claimed").is_none());
+    assert_eq!(
+        payload
+            .pointer("/acp_provider_capacity_recovery/reason")
+            .and_then(|value| value.as_str()),
+        Some("junie_provider_capacity_after_preflight")
+    );
+
+    let executions = agent_executions::find_by_stage(&pool, stage_exec_id)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].status, AgentStatus::Failed);
 }
 
 #[tokio::test]
@@ -10402,9 +11487,7 @@ async fn proposal_088_code_writer_stale_implementation_active_enters_receipt_pat
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("p088-stale-implementation-active.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
         .await
         .expect("test shared DbWriter registration failed");
@@ -10563,9 +11646,7 @@ async fn proposal_088_startup_repair_recovers_receipt_artifact_without_db_row() 
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("p088-startup-recovery.sqlite");
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
+    let pool = file_backed_test_pool(&db_path).await;
     db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
         .await
         .expect("test shared DbWriter registration failed");
@@ -10608,6 +11689,19 @@ async fn proposal_088_startup_repair_recovers_receipt_artifact_without_db_row() 
         preexisting_dirty_path_count: 0,
         completion_status: "missing_required_outputs".into(),
         failure_class: None,
+        provider_runtime_family: Some("codex_acp".into()),
+        completion_boundary_subtype: Some("none".into()),
+        final_payload_status: Some("missing".into()),
+        progress_before_handoff: Some("none".into()),
+        runtime_preflight_phase: Some("ready".into()),
+        runtime_tool_path_preflight_json: None,
+        final_completion_payload_capture_json: None,
+        engine_failure_envelope_json: None,
+        repair_failure_envelope_json: None,
+        repair_materialization_summary_json: None,
+        repair_materialization_mode: Some("legacy_all_or_nothing".into()),
+        strict_final_payload_enabled: false,
+        staged_repair_settlement_enabled: false,
         terminal_response_status: Some("completed".into()),
         completion_turn_attempted: false,
         completion_turn_result: Some("not_attempted".into()),
@@ -10702,6 +11796,155 @@ async fn proposal_088_startup_repair_recovers_receipt_artifact_without_db_row() 
         recovered.receipt_artifact_path.as_deref(),
         Some(artifact_path.to_string_lossy().as_ref())
     );
+}
+
+#[tokio::test]
+async fn proposal_090_startup_repair_publishes_recovered_committed_active_pointer() {
+    use domain::code_writer_completion::{
+        CodeWriterCompletionReceiptRecord, CodeWriterOutputSettlementRow,
+    };
+    use sha2::{Digest, Sha256};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("p090-startup-recovery.sqlite");
+    let pool = file_backed_test_pool(&db_path).await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.artifact_root = tmp.path().to_string_lossy().into_owned();
+    runs::insert(&pool, &run).await.unwrap();
+    let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Running);
+    stage.owner_agent = Some("code_writer".into());
+    stages::insert(&pool, &stage).await.unwrap();
+    let mut execution = make_agent_execution(stage_exec_id, AgentStatus::Failed);
+    execution.agent_id = "code_writer".into();
+    execution.provider = "junie".into();
+    execution.completed_at = Some(Utc::now());
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let canonical_path = tmp.path().join("tests_result.json");
+    let canonical_bytes = br#"{"status":"green"}"#;
+    std::fs::write(&canonical_path, canonical_bytes).unwrap();
+    let canonical_sha = format!("{:x}", Sha256::digest(canonical_bytes));
+    let receipt = CodeWriterCompletionReceiptRecord {
+        id: format!("{}:code_writer_completion_receipt_v1", execution.id),
+        run_id,
+        stage_execution_id: stage_exec_id,
+        agent_execution_id: execution.id,
+        session_generation_id: Some("session-generation-p090".into()),
+        original_runtime_receipt_id: Some(format!("{}:original:0", execution.id)),
+        completion_repair_runtime_receipt_id: Some(format!("{}:repair:1", execution.id)),
+        provider: "junie".into(),
+        model: Some("junie-default".into()),
+        completion_mode: Some("acp_final_text_chainworks_output".into()),
+        published_at: Some(Utc::now()),
+        activation_source: "declared_output_settlement_failed".into(),
+        ingestion_boundary_failure: None,
+        work_change_kind: Some("current_attempt_diff".into()),
+        pre_prompt_worktree_fingerprint_path: None,
+        post_prompt_worktree_fingerprint_path: None,
+        pre_prompt_worktree_fingerprint_sha256: None,
+        post_prompt_worktree_fingerprint_sha256: None,
+        current_attempt_changed_path_count: 1,
+        preexisting_dirty_path_count: 0,
+        completion_status: "complete".into(),
+        failure_class: None,
+        provider_runtime_family: Some("junie_acp".into()),
+        completion_boundary_subtype: Some("none".into()),
+        final_payload_status: Some("present".into()),
+        progress_before_handoff: Some("meaningful_progress".into()),
+        runtime_preflight_phase: Some("passed".into()),
+        runtime_tool_path_preflight_json: None,
+        final_completion_payload_capture_json: None,
+        engine_failure_envelope_json: None,
+        repair_failure_envelope_json: None,
+        repair_materialization_summary_json: None,
+        repair_materialization_mode: Some("staged_per_output".into()),
+        strict_final_payload_enabled: true,
+        staged_repair_settlement_enabled: true,
+        terminal_response_status: Some("completed".into()),
+        completion_turn_attempted: true,
+        completion_turn_result: Some("succeeded".into()),
+        completion_text_capture_count: 1,
+        completion_text_absence_count: 0,
+        completion_repair_text_status: Some("captured".into()),
+        completion_repair_raw_text_artifact_path: None,
+        completion_repair_redacted_text_artifact_path: None,
+        completion_repair_text_absence_reason: None,
+        fresh_required_output_count: 1,
+        stale_required_output_count: 0,
+        missing_required_output_count: 0,
+        control_plane_output_count: 0,
+        completion_repair_turn_count: 1,
+        generic_repair_turn_count: 0,
+        missing_outputs: vec![],
+        stale_outputs: vec![],
+        transcript_status: Some("captured".into()),
+        transcript_absence_reason: None,
+        receipt_artifact_path: None,
+        failed_stage_evidence_path: None,
+        created_at: Utc::now(),
+    };
+    let settlement_row = CodeWriterOutputSettlementRow {
+        id: format!("{}:tests_result", receipt.id),
+        receipt_id: receipt.id.clone(),
+        run_id,
+        stage_id: "implementation".into(),
+        stage_execution_id: stage_exec_id,
+        agent_execution_id: execution.id,
+        session_generation_id: Some("session-generation-p090".into()),
+        repair_attempt: 1,
+        output_name: "tests_result".into(),
+        contract_id: "tests_result_v1".into(),
+        source_kind: "completion_chainworks_output".into(),
+        source_generation_owner: "agent".into(),
+        candidate_digest: Some(canonical_sha.clone()),
+        staging_path: Some(
+            tmp.path()
+                .join("repair-staging/tests_result.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        canonical_path: canonical_path.to_string_lossy().into_owned(),
+        canonical_before_sha256: None,
+        canonical_after_sha256: None,
+        decision: "accepted".into(),
+        rejection_reason: None,
+        materialization_state: "staged".into(),
+        active_pointer_generation_id: Some("recovered-tests-generation".into()),
+        created_at: Utc::now(),
+        committed_at: None,
+    };
+    code_writer_completion_receipts::upsert_with_settlement_rows(
+        &pool,
+        &receipt,
+        &[],
+        &[],
+        &[settlement_row],
+    )
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new_with_db_writer(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+        Arc::new(db::writer::DbWriter::new(pool.clone())),
+    );
+    let summary = recovery.run_startup_repair().await.unwrap();
+    assert_eq!(summary.runs_repaired, 1);
+
+    let active_generation: String = sqlx::query_scalar(
+        "SELECT generation_id FROM active_artifact_contracts WHERE run_id = ?1 AND contract_id = 'tests_result_v1'",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("startup recovery must publish accepted active pointer");
+    assert_eq!(active_generation, "recovered-tests-generation");
 }
 
 #[cfg(unix)]
@@ -11649,7 +12892,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
     // Use real workflow + catalog so advance_run can compile the plan and
-    // detect state_11_manual_release as a manual_gate with post_approval_tasks.
+    // detect state_6_implementation_approval as a manual_gate with post_approval_tasks.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let wf_path = format!(
         "{}/../../../examples/workflows/full-mvp-live.yaml",
@@ -11659,18 +12902,21 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
     run.workflow_yaml_path = Some(wf_path);
     run.agent_catalog_yaml_path = Some(cat_path);
-    run.current_state = Some("state_11_manual_release".into());
+    run.current_state = Some("state_6_implementation_approval".into());
     runs::insert(&pool, &run).await.unwrap();
 
-    // Simulate a failed post-approval stage with a resolved approval record
+    // Simulate a failed manual approval stage with a resolved approval record
     // from the first (failed) attempt.
     let mut stage = make_stage(stage_exec_id, run_id, StageStatus::Failed);
-    stage.stage_id = "state_11_manual_release".into();
+    stage.stage_id = "state_6_implementation_approval".into();
     stage.stage_type = Some("manual_gate".into());
     stages::insert(&pool, &stage).await.unwrap();
 
-    let mut first_approval =
-        make_approval(run_id, "state_11_manual_release", ApprovalDecision::Granted);
+    let mut first_approval = make_approval(
+        run_id,
+        "state_6_implementation_approval",
+        ApprovalDecision::Granted,
+    );
     first_approval.decided_at = Some(Utc::now());
     approvals::insert(&pool, &first_approval).await.unwrap();
 
@@ -11681,7 +12927,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
         .handle(
             Command::RetryStage(RetryStageCmd {
                 run_id,
-                stage_id: "state_11_manual_release".into(),
+                stage_id: "state_6_implementation_approval".into(),
                 consume_quota_budget_now: false,
                 agent_execution_id: None,
                 legacy_discovery_override_policy: None,
@@ -11706,7 +12952,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
     let retried_stage = all_stages
         .iter()
-        .find(|s| s.stage_id == "state_11_manual_release" && s.attempt_number == 2)
+        .find(|s| s.stage_id == "state_6_implementation_approval" && s.attempt_number == 2)
         .expect("retry must create new stage with attempt_number=2")
         .clone();
     assert_eq!(
@@ -11743,7 +12989,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     let post_advance_stages = stages::list_by_run(&pool, run_id).await.unwrap();
     let attempts_for_state_11: Vec<_> = post_advance_stages
         .iter()
-        .filter(|s| s.stage_id == "state_11_manual_release")
+        .filter(|s| s.stage_id == "state_6_implementation_approval")
         .collect();
     assert_eq!(
         attempts_for_state_11.len(),
@@ -11762,7 +13008,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     let fresh_requests: Vec<_> = all_approvals
         .iter()
         .filter(|a| {
-            a.stage_id == "state_11_manual_release"
+            a.stage_id == "state_6_implementation_approval"
                 && a.decision == ApprovalDecision::Requested
                 && a.id != first_approval.id
         })
@@ -11788,7 +13034,7 @@ async fn test_post_approval_retry_requires_fresh_approval() {
     assert_eq!(
         refreshed_run.status,
         RunStatus::WaitingApproval,
-        "run status must be WaitingApproval after retried release gate awaits fresh approval"
+        "run status must be WaitingApproval after retried manual gate awaits fresh approval"
     );
 }
 

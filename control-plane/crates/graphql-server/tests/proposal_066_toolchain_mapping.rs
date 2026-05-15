@@ -22,6 +22,14 @@ use engine::lifecycle_reporter::LifecycleReporter;
 use engine::work_queue::WorkQueue;
 use graphql_server::schema::build_schema;
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .unwrap();
+    pool
+}
+
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
     Run {
         id: run_id,
@@ -216,7 +224,7 @@ static TOOLCHAIN_DIAGNOSTICS_QUERY: &str = r#"
 /// Matches normative example graphql_legacy from proposal §normative_examples.
 #[tokio::test]
 async fn p066_null_toolchain_diagnostics_synthesizes_legacy_row_unavailable() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_, stage_id, _) = seed_execution(&pool, None::<&str>).await;
     let schema = make_schema(pool);
 
@@ -283,7 +291,7 @@ async fn p066_disabled_by_policy_diagnostics_exposed_correctly() {
     })
     .to_string();
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_, stage_id, exec_id) = seed_execution(&pool, Some(diagnostics_json.as_str())).await;
     let schema = make_schema(pool.clone());
 
@@ -343,7 +351,7 @@ async fn p066_active_mapping_diagnostics_exposed_correctly() {
     })
     .to_string();
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_, stage_id, _) = seed_execution(&pool, Some(diagnostics_json.as_str())).await;
     let schema = make_schema(pool);
 
@@ -398,7 +406,7 @@ async fn p066_absolute_paths_not_exposed_on_graphql_surface() {
     })
     .to_string();
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_, stage_id, _) = seed_execution(&pool, Some(diagnostics_json.as_str())).await;
     let schema = make_schema(pool);
 
@@ -449,7 +457,7 @@ async fn p066_policy_absent_diagnostics_exposed_correctly() {
     })
     .to_string();
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_, stage_id, _) = seed_execution(&pool, Some(diagnostics_json.as_str())).await;
     let schema = make_schema(pool);
 
@@ -503,7 +511,7 @@ async fn p066_unsupported_family_diagnostics_exposed_correctly() {
     })
     .to_string();
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_, stage_id, _) = seed_execution(&pool, Some(diagnostics_json.as_str())).await;
     let schema = make_schema(pool);
 
@@ -548,7 +556,7 @@ async fn p066_setup_failed_diagnostics_exposed_correctly() {
     })
     .to_string();
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_, stage_id, _) = seed_execution(&pool, Some(diagnostics_json.as_str())).await;
     let schema = make_schema(pool);
 
@@ -602,7 +610,7 @@ async fn p066_queue_timeout_diagnostics_exposed_correctly() {
     })
     .to_string();
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_, stage_id, _) = seed_execution(&pool, Some(diagnostics_json.as_str())).await;
     let schema = make_schema(pool);
 

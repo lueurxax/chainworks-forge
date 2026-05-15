@@ -17,6 +17,17 @@ use engine::command_handler::CommandHandler;
 use engine::event_bus;
 use engine::work_queue::WorkQueue;
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(
+        &pool,
+        std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+    )
+    .await
+    .unwrap();
+    pool
+}
+
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
     Run {
         id: run_id,
@@ -191,7 +202,7 @@ fn mcp_execution_truth_report(payload: &serde_json::Value) -> &serde_json::Value
 /// Matches normative example mcp_legacy from proposal §normative_examples.
 #[tokio::test]
 async fn p066_mcp_null_toolchain_diagnostics_synthesizes_legacy_row_unavailable() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, _) = seed_execution_with_diagnostics(&pool, None).await;
 
     let payload = mcp_server::tools::reports::execute(
@@ -234,7 +245,7 @@ async fn p066_mcp_disabled_by_policy_diagnostics_exposed_correctly() {
     })
     .to_string();
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, _) = seed_execution_with_diagnostics(&pool, Some(&diagnostics_json)).await;
 
     let payload = mcp_server::tools::reports::execute(
@@ -282,7 +293,7 @@ async fn p066_mcp_absolute_paths_not_exposed_in_reports() {
     })
     .to_string();
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, _) = seed_execution_with_diagnostics(&pool, Some(&diagnostics_json)).await;
 
     let payload = mcp_server::tools::reports::execute(

@@ -1,0 +1,14 @@
+{
+  "capture_rule": "stdout_task_result_block_after_last_marker",
+  "extracted_fields": [
+    "p089_native_probe",
+    "status",
+    "value"
+  ],
+  "parse_error": null,
+  "parser_input_sha256": "b84c115c0507f76876524c32884eeb8c09ab0465451894234407dc8224ec9f0e",
+  "parser_version": "p089_native_parser_v1",
+  "stdout_sha256": "2bf5b0e32aa84f89dc0f64da0d358a31527c05a5b1d2005ab05d9eafa7dbb9cc",
+  "success": true,
+  "top_level_shape": "object"
+}

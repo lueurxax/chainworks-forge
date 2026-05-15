@@ -1,0 +1,50 @@
+{
+  "schema_version": "p091_orphaned_retry_readback_fixture.v1",
+  "proposal_id": "091",
+  "source_run_id": "976f3d1b-31d8-43ef-a3d7-c9940c7086ab",
+  "diagnostic_status": "historical_local_readback",
+  "trusted_for": [
+    "orphaned_retry_authority_shape",
+    "projection_rebuild_acceptance_fixture"
+  ],
+  "source_paths": [
+    ".chainworks/runs/976f3d1b-31d8-43ef-a3d7-c9940c7086ab/state/run-state.json",
+    ".chainworks/runs/976f3d1b-31d8-43ef-a3d7-c9940c7086ab/artifacts/active-index.json",
+    ".chainworks/runs/976f3d1b-31d8-43ef-a3d7-c9940c7086ab/review/implementation-summary.json"
+  ],
+  "limitations": [
+    "This fixture captures the local P086 diagnostic shape for proposal readiness.",
+    "The implementation gate must recreate this shape synthetically if the local run evidence is unavailable.",
+    "The historical local readback does not include stage timestamp fields, so this fixture proves settled_sibling_without_live_retry_driver rather than newer_settled_sibling."
+  ],
+  "facts": {
+    "retry_command_journal_id": "96ad2abe-e906-4422-a0d3-2f7a30912f0a",
+    "retry_stage_execution_id": "780a94ce-8ae6-4b0c-99c6-eb79118ee640",
+    "retry_stage_id": "state_9_implementation_reviewed",
+    "retry_status": "pending",
+    "retry_attempt_number": 8,
+    "settled_sibling_stage_execution_id": "36ce1846-8d80-4ebf-afb3-7ba6fcaa75ad",
+    "settled_sibling_status": "completed",
+    "historical_timestamp_evidence": "unavailable",
+    "qualifying_predicate": "settled_sibling_without_live_retry_driver",
+    "predicate_inputs": {
+      "live_work_items_for_retry": 0,
+      "active_agent_executions_for_retry": 0,
+      "durable_retry_authority_active_for_retry": false,
+      "settled_sibling_status": "completed",
+      "stage_summaries_surface_retry_as_pending": true,
+      "blocked_truth_preserved_orphan": true
+    },
+    "live_work_items_for_retry": 0,
+    "active_agent_executions_for_retry": 0,
+    "durable_retry_authority_active_for_retry": false,
+    "stage_summaries_surface_retry_as_pending": true,
+    "blocked_truth_preserved_orphan": true
+  },
+  "expected_p091_behavior": {
+    "startup_recovery_classifies_retry_as_orphan_candidate": true,
+    "orphan_repair_requires_section_8_9_exclusions_to_be_false": true,
+    "orphan_repair_terminalizes_retry_or_marks_recovered_orphan": true,
+    "projection_rebuild_no_longer_uses_orphan_as_authoritative_blocked_truth": true
+  }
+}

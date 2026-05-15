@@ -1,0 +1,35 @@
+{
+  "schema_version": "p091_targeted_retry_authority_evidence_index_v1",
+  "proposal_id": "091",
+  "status": "proposal_readiness_inventory",
+  "gate": "./scripts/test-gate.sh proposal-091",
+  "fixtures": [
+    {
+      "fixture_id": "p086_orphaned_retry_readback",
+      "path": "docs/evidence/091/targeted-retry-authority/p086-orphaned-retry-readback.fixture.json",
+      "sha256": "c20dd0232fa2da0beac549ee658a16b57933670c18e3b5bcc02bda94837319b8",
+      "trusted_for": [
+        "historical_orphan_recovery_shape",
+        "projection_rebuild_acceptance_fixture",
+        "settled_sibling_without_live_retry_driver"
+      ]
+    }
+  ],
+  "required_contract_terms": [
+    "entry_kind = targeted_agent_retry",
+    "historical_orphan_recovery",
+    "terminal_reason = stale_retry_recovered",
+    "retry_stage_execution_authorities_one_active",
+    "Target-aware work-item repository semantics",
+    "retryAuthorityHistory",
+    "startup orphan repair must run before projection rebuild",
+    "stage terminal metadata and authority history must agree",
+    "advance_run_payload_missing_target_for_authority",
+    "settled_sibling_without_live_retry_driver",
+    "CHAINWORKS_P091_STARTUP_ORPHAN_REPAIR_MODE",
+    "CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR",
+    "p091_orphan_repair_candidates_total",
+    "./scripts/test-gate.sh proposal-091"
+  ],
+  "implementation_gate_upgrade_required": true
+}

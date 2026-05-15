@@ -352,6 +352,21 @@ pub async fn execute(
                                 legacy_discovery_overrides::list_by_run(pool, run_id).await?,
                             )?,
                         );
+                        obj.insert(
+                            "retry_authority".into(),
+                            crate::tools::reports::retry_authority_current_json(pool, run_id)
+                                .await?,
+                        );
+                        obj.insert(
+                            "retry_authority_history".into(),
+                            crate::tools::reports::retry_authority_history_json(pool, run_id)
+                                .await?,
+                        );
+                        obj.insert(
+                            "p091_orphan_repair_readback".into(),
+                            crate::tools::reports::p091_orphan_repair_readback_json(pool, run_id)
+                                .await?,
+                        );
                     }
                     let value = attach_implementation_self_assessment_summary(pool, value).await?;
                     // P077 BLK-004: attach closeout_readiness_summary parity on runs.get.
@@ -1037,9 +1052,16 @@ mod tests {
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
-        create_pool("sqlite::memory:")
+        let pool = create_pool("sqlite::memory:")
             .await
-            .expect("in-memory pool failed")
+            .expect("in-memory pool failed");
+        db::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
+        pool
     }
 
     fn make_run(id: RunId, idea_id: IdeaId) -> Run {

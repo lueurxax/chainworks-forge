@@ -292,6 +292,19 @@ fn minimal_completion_receipt(
         completion_status: completion_status.into(),
         failure_class: (completion_status != "complete")
             .then(|| "work_completed_missing_current_attempt_outputs".into()),
+        provider_runtime_family: Some("claude_acp".into()),
+        completion_boundary_subtype: Some("none".into()),
+        final_payload_status: Some("not_applicable".into()),
+        progress_before_handoff: Some("none".into()),
+        runtime_preflight_phase: Some("ready".into()),
+        runtime_tool_path_preflight_json: None,
+        final_completion_payload_capture_json: None,
+        engine_failure_envelope_json: None,
+        repair_failure_envelope_json: None,
+        repair_materialization_summary_json: None,
+        repair_materialization_mode: Some("legacy_all_or_nothing".into()),
+        strict_final_payload_enabled: false,
+        staged_repair_settlement_enabled: false,
         terminal_response_status: Some("completed".into()),
         completion_turn_attempted: false,
         completion_turn_result: Some("not_attempted".into()),
@@ -419,6 +432,19 @@ async fn proposal_088_completion_receipt_round_trips_with_text_and_output_decisi
         preexisting_dirty_path_count: 0,
         completion_status: "missing_required_outputs".into(),
         failure_class: Some("work_completed_missing_current_attempt_outputs".into()),
+        provider_runtime_family: Some("claude_acp".into()),
+        completion_boundary_subtype: Some("none".into()),
+        final_payload_status: Some("repair_required".into()),
+        progress_before_handoff: Some("none".into()),
+        runtime_preflight_phase: Some("ready".into()),
+        runtime_tool_path_preflight_json: None,
+        final_completion_payload_capture_json: None,
+        engine_failure_envelope_json: None,
+        repair_failure_envelope_json: None,
+        repair_materialization_summary_json: None,
+        repair_materialization_mode: Some("legacy_all_or_nothing".into()),
+        strict_final_payload_enabled: false,
+        staged_repair_settlement_enabled: false,
         terminal_response_status: Some("completed".into()),
         completion_turn_attempted: true,
         completion_turn_result: Some("failed_missing_outputs".into()),
@@ -583,7 +609,10 @@ async fn proposal_088_provider_independence_round_trips_claude_codex_junie_recei
 
     let summary = domain::code_writer_completion::project_implementation_completion(&canonical);
     assert_eq!(summary.status.value, "failed");
-    assert_eq!(summary.next_operator_action.value, "fix_chainworks_output_extraction");
+    assert_eq!(
+        summary.next_operator_action.value,
+        "fix_chainworks_output_extraction"
+    );
 }
 
 #[tokio::test]
@@ -614,6 +643,19 @@ async fn proposal_088_completion_receipt_replay_detects_text_capture_drift() {
         preexisting_dirty_path_count: 0,
         completion_status: "missing_required_outputs".into(),
         failure_class: Some("work_completed_missing_current_attempt_outputs".into()),
+        provider_runtime_family: Some("claude_acp".into()),
+        completion_boundary_subtype: Some("none".into()),
+        final_payload_status: Some("repair_required".into()),
+        progress_before_handoff: Some("none".into()),
+        runtime_preflight_phase: Some("ready".into()),
+        runtime_tool_path_preflight_json: None,
+        final_completion_payload_capture_json: None,
+        engine_failure_envelope_json: None,
+        repair_failure_envelope_json: None,
+        repair_materialization_summary_json: None,
+        repair_materialization_mode: Some("legacy_all_or_nothing".into()),
+        strict_final_payload_enabled: false,
+        staged_repair_settlement_enabled: false,
         terminal_response_status: Some("completed".into()),
         completion_turn_attempted: false,
         completion_turn_result: Some("not_attempted".into()),
@@ -772,5 +814,253 @@ async fn proposal_088_canonical_readback_returns_empty_when_links_are_missing() 
     assert!(
         canonical.is_empty(),
         "unlinked P088 receipts must not become canonical readback"
+    );
+}
+
+#[tokio::test]
+async fn proposal_090_receipt_round_trips_boundary_subtype_and_preflight_readback() {
+    let pool = setup_db().await;
+    let (run_id, stage_id, exec_id) = seed_execution(&pool).await;
+    let mut receipt = minimal_completion_receipt(
+        "p090-boundary-subtype",
+        run_id,
+        stage_id,
+        exec_id,
+        "missing_required_outputs",
+        Utc::now(),
+    );
+    receipt.provider = "junie".into();
+    receipt.provider_runtime_family = Some("junie_acp".into());
+    receipt.completion_boundary_subtype =
+        Some("junie_runtime_tool_path_failure_before_publication".into());
+    receipt.final_payload_status = Some("missing".into());
+    receipt.progress_before_handoff = Some("none".into());
+    receipt.runtime_preflight_phase = Some("failed_no_launch".into());
+    receipt.runtime_tool_path_preflight_json = Some(
+        serde_json::json!({
+            "status": "failed",
+            "attempt_count": 1,
+            "provider_launched": false,
+            "failed_operation_class": "read_project_file",
+            "failure_category": "permission_denied"
+        })
+        .to_string(),
+    );
+    receipt.strict_final_payload_enabled = true;
+    receipt.staged_repair_settlement_enabled = false;
+    receipt.repair_materialization_mode = Some("legacy_all_or_nothing".into());
+
+    code_writer_completion_receipts::upsert(&pool, &receipt, &[], &[])
+        .await
+        .unwrap();
+
+    let canonical = code_writer_completion_receipts::list_canonical_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(canonical.len(), 1);
+    assert_eq!(
+        canonical[0].receipt.completion_boundary_subtype.as_deref(),
+        Some("junie_runtime_tool_path_failure_before_publication")
+    );
+    assert_eq!(
+        canonical[0].receipt.runtime_preflight_phase.as_deref(),
+        Some("failed_no_launch")
+    );
+    assert_eq!(canonical[0].receipt.strict_final_payload_enabled, true);
+
+    let summary = domain::code_writer_completion::project_implementation_completion(&canonical);
+    assert_eq!(
+        summary.completion_boundary_subtype.value,
+        "junie_runtime_tool_path_failure_before_publication"
+    );
+    assert_eq!(summary.completion_boundary_subtype.known, true);
+    assert_eq!(summary.final_payload_status.as_deref(), Some("missing"));
+    assert_eq!(
+        summary.runtime_tool_path_preflight_json.as_deref(),
+        receipt.runtime_tool_path_preflight_json.as_deref()
+    );
+    assert_eq!(
+        summary.repair_materialization_mode.as_deref(),
+        Some("legacy_all_or_nothing")
+    );
+}
+
+#[tokio::test]
+async fn proposal_090_settlement_rows_are_receipt_linked_and_idempotent_by_candidate_digest() {
+    let pool = setup_db().await;
+    let (run_id, stage_id, exec_id) = seed_execution(&pool).await;
+    let mut receipt = minimal_completion_receipt(
+        "p090-settlement",
+        run_id,
+        stage_id,
+        exec_id,
+        "partial_evidence",
+        Utc::now(),
+    );
+    receipt.provider = "junie".into();
+    receipt.completion_boundary_subtype =
+        Some("junie_repair_outputs_partially_materialized".into());
+    receipt.repair_materialization_mode = Some("staged_per_output".into());
+    receipt.staged_repair_settlement_enabled = true;
+
+    let accepted = domain::code_writer_completion::CodeWriterOutputSettlementRow {
+        id: "p090-row-progress".into(),
+        receipt_id: receipt.id.clone(),
+        run_id,
+        stage_id: "state_implementation".into(),
+        stage_execution_id: stage_id,
+        agent_execution_id: exec_id,
+        session_generation_id: Some(format!("generation-{exec_id}")),
+        repair_attempt: 1,
+        output_name: "implementation_progress".into(),
+        contract_id: "implementation_progress".into(),
+        source_kind: "repair_chainworks_output".into(),
+        source_generation_owner: "agent".into(),
+        candidate_digest: Some("sha256:progress".into()),
+        staging_path: Some(".chainworks/runs/r/repair-staging/progress.md".into()),
+        canonical_path: "implementation/progress.md".into(),
+        canonical_before_sha256: None,
+        canonical_after_sha256: Some("sha256:progress".into()),
+        decision: "accepted".into(),
+        rejection_reason: None,
+        materialization_state: "committed".into(),
+        active_pointer_generation_id: Some("gen-progress".into()),
+        created_at: Utc::now(),
+        committed_at: Some(Utc::now()),
+    };
+    let rejected = domain::code_writer_completion::CodeWriterOutputSettlementRow {
+        id: "p090-row-self-assessment".into(),
+        receipt_id: receipt.id.clone(),
+        output_name: "implementation_self_assessment".into(),
+        contract_id: "implementation_self_assessment_v2".into(),
+        candidate_digest: Some("sha256:bad-self-assessment".into()),
+        canonical_path: "implementation/self-assessment.json".into(),
+        canonical_before_sha256: Some("sha256:old-valid".into()),
+        canonical_after_sha256: None,
+        decision: "rejected".into(),
+        rejection_reason: Some("malformed_json".into()),
+        materialization_state: "not_materialized".into(),
+        active_pointer_generation_id: None,
+        ..accepted.clone()
+    };
+
+    code_writer_completion_receipts::upsert_with_settlement_rows(
+        &pool,
+        &receipt,
+        &[],
+        &[],
+        &[accepted.clone(), rejected.clone()],
+    )
+    .await
+    .unwrap();
+    code_writer_completion_receipts::upsert_with_settlement_rows(
+        &pool,
+        &receipt,
+        &[],
+        &[],
+        &[accepted.clone(), rejected.clone()],
+    )
+    .await
+    .unwrap();
+
+    let found = code_writer_completion_receipts::find_by_execution_id(&pool, exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.settlement_rows.len(), 2);
+    assert_eq!(
+        found
+            .settlement_rows
+            .iter()
+            .find(|row| row.output_name == "implementation_self_assessment")
+            .unwrap()
+            .canonical_before_sha256
+            .as_deref(),
+        Some("sha256:old-valid")
+    );
+
+    let staged = domain::code_writer_completion::CodeWriterOutputSettlementRow {
+        id: "p090-row-staged-crash".into(),
+        receipt_id: receipt.id.clone(),
+        run_id,
+        stage_id: "state_implementation".into(),
+        stage_execution_id: stage_id,
+        agent_execution_id: exec_id,
+        session_generation_id: Some(format!("generation-{exec_id}")),
+        repair_attempt: 2,
+        output_name: "tests_result".into(),
+        contract_id: "tests_result".into(),
+        source_kind: "repair_chainworks_output".into(),
+        source_generation_owner: "agent".into(),
+        candidate_digest: Some("sha256:tests".into()),
+        staging_path: Some(".chainworks/runs/r/repair-staging/tests.json".into()),
+        canonical_path: "implementation/tests.json".into(),
+        canonical_before_sha256: Some("sha256:old-tests".into()),
+        canonical_after_sha256: None,
+        decision: "accepted".into(),
+        rejection_reason: None,
+        materialization_state: "staged".into(),
+        active_pointer_generation_id: Some("gen-tests".into()),
+        created_at: Utc::now(),
+        committed_at: None,
+    };
+    code_writer_completion_receipts::upsert_with_settlement_rows(
+        &pool,
+        &receipt,
+        &[],
+        &[],
+        &[accepted.clone(), rejected.clone(), staged.clone()],
+    )
+    .await
+    .unwrap();
+    let recoverable =
+        code_writer_completion_receipts::list_p090_recoverable_settlement_rows_by_run(
+            &pool, run_id,
+        )
+        .await
+        .unwrap();
+    assert!(recoverable.iter().any(|row| row.id == staged.id));
+    code_writer_completion_receipts::update_p090_settlement_row_recovery_state(
+        &pool,
+        &staged.id,
+        "failed",
+        Some("sha256:old-tests"),
+        None,
+        Some("startup_recovery_left_staged_output_unpromoted"),
+    )
+    .await
+    .unwrap();
+    let recovered = code_writer_completion_receipts::find_by_execution_id(&pool, exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let staged_after_recovery = recovered
+        .settlement_rows
+        .iter()
+        .find(|row| row.id == staged.id)
+        .unwrap();
+    assert_eq!(staged_after_recovery.materialization_state, "failed");
+    assert_eq!(
+        staged_after_recovery.rejection_reason.as_deref(),
+        Some("startup_recovery_left_staged_output_unpromoted")
+    );
+
+    let mut conflicting = accepted.clone();
+    conflicting.id = "p090-row-progress-conflict".into();
+    conflicting.candidate_digest = Some("sha256:different".into());
+    let error = code_writer_completion_receipts::upsert_with_settlement_rows(
+        &pool,
+        &receipt,
+        &[],
+        &[],
+        &[conflicting],
+    )
+    .await
+    .expect_err("different digest for same repair attempt/output should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("code_writer_output_settlement_conflict"),
+        "unexpected error: {error:#}"
     );
 }

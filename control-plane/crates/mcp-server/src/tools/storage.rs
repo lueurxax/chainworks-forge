@@ -355,9 +355,20 @@ mod tests {
     use super::*;
     use db::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
 
+    async fn test_pool() -> sqlx::SqlitePool {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        db::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .unwrap();
+        pool
+    }
+
     #[tokio::test]
     async fn storage_write_pressure_honors_include_lanes_and_window() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let now = Utc::now();
         db::repos::storage_health::insert_write_pressure_snapshot(
             &pool,
@@ -390,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn storage_health_reads_live_dbwriter_heartbeat_when_injected() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let writer = db::writer::DbWriter::new(pool.clone());
         let result = writer
             .submit(
@@ -462,7 +473,7 @@ mod tests {
     /// must return a typed error response, not a JSON-RPC error.
     #[tokio::test]
     async fn reconcile_evidence_orphans_returns_invalid_input_when_run_id_missing() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = execute(
             "storage.reconcile_evidence_orphans",
             serde_json::json!({"dryRun": false}),
@@ -486,7 +497,7 @@ mod tests {
     /// invalid_input: dry-run without runId is permitted (runId is optional for dry-run).
     #[tokio::test]
     async fn reconcile_evidence_orphans_dry_run_without_run_id_is_permitted() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let dir = tempfile::TempDir::new().unwrap();
         // Point artifact root to a temp dir that has no evidence/runs subtree.
         std::env::set_var("CHAINWORKS_META_ROOT", dir.path().to_str().unwrap());
@@ -516,7 +527,7 @@ mod tests {
     /// when no live writer is injected, so the 'stale' code must appear.
     #[tokio::test]
     async fn storage_health_returns_typed_stale_error_when_is_stale_true() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let result = execute("storage.health", serde_json::json!({}), &pool)
             .await
             .expect("storage.health must not error");
@@ -532,7 +543,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_evidence_orphans_returns_maintenance_disabled_when_kill_switch_set() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         std::env::set_var("CHAINWORKS_STORAGE_MAINTENANCE_DISABLED", "1");
         let result = execute(
             "storage.reconcile_evidence_orphans",
@@ -573,7 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn evidence_spool_summary_honors_run_filter_and_orphan_flag() {
-        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let pool = test_pool().await;
         let dir = tempfile::TempDir::new().unwrap();
         let output = db::evidence_spool::write_spool_file(
             dir.path(),

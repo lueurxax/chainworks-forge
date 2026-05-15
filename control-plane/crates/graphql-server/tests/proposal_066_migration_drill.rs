@@ -25,6 +25,14 @@ use engine::lifecycle_reporter::LifecycleReporter;
 use engine::work_queue::WorkQueue;
 use graphql_server::schema::build_schema;
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .unwrap();
+    pool
+}
+
 // ── Seeding helpers ───────────────────────────────────────────────────────────
 
 fn make_run_record(run_id: RunId, idea_id: IdeaId) -> Run {
@@ -270,7 +278,7 @@ async fn p066_migration_drill_legacy_rows_synthesize_sentinel() {
     const LEGACY_COUNT: usize = 12;
     const POST_COUNT: usize = 0;
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (legacy_stage_id, _) = seed_drill_corpus(&pool, LEGACY_COUNT, POST_COUNT).await;
 
     // Fresh schema instance — simulates daemon restart opening the same DB.
@@ -342,7 +350,7 @@ async fn p066_migration_drill_post_migration_rows_expose_structured_data() {
     const LEGACY_COUNT: usize = 0;
     const POST_COUNT: usize = 12;
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_, post_stage_id) = seed_drill_corpus(&pool, LEGACY_COUNT, POST_COUNT).await;
 
     // Fresh schema instance — simulates daemon restart.
@@ -439,7 +447,7 @@ async fn p066_migration_drill_mixed_corpus_differentiates_legacy_from_post_migra
     const LEGACY_COUNT: usize = 12;
     const POST_COUNT: usize = 12;
 
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (legacy_stage_id, post_stage_id) = seed_drill_corpus(&pool, LEGACY_COUNT, POST_COUNT).await;
 
     // Fresh schema instance — simulates daemon restart opening the same DB.

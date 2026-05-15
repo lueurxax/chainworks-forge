@@ -1,12 +1,13 @@
 use anyhow::Result;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
     agent_execution_runtime_receipts, agent_executions, artifact_contracts, artifacts, closeout,
     code_writer_completion_receipts, lead_conflict_mediations, legacy_discovery_overrides,
-    rollout_contract_checks, sessions, validation, workflow_conflicts,
+    retry_stage_execution_authorities, rollout_contract_checks, sessions, validation,
+    workflow_conflicts,
 };
 use db::write_class::WriteLane;
 use db::writer::class_a_operation;
@@ -104,6 +105,9 @@ pub async fn execute(
                 "code_writer_completion_receipts": code_writer_completion_receipts,
                 "implementationCompletion": implementation_completion,
                 "workflow_conflict": workflow_conflict_json(pool, cmd_handler, run_id).await?,
+                "retryAuthority": retry_authority_current_json(pool, run_id).await?,
+                "retryAuthorityHistory": retry_authority_history_json(pool, run_id).await?,
+                "p091OrphanRepairReadback": p091_orphan_repair_readback_json(pool, run_id).await?,
                 "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
                 "rollout_contract_readback": rollout_contract_readback,
@@ -142,6 +146,79 @@ pub async fn execute(
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
+    }
+}
+
+pub(crate) async fn retry_authority_history_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(
+        retry_stage_execution_authorities::list_by_run(pool, run_id).await?,
+    )?)
+}
+
+pub(crate) async fn retry_authority_current_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let history = retry_stage_execution_authorities::list_by_run(pool, run_id).await?;
+    Ok(history
+        .into_iter()
+        .find(|authority| authority.authority_state.to_string() == "active")
+        .map(serde_json::to_value)
+        .transpose()?
+        .unwrap_or(serde_json::Value::Null))
+}
+
+pub(crate) async fn p091_orphan_repair_readback_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let row = sqlx::query(
+        r#"SELECT mode, disabled, candidates_total, excluded_total,
+                  would_repair_total, repaired_total, disabled_total,
+                  bounded_samples_json, created_at
+           FROM p091_orphan_repair_passes
+           WHERE run_id IS NULL OR run_id = ?1
+           ORDER BY created_at DESC
+           LIMIT 1"#,
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let operator_disabled = std::env::var("CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let configured_mode = std::env::var("CHAINWORKS_P091_STARTUP_ORPHAN_REPAIR_MODE")
+        .unwrap_or_else(|_| "diagnostic".to_string());
+    if let Some(row) = row {
+        let samples_raw: Option<String> = row.get("bounded_samples_json");
+        let samples = samples_raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or_else(|| serde_json::json!([]));
+        Ok(serde_json::json!({
+            "configured_mode": configured_mode,
+            "operator_disabled": operator_disabled,
+            "latest_pass": {
+                "mode": row.get::<String, _>("mode"),
+                "disabled": row.get::<i64, _>("disabled") != 0,
+                "candidates_total": row.get::<i64, _>("candidates_total"),
+                "excluded_total": row.get::<i64, _>("excluded_total"),
+                "would_repair_total": row.get::<i64, _>("would_repair_total"),
+                "repaired_total": row.get::<i64, _>("repaired_total"),
+                "disabled_total": row.get::<i64, _>("disabled_total"),
+                "bounded_samples": samples,
+                "created_at": row.get::<String, _>("created_at"),
+            }
+        }))
+    } else {
+        Ok(serde_json::json!({
+            "configured_mode": configured_mode,
+            "operator_disabled": operator_disabled,
+            "latest_pass": null,
+        }))
     }
 }
 
@@ -1177,9 +1254,16 @@ mod tests {
     }
 
     async fn test_pool() -> sqlx::SqlitePool {
-        create_pool("sqlite::memory:")
+        let pool = create_pool("sqlite::memory:")
             .await
-            .expect("in-memory pool failed")
+            .expect("in-memory pool failed");
+        db::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
+        pool
     }
 
     async fn seed_validation_attempt(

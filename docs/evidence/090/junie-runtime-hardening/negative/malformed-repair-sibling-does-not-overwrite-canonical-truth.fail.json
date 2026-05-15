@@ -1,0 +1,27 @@
+{
+  "schema_version": "p090_negative_fixture_v1",
+  "fixture_class": "malformed_repair_sibling_does_not_overwrite_canonical_truth",
+  "status": "accepted_for_proposal_readiness",
+  "input": {
+    "repair_attempt": 1,
+    "candidate_digest": "sha256:synthetic-malformed-sibling",
+    "outputs": [
+      {
+        "output_name": "implementation_progress",
+        "decision": "accepted"
+      },
+      {
+        "output_name": "implementation_self_assessment",
+        "decision": "rejected",
+        "rejection_reason": "malformed_json",
+        "canonical_before_sha256": "sha256:old-valid-self-assessment"
+      }
+    ]
+  },
+  "expected": {
+    "status": "junie_repair_outputs_partially_materialized",
+    "malformed_sibling_materializes": false,
+    "canonical_self_assessment_sha256": "sha256:old-valid-self-assessment",
+    "active_pointer_from_accepted_rows_only": true
+  }
+}

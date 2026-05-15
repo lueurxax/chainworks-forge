@@ -981,9 +981,14 @@ mod tests {
     };
 
     async fn test_pool() -> sqlx::SqlitePool {
-        create_pool("sqlite::memory:")
+        let pool = create_pool("sqlite::memory:")
             .await
-            .expect("in-memory pool failed")
+            .expect("in-memory pool failed");
+        let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .expect("test shared DbWriter registration failed");
+        pool
     }
 
     async fn seed_run(pool: &sqlx::SqlitePool) {

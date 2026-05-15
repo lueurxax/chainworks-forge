@@ -17,6 +17,14 @@ use engine::lifecycle_reporter::LifecycleReporter;
 use engine::work_queue::WorkQueue;
 use graphql_server::schema::build_schema;
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .unwrap();
+    pool
+}
+
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
     Run {
         id: run_id,
@@ -57,7 +65,7 @@ fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
 }
 
 async fn seed_run_with_closeout_summary() -> (sqlx::SqlitePool, RunId, String) {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     ideas::insert(

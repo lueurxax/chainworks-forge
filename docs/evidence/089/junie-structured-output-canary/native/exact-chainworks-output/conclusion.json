@@ -1,0 +1,8 @@
+{
+  "conclusion": "Junie final task result matched the requested CHAINWORKS_OUTPUT payload.",
+  "exit_code": 0,
+  "experiment": "exact-chainworks-output",
+  "final_output_sha256": "6fd2a17db04510a9fb06d16de46051fbfa295092ca3b945fe4de989bfa49d9f7",
+  "schema_version": "p089_native_conclusion_v1",
+  "status": "passed"
+}

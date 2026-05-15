@@ -123,6 +123,10 @@ pub struct GqlStageExecution {
     pub validation_failure_json: Option<String>,
     pub evidence_packet_json: Option<String>,
     pub recovery_snapshot_json: Option<String>,
+    pub terminal_reason: Option<String>,
+    pub retry_authority_id: Option<String>,
+    pub is_retry_authoritative: Option<bool>,
+    pub retry_authority_state: Option<String>,
     pub projection_present: bool,
     pub projection_updated_at: Option<String>,
     pub projection_lag: bool,
@@ -819,6 +823,10 @@ impl From<StageExecution> for GqlStageExecution {
             validation_failure_json: s.validation_failure_json,
             evidence_packet_json: s.evidence_packet_json,
             recovery_snapshot_json: s.recovery_snapshot_json,
+            terminal_reason: None,
+            retry_authority_id: None,
+            is_retry_authoritative: None,
+            retry_authority_state: None,
             projection_present: false,
             projection_updated_at: None,
             projection_lag: true,
@@ -836,6 +844,10 @@ impl GqlStageExecution {
         gql.has_artifacts = Some(r.has_artifacts);
         gql.has_pending_approval = Some(r.has_pending_approval);
         gql.has_validation_failure = Some(r.has_validation_failure);
+        gql.terminal_reason = r.terminal_reason;
+        gql.retry_authority_id = r.retry_authority_id;
+        gql.is_retry_authoritative = Some(r.is_retry_authoritative);
+        gql.retry_authority_state = r.retry_authority_state;
         gql.projection_present = r.projection_present;
         gql.projection_updated_at = r.projection_updated_at;
         gql.projection_lag = r.projection_lag;
@@ -863,6 +875,10 @@ impl From<StageSummaryRow> for GqlStageExecution {
             validation_failure_json: None,
             evidence_packet_json: None,
             recovery_snapshot_json: None,
+            terminal_reason: r.terminal_reason,
+            retry_authority_id: r.retry_authority_id,
+            is_retry_authoritative: Some(r.is_retry_authoritative),
+            retry_authority_state: r.retry_authority_state,
             projection_present: r.projection_present,
             projection_updated_at: r.projection_updated_at,
             projection_lag: r.projection_lag,

@@ -71,6 +71,8 @@ pub async fn run_startup_evidence_orphan_sweep(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::Utc;
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{IdeaId, RunId};
@@ -81,6 +83,12 @@ mod tests {
     #[tokio::test]
     async fn startup_sweep_recovers_active_run_orphan_without_failing_startup() {
         let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        db::writer::register_shared_writer(
+            &pool,
+            Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .unwrap();
         let dir = tempfile::TempDir::new().unwrap();
         let run_id = RunId::new();
         let run_id_str = run_id.to_string();

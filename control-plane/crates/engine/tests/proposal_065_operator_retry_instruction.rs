@@ -83,6 +83,17 @@ fn agent_caller() -> CallerContext {
     }
 }
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(
+        &pool,
+        std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+    )
+    .await
+    .unwrap();
+    pool
+}
+
 async fn setup_failed_stage(pool: &sqlx::SqlitePool) -> (RunId, IdeaId, StageExecutionId) {
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
@@ -139,7 +150,7 @@ async fn setup_failed_stage(pool: &sqlx::SqlitePool) -> (RunId, IdeaId, StageExe
 
 #[tokio::test]
 async fn p065_full_stage_retry_with_operator_instruction_creates_binding() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, _old_stage_execution_id) = setup_failed_stage(&pool).await;
 
     let handler = CommandHandler::new(
@@ -210,7 +221,7 @@ async fn p065_full_stage_retry_with_operator_instruction_creates_binding() {
 
 #[tokio::test]
 async fn p065_full_stage_retry_without_instruction_has_no_binding() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, _) = setup_failed_stage(&pool).await;
 
     let handler = CommandHandler::new(
@@ -257,7 +268,7 @@ async fn p065_full_stage_retry_without_instruction_has_no_binding() {
 
 #[tokio::test]
 async fn p065_validation_failure_rejects_empty_instruction() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, _) = setup_failed_stage(&pool).await;
 
     let handler = CommandHandler::new(
@@ -301,7 +312,7 @@ async fn p065_validation_failure_rejects_empty_instruction() {
 
 #[tokio::test]
 async fn p065_validation_failure_rejects_too_long_instruction() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, _) = setup_failed_stage(&pool).await;
 
     let handler = CommandHandler::new(
@@ -330,7 +341,7 @@ async fn p065_validation_failure_rejects_too_long_instruction() {
 
 #[tokio::test]
 async fn p065_validation_failure_rejects_control_characters() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, _) = setup_failed_stage(&pool).await;
 
     let handler = CommandHandler::new(
@@ -366,7 +377,7 @@ async fn p065_validation_failure_rejects_control_characters() {
 
 #[tokio::test]
 async fn p065_non_operator_cannot_attach_instruction() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, _) = setup_failed_stage(&pool).await;
 
     let handler = CommandHandler::new(
@@ -403,7 +414,7 @@ async fn p065_non_operator_cannot_attach_instruction() {
 
 #[tokio::test]
 async fn p065_retry_without_instruction_from_agent_still_works() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, _) = setup_failed_stage(&pool).await;
 
     let handler = CommandHandler::new(
@@ -457,7 +468,7 @@ fn p065_validate_instruction_exactly_2000_chars() {
 
 #[tokio::test]
 async fn p065_targeted_retry_with_instruction_creates_binding_and_child_delivery() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, old_stage_execution_id) = setup_failed_stage(&pool).await;
 
     // Create a failed agent execution for targeted retry
@@ -618,7 +629,7 @@ async fn p065_targeted_retry_with_instruction_creates_binding_and_child_delivery
 
 #[tokio::test]
 async fn p065_repo_helpers_round_trip() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, old_stage_execution_id) = setup_failed_stage(&pool).await;
     let new_stage_execution_id = StageExecutionId::new();
 
@@ -736,7 +747,7 @@ async fn p065_repo_helpers_round_trip() {
 
 #[tokio::test]
 async fn p065_mark_failed_sets_reason() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, _, old_stage_execution_id) = setup_failed_stage(&pool).await;
     let new_stage_execution_id = StageExecutionId::new();
 

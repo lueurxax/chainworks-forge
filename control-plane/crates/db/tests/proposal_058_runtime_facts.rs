@@ -20,6 +20,15 @@ use domain::mediation::OwnerKind;
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
 
+async fn test_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+    db::writer::register_shared_writer(&pool, writer)
+        .await
+        .expect("test shared DbWriter registration failed");
+    pool
+}
+
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
     Run {
         id: run_id,
@@ -172,7 +181,7 @@ async fn seed_execution(
 
 #[tokio::test]
 async fn proposal_058_runtime_facts_upsert_preserves_unknown_raw_debug() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, stage_execution_id, agent_execution_id, _work_item_id) =
         seed_execution(&pool).await;
     let ledger = agent_retry_budget_ledger::upsert_quota_failure(
@@ -219,7 +228,7 @@ async fn proposal_058_runtime_facts_upsert_preserves_unknown_raw_debug() {
 
 #[tokio::test]
 async fn proposal_058_unknown_failure_kind_backfills_raw_debug_from_stored_value() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_run_id, _stage_id, agent_execution_id, _work_item_id) = seed_execution(&pool).await;
     let now = Utc::now().to_rfc3339();
     sqlx::query(
@@ -252,7 +261,7 @@ async fn proposal_058_unknown_failure_kind_backfills_raw_debug_from_stored_value
 
 #[tokio::test]
 async fn proposal_058_runtime_facts_quota_ledger_id_is_schema_foreign_key() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (_run_id, _stage_execution_id, agent_execution_id, _work_item_id) =
         seed_execution(&pool).await;
 
@@ -285,7 +294,7 @@ async fn proposal_058_runtime_facts_quota_ledger_id_is_schema_foreign_key() {
 
 #[tokio::test]
 async fn proposal_058_quota_ledger_idempotency_key_is_execution_scoped() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, stage_execution_id, agent_execution_id, _work_item_id) =
         seed_execution(&pool).await;
     let retry_after = Utc::now() + chrono::Duration::minutes(30);
@@ -326,7 +335,7 @@ async fn proposal_058_quota_ledger_idempotency_key_is_execution_scoped() {
 
 #[tokio::test]
 async fn proposal_058_retry_enqueue_pending_supersession_blocks_late_import() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, stage_execution_id, agent_execution_id, source_work_item_id) =
         seed_execution(&pool).await;
     let key = ArtifactSourceGenerationClaimKey {
@@ -446,7 +455,7 @@ async fn proposal_058_retry_enqueue_pending_supersession_blocks_late_import() {
 
 #[tokio::test]
 async fn proposal_058_import_before_supersession_keeps_accepted_active_truth() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, stage_execution_id, agent_execution_id, source_work_item_id) =
         seed_execution(&pool).await;
     let key = ArtifactSourceGenerationClaimKey {
@@ -531,7 +540,7 @@ async fn proposal_058_import_before_supersession_keeps_accepted_active_truth() {
 
 #[tokio::test]
 async fn proposal_058_ignored_late_projection_and_runtime_facts_commit_or_rollback_together() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, stage_execution_id, agent_execution_id, source_work_item_id) =
         seed_execution(&pool).await;
     let key = ArtifactSourceGenerationClaimKey {
@@ -650,7 +659,7 @@ async fn proposal_058_ignored_late_projection_and_runtime_facts_commit_or_rollba
 
 #[tokio::test]
 async fn proposal_058_import_cas_and_runtime_facts_share_transaction_boundary() {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let pool = test_pool().await;
     let (run_id, stage_execution_id, agent_execution_id, source_work_item_id) =
         seed_execution(&pool).await;
     let key = ArtifactSourceGenerationClaimKey {

@@ -1,0 +1,8 @@
+{
+  "conclusion": "Junie final task result matched the requested structured payload.",
+  "exit_code": 0,
+  "experiment": "exact-json",
+  "final_output_sha256": "b84c115c0507f76876524c32884eeb8c09ab0465451894234407dc8224ec9f0e",
+  "schema_version": "p089_native_conclusion_v1",
+  "status": "passed"
+}

@@ -1,0 +1,19 @@
+{
+  "schema_version": "p090_negative_fixture_v1",
+  "fixture_class": "permission_denied_preflight_does_not_launch_provider",
+  "status": "accepted_for_proposal_readiness",
+  "input": {
+    "runtime_preflight_phase": "failed_no_launch",
+    "failed_operation_class": "read_project_file",
+    "redacted_path_class": "project_source_file",
+    "failure_category": "permission_denied",
+    "remediation_allowed": false
+  },
+  "expected": {
+    "completion_boundary_subtype": "junie_runtime_tool_path_failure_before_publication",
+    "agent_status": "failed",
+    "provider_launched": false,
+    "provider_capacity_acquired": false,
+    "materializes_outputs": false
+  }
+}

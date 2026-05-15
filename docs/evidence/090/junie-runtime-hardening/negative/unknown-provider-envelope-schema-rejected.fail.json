@@ -1,0 +1,18 @@
+{
+  "schema_version": "p090_negative_fixture_v1",
+  "fixture_class": "unknown_provider_envelope_schema_rejected",
+  "status": "accepted_for_proposal_readiness",
+  "input": {
+    "source": "provider_final_text",
+    "payload_schema_version": "code_writer_engine_failure.v999",
+    "payload": {
+      "schema_version": "code_writer_engine_failure.v999",
+      "completion_boundary_subtype": "junie_progress_without_terminal_handoff"
+    }
+  },
+  "expected": {
+    "status": "provider_envelope_unrecognized",
+    "materializes_outputs": false,
+    "unknown_schema_round_trips_raw": true
+  }
+}

@@ -11,9 +11,16 @@ use std::fs;
 use chrono::Utc;
 
 async fn test_pool() -> sqlx::SqlitePool {
-    db::pool::create_pool("sqlite::memory:")
+    let pool = db::pool::create_pool("sqlite::memory:")
         .await
-        .expect("in-memory pool failed")
+        .expect("in-memory pool failed");
+    db::writer::register_shared_writer(
+        &pool,
+        std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+    )
+    .await
+    .expect("test shared DbWriter registration failed");
+    pool
 }
 
 async fn insert_run(pool: &sqlx::SqlitePool, status: &str) -> String {
