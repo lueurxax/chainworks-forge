@@ -191,6 +191,38 @@ pub async fn settle_tx(
     Ok(())
 }
 
+pub async fn settle_with_terminal_reason_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: StageExecutionId,
+    kind: StageSettlementKind,
+    at: DateTime<Utc>,
+    terminal_reason: &str,
+) -> Result<()> {
+    let id_str = id.to_string();
+    let kind_str = kind.to_string();
+    let at_str = at.to_rfc3339();
+    let status = match kind {
+        StageSettlementKind::Completed => StageStatus::Completed.to_string(),
+        StageSettlementKind::Skipped => StageStatus::Skipped.to_string(),
+        StageSettlementKind::Failed => StageStatus::Failed.to_string(),
+    };
+
+    sqlx::query(
+        r#"UPDATE stage_executions
+           SET status = ?1, settlement_kind = ?2, completed_at = ?3, terminal_reason = ?4
+           WHERE id = ?5"#,
+    )
+    .bind(status)
+    .bind(kind_str)
+    .bind(at_str)
+    .bind(terminal_reason)
+    .bind(id_str)
+    .execute(&mut **tx)
+    .await
+    .context("settle stage execution with terminal reason")?;
+    Ok(())
+}
+
 pub async fn update_validation_failure_json(
     pool: &SqlitePool,
     id: StageExecutionId,

@@ -11,21 +11,23 @@ use sqlx::SqlitePool;
 use tracing::{info, warn};
 
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, artifact_contracts,
-    code_writer_completion_receipts, projections, runs, sessions, stages, startup_repairs,
-    work_items, workflow_conflicts,
+    agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts,
+    code_writer_completion_receipts, projections, retry_stage_execution_authorities, runs,
+    sessions, side_effects, stages, startup_repairs, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
 use db::writer::{class_a_operation, DbWriter};
 use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
+use domain::approval::ApprovalDecision;
 use domain::code_writer_completion::{
     CodeWriterCompletionOutputDecisionRecord, CodeWriterCompletionReceiptRecord,
     CodeWriterCompletionTextCaptureRecord,
 };
 use domain::provider::InvokeAgentCapacityConfig;
+use domain::retry_authority::RetryAuthorityState;
 use domain::run::Run;
-use domain::stage::StageStatus;
+use domain::stage::{StageSettlementKind, StageStatus};
 
 use crate::event_bus::EventSender;
 use crate::work_queue::WorkQueue;
@@ -195,6 +197,33 @@ async fn stage_has_pending_or_running_invoke_work(
     }))
 }
 
+async fn stage_has_pending_or_running_advance_work(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+    stage_execution_id: domain::ids::StageExecutionId,
+) -> Result<bool> {
+    let items = work_items::list_by_run(pool, run_id).await?;
+    let stage_execution_id = stage_execution_id.to_string();
+    Ok(items.iter().any(|item| {
+        item.kind == WorkItemKind::AdvanceRun
+            && matches!(
+                item.status,
+                WorkItemStatus::Pending | WorkItemStatus::Running
+            )
+            && serde_json::from_str::<serde_json::Value>(&item.payload_json)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("target_stage_execution_id")
+                        .or_else(|| payload.get("stage_execution_id"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+                .as_deref()
+                == Some(stage_execution_id.as_str())
+    }))
+}
+
 async fn run_has_pending_or_running_work(
     pool: &SqlitePool,
     run_id: domain::ids::RunId,
@@ -206,6 +235,81 @@ async fn run_has_pending_or_running_work(
             WorkItemStatus::Pending | WorkItemStatus::Running
         )
     }))
+}
+
+async fn run_has_recovered_p091_orphan(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM stage_executions
+           WHERE run_id = ?1
+             AND terminal_reason = 'stale_retry_recovered'"#,
+    )
+    .bind(run_id.to_string())
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
+struct P091OrphanRepairPass {
+    id: String,
+    run_id: String,
+    mode: String,
+    disabled: bool,
+    candidates_total: i64,
+    excluded_total: i64,
+    would_repair_total: i64,
+    repaired_total: i64,
+    disabled_total: i64,
+    samples: Vec<serde_json::Value>,
+}
+
+impl P091OrphanRepairPass {
+    fn from_env(run_id: String) -> Self {
+        let disabled = std::env::var("CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let mode = if disabled {
+            "disabled".to_string()
+        } else {
+            match std::env::var("CHAINWORKS_P091_STARTUP_ORPHAN_REPAIR_MODE")
+                .unwrap_or_else(|_| "diagnostic".to_string())
+                .as_str()
+            {
+                "enforce" => "enforce".to_string(),
+                _ => "diagnostic".to_string(),
+            }
+        };
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            run_id,
+            mode,
+            disabled,
+            candidates_total: 0,
+            excluded_total: 0,
+            would_repair_total: 0,
+            repaired_total: 0,
+            disabled_total: 0,
+            samples: Vec::new(),
+        }
+    }
+
+    fn sample(&mut self, stage_execution_id: String, reason: &str) {
+        if self.samples.len() >= 20 {
+            return;
+        }
+        self.samples.push(serde_json::json!({
+            "stage_execution_id": stage_execution_id,
+            "reason": reason,
+        }));
+    }
+
+    fn exclude(&mut self, stage_execution_id: String, reason: &str) {
+        self.excluded_total += 1;
+        self.sample(stage_execution_id, reason);
+    }
 }
 
 impl RecoveryService {
@@ -369,6 +473,30 @@ impl RecoveryService {
                         run_id = %run.id,
                         error = %e,
                         "Failed to repair artifact contract normalization during startup"
+                    );
+                }
+            }
+            match self.repair_p091_orphaned_retry_attempts(run).await {
+                Ok(pass) => {
+                    if pass.repaired_total > 0 {
+                        repaired_run = true;
+                    }
+                    if pass.would_repair_total > 0 || pass.repaired_total > 0 {
+                        info!(
+                            run_id = %run.id,
+                            mode = %pass.mode,
+                            candidates = pass.candidates_total,
+                            would_repair = pass.would_repair_total,
+                            repaired = pass.repaired_total,
+                            "P091 startup orphan retry repair pass complete"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run.id,
+                        error = %e,
+                        "Failed to run P091 orphan retry repair during startup"
                     );
                 }
             }
@@ -918,6 +1046,42 @@ impl RecoveryService {
                 return Ok(requeued);
             }
 
+            let mut requeued_targeted_advance = 0_u64;
+            for authority in retry_stage_execution_authorities::list_by_run(&self.pool, run.id)
+                .await?
+                .into_iter()
+                .filter(|authority| authority.authority_state == RetryAuthorityState::Active)
+            {
+                let tx_started = std::time::Instant::now();
+                let mut tx = self
+                    .begin_transaction(
+                        "recovery.requeue_targeted_advance",
+                        format!("recovery.requeue_targeted_advance:{}", authority.id),
+                    )
+                    .await?;
+                let requeued_for_authority =
+                    work_items::requeue_running_advance_by_retry_authority_tx(
+                        &mut tx,
+                        run.id,
+                        &authority.id,
+                        authority.target_stage_execution_id,
+                        now,
+                        "startup_repair_abandoned_targeted_advance_run",
+                    )
+                    .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("recovery.requeue_targeted_advance", tx_started);
+                requeued_targeted_advance += requeued_for_authority;
+            }
+            if requeued_targeted_advance > 0 {
+                info!(
+                    run_id = %run.id,
+                    requeued = %requeued_targeted_advance,
+                    "Startup recovery requeued abandoned targeted AdvanceRun work items"
+                );
+                requeued += requeued_targeted_advance as usize;
+            }
+
             let requeued_running_advance = work_items::requeue_running_advance_by_run(
                 &self.pool,
                 run.id,
@@ -946,6 +1110,13 @@ impl RecoveryService {
                 .unwrap_or(false);
 
             if !has_pending_work {
+                if run_has_recovered_p091_orphan(&self.pool, run.id).await? {
+                    info!(
+                        run_id = %run.id,
+                        "Active run has recovered P091 orphan and no live work — suppressing generic startup_catchup"
+                    );
+                    return Ok(requeued);
+                }
                 info!(
                     run_id = %run.id,
                     "Active run with no pending/running work — enqueuing AdvanceRun"
@@ -963,6 +1134,213 @@ impl RecoveryService {
         }
 
         Ok(requeued)
+    }
+
+    async fn repair_p091_orphaned_retry_attempts(&self, run: &Run) -> Result<P091OrphanRepairPass> {
+        let mut pass = P091OrphanRepairPass::from_env(run.id.to_string());
+        let now = Utc::now();
+        if pass.disabled {
+            pass.disabled_total = 1;
+            self.record_p091_orphan_repair_pass(&pass, now).await?;
+            return Ok(pass);
+        }
+
+        let stages_for_run = stages::list_by_run(&self.pool, run.id).await?;
+        let mut repair_targets = Vec::new();
+        let transition_cursor_parked = self.transition_cursor_blocks_startup_catchup(run).await?;
+        let approvals_for_run = approvals::list_by_run(&self.pool, run.id).await?;
+        let unresolved_side_effects =
+            side_effects::list_unresolved_for_run(&self.pool, &run.id.to_string()).await?;
+        for stage in stages_for_run
+            .iter()
+            .filter(|stage| matches!(stage.status, StageStatus::Pending | StageStatus::Running))
+        {
+            if retry_stage_execution_authorities::find_active_by_target(&self.pool, stage.id)
+                .await?
+                .is_some()
+            {
+                pass.exclude(stage.id.to_string(), "active_retry_authority");
+                continue;
+            }
+            if stage_has_pending_or_running_invoke_work(&self.pool, run.id, stage.id).await?
+                || stage_has_pending_or_running_advance_work(&self.pool, run.id, stage.id).await?
+            {
+                pass.exclude(stage.id.to_string(), "live_work_item");
+                continue;
+            }
+            let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
+            if executions
+                .iter()
+                .any(|execution| execution.status == AgentStatus::Running)
+            {
+                pass.exclude(stage.id.to_string(), "live_agent_execution");
+                continue;
+            }
+            if transition_cursor_parked {
+                pass.exclude(stage.id.to_string(), "transition_cursor_parked");
+                continue;
+            }
+            if approvals_for_run.iter().any(|approval| {
+                approval.stage_id == stage.stage_id
+                    && matches!(
+                        approval.decision,
+                        ApprovalDecision::Pending | ApprovalDecision::Requested
+                    )
+            }) {
+                pass.exclude(stage.id.to_string(), "pending_approval");
+                continue;
+            }
+            if unresolved_side_effects
+                .iter()
+                .any(|effect| effect.stage_execution_id == stage.id)
+            {
+                pass.exclude(stage.id.to_string(), "unresolved_side_effect");
+                continue;
+            }
+            let runtime_facts = {
+                let mut facts_for_stage = Vec::new();
+                for execution in &executions {
+                    if let Some(facts) = agent_execution_runtime_facts::find_by_execution_id(
+                        &self.pool,
+                        execution.id,
+                    )
+                    .await?
+                    {
+                        facts_for_stage.push(facts);
+                    }
+                }
+                facts_for_stage
+            };
+            if runtime_facts.iter().any(|facts| {
+                facts
+                    .retry_after
+                    .map(|retry_after| retry_after > now)
+                    .unwrap_or(false)
+                    || matches!(
+                        facts.operator_action_hint,
+                        Some(domain::agent::OperatorActionHint::WaitUntilRetryAfter)
+                    )
+            }) {
+                pass.exclude(stage.id.to_string(), "retry_after_or_quota_wait");
+                continue;
+            }
+            if stage
+                .recovery_snapshot_json
+                .as_deref()
+                .map(recovery_snapshot_represents_wait)
+                .unwrap_or(false)
+            {
+                pass.exclude(stage.id.to_string(), "recovery_snapshot_wait");
+                continue;
+            }
+            let qualifying_sibling = stages_for_run.iter().any(|sibling| {
+                sibling.id != stage.id
+                    && sibling.stage_id == stage.stage_id
+                    && sibling.started_at >= stage.started_at
+                    && matches!(
+                        sibling.status,
+                        StageStatus::Completed
+                            | StageStatus::Failed
+                            | StageStatus::Blocked
+                            | StageStatus::Skipped
+                    )
+            });
+            if !qualifying_sibling {
+                pass.exclude(stage.id.to_string(), "no_qualifying_settled_sibling");
+                continue;
+            }
+
+            pass.candidates_total += 1;
+            pass.sample(
+                stage.id.to_string(),
+                "settled_sibling_without_live_retry_driver",
+            );
+            if pass.mode == "diagnostic" {
+                pass.would_repair_total += 1;
+                continue;
+            }
+            pass.would_repair_total += 1;
+            repair_targets.push(stage.clone());
+        }
+
+        self.record_p091_orphan_repair_pass(&pass, now).await?;
+        if pass.mode != "enforce" {
+            return Ok(pass);
+        }
+
+        for stage in repair_targets {
+            let tx_started = std::time::Instant::now();
+            let mut tx = self
+                .begin_transaction(
+                    "recovery.p091_orphan_retry_repair",
+                    format!("recovery.p091_orphan_retry_repair:{}", stage.id),
+                )
+                .await?;
+            stages::settle_with_terminal_reason_tx(
+                &mut tx,
+                stage.id,
+                StageSettlementKind::Skipped,
+                now,
+                "stale_retry_recovered",
+            )
+            .await?;
+            retry_stage_execution_authorities::create_recovered_orphan_tx(
+                &mut tx,
+                format!("p091-recovered-orphan:{}", stage.id),
+                run.id,
+                stage.stage_id.clone(),
+                stage.id,
+                "stale_retry_recovered",
+                now,
+            )
+            .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("recovery.p091_orphan_retry_repair", tx_started);
+            pass.repaired_total += 1;
+        }
+
+        self.record_p091_orphan_repair_pass(&pass, now).await?;
+        Ok(pass)
+    }
+
+    async fn record_p091_orphan_repair_pass(
+        &self,
+        pass: &P091OrphanRepairPass,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let samples = serde_json::to_string(&pass.samples)?;
+        sqlx::query(
+            r#"INSERT INTO p091_orphan_repair_passes
+               (id, mode, disabled, run_id, candidates_total, excluded_total,
+                would_repair_total, repaired_total, disabled_total,
+                bounded_samples_json, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+               ON CONFLICT(id) DO UPDATE SET
+                 mode = excluded.mode,
+                 disabled = excluded.disabled,
+                 run_id = excluded.run_id,
+                 candidates_total = excluded.candidates_total,
+                 excluded_total = excluded.excluded_total,
+                 would_repair_total = excluded.would_repair_total,
+                 repaired_total = excluded.repaired_total,
+                 disabled_total = excluded.disabled_total,
+                 bounded_samples_json = excluded.bounded_samples_json,
+                 created_at = excluded.created_at"#,
+        )
+        .bind(&pass.id)
+        .bind(&pass.mode)
+        .bind(if pass.disabled { 1 } else { 0 })
+        .bind(&pass.run_id)
+        .bind(pass.candidates_total)
+        .bind(pass.excluded_total)
+        .bind(pass.would_repair_total)
+        .bind(pass.repaired_total)
+        .bind(pass.disabled_total)
+        .bind(samples)
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn transition_cursor_blocks_startup_catchup(&self, run: &Run) -> Result<bool> {
@@ -1186,6 +1564,26 @@ async fn is_active_run(pool: &SqlitePool, run_id_str: &str) -> bool {
     status
         .map(|s| !matches!(s.as_str(), "completed" | "failed" | "cancelled"))
         .unwrap_or(false)
+}
+
+fn recovery_snapshot_represents_wait(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    [
+        "waitingapproval",
+        "waiting_approval",
+        "approval",
+        "manual_gate",
+        "retry_after",
+        "wait_until",
+        "wait_until_retry_after",
+        "provider_quota",
+        "capacity",
+        "backpressure",
+        "side_effect",
+        "transition_cursor",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 async fn rebuild_operator_read_projections(

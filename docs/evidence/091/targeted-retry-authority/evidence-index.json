@@ -7,10 +7,11 @@
     {
       "fixture_id": "p086_orphaned_retry_readback",
       "path": "docs/evidence/091/targeted-retry-authority/p086-orphaned-retry-readback.fixture.json",
-      "sha256": "c7745e6ea8e1e41a89789df5d6db9cc2169baffeb36285dd95874bd3846a9a17",
+      "sha256": "c20dd0232fa2da0beac549ee658a16b57933670c18e3b5bcc02bda94837319b8",
       "trusted_for": [
         "historical_orphan_recovery_shape",
-        "projection_rebuild_acceptance_fixture"
+        "projection_rebuild_acceptance_fixture",
+        "settled_sibling_without_live_retry_driver"
       ]
     }
   ],
@@ -24,6 +25,10 @@
     "startup orphan repair must run before projection rebuild",
     "stage terminal metadata and authority history must agree",
     "advance_run_payload_missing_target_for_authority",
+    "settled_sibling_without_live_retry_driver",
+    "CHAINWORKS_P091_STARTUP_ORPHAN_REPAIR_MODE",
+    "CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR",
+    "p091_orphan_repair_candidates_total",
     "./scripts/test-gate.sh proposal-091"
   ],
   "implementation_gate_upgrade_required": true

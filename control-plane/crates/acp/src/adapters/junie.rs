@@ -83,15 +83,14 @@ impl AcpAdapter for JunieAdapter {
         req: &ExecutionRequest,
         launch_spec: &mut AcpLaunchSpec,
     ) -> Result<()> {
-        if !junie_p090_preflight_enforced() {
-            return Ok(());
-        }
+        let enforcement_enabled = junie_p090_preflight_enforced();
         match run_junie_p090_tool_path_preflight(req, launch_spec.current_dir_override.as_deref()) {
             Ok(()) => {
                 launch_spec.runtime_tool_path_preflight_json = Some(junie_p090_preflight_json(
                     1,
                     None,
                     &["preflight_running", "passed"],
+                    enforcement_enabled,
                 ));
                 Ok(())
             }
@@ -116,7 +115,31 @@ impl AcpAdapter for JunieAdapter {
                     2,
                     Some("wrong_cwd_workspace_root"),
                     &["preflight_running", "preflight_remediating", "passed"],
+                    enforcement_enabled,
                 ));
+                Ok(())
+            }
+            Err(error) if error.to_string().contains("missing_junie_runtime_cache") => {
+                remediate_junie_runtime_cache(req).with_context(|| {
+                    "p090_junie_preflight_remediation_failed: runtime_home_cache_rebuilt"
+                })?;
+                run_junie_p090_tool_path_preflight(
+                    req,
+                    launch_spec.current_dir_override.as_deref(),
+                )
+                .context("p090_junie_preflight_remediation_failed: runtime_home_cache_rebuilt")?;
+                launch_spec.runtime_tool_path_preflight_json = Some(junie_p090_preflight_json(
+                    2,
+                    Some("runtime_home_cache_rebuilt"),
+                    &["preflight_running", "preflight_remediating", "passed"],
+                    enforcement_enabled,
+                ));
+                Ok(())
+            }
+            Err(error) if !enforcement_enabled => {
+                launch_spec.runtime_tool_path_preflight_json = Some(
+                    junie_p090_failed_diagnostic_json(&error, enforcement_enabled),
+                );
                 Ok(())
             }
             Err(error) => Err(error),
@@ -144,6 +167,7 @@ fn junie_p090_preflight_json(
     attempt_count: u64,
     remediation_applied: Option<&str>,
     lifecycle_phases: &[&str],
+    enforcement_enabled: bool,
 ) -> String {
     serde_json::json!({
         "schema": "p090_runtime_tool_path_preflight_v1",
@@ -151,12 +175,62 @@ fn junie_p090_preflight_json(
         "attempt_count": attempt_count,
         "remediation_applied": remediation_applied,
         "provider_launched": false,
-        "enforcement_enabled": true,
+        "enforcement_enabled": enforcement_enabled,
         "failed_operation_class": null,
         "redacted_path_class": null,
         "failure_category": null,
         "remediation_hint": null,
         "lifecycle_phases": lifecycle_phases,
+    })
+    .to_string()
+}
+
+fn junie_p090_failed_diagnostic_json(error: &anyhow::Error, enforcement_enabled: bool) -> String {
+    let message = error.to_string();
+    let (operation, path_class, category, hint) =
+        if message.contains("missing_provider_execution_root") {
+            (
+                "read_project_file",
+                "provider_execution_root",
+                "wrong_cwd_or_missing_project_root",
+                "retry with the canonical worktree/project root",
+            )
+        } else if message.contains("missing_junie_runtime_cache")
+            || message.contains("missing_chainworks_meta_root")
+        {
+            (
+                "read_runtime_home",
+                "junie_runtime_cache",
+                "runtime_home_unwritable",
+                "repair or recreate the Junie ACP runtime cache directory",
+            )
+        } else if message.contains("Operation not permitted") {
+            (
+                "read_project_file",
+                "project_root",
+                "operation_not_permitted",
+                "repair macOS privacy/sandbox access for the project root",
+            )
+        } else {
+            (
+                "read_project_file",
+                "project_root",
+                "permission_denied",
+                "repair filesystem permissions for the project root",
+            )
+        };
+    serde_json::json!({
+        "schema": "p090_runtime_tool_path_preflight_v1",
+        "status": "diagnostic_failed_launch_allowed",
+        "attempt_count": 1,
+        "remediation_applied": null,
+        "provider_launched": false,
+        "enforcement_enabled": enforcement_enabled,
+        "failed_operation_class": operation,
+        "redacted_path_class": path_class,
+        "failure_category": category,
+        "remediation_hint": hint,
+        "lifecycle_phases": ["preflight_running", "diagnostic_failed_launch_allowed"],
     })
     .to_string()
 }
@@ -215,6 +289,26 @@ fn run_junie_p090_tool_path_preflight(
         let _ = std::fs::remove_file(&probe);
     }
 
+    if let Some(runtime_cache) = junie_runtime_cache_dir(req) {
+        if !runtime_cache.is_dir() {
+            bail!(
+                "missing_junie_runtime_cache: p090_junie_preflight_failed: runtime cache {} is missing or not a directory",
+                runtime_cache.display()
+            );
+        }
+        let probe = runtime_cache.join(format!(
+            ".chainworks-p090-runtime-cache-preflight-{}",
+            std::process::id()
+        ));
+        std::fs::write(&probe, b"p090-preflight").with_context(|| {
+            format!(
+                "p090_junie_preflight_failed: permission denied writing runtime cache {}",
+                runtime_cache.display()
+            )
+        })?;
+        let _ = std::fs::remove_file(&probe);
+    }
+
     let temp_probe = std::env::temp_dir().join(format!(
         "chainworks-p090-junie-preflight-{}",
         std::process::id()
@@ -226,6 +320,26 @@ fn run_junie_p090_tool_path_preflight(
         )
     })?;
     let _ = std::fs::remove_file(&temp_probe);
+    Ok(())
+}
+
+fn junie_runtime_cache_dir(req: &ExecutionRequest) -> Option<PathBuf> {
+    req.chainworks_meta_root
+        .as_deref()
+        .map(PathBuf::from)
+        .map(|root| root.join("acp-runtime/junie/cache"))
+}
+
+fn remediate_junie_runtime_cache(req: &ExecutionRequest) -> Result<()> {
+    let Some(runtime_cache) = junie_runtime_cache_dir(req) else {
+        bail!("missing_junie_runtime_cache: no CHAINWORKS_META_ROOT configured for Junie cache");
+    };
+    std::fs::create_dir_all(&runtime_cache).with_context(|| {
+        format!(
+            "p090_junie_preflight_failed: create Junie runtime cache {}",
+            runtime_cache.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -258,6 +372,12 @@ mod tests {
     use super::*;
     use domain::agent::AgentStatus;
     use domain::ids::RunId;
+    use std::sync::{Mutex, OnceLock};
+
+    fn preflight_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn request() -> ExecutionRequest {
         ExecutionRequest {
@@ -332,6 +452,7 @@ mod tests {
 
     #[test]
     fn proposal_090_tool_path_preflight_checks_project_and_output_write_paths_before_launch() {
+        let _guard = preflight_env_lock();
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("AGENTS.md"), "project proof").unwrap();
         let output_path = temp
@@ -359,6 +480,7 @@ mod tests {
 
     #[test]
     fn proposal_090_tool_path_preflight_fails_before_launch_for_missing_project_root() {
+        let _guard = preflight_env_lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let mut req = request();
         req.workspace_root = temp.path().join("missing").to_string_lossy().into_owned();
@@ -373,6 +495,7 @@ mod tests {
 
     #[test]
     fn proposal_090_tool_path_preflight_remediates_wrong_cwd_once_before_launch() {
+        let _guard = preflight_env_lock();
         let previous = std::env::var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE").ok();
         std::env::set_var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE", "1");
         let temp = tempfile::tempdir().expect("tempdir");
@@ -413,6 +536,95 @@ mod tests {
         assert_eq!(preflight["status"], "passed");
         assert_eq!(preflight["attempt_count"], 2);
         assert_eq!(preflight["remediation_applied"], "wrong_cwd_workspace_root");
+        assert_eq!(
+            preflight["lifecycle_phases"],
+            serde_json::json!(["preflight_running", "preflight_remediating", "passed"])
+        );
+        if let Some(previous) = previous {
+            std::env::set_var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE", previous);
+        } else {
+            std::env::remove_var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE");
+        }
+    }
+
+    #[test]
+    fn proposal_090_tool_path_preflight_runs_in_diagnostic_mode_when_enforce_is_off() {
+        let _guard = preflight_env_lock();
+        let previous = std::env::var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE").ok();
+        std::env::set_var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE", "0");
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("AGENTS.md"), "project proof").unwrap();
+        let mut req = request();
+        req.workspace_root = temp.path().to_string_lossy().into_owned();
+        req.expected_output_paths = vec![temp
+            .path()
+            .join(".chainworks/runs/run-1/implementation/progress.md")
+            .to_string_lossy()
+            .into_owned()];
+        let adapter = JunieAdapter::new_with_binary("/bin/junie-fixture");
+        let mut launch_spec = AcpLaunchSpec::new("/bin/junie-fixture");
+
+        adapter
+            .preflight_launch(&req, &mut launch_spec)
+            .expect("diagnostic preflight should not block a valid launch");
+
+        let preflight: serde_json::Value = serde_json::from_str(
+            launch_spec
+                .runtime_tool_path_preflight_json
+                .as_deref()
+                .expect("diagnostic mode must still record real preflight facts"),
+        )
+        .unwrap();
+        assert_eq!(preflight["status"], "passed");
+        assert_eq!(preflight["attempt_count"], 1);
+        assert_eq!(preflight["enforcement_enabled"], false);
+        if let Some(previous) = previous {
+            std::env::set_var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE", previous);
+        } else {
+            std::env::remove_var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE");
+        }
+    }
+
+    #[test]
+    fn proposal_090_tool_path_preflight_remediates_missing_runtime_cache_once() {
+        let _guard = preflight_env_lock();
+        let previous = std::env::var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE").ok();
+        std::env::set_var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE", "1");
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("AGENTS.md"), "project proof").unwrap();
+        let meta_root = temp.path().join(".chainworks/runs/run-1");
+        let mut req = request();
+        req.workspace_root = temp.path().to_string_lossy().into_owned();
+        req.chainworks_meta_root = Some(meta_root.to_string_lossy().into_owned());
+        req.expected_output_paths = vec![meta_root
+            .join("implementation/progress.md")
+            .to_string_lossy()
+            .into_owned()];
+        let adapter = JunieAdapter::new_with_binary("/bin/junie-fixture");
+        let mut launch_spec = AcpLaunchSpec::new("/bin/junie-fixture");
+
+        adapter
+            .preflight_launch(&req, &mut launch_spec)
+            .expect("missing runtime cache should be rebuilt once before launch");
+
+        let runtime_cache = meta_root.join("acp-runtime/junie/cache");
+        assert!(
+            runtime_cache.is_dir(),
+            "runtime-home/cache remediation must create the Junie cache directory"
+        );
+        let preflight: serde_json::Value = serde_json::from_str(
+            launch_spec
+                .runtime_tool_path_preflight_json
+                .as_deref()
+                .expect("runtime cache remediation must be recorded"),
+        )
+        .unwrap();
+        assert_eq!(preflight["status"], "passed");
+        assert_eq!(preflight["attempt_count"], 2);
+        assert_eq!(
+            preflight["remediation_applied"],
+            "runtime_home_cache_rebuilt"
+        );
         assert_eq!(
             preflight["lifecycle_phases"],
             serde_json::json!(["preflight_running", "preflight_remediating", "passed"])

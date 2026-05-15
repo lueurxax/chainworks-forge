@@ -14,7 +14,8 @@
   ],
   "limitations": [
     "This fixture captures the local P086 diagnostic shape for proposal readiness.",
-    "The implementation gate must recreate this shape synthetically if the local run evidence is unavailable."
+    "The implementation gate must recreate this shape synthetically if the local run evidence is unavailable.",
+    "The historical local readback does not include stage timestamp fields, so this fixture proves settled_sibling_without_live_retry_driver rather than newer_settled_sibling."
   ],
   "facts": {
     "retry_command_journal_id": "96ad2abe-e906-4422-a0d3-2f7a30912f0a",
@@ -24,8 +25,19 @@
     "retry_attempt_number": 8,
     "settled_sibling_stage_execution_id": "36ce1846-8d80-4ebf-afb3-7ba6fcaa75ad",
     "settled_sibling_status": "completed",
+    "historical_timestamp_evidence": "unavailable",
+    "qualifying_predicate": "settled_sibling_without_live_retry_driver",
+    "predicate_inputs": {
+      "live_work_items_for_retry": 0,
+      "active_agent_executions_for_retry": 0,
+      "durable_retry_authority_active_for_retry": false,
+      "settled_sibling_status": "completed",
+      "stage_summaries_surface_retry_as_pending": true,
+      "blocked_truth_preserved_orphan": true
+    },
     "live_work_items_for_retry": 0,
     "active_agent_executions_for_retry": 0,
+    "durable_retry_authority_active_for_retry": false,
     "stage_summaries_surface_retry_as_pending": true,
     "blocked_truth_preserved_orphan": true
   },

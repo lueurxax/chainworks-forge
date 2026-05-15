@@ -73,6 +73,12 @@ pub struct GqlRun {
     pub code_writer_completion_receipts: Vec<GqlCodeWriterCompletionReceipt>,
     /// P088: Public implementation-completion summary with closed vocabularies and unknown metadata.
     pub implementation_completion: GqlImplementationCompletionSummary,
+    /// P091: Active retry-stage execution authority, when a targeted retry is in force.
+    pub retry_authority_json: Option<Json<serde_json::Value>>,
+    /// P091: Durable retry-stage authority history for this run.
+    pub retry_authority_history_json: Option<Json<serde_json::Value>>,
+    /// P091: Latest startup orphan-repair rollout counters and samples.
+    pub p091_orphan_repair_readback_json: Option<Json<serde_json::Value>>,
     /// P077: Active closeout readiness summary (via CloseoutReadinessSummaryAccessor).
     pub closeout_readiness_summary_json: Option<Json<serde_json::Value>>,
     /// P077: Documented alias for the implementation closeout readiness summary.
@@ -128,6 +134,9 @@ impl From<Run> for GqlRun {
             side_effect_readback_json: None,
             code_writer_completion_receipts: Vec::new(),
             implementation_completion: GqlImplementationCompletionSummary::not_attempted(),
+            retry_authority_json: None,
+            retry_authority_history_json: None,
+            p091_orphan_repair_readback_json: None,
             closeout_readiness_summary_json: None,
             implementation_closeout_readiness_summary: None,
         }
@@ -201,6 +210,9 @@ impl From<RunProjectionRow> for GqlRun {
             side_effect_readback_json: None,
             code_writer_completion_receipts: Vec::new(),
             implementation_completion: GqlImplementationCompletionSummary::not_attempted(),
+            retry_authority_json: None,
+            retry_authority_history_json: None,
+            p091_orphan_repair_readback_json: None,
             closeout_readiness_summary_json: None,
             implementation_closeout_readiness_summary: None,
         }
@@ -228,6 +240,8 @@ pub struct GqlImplementationCompletionSummary {
     pub runtime_tool_path_preflight_json: Option<String>,
     pub final_completion_payload_capture_json: Option<String>,
     pub failure_envelope_authority: Option<String>,
+    pub engine_failure_envelope_json: Option<String>,
+    pub repair_failure_envelope_json: Option<String>,
     pub repair_materialization_summary_json: Option<String>,
     pub repair_materialization_mode: Option<String>,
     pub strict_final_payload_enabled: bool,
@@ -317,6 +331,8 @@ impl From<ImplementationCompletionSummary> for GqlImplementationCompletionSummar
             runtime_tool_path_preflight_json: summary.runtime_tool_path_preflight_json,
             final_completion_payload_capture_json: summary.final_completion_payload_capture_json,
             failure_envelope_authority: summary.failure_envelope_authority,
+            engine_failure_envelope_json: summary.engine_failure_envelope_json,
+            repair_failure_envelope_json: summary.repair_failure_envelope_json,
             repair_materialization_summary_json: summary.repair_materialization_summary_json,
             repair_materialization_mode: summary.repair_materialization_mode,
             strict_final_payload_enabled: summary.strict_final_payload_enabled,
@@ -418,6 +434,8 @@ pub struct GqlCodeWriterCompletionReceipt {
     pub runtime_preflight_phase: Option<String>,
     pub runtime_tool_path_preflight_json: Option<String>,
     pub final_completion_payload_capture_json: Option<String>,
+    pub engine_failure_envelope_json: Option<String>,
+    pub repair_failure_envelope_json: Option<String>,
     pub repair_materialization_summary_json: Option<String>,
     pub repair_materialization_mode: Option<String>,
     pub strict_final_payload_enabled: bool,
@@ -565,6 +583,8 @@ impl GqlCodeWriterCompletionReceipt {
             runtime_preflight_phase: receipt.runtime_preflight_phase,
             runtime_tool_path_preflight_json: receipt.runtime_tool_path_preflight_json,
             final_completion_payload_capture_json: receipt.final_completion_payload_capture_json,
+            engine_failure_envelope_json: receipt.engine_failure_envelope_json,
+            repair_failure_envelope_json: receipt.repair_failure_envelope_json,
             repair_materialization_summary_json: receipt.repair_materialization_summary_json,
             repair_materialization_mode: receipt.repair_materialization_mode,
             strict_final_payload_enabled: receipt.strict_final_payload_enabled,

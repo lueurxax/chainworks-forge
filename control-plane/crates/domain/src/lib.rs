@@ -19,6 +19,7 @@ pub mod mediation;
 pub mod operator_action_routing;
 pub mod proposal_gate_result;
 pub mod provider;
+pub mod retry_authority;
 pub mod retry_instruction;
 pub mod risk_lineage;
 pub mod routing;

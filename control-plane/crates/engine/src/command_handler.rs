@@ -14,8 +14,9 @@ use tracing::{info, warn};
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
     artifact_contracts, closeout, code_writer_completion_receipts, command_journal, ideas,
-    legacy_discovery_overrides, projections, retry_operator_instructions, runs, scheduler,
-    sessions, stages, work_items, workflow_conflicts,
+    legacy_discovery_overrides, projections, retry_operator_instructions,
+    retry_stage_execution_authorities, runs, scheduler, sessions, stages, work_items,
+    workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
@@ -33,6 +34,9 @@ use domain::proposal_gate_result::{
     ProposalGateFailureClassification, ProposalGateLineage, ProposalGateResult, ProposalGateStatus,
 };
 use domain::provider::InvokeAgentCapacityConfig;
+use domain::retry_authority::{
+    RetryAuthorityEntryKind, RetryAuthorityState, RetryStageExecutionAuthority,
+};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::workflow_conflict::{
@@ -2544,6 +2548,7 @@ impl CommandHandler {
                 };
                 let retry_advance_work_item_id = new_stage.id.to_string();
                 let retry_invoke_work_item_id = format!("p058-invoke:{}:0", new_stage.id);
+                let retry_authority_id = format!("p091-retry-authority:{}", new_stage.id);
                 apply_quota_retry_budget_for_stage_tx(
                     &mut retry_tx,
                     c.run_id,
@@ -2575,6 +2580,34 @@ impl CommandHandler {
                 self.maybe_inject_retry_stage_failure("settle_old_stage")?;
                 stages::insert_tx(&mut retry_tx, &new_stage).await?;
                 self.maybe_inject_retry_stage_failure("insert_new_stage")?;
+                retry_stage_execution_authorities::supersede_active_for_stage_tx(
+                    &mut retry_tx,
+                    c.run_id,
+                    &c.stage_id,
+                    now,
+                    "superseded_by_new_retry",
+                )
+                .await?;
+                retry_stage_execution_authorities::create_tx(
+                    &mut retry_tx,
+                    &RetryStageExecutionAuthority {
+                        id: retry_authority_id.clone(),
+                        run_id: c.run_id,
+                        stage_id: c.stage_id.clone(),
+                        target_stage_execution_id: new_stage.id,
+                        entry_kind: RetryAuthorityEntryKind::FullStageRetry,
+                        source_command_journal_id: Some(journal_id.to_string()),
+                        source_retry_work_item_id: Some(retry_advance_work_item_id.clone()),
+                        source_invoke_work_item_id: None,
+                        source_agent_execution_id: None,
+                        authority_state: RetryAuthorityState::Active,
+                        created_at: now,
+                        updated_at: now,
+                        terminal_reason: None,
+                    },
+                )
+                .await?;
+                self.maybe_inject_retry_stage_failure("create_retry_authority")?;
                 sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
                     .bind(RunStatus::Running.to_string())
                     .bind(c.stage_id.clone())
@@ -2658,11 +2691,18 @@ impl CommandHandler {
                 work_items::enqueue_tx(
                     &mut retry_tx,
                     &WorkItem {
-                        id: retry_advance_work_item_id,
+                        id: retry_advance_work_item_id.clone(),
                         kind: WorkItemKind::AdvanceRun,
                         payload_json: serde_json::json!({
+                            "schema_version": "advance_run_payload.v1",
                             "run_id": c.run_id.to_string(),
-                            "stage_id": c.stage_id.clone()
+                            "stage_id": c.stage_id.clone(),
+                            "target_stage_execution_id": new_stage.id.to_string(),
+                            "retry_authority_id": retry_authority_id,
+                            "source_stage_execution_id": old_stage.id.to_string(),
+                            "source_work_item_id": retry_advance_work_item_id,
+                            "enqueue_reason": "retry_stage",
+                            "reason": "operator_full_stage_retry"
                         })
                         .to_string(),
                         status: WorkItemStatus::Pending,
@@ -4083,6 +4123,7 @@ impl CommandHandler {
         };
         let retry_advance_work_item_id = new_stage.id.to_string();
         let retry_invoke_work_item_id = format!("p058-invoke:{}:0", new_stage.id);
+        let retry_authority_id = format!("p091-retry-authority:{}", new_stage.id);
         let retry_tx_started = Instant::now();
         let mut retry_tx = self
             .begin_command_transaction("command.RetryStage", journal.id.clone())
@@ -4118,6 +4159,33 @@ impl CommandHandler {
         )
         .await?;
         stages::insert_tx(&mut retry_tx, &new_stage).await?;
+        retry_stage_execution_authorities::supersede_active_for_stage_tx(
+            &mut retry_tx,
+            run_id,
+            stage_id,
+            now,
+            "superseded_by_new_retry",
+        )
+        .await?;
+        retry_stage_execution_authorities::create_tx(
+            &mut retry_tx,
+            &RetryStageExecutionAuthority {
+                id: retry_authority_id.clone(),
+                run_id,
+                stage_id: stage_id.to_string(),
+                target_stage_execution_id: new_stage.id,
+                entry_kind: RetryAuthorityEntryKind::FullStageRetry,
+                source_command_journal_id: Some(journal_id.to_string()),
+                source_retry_work_item_id: Some(retry_advance_work_item_id.clone()),
+                source_invoke_work_item_id: None,
+                source_agent_execution_id: None,
+                authority_state: RetryAuthorityState::Active,
+                created_at: now,
+                updated_at: now,
+                terminal_reason: None,
+            },
+        )
+        .await?;
         artifact_contracts::mark_active_claims_superseded_pending_retry_for_stage_tx(
             &mut retry_tx,
             run_id,
@@ -4171,11 +4239,18 @@ impl CommandHandler {
         work_items::enqueue_tx(
             &mut retry_tx,
             &WorkItem {
-                id: retry_advance_work_item_id,
+                id: retry_advance_work_item_id.clone(),
                 kind: WorkItemKind::AdvanceRun,
                 payload_json: serde_json::json!({
+                    "schema_version": "advance_run_payload.v1",
                     "run_id": run_id.to_string(),
-                    "stage_id": stage_id
+                    "stage_id": stage_id,
+                    "target_stage_execution_id": new_stage.id.to_string(),
+                    "retry_authority_id": retry_authority_id,
+                    "source_stage_execution_id": old_stage.id.to_string(),
+                    "source_work_item_id": retry_advance_work_item_id,
+                    "enqueue_reason": "retry_stage",
+                    "reason": retry_reason
                 })
                 .to_string(),
                 status: WorkItemStatus::Pending,
@@ -4415,6 +4490,7 @@ impl CommandHandler {
             "p058-targeted-retry:{}:{}",
             new_stage.id, agent_execution_id
         );
+        let retry_authority_id = format!("p091-retry-authority:{}", new_stage.id);
         if let Some(object) = retry_payload.as_object_mut() {
             object.insert("run_id".into(), serde_json::json!(run_id.to_string()));
             object.insert("stage_id".into(), serde_json::json!(stage_id));
@@ -4422,14 +4498,36 @@ impl CommandHandler {
                 "stage_execution_id".into(),
                 serde_json::json!(new_stage.id.to_string()),
             );
+            object.insert(
+                "target_stage_execution_id".into(),
+                serde_json::json!(new_stage.id.to_string()),
+            );
+            object.insert(
+                "retry_authority_id".into(),
+                serde_json::json!(retry_authority_id.clone()),
+            );
+            object.insert(
+                "source_stage_execution_id".into(),
+                serde_json::json!(old_stage.id.to_string()),
+            );
+            object.insert(
+                "source_agent_execution_id".into(),
+                serde_json::json!(agent_execution_id.to_string()),
+            );
+            object.insert(
+                "source_work_item_id".into(),
+                serde_json::json!(source_item.id.clone()),
+            );
             object.remove("p058_claimed");
             object.insert(
                 "targeted_retry".into(),
                 serde_json::json!({
                     "journal_id": journal_id,
+                    "retry_authority_id": retry_authority_id.clone(),
+                    "target_stage_execution_id": new_stage.id.to_string(),
                     "source_stage_execution_id": old_stage.id.to_string(),
                     "source_agent_execution_id": agent_execution_id.to_string(),
-                    "source_work_item_id": source_item.id,
+                    "source_work_item_id": source_item.id.clone(),
                     "reason": "operator_targeted_retry"
                 }),
             );
@@ -4517,6 +4615,33 @@ impl CommandHandler {
         )
         .await?;
         stages::insert_tx(&mut retry_tx, &new_stage).await?;
+        retry_stage_execution_authorities::supersede_active_for_stage_tx(
+            &mut retry_tx,
+            run_id,
+            stage_id,
+            now,
+            "superseded_by_new_targeted_retry",
+        )
+        .await?;
+        retry_stage_execution_authorities::create_tx(
+            &mut retry_tx,
+            &RetryStageExecutionAuthority {
+                id: retry_authority_id,
+                run_id,
+                stage_id: stage_id.to_string(),
+                target_stage_execution_id: new_stage.id,
+                entry_kind: RetryAuthorityEntryKind::TargetedAgentRetry,
+                source_command_journal_id: Some(journal_id.to_string()),
+                source_retry_work_item_id: None,
+                source_invoke_work_item_id: Some(retry_work_item_id.clone()),
+                source_agent_execution_id: Some(agent_execution_id.to_string()),
+                authority_state: RetryAuthorityState::Active,
+                created_at: now,
+                updated_at: now,
+                terminal_reason: None,
+            },
+        )
+        .await?;
         sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
             .bind(RunStatus::Running.to_string())
             .bind(stage_id)

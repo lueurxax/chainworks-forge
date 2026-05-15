@@ -19,7 +19,7 @@
         "size_bytes": 1972
       },
       "preflight.json": {
-        "sha256": "7ccaa9588553ffd97f3b44717b3e74c85b08d21f1a674fb3bbd3ab7c090c7b0f",
+        "sha256": "169150733e2df043a88d0f67bf2694e69e9410d5c7fdc15190e4acb1ee34c8d4",
         "size_bytes": 557
       },
       "receipt.json": {
@@ -51,10 +51,10 @@
     "status": "passed"
   },
   "acp_canary_status": "passed",
-  "audited_git_sha": "225bac4e47b135d92c4fe2de243dd13c4647be19",
+  "audited_git_sha": "4e78ac642528945cec274c602d5fb1c410e7865e",
   "live_gate_run": {
     "path": "docs/evidence/089/junie-structured-output-canary/live-gate-run.json",
-    "sha256": "168ca0c8c351e1fd73981954b3a925014d69e44b78e4a1a10d193d789cd479d0",
+    "sha256": "719703317b2e5899dc3c8a4132658df7252633638e30fc0086d33537672c76f7",
     "size_bytes": 2412
   },
   "native_experiments": [
@@ -187,8 +187,8 @@
   "proof_critical_files": [
     {
       "path": "scripts/test-gate.sh",
-      "sha256": "204c3c1b9f0324a413860d2237f98eac4e969d3a94e741bcfc1d64e63e241b5c",
-      "size_bytes": 346872
+      "sha256": "eacee969da24c04cae930c9b7cc3a4d74a857228612478a9f80a7983ee0e97da",
+      "size_bytes": 352513
     },
     {
       "path": "scripts/proposal-089-refresh-evidence.py",
@@ -197,8 +197,8 @@
     },
     {
       "path": "control-plane/crates/acp/src/adapters/junie.rs",
-      "sha256": "06d5491dc5b8fc72b76a81efd83af3d802555dc0c9d305bed20629a43afe867e",
-      "size_bytes": 18086
+      "sha256": "9ea5cad9c0aa1e04e5f6cabfda9633bc0bd810afaa850a5eba43e2e7a79e5f38",
+      "size_bytes": 27029
     },
     {
       "path": "control-plane/crates/acp/src/transport.rs",
@@ -212,8 +212,8 @@
     },
     {
       "path": "control-plane/crates/engine/src/executor.rs",
-      "sha256": "33a8eec691102c155bd4009ebe83945cd94bd2f694fcf37ec885137c3183792f",
-      "size_bytes": 687155
+      "sha256": "5c86fba37e2a8a113ecfb597b12f725f9364226d04eefe8da50ae0a5cde2ecce",
+      "size_bytes": 716433
     },
     {
       "path": "control-plane/crates/engine/src/worktree_fingerprint.rs",
@@ -226,6 +226,6 @@
       "size_bytes": 72649
     }
   ],
-  "recorded_at": "2026-05-14T19:50:41.901467+00:00",
+  "recorded_at": "2026-05-15T05:35:44.621257+00:00",
   "schema_version": "p089_evidence_index_v1"
 }

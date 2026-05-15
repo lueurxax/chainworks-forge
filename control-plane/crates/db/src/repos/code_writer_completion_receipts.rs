@@ -153,6 +153,7 @@ pub async fn upsert_tx(
             failure_class, provider_runtime_family, completion_boundary_subtype,
             final_payload_status, progress_before_handoff, runtime_preflight_phase,
             runtime_tool_path_preflight_json, final_completion_payload_capture_json,
+            engine_failure_envelope_json, repair_failure_envelope_json,
             repair_materialization_summary_json, repair_materialization_mode,
             strict_final_payload_enabled, staged_repair_settlement_enabled,
             terminal_response_status, completion_turn_attempted,
@@ -167,7 +168,7 @@ pub async fn upsert_tx(
                    ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
                    ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41,
                    ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54,
-                   ?55)
+                   ?55, ?56, ?57)
            ON CONFLICT(agent_execution_id) DO UPDATE SET
              id = excluded.id,
              run_id = excluded.run_id,
@@ -197,6 +198,8 @@ pub async fn upsert_tx(
              runtime_preflight_phase = excluded.runtime_preflight_phase,
              runtime_tool_path_preflight_json = excluded.runtime_tool_path_preflight_json,
              final_completion_payload_capture_json = excluded.final_completion_payload_capture_json,
+             engine_failure_envelope_json = excluded.engine_failure_envelope_json,
+             repair_failure_envelope_json = excluded.repair_failure_envelope_json,
              repair_materialization_summary_json = excluded.repair_materialization_summary_json,
              repair_materialization_mode = excluded.repair_materialization_mode,
              strict_final_payload_enabled = excluded.strict_final_payload_enabled,
@@ -253,6 +256,8 @@ pub async fn upsert_tx(
     .bind(&receipt.runtime_preflight_phase)
     .bind(&receipt.runtime_tool_path_preflight_json)
     .bind(&receipt.final_completion_payload_capture_json)
+    .bind(&receipt.engine_failure_envelope_json)
+    .bind(&receipt.repair_failure_envelope_json)
     .bind(&receipt.repair_materialization_summary_json)
     .bind(&receipt.repair_materialization_mode)
     .bind(receipt.strict_final_payload_enabled)
@@ -718,6 +723,8 @@ fn receipt_select_sql(where_clause: &str) -> String {
                   code_writer_completion_receipts.runtime_preflight_phase,
                   code_writer_completion_receipts.runtime_tool_path_preflight_json,
                   code_writer_completion_receipts.final_completion_payload_capture_json,
+                  code_writer_completion_receipts.engine_failure_envelope_json,
+                  code_writer_completion_receipts.repair_failure_envelope_json,
                   code_writer_completion_receipts.repair_materialization_summary_json,
                   code_writer_completion_receipts.repair_materialization_mode,
                   code_writer_completion_receipts.strict_final_payload_enabled,
@@ -786,6 +793,8 @@ fn parse_receipt_row(row: &sqlx::sqlite::SqliteRow) -> Result<CodeWriterCompleti
         runtime_preflight_phase: row.get("runtime_preflight_phase"),
         runtime_tool_path_preflight_json: row.get("runtime_tool_path_preflight_json"),
         final_completion_payload_capture_json: row.get("final_completion_payload_capture_json"),
+        engine_failure_envelope_json: row.get("engine_failure_envelope_json"),
+        repair_failure_envelope_json: row.get("repair_failure_envelope_json"),
         repair_materialization_summary_json: row.get("repair_materialization_summary_json"),
         repair_materialization_mode: row.get("repair_materialization_mode"),
         strict_final_payload_enabled: row.get("strict_final_payload_enabled"),

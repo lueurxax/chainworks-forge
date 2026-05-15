@@ -7,8 +7,8 @@ use tracing::{debug, error, info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
-    closeout, ideas, lead_conflict_mediations, projections, runs, stages, work_items,
-    workflow_conflicts,
+    closeout, ideas, lead_conflict_mediations, projections, retry_stage_execution_authorities,
+    runs, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
@@ -20,8 +20,9 @@ use domain::artifact_contracts::{
 };
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::events::DomainEvent;
-use domain::ids::{ApprovalId, ArtifactId, RunId};
+use domain::ids::{ApprovalId, ArtifactId, RunId, StageExecutionId};
 use domain::proposal_gate_result::{ProposalGateResult, ProposalGateStatus};
+use domain::retry_authority::{AdvanceRunPayloadV1, AdvanceRunTargetMode, RetryAuthorityState};
 use domain::run::RunStatus;
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::workflow_conflict::{
@@ -138,11 +139,182 @@ impl Orchestrator {
 
         // ── Workflow-driven state machine ────────────────────────────────
         if run.workflow_yaml_path.is_some() && run.agent_catalog_yaml_path.is_some() {
-            return self.advance_run_workflow(run_id, &run).await;
+            return self.advance_run_workflow(run_id, &run, None).await;
         }
 
         // ── Legacy flat-stage orchestration ──────────────────────────────
         self.advance_run_flat(run_id, &run).await
+    }
+
+    pub async fn advance_run_from_payload(&self, payload: &AdvanceRunPayloadV1) -> Result<()> {
+        if payload.target_mode() == AdvanceRunTargetMode::LegacyRunScoped {
+            return self.advance_run(payload.run_id).await;
+        }
+
+        let stage_id = payload
+            .stage_id
+            .as_deref()
+            .context("targeted AdvanceRun missing stage_id after validation")?;
+        let target_stage_execution_id = payload
+            .target_stage_execution_id
+            .context("targeted AdvanceRun missing target_stage_execution_id after validation")?;
+        let retry_authority_id = payload
+            .retry_authority_id
+            .as_deref()
+            .context("targeted AdvanceRun missing retry_authority_id after validation")?;
+
+        let target_stage = stages::find_by_id(&self.pool, target_stage_execution_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "advance_run_target_missing: target stage {target_stage_execution_id} not found"
+                )
+            })?;
+        if target_stage.run_id != payload.run_id {
+            anyhow::bail!(
+                "advance_run_target_wrong_run: target stage {} belongs to run {}, not {}",
+                target_stage.id,
+                target_stage.run_id,
+                payload.run_id
+            );
+        }
+        if target_stage.stage_id != stage_id {
+            anyhow::bail!(
+                "advance_run_target_wrong_stage: target stage {} belongs to stage {}, not {}",
+                target_stage.id,
+                target_stage.stage_id,
+                stage_id
+            );
+        }
+
+        let authority = retry_stage_execution_authorities::find_by_id(
+            &self.pool,
+            retry_authority_id,
+        )
+        .await?
+        .with_context(|| {
+            format!("advance_run_authority_missing: retry authority {retry_authority_id} not found")
+        })?;
+        if authority.run_id != payload.run_id || authority.stage_id != stage_id {
+            anyhow::bail!(
+                "advance_run_authority_target_mismatch: authority {} belongs to run {} stage {}, not run {} stage {}",
+                authority.id,
+                authority.run_id,
+                authority.stage_id,
+                payload.run_id,
+                stage_id
+            );
+        }
+        if authority.target_stage_execution_id != target_stage_execution_id {
+            anyhow::bail!(
+                "advance_run_authority_target_mismatch: authority {} targets {}, payload targets {}",
+                authority.id,
+                authority.target_stage_execution_id,
+                target_stage_execution_id
+            );
+        }
+        match authority.authority_state {
+            RetryAuthorityState::Active => {}
+            RetryAuthorityState::Superseded | RetryAuthorityState::Invalid => {
+                info!(
+                    run_id = %payload.run_id,
+                    retry_authority_id = %authority.id,
+                    state = %authority.authority_state,
+                    "advance_run_authority_superseded: targeted AdvanceRun is stale; no-op"
+                );
+                return Ok(());
+            }
+            RetryAuthorityState::Terminalized | RetryAuthorityState::RecoveredOrphan => {
+                if stage_is_terminal(&target_stage.status) {
+                    info!(
+                        run_id = %payload.run_id,
+                        retry_authority_id = %authority.id,
+                        state = %authority.authority_state,
+                        "advance_run_authority_superseded: targeted AdvanceRun already terminal; no-op"
+                    );
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "advance_run_authority_superseded: retry authority {} is {}, but target {} is still {}",
+                    authority.id,
+                    authority.authority_state,
+                    target_stage.id,
+                    target_stage.status
+                );
+            }
+        }
+
+        if let Some(active_authority) = retry_stage_execution_authorities::find_active_by_run_stage(
+            &self.pool,
+            payload.run_id,
+            stage_id,
+        )
+        .await?
+        {
+            if active_authority.id != retry_authority_id {
+                anyhow::bail!(
+                    "advance_run_authority_conflict: active authority {} already owns run {} stage {}",
+                    active_authority.id,
+                    payload.run_id,
+                    stage_id
+                );
+            }
+        }
+
+        if stage_is_terminal(&target_stage.status) {
+            anyhow::bail!(
+                "advance_run_target_unexpected_terminal: target stage {} is {} while authority {} is active",
+                target_stage.id,
+                target_stage.status,
+                authority.id
+            );
+        }
+
+        let run = match runs::find_by_id(&self.pool, payload.run_id).await? {
+            Some(r) => r,
+            None => {
+                warn!(run_id = %payload.run_id, "targeted advance_run: run not found");
+                return Ok(());
+            }
+        };
+        if run.status.is_terminal() {
+            projections::rebuild_all_for_run(&self.pool, payload.run_id).await?;
+            return Ok(());
+        }
+        if run.workflow_yaml_path.is_some() && run.agent_catalog_yaml_path.is_some() {
+            self.advance_run_workflow(payload.run_id, &run, Some(target_stage_execution_id))
+                .await?;
+        } else {
+            anyhow::bail!("targeted AdvanceRun is only supported for workflow-backed runs");
+        }
+
+        let refreshed_target = stages::find_by_id(&self.pool, target_stage_execution_id).await?;
+        if matches!(
+            refreshed_target.as_ref().map(|stage| &stage.status),
+            Some(
+                StageStatus::Completed
+                    | StageStatus::Failed
+                    | StageStatus::Blocked
+                    | StageStatus::Skipped
+            )
+        ) {
+            let mut tx = self
+                .begin_orchestrator_transaction(
+                    "retry_authority.terminalize_after_advance",
+                    format!("retry-authority-terminalize:{retry_authority_id}"),
+                )
+                .await?;
+            retry_stage_execution_authorities::mark_terminalized_tx(
+                &mut tx,
+                retry_authority_id,
+                Utc::now(),
+                "target_stage_terminal",
+            )
+            .await?;
+            tx.commit().await?;
+        }
+
+        Ok(())
     }
 
     // =====================================================================
@@ -159,7 +331,12 @@ impl Orchestrator {
         Ok(())
     }
 
-    async fn advance_run_workflow(&self, run_id: RunId, run: &domain::run::Run) -> Result<()> {
+    async fn advance_run_workflow(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        target_stage_execution_id: Option<StageExecutionId>,
+    ) -> Result<()> {
         let workflow_path = run.workflow_yaml_path.as_deref().unwrap();
         let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap();
         let plan = match (
@@ -188,9 +365,27 @@ impl Orchestrator {
             _ => workflow::compiler::compile(workflow_path, catalog_path)?,
         };
 
-        let current_state_id = run
-            .current_state
-            .clone()
+        let targeted_stage = if let Some(target_id) = target_stage_execution_id {
+            let stage = stages::find_by_id(&self.pool, target_id)
+                .await?
+                .with_context(|| format!("targeted AdvanceRun stage {target_id} vanished"))?;
+            if stage.run_id != run_id {
+                anyhow::bail!(
+                    "targeted AdvanceRun stage {} belongs to run {}, not {}",
+                    stage.id,
+                    stage.run_id,
+                    run_id
+                );
+            }
+            Some(stage)
+        } else {
+            None
+        };
+
+        let current_state_id = targeted_stage
+            .as_ref()
+            .map(|stage| stage.stage_id.clone())
+            .or_else(|| run.current_state.clone())
             .unwrap_or_else(|| plan.initial_state.clone());
 
         let state = match plan.states.get(&current_state_id) {
@@ -204,10 +399,14 @@ impl Orchestrator {
         let all_stages = stages::list_by_run(&self.pool, run_id).await?;
 
         // Find the latest stage for the current state (highest iteration).
-        let current_stage = all_stages
-            .iter()
-            .filter(|s| s.stage_id == current_state_id)
-            .last();
+        let current_stage = if let Some(target_stage) = targeted_stage.as_ref() {
+            Some(target_stage)
+        } else {
+            all_stages
+                .iter()
+                .filter(|s| s.stage_id == current_state_id)
+                .last()
+        };
 
         // ── Case 1: stage in progress — wait or check task completion ──
         //
@@ -227,25 +426,26 @@ impl Orchestrator {
         // not be re-evaluated — we need to create a new stage instead.
         // Stale detection applies to any terminal status (Completed/Failed/etc)
         // if the workflow has already moved past this state and looped back.
-        let stage_is_stale = current_stage
-            .filter(|s| {
-                matches!(
-                    s.status,
-                    StageStatus::Completed
-                        | StageStatus::Failed
-                        | StageStatus::Blocked
-                        | StageStatus::Skipped
-                )
-            })
-            .map(|terminal_stage| {
-                // If any other stage (different state_id) was started AFTER
-                // this one, the workflow has moved past this state and looped back.
-                all_stages.iter().any(|other| {
-                    other.stage_id != current_state_id
-                        && other.started_at > terminal_stage.started_at
+        let stage_is_stale = target_stage_execution_id.is_none()
+            && current_stage
+                .filter(|s| {
+                    matches!(
+                        s.status,
+                        StageStatus::Completed
+                            | StageStatus::Failed
+                            | StageStatus::Blocked
+                            | StageStatus::Skipped
+                    )
                 })
-            })
-            .unwrap_or(false);
+                .map(|terminal_stage| {
+                    // If any other stage (different state_id) was started AFTER
+                    // this one, the workflow has moved past this state and looped back.
+                    all_stages.iter().any(|other| {
+                        other.stage_id != current_state_id
+                            && other.started_at > terminal_stage.started_at
+                    })
+                })
+                .unwrap_or(false);
 
         if let Some(stage) = current_stage {
             // BUG 4 fix: Deduplication guard. When multiple AdvanceRun items
@@ -6299,6 +6499,13 @@ fn payload_matches_stage_execution(payload_json: &str, expected_se_id: &str) -> 
                 .map(|s| s == expected_se_id)
         })
         .unwrap_or(false)
+}
+
+fn stage_is_terminal(status: &StageStatus) -> bool {
+    matches!(
+        status,
+        StageStatus::Completed | StageStatus::Failed | StageStatus::Blocked | StageStatus::Skipped
+    )
 }
 
 /// Build prompt for a specific task. Mirrors Swift `RuntimeSessionBridge.buildTaskDirective`:

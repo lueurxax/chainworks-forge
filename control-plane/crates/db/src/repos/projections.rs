@@ -122,6 +122,10 @@ pub struct StageSummaryRow {
     pub has_artifacts: bool,
     pub has_pending_approval: bool,
     pub has_validation_failure: bool,
+    pub terminal_reason: Option<String>,
+    pub retry_authority_id: Option<String>,
+    pub is_retry_authoritative: bool,
+    pub retry_authority_state: Option<String>,
     pub projection_present: bool,
     pub projection_updated_at: Option<String>,
     pub projection_lag: bool,
@@ -279,6 +283,10 @@ pub async fn list_stages_projection(
                   COALESCE(ss.has_artifacts, 0) AS has_artifacts,
                   COALESCE(ss.has_pending_approval, 0) AS has_pending_approval,
                   COALESCE(ss.has_validation_failure, 0) AS has_validation_failure,
+                  COALESCE(ss.terminal_reason, se.terminal_reason) AS terminal_reason,
+                  ss.retry_authority_id,
+                  COALESCE(ss.is_retry_authoritative, 0) AS is_retry_authoritative,
+                  ss.retry_authority_state,
                   CASE WHEN ss.stage_execution_id IS NULL THEN 0 ELSE 1 END AS projection_present,
                   ss.updated_at AS projection_updated_at,
                   CASE WHEN ss.stage_execution_id IS NULL OR ss.status != se.status OR ss.attempt_number != se.attempt_number THEN 1 ELSE 0 END AS projection_lag
@@ -307,6 +315,10 @@ pub async fn list_stages_projection(
                 has_artifacts: r.get::<i64, _>("has_artifacts") != 0,
                 has_pending_approval: r.get::<i64, _>("has_pending_approval") != 0,
                 has_validation_failure: r.get::<i64, _>("has_validation_failure") != 0,
+                terminal_reason: r.get("terminal_reason"),
+                retry_authority_id: r.get("retry_authority_id"),
+                is_retry_authoritative: r.get::<i64, _>("is_retry_authoritative") != 0,
+                retry_authority_state: r.get("retry_authority_state"),
                 projection_present: r.get::<i64, _>("projection_present") != 0,
                 projection_updated_at: r.get("projection_updated_at"),
                 projection_lag: r.get::<i64, _>("projection_lag") != 0,
@@ -522,7 +534,10 @@ async fn rebuild_stage_summaries_on_current_thread(pool: &SqlitePool, run_id: Ru
             Box::pin(async move {
             let rows = sqlx::query(
                 r#"INSERT OR REPLACE INTO stage_summaries
-                   (stage_execution_id, run_id, stage_id, label, status, attempt_number, has_artifacts, has_pending_approval, has_validation_failure, updated_at)
+                   (stage_execution_id, run_id, stage_id, label, status, attempt_number,
+                    has_artifacts, has_pending_approval, has_validation_failure,
+                    terminal_reason, retry_authority_id, is_retry_authoritative,
+                    retry_authority_state, updated_at)
                    SELECT
                      se.id,
                      se.run_id,
@@ -533,8 +548,15 @@ async fn rebuild_stage_summaries_on_current_thread(pool: &SqlitePool, run_id: Ru
                      EXISTS(SELECT 1 FROM artifacts art WHERE art.run_id = se.run_id AND art.stage_id = se.stage_id),
                      EXISTS(SELECT 1 FROM approvals ap WHERE ap.run_id = se.run_id AND ap.stage_id = se.stage_id AND ap.decision IN ('pending','requested')),
                      EXISTS(SELECT 1 FROM validation_failure_records vfr WHERE vfr.run_id = se.run_id AND vfr.stage_execution_id = se.id),
+                     se.terminal_reason,
+                     rsa.id,
+                     CASE WHEN rsa.id IS NULL THEN 0 ELSE 1 END,
+                     rsa.authority_state,
                      ?
                    FROM stage_executions se
+                   LEFT JOIN retry_stage_execution_authorities rsa
+                     ON rsa.target_stage_execution_id = se.id
+                    AND rsa.authority_state = 'active'
                    WHERE se.run_id = ?"#,
             )
             .bind(now)

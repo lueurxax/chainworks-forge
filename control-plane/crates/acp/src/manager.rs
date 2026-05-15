@@ -19,7 +19,8 @@ use crate::adapters::codex::CodexAdapter;
 use crate::adapters::gemini::GeminiCliAdapter;
 use crate::adapters::junie::JunieAdapter;
 use crate::adapters::{
-    AcpAdapter, LaunchResourceGuard, ProviderCapabilityCache, XcodeShimLaunchRuntime,
+    AcpAdapter, AcpProviderLaunchGate, LaunchResourceGuard, NoopAcpProviderLaunchGate,
+    ProviderCapabilityCache, XcodeShimLaunchRuntime,
 };
 use crate::session::{
     AcpSessionCloseBehavior, AcpSessionHandle, ProviderSessionStoreArchiveContext,
@@ -91,6 +92,7 @@ pub struct AcpRuntimeManager {
     live_xcode_leases: Mutex<HashMap<String, BrokeredXcodeLeaseCleanup>>,
     provider_capability_cache: ProviderCapabilityCache,
     prompt_progress_sink: RwLock<Arc<dyn AcpPromptProgressSink>>,
+    provider_launch_gate: RwLock<Arc<dyn AcpProviderLaunchGate>>,
     xcode_runtime_observation_sink: RwLock<Arc<dyn XcodeRuntimeObservationSink>>,
     xcode_broker_lease_attacher: RwLock<Arc<dyn XcodeBrokerLeaseAttacher>>,
     xcode_shim_runtime: RwLock<Option<XcodeShimRuntimeConfig>>,
@@ -137,6 +139,7 @@ impl AcpRuntimeManager {
             live_xcode_leases: Mutex::new(HashMap::new()),
             provider_capability_cache: ProviderCapabilityCache::default(),
             prompt_progress_sink: RwLock::new(Arc::new(NoopAcpPromptProgressSink)),
+            provider_launch_gate: RwLock::new(Arc::new(NoopAcpProviderLaunchGate)),
             xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
             xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
             xcode_shim_runtime: RwLock::new(None),
@@ -165,10 +168,25 @@ impl AcpRuntimeManager {
         *guard = sink;
     }
 
+    pub fn set_provider_launch_gate(&self, gate: Arc<dyn AcpProviderLaunchGate>) {
+        let mut guard = self
+            .provider_launch_gate
+            .write()
+            .expect("provider launch gate lock poisoned");
+        *guard = gate;
+    }
+
     fn prompt_progress_sink(&self) -> Arc<dyn AcpPromptProgressSink> {
         self.prompt_progress_sink
             .read()
             .expect("prompt progress sink lock poisoned")
+            .clone()
+    }
+
+    fn provider_launch_gate(&self) -> Arc<dyn AcpProviderLaunchGate> {
+        self.provider_launch_gate
+            .read()
+            .expect("provider launch gate lock poisoned")
             .clone()
     }
 
@@ -357,6 +375,7 @@ impl AcpRuntimeManager {
     ) -> Result<OpenedAcpSession> {
         let mut resources = LaunchResourceGuard::default();
         let mut launch_spec = adapter.prepare_launch_spec(req, &mut resources)?;
+        launch_spec.provider_launch_gate = Some(self.provider_launch_gate());
         launch_spec.apply_chainworks_meta_root_env(req);
         let runtime_profile_id = req
             .brokered_xcode_intents()
@@ -792,6 +811,7 @@ impl AcpRuntimeManager {
             live_xcode_leases: Mutex::new(HashMap::new()),
             provider_capability_cache: ProviderCapabilityCache::default(),
             prompt_progress_sink: RwLock::new(Arc::new(NoopAcpPromptProgressSink)),
+            provider_launch_gate: RwLock::new(Arc::new(NoopAcpProviderLaunchGate)),
             xcode_runtime_observation_sink: RwLock::new(Arc::new(NoopXcodeRuntimeObservationSink)),
             xcode_broker_lease_attacher: RwLock::new(Arc::new(NoopXcodeBrokerLeaseAttacher)),
             xcode_shim_runtime: RwLock::new(None),

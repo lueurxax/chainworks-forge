@@ -2226,7 +2226,7 @@ Available gates:
   proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
-  proposal-091|p091  Proposal 091 targeted retry authority evidence inventory gate
+  proposal-091|p091  Retained P091 targeted retry authority runtime proof gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -7025,8 +7025,13 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 index_path = root / "docs/evidence/090/junie-runtime-hardening/evidence-index.json"
-proposal_path = root / "docs/proposals/090-junie-code-writer-runtime-hardening-after-capability-proof.md"
 gates_doc = root / "docs/reference/test-gates.md"
+stable_doc_paths = [
+    root / "docs/reference/output-contracts-failure-evidence-and-recovery.md",
+    root / "docs/reference/acp-runtime-transport.md",
+    root / "docs/reference/rust-control-plane.md",
+    gates_doc,
+]
 
 required_subtypes = {
     "junie_final_response_missing",
@@ -7211,7 +7216,92 @@ for row in negative_fixtures:
     elif expected.get("materializes_outputs") is not False:
         fail(f"{fixture_class}: negative fixture must prove outputs are not materialized")
 
-proposal_text = proposal_path.read_text()
+valid_envelope_fixtures = index.get("valid_failure_envelope_fixtures") or []
+required_valid_envelopes = {
+    "valid_code_writer_engine_failure_v1",
+    "valid_code_writer_repair_failure_v1",
+}
+seen_valid_envelopes = {row.get("fixture_class") for row in valid_envelope_fixtures}
+if seen_valid_envelopes != required_valid_envelopes:
+    fail(
+        "valid failure envelope fixture coverage mismatch; "
+        f"missing={sorted(required_valid_envelopes - seen_valid_envelopes)} "
+        f"extra={sorted(seen_valid_envelopes - required_valid_envelopes)}"
+    )
+for row in valid_envelope_fixtures:
+    fixture_class = row.get("fixture_class")
+    fixture_path = root / (row.get("path") or "")
+    fixture = load_json(fixture_path)
+    if row.get("sha256") != sha256_file(fixture_path):
+        fail(f"{fixture_class}: valid failure envelope fixture sha256 mismatch")
+    if fixture.get("schema_version") != "p090_valid_failure_envelope_fixture_v1":
+        fail(f"{fixture_class}: invalid valid-envelope fixture schema")
+    if fixture.get("fixture_class") != fixture_class:
+        fail(f"{fixture_class}: fixture_class mismatch")
+    envelope = fixture.get("envelope") or {}
+    if fixture_class == "valid_code_writer_engine_failure_v1":
+        if envelope.get("schema_version") != "code_writer_engine_failure.v1":
+            fail(f"{fixture_class}: engine failure envelope must use dotted schema")
+    if fixture_class == "valid_code_writer_repair_failure_v1":
+        if envelope.get("schema_version") != "code_writer_repair_failure.v1":
+            fail(f"{fixture_class}: repair failure envelope must use dotted schema")
+        if envelope.get("repair_attempt") != 1:
+            fail(f"{fixture_class}: repair failure envelope must include repair_attempt")
+    if envelope.get("source") != "engine_synthesized":
+        fail(f"{fixture_class}: valid failure envelope source must be engine_synthesized")
+    if "proposal_090_engine_owned_failure_envelope_sections_are_versioned_json" not in (row.get("executable_test") or ""):
+        fail(f"{fixture_class}: valid envelope fixture must name executable test")
+
+preflight_capacity = index.get("preflight_capacity_proof") or {}
+if preflight_capacity.get("provider_capacity_counts_after_provider_launched") is not True:
+    fail("preflight capacity proof must assert provider capacity starts after launch")
+if preflight_capacity.get("preflight_running_provider_launched_false_excluded_from_provider_capacity") is not True:
+    fail("preflight capacity proof must exclude preflight_running/provider_launched=false")
+if preflight_capacity.get("provider_cap_one_atomic_after_preflight") is not True:
+    fail("preflight capacity proof must assert provider cap=1 atomic launch lease")
+if preflight_capacity.get("launch_lease_persisted_before_provider_spawn") is not True:
+    fail("preflight capacity proof must assert launch lease is persisted before provider spawn")
+if "proposal_090_junie_preflight_running_does_not_consume_provider_capacity_until_launch" not in (
+    preflight_capacity.get("executable_test") or ""
+):
+    fail("preflight capacity proof must name executable focused test")
+if "proposal_090_junie_provider_launch_lease_is_atomic_after_preflight" not in (
+    preflight_capacity.get("launch_lease_executable_test") or ""
+):
+    fail("preflight capacity proof must name provider launch lease test")
+
+preflight_lifecycle = index.get("preflight_lifecycle_proof") or {}
+if preflight_lifecycle.get("diagnostic_mode_runs_preflight_when_enforce_false") is not True:
+    fail("preflight lifecycle proof must assert diagnostic mode runs real preflight")
+if preflight_lifecycle.get("runtime_home_cache_remediation_attempt_count") != 2:
+    fail("preflight lifecycle proof must assert one runtime-home/cache remediation retry")
+if preflight_lifecycle.get("preflight_remediating_is_durable_runtime_fact") is not True:
+    fail("preflight lifecycle proof must assert durable preflight_remediating facts")
+if preflight_lifecycle.get("nonnull_envelope_readback_asserted") is not True:
+    fail("preflight lifecycle proof must assert non-null envelope readback")
+required_lifecycle_tests = [
+    ("diagnostic_mode_executable_test", "proposal_090_tool_path_preflight_runs_in_diagnostic_mode_when_enforce_is_off"),
+    ("runtime_cache_remediation_executable_test", "proposal_090_tool_path_preflight_remediates_missing_runtime_cache_once"),
+    ("durable_remediating_phase_executable_test", "proposal_090_runtime_cache_remediation_persists_intermediate_preflight_phase"),
+]
+for field, expected in required_lifecycle_tests:
+    if expected not in (preflight_lifecycle.get(field) or ""):
+        fail(f"preflight lifecycle proof missing executable test {expected}")
+readback_tests = set(preflight_lifecycle.get("nonnull_envelope_readback_tests") or [])
+for expected in [
+    "graphql-server::proposal_088_graphql_exposes_code_writer_completion_receipts_by_run_and_execution",
+    "mcp-server::proposal_088_mcp_runs_get_and_list_expose_implementation_completion",
+    "mcp-server::proposal_088_mcp_report_exposes_code_writer_completion_receipts",
+]:
+    if expected not in readback_tests:
+        fail(f"preflight lifecycle proof missing readback test {expected}")
+
+stable_text_parts = []
+for doc_path in stable_doc_paths:
+    if not doc_path.exists():
+        fail(f"missing stable reference doc {doc_path.relative_to(root)}")
+    stable_text_parts.append(doc_path.read_text())
+stable_text = "\n".join(stable_text_parts)
 required_terms = [
     "engine-synthesized",
     "provider_claim_rejected",
@@ -7219,6 +7309,8 @@ required_terms = [
     "code_writer_output_settlement_rows",
     "runtime_preflight_phase",
     "provider capacity accounting starts only after preflight passes",
+    "code_writer_engine_failure.v1",
+    "code_writer_repair_failure.v1",
     "CHAINWORKS_P090_STRICT_FINAL_PAYLOAD",
     "CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE",
     "CHAINWORKS_P090_STAGED_REPAIR_SETTLEMENT",
@@ -7227,8 +7319,8 @@ required_terms = [
     "./scripts/test-gate.sh proposal-090",
 ]
 for term in required_terms:
-    if term not in proposal_text:
-        fail(f"proposal missing required term {term!r}")
+    if term not in stable_text:
+        fail(f"stable reference docs missing required term {term!r}")
 
 gates_text = gates_doc.read_text()
 for term in ["proposal-090", "p090", "Junie runtime-hardening evidence inventory"]:
@@ -7242,13 +7334,15 @@ PY
       CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p db proposal_090_ -- --nocapture
       CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p acp proposal_090_ -- --nocapture
       CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p engine proposal_090_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p engine --test proposal_058_claim_start proposal_090_junie_preflight_running_does_not_consume_provider_capacity_until_launch -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p engine proposal_090_junie_provider_launch_lease_is_atomic_after_preflight -- --nocapture
       CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p graphql-server --test proposal_088_code_writer_completion_readback -- --nocapture
       CARGO_TARGET_DIR=target/proposal-090-gate cargo test -p mcp-server --test proposal_088_code_writer_completion_readback -- --nocapture
     )
     log "Proposal 090 gate passed"
     ;;
   proposal-091|p091)
-    log "Proposal 091 gate: targeted retry authority evidence inventory"
+    log "P091 retained gate: targeted retry authority evidence inventory and runtime proof"
     python3 - "$ROOT_DIR" <<'PY'
 import hashlib
 import json
@@ -7257,7 +7351,10 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 index_path = root / "docs/evidence/091/targeted-retry-authority/evidence-index.json"
-proposal_path = root / "docs/proposals/091-targeted-retry-stage-execution-authority.md"
+stable_doc_paths = [
+    root / "docs/reference/rust-control-plane.md",
+    root / "docs/reference/test-gates.md",
+]
 gates_doc = root / "docs/reference/test-gates.md"
 
 required_terms = {
@@ -7270,6 +7367,10 @@ required_terms = {
     "startup orphan repair must run before projection rebuild",
     "stage terminal metadata and authority history must agree",
     "advance_run_payload_missing_target_for_authority",
+    "settled_sibling_without_live_retry_driver",
+    "CHAINWORKS_P091_STARTUP_ORPHAN_REPAIR_MODE",
+    "CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR",
+    "p091_orphan_repair_candidates_total",
     "./scripts/test-gate.sh proposal-091",
 }
 
@@ -7312,11 +7413,33 @@ for fixture_record in fixtures:
         fail("P086 fixture must prove no live work items for retry")
     if facts.get("active_agent_executions_for_retry") != 0:
         fail("P086 fixture must prove no active agent executions for retry")
+    if facts.get("durable_retry_authority_active_for_retry") is not False:
+        fail("P086 fixture must prove no active retry authority for retry")
+    if facts.get("qualifying_predicate") != "settled_sibling_without_live_retry_driver":
+        fail("P086 fixture must classify the explicit section 8.9 qualifying predicate")
+    if facts.get("historical_timestamp_evidence") != "unavailable":
+        fail("P086 historical fixture must not pretend to prove sibling recency")
+    predicate_inputs = facts.get("predicate_inputs") or {}
+    for field, expected in {
+        "live_work_items_for_retry": 0,
+        "active_agent_executions_for_retry": 0,
+        "durable_retry_authority_active_for_retry": False,
+        "settled_sibling_status": "completed",
+        "stage_summaries_surface_retry_as_pending": True,
+        "blocked_truth_preserved_orphan": True,
+    }.items():
+        if predicate_inputs.get(field) != expected:
+            fail(f"P086 fixture predicate_inputs missing {field}={expected!r}")
 
-proposal_text = proposal_path.read_text()
+stable_text_parts = []
+for doc_path in stable_doc_paths:
+    if not doc_path.exists():
+        fail(f"missing stable reference doc {doc_path.relative_to(root)}")
+    stable_text_parts.append(doc_path.read_text())
+stable_text = "\n".join(stable_text_parts)
 for term in required_terms:
-    if term not in proposal_text:
-        fail(f"proposal missing required term {term!r}")
+    if term not in stable_text:
+        fail(f"stable reference docs missing required term {term!r}")
 
 index_terms = set(index.get("required_contract_terms") or [])
 missing_index_terms = required_terms - index_terms
@@ -7330,6 +7453,19 @@ for term in ["proposal-091", "p091", "targeted retry authority evidence inventor
 
 print("proposal-091 evidence inventory validation passed")
 PY
+    log "Proposal 091 runtime authority tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p domain --lib retry_authority
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p db --lib p091_
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p db --test proposal_091_retry_authority
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p engine --test integration p091_
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p engine --test integration test_retry_stage_creates_new_attempt_and_skips_old
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p engine --test integration test_retry_stage_with_agent_execution_id_schedules_single_invoke_attempt
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p graphql-server --lib run_query_exposes_p091_retry_authority_history_and_repair_readback
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p mcp-server --test proposal_091_retry_authority_readback -- --list | grep -q "retry_authority_history_and_current_readback_include_active_authority"
+      CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p mcp-server --test proposal_091_retry_authority_readback retry_authority_history_and_current_readback_include_active_authority
+    )
     log "Proposal 091 gate passed"
     ;;
   proposal-085|p085)

@@ -7,7 +7,7 @@ pub mod junie;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -63,6 +63,7 @@ pub struct AcpLaunchSpec {
     pub cleanup_paths: Vec<CleanupPathSpec>,
     pub current_dir_override: Option<PathBuf>,
     pub runtime_tool_path_preflight_json: Option<String>,
+    pub provider_launch_gate: Option<Arc<dyn AcpProviderLaunchGate>>,
     pub xcode_shim_runtime: Option<XcodeShimLaunchRuntime>,
     expected_capability_fingerprint: Option<CapabilitySliceFingerprint>,
 }
@@ -78,6 +79,10 @@ impl std::fmt::Debug for AcpLaunchSpec {
             .field(
                 "runtime_tool_path_preflight_json",
                 &self.runtime_tool_path_preflight_json,
+            )
+            .field(
+                "provider_launch_gate",
+                &self.provider_launch_gate.as_ref().map(|_| "<configured>"),
             )
             .field("xcode_shim_runtime", &self.xcode_shim_runtime)
             .field(
@@ -145,6 +150,7 @@ impl AcpLaunchSpec {
             cleanup_paths: Vec::new(),
             current_dir_override: None,
             runtime_tool_path_preflight_json: None,
+            provider_launch_gate: None,
             xcode_shim_runtime: None,
             expected_capability_fingerprint: None,
         }
@@ -287,6 +293,28 @@ impl AcpLaunchSpec {
             token_id: runtime.token_id.clone(),
             store: runtime.store.clone(),
         }))
+    }
+}
+
+#[async_trait]
+pub trait AcpProviderLaunchGate: Send + Sync {
+    async fn before_provider_launch(
+        &self,
+        req: &ExecutionRequest,
+        runtime_tool_path_preflight_json: Option<&str>,
+    ) -> Result<()>;
+}
+
+pub struct NoopAcpProviderLaunchGate;
+
+#[async_trait]
+impl AcpProviderLaunchGate for NoopAcpProviderLaunchGate {
+    async fn before_provider_launch(
+        &self,
+        _req: &ExecutionRequest,
+        _runtime_tool_path_preflight_json: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -851,6 +879,13 @@ pub trait AcpAdapter: Send + Sync {
         launch_spec.apply_chainworks_meta_root_env(req);
         ensure_chainworks_meta_root_launch_dir(req)?;
         self.preflight_launch(req, &mut launch_spec)?;
+        if let Some(gate) = launch_spec.provider_launch_gate.as_ref() {
+            gate.before_provider_launch(
+                req,
+                launch_spec.runtime_tool_path_preflight_json.as_deref(),
+            )
+            .await?;
+        }
         let execution_root = launch_spec
             .current_dir_override
             .clone()

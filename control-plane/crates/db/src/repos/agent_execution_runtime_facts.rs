@@ -27,8 +27,10 @@ pub async fn upsert_tx(
             operator_action_hint, provider_exit_status, transport_error_code,
             supervision_classification, output_settlement, valid_required_outputs,
             late_output_count, ignored_late_output_count, session_reuse_reason,
-            quota_ledger_id, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            quota_ledger_id, runtime_preflight_phase, runtime_preflight_attempt_count,
+            runtime_preflight_remediation, runtime_preflight_provider_launched,
+            runtime_preflight_json, created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
            ON CONFLICT(agent_execution_id) DO UPDATE SET
              failure_kind = excluded.failure_kind,
              failure_kind_raw_debug = excluded.failure_kind_raw_debug,
@@ -46,6 +48,11 @@ pub async fn upsert_tx(
              ignored_late_output_count = excluded.ignored_late_output_count,
              session_reuse_reason = COALESCE(excluded.session_reuse_reason, agent_execution_runtime_facts.session_reuse_reason),
              quota_ledger_id = COALESCE(excluded.quota_ledger_id, agent_execution_runtime_facts.quota_ledger_id),
+             runtime_preflight_phase = COALESCE(excluded.runtime_preflight_phase, agent_execution_runtime_facts.runtime_preflight_phase),
+             runtime_preflight_attempt_count = COALESCE(excluded.runtime_preflight_attempt_count, agent_execution_runtime_facts.runtime_preflight_attempt_count),
+             runtime_preflight_remediation = COALESCE(excluded.runtime_preflight_remediation, agent_execution_runtime_facts.runtime_preflight_remediation),
+             runtime_preflight_provider_launched = COALESCE(excluded.runtime_preflight_provider_launched, agent_execution_runtime_facts.runtime_preflight_provider_launched),
+             runtime_preflight_json = COALESCE(excluded.runtime_preflight_json, agent_execution_runtime_facts.runtime_preflight_json),
              updated_at = excluded.updated_at"#,
     )
     .bind(facts.agent_execution_id.to_string())
@@ -65,6 +72,13 @@ pub async fn upsert_tx(
     .bind(facts.ignored_late_output_count)
     .bind(&facts.session_reuse_reason)
     .bind(&facts.quota_ledger_id)
+    .bind(&facts.runtime_preflight_phase)
+    .bind(facts.runtime_preflight_attempt_count)
+    .bind(&facts.runtime_preflight_remediation)
+    .bind(facts.runtime_preflight_provider_launched.map(|value| {
+        if value { 1_i64 } else { 0_i64 }
+    }))
+    .bind(&facts.runtime_preflight_json)
     .bind(facts.created_at.to_rfc3339())
     .bind(facts.updated_at.to_rfc3339())
     .execute(&mut **tx)
@@ -83,7 +97,9 @@ pub async fn find_by_execution_id(
                   provider_exit_status, transport_error_code, supervision_classification,
                   output_settlement, valid_required_outputs, late_output_count,
                   ignored_late_output_count, session_reuse_reason, quota_ledger_id,
-                  created_at, updated_at
+                  runtime_preflight_phase, runtime_preflight_attempt_count,
+                  runtime_preflight_remediation, runtime_preflight_provider_launched,
+                  runtime_preflight_json, created_at, updated_at
            FROM agent_execution_runtime_facts WHERE agent_execution_id = ?1"#,
     )
     .bind(agent_execution_id.to_string())
@@ -106,7 +122,10 @@ pub async fn list_by_run(
                   arf.transport_error_code, arf.supervision_classification,
                   arf.output_settlement, arf.valid_required_outputs,
                   arf.late_output_count, arf.ignored_late_output_count,
-                  arf.session_reuse_reason, arf.quota_ledger_id, arf.created_at, arf.updated_at
+                  arf.session_reuse_reason, arf.quota_ledger_id,
+                  arf.runtime_preflight_phase, arf.runtime_preflight_attempt_count,
+                  arf.runtime_preflight_remediation, arf.runtime_preflight_provider_launched,
+                  arf.runtime_preflight_json, arf.created_at, arf.updated_at
            FROM agent_execution_runtime_facts arf
            INNER JOIN agent_executions ae ON ae.id = arf.agent_execution_id
            LEFT JOIN stage_executions se ON se.id = ae.stage_execution_id
@@ -173,6 +192,13 @@ fn parse_runtime_facts_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentExecuti
         ignored_late_output_count: row.get("ignored_late_output_count"),
         session_reuse_reason: row.get("session_reuse_reason"),
         quota_ledger_id: row.get("quota_ledger_id"),
+        runtime_preflight_phase: row.get("runtime_preflight_phase"),
+        runtime_preflight_attempt_count: row.get("runtime_preflight_attempt_count"),
+        runtime_preflight_remediation: row.get("runtime_preflight_remediation"),
+        runtime_preflight_provider_launched: row
+            .get::<Option<i64>, _>("runtime_preflight_provider_launched")
+            .map(|value| value != 0),
+        runtime_preflight_json: row.get("runtime_preflight_json"),
         created_at: DateTime::parse_from_rfc3339(&created_at_raw)?.with_timezone(&Utc),
         updated_at: DateTime::parse_from_rfc3339(&updated_at_raw)?.with_timezone(&Utc),
     })

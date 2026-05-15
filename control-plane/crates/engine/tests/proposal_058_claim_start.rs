@@ -916,6 +916,167 @@ async fn proposal_058_xcode_mcp_invoke_claim_respects_configured_xcode_capacity(
 }
 
 #[tokio::test]
+async fn proposal_090_junie_preflight_running_does_not_consume_provider_capacity_until_launch() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let first_stage_execution_id = StageExecutionId::new();
+    let second_stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P090 preflight capacity".into(),
+            body: "preflight must not consume Junie provider capacity".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    for (stage_execution_id, stage_id) in [
+        (first_stage_execution_id, "implementation_a"),
+        (second_stage_execution_id, "implementation_b"),
+    ] {
+        stages::insert(
+            &pool,
+            &StageExecution {
+                id: stage_execution_id,
+                run_id,
+                stage_id: stage_id.into(),
+                label: stage_id.into(),
+                status: StageStatus::Running,
+                iteration: 1,
+                attempt_number: 1,
+                settlement_kind: None,
+                started_at: Utc::now(),
+                completed_at: None,
+                owner_agent: None,
+                provider: None,
+                model: None,
+                stage_type: None,
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let preflight_execution_id = AgentExecutionId::new();
+    let now = Utc::now();
+    agent_executions::insert(
+        &pool,
+        &AgentExecution {
+            id: preflight_execution_id,
+            stage_execution_id: Some(first_stage_execution_id),
+            agent_id: "code_writer".into(),
+            provider: "junie".into(),
+            model: Some("junie".into()),
+            status: AgentStatus::Running,
+            started_at: now,
+            completed_at: None,
+            session_lineage_id: Some("junie-preflight".into()),
+            session_generation_id: Some("junie-preflight".into()),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some("code_writer".into()),
+            session_reuse_scope: None,
+            session_family_id: None,
+            session_reuse_disposition: Some("fresh".into()),
+            session_reset_reason: None,
+            owner_execution_lineage_id: Some(first_stage_execution_id.to_string()),
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            actual_xcode_runtime_observation_json: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+        },
+    )
+    .await
+    .unwrap();
+    let mut preflight_facts =
+        domain::agent::AgentExecutionRuntimeFacts::defaults_for(preflight_execution_id, now);
+    preflight_facts.runtime_preflight_phase = Some("preflight_running".into());
+    preflight_facts.runtime_preflight_provider_launched = Some(false);
+    preflight_facts.runtime_preflight_attempt_count = Some(1);
+    agent_execution_runtime_facts::upsert(&pool, &preflight_facts)
+        .await
+        .unwrap();
+
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: "junie-invoke-after-preflight".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "implementation_b",
+                "stage_execution_id": second_stage_execution_id.to_string(),
+                "agent_id": "code_writer",
+                "provider": "junie",
+                "model": "junie",
+                "prompt": "continue",
+                "task_name": "code_writer",
+                "task_inputs": ["input"],
+                "task_outputs": ["output"],
+                "declared_outputs": [],
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "code_writer",
+                "worktree_write_enabled": true
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("implementation_b".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let capacity = engine::executor::InvokeAgentCapacityConfig {
+        max_active_total: 10,
+        max_active_per_run: 10,
+        max_active_xcode_mcp: 10,
+        provider_caps: HashMap::from([("junie".to_string(), 1)]),
+    };
+
+    let claimed =
+        engine::executor::claim_next_invoke_agent_with_start_with_capacity(&pool, &capacity)
+            .await
+            .unwrap()
+            .expect("preflight-only Junie execution must not consume provider capacity");
+    assert_eq!(claimed.source_work_item_id, "junie-invoke-after-preflight");
+}
+
+#[tokio::test]
 async fn proposal_058_startup_repair_settles_terminal_preclaimed_invoke_execution() {
     let pool = test_pool().await;
     let idea_id = IdeaId::new();

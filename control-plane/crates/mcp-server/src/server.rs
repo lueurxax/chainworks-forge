@@ -575,6 +575,12 @@ impl McpServer {
                     .await?;
             let implementation_completion =
                 tools::reports::implementation_completion_json(&self.pool, run_id_parsed).await?;
+            let retry_authority_history =
+                tools::reports::retry_authority_history_json(&self.pool, run_id_parsed).await?;
+            let retry_authority =
+                tools::reports::retry_authority_current_json(&self.pool, run_id_parsed).await?;
+            let p091_orphan_repair_readback =
+                tools::reports::p091_orphan_repair_readback_json(&self.pool, run_id_parsed).await?;
 
             return Ok(serde_json::json!({
                 "run_id": run_id,
@@ -593,6 +599,9 @@ impl McpServer {
                 "code_writer_completion_receipts": code_writer_completion_receipts,
                 "implementationCompletion": implementation_completion,
                 "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, &self.cmd_handler, run_id_parsed).await?,
+                "retryAuthority": retry_authority,
+                "retryAuthorityHistory": retry_authority_history,
+                "p091OrphanRepairReadback": p091_orphan_repair_readback,
                 "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
                 "rollout_contract_readback": mcp_rollout_readback,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),

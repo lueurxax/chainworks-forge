@@ -57,6 +57,7 @@ use domain::discovery::{
 use domain::error_sanitizer::sanitize_error_for_storage;
 use domain::ids::RunId;
 use domain::provider::ProviderFamily;
+use domain::retry_authority::AdvanceRunPayloadV1;
 use domain::run::DeliveryConfiguration;
 use workflow::catalog::{AgentCatalogFile, AgentEntry};
 
@@ -93,6 +94,7 @@ use crate::worktree_fingerprint::{
 use domain::side_effect::{EffectKind, PrepareEffectIntent};
 
 const ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS: i64 = 3;
+const JUNIE_PROVIDER_CAPACITY_RETRY_DELAY_SECONDS: i64 = 15;
 const APPROVED_PROPOSAL_OUTPUT_NAME: &str = "approved_proposal";
 const IMPLEMENTATION_STARTED_STAGE_ID: &str = "state_7_implementation_started";
 const FREEZE_PROPOSAL_TASK_NAME: &str = "freeze_proposal_and_provision_worktree";
@@ -226,6 +228,41 @@ impl acp::AcpPromptProgressSink for DbAcpPromptProgressSink {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+struct DbAcpProviderLaunchGate {
+    pool: SqlitePool,
+    capacity: domain::provider::InvokeAgentCapacityConfig,
+}
+
+#[async_trait::async_trait]
+impl acp::adapters::AcpProviderLaunchGate for DbAcpProviderLaunchGate {
+    async fn before_provider_launch(
+        &self,
+        req: &acp::ExecutionRequest,
+        runtime_tool_path_preflight_json: Option<&str>,
+    ) -> Result<()> {
+        if req.provider != "junie" {
+            return Ok(());
+        }
+        let Some(agent_execution_id) = req.agent_execution_id else {
+            return Ok(());
+        };
+        let capacity = invoke_agent_start_capacity_from_domain(&self.capacity);
+        let acquired = p090_claim_junie_provider_launch_lease(
+            &self.pool,
+            agent_execution_id,
+            &capacity,
+            runtime_tool_path_preflight_json,
+        )
+        .await?;
+        if !acquired {
+            anyhow::bail!(
+                "p090_junie_provider_capacity_exhausted_after_preflight: provider cap reached before launch"
+            );
         }
         Ok(())
     }
@@ -412,11 +449,20 @@ async fn invoke_item_has_start_capacity(
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
 
     let running_status = AgentStatus::Running.to_string();
-    let total_active: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_executions WHERE status = ?1")
-            .bind(&running_status)
-            .fetch_one(pool)
-            .await?;
+    let total_active: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM agent_executions ae
+           LEFT JOIN agent_execution_runtime_facts arf ON arf.agent_execution_id = ae.id
+           WHERE ae.status = ?1
+             AND NOT (
+               COALESCE(ae.provider_family, ae.provider) = 'junie'
+               AND arf.runtime_preflight_phase IN ('preflight_running', 'preflight_remediating')
+               AND COALESCE(arf.runtime_preflight_provider_launched, 0) = 0
+             )"#,
+    )
+    .bind(&running_status)
+    .fetch_one(pool)
+    .await?;
     if total_active as usize >= capacity.max_active_total {
         return Ok(false);
     }
@@ -426,7 +472,13 @@ async fn invoke_item_has_start_capacity(
             r#"SELECT COUNT(*)
                FROM agent_executions ae
                INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
-               WHERE ae.status = ?1 AND se.run_id = ?2"#,
+               LEFT JOIN agent_execution_runtime_facts arf ON arf.agent_execution_id = ae.id
+               WHERE ae.status = ?1 AND se.run_id = ?2
+                 AND NOT (
+                   COALESCE(ae.provider_family, ae.provider) = 'junie'
+                   AND arf.runtime_preflight_phase IN ('preflight_running', 'preflight_remediating')
+                   AND COALESCE(arf.runtime_preflight_provider_launched, 0) = 0
+                 )"#,
         )
         .bind(&running_status)
         .bind(run_id.to_string())
@@ -439,7 +491,15 @@ async fn invoke_item_has_start_capacity(
 
     if let Some(provider_cap) = capacity.provider_caps.get(&provider_family) {
         let provider_active: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_executions WHERE status = ?1 AND COALESCE(provider_family, provider) = ?2",
+            r#"SELECT COUNT(*)
+               FROM agent_executions ae
+               LEFT JOIN agent_execution_runtime_facts arf ON arf.agent_execution_id = ae.id
+               WHERE ae.status = ?1 AND COALESCE(ae.provider_family, ae.provider) = ?2
+                 AND NOT (
+                   COALESCE(ae.provider_family, ae.provider) = 'junie'
+                   AND arf.runtime_preflight_phase IN ('preflight_running', 'preflight_remediating')
+                   AND COALESCE(arf.runtime_preflight_provider_launched, 0) = 0
+                 )"#,
         )
         .bind(&running_status)
         .bind(&provider_family)
@@ -660,7 +720,7 @@ async fn claim_invoke_agent_work_item_with_start(
             id: agent_execution_id,
             stage_execution_id: Some(stage_execution_id),
             agent_id,
-            provider,
+            provider: provider.clone(),
             model,
             status: AgentStatus::Running,
             started_at: now,
@@ -702,6 +762,22 @@ async fn claim_invoke_agent_work_item_with_start(
     let mut facts =
         domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
     facts.session_reuse_reason = Some("legacy_unknown".into());
+    if p090_junie_preflight_records_diagnostics(&provider) {
+        facts.runtime_preflight_phase = Some("preflight_running".into());
+        facts.runtime_preflight_attempt_count = Some(1);
+        facts.runtime_preflight_provider_launched = Some(false);
+        facts.runtime_preflight_json = Some(
+            serde_json::json!({
+                "schema": "p090_runtime_tool_path_preflight_v1",
+                "status": "preflight_running",
+                "attempt_count": 1,
+                "provider_launched": false,
+                "enforcement_enabled": p090_junie_preflight_enforce_enabled(&provider),
+                "lifecycle_phases": ["preflight_running"]
+            })
+            .to_string(),
+        );
+    }
     agent_execution_runtime_facts::upsert(pool, &facts).await?;
 
     let artifact_claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
@@ -2398,6 +2474,11 @@ fn is_active_prompt_closed_transport_error(message: &str) -> bool {
         .contains("session closed during active prompt")
 }
 
+fn is_junie_post_preflight_provider_capacity_error(provider: &str, message: &str) -> bool {
+    provider == "junie"
+        && message.contains("p090_junie_provider_capacity_exhausted_after_preflight")
+}
+
 fn is_work_item_requeued(error: &Error) -> bool {
     error.downcast_ref::<WorkItemRequeued>().is_some()
 }
@@ -2420,6 +2501,7 @@ fn runtime_facts_for_execution_result(
     now: chrono::DateTime<chrono::Utc>,
     close_diagnostic: Option<&acp::AcpCloseDiagnostic>,
     runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
+    runtime_tool_path_preflight_json: Option<&str>,
 ) -> AgentExecutionRuntimeFacts {
     let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
     facts.valid_required_outputs = validation_summary.is_some_and(|summary| {
@@ -2510,6 +2592,7 @@ fn runtime_facts_for_execution_result(
     if let Some(receipt) = runtime_receipt {
         enrich_runtime_facts_with_receipt(&mut facts, receipt);
     }
+    p090_enrich_runtime_facts_with_preflight_json(&mut facts, runtime_tool_path_preflight_json);
     facts
 }
 
@@ -3376,6 +3459,10 @@ impl BackgroundExecutor {
             pool: pool.clone(),
             events: events.clone(),
         }));
+        acp.set_provider_launch_gate(Arc::new(DbAcpProviderLaunchGate {
+            pool: pool.clone(),
+            capacity: work_queue.invoke_agent_capacity_config(),
+        }));
         let db_writer = Arc::new(DbWriter::new(pool.clone()));
         Self {
             pool,
@@ -3423,6 +3510,10 @@ impl BackgroundExecutor {
         acp.set_prompt_progress_sink(Arc::new(DbAcpPromptProgressSink {
             pool: pool.clone(),
             events: events.clone(),
+        }));
+        acp.set_provider_launch_gate(Arc::new(DbAcpProviderLaunchGate {
+            pool: pool.clone(),
+            capacity: work_queue.invoke_agent_capacity_config(),
         }));
         let db_writer = db_writer.unwrap_or_else(|| Arc::new(DbWriter::new(pool.clone())));
         Self {
@@ -3943,6 +4034,70 @@ impl BackgroundExecutor {
         Ok(true)
     }
 
+    async fn auto_requeue_junie_provider_capacity_after_preflight(
+        &self,
+        item: &WorkItem,
+        claimed: &ClaimedInvokeAgentStart,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        error: &Error,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let message = error.to_string();
+        if !is_junie_post_preflight_provider_capacity_error(provider, &message) {
+            return Ok(false);
+        }
+
+        let retry_at =
+            completed_at + chrono::Duration::seconds(JUNIE_PROVIDER_CAPACITY_RETRY_DELAY_SECONDS);
+        let mut runtime_facts =
+            runtime_facts_for_acp_error(claimed.agent_execution_id, error, completed_at);
+        runtime_facts.retry_after = Some(retry_at);
+        agent_executions::update_completed(
+            &self.pool,
+            claimed.agent_execution_id,
+            AgentStatus::Failed,
+            completed_at,
+        )
+        .await?;
+        agent_execution_runtime_facts::upsert(&self.pool, &runtime_facts).await?;
+
+        let requeued = work_items::requeue_running_invoke_agent_after_provider_capacity_wait(
+            &self.pool,
+            &item.id,
+            &claimed.artifact_claim_key,
+            retry_at,
+            "junie_provider_capacity_after_preflight",
+        )
+        .await?;
+        if !requeued {
+            return Ok(false);
+        }
+
+        self.work_queue.refresh_scheduler_projection().await?;
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::RuntimeStatusChanged {
+                run_id,
+                stage_id: stage_id.to_string(),
+                agent_id: agent_id.to_string(),
+                provider: provider.to_string(),
+                event_kind: "provider_capacity_requeued_after_preflight".to_string(),
+            });
+        warn!(
+            run_id = %run_id,
+            stage_id = %stage_id,
+            agent_id = %agent_id,
+            agent_execution_id = %claimed.agent_execution_id,
+            work_item_id = %item.id,
+            retry_at = %retry_at,
+            "Junie post-preflight provider capacity exhausted; requeued InvokeAgent instead of failing stage"
+        );
+        Ok(true)
+    }
+
     async fn run_loop(self: &Arc<Self>) {
         info!("BackgroundExecutor: starting work loop");
         loop {
@@ -4104,7 +4259,9 @@ impl BackgroundExecutor {
             WorkItemKind::AdvanceRun => {
                 let run_id = self.extract_run_id(&item)?;
                 run_unresolved_effects_preflight(&self.pool, &run_id, "advance_run").await?;
-                self.orchestrator.advance_run(run_id).await?;
+                let payload = AdvanceRunPayloadV1::parse_json(&item.payload_json)
+                    .with_context(|| format!("parse AdvanceRun payload {}", item.id))?;
+                self.orchestrator.advance_run_from_payload(&payload).await?;
                 self.backfill_delivery_receipt_if_eligible(run_id).await?;
                 projections::rebuild_all_for_run(&self.pool, run_id).await?;
             }
@@ -4999,10 +5156,44 @@ impl BackgroundExecutor {
                         event_kind: "session_started".to_string(),
                     });
 
+                if let Err(error) =
+                    p090_prepare_junie_preflight_remediation(&self.pool, agent_exec_id, &req).await
+                {
+                    warn!(
+                        run_id = %run_id,
+                        stage_id = %stage_id,
+                        agent_id = %agent_id,
+                        agent_execution_id = %agent_exec_id,
+                        error = %error,
+                        "P090 Junie preflight remediation preparation failed; adapter preflight will enforce final launch decision"
+                    );
+                }
+
                 let mut result = match self.acp.execute(req.clone()).await {
                     Ok(result) => result,
                     Err(error) => {
                         let completed_at = chrono::Utc::now();
+                        if let Some(claimed) = preclaimed_start.as_ref() {
+                            if self
+                                .auto_requeue_junie_provider_capacity_after_preflight(
+                                    &item,
+                                    claimed,
+                                    run_id,
+                                    &stage_id,
+                                    &agent_id,
+                                    &provider,
+                                    &error,
+                                    completed_at,
+                                )
+                                .await?
+                            {
+                                return Err(WorkItemRequeued {
+                                    work_item_id: item.id.clone(),
+                                    reason: "junie_provider_capacity_after_preflight",
+                                }
+                                .into());
+                            }
+                        }
                         if !p088_code_writer_completion_candidate {
                             if let Some(claimed) = preclaimed_start.as_ref() {
                                 if self
@@ -5027,8 +5218,14 @@ impl BackgroundExecutor {
                                 }
                             }
                         }
-                        let runtime_facts =
+                        let mut runtime_facts =
                             runtime_facts_for_acp_error(agent_exec_id, &error, completed_at);
+                        let p090_error_preflight_json =
+                            p090_runtime_tool_path_preflight_json_from_error(&provider, &error);
+                        p090_enrich_runtime_facts_with_preflight_json(
+                            &mut runtime_facts,
+                            p090_error_preflight_json.as_deref(),
+                        );
                         if let Err(update_error) = agent_executions::update_completed(
                             &self.pool,
                             agent_exec_id,
@@ -5172,9 +5369,7 @@ impl BackgroundExecutor {
                                         None,
                                         None,
                                         None,
-                                        p090_runtime_tool_path_preflight_json_from_error(
-                                            &provider, &error,
-                                        ),
+                                        p090_error_preflight_json,
                                         false,
                                         0,
                                         p088_operator_retry_completion_recovery,
@@ -6920,6 +7115,7 @@ impl BackgroundExecutor {
                         ),
                         result.close_diagnostic.as_ref(),
                         result.runtime_receipt.as_ref(),
+                        result.runtime_tool_path_preflight_json.as_deref(),
                         discovery_diagnostics.as_ref(),
                         &stage_degraded_output_policy,
                         validation_summary_override,
@@ -8592,6 +8788,7 @@ impl BackgroundExecutor {
         observed_failure_classification: Option<RuntimeFailureClassification>,
         close_diagnostic: Option<&acp::AcpCloseDiagnostic>,
         runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
+        runtime_tool_path_preflight_json: Option<&str>,
         discovery_diagnostics: Option<&AgentExecutionDiscoveryDiagnostics>,
         stage_degraded_output_policy: &workflow::plan::DegradedOutputPolicy,
         validation_summary_override: Option<TaskValidationSummary>,
@@ -8612,6 +8809,7 @@ impl BackgroundExecutor {
             completed_at,
             close_diagnostic,
             runtime_receipt,
+            runtime_tool_path_preflight_json,
         );
         let policy_failure_kind = runtime_facts
             .failure_kind
@@ -11106,6 +11304,37 @@ async fn persist_p088_code_writer_completion_receipt(
         &completion_boundary_subtype,
         provider_failure_envelope_claim,
     );
+    let engine_failure_envelope_json = if failure_envelope_authority.as_deref()
+        == Some("engine_synthesized")
+        && !completion_boundary_subtype.starts_with("junie_repair_")
+    {
+        p090_engine_failure_envelope_json(
+            run_id,
+            stage_execution_id,
+            agent_exec_id,
+            session_generation_id,
+            &completion_boundary_subtype,
+            "completion_boundary_subtype",
+        )
+    } else {
+        None
+    };
+    let repair_failure_envelope_json = if failure_envelope_authority.as_deref()
+        == Some("engine_synthesized")
+        && completion_boundary_subtype.starts_with("junie_repair_")
+    {
+        p090_repair_failure_envelope_json(
+            run_id,
+            stage_execution_id,
+            agent_exec_id,
+            session_generation_id,
+            i64::from(completion_turn_attempted),
+            &completion_boundary_subtype,
+            "completion_repair_boundary",
+        )
+    } else {
+        None
+    };
     let mut receipt = CodeWriterCompletionReceiptRecord {
         id: receipt_id.clone(),
         run_id,
@@ -11175,6 +11404,8 @@ async fn persist_p088_code_writer_completion_receipt(
             absence_count,
             failure_envelope_authority.as_deref(),
         ),
+        engine_failure_envelope_json,
+        repair_failure_envelope_json,
         repair_materialization_summary_json:
             p090_repair_materialization_summary_json_with_config_warning(
                 completion_turn_attempted,
@@ -11826,6 +12057,10 @@ fn p090_junie_preflight_enforce_enabled(provider: &str) -> bool {
     provider == "junie" && p090_env_flag("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE", false)
 }
 
+fn p090_junie_preflight_records_diagnostics(provider: &str) -> bool {
+    provider == "junie"
+}
+
 fn p090_staged_repair_disabled(provider: &str) -> bool {
     provider == "junie" && p090_env_flag("CHAINWORKS_P090_DISABLE_STAGED_REPAIR_SETTLEMENT", false)
 }
@@ -11894,7 +12129,10 @@ fn p090_completion_boundary_subtype(
         P090ProviderFailureEnvelopeClaim::UnknownSchema => {
             return "provider_envelope_unrecognized".to_string();
         }
-        P090ProviderFailureEnvelopeClaim::None | P090ProviderFailureEnvelopeClaim::Recognized => {}
+        P090ProviderFailureEnvelopeClaim::Recognized => {
+            return "provider_authored_engine_failure_spoof_rejected".to_string();
+        }
+        P090ProviderFailureEnvelopeClaim::None => {}
     }
     if p090_preflight_status(runtime_tool_path_preflight_json).as_deref()
         == Some("failed_no_launch")
@@ -11995,15 +12233,227 @@ fn p090_runtime_preflight_phase(
 }
 
 fn p090_preflight_status(runtime_tool_path_preflight_json: Option<&str>) -> Option<String> {
-    runtime_tool_path_preflight_json.and_then(|json| {
-        serde_json::from_str::<serde_json::Value>(json)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
+    runtime_tool_path_preflight_json.and_then(|json| p090_preflight_status_from_json(json))
+}
+
+fn p090_preflight_status_from_json(json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn p090_preflight_attempt_count_from_json(json: &str) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("attempt_count")
+                .and_then(serde_json::Value::as_i64)
+        })
+}
+
+fn p090_preflight_remediation_from_json(json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("remediation_applied")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn p090_enrich_runtime_facts_with_preflight_json(
+    facts: &mut AgentExecutionRuntimeFacts,
+    runtime_tool_path_preflight_json: Option<&str>,
+) {
+    let Some(json) = runtime_tool_path_preflight_json else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return;
+    };
+    facts.runtime_preflight_json = Some(json.to_string());
+    facts.runtime_preflight_phase = value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| facts.runtime_preflight_phase.clone());
+    facts.runtime_preflight_attempt_count = value
+        .get("attempt_count")
+        .and_then(serde_json::Value::as_i64)
+        .or(facts.runtime_preflight_attempt_count);
+    facts.runtime_preflight_remediation = value
+        .get("remediation_applied")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| facts.runtime_preflight_remediation.clone());
+    facts.runtime_preflight_provider_launched = value
+        .get("provider_launched")
+        .and_then(serde_json::Value::as_bool)
+        .or(facts.runtime_preflight_provider_launched);
+}
+
+async fn p090_prepare_junie_preflight_remediation(
+    pool: &SqlitePool,
+    agent_execution_id: domain::ids::AgentExecutionId,
+    req: &acp::ExecutionRequest,
+) -> Result<()> {
+    if req.provider != "junie" {
+        return Ok(());
+    }
+
+    let remediation = if req.worktree_write_enabled
+        && req
+            .worktree_root
+            .as_deref()
+            .is_some_and(|root| !Path::new(root).is_dir())
+        && Path::new(&req.workspace_root).is_dir()
+    {
+        Some("wrong_cwd_workspace_root")
+    } else if let Some(runtime_cache) = p090_junie_runtime_cache_dir(req) {
+        if !runtime_cache.is_dir() {
+            std::fs::create_dir_all(&runtime_cache).with_context(|| {
+                format!(
+                    "create P090 Junie runtime cache directory {}",
+                    runtime_cache.display()
+                )
+            })?;
+            Some("runtime_home_cache_rebuilt")
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let Some(remediation) = remediation else {
+        return Ok(());
+    };
+
+    let now = chrono::Utc::now();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.runtime_preflight_phase = Some("preflight_remediating".into());
+    facts.runtime_preflight_attempt_count = Some(2);
+    facts.runtime_preflight_remediation = Some(remediation.to_string());
+    facts.runtime_preflight_provider_launched = Some(false);
+    facts.runtime_preflight_json = Some(
+        serde_json::json!({
+            "schema": "p090_runtime_tool_path_preflight_v1",
+            "status": "preflight_remediating",
+            "attempt_count": 2,
+            "remediation_applied": remediation,
+            "provider_launched": false,
+            "enforcement_enabled": p090_junie_preflight_enforce_enabled("junie"),
+            "failed_operation_class": if remediation == "runtime_home_cache_rebuilt" { "read_runtime_home" } else { "read_project_file" },
+            "redacted_path_class": if remediation == "runtime_home_cache_rebuilt" { "junie_runtime_cache" } else { "provider_execution_root" },
+            "failure_category": if remediation == "runtime_home_cache_rebuilt" { "runtime_home_unwritable" } else { "wrong_cwd_or_missing_project_root" },
+            "remediation_hint": if remediation == "runtime_home_cache_rebuilt" { "rebuilt Junie ACP runtime cache directory" } else { "retry with canonical workspace root" },
+            "lifecycle_phases": ["preflight_running", "preflight_remediating"]
+        })
+        .to_string(),
+    );
+    agent_execution_runtime_facts::upsert(pool, &facts).await?;
+    Ok(())
+}
+
+fn p090_junie_runtime_cache_dir(req: &acp::ExecutionRequest) -> Option<PathBuf> {
+    req.chainworks_meta_root
+        .as_deref()
+        .map(PathBuf::from)
+        .map(|root| root.join("acp-runtime/junie/cache"))
+}
+
+async fn p090_claim_junie_provider_launch_lease(
+    pool: &SqlitePool,
+    agent_execution_id: domain::ids::AgentExecutionId,
+    capacity: &InvokeAgentCapacityConfig,
+    runtime_tool_path_preflight_json: Option<&str>,
+) -> Result<bool> {
+    let mut tx =
+        db::writer::begin_repository_transaction(pool, "p090.claim_junie_provider_launch_lease")
+            .await?;
+    let running_status = AgentStatus::Running.to_string();
+    let execution = sqlx::query(
+        r#"SELECT status, COALESCE(provider_family, provider) AS provider_family
+           FROM agent_executions
+           WHERE id = ?1"#,
+    )
+    .bind(agent_execution_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(execution) = execution else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let status: String = execution.get("status");
+    let provider_family: String = execution.get("provider_family");
+    if status != running_status || provider_family != "junie" {
+        tx.commit().await?;
+        return Ok(true);
+    }
+
+    if let Some(provider_cap) = capacity.provider_caps.get("junie") {
+        let provider_active: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM agent_executions ae
+               LEFT JOIN agent_execution_runtime_facts arf ON arf.agent_execution_id = ae.id
+               WHERE ae.status = ?1
+                 AND COALESCE(ae.provider_family, ae.provider) = 'junie'
+                 AND ae.id != ?2
+                 AND NOT (
+                   arf.runtime_preflight_phase IN ('preflight_running', 'preflight_remediating')
+                   AND COALESCE(arf.runtime_preflight_provider_launched, 0) = 0
+                 )"#,
+        )
+        .bind(&running_status)
+        .bind(agent_execution_id.to_string())
+        .fetch_one(&mut **tx)
+        .await?;
+        if provider_active as usize >= *provider_cap {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+    }
+
+    let now = chrono::Utc::now();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    let launch_json = p090_runtime_tool_path_preflight_json_mark_provider_launched(
+        runtime_tool_path_preflight_json,
+    );
+    facts.runtime_preflight_phase = launch_json
+        .as_deref()
+        .and_then(p090_preflight_status_from_json)
+        .or_else(|| Some("passed".to_string()));
+    facts.runtime_preflight_attempt_count = launch_json
+        .as_deref()
+        .and_then(p090_preflight_attempt_count_from_json);
+    facts.runtime_preflight_remediation = launch_json
+        .as_deref()
+        .and_then(p090_preflight_remediation_from_json);
+    facts.runtime_preflight_provider_launched = Some(true);
+    facts.runtime_preflight_json = launch_json;
+    agent_execution_runtime_facts::upsert_tx(&mut tx, &facts).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+fn p090_runtime_tool_path_preflight_json_mark_provider_launched(
+    runtime_tool_path_preflight_json: Option<&str>,
+) -> Option<String> {
+    runtime_tool_path_preflight_json.map(|json| {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json) else {
+            return json.to_string();
+        };
+        if let Some(object) = value.as_object_mut() {
+            object.insert("provider_launched".to_string(), serde_json::json!(true));
+        }
+        serde_json::to_string(&value).unwrap_or_else(|_| json.to_string())
     })
 }
 
@@ -12145,6 +12595,50 @@ fn p090_final_payload_capture_json(
     .ok()
 }
 
+fn p090_engine_failure_envelope_json(
+    run_id: RunId,
+    stage_execution_id: domain::ids::StageExecutionId,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    session_generation_id: Option<&str>,
+    completion_boundary_subtype: &str,
+    reason: &str,
+) -> Option<String> {
+    serde_json::to_string(&serde_json::json!({
+        "schema_version": "code_writer_engine_failure.v1",
+        "source": "engine_synthesized",
+        "run_id": run_id.to_string(),
+        "stage_execution_id": stage_execution_id.to_string(),
+        "agent_execution_id": agent_exec_id.to_string(),
+        "session_generation_id": session_generation_id,
+        "completion_boundary_subtype": completion_boundary_subtype,
+        "reason": reason,
+    }))
+    .ok()
+}
+
+fn p090_repair_failure_envelope_json(
+    run_id: RunId,
+    stage_execution_id: domain::ids::StageExecutionId,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    session_generation_id: Option<&str>,
+    repair_attempt: i64,
+    completion_boundary_subtype: &str,
+    reason: &str,
+) -> Option<String> {
+    serde_json::to_string(&serde_json::json!({
+        "schema_version": "code_writer_repair_failure.v1",
+        "source": "engine_synthesized",
+        "run_id": run_id.to_string(),
+        "stage_execution_id": stage_execution_id.to_string(),
+        "agent_execution_id": agent_exec_id.to_string(),
+        "session_generation_id": session_generation_id,
+        "repair_attempt": repair_attempt,
+        "completion_boundary_subtype": completion_boundary_subtype,
+        "reason": reason,
+    }))
+    .ok()
+}
+
 fn p090_failure_envelope_authority(
     provider: &str,
     completion_boundary_subtype: &str,
@@ -12214,7 +12708,12 @@ fn p090_provider_failure_envelope_claim_from_text(
         .or_else(|| value.get("schema_version"))
         .and_then(serde_json::Value::as_str);
     match schema {
-        Some("code_writer_engine_failure_v1" | "code_writer_repair_failure_v1") => {
+        Some(
+            "code_writer_engine_failure_v1"
+            | "code_writer_repair_failure_v1"
+            | "code_writer_engine_failure.v1"
+            | "code_writer_repair_failure.v1",
+        ) => {
             let expected = [
                 ("run_id", run_id.to_string()),
                 ("stage_execution_id", stage_execution_id.to_string()),
@@ -14042,6 +14541,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None,
+            None,
         );
         assert_eq!(facts.failure_kind, Some(AgentFailureKind::ProviderQuota));
         assert!(degraded_policy_allows_valid_failed_outputs(
@@ -14074,6 +14574,7 @@ mod tests {
                 },
             )),
             chrono::Utc::now(),
+            None,
             None,
             None,
         );
@@ -14386,6 +14887,235 @@ mod tests {
         assert_eq!(p090_runtime_preflight_phase("codex", None), "not_recorded");
     }
 
+    #[tokio::test]
+    async fn proposal_090_runtime_cache_remediation_persists_intermediate_preflight_phase() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        db::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .unwrap();
+        let agent_execution_id = domain::ids::AgentExecutionId::new();
+        let now = chrono::Utc::now();
+        agent_executions::insert(
+            &pool,
+            &domain::agent::AgentExecution {
+                id: agent_execution_id,
+                stage_execution_id: None,
+                agent_id: "code_writer".into(),
+                provider: "junie".into(),
+                model: Some("junie".into()),
+                status: AgentStatus::Running,
+                started_at: now,
+                completed_at: None,
+                owner_execution_lineage_id: None,
+                session_lineage_id: None,
+                session_generation_id: Some("session-generation-p090".into()),
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: Some("code_writer".into()),
+                session_reuse_scope: None,
+                session_family_id: None,
+                session_reuse_disposition: Some("fresh".into()),
+                session_reset_reason: None,
+                backend_profile_id: None,
+                requested_mcp_extensions_json: None,
+                predicted_mcp_extensions_json: None,
+                predicted_mcp_runtime_ids_json: None,
+                actual_mcp_extensions_json: None,
+                actual_mcp_runtime_ids_json: None,
+                denied_mcp_extensions_json: None,
+                mcp_blocking_issues_json: None,
+                actual_mcp_observation_json: None,
+                actual_xcode_runtime_observation_json: None,
+                mcp_session_startup_latency_ms: None,
+                owner_kind: Some("lead_conflict_mediation".into()),
+                owner_id: Some("mediation-p090".into()),
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
+                total_cost_cents: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let meta_root = tmp.path().join(".chainworks/runs/run-1");
+        let req = acp::ExecutionRequest {
+            agent_execution_id: Some(agent_execution_id),
+            run_id: RunId::new(),
+            stage_execution_id: None,
+            stage_id: "implementation".into(),
+            attempt_number: 1,
+            agent_id: "code_writer".into(),
+            provider: "junie".into(),
+            model: Some("junie".into()),
+            effort: None,
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            prompt: "test".into(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: Some("session-generation-p090".into()),
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: Some(meta_root.to_string_lossy().into_owned()),
+            legacy_broad_discovery_policy: Default::default(),
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".into(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
+        };
+
+        p090_prepare_junie_preflight_remediation(&pool, agent_execution_id, &req)
+            .await
+            .unwrap();
+
+        let facts = agent_execution_runtime_facts::find_by_execution_id(&pool, agent_execution_id)
+            .await
+            .unwrap()
+            .expect("runtime facts must be persisted");
+        assert_eq!(
+            facts.runtime_preflight_phase.as_deref(),
+            Some("preflight_remediating")
+        );
+        assert_eq!(facts.runtime_preflight_attempt_count, Some(2));
+        assert_eq!(
+            facts.runtime_preflight_remediation.as_deref(),
+            Some("runtime_home_cache_rebuilt")
+        );
+        assert_eq!(facts.runtime_preflight_provider_launched, Some(false));
+        assert!(meta_root.join("acp-runtime/junie/cache").is_dir());
+    }
+
+    #[tokio::test]
+    async fn proposal_090_junie_provider_launch_lease_is_atomic_after_preflight() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        db::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now();
+        let first_execution_id = domain::ids::AgentExecutionId::new();
+        let second_execution_id = domain::ids::AgentExecutionId::new();
+        for agent_execution_id in [first_execution_id, second_execution_id] {
+            agent_executions::insert(
+                &pool,
+                &domain::agent::AgentExecution {
+                    id: agent_execution_id,
+                    stage_execution_id: None,
+                    agent_id: "code_writer".into(),
+                    provider: "junie".into(),
+                    model: Some("junie".into()),
+                    status: AgentStatus::Running,
+                    started_at: now,
+                    completed_at: None,
+                    owner_execution_lineage_id: None,
+                    session_lineage_id: None,
+                    session_generation_id: Some(format!("session-{agent_execution_id}")),
+                    rehydrated_from_checkpoint_artifact_id: None,
+                    invocation_owner_key: Some("code_writer".into()),
+                    session_reuse_scope: None,
+                    session_family_id: None,
+                    session_reuse_disposition: Some("fresh".into()),
+                    session_reset_reason: None,
+                    backend_profile_id: None,
+                    requested_mcp_extensions_json: None,
+                    predicted_mcp_extensions_json: None,
+                    predicted_mcp_runtime_ids_json: None,
+                    actual_mcp_extensions_json: None,
+                    actual_mcp_runtime_ids_json: None,
+                    denied_mcp_extensions_json: None,
+                    mcp_blocking_issues_json: None,
+                    actual_mcp_observation_json: None,
+                    actual_xcode_runtime_observation_json: None,
+                    mcp_session_startup_latency_ms: None,
+                    owner_kind: Some("lead_conflict_mediation".into()),
+                    owner_id: Some("mediation-p090".into()),
+                    lead_mediation_record_id: None,
+                    origin_stage_execution_id: None,
+                    total_cost_cents: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cached_input_tokens: None,
+                    transcript_artifact_id: None,
+                    actual_toolchain_mapping_diagnostics_json: None,
+                },
+            )
+            .await
+            .unwrap();
+            let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+            facts.runtime_preflight_phase = Some("preflight_running".into());
+            facts.runtime_preflight_attempt_count = Some(1);
+            facts.runtime_preflight_provider_launched = Some(false);
+            agent_execution_runtime_facts::upsert(&pool, &facts)
+                .await
+                .unwrap();
+        }
+
+        let capacity = InvokeAgentCapacityConfig {
+            max_active_total: 10,
+            max_active_per_run: 10,
+            max_active_xcode_mcp: 10,
+            provider_caps: HashMap::from([("junie".to_string(), 1)]),
+        };
+        let preflight_json = p090_runtime_tool_path_preflight_json_for_success("junie").unwrap();
+
+        assert!(
+            p090_claim_junie_provider_launch_lease(
+                &pool,
+                first_execution_id,
+                &capacity,
+                Some(&preflight_json)
+            )
+            .await
+            .unwrap(),
+            "first Junie execution should acquire the provider launch lease"
+        );
+        assert!(
+            !p090_claim_junie_provider_launch_lease(
+                &pool,
+                second_execution_id,
+                &capacity,
+                Some(&preflight_json)
+            )
+            .await
+            .unwrap(),
+            "second Junie execution must wait while provider cap=1 is leased"
+        );
+
+        let first_facts =
+            agent_execution_runtime_facts::find_by_execution_id(&pool, first_execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+        let second_facts =
+            agent_execution_runtime_facts::find_by_execution_id(&pool, second_execution_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(first_facts.runtime_preflight_provider_launched, Some(true));
+        assert_eq!(
+            second_facts.runtime_preflight_provider_launched,
+            Some(false)
+        );
+    }
+
     #[test]
     fn proposal_090_rollout_flags_default_off_and_parse_explicit_values() {
         assert!(!p090_parse_flag(None, false));
@@ -14574,6 +15304,108 @@ mod tests {
             p090_failure_envelope_authority("junie", "provider_envelope_identity_mismatch", claim,)
                 .as_deref(),
             Some("provider_claim_rejected")
+        );
+    }
+
+    #[test]
+    fn proposal_090_provider_authored_dotted_failure_schema_is_rejected_as_spoof() {
+        let run_id = RunId::new();
+        let stage_execution_id = domain::ids::StageExecutionId::new();
+        let agent_exec_id = domain::ids::AgentExecutionId::new();
+        let captured = acp::AcpCompletionTextCaptureMetadata {
+            capture_status: acp::AcpCompletionCaptureStatus::Captured,
+            captured_text: Some(
+                serde_json::json!({
+                    "schema_version": "code_writer_engine_failure.v1",
+                    "run_id": run_id.to_string(),
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "agent_execution_id": agent_exec_id.to_string(),
+                    "session_generation_id": "session-generation-1",
+                    "completion_boundary_subtype": "junie_progress_without_terminal_handoff"
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let claim = p090_provider_failure_envelope_claim(
+            "junie",
+            &captured,
+            None,
+            run_id,
+            stage_execution_id,
+            agent_exec_id,
+            Some("session-generation-1"),
+        );
+
+        assert_eq!(claim, P090ProviderFailureEnvelopeClaim::Recognized);
+        assert_eq!(
+            p090_completion_boundary_subtype(
+                "junie",
+                &captured,
+                None,
+                1,
+                None,
+                None,
+                false,
+                "missing_required_outputs",
+                None,
+                claim,
+            ),
+            "provider_authored_engine_failure_spoof_rejected"
+        );
+        assert_eq!(
+            p090_failure_envelope_authority(
+                "junie",
+                "provider_authored_engine_failure_spoof_rejected",
+                claim,
+            )
+            .as_deref(),
+            Some("provider_claim_rejected")
+        );
+    }
+
+    #[test]
+    fn proposal_090_engine_owned_failure_envelope_sections_are_versioned_json() {
+        let run_id = RunId::new();
+        let stage_execution_id = domain::ids::StageExecutionId::new();
+        let agent_exec_id = domain::ids::AgentExecutionId::new();
+        let engine_json = p090_engine_failure_envelope_json(
+            run_id,
+            stage_execution_id,
+            agent_exec_id,
+            Some("session-generation-1"),
+            "junie_progress_without_terminal_handoff",
+            "terminal_response_missing",
+        )
+        .expect("engine envelope json");
+        let engine: serde_json::Value = serde_json::from_str(&engine_json).unwrap();
+
+        assert_eq!(engine["schema_version"], "code_writer_engine_failure.v1");
+        assert_eq!(engine["source"], "engine_synthesized");
+        assert_eq!(
+            engine["completion_boundary_subtype"],
+            "junie_progress_without_terminal_handoff"
+        );
+
+        let repair_json = p090_repair_failure_envelope_json(
+            run_id,
+            stage_execution_id,
+            agent_exec_id,
+            Some("session-generation-1"),
+            1,
+            "junie_repair_returned_malformed_json",
+            "repair_json_malformed",
+        )
+        .expect("repair envelope json");
+        let repair: serde_json::Value = serde_json::from_str(&repair_json).unwrap();
+
+        assert_eq!(repair["schema_version"], "code_writer_repair_failure.v1");
+        assert_eq!(repair["source"], "engine_synthesized");
+        assert_eq!(repair["repair_attempt"], 1);
+        assert_eq!(
+            repair["completion_boundary_subtype"],
+            "junie_repair_returned_malformed_json"
         );
     }
 
@@ -14812,6 +15644,7 @@ mod tests {
             None,
             chrono::Utc::now(),
             Some(&close_diagnostic),
+            None,
             None,
         );
 

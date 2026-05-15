@@ -195,6 +195,22 @@ async fn seed_receipt(
             })
             .to_string(),
         ),
+        engine_failure_envelope_json: Some(
+            serde_json::json!({
+                "schema_version": "code_writer_engine_failure.v1",
+                "source": "engine_synthesized",
+                "completion_boundary_subtype": "provider_authored_engine_failure_spoof_rejected"
+            })
+            .to_string(),
+        ),
+        repair_failure_envelope_json: Some(
+            serde_json::json!({
+                "schema_version": "code_writer_repair_failure.v1",
+                "source": "engine_synthesized",
+                "completion_boundary_subtype": "junie_repair_outputs_partially_materialized"
+            })
+            .to_string(),
+        ),
         repair_materialization_summary_json: Some(
             serde_json::json!({
                 "schema": "p090_repair_materialization_summary_v1",
@@ -458,6 +474,14 @@ async fn proposal_088_mcp_report_exposes_code_writer_completion_receipts() {
         implementation_completion["failure_envelope_authority"],
         "provider_claim_rejected"
     );
+    assert!(implementation_completion["engine_failure_envelope_json"]
+        .as_str()
+        .unwrap()
+        .contains("code_writer_engine_failure.v1"));
+    assert!(implementation_completion["repair_failure_envelope_json"]
+        .as_str()
+        .unwrap()
+        .contains("code_writer_repair_failure.v1"));
     assert_eq!(
         implementation_completion["repair_materialization_mode"],
         "staged_per_output"

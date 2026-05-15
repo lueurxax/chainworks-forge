@@ -212,6 +212,22 @@ async fn seed_receipt(
             })
             .to_string(),
         ),
+        engine_failure_envelope_json: Some(
+            serde_json::json!({
+                "schema_version": "code_writer_engine_failure.v1",
+                "source": "engine_synthesized",
+                "completion_boundary_subtype": "provider_authored_engine_failure_spoof_rejected"
+            })
+            .to_string(),
+        ),
+        repair_failure_envelope_json: Some(
+            serde_json::json!({
+                "schema_version": "code_writer_repair_failure.v1",
+                "source": "engine_synthesized",
+                "completion_boundary_subtype": "junie_repair_outputs_partially_materialized"
+            })
+            .to_string(),
+        ),
         repair_materialization_summary_json: Some(
             serde_json::json!({
                 "schema": "p090_repair_materialization_summary_v1",
@@ -604,6 +620,8 @@ async fn proposal_088_graphql_exposes_code_writer_completion_receipts_by_run_and
                             runtimePreflightPhase
                             runtimeToolPathPreflightJson
                             finalCompletionPayloadCaptureJson
+                            engineFailureEnvelopeJson
+                            repairFailureEnvelopeJson
                             failureEnvelopeAuthority
                             repairMaterializationMode
                             strictFinalPayloadEnabled
@@ -637,6 +655,8 @@ async fn proposal_088_graphql_exposes_code_writer_completion_receipts_by_run_and
                             finalPayloadStatus
                             runtimePreflightPhase
                             runtimeToolPathPreflightJson
+                            engineFailureEnvelopeJson
+                            repairFailureEnvelopeJson
                             repairMaterializationMode
                             strictFinalPayloadEnabled
                             stagedRepairSettlementEnabled
@@ -741,6 +761,26 @@ async fn proposal_088_graphql_exposes_code_writer_completion_receipts_by_run_and
         implementation_completion["failureEnvelopeAuthority"],
         "provider_claim_rejected"
     );
+    let engine_envelope: serde_json::Value = serde_json::from_str(
+        implementation_completion["engineFailureEnvelopeJson"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        engine_envelope["schema_version"],
+        "code_writer_engine_failure.v1"
+    );
+    let repair_envelope: serde_json::Value = serde_json::from_str(
+        implementation_completion["repairFailureEnvelopeJson"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        repair_envelope["schema_version"],
+        "code_writer_repair_failure.v1"
+    );
     let final_payload: serde_json::Value = serde_json::from_str(
         implementation_completion["finalCompletionPayloadCaptureJson"]
             .as_str()
@@ -791,6 +831,14 @@ async fn proposal_088_graphql_exposes_code_writer_completion_receipts_by_run_and
         "junie_repair_outputs_partially_materialized"
     );
     assert_eq!(receipt["runtimePreflightPhase"], "passed");
+    assert!(receipt["engineFailureEnvelopeJson"]
+        .as_str()
+        .unwrap()
+        .contains("code_writer_engine_failure.v1"));
+    assert!(receipt["repairFailureEnvelopeJson"]
+        .as_str()
+        .unwrap()
+        .contains("code_writer_repair_failure.v1"));
     let settlement_rows = receipt["settlementRows"].as_array().unwrap();
     assert_eq!(settlement_rows.len(), 2);
     let accepted = settlement_rows
