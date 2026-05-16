@@ -207,6 +207,50 @@ async fn runs_get_and_list_expose_p077_documented_and_legacy_closeout_summary_na
 }
 
 #[tokio::test]
+async fn runs_list_uses_projected_p077_closeout_summary_without_detail_lookup() {
+    let (pool, run_id, fingerprint_hash) = seed_run_with_closeout_summary().await;
+    db::repos::projections::rebuild_all_for_run(&pool, run_id)
+        .await
+        .unwrap();
+
+    sqlx::query("DELETE FROM closeout_gate_generations WHERE run_id = ?1")
+        .bind(run_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let handler = engine::command_handler::CommandHandler::new(
+        pool.clone(),
+        engine::event_bus::new_bus(16),
+        engine::work_queue::WorkQueue::new(pool.clone()),
+    );
+    let list_payload = mcp_server::tools::runs::execute(
+        "runs.list",
+        serde_json::json!({}),
+        &pool,
+        &handler,
+        &principal(auth::PrincipalClass::Operator),
+    )
+    .await
+    .unwrap();
+    let listed = list_payload
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == run_id.to_string())
+        .expect("seeded run must appear in runs.list");
+
+    assert_eq!(
+        listed["implementation_closeout_readiness_summary"],
+        listed["closeout_readiness_summary"]
+    );
+    assert_summary_fields(
+        &listed["implementation_closeout_readiness_summary"],
+        &fingerprint_hash,
+    );
+}
+
+#[tokio::test]
 async fn reports_get_exposes_p077_documented_and_legacy_closeout_summary_names() {
     let (pool, run_id, fingerprint_hash) = seed_run_with_closeout_summary().await;
     let handler = engine::command_handler::CommandHandler::new(
