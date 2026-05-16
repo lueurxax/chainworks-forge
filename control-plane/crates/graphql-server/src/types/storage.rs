@@ -115,6 +115,30 @@ pub struct GqlProjectionStorageHealth {
 }
 
 #[derive(SimpleObject, Debug, Clone)]
+#[graphql(name = "ReadPathMetricHealth", rename_fields = "camelCase")]
+pub struct GqlReadPathMetricHealth {
+    pub sample_count: i64,
+    pub last_ms: Option<i64>,
+    pub p95_ms: Option<i64>,
+}
+
+#[derive(SimpleObject, Debug, Clone)]
+#[graphql(name = "McpLivenessGateMetricHealth", rename_fields = "camelCase")]
+pub struct GqlMcpLivenessGateMetricHealth {
+    pub sample_count: i64,
+    pub last_ms: Option<i64>,
+    pub p95_ms: Option<i64>,
+    pub mcp_liveness_gate_duration_ms: Option<i64>,
+}
+
+#[derive(SimpleObject, Debug, Clone)]
+#[graphql(name = "StorageReadPathHealth", rename_fields = "camelCase")]
+pub struct GqlStorageReadPathHealth {
+    pub runs_list: GqlReadPathMetricHealth,
+    pub mcp_liveness_gate: GqlMcpLivenessGateMetricHealth,
+}
+
+#[derive(SimpleObject, Debug, Clone)]
 #[graphql(name = "EvidenceSpoolSummary", rename_fields = "camelCase")]
 pub struct GqlEvidenceSpoolSummary {
     pub enabled: bool,
@@ -146,6 +170,7 @@ pub struct GqlStorageHealth {
     pub writer: GqlDbWriterHealth,
     pub wal: GqlWalHealth,
     pub projections: GqlProjectionStorageHealth,
+    pub read_path: GqlStorageReadPathHealth,
     pub evidence_spool: GqlEvidenceSpoolSummary,
     pub kill_switches: GqlStorageKillSwitchState,
     pub thresholds: Vec<GqlStorageHealthThreshold>,
@@ -218,6 +243,24 @@ impl GqlStorageHealth {
             coalesced_keys_pending: proj["coalescedKeysPending"].as_i64().unwrap_or(0),
             coalesced_merged_total: proj["coalescedMergedTotal"].as_i64().unwrap_or(0),
             coalesced_flush_age_p95_ms: proj["coalescedFlushAgeP95Ms"].as_f64(),
+        };
+
+        let read_path_json = &json["readPath"];
+        let runs_list_json = &read_path_json["runsList"];
+        let mcp_liveness_json = &read_path_json["mcpLivenessGate"];
+        let read_path = GqlStorageReadPathHealth {
+            runs_list: GqlReadPathMetricHealth {
+                sample_count: runs_list_json["sampleCount"].as_i64().unwrap_or(0),
+                last_ms: runs_list_json["lastMs"].as_i64(),
+                p95_ms: runs_list_json["p95Ms"].as_i64(),
+            },
+            mcp_liveness_gate: GqlMcpLivenessGateMetricHealth {
+                sample_count: mcp_liveness_json["sampleCount"].as_i64().unwrap_or(0),
+                last_ms: mcp_liveness_json["lastMs"].as_i64(),
+                p95_ms: mcp_liveness_json["p95Ms"].as_i64(),
+                mcp_liveness_gate_duration_ms: mcp_liveness_json["mcp_liveness_gate_duration_ms"]
+                    .as_i64(),
+            },
         };
 
         let ev = &json["evidenceSpool"];
@@ -304,6 +347,7 @@ impl GqlStorageHealth {
             writer,
             wal,
             projections,
+            read_path,
             evidence_spool,
             kill_switches,
             thresholds,
@@ -329,6 +373,15 @@ mod tests {
                      "criticalSizeBytes": 536870912 },
             "projections": { "pendingInvalidations": 0, "coalescedKeysPending": 0,
                              "coalescedMergedTotal": 0 },
+            "readPath": {
+                "runsList": { "sampleCount": 2, "lastMs": 12, "p95Ms": 12 },
+                "mcpLivenessGate": {
+                    "sampleCount": 1,
+                    "lastMs": 8,
+                    "p95Ms": 8,
+                    "mcp_liveness_gate_duration_ms": 8
+                }
+            },
             "evidenceSpool": { "enabled": false, "filesWrittenTotal": 0, "bytesWrittenTotal": 0,
                                "metadataRowsTotal": 0, "orphanFiles": 0, "orphanBytes": 0,
                                "recoveredFiles": 0, "checksumMismatchFiles": 0,
@@ -372,5 +425,21 @@ mod tests {
         let gql = GqlStorageHealth::from_storage_health_json(json)
             .expect("from_storage_health_json must succeed");
         assert!(!gql.is_stale, "explicit isStale=false must be preserved");
+    }
+
+    #[test]
+    fn proposal_087_storage_health_exposes_read_path_metrics() {
+        let json = minimal_health_json(serde_json::json!(false));
+        let gql = GqlStorageHealth::from_storage_health_json(json)
+            .expect("from_storage_health_json must include readPath");
+        assert_eq!(gql.read_path.runs_list.sample_count, 2);
+        assert_eq!(gql.read_path.runs_list.p95_ms, Some(12));
+        assert_eq!(gql.read_path.mcp_liveness_gate.sample_count, 1);
+        assert_eq!(
+            gql.read_path
+                .mcp_liveness_gate
+                .mcp_liveness_gate_duration_ms,
+            Some(8)
+        );
     }
 }

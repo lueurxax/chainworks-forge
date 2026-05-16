@@ -152,15 +152,7 @@ impl AcpAdapter for JunieAdapter {
 }
 
 fn junie_p090_preflight_enforced() -> bool {
-    matches!(
-        std::env::var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+    true
 }
 
 fn junie_p090_preflight_json(
@@ -548,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn proposal_090_tool_path_preflight_runs_in_diagnostic_mode_when_enforce_is_off() {
+    fn proposal_090_tool_path_preflight_enforcement_ignores_disable_env() {
         let _guard = preflight_env_lock();
         let previous = std::env::var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE").ok();
         std::env::set_var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE", "0");
@@ -577,7 +569,7 @@ mod tests {
         .unwrap();
         assert_eq!(preflight["status"], "passed");
         assert_eq!(preflight["attempt_count"], 1);
-        assert_eq!(preflight["enforcement_enabled"], false);
+        assert_eq!(preflight["enforcement_enabled"], true);
         if let Some(previous) = previous {
             std::env::set_var("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE", previous);
         } else {

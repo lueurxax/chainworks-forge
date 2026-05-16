@@ -166,14 +166,10 @@ pointer publication. Staged rows without accepted settlement may be retried or
 discarded; committed rows are recovered from their canonical digest; failed rows
 preserve the prior digest and failure reason.
 
-Rollout controls:
-
-| Control | Default | Stable behavior |
-|---|---|---|
-| `CHAINWORKS_P090_STRICT_FINAL_PAYLOAD` | `0` | Records strict completion-boundary diagnostics while preserving legacy enforcement until enabled. |
-| `CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE` | `0` | Runs Junie preflight in diagnostic mode by default; when enabled, non-remediable path failures fail before provider launch. |
-| `CHAINWORKS_P090_STAGED_REPAIR_SETTLEMENT` | `0` | Enables staged per-output repair settlement when strict final payload is also enabled. |
-| `CHAINWORKS_P090_DISABLE_STAGED_REPAIR_SETTLEMENT` | `0` | Emergency kill switch for staged repair materialization; readback reports the disabled mode. |
+P090 Junie hardening is always enabled in runtime code. Strict final-payload
+handling, Junie tool-path preflight enforcement, and staged per-output repair
+settlement do not depend on process environment variables during normal daemon
+startup.
 
 ### One contract authority
 

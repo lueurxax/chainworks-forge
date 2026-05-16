@@ -7,7 +7,7 @@ use serde::Serialize;
 use sqlx::{Row, SqlitePool};
 use tracing::info;
 
-use super::artifact_contracts;
+use super::{artifact_contracts, closeout, code_writer_completion_receipts};
 use crate::writer::{
     execute_repository_transaction_operation, repository_transaction_operation, TransactionWork,
 };
@@ -100,6 +100,11 @@ pub struct RunProjectionRow {
     pub pending_approvals: i64,
     /// P050: Per-run meta root (read-only, nullable for legacy runs).
     pub chainworks_meta_root: Option<String>,
+    pub implementation_self_assessment_summary: Option<serde_json::Value>,
+    #[serde(rename = "implementationCompletion")]
+    pub implementation_completion: serde_json::Value,
+    pub closeout_readiness_summary: Option<serde_json::Value>,
+    pub implementation_closeout_readiness_summary: Option<serde_json::Value>,
     pub projection_present: bool,
     pub projection_updated_at: Option<String>,
     pub projection_lag: bool,
@@ -148,6 +153,9 @@ pub async fn list_active_projection(pool: &SqlitePool) -> Result<Vec<RunProjecti
                   r.artifact_root, r.started_at, r.completed_at,
                   r.cancellation_requested_at, r.cancellation_settled_at,
                   rs.cancellation_settlement_summary,
+                  rs.implementation_self_assessment_summary_json,
+                  rs.implementation_completion_json,
+                  rs.closeout_readiness_summary_json,
                   r.status AS status,
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
@@ -186,6 +194,23 @@ pub async fn list_active_projection(pool: &SqlitePool) -> Result<Vec<RunProjecti
                 cancellation_requested_at: r.get("cancellation_requested_at"),
                 cancellation_settled_at: r.get("cancellation_settled_at"),
                 cancellation_settlement_summary: r.get("cancellation_settlement_summary"),
+                implementation_self_assessment_summary: parse_optional_json_column(
+                    &r,
+                    "implementation_self_assessment_summary_json",
+                )?,
+                implementation_completion: parse_optional_json_column(
+                    &r,
+                    "implementation_completion_json",
+                )?
+                .unwrap_or_else(not_attempted_implementation_completion_json),
+                closeout_readiness_summary: parse_optional_json_column(
+                    &r,
+                    "closeout_readiness_summary_json",
+                )?,
+                implementation_closeout_readiness_summary: parse_optional_json_column(
+                    &r,
+                    "closeout_readiness_summary_json",
+                )?,
                 total_stages: r.get("total_stages"),
                 completed_stages: r.get("completed_stages"),
                 failed_stages: r.get("failed_stages"),
@@ -215,6 +240,9 @@ pub async fn list_by_idea_projection(
                   r.artifact_root, r.started_at, r.completed_at,
                   r.cancellation_requested_at, r.cancellation_settled_at,
                   rs.cancellation_settlement_summary,
+                  rs.implementation_self_assessment_summary_json,
+                  rs.implementation_completion_json,
+                  rs.closeout_readiness_summary_json,
                   r.status AS status,
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
@@ -254,6 +282,23 @@ pub async fn list_by_idea_projection(
                 cancellation_requested_at: r.get("cancellation_requested_at"),
                 cancellation_settled_at: r.get("cancellation_settled_at"),
                 cancellation_settlement_summary: r.get("cancellation_settlement_summary"),
+                implementation_self_assessment_summary: parse_optional_json_column(
+                    &r,
+                    "implementation_self_assessment_summary_json",
+                )?,
+                implementation_completion: parse_optional_json_column(
+                    &r,
+                    "implementation_completion_json",
+                )?
+                .unwrap_or_else(not_attempted_implementation_completion_json),
+                closeout_readiness_summary: parse_optional_json_column(
+                    &r,
+                    "closeout_readiness_summary_json",
+                )?,
+                implementation_closeout_readiness_summary: parse_optional_json_column(
+                    &r,
+                    "closeout_readiness_summary_json",
+                )?,
                 total_stages: r.get("total_stages"),
                 completed_stages: r.get("completed_stages"),
                 failed_stages: r.get("failed_stages"),
@@ -347,6 +392,9 @@ pub async fn find_run_projection(
                   r.artifact_root, r.started_at, r.completed_at,
                   r.cancellation_requested_at, r.cancellation_settled_at,
                   rs.cancellation_settlement_summary,
+                  rs.implementation_self_assessment_summary_json,
+                  rs.implementation_completion_json,
+                  rs.closeout_readiness_summary_json,
                   r.status AS status,
                   COALESCE(rs.total_stages, 0) AS total_stages,
                   COALESCE(rs.completed_stages, 0) AS completed_stages,
@@ -384,6 +432,23 @@ pub async fn find_run_projection(
             cancellation_requested_at: r.get("cancellation_requested_at"),
             cancellation_settled_at: r.get("cancellation_settled_at"),
             cancellation_settlement_summary: r.get("cancellation_settlement_summary"),
+            implementation_self_assessment_summary: parse_optional_json_column(
+                &r,
+                "implementation_self_assessment_summary_json",
+            )?,
+            implementation_completion: parse_optional_json_column(
+                &r,
+                "implementation_completion_json",
+            )?
+            .unwrap_or_else(not_attempted_implementation_completion_json),
+            closeout_readiness_summary: parse_optional_json_column(
+                &r,
+                "closeout_readiness_summary_json",
+            )?,
+            implementation_closeout_readiness_summary: parse_optional_json_column(
+                &r,
+                "closeout_readiness_summary_json",
+            )?,
             total_stages: r.get("total_stages"),
             completed_stages: r.get("completed_stages"),
             failed_stages: r.get("failed_stages"),
@@ -395,6 +460,25 @@ pub async fn find_run_projection(
         })
     })
     .transpose()
+}
+
+fn parse_optional_json_column(
+    row: &sqlx::sqlite::SqliteRow,
+    column: &str,
+) -> Result<Option<serde_json::Value>> {
+    let raw: Option<String> = row
+        .try_get(column)
+        .with_context(|| format!("read run projection JSON column {column}"))?;
+    raw.map(|value| {
+        serde_json::from_str(&value)
+            .with_context(|| format!("parse run projection JSON column {column}"))
+    })
+    .transpose()
+}
+
+fn not_attempted_implementation_completion_json() -> serde_json::Value {
+    serde_json::to_value(domain::code_writer_completion::project_implementation_completion(&[]))
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// Rebuild run_summary for a single run from canonical tables.
@@ -477,6 +561,51 @@ async fn rebuild_run_summary_on_current_thread(pool: &SqlitePool, run_id: RunId)
                 .await?
                 .rows_affected() as u32;
                 Ok(((), rows))
+                })
+            })
+        },
+    )
+    .await?;
+
+    let implementation_self_assessment_summary_json =
+        artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
+            .await?
+            .map(|stored| serde_json::to_string(&stored.summary))
+            .transpose()?;
+    let canonical_receipts =
+        code_writer_completion_receipts::list_canonical_by_run(pool, run_id).await?;
+    let implementation_completion_json = serde_json::to_string(
+        &domain::code_writer_completion::project_implementation_completion(&canonical_receipts),
+    )?;
+    let closeout_readiness_summary_json =
+        closeout::load_closeout_readiness_summary(pool, &run_id_string)
+            .await?
+            .map(|summary| serde_json::to_string(&summary))
+            .transpose()?;
+
+    execute_projection_write(
+        pool,
+        "projections.rebuild_run_summary",
+        format!("run:{run_id_string}:projection:run_summary:hot_read_payloads"),
+        {
+            let run_id_string = run_id_string.clone();
+            Box::new(move |tx| {
+                Box::pin(async move {
+                    let rows = sqlx::query(
+                        r#"UPDATE run_summaries
+                           SET implementation_self_assessment_summary_json = ?1,
+                               implementation_completion_json = ?2,
+                               closeout_readiness_summary_json = ?3
+                           WHERE run_id = ?4"#,
+                    )
+                    .bind(implementation_self_assessment_summary_json)
+                    .bind(implementation_completion_json)
+                    .bind(closeout_readiness_summary_json)
+                    .bind(run_id_string)
+                    .execute(&mut **tx)
+                    .await?
+                    .rows_affected() as u32;
+                    Ok(((), rows))
                 })
             })
         },

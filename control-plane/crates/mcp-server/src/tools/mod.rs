@@ -4,6 +4,7 @@ pub mod effects;
 pub mod ideas;
 pub mod reports;
 pub mod runs;
+pub mod runtime;
 pub mod stages;
 pub mod steward;
 pub mod storage;
@@ -11,7 +12,7 @@ pub mod storage;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 32] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 33] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -36,6 +37,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 32] {
         CapabilityToolId::StewardListAnalyses,
         CapabilityToolId::StewardGetAnalysis,
         CapabilityToolId::StorageHealth,
+        CapabilityToolId::RuntimeHealth,
         CapabilityToolId::StorageWritePressure,
         CapabilityToolId::StorageEvidenceSpoolSummary,
         CapabilityToolId::StorageReconcileEvidenceOrphans,
@@ -89,6 +91,7 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
         "storage.health" => Some(CapabilityToolId::StorageHealth),
+        "runtime.health" => Some(CapabilityToolId::RuntimeHealth),
         "storage.write_pressure" => Some(CapabilityToolId::StorageWritePressure),
         "storage.evidence_spool_summary" => Some(CapabilityToolId::StorageEvidenceSpoolSummary),
         "storage.reconcile_evidence_orphans" => {
@@ -136,6 +139,7 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "effects_mark_unrecoverable" => "effects.mark_unrecoverable",
         "effects_clear_after_manual_verification" => "effects.clear_after_manual_verification",
         "storage_health" => "storage.health",
+        "runtime_health" => "runtime.health",
         "storage_write_pressure" => "storage.write_pressure",
         "storage_evidence_spool_summary" => "storage.evidence_spool_summary",
         "storage_reconcile_evidence_orphans" => "storage.reconcile_evidence_orphans",
@@ -204,6 +208,9 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::StorageHealth => {
             tool_spec_by_name(storage::tool_specs(), "storage.health")
         }
+        CapabilityToolId::RuntimeHealth => {
+            tool_spec_by_name(runtime::tool_specs(), "runtime.health")
+        }
         CapabilityToolId::StorageWritePressure => {
             tool_spec_by_name(storage::tool_specs(), "storage.write_pressure")
         }
@@ -246,6 +253,7 @@ pub fn all_tool_specs() -> Vec<McpTool> {
     specs.extend(artifacts::tool_specs());
     specs.extend(steward::tool_specs());
     specs.extend(effects::tool_specs());
+    specs.extend(runtime::tool_specs());
     specs.extend(storage::tool_specs());
     specs
 }
@@ -294,6 +302,10 @@ mod tests {
         assert_eq!(
             super::capability_id_for("runs_list"),
             Some(CapabilityToolId::RunsList)
+        );
+        assert_eq!(
+            super::capability_id_for("runtime.health"),
+            Some(CapabilityToolId::RuntimeHealth)
         );
         assert_eq!(
             super::mcp_tool_for(CapabilityToolId::StewardGetAnalysis).name,

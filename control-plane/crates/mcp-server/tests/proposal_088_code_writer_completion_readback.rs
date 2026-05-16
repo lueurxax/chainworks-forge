@@ -556,3 +556,49 @@ async fn proposal_088_mcp_runs_get_and_list_expose_implementation_completion() {
         "junie_repair_outputs_partially_materialized"
     );
 }
+
+#[tokio::test]
+async fn proposal_088_mcp_runs_list_uses_projected_implementation_completion_without_receipt_lookup(
+) {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
+        .await
+        .unwrap();
+    let (run_id, _stage_execution_id, _agent_execution_id, _receipt_id) = seed_receipt(&pool).await;
+    db::repos::projections::rebuild_all_for_run(&pool, run_id)
+        .await
+        .unwrap();
+
+    sqlx::query("DELETE FROM code_writer_completion_receipts WHERE run_id = ?1")
+        .bind(run_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+    let run_list = mcp_runs::execute(
+        "runs.list",
+        serde_json::json!({}),
+        &pool,
+        &handler,
+        &principal,
+    )
+    .await
+    .unwrap();
+    let listed = run_list
+        .as_array()
+        .expect("runs.list array")
+        .iter()
+        .find(|item| item["id"] == serde_json::json!(run_id.to_string()))
+        .expect("seeded run listed");
+
+    assert_eq!(
+        listed["implementationCompletion"]["ingestion_boundary_failure"]["value"],
+        "extraction_input_truncated"
+    );
+    assert_eq!(
+        listed["implementationCompletion"]["completion_boundary_subtype"]["value"],
+        "junie_repair_outputs_partially_materialized"
+    );
+}
