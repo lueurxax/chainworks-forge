@@ -259,10 +259,10 @@ impl QueryRoot {
         let pool = ctx.data::<SqlitePool>()?;
         if let Some(id) = idea_id {
             let items = projections::list_by_idea_projection(pool, id.as_str()).await?;
-            runs_with_latest_summaries(pool, items.into_iter().map(GqlRun::from).collect()).await
+            Ok(items.into_iter().map(GqlRun::from).collect())
         } else {
             let items = projections::list_active_projection(pool).await?;
-            runs_with_latest_summaries(pool, items.into_iter().map(GqlRun::from).collect()).await
+            Ok(items.into_iter().map(GqlRun::from).collect())
         }
     }
 
@@ -1016,75 +1016,6 @@ fn side_effect_operator_next_action(status: &domain::side_effect::SideEffectStat
         _ => "effects.inspect",
     }
     .to_string()
-}
-
-async fn runs_with_latest_summaries(pool: &SqlitePool, runs: Vec<GqlRun>) -> Result<Vec<GqlRun>> {
-    let mut with_summaries = Vec::with_capacity(runs.len());
-    for run in runs {
-        with_summaries.push(run_with_latest_summary(pool, run).await?);
-    }
-    Ok(with_summaries)
-}
-
-async fn run_with_latest_summary(pool: &SqlitePool, mut run: GqlRun) -> Result<GqlRun> {
-    let run_id: RunId = run
-        .id
-        .as_str()
-        .parse()
-        .map_err(|error: uuid::Error| Error::new(error.to_string()))?;
-    run.implementation_self_assessment_summary =
-        artifact_contracts::find_active_implementation_self_assessment_summary(pool, run_id)
-            .await?
-            .map(|stored| stored.summary.into());
-    let code_writer_completion_readbacks =
-        code_writer_completion_receipts::list_by_run(pool, run_id).await?;
-    let canonical_code_writer_completion_readbacks =
-        code_writer_completion_receipts::list_canonical_by_run(pool, run_id).await?;
-    run.implementation_completion =
-        domain::code_writer_completion::project_implementation_completion(
-            &canonical_code_writer_completion_readbacks,
-        )
-        .into();
-    run.code_writer_completion_receipts = code_writer_completion_readbacks
-        .into_iter()
-        .map(Into::into)
-        .collect();
-    enrich_run_with_p091_retry_authority(pool, run_id, &mut run).await?;
-    run.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
-        .await?
-        .map(Into::into);
-    // P017: Enrich workflow conflict with lead mediation readback if present.
-    // API-001 (P017 R2 audit): the enriched projection includes
-    // mediation-owned `execution_attempts` so operators can inspect the
-    // mediation's runtime facts, watchdog outcome, artifacts, and
-    // provider/timing details directly through the conflict surface.
-    if let Some(ref mut conflict) = run.workflow_conflict {
-        if let Some(ref mediation_id) = conflict.mediation_record_id {
-            if let Ok(Some(med)) =
-                db::repos::lead_conflict_mediations::find_by_id(pool, mediation_id).await
-            {
-                conflict.lead_mediation = Some(
-                    crate::types::run::GqlLeadMediation::build_with_attempts(pool, &med).await?,
-                );
-            }
-        }
-    }
-    run.implementation_handoff_status_json = if let Some(status) =
-        workflow_conflicts::get_implementation_handoff_status(pool, run_id).await?
-    {
-        Some(async_graphql::Json(serde_json::to_value(status)?))
-    } else {
-        None
-    };
-    // P077: Populate closeout readiness summary via CloseoutReadinessSummaryAccessor.
-    let run_id_str = run_id.to_string();
-    if let Some(summary) = closeout::load_closeout_readiness_summary(pool, &run_id_str).await? {
-        let summary_json = async_graphql::Json(serde_json::to_value(&summary)?);
-        run.closeout_readiness_summary_json = Some(summary_json.clone());
-        run.implementation_closeout_readiness_summary = Some(summary_json);
-    }
-    run.side_effect_readback_json = Some(Json(side_effect_readback_json(pool, run_id).await?));
-    Ok(run)
 }
 
 async fn enrich_run_with_p091_retry_authority(

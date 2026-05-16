@@ -12055,22 +12055,21 @@ fn p090_provider_runtime_family(provider: &str) -> Option<String> {
 }
 
 fn p090_strict_final_payload_enabled(provider: &str) -> bool {
-    provider == "junie" && p090_env_flag("CHAINWORKS_P090_STRICT_FINAL_PAYLOAD", false)
+    provider == "junie"
 }
 
 fn p090_staged_repair_settlement_requested(provider: &str) -> bool {
-    provider == "junie" && p090_env_flag("CHAINWORKS_P090_STAGED_REPAIR_SETTLEMENT", false)
+    provider == "junie"
 }
 
 fn p090_staged_repair_settlement_enabled(provider: &str) -> bool {
     provider == "junie"
         && p090_strict_final_payload_enabled(provider)
         && p090_staged_repair_settlement_requested(provider)
-        && !p090_env_flag("CHAINWORKS_P090_DISABLE_STAGED_REPAIR_SETTLEMENT", false)
 }
 
 fn p090_junie_preflight_enforce_enabled(provider: &str) -> bool {
-    provider == "junie" && p090_env_flag("CHAINWORKS_P090_JUNIE_PREFLIGHT_ENFORCE", false)
+    provider == "junie"
 }
 
 fn p090_junie_preflight_records_diagnostics(provider: &str) -> bool {
@@ -12078,7 +12077,8 @@ fn p090_junie_preflight_records_diagnostics(provider: &str) -> bool {
 }
 
 fn p090_staged_repair_disabled(provider: &str) -> bool {
-    provider == "junie" && p090_env_flag("CHAINWORKS_P090_DISABLE_STAGED_REPAIR_SETTLEMENT", false)
+    let _ = provider;
+    false
 }
 
 fn p090_staged_repair_missing_strict_warning(provider: &str) -> Option<&'static str> {
@@ -12109,18 +12109,6 @@ fn p090_repair_materialization_mode_for_flags(
         return "staged_per_output";
     }
     "legacy_all_or_nothing"
-}
-
-fn p090_env_flag(name: &str, default: bool) -> bool {
-    p090_parse_flag(std::env::var(name).ok().as_deref(), default)
-}
-
-fn p090_parse_flag(raw: Option<&str>, default: bool) -> bool {
-    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("1" | "true" | "yes" | "on") => true,
-        Some("0" | "false" | "no" | "off") => false,
-        _ => default,
-    }
 }
 
 fn p090_completion_boundary_subtype(
@@ -14895,7 +14883,7 @@ mod tests {
 
         assert_eq!(preflight["status"], "passed");
         assert_eq!(preflight["provider_launched"], true);
-        assert_eq!(preflight["enforcement_enabled"], false);
+        assert_eq!(preflight["enforcement_enabled"], true);
         assert_eq!(
             p090_runtime_preflight_phase("junie", Some(&preflight_json)),
             "passed"
@@ -15133,13 +15121,15 @@ mod tests {
     }
 
     #[test]
-    fn proposal_090_rollout_flags_default_off_and_parse_explicit_values() {
-        assert!(!p090_parse_flag(None, false));
-        assert!(p090_parse_flag(Some("1"), false));
-        assert!(p090_parse_flag(Some("true"), false));
-        assert!(!p090_parse_flag(Some("0"), true));
-        assert!(!p090_parse_flag(Some("off"), true));
-        assert!(p090_parse_flag(Some("unexpected"), true));
+    fn proposal_090_junie_runtime_hardening_is_always_enabled() {
+        assert!(p090_strict_final_payload_enabled("junie"));
+        assert!(p090_staged_repair_settlement_requested("junie"));
+        assert!(p090_staged_repair_settlement_enabled("junie"));
+        assert!(p090_junie_preflight_enforce_enabled("junie"));
+        assert!(!p090_staged_repair_disabled("junie"));
+        assert!(!p090_strict_final_payload_enabled("codex"));
+        assert!(!p090_staged_repair_settlement_enabled("codex"));
+        assert!(!p090_junie_preflight_enforce_enabled("codex"));
     }
 
     #[test]

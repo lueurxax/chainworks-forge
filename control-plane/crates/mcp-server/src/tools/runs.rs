@@ -377,17 +377,15 @@ pub async fn execute(
         }
 
         "runs.list" => {
+            let started = std::time::Instant::now();
             let items = projections::list_active_projection(pool).await?;
-            let mut values = Vec::with_capacity(items.len());
-            for item in items {
-                let value = attach_implementation_self_assessment_summary(
-                    pool,
-                    serde_json::to_value(&item)?,
-                )
-                .await?;
-                // P077 BLK-004: attach closeout_readiness_summary parity on runs.list.
-                values.push(attach_closeout_readiness_summary(pool, value).await?);
-            }
+            let values = items
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            db::repos::storage_health::record_runs_list_read_latency(
+                started.elapsed().as_millis() as u64
+            );
             Ok(serde_json::Value::Array(values))
         }
 
@@ -1491,6 +1489,97 @@ mod tests {
         assert_eq!(
             item["implementation_self_assessment_summary"]["status"],
             serde_json::json!("blocked")
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_list_records_production_read_latency_metric() {
+        db::repos::storage_health::reset_read_path_metrics_for_tests();
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run = make_run(RunId::new(), idea_id);
+        runs::insert(&pool, &run).await.unwrap();
+        db::repos::projections::rebuild_all_for_run(&pool, run.id)
+            .await
+            .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        execute(
+            "runs.list",
+            serde_json::json!({}),
+            &pool,
+            &handler,
+            &test_principal(),
+        )
+        .await
+        .unwrap();
+
+        let health = db::repos::storage_health::storage_health(&pool)
+            .await
+            .unwrap();
+        assert_eq!(health["readPath"]["runsList"]["sampleCount"], 1);
+        assert!(health["readPath"]["runsList"]["p95Ms"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn proposal_087_runs_list_p95_stays_under_budget_from_projection() {
+        db::repos::storage_health::reset_read_path_metrics_for_tests();
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        for index in 0..120 {
+            let run = make_run(RunId::new(), idea_id);
+            runs::insert(&pool, &run).await.unwrap();
+            sqlx::query(
+                r#"INSERT INTO run_summaries
+                   (run_id, idea_id, workflow_title, status, total_stages, completed_stages,
+                    failed_stages, pending_approvals, started_at, updated_at)
+                   VALUES (?1, ?2, ?3, 'ready', ?4, 0, 0, 0, ?5, ?5)"#,
+            )
+            .bind(run.id.to_string())
+            .bind(idea_id.to_string())
+            .bind(format!("Workflow {index}"))
+            .bind((index % 4) as i64)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let handler = make_command_handler(pool.clone());
+        let mut durations_ms = Vec::new();
+        for _ in 0..8 {
+            let started = std::time::Instant::now();
+            let result = execute(
+                "runs.list",
+                serde_json::json!({}),
+                &pool,
+                &handler,
+                &test_principal(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.as_array().unwrap().len(), 120);
+            durations_ms.push(started.elapsed().as_millis() as u64);
+        }
+        durations_ms.sort_unstable();
+        let p95 = durations_ms[durations_ms.len() - 1];
+        assert!(
+            p95 <= 500,
+            "projection-backed runs.list p95 must stay under 500 ms, got {p95} ms from samples {durations_ms:?}"
+        );
+
+        let health = db::repos::storage_health::storage_health(&pool)
+            .await
+            .unwrap();
+        assert_eq!(health["readPath"]["runsList"]["sampleCount"], 8);
+        assert!(
+            health["readPath"]["runsList"]["p95Ms"]
+                .as_u64()
+                .unwrap_or(u64::MAX)
+                <= 500
         );
     }
 

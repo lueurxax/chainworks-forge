@@ -4615,33 +4615,19 @@ impl CommandHandler {
         )
         .await?;
         stages::insert_tx(&mut retry_tx, &new_stage).await?;
-        retry_stage_execution_authorities::supersede_active_for_stage_tx(
+        let authority = retry_stage_execution_authorities::create_active_targeted_agent_retry_tx(
             &mut retry_tx,
             run_id,
             stage_id,
+            new_stage.id,
+            Some(journal_id.to_string()),
+            None,
+            retry_work_item_id.clone(),
+            Some(agent_execution_id.to_string()),
             now,
-            "superseded_by_new_targeted_retry",
         )
         .await?;
-        retry_stage_execution_authorities::create_tx(
-            &mut retry_tx,
-            &RetryStageExecutionAuthority {
-                id: retry_authority_id,
-                run_id,
-                stage_id: stage_id.to_string(),
-                target_stage_execution_id: new_stage.id,
-                entry_kind: RetryAuthorityEntryKind::TargetedAgentRetry,
-                source_command_journal_id: Some(journal_id.to_string()),
-                source_retry_work_item_id: None,
-                source_invoke_work_item_id: Some(retry_work_item_id.clone()),
-                source_agent_execution_id: Some(agent_execution_id.to_string()),
-                authority_state: RetryAuthorityState::Active,
-                created_at: now,
-                updated_at: now,
-                terminal_reason: None,
-            },
-        )
-        .await?;
+        debug_assert_eq!(authority.id, retry_authority_id);
         sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
             .bind(RunStatus::Running.to_string())
             .bind(stage_id)

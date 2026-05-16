@@ -25,6 +25,7 @@ pub enum CapabilityToolId {
     StewardListAnalyses,
     StewardGetAnalysis,
     StorageHealth,
+    RuntimeHealth,
     StorageWritePressure,
     StorageEvidenceSpoolSummary,
     StorageReconcileEvidenceOrphans,

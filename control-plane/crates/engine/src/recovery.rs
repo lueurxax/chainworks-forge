@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -28,6 +28,7 @@ use domain::provider::InvokeAgentCapacityConfig;
 use domain::retry_authority::RetryAuthorityState;
 use domain::run::Run;
 use domain::stage::{StageSettlementKind, StageStatus};
+use sqlx::Row;
 
 use crate::event_bus::EventSender;
 use crate::work_queue::WorkQueue;
@@ -169,6 +170,33 @@ fn recovery_action_from_runtime_facts(
         }
         _ => ("retry_stage", "runtime_failure"),
     }
+}
+
+fn inject_retry_authority_id_into_payload(
+    payload_json: &str,
+    retry_authority_id: &str,
+) -> Result<String> {
+    let mut payload: serde_json::Value = serde_json::from_str(payload_json)?;
+    let Some(object) = payload.as_object_mut() else {
+        return Err(anyhow!("auto-contract retry payload is not an object"));
+    };
+    object.insert(
+        "retry_authority_id".to_string(),
+        serde_json::json!(retry_authority_id),
+    );
+    let targeted_retry = object
+        .entry("targeted_retry".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(targeted_retry) = targeted_retry.as_object_mut() else {
+        return Err(anyhow!(
+            "auto-contract retry targeted_retry is not an object"
+        ));
+    };
+    targeted_retry.insert(
+        "retry_authority_id".to_string(),
+        serde_json::json!(retry_authority_id),
+    );
+    Ok(serde_json::to_string(&payload)?)
 }
 
 async fn stage_has_pending_or_running_invoke_work(
@@ -385,6 +413,52 @@ impl RecoveryService {
                 settled = agent_executions_settled,
                 "Startup recovery settled terminal preclaimed InvokeAgent executions"
             );
+        }
+        for run in &active_runs {
+            match self
+                .repair_auto_contract_retry_authority_gaps_for_run(run)
+                .await
+            {
+                Ok(repaired) => {
+                    if repaired > 0 {
+                        work_items_requeued += repaired;
+                        warn!(
+                            run_id = %run.id,
+                            repaired = repaired,
+                            "Startup recovery repaired auto-contract targeted retry authority gaps"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run.id,
+                        error = %e,
+                        "Failed to repair auto-contract targeted retry authority gaps during startup"
+                    );
+                }
+            }
+            match self
+                .recover_failed_terminal_targeted_advance_authorities_for_run(run)
+                .await
+            {
+                Ok(recovered) => {
+                    if recovered > 0 {
+                        work_items_requeued += recovered;
+                        warn!(
+                            run_id = %run.id,
+                            recovered = recovered,
+                            "Startup recovery settled terminal targeted AdvanceRun authority rows"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run.id,
+                        error = %e,
+                        "Failed to recover terminal targeted AdvanceRun authority rows during startup"
+                    );
+                }
+            }
         }
         let requeued_steward_analyses = work_items::requeue_running_steward_analysis_on_startup(
             &self.pool,
@@ -718,6 +792,247 @@ impl RecoveryService {
                 continue;
             }
             recovered += 1;
+        }
+        Ok(recovered)
+    }
+
+    async fn repair_auto_contract_retry_authority_gaps_for_run(&self, run: &Run) -> Result<usize> {
+        let rows = sqlx::query(
+            r#"
+            WITH candidates AS (
+                SELECT id,
+                       payload_json,
+                       stage_id AS work_stage_id,
+                       json_extract(payload_json, '$.stage_execution_id') AS target_stage_execution_id,
+                       json_extract(payload_json, '$.p058_claimed.agent_execution_id') AS claimed_agent_execution_id,
+                       json_extract(payload_json, '$.targeted_retry.source_agent_execution_id') AS source_agent_execution_id
+                FROM work_items
+                WHERE run_id = ?1
+                  AND kind = 'invoke_agent'
+                  AND status = 'running'
+                  AND id LIKE 'auto-contract-output-retry:%'
+                  AND json_extract(payload_json, '$.targeted_retry.reason') = 'auto_contract_output_retry'
+            )
+            SELECT c.id,
+                   c.payload_json,
+                   c.work_stage_id,
+                   c.target_stage_execution_id,
+                   c.claimed_agent_execution_id,
+                   c.source_agent_execution_id,
+                   ae.status AS agent_status,
+                   facts.output_settlement,
+                   facts.valid_required_outputs
+            FROM candidates c
+            LEFT JOIN retry_stage_execution_authorities rsa
+                   ON rsa.run_id = ?1
+                  AND rsa.target_stage_execution_id = c.target_stage_execution_id
+                  AND rsa.authority_state = 'active'
+            LEFT JOIN agent_executions ae
+                   ON ae.id = c.claimed_agent_execution_id
+            LEFT JOIN agent_execution_runtime_facts facts
+                   ON facts.agent_execution_id = c.claimed_agent_execution_id
+            WHERE c.target_stage_execution_id IS NOT NULL
+              AND rsa.id IS NULL
+            ORDER BY c.id
+            "#,
+        )
+        .bind(run.id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut repaired = 0usize;
+        for row in rows {
+            let item_id: String = row.get("id");
+            let payload_json: String = row.get("payload_json");
+            let Some(stage_id) = row.get::<Option<String>, _>("work_stage_id") else {
+                continue;
+            };
+            let Some(target_raw) = row.get::<Option<String>, _>("target_stage_execution_id") else {
+                continue;
+            };
+            let Ok(target_stage_execution_id) = target_raw.parse() else {
+                continue;
+            };
+            let Some(claimed_agent_execution_id) =
+                row.get::<Option<String>, _>("claimed_agent_execution_id")
+            else {
+                continue;
+            };
+            let Some(agent_status) = row.get::<Option<String>, _>("agent_status") else {
+                continue;
+            };
+            let output_settlement = row.get::<Option<String>, _>("output_settlement");
+            let valid_required_outputs = row
+                .get::<Option<i64>, _>("valid_required_outputs")
+                .unwrap_or_default();
+            let is_valid_completed = agent_status == AgentStatus::Completed.to_string()
+                && matches!(
+                    output_settlement.as_deref(),
+                    Some(
+                        "valid_outputs_from_completed_execution"
+                            | "valid_outputs_from_failed_execution"
+                    )
+                )
+                && valid_required_outputs > 0;
+            let is_terminal_failed = matches!(agent_status.as_str(), "failed" | "cancelled");
+            if !is_valid_completed && !is_terminal_failed {
+                continue;
+            }
+
+            let source_agent_execution_id = row
+                .get::<Option<String>, _>("source_agent_execution_id")
+                .or(Some(claimed_agent_execution_id));
+            let now = Utc::now();
+            let authority_id = {
+                let mut tx = self
+                    .begin_transaction(
+                        "recovery.auto_contract_retry_authority_gap",
+                        format!("recovery.auto_contract_retry_authority_gap:{item_id}"),
+                    )
+                    .await?;
+                let authority =
+                    retry_stage_execution_authorities::create_active_targeted_agent_retry_tx(
+                        &mut tx,
+                        run.id,
+                        &stage_id,
+                        target_stage_execution_id,
+                        None,
+                        None,
+                        item_id.clone(),
+                        source_agent_execution_id,
+                        now,
+                    )
+                    .await?;
+                let updated_payload =
+                    inject_retry_authority_id_into_payload(&payload_json, &authority.id)?;
+                sqlx::query(
+                    r#"UPDATE work_items
+                       SET payload_json = ?1
+                       WHERE id = ?2 AND status = 'running'"#,
+                )
+                .bind(updated_payload)
+                .bind(&item_id)
+                .execute(&mut **tx)
+                .await?;
+                tx.commit().await?;
+                authority.id
+            };
+
+            if is_valid_completed {
+                work_items::complete(&self.pool, &item_id).await?;
+            } else {
+                work_items::fail(
+                    &self.pool,
+                    &item_id,
+                    "startup_recovery_auto_contract_retry_terminal_agent_without_valid_outputs",
+                )
+                .await?;
+            }
+            info!(
+                run_id = %run.id,
+                item_id = %item_id,
+                retry_authority_id = %authority_id,
+                completed = is_valid_completed,
+                "Startup recovery repaired legacy auto-contract targeted retry without authority"
+            );
+            repaired += 1;
+        }
+
+        if repaired > 0 {
+            projections::rebuild_all_for_run(&self.pool, run.id).await?;
+        }
+        Ok(repaired)
+    }
+
+    async fn recover_failed_terminal_targeted_advance_authorities_for_run(
+        &self,
+        run: &Run,
+    ) -> Result<usize> {
+        let rows = sqlx::query(
+            r#"
+            SELECT wi.id,
+                   json_extract(wi.payload_json, '$.retry_authority_id') AS retry_authority_id,
+                   json_extract(wi.payload_json, '$.target_stage_execution_id') AS target_stage_execution_id,
+                   se.status AS target_stage_status
+            FROM work_items wi
+            JOIN retry_stage_execution_authorities rsa
+              ON rsa.id = json_extract(wi.payload_json, '$.retry_authority_id')
+             AND rsa.run_id = ?1
+             AND rsa.authority_state = 'active'
+            JOIN stage_executions se
+              ON se.id = json_extract(wi.payload_json, '$.target_stage_execution_id')
+             AND se.run_id = ?1
+             AND se.id = rsa.target_stage_execution_id
+            WHERE wi.run_id = ?1
+              AND wi.kind = 'advance_run'
+              AND wi.status = 'failed'
+              AND wi.id LIKE 'advance-after-invoke:%'
+              AND wi.last_error LIKE 'advance_run_target_unexpected_terminal:%'
+              AND se.status IN ('completed', 'failed', 'blocked', 'skipped')
+            ORDER BY wi.id
+            "#,
+        )
+        .bind(run.id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut recovered = 0usize;
+        for row in rows {
+            let item_id: String = row.get("id");
+            let Some(retry_authority_id) = row.get::<Option<String>, _>("retry_authority_id")
+            else {
+                continue;
+            };
+            let Some(target_stage_execution_id) =
+                row.get::<Option<String>, _>("target_stage_execution_id")
+            else {
+                continue;
+            };
+            let Some(target_stage_status) = row.get::<Option<String>, _>("target_stage_status")
+            else {
+                continue;
+            };
+            let now = Utc::now();
+            let mut tx = self
+                .begin_transaction(
+                    "recovery.terminal_targeted_advance_authority",
+                    format!("recovery.terminal_targeted_advance_authority:{item_id}"),
+                )
+                .await?;
+            retry_stage_execution_authorities::mark_terminalized_tx(
+                &mut tx,
+                &retry_authority_id,
+                now,
+                "target_stage_terminal",
+            )
+            .await?;
+            sqlx::query(
+                r#"UPDATE work_items
+                   SET status = 'completed',
+                       completed_at = COALESCE(completed_at, ?1),
+                       last_error = NULL
+                   WHERE id = ?2
+                     AND status = 'failed'
+                     AND last_error LIKE 'advance_run_target_unexpected_terminal:%'"#,
+            )
+            .bind(now.to_rfc3339())
+            .bind(&item_id)
+            .execute(&mut **tx)
+            .await?;
+            tx.commit().await?;
+            info!(
+                run_id = %run.id,
+                item_id = %item_id,
+                retry_authority_id = %retry_authority_id,
+                target_stage_execution_id = %target_stage_execution_id,
+                target_stage_status = %target_stage_status,
+                "Startup recovery converted terminal-targeted AdvanceRun failure into settled authority"
+            );
+            recovered += 1;
+        }
+
+        if recovered > 0 {
+            projections::rebuild_all_for_run(&self.pool, run.id).await?;
         }
         Ok(recovered)
     }

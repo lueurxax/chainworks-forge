@@ -2327,6 +2327,218 @@ async fn p091_startup_recovery_requeues_abandoned_targeted_advance_by_authority(
 }
 
 #[tokio::test]
+async fn auto_contract_retry_authority_gap_recovery_completes_valid_legacy_invoke() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+    let source_exec_id = AgentExecutionId::new();
+    let retry_exec_id = AgentExecutionId::new();
+    let work_item_id = format!("auto-contract-output-retry:{stage_id}:{source_exec_id}");
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("stage_test".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_id, run_id, StageStatus::Running);
+    stage.retry_reason = Some("auto_contract_output_retry:security_checker".into());
+    stages::insert(&pool, &stage).await.unwrap();
+    sqlx::query(
+        r#"INSERT INTO agent_executions
+           (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+            started_at, completed_at, owner_kind, owner_id)
+           VALUES (?1, ?2, 'security_checker', 'claude_acp', 'claude', 'sonnet',
+                   'completed', ?3, ?4, 'stage_execution', ?2)"#,
+    )
+    .bind(retry_exec_id.to_string())
+    .bind(stage_id.to_string())
+    .bind(Utc::now().to_rfc3339())
+    .bind(Utc::now().to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(retry_exec_id, Utc::now());
+    facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+    facts.valid_required_outputs = true;
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: work_item_id.clone(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "stage_test",
+                "stage_execution_id": stage_id.to_string(),
+                "agent_id": "security_checker",
+                "provider": "claude_acp",
+                "p058_claimed": {
+                    "agent_execution_id": retry_exec_id.to_string()
+                },
+                "targeted_retry": {
+                    "reason": "auto_contract_output_retry",
+                    "source_stage_execution_id": StageExecutionId::new().to_string(),
+                    "source_agent_execution_id": source_exec_id.to_string(),
+                    "source_work_item_id": "p058-invoke:source:0"
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("stage_test".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(8),
+    );
+    recovery.run_startup_repair().await.unwrap();
+
+    let authority = retry_stage_execution_authorities::find_active_by_target(&pool, stage_id)
+        .await
+        .unwrap()
+        .expect("recovery should create missing authority");
+    assert_eq!(
+        authority.source_invoke_work_item_id.as_deref(),
+        Some(work_item_id.as_str())
+    );
+    assert_eq!(
+        authority.source_agent_execution_id.as_deref(),
+        Some(source_exec_id.to_string().as_str())
+    );
+    let item = work_items::find_by_id(&pool, &work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.status, db::work_item::WorkItemStatus::Completed);
+    let payload: serde_json::Value = serde_json::from_str(&item.payload_json).unwrap();
+    assert_eq!(
+        payload["retry_authority_id"],
+        serde_json::json!(authority.id)
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/retry_authority_id"),
+        Some(&serde_json::json!(authority.id.clone()))
+    );
+
+    let advance_id = format!("advance-after-invoke:{work_item_id}");
+    let advance = work_items::find_by_id(&pool, &advance_id)
+        .await
+        .unwrap()
+        .expect("completion should enqueue targeted post-invoke advance");
+    assert_eq!(advance.status, db::work_item::WorkItemStatus::Pending);
+    let advance_payload: serde_json::Value = serde_json::from_str(&advance.payload_json).unwrap();
+    assert_eq!(
+        advance_payload["target_stage_execution_id"],
+        serde_json::json!(stage_id.to_string())
+    );
+    assert_eq!(
+        advance_payload["retry_authority_id"],
+        serde_json::json!(authority.id)
+    );
+}
+
+#[tokio::test]
+async fn terminal_targeted_advance_recovery_terminalizes_authority_and_clears_failure() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+    let authority_id = format!("p091-retry-authority:{stage_id}");
+    let advance_id = format!("advance-after-invoke:auto-contract-output-retry:{stage_id}:source");
+    let now = Utc::now();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("stage_test".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_id, run_id, StageStatus::Blocked);
+    stage.stage_id = "stage_test".into();
+    stage.retry_reason = Some("auto_contract_output_retry:security_checker".into());
+    stages::insert(&pool, &stage).await.unwrap();
+
+    insert_p091_authority_row(
+        &pool,
+        &authority_id,
+        run_id,
+        "stage_test",
+        stage_id,
+        "targeted_agent_retry",
+        "active",
+        Some("auto-contract-output-retry:legacy"),
+    )
+    .await;
+
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: advance_id.clone(),
+            kind: db::work_item::WorkItemKind::AdvanceRun,
+            payload_json: serde_json::json!({
+                "schema_version": "advance_run_payload.v1",
+                "run_id": run_id.to_string(),
+                "stage_id": "stage_test",
+                "target_stage_execution_id": stage_id.to_string(),
+                "retry_authority_id": authority_id.clone(),
+                "enqueue_reason": "post_invoke",
+                "reason": "invoke_agent_completed"
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Failed,
+            run_id: Some(run_id),
+            stage_id: Some("stage_test".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: Some(format!(
+                "advance_run_target_unexpected_terminal: target stage {stage_id} is blocked while authority {authority_id} is active"
+            )),
+        },
+    )
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(8),
+    );
+    recovery.run_startup_repair().await.unwrap();
+
+    let authority = retry_stage_execution_authorities::find_by_id(&pool, &authority_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        authority.authority_state,
+        domain::retry_authority::RetryAuthorityState::Terminalized
+    );
+    assert_eq!(
+        authority.terminal_reason.as_deref(),
+        Some("target_stage_terminal")
+    );
+    let item = work_items::find_by_id(&pool, &advance_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.status, db::work_item::WorkItemStatus::Completed);
+    assert!(item.last_error.is_none());
+}
+
+#[tokio::test]
 async fn test_retry_stage_creates_new_attempt_and_skips_old() {
     let pool = test_pool().await;
 
@@ -2651,7 +2863,7 @@ async fn p091_runtime_advance_matrix_returns_typed_target_authority_outcomes() {
         None,
     )
     .await;
-    let error = orchestrator
+    orchestrator
         .advance_run_from_payload(&p091_advance_payload(
             terminal_run,
             "implement",
@@ -2659,10 +2871,20 @@ async fn p091_runtime_advance_matrix_returns_typed_target_authority_outcomes() {
             "auth-terminal-active",
         ))
         .await
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("advance_run_target_unexpected_terminal"));
+        .unwrap();
+    let terminal_authority =
+        retry_stage_execution_authorities::find_by_id(&pool, "auth-terminal-active")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        terminal_authority.authority_state,
+        domain::retry_authority::RetryAuthorityState::Terminalized
+    );
+    assert_eq!(
+        terminal_authority.terminal_reason.as_deref(),
+        Some("target_stage_terminal")
+    );
 
     let superseded_run = RunId::new();
     let superseded_target = StageExecutionId::new();

@@ -262,12 +262,19 @@ impl Orchestrator {
         }
 
         if stage_is_terminal(&target_stage.status) {
-            anyhow::bail!(
-                "advance_run_target_unexpected_terminal: target stage {} is {} while authority {} is active",
-                target_stage.id,
-                target_stage.status,
-                authority.id
+            self.terminalize_retry_authority_for_terminal_target(
+                retry_authority_id,
+                "target_stage_terminal",
+            )
+            .await?;
+            info!(
+                run_id = %payload.run_id,
+                stage_execution_id = %target_stage.id,
+                stage_status = %target_stage.status,
+                retry_authority_id = %authority.id,
+                "targeted AdvanceRun observed already terminal target; terminalized authority"
             );
+            return Ok(());
         }
 
         let run = match runs::find_by_id(&self.pool, payload.run_id).await? {
@@ -314,6 +321,28 @@ impl Orchestrator {
             tx.commit().await?;
         }
 
+        Ok(())
+    }
+
+    async fn terminalize_retry_authority_for_terminal_target(
+        &self,
+        retry_authority_id: &str,
+        terminal_reason: &str,
+    ) -> Result<()> {
+        let mut tx = self
+            .begin_orchestrator_transaction(
+                "retry_authority.terminalize_after_advance",
+                format!("retry-authority-terminalize:{retry_authority_id}"),
+            )
+            .await?;
+        retry_stage_execution_authorities::mark_terminalized_tx(
+            &mut tx,
+            retry_authority_id,
+            Utc::now(),
+            terminal_reason,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2914,6 +2943,7 @@ impl Orchestrator {
                 "auto-contract-output-retry:{}:{}",
                 new_stage.id, execution.id
             );
+            let retry_authority_id = format!("p091-retry-authority:{}", new_stage.id);
             let from_backend_profile_id = retry_payload
                 .get("backend_profile_id")
                 .and_then(serde_json::Value::as_str)
@@ -2927,6 +2957,10 @@ impl Orchestrator {
             object.insert(
                 "stage_execution_id".into(),
                 serde_json::json!(new_stage.id.to_string()),
+            );
+            object.insert(
+                "retry_authority_id".into(),
+                serde_json::json!(retry_authority_id),
             );
             object.remove("p058_claimed");
             object.insert(
@@ -2956,6 +2990,7 @@ impl Orchestrator {
                     "source_stage_execution_id": stage.id.to_string(),
                     "source_agent_execution_id": execution.id.to_string(),
                     "source_work_item_id": source_item.id,
+                    "retry_authority_id": retry_authority_id,
                     "reason": "auto_contract_output_retry",
                     "provider_fallback": {
                         "reason": "source_contract_outputs_missing",
@@ -2976,6 +3011,18 @@ impl Orchestrator {
                 .await?;
             stages::settle_tx(&mut tx, stage.id, StageSettlementKind::Skipped, now).await?;
             stages::insert_tx(&mut tx, &new_stage).await?;
+            retry_stage_execution_authorities::create_active_targeted_agent_retry_tx(
+                &mut tx,
+                run_id,
+                &stage.stage_id,
+                new_stage.id,
+                None,
+                None,
+                retry_work_item_id.clone(),
+                Some(execution.id.to_string()),
+                now,
+            )
+            .await?;
             sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
                 .bind(RunStatus::Running.to_string())
                 .bind(stage.stage_id.as_str())
@@ -7394,7 +7441,7 @@ mod tests {
     use chrono::Utc;
     use db::pool::create_pool;
     use db::repos::{agent_execution_runtime_facts, ideas, runs, stages};
-    use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind};
+    use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
     use domain::run::{Run, RunStatus};
@@ -8093,6 +8140,93 @@ mod tests {
         assert_eq!(
             payload.pointer("/targeted_retry/provider_fallback/reason"),
             Some(&serde_json::json!("source_contract_outputs_missing"))
+        );
+        let authority = db::repos::retry_stage_execution_authorities::find_active_by_target(
+            &pool,
+            retry_stage.id,
+        )
+        .await
+        .unwrap()
+        .expect("auto retry should create active targeted retry authority");
+        assert_eq!(
+            authority.entry_kind,
+            domain::retry_authority::RetryAuthorityEntryKind::TargetedAgentRetry
+        );
+        assert_eq!(
+            authority.source_invoke_work_item_id.as_deref(),
+            Some(retry_invokes[0].id.as_str())
+        );
+        assert_eq!(
+            authority.source_agent_execution_id.as_deref(),
+            Some(failed_exec_id.to_string().as_str())
+        );
+        assert_eq!(
+            payload["retry_authority_id"],
+            serde_json::json!(authority.id)
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/retry_authority_id"),
+            Some(&serde_json::json!(authority.id.clone()))
+        );
+
+        let retry_exec_id = AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+                started_at, completed_at, owner_kind, owner_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'completed', ?7, ?8, 'stage_execution', ?2)"#,
+        )
+        .bind(retry_exec_id.to_string())
+        .bind(retry_stage.id.to_string())
+        .bind("proposal_reviewer_product_owner")
+        .bind("codex_acp")
+        .bind("codex")
+        .bind("gpt-5.5")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut retry_facts = AgentExecutionRuntimeFacts::defaults_for(retry_exec_id, Utc::now());
+        retry_facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+        retry_facts.valid_required_outputs = true;
+        agent_execution_runtime_facts::upsert(&pool, &retry_facts)
+            .await
+            .unwrap();
+
+        let mut retry_payload = payload.clone();
+        retry_payload["p058_claimed"] = serde_json::json!({
+            "agent_execution_id": retry_exec_id.to_string()
+        });
+        sqlx::query(
+            r#"UPDATE work_items
+               SET status = 'running', payload_json = ?1
+               WHERE id = ?2"#,
+        )
+        .bind(serde_json::to_string(&retry_payload).unwrap())
+        .bind(&retry_invokes[0].id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        db::repos::work_items::complete(&pool, &retry_invokes[0].id)
+            .await
+            .unwrap();
+        let advance_id = format!("advance-after-invoke:{}", retry_invokes[0].id);
+        let advance_payload: String =
+            sqlx::query_scalar("SELECT payload_json FROM work_items WHERE id = ?1")
+                .bind(&advance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let advance_payload: serde_json::Value = serde_json::from_str(&advance_payload).unwrap();
+        assert_eq!(
+            advance_payload["target_stage_execution_id"],
+            serde_json::json!(retry_stage.id.to_string())
+        );
+        assert_eq!(
+            advance_payload["retry_authority_id"],
+            serde_json::json!(authority.id)
         );
     }
 
