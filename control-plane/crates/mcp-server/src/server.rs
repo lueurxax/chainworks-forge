@@ -299,6 +299,19 @@ impl McpServer {
         req: JsonRpcRequest,
         principal: &auth::Principal,
     ) -> JsonRpcResponse {
+        let started = std::time::Instant::now();
+        let response = self.handle_request_inner(req, principal).await;
+        db::repos::storage_health::record_mcp_liveness_gate_duration(
+            started.elapsed().as_millis() as u64
+        );
+        response
+    }
+
+    async fn handle_request_inner(
+        &self,
+        req: JsonRpcRequest,
+        principal: &auth::Principal,
+    ) -> JsonRpcResponse {
         let id = req.id.clone();
 
         match req.method.as_str() {
@@ -762,6 +775,8 @@ impl McpServer {
             tools::steward::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("effects.") {
             tools::effects::execute(tool_name, params, pool, principal).await
+        } else if tool_name.starts_with("runtime.") {
+            tools::runtime::execute(tool_name, params, pool).await
         } else if tool_name.starts_with("storage.") {
             tools::storage::execute_with_writer(
                 tool_name,
@@ -2391,6 +2406,159 @@ mod tests {
         assert!(
             !top_level_has_journal_id,
             "read-only tool runs.list must not emit journal_id at top level, got {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_records_mcp_liveness_duration_metric() {
+        db::repos::storage_health::reset_read_path_metrics_for_tests();
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let response = server.handle_request(req, &operator_principal()).await;
+        assert!(response.result.is_some());
+
+        let health = db::repos::storage_health::storage_health(&pool)
+            .await
+            .unwrap();
+        assert_eq!(health["readPath"]["mcpLivenessGate"]["sampleCount"], 1);
+        assert!(
+            health["readPath"]["mcpLivenessGate"]["mcp_liveness_gate_duration_ms"]
+                .as_u64()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_087_runtime_health_returns_projection_backed_summary() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        let payload = call_tool_and_parse(
+            &server,
+            &operator_principal(),
+            "runtime.health",
+            serde_json::json!({}),
+        )
+        .await;
+
+        assert_eq!(
+            payload["schemaVersion"], "runtime_health_projection.v1",
+            "runtime.health must expose the compact projection-backed runtime summary"
+        );
+        assert_eq!(payload["acpRuntimeFamily"], "acp");
+        assert!(payload["activeSessions"].as_i64().is_some());
+        assert!(payload["degradedFlags"].is_array());
+    }
+
+    #[tokio::test]
+    async fn proposal_087_mcp_liveness_gate_covers_required_read_sequence() {
+        db::repos::storage_health::reset_read_path_metrics_for_tests();
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let principal = operator_principal();
+
+        let initialize = server
+            .handle_request(
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(serde_json::json!(1)),
+                    method: "initialize".to_string(),
+                    params: Some(serde_json::json!({
+                        "clientInfo": {"principal_token": "test-token"}
+                    })),
+                },
+                &principal,
+            )
+            .await;
+        assert!(initialize.result.is_some());
+
+        let tools_list = server
+            .handle_request(
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(serde_json::json!(2)),
+                    method: "tools/list".to_string(),
+                    params: Some(serde_json::json!({})),
+                },
+                &principal,
+            )
+            .await;
+        let tools = tools_list.result.expect("tools/list result")["tools"]
+            .as_array()
+            .cloned()
+            .expect("tools/list returns tools array");
+        assert!(
+            tools.iter().any(|tool| tool["name"] == "runtime_health"),
+            "operator tools/list must expose runtime.health as Codex-compatible runtime_health"
+        );
+
+        let runs_resource = server
+            .handle_request(
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(serde_json::json!(3)),
+                    method: "resources/read".to_string(),
+                    params: Some(serde_json::json!({"uri": "chainworks://runs"})),
+                },
+                &principal,
+            )
+            .await;
+        let runs_text = runs_resource.result.expect("resources/read result")["contents"][0]["text"]
+            .as_str()
+            .expect("resources/read text")
+            .to_string();
+        let runs_json: serde_json::Value =
+            serde_json::from_str(&runs_text).expect("chainworks://runs resource is JSON");
+        assert!(runs_json.is_array());
+
+        let runs_list =
+            call_tool_and_parse(&server, &principal, "runs.list", serde_json::json!({})).await;
+        assert!(runs_list.is_array());
+
+        let runtime_health =
+            call_tool_and_parse(&server, &principal, "runtime.health", serde_json::json!({})).await;
+        assert_eq!(
+            runtime_health["schemaVersion"],
+            "runtime_health_projection.v1"
+        );
+
+        let storage_health =
+            call_tool_and_parse(&server, &principal, "storage.health", serde_json::json!({})).await;
+        assert_eq!(storage_health["tool"], "storage.health");
+        assert_eq!(storage_health["error"], true);
+        assert_eq!(storage_health["errorCode"], tools::storage::ERR_STALE);
+
+        let final_health = db::repos::storage_health::storage_health(&pool)
+            .await
+            .unwrap();
+        assert!(
+            final_health["readPath"]["mcpLivenessGate"]["sampleCount"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 6,
+            "required MCP liveness sequence must be measured end to end: {final_health}"
+        );
+        assert_eq!(
+            final_health["readPath"]["runsList"]["sampleCount"], 1,
+            "runs.list latency must be recorded by the production tool path"
         );
     }
 

@@ -1,3 +1,8 @@
+use std::{
+    collections::VecDeque,
+    sync::{LazyLock, Mutex},
+};
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,6 +19,12 @@ use crate::writer::{
 
 const PRESSURE_STALE_AFTER_MS: i64 = 5 * 60 * 1000;
 const STORAGE_HEALTH_STALE_AFTER_MS: i64 = 5_000;
+const READ_PATH_METRIC_SAMPLE_LIMIT: usize = 128;
+
+static RUNS_LIST_READ_LATENCY_MS: LazyLock<Mutex<VecDeque<u64>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
+static MCP_LIVENESS_GATE_DURATION_MS: LazyLock<Mutex<VecDeque<u64>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageWritePressureSnapshot {
@@ -22,6 +33,61 @@ pub struct StorageWritePressureSnapshot {
     pub window_end: DateTime<Utc>,
     pub payload_json: Value,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct ReadPathMetricSnapshot {
+    sample_count: usize,
+    last_ms: Option<u64>,
+    p95_ms: Option<u64>,
+}
+
+pub fn record_runs_list_read_latency(duration_ms: u64) {
+    record_read_path_sample(&RUNS_LIST_READ_LATENCY_MS, duration_ms);
+}
+
+pub fn record_mcp_liveness_gate_duration(duration_ms: u64) {
+    record_read_path_sample(&MCP_LIVENESS_GATE_DURATION_MS, duration_ms);
+}
+
+pub fn reset_read_path_metrics_for_tests() {
+    RUNS_LIST_READ_LATENCY_MS.lock().unwrap().clear();
+    MCP_LIVENESS_GATE_DURATION_MS.lock().unwrap().clear();
+}
+
+fn record_read_path_sample(samples: &Mutex<VecDeque<u64>>, duration_ms: u64) {
+    let mut samples = samples.lock().unwrap();
+    if samples.len() >= READ_PATH_METRIC_SAMPLE_LIMIT {
+        samples.pop_front();
+    }
+    samples.push_back(duration_ms);
+}
+
+fn read_path_metric_snapshot(samples: &Mutex<VecDeque<u64>>) -> ReadPathMetricSnapshot {
+    let samples = samples.lock().unwrap();
+    let sample_count = samples.len();
+    let last_ms = samples.back().copied();
+    let p95_ms = if sample_count == 0 {
+        None
+    } else {
+        let mut sorted: Vec<u64> = samples.iter().copied().collect();
+        sorted.sort_unstable();
+        let index = ((sample_count * 95 + 99) / 100).saturating_sub(1);
+        sorted.get(index).copied()
+    };
+    ReadPathMetricSnapshot {
+        sample_count,
+        last_ms,
+        p95_ms,
+    }
+}
+
+fn read_path_metric_json(snapshot: ReadPathMetricSnapshot) -> Value {
+    json!({
+        "sampleCount": snapshot.sample_count,
+        "lastMs": snapshot.last_ms,
+        "p95Ms": snapshot.p95_ms
+    })
 }
 
 impl StorageWritePressureSnapshot {
@@ -303,6 +369,8 @@ pub async fn storage_health_with_writer(
 ) -> Result<Value> {
     let evidence = evidence_spool_summary(pool).await?;
     let wal_json = wal_health(pool).await;
+    let runtime_health_projection = runtime_health_projection(pool).await?;
+    let artifact_noise_projection = artifact_noise_projection(pool).await?;
     let latest_pressure = latest_write_pressure_snapshot(pool).await?;
     let updated_at = Utc::now();
     let writer_snapshot = writer_heartbeat.map(DbWriterHeartbeat::snapshot);
@@ -322,6 +390,8 @@ pub async fn storage_health_with_writer(
                 .map(|snapshot| live_write_pressure_json(updated_at, snapshot))
         })
         .unwrap_or_else(missing_write_pressure_json);
+    let runs_list_read_latency = read_path_metric_snapshot(&RUNS_LIST_READ_LATENCY_MS);
+    let mcp_liveness_gate_duration = read_path_metric_snapshot(&MCP_LIVENESS_GATE_DURATION_MS);
 
     // Fail-closed when no live DbWriter heartbeat is supplied. Daemon-owned
     // GraphQL/MCP paths inject the shared writer heartbeat; tests and static
@@ -371,6 +441,17 @@ pub async fn storage_health_with_writer(
             "coalescedMergedTotal": writer_snapshot.as_ref().map(|snapshot| snapshot.coalesced_merged_total).unwrap_or(0),
             "coalescedFlushAgeP95Ms": null
         },
+        "runtimeHealthProjection": runtime_health_projection,
+        "artifactNoiseProjection": artifact_noise_projection,
+        "readPath": {
+            "runsList": read_path_metric_json(runs_list_read_latency),
+            "mcpLivenessGate": {
+                "sampleCount": mcp_liveness_gate_duration.sample_count,
+                "lastMs": mcp_liveness_gate_duration.last_ms,
+                "p95Ms": mcp_liveness_gate_duration.p95_ms,
+                "mcp_liveness_gate_duration_ms": mcp_liveness_gate_duration.last_ms
+            }
+        },
         "evidenceSpool": evidence,
         "writePressure": pressure_json,
         "telemetryRollup": {
@@ -392,6 +473,83 @@ pub async fn storage_health_with_writer(
             "evidenceSpoolDisabledKinds": []
         },
         "thresholds": storage_thresholds()
+    }))
+}
+
+async fn runtime_health_projection(pool: &SqlitePool) -> Result<Value> {
+    let active_sessions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_executions WHERE status = 'running'")
+            .fetch_one(pool)
+            .await
+            .context("runtime health active session count")?;
+    let side_effect_unresolved_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM side_effects
+           WHERE status IN (
+             'prepared','executing','externally_observed',
+             'needs_reconciliation','conflict','unrecoverable'
+           )"#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("runtime health side-effect unresolved count")?;
+    let continuation_active_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM work_items
+           WHERE status IN ('pending','running')
+             AND (kind LIKE '%continuation%' OR kind LIKE '%resume%')"#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("runtime health continuation active count")?;
+    Ok(json!({
+        "schemaVersion": "runtime_health_projection.v1",
+        "acpRuntimeFamily": "acp",
+        "activeSessions": active_sessions,
+        "degradedFlags": [],
+        "writePressureFlags": [],
+        "sideEffectUnresolvedCount": side_effect_unresolved_count,
+        "continuationActiveCount": continuation_active_count
+    }))
+}
+
+async fn artifact_noise_projection(pool: &SqlitePool) -> Result<Value> {
+    let artifact_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artifacts")
+        .fetch_one(pool)
+        .await
+        .context("artifact noise artifact count")?;
+    let superseded_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM artifact_source_generation_claims
+           WHERE claim_state IN ('superseded_pending_retry', 'superseded')"#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("artifact noise superseded count")?;
+    let duplicate_candidate_count: i64 = sqlx::query_scalar(
+        r#"SELECT COALESCE(SUM(duplicate_count), 0)
+           FROM (
+             SELECT COUNT(*) - 1 AS duplicate_count
+             FROM artifacts
+             GROUP BY run_id, name
+             HAVING COUNT(*) > 1
+           )"#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("artifact noise duplicate candidate count")?;
+    let archive_eligible_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE is_pinned = 0")
+            .fetch_one(pool)
+            .await
+            .context("artifact noise archive eligible count")?;
+    Ok(json!({
+        "schemaVersion": "artifact_noise_projection.v1",
+        "artifactCount": artifact_count,
+        "supersededCount": superseded_count,
+        "duplicateCandidateCount": duplicate_candidate_count,
+        "archiveEligibleCount": archive_eligible_count,
+        "compactionRecommended": duplicate_candidate_count > 0 || archive_eligible_count > 100
     }))
 }
 
@@ -912,6 +1070,82 @@ mod tests {
         assert_eq!(health["wal"]["available"], true);
         assert!(health["wal"]["sizeBytes"].as_u64().is_some());
         assert_eq!(health["writePressure"]["state"], "available");
+    }
+
+    #[tokio::test]
+    async fn storage_health_exposes_p087_runtime_and_artifact_noise_projections() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO ideas (id, title, body, status, created_at) VALUES ('idea-p087', 'P087', 'body', 'active', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at) VALUES ('run-p087', 'idea-p087', 'ready', 'wf', 'Workflow', '/tmp/ws', '/tmp/artifacts', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO stage_executions (id, run_id, stage_id, label, status, started_at) VALUES ('stage-p087', 'run-p087', 'implementation', 'Implementation', 'running', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_executions (id, stage_execution_id, agent_id, provider, status, started_at) VALUES ('agent-p087', 'stage-p087', 'code_writer', 'junie', 'running', ?1)",
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for artifact_id in ["artifact-p087-a", "artifact-p087-b"] {
+            sqlx::query(
+                "INSERT INTO artifacts (id, run_id, stage_id, agent_id, name, contract_id, format, file_path, provider, created_at, is_pinned) VALUES (?1, 'run-p087', 'implementation', 'code_writer', 'implementation_progress', 'implementation_progress_v1', 'json', '/tmp/a.json', 'junie', ?2, 0)",
+            )
+            .bind(artifact_id)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            r#"INSERT INTO side_effects
+               (id, run_id, stage_execution_id, effect_kind, target_key, idempotency_key,
+                request_fingerprint, status, created_at, updated_at)
+               VALUES ('effect-p087', 'run-p087', 'stage-p087', 'git_push', 'origin/main',
+                       'effect-p087-key', 'sha256:effect', 'prepared', ?1, ?1)"#,
+        )
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let health = storage_health(&pool).await.unwrap();
+        assert_eq!(
+            health["runtimeHealthProjection"]["schemaVersion"],
+            "runtime_health_projection.v1"
+        );
+        assert_eq!(health["runtimeHealthProjection"]["activeSessions"], 1);
+        assert_eq!(
+            health["runtimeHealthProjection"]["sideEffectUnresolvedCount"],
+            1
+        );
+        assert_eq!(
+            health["artifactNoiseProjection"]["schemaVersion"],
+            "artifact_noise_projection.v1"
+        );
+        assert_eq!(health["artifactNoiseProjection"]["artifactCount"], 2);
+        assert_eq!(
+            health["artifactNoiseProjection"]["duplicateCandidateCount"],
+            1
+        );
+        assert_eq!(health["artifactNoiseProjection"]["archiveEligibleCount"], 2);
     }
 
     #[tokio::test]

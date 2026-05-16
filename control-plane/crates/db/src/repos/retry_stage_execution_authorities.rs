@@ -55,6 +55,44 @@ pub async fn create_recovered_orphan_tx(
     Ok(authority)
 }
 
+pub async fn create_active_targeted_agent_retry_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    stage_id: &str,
+    target_stage_execution_id: StageExecutionId,
+    source_command_journal_id: Option<String>,
+    source_retry_work_item_id: Option<String>,
+    source_invoke_work_item_id: String,
+    source_agent_execution_id: Option<String>,
+    now: DateTime<Utc>,
+) -> Result<RetryStageExecutionAuthority> {
+    supersede_active_for_stage_tx(
+        tx,
+        run_id,
+        stage_id,
+        now,
+        "superseded_by_new_targeted_retry",
+    )
+    .await?;
+    let authority = RetryStageExecutionAuthority {
+        id: format!("p091-retry-authority:{target_stage_execution_id}"),
+        run_id,
+        stage_id: stage_id.to_string(),
+        target_stage_execution_id,
+        entry_kind: RetryAuthorityEntryKind::TargetedAgentRetry,
+        source_command_journal_id,
+        source_retry_work_item_id,
+        source_invoke_work_item_id: Some(source_invoke_work_item_id),
+        source_agent_execution_id,
+        authority_state: RetryAuthorityState::Active,
+        created_at: now,
+        updated_at: now,
+        terminal_reason: None,
+    };
+    create_tx(tx, &authority).await?;
+    Ok(authority)
+}
+
 pub async fn supersede_active_for_stage_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: RunId,

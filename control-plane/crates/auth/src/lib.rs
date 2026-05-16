@@ -516,7 +516,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 33] {
+fn all_tool_capabilities() -> [CapabilityToolId; 34] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -541,6 +541,7 @@ fn all_tool_capabilities() -> [CapabilityToolId; 33] {
         CapabilityToolId::StewardListAnalyses,
         CapabilityToolId::StewardGetAnalysis,
         CapabilityToolId::StorageHealth,
+        CapabilityToolId::RuntimeHealth,
         CapabilityToolId::StorageWritePressure,
         CapabilityToolId::StorageEvidenceSpoolSummary,
         CapabilityToolId::StorageReconcileEvidenceOrphans,
@@ -597,6 +598,7 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::StorageHealth => {
             matches!(class, PrincipalClass::Operator)
         }
+        CapabilityToolId::RuntimeHealth => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StorageWritePressure => {
             matches!(class, PrincipalClass::Operator)
         }
@@ -712,6 +714,7 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
         "storage.health" => Some(CapabilityToolId::StorageHealth),
+        "runtime.health" => Some(CapabilityToolId::RuntimeHealth),
         "storage.write_pressure" => Some(CapabilityToolId::StorageWritePressure),
         "storage.evidence_spool_summary" => Some(CapabilityToolId::StorageEvidenceSpoolSummary),
         "storage.reconcile_evidence_orphans" => {
