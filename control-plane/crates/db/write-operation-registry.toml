@@ -845,6 +845,104 @@ idempotency_key_kind = "repository operation natural key; queued transaction adm
 duplicate_application_test_path = "docs/evidence/p075/operation-duplicate-application-matrix.md#steward-set-runtime-state"
 
 [[operations]]
+operation_name = "maintenance.repair_slot"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "repair_slot idempotency key (UUID)"
+duplicate_application_test_path = "crates/db/src/repair_test.rs"
+
+[[operations]]
+operation_name = "maintenance.acquire_slot"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "acquire_slot idempotency key (UUID)"
+duplicate_application_test_path = "crates/db/src/repair_test.rs"
+
+[[operations]]
+operation_name = "maintenance.release_slot"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "release_slot idempotency key (UUID)"
+duplicate_application_test_path = "crates/db/src/repair_test.rs"
+
+[[operations]]
+operation_name = "maintenance.repair_slot_poisoned"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "poisoned repair_slot diagnostic natural key"
+duplicate_application_test_path = "crates/db/src/repos/maintenance.rs::tests::proposal_087_poisoned_repair_slot_persists_diagnostic"
+
+[[operations]]
+operation_name = "projection.invalidation.upsert"
+class = "D"
+replay_policy = "telemetry_merge"
+idempotency_key_kind = "projection/source/key/kind"
+duplicate_application_test_path = ""
+
+[[operations]]
+operation_name = "projection.invalidation.delete"
+class = "D"
+replay_policy = "telemetry_merge"
+idempotency_key_kind = "projection/source/key/kind"
+duplicate_application_test_path = ""
+
+[[operations]]
+operation_name = "projection.invalidation.generic"
+class = "D"
+replay_policy = "telemetry_merge"
+idempotency_key_kind = "projection/source/key/kind"
+duplicate_application_test_path = ""
+
+[[operations]]
+operation_name = "projection.invalidation.mark_consumed"
+class = "D"
+replay_policy = "telemetry_merge"
+idempotency_key_kind = "projection/source/watermark"
+duplicate_application_test_path = "crates/db/src/repos/projection_invalidation.rs::tests::proposal_087_projection_invalidation_lifecycle"
+
+[[operations]]
+operation_name = "projection.invalidation.freeze_cursor"
+class = "D"
+replay_policy = "telemetry_merge"
+idempotency_key_kind = "projection/source retry exhaustion marker"
+duplicate_application_test_path = "crates/db/src/repos/projection_invalidation.rs::tests::proposal_087_freeze_cursor_after_retry_exhaustion_marks_poisoned"
+
+[[operations]]
+operation_name = "projection.invalidation.clear"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "projection/source"
+duplicate_application_test_path = "crates/db/src/repos/projection_invalidation.rs::tests::proposal_087_projection_invalidation_records_and_clears_rows"
+
+[[operations]]
+operation_name = "projection.invalidation.clear_poison"
+class = "A"
+replay_policy = "caller_guarded"
+idempotency_key_kind = "projection/source"
+duplicate_application_test_path = "crates/db/src/repos/projection_invalidation.rs::tests::proposal_087_projection_invalidation_lifecycle"
+
+[[operations]]
+operation_name = "maintenance.reaper"
+class = "D"
+replay_policy = "telemetry_merge"
+idempotency_key_kind = "none"
+duplicate_application_test_path = ""
+
+[[operations]]
+operation_name = "maintenance.reaper.record"
+class = "D"
+replay_policy = "telemetry_merge"
+idempotency_key_kind = "reaper-run timestamp"
+duplicate_application_test_path = ""
+
+[[operations]]
+operation_name = "projection.invalidation.reap"
+class = "D"
+replay_policy = "telemetry_merge"
+idempotency_key_kind = "none"
+duplicate_application_test_path = ""
+
+[[operations]]
 operation_name = "storage_health.insert_write_pressure_snapshot"
 class = "D"
 replay_policy = "telemetry_merge"

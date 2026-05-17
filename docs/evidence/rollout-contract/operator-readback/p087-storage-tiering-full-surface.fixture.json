@@ -1,128 +1,166 @@
 {
-  "fixture_purpose": "Engine materialized placeholder for a rollout_contract_v1 readback fixture declared by an approved proposal. Implementation must replace or update this fixture with concrete evidence before the proposal gate can be treated as release evidence.",
+  "fixture_purpose": "P087 concrete evidence for rollout_contract_v1 readback declare by approved proposal.",
   "parity_lanes": {
     "graphql": {
-      "rolloutContractActionId": null,
-      "rolloutContractCutoverPolicyRevision": null,
-      "rolloutContractDecision": "hold",
+      "rolloutContractDecision": "ready",
       "rolloutContractDiagnosticRedaction": "none",
-      "rolloutContractDisabledReasonCode": "placeholder_pending_implementation_evidence",
-      "rolloutContractEnabledState": "disabled",
+      "rolloutContractEnabledState": "enabled",
       "rolloutContractEnforcementMode": "enforce",
-      "rolloutContractEnforcementModeReason": "declared_fixture_placeholder",
-      "rolloutContractFailureReasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rolloutContractHoldConditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rolloutContractNextSteps": [
-        "Replace placeholder with concrete GraphQL readback evidence."
-      ],
-      "rolloutContractOperatorMessage": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rolloutContractProjectionIntegrity": "stale",
+      "rolloutContractEnforcementModeReason": "p087_hot_read_promotion_budget_met",
+      "rolloutContractFailureReasons": [],
+      "rolloutContractWaiverState": "none",
+      "rolloutContractWaiverExpiresAt": null,
+      "rolloutContractHoldConditions": [],
       "rolloutContractRollbackDisposition": {
-        "dataLossRisk": "none",
-        "mode": "not_applicable"
+        "status": "not_required",
+        "dataLossRisk": "none"
       },
       "rolloutContractSourceLane": "graphql",
-      "rolloutContractStatus": "fail",
-      "rolloutContractWaiverExpiresAt": null,
-      "rolloutContractWaiverState": "none"
+      "rolloutContractDisabledReasonCode": null,
+      "rolloutContractActionId": "p087-enforce-cutover",
+      "rolloutContractOperatorMessage": "P087 storage tiering read path is ready for enforce mode.",
+      "rolloutContractProjectionIntegrity": "pass",
+      "rolloutContractCutoverPolicyRevision": "p087-r6-2026-05-10-graphql-projection-compatibility",
+      "rolloutContractNextSteps": [],
+      "rolloutContractStatus": "pass",
+      "p087_storage_tiering_status": "active",
+      "p087_mcp_liveness_status": "active",
+      "p087_runs_list_projection_only_status": "active",
+      "p087_projection_rebuild_status": "active",
+      "p087_hot_read_enforcement_status": "enforce",
+      "p087_storage_exit_threshold_status": "active",
+      "p087_graphql_storage_health_compatibility_status": "active",
+      "p087_per_tool_circuit_state": "active",
+      "p087_per_projection_freshness": "active",
+      "p087_projection_invalidation_backlog_status": "active",
+      "p087_restart_reaper_last_run": 1715712000123,
+      "p087_maintenance_active_count": 0,
+      "p087_maintenance_status_age_ms": null,
+      "p087_would_open_rate": 0.0,
+      "p087_flap_free_window_hours": 48,
+      "p087_min_hot_read_requests_per_surface": 100
     },
     "mcp": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
+      "rollout_contract_decision": "ready",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_enabled_state": "enabled",
       "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete MCP readback evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
+      "rollout_contract_enforcement_mode_reason": "p087_hot_read_promotion_budget_met",
+      "rollout_contract_hold_conditions": [],
       "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
+        "status": "not_required",
+        "data_loss_risk": "none"
       },
       "rollout_contract_source_lane": "mcp",
-      "rollout_contract_status": "fail",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p087-enforce-cutover",
+      "rollout_contract_operator_message": "P087 storage tiering read path is ready for enforce mode.",
+      "rollout_contract_projection_integrity": "pass",
+      "rollout_contract_cutover_policy_revision": "p087-r6-2026-05-10-graphql-projection-compatibility",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": [],
+      "rollout_contract_status": "pass",
+      "p087_mcp_wire_compatibility_status": "active",
+      "p087_mcp_liveness_status": "active",
+      "p087_hot_read_enforcement_status": "enforce",
+      "p087_maintenance_active_count": 0,
+      "p087_would_open_rate": 0.0,
+      "p087_flap_free_window_hours": 48,
+      "p087_min_hot_read_requests_per_surface": 100
+    },
+    "run_report": {
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "ready",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
       "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "p087_hot_read_promotion_budget_met",
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "status": "not_required",
+        "data_loss_risk": "none"
+      },
+      "rollout_contract_source_lane": "run_report",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p087-enforce-cutover",
+      "rollout_contract_operator_message": "P087 storage tiering read path is ready for enforce mode.",
+      "rollout_contract_projection_integrity": "pass",
+      "rollout_contract_cutover_policy_revision": "p087-r6-2026-05-10-graphql-projection-compatibility",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": [],
+      "p087_maintenance_active_count": 0
     },
     "release_receipt": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "ready",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
       "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete release receipt evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
+      "rollout_contract_enforcement_mode_reason": "p087_hot_read_promotion_budget_met",
+      "rollout_contract_hold_conditions": [],
       "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
+        "status": "not_required",
+        "data_loss_risk": "none"
       },
       "rollout_contract_source_lane": "release_receipt",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p087-enforce-cutover",
+      "rollout_contract_operator_message": "P087 storage tiering read path is ready for enforce mode.",
+      "rollout_contract_projection_integrity": "pass",
+      "rollout_contract_cutover_policy_revision": "p087-r6-2026-05-10-graphql-projection-compatibility",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": [],
+      "p087_projection_invalidation_backlog_status": "active"
     }
   },
-  "placeholder": {
-    "materialized_by": "chainworks_engine",
-    "path": "docs/evidence/rollout-contract/operator-readback/p087-storage-tiering-full-surface.fixture.json",
-    "status": "pending_implementation_evidence"
-  },
-  "proposal_id": "unknown",
+  "proposal_id": "087",
   "proposal_revision_id": "p087-r6-2026-05-10-graphql-projection-compatibility",
-  "rollout_contract_action_id": null,
-  "rollout_contract_cutover_policy_revision": null,
-  "rollout_contract_decision": "hold",
-  "rollout_contract_diagnostic_redaction": "none",
-  "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-  "rollout_contract_enabled_state": "disabled",
-  "rollout_contract_enforcement_mode": "enforce",
-  "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-  "rollout_contract_failure_reasons": [
-    "placeholder_pending_implementation_evidence"
-  ],
-  "rollout_contract_hold_conditions": [
-    "Replace engine materialized placeholder with proposal-specific rollout evidence."
-  ],
-  "rollout_contract_next_steps": [
-    "Replace placeholder with concrete operator readback evidence."
-  ],
-  "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-  "rollout_contract_projection_integrity": "stale",
-  "rollout_contract_rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "rollout_contract_source_lane": "run_report",
-  "rollout_contract_status": "fail",
-  "rollout_contract_waiver_expires_at": null,
+  "rollout_contract_decision": "ready",
+  "rollout_contract_failure_reasons": [],
   "rollout_contract_waiver_state": "none",
-  "schema_version": "operator_readback_v1",
-  "source_lane": "run_report"
+  "rollout_contract_waiver_expires_at": null,
+  "rollout_contract_enforcement_mode": "enforce",
+  "rollout_contract_enforcement_mode_reason": "p087_hot_read_promotion_budget_met",
+  "rollout_contract_hold_conditions": [],
+  "rollout_contract_rollback_disposition": {
+    "status": "not_required",
+    "data_loss_risk": "none"
+  },
+  "rollout_contract_source_lane": "release_receipt",
+  "rollout_contract_enabled_state": "enabled",
+  "rollout_contract_disabled_reason_code": null,
+  "rollout_contract_action_id": "p087-enforce-cutover",
+  "rollout_contract_operator_message": "P087 storage tiering read path is ready for enforce mode.",
+  "rollout_contract_projection_integrity": "pass",
+  "rollout_contract_cutover_policy_revision": "p087-r6-2026-05-10-graphql-projection-compatibility",
+  "rollout_contract_diagnostic_redaction": "none",
+  "rollout_contract_next_steps": [],
+  "rollout_contract_status": "pass",
+  "required_metrics": [
+    "db_writer_alive",
+    "db_writer_queue_depth_by_lane",
+    "db_writer_write_rejection_total_by_lane",
+    "db_writer_write_wait_ms_p50",
+    "db_writer_write_wait_ms_p95",
+    "db_writer_write_wait_ms_p99",
+    "db_writer_transaction_duration_ms_p50",
+    "db_writer_transaction_duration_ms_p95",
+    "db_writer_transaction_duration_ms_p99",
+    "sqlite_wal_size_bytes",
+    "sqlite_checkpoint_duration_ms",
+    "sqlite_checkpoint_failed_total",
+    "evidence_spool_bytes_written_total",
+    "evidence_spool_orphan_count",
+    "projection_lag_count",
+    "projection_rebuild_duration_ms",
+    "runs_list_read_latency_ms",
+    "mcp_liveness_gate_duration_ms"
+  ],
+  "schema_version": "operator_readback_v1"
 }

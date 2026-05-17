@@ -1,0 +1,107 @@
+{
+  "schema_version": "mcp_tool_call_fixture.v1",
+  "tool": "storage.health",
+  "request": {
+    "requestId": "req-p087-mcp-compat",
+    "params": {}
+  },
+  "response": {
+    "isError": false,
+    "result": {
+      "schemaVersion": "storage_health.v1",
+      "updatedAt": "2026-05-16T13:53:00Z",
+      "staleAfterMs": 5000,
+      "isStale": false,
+      "dbState": "HEALTHY",
+      "writer": {
+        "alive": true,
+        "lastHeartbeatAt": null,
+        "lastDrainAt": null,
+        "totalQueued": 0,
+        "lanes": null,
+        "writeLockWaitP50Ms": null,
+        "writeLockWaitP95Ms": null,
+        "transactionDurationP50Ms": null,
+        "transactionDurationP95Ms": null,
+        "busyRetryRatePerMinute": null,
+        "busyRetryExhaustedTotal": 0,
+        "rejectedTotal": 0,
+        "droppedTelemetryTotal": 0
+      },
+      "wal": null,
+      "projections": {
+        "pendingInvalidations": 0,
+        "projectionLagMs": null,
+        "latencyMs": null,
+        "rebuildDurationP95Ms": null,
+        "coalescedKeysPending": 0,
+        "coalescedMergedTotal": 0,
+        "coalescedFlushAgeP95Ms": null
+      },
+      "projectionFreshness": [
+        {
+          "projectionName": "run_summaries",
+          "sourceName": "runs",
+          "freshnessMs": null,
+          "watermarkMs": null,
+          "isPoisoned": false,
+          "backlogCount": 0
+        }
+      ],
+      "hotReadGuards": [],
+      "readPathMetrics": {
+        "runsListReadLatencyP95Ms": null,
+        "mcpLivenessGateDurationP95Ms": null,
+        "mcpLivenessGateDurationSource": "runtime.health",
+        "mcpLivenessGateLastRecordedAtMs": null
+      },
+      "readPath": {
+        "runsList": {
+          "status": "healthy",
+          "sampleCount": 0,
+          "runs_list_read_latency_ms": null,
+          "p95Ms": 0
+        },
+        "mcpLivenessGate": {
+          "status": "healthy",
+          "sampleCount": 0,
+          "mcp_liveness_gate_duration_ms": null,
+          "p95Ms": 0,
+          "lastRecordedAtMs": null
+        }
+      },
+      "artifactNoiseProjection": null,
+      "maintenanceOperations": [],
+      "maintenanceReaper": {
+        "status": "breach"
+      },
+      "degraded": null,
+      "hotRead": {
+        "status": "healthy",
+        "circuitState": "closed",
+        "reason": null
+      },
+      "rollout": {
+        "p087_storage_tiering_status": "active",
+        "p087_mcp_liveness_status": "active",
+        "p087_runs_list_projection_only_status": "active",
+        "p087_projection_rebuild_status": "active",
+        "p087_hot_read_enforcement_status": "disabled",
+        "p087_storage_exit_threshold_status": "active",
+        "p087_mcp_wire_compatibility_status": "active",
+        "p087_graphql_storage_health_compatibility_status": "active",
+        "p087_per_tool_circuit_state": "active",
+        "p087_per_projection_freshness": "active",
+        "p087_maintenance_active_count": 0,
+        "p087_maintenance_status_age_ms": null,
+        "p087_restart_reaper_last_run": null,
+        "p087_projection_invalidation_backlog_status": "active"
+      },
+      "evidenceSpool": null,
+      "writePressure": null,
+      "telemetryRollup": null
+    }
+  },
+  "notes": "Complete storage_health.v1 top-level field inventory. Legacy fields (schemaVersion, staleAfterMs=5000, dbState, writer, isStale) remain unchanged. projections is the existing ProjectionStorageHealth object (unchanged field type). projectionFreshness carries projectionName+sourceName identity and is additive. hotRead uses status/circuitState/reason. readPathMetrics, readPath, artifactNoiseProjection, maintenanceOperations, maintenanceReaper, rollout are all additive. Old clients tolerate unknown fields via JSON forward-compatibility.",
+  "old_client_unknown_field_tolerance": "Fields not present in pre-P087 storage_health.v1 clients (projectionFreshness, hotReadGuards, readPathMetrics, readPath, artifactNoiseProjection, maintenanceOperations, maintenanceReaper, rollout, evidenceSpool, writePressure, telemetryRollup) are additive. Clients that only read known fields (schemaVersion, updatedAt, staleAfterMs, isStale, dbState, writer, projections) continue to function correctly."
+}

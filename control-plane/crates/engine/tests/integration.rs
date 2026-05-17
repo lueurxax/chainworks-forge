@@ -435,6 +435,144 @@ async fn startup_repair_kickstarts_empty_running_stage_without_blocking() {
     );
 }
 
+#[tokio::test]
+async fn proposal_087_projection_cache_rebuilds_after_restart() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Completed))
+        .await
+        .unwrap();
+
+    for suffix in ["a", "b"] {
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: ArtifactId::new(),
+                run_id,
+                stage_id: "stage_test".into(),
+                agent_id: "worker".into(),
+                name: "duplicate-output".into(),
+                contract_id: "duplicate-output-v1".into(),
+                format: ArtifactFormat::Json,
+                file_path: format!("/tmp/p087-restart-{suffix}.json"),
+                checksum_sha256: None,
+                size_bytes: Some(2),
+                provider: "test".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+                agent_execution_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"INSERT INTO side_effects
+           (id, run_id, stage_execution_id, effect_kind, target_key, idempotency_key,
+            request_fingerprint, status, created_at, updated_at)
+           VALUES (?1, ?2, ?3, 'git_commit', 'p087-restart-target', ?4,
+                   'sha256:p087-restart', 'prepared', ?5, ?5)"#,
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(run_id.to_string())
+    .bind(stage_id.to_string())
+    .bind(format!("p087-restart-{}", uuid::Uuid::new_v4()))
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"INSERT OR REPLACE INTO artifact_noise_summary
+           (run_id, artifact_count, superseded_count, duplicate_candidate_count,
+            archive_eligible_count, updated_at_ms)
+           VALUES (?1, 0, 0, 0, 0, 1)"#,
+    )
+    .bind(run_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"UPDATE runtime_health_summary
+           SET active_sessions = 0,
+               open_hot_read_circuits = 0,
+               side_effect_unresolved_count = 0,
+               continuation_active_count = 0,
+               runtime_families_json = '[]',
+               updated_at_ms = 1
+           WHERE id = 1"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+    let summary = recovery.run_startup_repair().await.unwrap();
+    assert_eq!(summary.runs_inspected, 1);
+    assert_eq!(
+        summary.work_items_requeued, 1,
+        "startup catchup AdvanceRun should be queued before the P087 runtime projection rebuild"
+    );
+
+    let artifact_noise = sqlx::query(
+        r#"SELECT artifact_count, superseded_count, duplicate_candidate_count,
+                  archive_eligible_count, updated_at_ms
+           FROM artifact_noise_summary
+           WHERE run_id = ?1"#,
+    )
+    .bind(run_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(artifact_noise.get::<i64, _>("artifact_count"), 2);
+    assert_eq!(artifact_noise.get::<i64, _>("superseded_count"), 1);
+    assert_eq!(artifact_noise.get::<i64, _>("duplicate_candidate_count"), 1);
+    assert_eq!(artifact_noise.get::<i64, _>("archive_eligible_count"), 2);
+    assert!(
+        artifact_noise.get::<i64, _>("updated_at_ms") > 1,
+        "startup rebuild must refresh stale artifact noise projection"
+    );
+
+    let runtime_health = sqlx::query(
+        r#"SELECT side_effect_unresolved_count, continuation_active_count, updated_at_ms
+           FROM runtime_health_summary
+           WHERE id = 1"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime_health.get::<i64, _>("side_effect_unresolved_count"),
+        1
+    );
+    assert_eq!(
+        runtime_health.get::<i64, _>("continuation_active_count"),
+        1,
+        "startup rebuild must run after recovery enqueues catchup work"
+    );
+    assert!(
+        runtime_health.get::<i64, _>("updated_at_ms") > 1,
+        "startup rebuild must refresh stale runtime health projection"
+    );
+}
+
 /// A run with no stuck stages must not be counted as repaired.
 #[tokio::test]
 async fn test_startup_repair_skips_clean_runs() {

@@ -38,6 +38,7 @@ pub async fn upsert(
             .await?;
     upsert_tx(&mut tx, receipt, text_captures, output_decisions).await?;
     tx.commit().await?;
+    crate::repos::projections::rebuild_run_summary(pool, receipt.run_id).await?;
     Ok(())
 }
 
@@ -58,6 +59,7 @@ pub async fn upsert_with_settlement_rows(
     upsert_tx(&mut tx, receipt, text_captures, output_decisions).await?;
     replace_settlement_rows_tx(&mut tx, &receipt.id, settlement_rows).await?;
     tx.commit().await?;
+    crate::repos::projections::rebuild_run_summary(pool, receipt.run_id).await?;
     Ok(())
 }
 
@@ -93,6 +95,7 @@ pub async fn upsert_with_runtime_receipts(
     }
     upsert_tx(&mut tx, receipt, text_captures, output_decisions).await?;
     tx.commit().await?;
+    crate::repos::projections::rebuild_run_summary(pool, receipt.run_id).await?;
     Ok(())
 }
 
@@ -131,6 +134,7 @@ pub async fn upsert_with_runtime_receipts_and_settlement_rows(
     upsert_tx(&mut tx, receipt, text_captures, output_decisions).await?;
     replace_settlement_rows_tx(&mut tx, &receipt.id, settlement_rows).await?;
     tx.commit().await?;
+    crate::repos::projections::rebuild_run_summary(pool, receipt.run_id).await?;
     Ok(())
 }
 

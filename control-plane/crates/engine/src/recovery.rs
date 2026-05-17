@@ -574,13 +574,6 @@ impl RecoveryService {
                     );
                 }
             }
-            if let Err(e) = rebuild_operator_read_projections(&self.pool, run.id).await {
-                warn!(
-                    run_id = %run.id,
-                    error = %e,
-                    "Failed to rebuild operator read projections during startup"
-                );
-            }
             match self.repair_run(run).await {
                 Ok(requeued) => {
                     if requeued > 0 {
@@ -591,6 +584,13 @@ impl RecoveryService {
                 Err(e) => {
                     warn!(run_id = %run.id, error = %e, "Failed to repair run during startup");
                 }
+            }
+            if let Err(e) = rebuild_startup_read_projections(&self.pool, run.id).await {
+                warn!(
+                    run_id = %run.id,
+                    error = %e,
+                    "Failed to rebuild startup read projections"
+                );
             }
             if repaired_run {
                 runs_repaired += 1;
@@ -1901,12 +1901,9 @@ fn recovery_snapshot_represents_wait(raw: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-async fn rebuild_operator_read_projections(
+async fn rebuild_startup_read_projections(
     pool: &SqlitePool,
     run_id: domain::ids::RunId,
 ) -> Result<()> {
-    projections::rebuild_run_summary(pool, run_id).await?;
-    projections::rebuild_stage_summaries(pool, run_id).await?;
-    projections::rebuild_approval_inbox(pool, run_id).await?;
-    Ok(())
+    projections::rebuild_all_for_run(pool, run_id).await
 }

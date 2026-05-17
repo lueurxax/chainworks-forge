@@ -721,6 +721,7 @@ struct DaemonLifecycleClient {
           isPoisoned
           lastError
           updatedAtMs
+          throttledUntilMs
           backlogRows
           backlogBytes
         }
@@ -750,6 +751,14 @@ struct DaemonLifecycleClient {
           severity
           reason
           message
+        }
+        hotRead {
+          status
+          circuitState
+          reason
+        }
+        maintenanceReaper {
+          status
         }
       }
     }

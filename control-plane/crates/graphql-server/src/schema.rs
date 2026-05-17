@@ -585,13 +585,95 @@ impl QueryRoot {
         require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
         let heartbeat = ctx.data_opt::<Arc<DbWriterHeartbeat>>();
-        let json = db::repos::storage_health::storage_health_with_writer(
-            pool,
-            heartbeat.map(|heartbeat| heartbeat.as_ref()),
-        )
-        .await?;
-        crate::types::storage::GqlStorageHealth::from_storage_health_json(json)
-            .map_err(|e| Error::new(e.to_string()))
+
+        // P087: Enforce hot-read circuit guard for storage.health GraphQL readback.
+        let guard = db::hot_read_guard::HotReadGuard::new(pool.clone(), "storage.health");
+        let check = guard.check().await.map_err(|e| Error::new(e.to_string()))?;
+
+        match check {
+            db::hot_read_guard::CheckResult::Allowed {
+                is_probe,
+                probe_guard: _probe_guard,
+            } => {
+                let timeout_ms = if is_probe { 500 } else { 10_000 };
+
+                // P087: Create a cancellation token so underlying SQLite/metadata/lane
+                // resources are cancelled when the timeout fires, matching MCP behaviour.
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let _cancel_guard = cancel.clone().drop_guard();
+
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms),
+                    db::writer::CANCELLATION_TOKEN.scope(
+                        cancel,
+                        db::repos::storage_health::storage_health_with_writer(
+                            pool,
+                            heartbeat.map(|heartbeat| heartbeat.as_ref()),
+                        ),
+                    ),
+                )
+                .await;
+
+                let json = match result {
+                    Err(_elapsed) => {
+                        // P087: Record violation so the circuit opens/stays open on timeout.
+                        let _ = guard.record_violation("timeout").await;
+                        let _ = db::metrics::increment_counter("graphql_hot_read_timeout_total");
+                        return Err(Error::new("hot read timeout (GraphQL)").extend_with(
+                            |_, ext| {
+                                ext.set("code", "HOT_READ_TIMEOUT");
+                                ext.set("surface", "storage.health");
+                                ext.set("timeoutMs", timeout_ms as i64);
+                            },
+                        ));
+                    }
+                    Ok(Err(e)) => {
+                        let _ = guard.record_violation("unavailable").await;
+                        return Err(Error::new(e.to_string()));
+                    }
+                    Ok(Ok(json)) => json,
+                };
+
+                if is_probe {
+                    let _ = guard.record_success().await;
+                }
+
+                crate::types::storage::GqlStorageHealth::from_storage_health_json(json)
+                    .map_err(|e| Error::new(e.to_string()))
+            }
+            db::hot_read_guard::CheckResult::Denied {
+                status,
+                last_opened,
+                retry_after,
+            } => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let retry_after_ms = retry_after.map(|retry_after| (retry_after - now_ms).max(0));
+                Err(
+                    Error::new("hot read circuit is open (GraphQL)").extend_with(
+                        |_, extensions| {
+                            extensions.set("code", "HOT_READ_CIRCUIT_OPEN");
+                            extensions.set("surface", "storage.health");
+                            extensions.set(
+                                "status",
+                                match status {
+                                    db::repos::hot_read_circuit::CircuitStatus::Open => "OPEN",
+                                    db::repos::hot_read_circuit::CircuitStatus::HalfOpen => {
+                                        "HALF_OPEN"
+                                    }
+                                    db::repos::hot_read_circuit::CircuitStatus::Closed => "CLOSED",
+                                },
+                            );
+                            if let Some(last_opened) = last_opened {
+                                extensions.set("lastOpenedAtMs", last_opened);
+                            }
+                            if let Some(retry_after_ms) = retry_after_ms {
+                                extensions.set("retryAfterMs", retry_after_ms);
+                            }
+                        },
+                    ),
+                )
+            }
+        }
     }
 
     /// P066 T17: Latest startup recovery summary including toolchainCache fields.
@@ -1814,7 +1896,8 @@ impl SubscriptionRoot {
                     DomainEvent::SchedulerBackpressureChanged { run_id, .. } => {
                         run_id.and_then(|id| id.parse().ok())
                     }
-                    DomainEvent::DaemonStatusChanged { .. } => None,
+                    DomainEvent::DaemonStatusChanged { .. }
+                    | DomainEvent::MaintenanceSlotReleaseCasFailed { .. } => None,
                 }?;
                 if let Some(fid) = filter_run_id {
                     if refresh_run_id != fid {
@@ -2809,6 +2892,68 @@ mod tests {
             summary["blockingRemainingCodeTaskCount"],
             serde_json::json!(0)
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_087_runs_query_is_projection_only_without_per_row_enrichment() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run_id = RunId::new();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        persist_blocked_implementation_summary(&pool, run_id).await;
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                query RunsProjectionOnly {
+                  runs {
+                    id
+                    totalStages
+                    implementationSelfAssessmentSummary { status }
+                    rolloutContractReadbackJson
+                    sideEffectReadbackJson
+                    closeoutReadinessSummaryJson
+                  }
+                }
+                "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "query must succeed: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let run_json = json["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|run| run["id"] == serde_json::json!(run_id.to_string()))
+            .expect("run appears in active run list");
+        assert_eq!(run_json["totalStages"], serde_json::json!(0));
+        assert!(
+            run_json["implementationSelfAssessmentSummary"].is_null(),
+            "GraphQL runs list must not perform per-row implementation summary enrichment"
+        );
+        assert!(run_json["rolloutContractReadbackJson"].is_null());
+        assert!(run_json["sideEffectReadbackJson"].is_null());
+        assert!(run_json["closeoutReadinessSummaryJson"].is_null());
     }
 
     #[tokio::test]
@@ -7726,6 +7871,81 @@ mod tests {
                 .any(|e| e.message.to_lowercase().contains("forbidden")),
             "error must mention 'forbidden' for the observer class: {:?}",
             frame.errors
+        );
+    }
+
+    // Mutex to serialise tests that mutate CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE.
+    static P087_GQL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn proposal_087_graphql_storage_health_circuit_open_returns_hot_read_circuit_open_error()
+    {
+        // Prove that record_violation("timeout") — now called by the GraphQL storage_health
+        // resolver on timeout — opens the circuit and subsequent queries return
+        // HOT_READ_CIRCUIT_OPEN, matching the MCP enforcement contract.
+        let _env_lock = P087_GQL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+
+        let pool = test_pool().await;
+
+        // Open the circuit by recording 3 violations (the same error code the timeout
+        // path now emits via guard.record_violation("timeout")).
+        let guard = db::hot_read_guard::HotReadGuard::new(pool.clone(), "storage.health");
+        for _ in 0..3 {
+            guard.record_violation("timeout").await.unwrap();
+        }
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        let resp = schema
+            .execute(
+                Request::new("{ storageHealth { projections { pendingInvalidations } } }")
+                    .data(test_principal()),
+            )
+            .await;
+
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        assert!(
+            !resp.errors.is_empty(),
+            "circuit-open must surface a GraphQL error, got: {:?}",
+            resp.data
+        );
+        let error_str = format!("{:?}", resp.errors);
+        assert!(
+            error_str.contains("HOT_READ_CIRCUIT_OPEN") || error_str.contains("circuit"),
+            "error must identify the circuit-open condition: {error_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_087_graphql_storage_health_record_violation_wires_to_circuit_state() {
+        // Prove the GraphQL storageHealth guard's record_violation("timeout") updates
+        // hot_read_circuit_states — the same persistence path used by MCP.
+        let pool = test_pool().await;
+        let guard = db::hot_read_guard::HotReadGuard::new(pool.clone(), "storage.health");
+
+        // Three violations must be enough to set would_open or open the circuit.
+        for _ in 0..3 {
+            guard.record_violation("timeout").await.unwrap();
+        }
+
+        let (_, _, failures, _, _, _) =
+            db::repos::hot_read_circuit::get_circuit_state(&pool, "storage.health")
+                .await
+                .unwrap();
+        assert!(
+            failures >= 3,
+            "violation calls must be persisted in hot_read_circuit_states; got {failures}"
         );
     }
 }
