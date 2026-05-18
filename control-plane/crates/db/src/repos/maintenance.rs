@@ -184,6 +184,13 @@ async fn repair_slot_once(
     request_id: Option<&str>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<MaintenanceOperation> {
+    // P087-SEC-L-002: validate lengths before consuming a writer slot.
+    if idempotency_key.len() > 256 {
+        return Err(anyhow!("idempotency_key too long (max 256 bytes)"));
+    }
+    if operation_id.len() > 256 {
+        return Err(anyhow!("operation_id too long (max 256 bytes)"));
+    }
     let now = Utc::now();
     let now_ms = now.timestamp_millis();
     let mut tx = crate::writer::begin_repository_transaction_cancellable(

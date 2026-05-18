@@ -36,9 +36,20 @@
       "p087_restart_reaper_last_run": 1715712000123,
       "p087_maintenance_active_count": 0,
       "p087_maintenance_status_age_ms": null,
+      "p087_liveness_mode_config_status": "active",
+      "p087_liveness_mode_configured_value": "enforce",
       "p087_would_open_rate": 0.0,
-      "p087_flap_free_window_hours": 48,
-      "p087_min_hot_read_requests_per_surface": 100
+      "p087_total_requests_min": 100,
+      "p087_flap_free_hours_min": 48.0,
+      "p087_promotion_budget_met": true,
+      "p087_per_surface_promotion_budget": [
+        {"governed_surface": "initialize", "total_requests": 320, "total_would_open": 0, "would_open_rate_pct": 0.0, "flap_free_hours": 48.5, "promotion_ready": true},
+        {"governed_surface": "runs.list", "total_requests": 500, "total_would_open": 0, "would_open_rate_pct": 0.0, "flap_free_hours": 48.5, "promotion_ready": true},
+        {"governed_surface": "tools.list", "total_requests": 350, "total_would_open": 0, "would_open_rate_pct": 0.0, "flap_free_hours": 48.5, "promotion_ready": true},
+        {"governed_surface": "runtime.health", "total_requests": 420, "total_would_open": 0, "would_open_rate_pct": 0.0, "flap_free_hours": 48.5, "promotion_ready": true},
+        {"governed_surface": "storage.health", "total_requests": 200, "total_would_open": 0, "would_open_rate_pct": 0.0, "flap_free_hours": 48.5, "promotion_ready": true},
+        {"governed_surface": "artifacts.metadata.get", "total_requests": 160, "total_would_open": 0, "would_open_rate_pct": 0.0, "flap_free_hours": 48.5, "promotion_ready": true}
+      ]
     },
     "mcp": {
       "rollout_contract_decision": "ready",
@@ -53,7 +64,7 @@
         "status": "not_required",
         "data_loss_risk": "none"
       },
-      "rollout_contract_source_lane": "mcp",
+      "rollout_contract_source_lane": "storage_health",
       "rollout_contract_disabled_reason_code": null,
       "rollout_contract_action_id": "p087-enforce-cutover",
       "rollout_contract_operator_message": "P087 storage tiering read path is ready for enforce mode.",
@@ -66,9 +77,12 @@
       "p087_mcp_liveness_status": "active",
       "p087_hot_read_enforcement_status": "enforce",
       "p087_maintenance_active_count": 0,
+      "p087_liveness_mode_config_status": "active",
+      "p087_liveness_mode_configured_value": "enforce",
       "p087_would_open_rate": 0.0,
-      "p087_flap_free_window_hours": 48,
-      "p087_min_hot_read_requests_per_surface": 100
+      "p087_total_requests_min": 100,
+      "p087_flap_free_hours_min": 48.0,
+      "p087_promotion_budget_met": true
     },
     "run_report": {
       "rollout_contract_status": "pass",
@@ -142,6 +156,7 @@
   "rollout_contract_diagnostic_redaction": "none",
   "rollout_contract_next_steps": [],
   "rollout_contract_status": "pass",
+  "p087_promotion_budget_met": true,
   "required_metrics": [
     "db_writer_alive",
     "db_writer_queue_depth_by_lane",

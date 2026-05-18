@@ -35,6 +35,31 @@ async fn write_json_line<T: serde::Serialize>(stdout: &Arc<Mutex<tokio::io::Stdo
     }
 }
 
+fn public_json_rpc_request_id(id: &Option<serde_json::Value>) -> String {
+    let Some(value) = id.as_ref() else {
+        return uuid::Uuid::new_v4().to_string();
+    };
+
+    match value {
+        serde_json::Value::String(raw) => public_request_id_string(raw),
+        serde_json::Value::Number(number) => public_request_id_string(&number.to_string()),
+        _ => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
+fn public_request_id_string(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(128)
+        .collect();
+    if sanitized.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn spawn_scheduler_notification_pump(
     events: EventSender,
     stdout: Arc<Mutex<tokio::io::Stdout>>,
@@ -315,31 +340,27 @@ impl McpServer {
         let id = req.id.clone();
 
         match req.method.as_str() {
-            "initialize" => JsonRpcResponse::success(
-                id,
-                serde_json::json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": "chainworks-control-plane",
-                        "version": "0.1.0"
-                    }
-                }),
-            ),
+            "initialize" => {
+                // Record initialize traffic so the promotion budget tracks this governed surface.
+                let guard = hot_read_guard::HotReadGuard::new(self.pool.clone(), "initialize");
+                let _ = guard.record_success().await;
+                JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {
+                            "tools": {}
+                        },
+                        "serverInfo": {
+                            "name": "chainworks-control-plane",
+                            "version": "0.1.0"
+                        }
+                    }),
+                )
+            }
 
             "tools/list" => {
-                let request_id = id
-                    .as_ref()
-                    .and_then(|v| {
-                        if v.is_string() {
-                            v.as_str().map(|s| s.to_string())
-                        } else {
-                            Some(v.to_string())
-                        }
-                    })
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let request_id = public_json_rpc_request_id(&id);
                 self.handle_hot_read_json_rpc(
                     id,
                     "tools.list",
@@ -371,16 +392,7 @@ impl McpServer {
                         return JsonRpcResponse::error(id, -32602, "Missing tool name".to_string());
                     }
                 };
-                let request_id = id
-                    .as_ref()
-                    .and_then(|v| {
-                        if v.is_string() {
-                            v.as_str().map(|s| s.to_string())
-                        } else {
-                            Some(v.to_string())
-                        }
-                    })
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let request_id = public_json_rpc_request_id(&id);
 
                 let Some(tool_id) = tools::capability_id_for(&tool_name) else {
                     return JsonRpcResponse::error(
@@ -474,23 +486,14 @@ impl McpServer {
                         );
                     }
                 };
-                let request_id = id
-                    .as_ref()
-                    .and_then(|v| {
-                        if v.is_string() {
-                            v.as_str().map(|s| s.to_string())
-                        } else {
-                            Some(v.to_string())
-                        }
-                    })
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let request_id = public_json_rpc_request_id(&id);
                 if auth::match_resource_uri(principal, &uri, resource_template_id_for_uri).is_none()
                 {
                     return JsonRpcResponse::error(id, -32002, "Resource not found".to_string());
                 }
                 self.handle_hot_read_json_rpc(
                     id,
-                    "resources.read",
+                    "artifacts.metadata.get",
                     async {
                         let data = self.read_resource_for_principal(&uri, principal).await?;
                         Ok(serde_json::json!({
@@ -2744,7 +2747,7 @@ mod tests {
         assert!(db::metrics::get_runs_list_read_latency_p95().is_some());
         assert!(db::metrics::get_hot_read_p95("runtime.health").is_some());
         assert!(db::metrics::get_hot_read_p95("storage.health").is_some());
-        assert!(db::metrics::get_hot_read_p95("resources.read").is_some());
+        assert!(db::metrics::get_hot_read_p95("artifacts.metadata.get").is_some());
         assert!(db::metrics::get_mcp_liveness_gate_duration_p95().is_some());
 
         let readback = db::repos::storage_health::storage_health(&pool)
@@ -2839,6 +2842,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_087_tools_list_typed_error_sanitizes_request_id() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "tools.list").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let raw_id = format!("p087-tools-list\n{}", "x".repeat(2_048));
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(raw_id.clone())),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        let request_id = result["requestId"].as_str().unwrap();
+        assert_ne!(request_id, raw_id);
+        assert!(request_id.len() <= 128);
+        assert!(!request_id.contains('\n'));
+        assert_eq!(
+            result["errorCode"],
+            tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_087_tools_list_typed_error_rejects_structured_request_id() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "tools.list").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!({"raw": "do-not-publish"})),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        let request_id = result["requestId"].as_str().unwrap();
+        assert!(!request_id.contains("do-not-publish"));
+        assert!(uuid::Uuid::parse_str(request_id).is_ok());
+    }
+
+    #[tokio::test]
     async fn proposal_087_storage_health_tool_call_open_circuit_is_typed_result() {
         let _guard = crate::hot_read_guard::P087_ENV_LOCK
             .lock()
@@ -2895,7 +2966,7 @@ mod tests {
             "enforce",
         );
         let pool = test_pool().await;
-        open_hot_read_circuit(&pool, "resources.read").await;
+        open_hot_read_circuit(&pool, "artifacts.metadata.get").await;
         let server = McpServer::new(
             pool.clone(),
             make_command_handler(pool.clone()),
@@ -2916,7 +2987,7 @@ mod tests {
             result["errorCode"],
             tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
         );
-        assert_eq!(result["tool"], "resources.read");
+        assert_eq!(result["tool"], "artifacts.metadata.get");
     }
 
     #[test]

@@ -913,12 +913,26 @@ pub(crate) async fn rollout_contract_readback_json(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<serde_json::Value> {
-    Ok(
+    let base =
         rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
             .await?
             .map(|check| check.operator_readback_json_for_lane("run_report"))
-            .unwrap_or(serde_json::Value::Null),
-    )
+            .unwrap_or(serde_json::Value::Null);
+
+    if base.is_null() {
+        return Ok(base);
+    }
+    // Merge live P087 fields into the run_report readback lane.
+    let p087 = db::repos::storage_health::p087_rollout_readback_fields(pool).await;
+    if let (Some(base_obj), Some(p087_obj)) = (base.as_object(), p087.as_object()) {
+        let mut merged = base_obj.clone();
+        for (k, v) in p087_obj {
+            merged.insert(k.clone(), v.clone());
+        }
+        Ok(serde_json::Value::Object(merged))
+    } else {
+        Ok(base)
+    }
 }
 
 /// P077: Serialize the active closeout readiness generation for MCP readback.

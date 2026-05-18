@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
@@ -14,6 +15,7 @@ use crate::writer::{
 
 const PRESSURE_STALE_AFTER_MS: i64 = 5 * 60 * 1000;
 const STORAGE_HEALTH_STALE_AFTER_MS: i64 = 5_000;
+const DIAGNOSTIC_ROW_LIMIT: i64 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageWritePressureSnapshot {
@@ -444,13 +446,13 @@ pub async fn storage_health_with_writer(
         },
         "readPath": {
             "runsList": {
-                "status": if runs_list_p95 > 250 { "breach" } else { "healthy" },
+                "status": if runs_list_p95 > 500 { "breach" } else if runs_list_p95 >= 350 { "warn" } else { "healthy" },
                 "sampleCount": crate::metrics::get_hot_read_sample_count("runs.list"),
                 "runs_list_read_latency_ms": crate::metrics::get_hot_read_latest("runs_list_read_latency_ms"),
                 "p95Ms": runs_list_p95,
             },
             "mcpLivenessGate": {
-                "status": if mcp_liveness_p95 > 1000 { "breach" } else { "healthy" },
+                "status": if mcp_liveness_p95 > 500 { "breach" } else if mcp_liveness_p95 >= 350 { "warn" } else { "healthy" },
                 "sampleCount": crate::metrics::get_hot_read_sample_count("mcp_liveness_gate_duration_ms"),
                 "mcp_liveness_gate_duration_ms": crate::metrics::get_hot_read_latest("mcp_liveness_gate_duration_ms"),
                 "p95Ms": mcp_liveness_p95,
@@ -560,8 +562,11 @@ async fn evaluate_p087_metrics(
 async fn projection_freshness_summary(pool: &SqlitePool) -> Result<Vec<Value>> {
     let cursors = sqlx::query(
         "SELECT projection_name, source_name, watermark_ms, is_poisoned, last_error, updated_at_ms, throttled_until_ms
-         FROM projection_cursors"
+         FROM projection_cursors
+         ORDER BY updated_at_ms DESC, projection_name ASC, source_name ASC
+         LIMIT ?"
     )
+    .bind(DIAGNOSTIC_ROW_LIMIT)
     .fetch_all(pool)
     .await?;
 
@@ -613,7 +618,10 @@ async fn projection_freshness_summary(pool: &SqlitePool) -> Result<Vec<Value>> {
                 "sourceName": s_name,
                 "watermarkMs": row.get::<i64, _>("watermark_ms"),
                 "isPoisoned": row.get::<i32, _>("is_poisoned") != 0,
-                "lastError": row.get::<Option<String>, _>("last_error"),
+                "lastError": public_error_code(
+                    row.get::<Option<String>, _>("last_error").as_deref(),
+                    "projection_error"
+                ),
                 "updatedAtMs": row.get::<i64, _>("updated_at_ms"),
                 "throttledUntilMs": row.get::<Option<i64>, _>("throttled_until_ms"),
                 "backlogRows": backlog_rows,
@@ -640,8 +648,11 @@ async fn projection_freshness_summary(pool: &SqlitePool) -> Result<Vec<Value>> {
 async fn hot_read_circuit_summary(pool: &SqlitePool) -> Result<Vec<Value>> {
     let rows = sqlx::query(
         "SELECT governed_surface, circuit_status, consecutive_successes, consecutive_failures, last_violation_kind, last_opened_at_ms, retry_after_ms, would_open, updated_at_ms
-         FROM hot_read_circuit_states"
+         FROM hot_read_circuit_states
+         ORDER BY updated_at_ms DESC, governed_surface ASC
+         LIMIT ?"
     )
+    .bind(DIAGNOSTIC_ROW_LIMIT)
     .fetch_all(pool)
     .await?;
 
@@ -677,15 +688,19 @@ async fn maintenance_operations_summary(pool: &SqlitePool) -> Result<Vec<Value>>
 
     let mut list = Vec::new();
     for row in rows {
+        let raw_id = row.get::<String, _>("id");
+        let raw_key = row.get::<String, _>("idempotency_key");
+        let raw_error = row.get::<Option<String>, _>("error");
         list.push(json!({
-            "id": row.get::<String, _>("id"),
+            "id": public_reference("maintenance_operation", &raw_id),
             "operationKind": row.get::<String, _>("operation_kind"),
             "status": row.get::<String, _>("status"),
-            "idempotencyKey": row.get::<String, _>("idempotency_key"),
+            "idempotencyKey": public_hash(&raw_key),
             "slotGeneration": row.get::<i64, _>("slot_generation"),
             "startedAtMs": row.get::<Option<i64>, _>("started_at_ms"),
             "completedAtMs": row.get::<Option<i64>, _>("completed_at_ms"),
-            "error": row.get::<Option<String>, _>("error"),
+            "error": public_error_code(raw_error.as_deref(), "maintenance_operation_failed"),
+            "detailsRedacted": !raw_key.is_empty() || raw_error.is_some(),
             "createdAtMs": row.get::<i64, _>("created_at_ms"),
             "updatedAtMs": row.get::<i64, _>("updated_at_ms"),
         }));
@@ -694,28 +709,38 @@ async fn maintenance_operations_summary(pool: &SqlitePool) -> Result<Vec<Value>>
 }
 
 async fn artifact_noise_projection(pool: &SqlitePool) -> Result<Value> {
+    let totals = sqlx::query(
+        r#"SELECT COUNT(*) as total_run_count,
+                  COALESCE(SUM(artifact_count), 0) as artifact_count,
+                  COALESCE(SUM(superseded_count), 0) as superseded_count,
+                  COALESCE(SUM(duplicate_candidate_count), 0) as duplicate_candidate_count,
+                  COALESCE(SUM(archive_eligible_count), 0) as archive_eligible_count
+           FROM artifact_noise_summary"#,
+    )
+    .fetch_one(pool)
+    .await?;
+
     let rows = sqlx::query(
         r#"SELECT run_id, artifact_count, superseded_count, duplicate_candidate_count, archive_eligible_count
            FROM artifact_noise_summary
-           ORDER BY run_id"#,
+           ORDER BY run_id
+           LIMIT ?"#,
     )
+    .bind(DIAGNOSTIC_ROW_LIMIT)
     .fetch_all(pool)
     .await?;
 
-    let mut total_artifact_count = 0_i64;
-    let mut total_superseded_count = 0_i64;
-    let mut total_duplicate_candidate_count = 0_i64;
-    let mut total_archive_eligible_count = 0_i64;
+    let total_run_count = totals.get::<i64, _>("total_run_count");
+    let total_artifact_count = totals.get::<i64, _>("artifact_count");
+    let total_superseded_count = totals.get::<i64, _>("superseded_count");
+    let total_duplicate_candidate_count = totals.get::<i64, _>("duplicate_candidate_count");
+    let total_archive_eligible_count = totals.get::<i64, _>("archive_eligible_count");
     let mut runs = Vec::new();
     for row in rows {
         let artifact_count = row.get::<i64, _>("artifact_count");
         let superseded_count = row.get::<i64, _>("superseded_count");
         let duplicate_candidate_count = row.get::<i64, _>("duplicate_candidate_count");
         let archive_eligible_count = row.get::<i64, _>("archive_eligible_count");
-        total_artifact_count += artifact_count;
-        total_superseded_count += superseded_count;
-        total_duplicate_candidate_count += duplicate_candidate_count;
-        total_archive_eligible_count += archive_eligible_count;
         runs.push(json!({
             "runId": row.get::<String, _>("run_id"),
             "artifactCount": artifact_count,
@@ -735,8 +760,45 @@ async fn artifact_noise_projection(pool: &SqlitePool) -> Result<Value> {
         "compactionRecommended": total_superseded_count > 0
             || total_duplicate_candidate_count > 0
             || total_artifact_count > 500,
+        "totalRunCount": total_run_count,
+        "returnedRunCount": runs.len(),
+        "truncated": total_run_count > runs.len() as i64,
         "runs": runs,
     }))
+}
+
+fn public_reference(prefix: &str, raw: &str) -> String {
+    format!("{prefix}:{}", short_sha256(raw))
+}
+
+fn public_hash(raw: &str) -> String {
+    format!("sha256:{}", short_sha256(raw))
+}
+
+fn short_sha256(raw: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    let digest = hasher.finalize();
+    format!("{digest:x}").chars().take(16).collect()
+}
+
+fn public_error_code(raw: Option<&str>, fallback: &str) -> Option<String> {
+    raw.map(|value| {
+        let value = value.trim();
+        if is_public_error_code(value) {
+            value.to_string()
+        } else {
+            fallback.to_string()
+        }
+    })
+}
+
+fn is_public_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-' | ':' | '.')
+        })
 }
 
 pub async fn runtime_health_projection(pool: &SqlitePool) -> Result<Value> {
@@ -784,6 +846,10 @@ async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
     let last_reaper = crate::repos::maintenance::last_reaper_run(pool)
         .await
         .unwrap_or(None);
+    let promotion_budget = compute_promotion_budget(pool).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "p087 compute_promotion_budget db error; falling back to pending");
+        PromotionBudget::default()
+    });
 
     let now_ms = Utc::now().timestamp_millis();
     let reaper_sla_breach = if mode == crate::hot_read_guard::LivenessMode::Enforce {
@@ -812,6 +878,46 @@ async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
         "active"
     };
 
+    // Check for poisoned projection cursors: projection freshness is not healthy.
+    let projection_freshness_degraded = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM projection_cursors WHERE is_poisoned = 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        > 0;
+
+    // Check for sustained projection invalidation backlog exceeded events.
+    let backlog_exceeded =
+        crate::metrics::get_counter("projection_invalidation_backlog_exceeded_total") > 0;
+
+    // Collect all hold conditions; every criterion must pass before the contract is ready.
+    let mut hold_conditions: Vec<&str> = Vec::new();
+    let mut failure_reasons: Vec<&str> = Vec::new();
+
+    if status != "active" {
+        hold_conditions.push(status);
+        failure_reasons.push(status);
+    }
+    if invalid_mode {
+        hold_conditions.push("invalid_liveness_mode_config");
+        failure_reasons.push("invalid_liveness_mode_config");
+    }
+    if !promotion_budget.promotion_budget_met {
+        hold_conditions.push("p087_hot_read_promotion_budget_pending");
+        failure_reasons.push("p087_hot_read_promotion_budget_pending");
+    }
+    if projection_freshness_degraded {
+        hold_conditions.push("p087_projection_freshness_degraded");
+        failure_reasons.push("p087_projection_freshness_degraded");
+    }
+    if backlog_exceeded {
+        hold_conditions.push("p087_projection_invalidation_backlog_exceeded");
+        failure_reasons.push("p087_projection_invalidation_backlog_exceeded");
+    }
+
+    let is_ready = hold_conditions.is_empty();
+
     Ok(json!({
         "p087_storage_tiering_status": status,
         "p087_mcp_liveness_status": status,
@@ -826,20 +932,22 @@ async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
         "p087_maintenance_active_count": m_count,
         "p087_maintenance_status_age_ms": m_age,
         "p087_restart_reaper_last_run": last_reaper,
-        "p087_projection_invalidation_backlog_status": status,
+        "p087_projection_invalidation_backlog_status": if backlog_exceeded { "exceeded" } else { status },
         "p087_liveness_mode_config_status": if invalid_mode { "invalid_observe_fallback" } else { "active" },
         "p087_liveness_mode_configured_value": mode_raw,
-        "p087_would_open_rate": 0.0,
-        "p087_flap_free_window_hours": 48,
-        "p087_min_hot_read_requests_per_surface": 100,
-        "rollout_contract_status": if status == "active" { "pass" } else { "hold" },
-        "rollout_contract_decision": if status == "active" { "ready" } else { "hold" },
-        "rollout_contract_failure_reasons": if status == "active" { json!([]) } else { json!([status]) },
+        "p087_would_open_rate": promotion_budget.worst_would_open_rate,
+        "p087_total_requests_min": promotion_budget.min_total_requests,
+        "p087_flap_free_hours_min": promotion_budget.min_flap_free_hours,
+        "p087_promotion_budget_met": promotion_budget.promotion_budget_met,
+        "p087_per_surface_promotion_budget": promotion_budget.per_surface,
+        "rollout_contract_status": if is_ready { "pass" } else { "hold" },
+        "rollout_contract_decision": if is_ready { "ready" } else { "hold" },
+        "rollout_contract_failure_reasons": json!(failure_reasons),
         "rollout_contract_waiver_state": "none",
         "rollout_contract_waiver_expires_at": Value::Null,
         "rollout_contract_enforcement_mode": mode_str,
-        "rollout_contract_enforcement_mode_reason": if invalid_mode { "invalid_liveness_mode_observe_fallback" } else { "p087_hot_read_promotion_budget_met" },
-        "rollout_contract_hold_conditions": if status == "active" { json!([]) } else { json!([status]) },
+        "rollout_contract_enforcement_mode_reason": if invalid_mode { "invalid_liveness_mode_observe_fallback" } else if promotion_budget.promotion_budget_met { "p087_hot_read_promotion_budget_met" } else { "p087_hot_read_promotion_budget_pending" },
+        "rollout_contract_hold_conditions": json!(hold_conditions),
         "rollout_contract_rollback_disposition": {
             "status": "not_required",
             "data_loss_risk": "none"
@@ -848,16 +956,160 @@ async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
         "rollout_contract_enabled_state": if mode_str == "disabled" { "disabled" } else { "enabled" },
         "rollout_contract_disabled_reason_code": if mode_str == "disabled" { json!("operator_disabled") } else { Value::Null },
         "rollout_contract_action_id": "p087-enforce-cutover",
-        "rollout_contract_operator_message": if status == "active" {
+        "rollout_contract_operator_message": if is_ready {
             "P087 storage tiering read path is ready for enforce mode."
         } else {
             "P087 storage tiering read path has rollout holds."
         },
-        "rollout_contract_projection_integrity": if status == "active" { "pass" } else { "hold" },
+        "rollout_contract_projection_integrity": if is_ready { "pass" } else { "hold" },
         "rollout_contract_cutover_policy_revision": "p087-r6-2026-05-10-graphql-projection-compatibility",
         "rollout_contract_diagnostic_redaction": "none",
-        "rollout_contract_next_steps": if status == "active" { json!([]) } else { json!(["inspect_p087_rollout_holds"]) }
+        "rollout_contract_next_steps": if is_ready { json!([]) } else { json!(["inspect_p087_rollout_holds"]) }
     }))
+}
+
+/// Summarized per-surface promotion budget for observe-to-enforce promotion.
+#[derive(Default)]
+struct PromotionBudget {
+    worst_would_open_rate: f64,
+    min_total_requests: i64,
+    min_flap_free_hours: f64,
+    promotion_budget_met: bool,
+    per_surface: serde_json::Value,
+}
+
+/// The canonical set of hot-read governed surfaces that must all meet the
+/// observe-to-enforce promotion criteria. Adding or removing surfaces here
+/// changes the promotion requirements and must be coordinated with a proposal.
+const CANONICAL_HOT_READ_SURFACES: &[&str] = &[
+    "initialize",
+    "runs.list",
+    "tools.list",
+    "runtime.health",
+    "storage.health",
+    "artifacts.metadata.get",
+];
+
+/// Query all governed surfaces and evaluate the observe-to-enforce promotion criteria:
+/// - wouldOpen rate below 0.1% per surface
+/// - at least 100 requests per surface
+/// - 48-hour flap-free window per surface
+///
+/// All CANONICAL_HOT_READ_SURFACES are always evaluated. Surfaces with no DB row
+/// default to total_requests=0, which means they can never satisfy the 100-request
+/// floor, so promotion_budget_met remains false until every surface has sufficient traffic.
+async fn compute_promotion_budget(pool: &SqlitePool) -> Result<PromotionBudget> {
+    let rows = sqlx::query(
+        "SELECT governed_surface, total_requests, total_would_open, last_state_change_at_ms, first_observed_at_ms
+         FROM hot_read_circuit_states",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    // Build a lookup from DB rows; surfaces absent from the DB are treated as
+    // (0 requests, 0 would_open, no state change, never observed) — i.e. not yet ready.
+    let mut row_map: std::collections::HashMap<String, (i64, i64, Option<i64>, Option<i64>)> =
+        std::collections::HashMap::new();
+    for row in &rows {
+        let surface: String = row.get("governed_surface");
+        let total_requests: i64 = row.get("total_requests");
+        let total_would_open: i64 = row.get("total_would_open");
+        let last_state_change: Option<i64> = row.get("last_state_change_at_ms");
+        let first_observed: Option<i64> = row.get("first_observed_at_ms");
+        row_map.insert(
+            surface,
+            (
+                total_requests,
+                total_would_open,
+                last_state_change,
+                first_observed,
+            ),
+        );
+    }
+
+    let now_ms = Utc::now().timestamp_millis();
+    let required_ms: i64 = 48 * 60 * 60 * 1000;
+    let mut per_surface = Vec::new();
+    let mut worst_rate: f64 = 0.0;
+    let mut min_requests: i64 = i64::MAX;
+    let mut min_flap_free_ms: i64 = 0;
+
+    for &surface in CANONICAL_HOT_READ_SURFACES {
+        let (total_requests, total_would_open, last_state_change, first_observed) =
+            row_map.get(surface).copied().unwrap_or((0, 0, None, None));
+
+        let rate = if total_requests > 0 {
+            (total_would_open as f64 / total_requests as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        // The observation window starts at first_observed_at_ms (when this surface was first
+        // ever seen), unless the circuit later changed state (open/close recovery), in which
+        // case stability is only guaranteed from the last state change.
+        // If the surface has never been observed, it cannot satisfy the 48-hour requirement.
+        let effective_window_start_ms: Option<i64> = match (first_observed, last_state_change) {
+            (None, _) => None,                  // never observed — not ready
+            (Some(first), None) => Some(first), // observed but never had a state change
+            (Some(first), Some(last_change)) => Some(last_change.max(first)),
+        };
+
+        let flap_free_ms = match effective_window_start_ms {
+            Some(t) => (now_ms - t).max(0),
+            None => 0, // never observed — treat as 0 ms flap-free
+        };
+        let flap_free_hours = flap_free_ms as f64 / 3_600_000.0;
+
+        let surface_met = rate < 0.1
+            && total_requests >= 100
+            && effective_window_start_ms.is_some()
+            && flap_free_ms >= required_ms;
+
+        per_surface.push(serde_json::json!({
+            "governed_surface": surface,
+            "total_requests": total_requests,
+            "total_would_open": total_would_open,
+            "would_open_rate_pct": (rate * 1000.0).round() / 1000.0,
+            "flap_free_hours": (flap_free_hours * 10.0).round() / 10.0,
+            "promotion_ready": surface_met,
+        }));
+
+        if rate > worst_rate {
+            worst_rate = rate;
+        }
+        if total_requests < min_requests {
+            min_requests = total_requests;
+        }
+        if flap_free_ms < min_flap_free_ms || per_surface.len() == 1 {
+            min_flap_free_ms = flap_free_ms;
+        }
+    }
+
+    let all_met = per_surface
+        .iter()
+        .all(|s| s["promotion_ready"].as_bool().unwrap_or(false));
+    let final_flap_free = (min_flap_free_ms as f64 / 3_600_000.0 * 10.0).round() / 10.0;
+
+    Ok(PromotionBudget {
+        worst_would_open_rate: (worst_rate * 1000.0).round() / 1000.0,
+        min_total_requests: if min_requests == i64::MAX {
+            0
+        } else {
+            min_requests
+        },
+        min_flap_free_hours: final_flap_free,
+        promotion_budget_met: all_met,
+        per_surface: serde_json::json!(per_surface),
+    })
+}
+
+/// Returns the live P087 rollout readback fields for merging into production
+/// readback lanes (run_report, release_receipt).
+pub async fn p087_rollout_readback_fields(pool: &SqlitePool) -> Value {
+    rollout_readback(pool).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "p087 rollout_readback db error; returning empty readback");
+        json!({})
+    })
 }
 
 async fn maintenance_active_stats(pool: &SqlitePool) -> Result<(i64, Option<i64>)> {
@@ -1270,6 +1522,9 @@ fn parse_time(value: String) -> Result<DateTime<Utc>> {
 }
 
 #[cfg(test)]
+pub(crate) static P087_STORAGE_HEALTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1473,57 +1728,304 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proposal_087_storage_health_enforces_reaper_sla_in_enforce_mode() {
+    async fn proposal_087_storage_health_redacts_maintenance_operation_details() {
         let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
         let now = Utc::now().timestamp_millis();
 
-        // Use a wrapper to set env var for this test
-        let run_test = || async {
-            std::env::set_var(
-                "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
-                "enforce",
+        sqlx::query(
+            "INSERT INTO maintenance_operations \
+             (id, operation_kind, status, idempotency_key, error, created_at_ms, updated_at_ms) \
+             VALUES ('raw-maintenance-operation-id', 'repair_slot', 'failed', \
+                     'operator-provided-idempotency-key', '/Users/user/private/db.sqlite: boom', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let health = storage_health(&pool).await.unwrap();
+        let operations = health["maintenanceOperations"].as_array().unwrap();
+        let operation = operations
+            .iter()
+            .find(|row| row["operationKind"] == "repair_slot")
+            .expect("repair operation should be returned");
+
+        let public_id = operation["id"].as_str().unwrap();
+        assert_ne!(public_id, "raw-maintenance-operation-id");
+        assert!(
+            public_id.starts_with("maintenance_operation:"),
+            "operation id must be an opaque public reference"
+        );
+
+        let public_key = operation["idempotencyKey"].as_str().unwrap();
+        assert_ne!(public_key, "operator-provided-idempotency-key");
+        assert!(
+            public_key.starts_with("sha256:"),
+            "idempotency key must be hash-redacted"
+        );
+        assert_eq!(operation["error"], "maintenance_operation_failed");
+        assert_eq!(operation["detailsRedacted"], true);
+    }
+
+    #[tokio::test]
+    async fn proposal_087_storage_health_redacts_projection_cursor_errors() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO projection_cursors \
+             (projection_name, source_name, watermark_ms, is_poisoned, last_error, updated_at_ms, throttled_until_ms) \
+             VALUES ('runs_home', 'runs', ?, 1, '/Users/user/private/projection.log: stack', ?, NULL)",
+        )
+        .bind(now - 10_000)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let health = storage_health(&pool).await.unwrap();
+        let freshness = health["projectionFreshness"].as_array().unwrap();
+        let row = freshness
+            .iter()
+            .find(|row| row["projectionName"] == "runs_home" && row["sourceName"] == "runs")
+            .expect("projection freshness row must be present");
+        assert_eq!(row["lastError"], "projection_error");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_artifact_noise_projection_is_bounded() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO ideas (id, title, body, status, created_at) \
+             VALUES ('idea-artifact-noise', 'Artifact noise', 'body', 'draft', '2026-05-18T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for idx in 0..125 {
+            let run_id = format!("run-{idx:03}");
+            sqlx::query(
+                "INSERT INTO runs \
+                 (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at) \
+                 VALUES (?, 'idea-artifact-noise', 'running', 'wf', 'Workflow', '/tmp', '/tmp/artifacts', '2026-05-18T00:00:00Z')",
+            )
+            .bind(&run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO artifact_noise_summary \
+                 (run_id, artifact_count, superseded_count, duplicate_candidate_count, archive_eligible_count, updated_at_ms) \
+                 VALUES (?, 1, 0, 0, 0, ?)",
+            )
+            .bind(run_id)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let health = storage_health(&pool).await.unwrap();
+        let projection = &health["artifactNoiseProjection"];
+        assert_eq!(projection["totalRunCount"], 125);
+        assert_eq!(projection["returnedRunCount"], 100);
+        assert_eq!(projection["truncated"], true);
+        assert_eq!(projection["runs"].as_array().unwrap().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn proposal_087_storage_health_enforces_reaper_sla_in_enforce_mode() {
+        let _guard = P087_STORAGE_HEALTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let now = Utc::now().timestamp_millis();
+
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+
+        // 1. No reaper run yet -> degraded
+        let health = storage_health(&pool).await.unwrap();
+        let rollout = &health["rollout"];
+        assert_eq!(rollout["p087_storage_tiering_status"], "degraded");
+
+        // 2. Old reaper run (70s ago) -> degraded
+        sqlx::query("INSERT INTO maintenance_operations (id, operation_kind, status, idempotency_key, created_at_ms, updated_at_ms) VALUES ('r1', 'restart_reaper', 'completed', 'i1', ?, ?)")
+            .bind(now - 70_000)
+            .bind(now - 70_000)
+            .execute(&pool).await.unwrap();
+
+        let health = storage_health(&pool).await.unwrap();
+        let rollout = &health["rollout"];
+        assert_eq!(rollout["p087_storage_tiering_status"], "degraded");
+
+        // 3. Fresh reaper run (10s ago) -> active
+        sqlx::query("INSERT INTO maintenance_operations (id, operation_kind, status, idempotency_key, created_at_ms, updated_at_ms) VALUES ('r2', 'restart_reaper', 'completed', 'i2', ?, ?)")
+            .bind(now - 10_000)
+            .bind(now - 10_000)
+            .execute(&pool).await.unwrap();
+
+        let health = storage_health(&pool).await.unwrap();
+        let rollout = &health["rollout"];
+        assert_eq!(rollout["p087_storage_tiering_status"], "active");
+
+        // 4. Fresh reaper BUT old poisoned slot -> degraded
+        sqlx::query("INSERT INTO maintenance_operations (id, operation_kind, status, idempotency_key, created_at_ms, updated_at_ms) VALUES ('p1', 'repair_slot_poisoned', 'failed', 'i3', ?, ?)")
+            .bind(now - 6 * 60 * 1000)
+            .bind(now - 6 * 60 * 1000)
+            .execute(&pool).await.unwrap();
+
+        let health = storage_health(&pool).await.unwrap();
+        let rollout = &health["rollout"];
+        assert_eq!(rollout["p087_storage_tiering_status"], "degraded");
+
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_promotion_budget_false_positive_subset_surfaces() {
+        // Regression: promotion_budget_met must stay false when only a subset of
+        // canonical governed surfaces has passing counters. Before this fix,
+        // absent surfaces were ignored, making all_met=true for a partial set.
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+        let old_enough = now_ms - (49 * 60 * 60 * 1000_i64); // > 48 hours ago
+
+        // Insert passing rows for only 2 of 6 canonical surfaces
+        for surface in ["runs.list", "tools.list"] {
+            sqlx::query(
+                "INSERT OR REPLACE INTO hot_read_circuit_states
+                 (governed_surface, circuit_status, consecutive_successes, consecutive_failures,
+                  last_opened_at_ms, retry_after_ms, would_open, updated_at_ms,
+                  total_requests, total_would_open, last_state_change_at_ms, first_observed_at_ms)
+                 VALUES (?, 'closed', 0, 0, NULL, NULL, 0, ?, 500, 0, NULL, ?)",
+            )
+            .bind(surface)
+            .bind(now_ms)
+            .bind(old_enough)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let budget = compute_promotion_budget(&pool).await.unwrap();
+
+        assert!(
+            !budget.promotion_budget_met,
+            "promotion_budget_met must be false when 4 canonical surfaces have no traffic"
+        );
+        assert_eq!(
+            budget.per_surface.as_array().unwrap().len(),
+            CANONICAL_HOT_READ_SURFACES.len(),
+            "per_surface must enumerate all {} canonical surfaces",
+            CANONICAL_HOT_READ_SURFACES.len()
+        );
+
+        let not_ready: Vec<_> = budget
+            .per_surface
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| !s["promotion_ready"].as_bool().unwrap_or(true))
+            .collect();
+        assert!(
+            not_ready.len() >= 4,
+            "at least 4 surfaces (missing from DB) must not be promotion_ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_087_p087_rollout_readback_fields_returns_required_p087_keys() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let fields = p087_rollout_readback_fields(&pool).await;
+
+        for key in [
+            "p087_storage_tiering_status",
+            "p087_mcp_liveness_status",
+            "p087_hot_read_enforcement_status",
+            "p087_promotion_budget_met",
+            "p087_per_surface_promotion_budget",
+            "p087_would_open_rate",
+            "p087_total_requests_min",
+            "p087_flap_free_hours_min",
+            "rollout_contract_status",
+            "rollout_contract_decision",
+        ] {
+            assert!(
+                fields.get(key).is_some(),
+                "p087_rollout_readback_fields missing key: {key}"
             );
+        }
+    }
 
-            // 1. No reaper run yet -> degraded
-            let health = storage_health(&pool).await.unwrap();
-            let rollout = &health["rollout"];
-            assert_eq!(rollout["p087_storage_tiering_status"], "degraded");
+    /// Regression: 100 immediate successes must NOT satisfy the 48-hour promotion window.
+    /// first_observed_at_ms is set to "now" by the record_success inserts, so flap_free_ms < 48h.
+    #[tokio::test]
+    async fn proposal_087_100_immediate_successes_do_not_bypass_48h_window() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
 
-            // 2. Old reaper run (70s ago) -> degraded
-            sqlx::query("INSERT INTO maintenance_operations (id, operation_kind, status, idempotency_key, created_at_ms, updated_at_ms) VALUES ('r1', 'restart_reaper', 'completed', 'i1', ?, ?)")
-                .bind(now - 70_000)
-                .bind(now - 70_000)
-                .execute(&pool).await.unwrap();
+        // Record 100+ successes for every canonical surface right now
+        for &surface in CANONICAL_HOT_READ_SURFACES {
+            for _ in 0..110 {
+                crate::repos::hot_read_circuit::record_success(&pool, surface)
+                    .await
+                    .unwrap();
+            }
+        }
 
-            let health = storage_health(&pool).await.unwrap();
-            let rollout = &health["rollout"];
-            assert_eq!(rollout["p087_storage_tiering_status"], "degraded");
+        let budget = compute_promotion_budget(&pool).await.unwrap();
 
-            // 3. Fresh reaper run (10s ago) -> active
-            sqlx::query("INSERT INTO maintenance_operations (id, operation_kind, status, idempotency_key, created_at_ms, updated_at_ms) VALUES ('r2', 'restart_reaper', 'completed', 'i2', ?, ?)")
-                .bind(now - 10_000)
-                .bind(now - 10_000)
-                .execute(&pool).await.unwrap();
+        assert!(
+            !budget.promotion_budget_met,
+            "promotion_budget_met must be false when first_observed_at_ms is too recent \
+             (< 48 hours ago), even with 110 successful requests per surface"
+        );
+        for surface_entry in budget.per_surface.as_array().unwrap() {
+            assert!(
+                !surface_entry["promotion_ready"].as_bool().unwrap_or(true),
+                "surface '{}' must not be promotion_ready when observation window < 48h",
+                surface_entry["governed_surface"]
+            );
+            let hours = surface_entry["flap_free_hours"].as_f64().unwrap_or(999.0);
+            assert!(
+                hours < 1.0,
+                "flap_free_hours for '{}' should be near 0 for immediate traffic, got {hours}",
+                surface_entry["governed_surface"]
+            );
+        }
+    }
 
-            let health = storage_health(&pool).await.unwrap();
-            let rollout = &health["rollout"];
-            assert_eq!(rollout["p087_storage_tiering_status"], "active");
+    /// Regression: rollout_contract_status must be "hold" when promotion budget is pending.
+    /// Before the fix, it returned "pass"/"ready" based on status=="active" alone.
+    #[tokio::test]
+    async fn proposal_087_rollout_contract_holds_when_promotion_budget_pending() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
 
-            // 4. Fresh reaper BUT old poisoned slot -> degraded
-            sqlx::query("INSERT INTO maintenance_operations (id, operation_kind, status, idempotency_key, created_at_ms, updated_at_ms) VALUES ('p1', 'repair_slot_poisoned', 'failed', 'i3', ?, ?)")
-                .bind(now - 6 * 60 * 1000)
-                .bind(now - 6 * 60 * 1000)
-                .execute(&pool).await.unwrap();
-
-            let health = storage_health(&pool).await.unwrap();
-            let rollout = &health["rollout"];
-            assert_eq!(rollout["p087_storage_tiering_status"], "degraded");
-
-            std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
-        };
-
-        // Note: we don't have P087_ENV_LOCK here, so this test might be flaky if run in parallel with other env-sensitive tests.
-        // But in memory pool is isolated.
-        run_test().await;
+        // Fresh DB: no traffic, promotion budget not met
+        let fields = p087_rollout_readback_fields(&pool).await;
+        assert_eq!(
+            fields["p087_promotion_budget_met"], false,
+            "promotion_budget_met should be false with no traffic"
+        );
+        assert_eq!(
+            fields["rollout_contract_status"], "hold",
+            "rollout_contract_status must be 'hold' when promotion_budget_met is false"
+        );
+        assert_eq!(
+            fields["rollout_contract_decision"], "hold",
+            "rollout_contract_decision must be 'hold' when promotion_budget_met is false"
+        );
+        let hold_conditions = fields["rollout_contract_hold_conditions"]
+            .as_array()
+            .expect("rollout_contract_hold_conditions must be an array");
+        assert!(
+            hold_conditions
+                .iter()
+                .any(|c| c.as_str() == Some("p087_hot_read_promotion_budget_pending")),
+            "hold_conditions must include p087_hot_read_promotion_budget_pending, got: {hold_conditions:?}"
+        );
     }
 }

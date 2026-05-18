@@ -82,9 +82,9 @@ impl HotReadGuard {
 pub fn is_hot_read_tool(name: &str) -> bool {
     matches!(
         name,
-        "runs.list"
+        "initialize"
+            | "runs.list"
             | "tools.list"
-            | "resources.read"
             | "runtime.health"
             | "storage.health"
             | "artifacts.metadata.get"

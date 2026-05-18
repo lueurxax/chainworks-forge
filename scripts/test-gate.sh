@@ -8062,8 +8062,10 @@ for field in [
     "p087_restart_reaper_last_run",
     "p087_maintenance_active_count",
     "p087_would_open_rate",
-    "p087_flap_free_window_hours",
-    "p087_min_hot_read_requests_per_surface",
+    "p087_total_requests_min",
+    "p087_flap_free_hours_min",
+    "p087_promotion_budget_met",
+    "p087_per_surface_promotion_budget",
 ]:
     if field not in graphql_lane:
         print(f"FAILED: P087 rollout GraphQL lane missing {field}")
@@ -8074,8 +8076,9 @@ for field in [
     "p087_hot_read_enforcement_status",
     "p087_maintenance_active_count",
     "p087_would_open_rate",
-    "p087_flap_free_window_hours",
-    "p087_min_hot_read_requests_per_surface",
+    "p087_total_requests_min",
+    "p087_flap_free_hours_min",
+    "p087_promotion_budget_met",
 ]:
     if field not in mcp_lane:
         print(f"FAILED: P087 rollout MCP lane missing {field}")
@@ -8126,6 +8129,38 @@ for lane_name, lane in rollout["parity_lanes"].items():
         if field not in lane:
             print(f"FAILED: P087 rollout {lane_name} lane missing {field}")
             sys.exit(1)
+# Rollout "pass" must only appear when the promotion budget is met
+if rollout.get("rollout_contract_status") == "pass" and not rollout.get("p087_promotion_budget_met"):
+    print("FAILED: P087 rollout fixture claims rollout_contract_status=pass but p087_promotion_budget_met is false or missing")
+    sys.exit(1)
+if graphql_lane.get("rolloutContractStatus") == "pass" and not graphql_lane.get("p087_promotion_budget_met"):
+    print("FAILED: P087 rollout GraphQL lane claims rolloutContractStatus=pass but p087_promotion_budget_met is false or missing")
+    sys.exit(1)
+if mcp_lane.get("rollout_contract_status") == "pass" and not mcp_lane.get("p087_promotion_budget_met"):
+    print("FAILED: P087 rollout MCP lane claims rollout_contract_status=pass but p087_promotion_budget_met is false or missing")
+    sys.exit(1)
+
+# p087_per_surface_promotion_budget must enumerate all 6 canonical governed surfaces
+canonical_surfaces = {"initialize", "runs.list", "tools.list", "runtime.health", "storage.health", "artifacts.metadata.get"}
+graphql_per_surface = graphql_lane.get("p087_per_surface_promotion_budget", [])
+present_surfaces = {s["governed_surface"] for s in graphql_per_surface if isinstance(s, dict)}
+missing_surfaces = canonical_surfaces - present_surfaces
+if missing_surfaces:
+    print(f"FAILED: P087 rollout GraphQL lane p087_per_surface_promotion_budget is missing canonical surfaces: {sorted(missing_surfaces)}")
+    sys.exit(1)
+
+# MCP compat fixture must use current ProjectionFreshnessV1 field names
+mcp_compat_result = fixtures["mcp-storage-health-compatibility.fixture.json"]["response"]["result"]
+for pf_entry in mcp_compat_result.get("projectionFreshness", []):
+    for stale_field in ("freshnessMs", "backlogCount"):
+        if stale_field in pf_entry:
+            print(f"FAILED: P087 MCP compat fixture projectionFreshness uses stale field '{stale_field}' (should use updatedAtMs/backlogRows/backlogBytes)")
+            sys.exit(1)
+    for required_pf_field in ("updatedAtMs", "backlogRows", "backlogBytes"):
+        if required_pf_field not in pf_entry:
+            print(f"FAILED: P087 MCP compat fixture projectionFreshness missing required field '{required_pf_field}'")
+            sys.exit(1)
+
 required_metrics = set(rollout.get("required_metrics", []))
 for metric in [
     "db_writer_alive",
@@ -8188,6 +8223,23 @@ for call in ["mark_consumed_entity_tx", "mark_consumed_tx"]:
     if call not in proj_repo:
         print(f"FAILED: projections.rs missing P087 {call} wiring")
         sys.exit(1)
+
+# 7. Verify P087 readback fields are wired into production run_report and release_receipt lanes
+reports_rs = (root / "control-plane/crates/mcp-server/src/tools/reports.rs").read_text()
+if "p087_rollout_readback_fields" not in reports_rs:
+    print("FAILED: reports.rs missing P087 rollout readback fields wiring for run_report lane")
+    sys.exit(1)
+
+executor_rs = (root / "control-plane/crates/engine/src/executor.rs").read_text()
+if "p087_rollout_readback_fields" not in executor_rs:
+    print("FAILED: executor.rs missing P087 rollout readback fields wiring for release_receipt lane")
+    sys.exit(1)
+
+# 8. Verify promotion budget enumerates canonical governed surfaces
+storage_health_rs = (db_repos / "storage_health.rs").read_text()
+if "CANONICAL_HOT_READ_SURFACES" not in storage_health_rs:
+    print("FAILED: storage_health.rs missing CANONICAL_HOT_READ_SURFACES enumeration for promotion budget")
+    sys.exit(1)
 
 print("P087 UI, schema, and evidence verified")
 PY

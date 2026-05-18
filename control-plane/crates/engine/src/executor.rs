@@ -25,7 +25,7 @@ use db::repos::{
     agent_execution_runtime_receipts, agent_executions, agent_retry_budget_ledger,
     artifact_contracts, artifacts, code_writer_completion_receipts, evidence_spool_refs, ideas,
     legacy_discovery_overrides, projections, rollout_contract_checks, scheduler, sessions, stages,
-    validation, work_items, workflow_conflicts,
+    storage_health, validation, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::{WriteLane, WriteResult};
@@ -10238,13 +10238,32 @@ impl BackgroundExecutor {
         provider: &str,
         model: Option<String>,
     ) -> Result<Option<Artifact>> {
-        let rollout_contract_readback =
-            rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
+        let rollout_contract_readback = {
+            let base = rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
                 &self.pool,
                 run.id.inner(),
             )
             .await?
             .map(|check| check.operator_readback_json_for_lane("release_receipt"));
+            // Merge live P087 fields into the release_receipt readback lane.
+            match base {
+                Some(base_val) => {
+                    let p087 = storage_health::p087_rollout_readback_fields(&self.pool).await;
+                    if let (Some(base_obj), Some(p087_obj)) =
+                        (base_val.as_object(), p087.as_object())
+                    {
+                        let mut merged = base_obj.clone();
+                        for (k, v) in p087_obj {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                        Some(serde_json::Value::Object(merged))
+                    } else {
+                        Some(base_val)
+                    }
+                }
+                None => None,
+            }
+        };
         let receipt = match DeliveryReceiptBuilder::build_receipt(
             run,
             delivery_config,

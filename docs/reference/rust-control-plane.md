@@ -117,7 +117,10 @@ for the full authentication and capability filtering reference.
 - `POST /graphql` -- queries and mutations
 - `WS /graphql/ws` -- subscriptions
 
-Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`.
+Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`, `storageHealth`.
+
+**Storage Health Readback:**
+The `storageHealth` query exposes the current health state of the storage subsystem, including `DbWriter`, WAL, projections, evidence spool, and freshness details, aligning with the P087 proposal for local storage tiering and read-path liveness. Specifically, it now exposes identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `projectionFreshness` and `projectionFreshnessBySource`.
 
 **Implementation self-assessment summary extension:**
 The `Run` type includes a nullable `implementationSelfAssessmentSummary` field that exposes structured assessment truth (status, verification, code tasks, handoff tasks) without requiring raw artifact parsing.
@@ -418,6 +421,8 @@ wait.
 
 ## Persistence model
 
+The system's persistence model is designed to keep SQLite as a compact canonical state, storing high-volume evidence in file-backed storage, and facilitating hot operator reads on projections or bounded snapshots.
+
 ### SQLite configuration
 
 The `db` crate creates the pool at `crates/db/src/pool.rs`:
@@ -509,7 +514,9 @@ remaining byte budget is skipped without being read and truncates the pass.
 `storage.reconcile_evidence_orphans` exposes the sweep through MCP with camelCase
 `runId`, `dryRun`, and `maxFiles` parameters. `runId` is required for non-dry-run calls
 so recovered metadata is bound to a real run, and `artifact_root` is resolved
-server-side from `CHAINWORKS_META_ROOT` or the `DATABASE_URL` parent rather than
+server-side from `CHAINWORKS_META_ROOT` or the `DATABASE_URL` parent rather than from
+client-supplied paths.
+
 GraphQL `storageHealth` returns a typed `StorageHealth` SDL
 object (`writer`, `wal`, `projections`, `evidenceSpool`, `killSwitches`, `thresholds`, `projectionFreshness`, `projectionFreshnessBySource`,
   plus `updatedAt`/`staleAfterMs`/`isStale`) instead of an opaque JSON blob, with
