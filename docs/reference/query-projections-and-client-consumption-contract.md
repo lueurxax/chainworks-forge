@@ -134,9 +134,16 @@ The `storageHealth` query returns a `GqlStorageHealth` object, providing a compr
 | | `thresholds` | Configured warning and critical thresholds for various storage metrics. |
 | | `projectionFreshness` | A list of `GqlProjectionFreshnessV1` objects, each detailing the freshness of a specific projection, including its watermark, poisoning status, and backlog. |
 | | `projectionFreshnessBySource(projectionName: String, sourceName: String)` | A filterable complex field returning `GqlProjectionFreshnessV1` objects. Allows clients to query freshness details for specific projections or data sources. |
+| | `hotReadGuards` | A list of `HotReadCircuitStateV1` objects exposing per-surface hot-read circuit state (closed, open, half-open) including `wouldOpen` observe-mode counters used by the P087 promotion budget. |
+| | `maintenanceOperations` | A list of `MaintenanceOperationStatusV1` objects describing active and recently terminal maintenance operations (e.g., `repair_slot`) with `operationId`, `slotGeneration`, and audit-bound state. |
+| | `degraded` | Optional `DegradedStateV1` carrying a compact severity, short reason, and inline-detail payload for the operator UI degraded-state pattern. |
 | | `updatedAt` | Timestamp of the last health status update. |
 | | `staleAfterMs` | Duration in milliseconds after which the health data is considered stale. |
 | | `isStale` | Boolean indicating if the current health data is considered stale. |
+
+Storage health diagnostics are public readback, not raw internal error transport. Unknown persisted error strings, idempotency material, hostnames, principal tokens, and provider-authored diagnostic text must be reduced to explicit public error codes or stable hash references before they leave the daemon. If a diagnostic subquery fails, `storageHealth` remains available with `degraded.reason = storage_health_partial_readback_unavailable` or a projection-local `storage_health_subquery_unavailable` marker instead of silently presenting missing data as absent data.
+
+P087 hot-read liveness mode defaults may be relaxed only for local development. Production mode (`CHAINWORKS_ENV=production` or `CHAINWORKS_STORAGE_TIERING_PRODUCTION_MODE=1|true`) requires `CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE=enforce`; any other value is a rollout hold reported as `p087_liveness_mode_not_enforced_in_production`.
 
 ### GqlProjectionFreshnessV1
 
@@ -150,6 +157,7 @@ Provides detailed freshness information for individual projections.
 | `isPoisoned` | Indicates if the projection is in a poisoned state due to errors. |
 | `lastError` | Details of the last error encountered by the projection (if any). |
 | `updatedAtMs` | Timestamp (in milliseconds) when this freshness record was last updated. |
+| `throttledUntilMs` | Optional timestamp (in milliseconds) until which producers for this projection/source are throttled because the invalidation backlog crossed bound thresholds; `null` when no throttle is active. |
 | `backlogRows` | Number of rows currently in the projection's processing backlog. |
 | `backlogBytes` | Size in bytes of the projection's processing backlog. |
 

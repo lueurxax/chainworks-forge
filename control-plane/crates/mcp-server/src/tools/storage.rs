@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use db::writer::DbWriterHeartbeat;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use crate::protocol::McpTool;
@@ -93,6 +94,29 @@ fn repair_slot_public_error(error: &anyhow::Error) -> (&'static str, &'static st
     } else {
         (ERR_UNAVAILABLE, "repair slot failed")
     }
+}
+
+fn public_reference(prefix: &str, raw: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    let digest = hasher.finalize();
+    let short: String = format!("{digest:x}").chars().take(16).collect();
+    format!("{prefix}:{short}")
+}
+
+fn public_maintenance_operation(
+    op: &db::repos::maintenance::MaintenanceOperation,
+) -> serde_json::Value {
+    serde_json::json!({
+        "operationId": public_reference("maintenance_operation", &op.id),
+        "operationKind": op.operation_kind,
+        "status": op.status,
+        "slotGeneration": op.slot_generation,
+        "startedAtMs": op.started_at_ms,
+        "completedAtMs": op.completed_at_ms,
+        "error": op.error.as_ref().map(|_| "maintenance_operation_failed"),
+        "detailsRedacted": true,
+    })
 }
 
 pub fn tool_specs() -> Vec<McpTool> {
@@ -505,7 +529,7 @@ pub async fn execute_with_writer(
             )
             .await
             {
-                Ok(op) => Ok(serde_json::to_value(op).unwrap_or_default()),
+                Ok(op) => Ok(public_maintenance_operation(&op)),
                 Err(e) => {
                     let (code, message) = repair_slot_public_error(&e);
                     Ok(typed_error(
@@ -913,6 +937,51 @@ mod tests {
             !message.contains("maintenance_operations") && !message.contains("SQL"),
             "public MCP error must not leak storage internals: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_087_repair_slot_success_returns_public_dto() {
+        let pool = db::pool::create_pool("sqlite::memory:").await.unwrap();
+        let principal = auth::Principal::new("test-op", auth::PrincipalClass::Operator);
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO maintenance_operations \
+             (id, operation_kind, status, idempotency_key, slot_generation, metadata_json, created_at_ms, updated_at_ms) \
+             VALUES ('p087-sensitive-target-op', 'projection_rebuild', 'completed', \
+                     'target-secret-idempotency-key', 7, '{\"internal\":\"metadata\"}', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = execute(
+            "storage.maintenance.repair_slot",
+            serde_json::json!({
+                "operationId": "p087-sensitive-target-op",
+                "slotGeneration": 7,
+                "idempotencyKey": "repair-secret-idempotency-key"
+            }),
+            &pool,
+            &principal,
+            None,
+        )
+        .await
+        .expect("repair_slot success must return public DTO");
+
+        let rendered = result.to_string();
+        assert_eq!(result["operationKind"], "projection_rebuild");
+        assert!(result["operationId"]
+            .as_str()
+            .unwrap()
+            .starts_with("maintenance_operation:"));
+        assert!(!rendered.contains("p087-sensitive-target-op"));
+        assert!(!rendered.contains("target-secret-idempotency-key"));
+        assert!(!rendered.contains("repair-secret-idempotency-key"));
+        assert!(!rendered.contains("metadata"));
+        assert!(result.get("idempotencyKey").is_none());
+        assert!(result.get("metadata_json").is_none());
     }
 
     #[tokio::test]

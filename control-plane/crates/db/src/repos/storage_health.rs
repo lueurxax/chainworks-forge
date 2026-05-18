@@ -16,6 +16,7 @@ use crate::writer::{
 const PRESSURE_STALE_AFTER_MS: i64 = 5 * 60 * 1000;
 const STORAGE_HEALTH_STALE_AFTER_MS: i64 = 5_000;
 const DIAGNOSTIC_ROW_LIMIT: i64 = 100;
+const STORAGE_HEALTH_SUBQUERY_UNAVAILABLE: &str = "storage_health_subquery_unavailable";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageWritePressureSnapshot {
@@ -313,16 +314,64 @@ pub async fn storage_health_with_writer(
     let updated_at = Utc::now();
     let writer_snapshot = writer_heartbeat.map(DbWriterHeartbeat::snapshot);
     let lock_metrics = crate::pool::write_lock_metrics_snapshot();
-    let (pending_invalidations, projection_lag_ms) = projection_invalidation_stats(pool)
-        .await
-        .unwrap_or((0, None));
-    let projection_freshness = projection_freshness_summary(pool).await.unwrap_or_default();
-    let hot_read_guards = hot_read_circuit_summary(pool).await.unwrap_or_default();
-    let maintenance_operations = maintenance_operations_summary(pool)
-        .await
-        .unwrap_or_default();
-    let artifact_noise_projection = artifact_noise_projection(pool).await.unwrap_or_default();
-    let rollout = rollout_readback(pool).await.unwrap_or(json!({}));
+    let mut subquery_failures = Vec::new();
+    let (pending_invalidations, projection_lag_ms) = match projection_invalidation_stats(pool).await
+    {
+        Ok(stats) => stats,
+        Err(err) => {
+            subquery_failures.push(storage_health_subquery_failure(
+                "projectionInvalidationStats",
+                &err,
+            ));
+            (0, None)
+        }
+    };
+    let projection_freshness = match projection_freshness_summary(pool).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            subquery_failures.push(storage_health_subquery_failure("projectionFreshness", &err));
+            Vec::new()
+        }
+    };
+    let hot_read_guards = match hot_read_circuit_summary(pool).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            subquery_failures.push(storage_health_subquery_failure("hotReadGuards", &err));
+            Vec::new()
+        }
+    };
+    let maintenance_operations = match maintenance_operations_summary(pool).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            subquery_failures.push(storage_health_subquery_failure(
+                "maintenanceOperations",
+                &err,
+            ));
+            Vec::new()
+        }
+    };
+    let artifact_noise_projection = match artifact_noise_projection(pool).await {
+        Ok(value) => value,
+        Err(err) => {
+            subquery_failures.push(storage_health_subquery_failure(
+                "artifactNoiseProjection",
+                &err,
+            ));
+            unavailable_projection("artifact_noise_projection.v1")
+        }
+    };
+    let rollout = match rollout_readback(pool).await {
+        Ok(value) => value,
+        Err(err) => {
+            subquery_failures.push(storage_health_subquery_failure("rollout", &err));
+            json!({
+                "p087_storage_tiering_status": "degraded",
+                "p087_rollout_contract_status": "hold",
+                "p087_failure_reasons": [STORAGE_HEALTH_SUBQUERY_UNAVAILABLE],
+                "p087_hold_conditions": [STORAGE_HEALTH_SUBQUERY_UNAVAILABLE],
+            })
+        }
+    };
 
     let is_pressure_stale = latest_pressure
         .as_ref()
@@ -370,6 +419,7 @@ pub async fn storage_health_with_writer(
         "HEALTHY"
     };
 
+    let readback_partial = !subquery_failures.is_empty();
     let degraded = if !writer_alive {
         Some(json!({
             "severity": "critical",
@@ -381,6 +431,13 @@ pub async fn storage_health_with_writer(
             "severity": "warn",
             "reason": "telemetry_stale",
             "message": "Storage write pressure telemetry is stale"
+        }))
+    } else if readback_partial {
+        Some(json!({
+            "severity": "warn",
+            "reason": "storage_health_partial_readback_unavailable",
+            "message": "One or more storage health diagnostic sections could not be read",
+            "details": subquery_failures,
         }))
     } else {
         None
@@ -461,6 +518,10 @@ pub async fn storage_health_with_writer(
         },
         "artifactNoiseProjection": artifact_noise_projection,
         "maintenanceOperations": maintenance_operations,
+        "readbackDiagnostics": {
+            "partial": readback_partial,
+            "subqueryFailures": subquery_failures,
+        },
         "maintenanceReaper": {
             "status": reaper_status,
         },
@@ -788,7 +849,7 @@ fn short_sha256(raw: &str) -> String {
 fn public_error_code(raw: Option<&str>, fallback: &str) -> Option<String> {
     raw.map(|value| {
         let value = value.trim();
-        if is_public_error_code(value) {
+        if is_known_public_error_code(value) {
             value.to_string()
         } else {
             fallback.to_string()
@@ -796,12 +857,53 @@ fn public_error_code(raw: Option<&str>, fallback: &str) -> Option<String> {
     })
 }
 
-fn is_public_error_code(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value.chars().all(|ch| {
-            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-' | ':' | '.')
-        })
+fn is_known_public_error_code(value: &str) -> bool {
+    matches!(
+        value,
+        "projection_error"
+            | "projection_invalidation_backlog_exceeded"
+            | "projection_unavailable"
+            | "storage_health_subquery_unavailable"
+            | "maintenance_operation_failed"
+            | "operation not found"
+            | "operation is not repairable"
+            | "slot generation mismatch"
+            | "repair slot failed"
+            | "timeout"
+            | "busy"
+            | "unavailable"
+            | "stale"
+            | "hot_read_circuit_open"
+            | "invalid_input"
+            | "maintenance_disabled"
+            | "not_found"
+            | "conflict"
+    )
+}
+
+fn storage_health_subquery_failure(section: &str, error: &anyhow::Error) -> Value {
+    tracing::warn!(
+        section,
+        error = %error,
+        "storage health diagnostic subquery failed"
+    );
+    json!({
+        "section": section,
+        "status": "unavailable",
+        "errorCode": STORAGE_HEALTH_SUBQUERY_UNAVAILABLE,
+        "detailsRedacted": true,
+    })
+}
+
+fn unavailable_projection(schema_version: &str) -> Value {
+    json!({
+        "schemaVersion": schema_version,
+        "status": "unavailable",
+        "errorCode": STORAGE_HEALTH_SUBQUERY_UNAVAILABLE,
+        "detailsRedacted": true,
+        "runs": [],
+        "truncated": false,
+    })
 }
 
 pub async fn runtime_health_projection(pool: &SqlitePool) -> Result<Value> {
@@ -835,6 +937,12 @@ pub async fn runtime_health_projection(pool: &SqlitePool) -> Result<Value> {
 async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
     let mode = crate::hot_read_guard::LivenessMode::current();
     let mode_raw = std::env::var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE").ok();
+    let production_mode = std::env::var("CHAINWORKS_STORAGE_TIERING_PRODUCTION_MODE")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+        || std::env::var("CHAINWORKS_ENV")
+            .map(|value| value.eq_ignore_ascii_case("production"))
+            .unwrap_or(false);
     let invalid_mode = matches!(
         mode_raw.as_deref(),
         Some(value) if !matches!(value, "observe" | "enforce" | "disabled")
@@ -918,8 +1026,42 @@ async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
         hold_conditions.push("p087_projection_invalidation_backlog_exceeded");
         failure_reasons.push("p087_projection_invalidation_backlog_exceeded");
     }
+    if production_mode && mode != crate::hot_read_guard::LivenessMode::Enforce {
+        hold_conditions.push("p087_liveness_mode_not_enforced_in_production");
+        failure_reasons.push("p087_liveness_mode_not_enforced_in_production");
+    }
 
     let is_ready = hold_conditions.is_empty();
+    let liveness_mode_enforcement_status =
+        if production_mode && mode != crate::hot_read_guard::LivenessMode::Enforce {
+            "hold"
+        } else {
+            "active"
+        };
+    let rollout_contract_failure_reasons = json!(failure_reasons);
+    let rollout_contract_hold_conditions = json!(hold_conditions);
+    let rollout_contract_enforcement_mode_reason = if invalid_mode {
+        "invalid_liveness_mode_observe_fallback"
+    } else if promotion_budget.promotion_budget_met {
+        "p087_hot_read_promotion_budget_met"
+    } else {
+        "p087_hot_read_promotion_budget_pending"
+    };
+    let rollout_contract_disabled_reason_code = if mode_str == "disabled" {
+        json!("operator_disabled")
+    } else {
+        Value::Null
+    };
+    let rollout_contract_operator_message = if is_ready {
+        "P087 storage tiering read path is ready for enforce mode."
+    } else {
+        "P087 storage tiering read path has rollout holds."
+    };
+    let rollout_contract_next_steps = if is_ready {
+        json!([])
+    } else {
+        json!(["inspect_p087_rollout_holds"])
+    };
 
     Ok(json!({
         "p087_storage_tiering_status": status,
@@ -938,6 +1080,8 @@ async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
         "p087_projection_invalidation_backlog_status": if backlog_exceeded { "exceeded" } else { status },
         "p087_liveness_mode_config_status": if invalid_mode { "invalid_observe_fallback" } else { "active" },
         "p087_liveness_mode_configured_value": mode_raw,
+        "p087_liveness_mode_production_required": production_mode,
+        "p087_liveness_mode_enforcement_status": liveness_mode_enforcement_status,
         "p087_would_open_rate": promotion_budget.worst_would_open_rate,
         "p087_total_requests_min": promotion_budget.min_total_requests,
         "p087_flap_free_hours_min": promotion_budget.min_flap_free_hours,
@@ -945,29 +1089,25 @@ async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
         "p087_per_surface_promotion_budget": promotion_budget.per_surface,
         "rollout_contract_status": if is_ready { "pass" } else { "hold" },
         "rollout_contract_decision": if is_ready { "ready" } else { "hold" },
-        "rollout_contract_failure_reasons": json!(failure_reasons),
+        "rollout_contract_failure_reasons": rollout_contract_failure_reasons,
         "rollout_contract_waiver_state": "none",
         "rollout_contract_waiver_expires_at": Value::Null,
         "rollout_contract_enforcement_mode": mode_str,
-        "rollout_contract_enforcement_mode_reason": if invalid_mode { "invalid_liveness_mode_observe_fallback" } else if promotion_budget.promotion_budget_met { "p087_hot_read_promotion_budget_met" } else { "p087_hot_read_promotion_budget_pending" },
-        "rollout_contract_hold_conditions": json!(hold_conditions),
+        "rollout_contract_enforcement_mode_reason": rollout_contract_enforcement_mode_reason,
+        "rollout_contract_hold_conditions": rollout_contract_hold_conditions,
         "rollout_contract_rollback_disposition": {
             "status": "not_required",
             "data_loss_risk": "none"
         },
         "rollout_contract_source_lane": "storage_health",
         "rollout_contract_enabled_state": if mode_str == "disabled" { "disabled" } else { "enabled" },
-        "rollout_contract_disabled_reason_code": if mode_str == "disabled" { json!("operator_disabled") } else { Value::Null },
+        "rollout_contract_disabled_reason_code": rollout_contract_disabled_reason_code,
         "rollout_contract_action_id": "p087-enforce-cutover",
-        "rollout_contract_operator_message": if is_ready {
-            "P087 storage tiering read path is ready for enforce mode."
-        } else {
-            "P087 storage tiering read path has rollout holds."
-        },
+        "rollout_contract_operator_message": rollout_contract_operator_message,
         "rollout_contract_projection_integrity": if is_ready { "pass" } else { "hold" },
         "rollout_contract_cutover_policy_revision": "p087-r6-2026-05-10-graphql-projection-compatibility",
         "rollout_contract_diagnostic_redaction": "none",
-        "rollout_contract_next_steps": if is_ready { json!([]) } else { json!(["inspect_p087_rollout_holds"]) }
+        "rollout_contract_next_steps": rollout_contract_next_steps
     }))
 }
 
@@ -1796,6 +1936,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_087_storage_health_redacts_token_like_public_error_values() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO projection_cursors \
+             (projection_name, source_name, watermark_ms, is_poisoned, last_error, updated_at_ms, throttled_until_ms) \
+             VALUES ('runs_home', 'runs', ?, 1, 'github_pat_secretvalue', ?, NULL)",
+        )
+        .bind(now - 10_000)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO maintenance_operations \
+             (id, operation_kind, status, idempotency_key, error, created_at_ms, updated_at_ms) \
+             VALUES ('raw-maintenance-operation-id', 'repair_slot', 'failed', \
+                     'principal_token_fragment', 'internal-hostname-prod-db', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let health = storage_health(&pool).await.unwrap();
+        let row = health["projectionFreshness"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["projectionName"] == "runs_home")
+            .unwrap()
+            .clone();
+        assert_eq!(row["lastError"], "projection_error");
+        assert_ne!(row["lastError"], "github_pat_secretvalue");
+
+        let operation = &health["maintenanceOperations"].as_array().unwrap()[0];
+        assert_eq!(operation["error"], "maintenance_operation_failed");
+        assert_ne!(operation["error"], "internal-hostname-prod-db");
+        assert!(operation["idempotencyKey"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+    }
+
+    #[tokio::test]
     async fn proposal_087_artifact_noise_projection_is_bounded() {
         let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
         let now = Utc::now().timestamp_millis();
@@ -1838,6 +2024,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_087_storage_health_marks_subquery_failures_degraded() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        sqlx::query("DROP TABLE artifact_noise_summary")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let health = storage_health(&pool).await.unwrap();
+        assert_eq!(health["readbackDiagnostics"]["partial"], true);
+        assert!(health["readbackDiagnostics"]["subqueryFailures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|failure| failure["section"] == "artifactNoiseProjection"
+                && failure["errorCode"] == STORAGE_HEALTH_SUBQUERY_UNAVAILABLE));
+        assert_eq!(
+            health["artifactNoiseProjection"]["errorCode"],
+            STORAGE_HEALTH_SUBQUERY_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
     async fn proposal_087_storage_health_redacts_legacy_raw_hot_read_violation_kind() {
         let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
         let now = Utc::now().timestamp_millis();
@@ -1864,6 +2072,30 @@ mod tests {
             .to_string()
             .contains("/Users/user"));
         assert!(!guard["lastViolationKind"].to_string().contains("sk-secret"));
+    }
+
+    #[tokio::test]
+    async fn proposal_087_storage_health_requires_enforce_mode_in_production() {
+        let _guard = P087_STORAGE_HEALTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+        std::env::set_var("CHAINWORKS_ENV", "production");
+
+        let health = storage_health(&pool).await.unwrap();
+        let holds = health["rollout"]["rollout_contract_hold_conditions"]
+            .as_array()
+            .unwrap();
+        assert!(holds
+            .iter()
+            .any(|hold| hold == "p087_liveness_mode_not_enforced_in_production"));
+        assert_eq!(
+            health["rollout"]["p087_liveness_mode_enforcement_status"],
+            "hold"
+        );
+
+        std::env::remove_var("CHAINWORKS_ENV");
     }
 
     #[tokio::test]
