@@ -664,7 +664,10 @@ async fn hot_read_circuit_summary(pool: &SqlitePool) -> Result<Vec<Value>> {
             "circuitStatus": row.get::<String, _>("circuit_status"),
             "consecutiveSuccesses": row.get::<i32, _>("consecutive_successes"),
             "consecutiveFailures": row.get::<i32, _>("consecutive_failures"),
-            "lastViolationKind": row.get::<Option<String>, _>("last_violation_kind"),
+            "lastViolationKind": row
+                .get::<Option<String>, _>("last_violation_kind")
+                .as_deref()
+                .map(crate::repos::hot_read_circuit::public_violation_kind),
             "wouldOpen": row.get::<i32, _>("would_open") != 0,
             "lastOpenedAtMs": row.get::<Option<i64>, _>("last_opened_at_ms"),
             "retryAfterMs": row.get::<Option<i64>, _>("retry_after_ms"),
@@ -1832,6 +1835,35 @@ mod tests {
         assert_eq!(projection["returnedRunCount"], 100);
         assert_eq!(projection["truncated"], true);
         assert_eq!(projection["runs"].as_array().unwrap().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn proposal_087_storage_health_redacts_legacy_raw_hot_read_violation_kind() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO hot_read_circuit_states \
+             (governed_surface, circuit_status, consecutive_successes, consecutive_failures, \
+              last_violation_kind, would_open, updated_at_ms) \
+             VALUES ('storage.health', 'open', 0, 3, \
+                     'timeout opening /Users/user/private/control-plane.db with token sk-secret', 1, ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let health = storage_health(&pool).await.unwrap();
+        let guards = health["hotReadGuards"].as_array().unwrap();
+        let guard = guards
+            .iter()
+            .find(|row| row["governedSurface"] == "storage.health")
+            .expect("storage.health guard should be returned");
+        assert_eq!(guard["lastViolationKind"], "timeout");
+        assert!(!guard["lastViolationKind"]
+            .to_string()
+            .contains("/Users/user"));
+        assert!(!guard["lastViolationKind"].to_string().contains("sk-secret"));
     }
 
     #[tokio::test]

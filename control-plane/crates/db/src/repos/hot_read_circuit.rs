@@ -91,6 +91,7 @@ pub async fn record_violation(
     violation_kind: &str,
 ) -> Result<()> {
     let now = Utc::now().timestamp_millis();
+    let violation_kind = public_violation_kind(violation_kind);
     let (status, _, failures, _, _, _) = get_circuit_state(pool, governed_surface).await?;
 
     let next_failures = failures + 1;
@@ -181,6 +182,7 @@ pub async fn record_would_open(
     violation_kind: &str,
 ) -> Result<()> {
     let now = Utc::now().timestamp_millis();
+    let violation_kind = public_violation_kind(violation_kind);
     let (_status, _, failures, _, _, _) = get_circuit_state(pool, governed_surface).await?;
 
     let next_failures = failures + 1;
@@ -214,6 +216,29 @@ pub async fn record_would_open(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub fn public_violation_kind(raw: &str) -> &'static str {
+    match raw {
+        "timeout" | "hot_read_timeout" => "timeout",
+        "busy" | "database_busy" | "sqlite_busy" => "busy",
+        "unavailable" | "storage_unavailable" => "unavailable",
+        "stale" | "storage_stale" => "stale",
+        "projection_unavailable" => "projection_unavailable",
+        "hot_read_circuit_open" => "hot_read_circuit_open",
+        _ => {
+            let lower = raw.to_ascii_lowercase();
+            if lower.contains("timeout") {
+                "timeout"
+            } else if lower.contains("busy") {
+                "busy"
+            } else if lower.contains("unavailable") {
+                "unavailable"
+            } else {
+                "unavailable"
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -259,5 +284,25 @@ mod tests {
             would_open_count, 1,
             "third would_open should increment counter"
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_087_hot_read_violation_kind_never_persists_raw_error_text() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let raw = "timeout opening /Users/user/private/control-plane.db with token sk-secret";
+
+        record_violation(&pool, "storage.health", raw)
+            .await
+            .unwrap();
+
+        let stored: String = sqlx::query_scalar(
+            "SELECT last_violation_kind FROM hot_read_circuit_states WHERE governed_surface = 'storage.health'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, "timeout");
+        assert!(!stored.contains("/Users/user"));
+        assert!(!stored.contains("sk-secret"));
     }
 }

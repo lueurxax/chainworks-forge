@@ -2,6 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
@@ -41,22 +42,21 @@ fn public_json_rpc_request_id(id: &Option<serde_json::Value>) -> String {
     };
 
     match value {
-        serde_json::Value::String(raw) => public_request_id_string(raw),
-        serde_json::Value::Number(number) => public_request_id_string(&number.to_string()),
+        serde_json::Value::String(raw) => public_request_id_reference(raw),
+        serde_json::Value::Number(number) => public_request_id_reference(&number.to_string()),
         _ => uuid::Uuid::new_v4().to_string(),
     }
 }
 
-fn public_request_id_string(raw: &str) -> String {
-    let sanitized: String = raw
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .take(128)
-        .collect();
-    if sanitized.is_empty() {
+fn public_request_id_reference(raw: &str) -> String {
+    if raw.is_empty() {
         uuid::Uuid::new_v4().to_string()
     } else {
-        sanitized
+        let mut hasher = Sha256::new();
+        hasher.update(raw.as_bytes());
+        let digest = hasher.finalize();
+        let short: String = format!("{digest:x}").chars().take(16).collect();
+        format!("request_id:sha256:{short}")
     }
 }
 
@@ -2872,6 +2872,7 @@ mod tests {
         assert_ne!(request_id, raw_id);
         assert!(request_id.len() <= 128);
         assert!(!request_id.contains('\n'));
+        assert!(request_id.starts_with("request_id:sha256:"));
         assert_eq!(
             result["errorCode"],
             tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
