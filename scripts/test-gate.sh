@@ -1173,11 +1173,10 @@ emit_forwarded_chainworks_env() {
   local key
   local -a allowed_chainworks_env=(
     CHAINWORKS_REMOTE_UI_TEST_HOSTS
-    CHAINWORKS_USE_UNSIGNED_UI_TESTS
-    CHAINWORKS_GUI_GATE_TIMEOUT_SECONDS
-    CHAINWORKS_CODESIGN_KEYCHAIN
-    CHAINWORKS_CODESIGN_KEYCHAIN_PASSWORD
-    CHAINWORKS_P013_UI_SUCCESS_GRACE_SECONDS
+	    CHAINWORKS_USE_UNSIGNED_UI_TESTS
+	    CHAINWORKS_GUI_GATE_TIMEOUT_SECONDS
+	    CHAINWORKS_CODESIGN_KEYCHAIN
+	    CHAINWORKS_P013_UI_SUCCESS_GRACE_SECONDS
     CHAINWORKS_P013_UI_HARD_TIMEOUT_SECONDS
     CHAINWORKS_P015_UI_SUCCESS_GRACE_SECONDS
     CHAINWORKS_P015_UI_HARD_TIMEOUT_SECONDS
@@ -1200,18 +1199,22 @@ run_gate_in_terminal_gui_session() {
   local gate_name="$1"
   local stamp command_path log_path rc_path resolved_unsigned_ui_tests
   stamp="$(make_stamp)"
-  command_path="$TMP_BASE/${gate_name}-${stamp}-gui.command"
-  log_path="$TMP_BASE/${gate_name}-${stamp}-gui.log"
-  rc_path="$TMP_BASE/${gate_name}-${stamp}-gui.rc"
-  mkdir -p "$TMP_BASE"
+	  command_path="$TMP_BASE/${gate_name}-${stamp}-gui.command"
+	  log_path="$TMP_BASE/${gate_name}-${stamp}-gui.log"
+	  rc_path="$TMP_BASE/${gate_name}-${stamp}-gui.rc"
+	  mkdir -p "$TMP_BASE"
+	  chmod 700 "$TMP_BASE" 2>/dev/null || true
 
-  if should_use_unsigned_ui_tests; then
-    resolved_unsigned_ui_tests=1
-  else
-    resolved_unsigned_ui_tests=0
-  fi
+	  if should_use_unsigned_ui_tests; then
+	    resolved_unsigned_ui_tests=1
+	  else
+	    resolved_unsigned_ui_tests=0
+	  fi
+	  if [[ -n ${CHAINWORKS_CODESIGN_KEYCHAIN_PASSWORD+x} ]]; then
+	    prepare_codesign_keychain
+	  fi
 
-  {
+	  {
     printf '#!/bin/zsh\n'
     printf 'cd %q || exit 97\n' "$ROOT_DIR"
     printf 'export CHAINWORKS_GUI_SESSION_WRAPPED=1\n'
@@ -7875,6 +7878,14 @@ import json
 import sys
 from pathlib import Path
 root = Path.cwd()
+test_gate = (root / "scripts/test-gate.sh").read_text()
+env_forwarder = test_gate[
+    test_gate.index("emit_forwarded_chainworks_env()"):
+    test_gate.index("run_gate_in_terminal_gui_session()")
+]
+if "CHAINWORKS_CODESIGN_KEYCHAIN_PASSWORD" in env_forwarder:
+    print("FAILED: GUI gate env forwarder must not write keychain passwords into .command files")
+    sys.exit(1)
 
 # 1. Verify UI visual tokens
 view_file = root / "Chainworks Forge/Views/RunsHomeView.swift"

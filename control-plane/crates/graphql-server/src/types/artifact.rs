@@ -25,7 +25,6 @@ pub struct GqlArtifact {
     pub name: String,
     pub contract_id: String,
     pub format: String,
-    pub file_path: String,
     pub artifact_metadata_pointer: Json<serde_json::Value>,
     pub checksum_sha256: Option<String>,
     pub size_bytes: Option<i64>,
@@ -120,7 +119,6 @@ impl From<Artifact> for GqlArtifact {
     fn from(a: Artifact) -> Self {
         let artifact_id = a.id.to_string();
         let is_report = is_report_metadata(&a.format.to_string(), a.report_kind.as_deref());
-        let file_path = a.file_path;
         let checksum_sha256 = a.checksum_sha256;
         let size_bytes = a.size_bytes;
         GqlArtifact {
@@ -131,7 +129,6 @@ impl From<Artifact> for GqlArtifact {
             name: a.name,
             contract_id: a.contract_id,
             format: a.format.to_string(),
-            file_path,
             artifact_metadata_pointer: Json(artifact_metadata_pointer(
                 &artifact_id,
                 checksum_sha256.as_deref(),
@@ -190,7 +187,6 @@ impl From<ArtifactIndexRow> for GqlArtifact {
             name: r.name,
             contract_id: r.contract_id,
             format: r.format,
-            file_path: r.file_path,
             artifact_metadata_pointer: Json(artifact_metadata_pointer(
                 &r.id,
                 checksum_sha256.as_deref(),

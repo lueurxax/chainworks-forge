@@ -798,9 +798,35 @@ pub struct GqlMediationAttemptArtifact {
     pub id: ID,
     pub name: String,
     pub format: String,
-    pub file_path: String,
+    pub artifact_metadata_pointer: Json<serde_json::Value>,
     pub report_kind: Option<String>,
     pub is_pinned: bool,
+}
+
+fn artifact_metadata_pointer_value(
+    artifact_id: &str,
+    checksum_sha256: Option<&str>,
+    size_bytes: Option<i64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": "artifact_metadata_pointer.v1",
+        "artifactId": artifact_id,
+        "checksumSha256": checksum_sha256,
+        "sizeBytes": size_bytes,
+        "authorizedPayloadRoute": format!("/artifacts/{artifact_id}/payload"),
+        "payloadPathRedacted": true,
+        "forbiddenFields": ["absolutePath", "filesystemPath", "rawPayload"]
+    })
+}
+
+fn artifact_metadata_pointer_json(
+    artifact: &domain::artifact::Artifact,
+) -> Json<serde_json::Value> {
+    Json(artifact_metadata_pointer_value(
+        &artifact.id.to_string(),
+        artifact.checksum_sha256.as_deref(),
+        artifact.size_bytes,
+    ))
 }
 
 impl From<&LeadConflictMediationRecord> for GqlLeadMediation {
@@ -926,7 +952,7 @@ async fn build_mediation_execution_attempts(
                         id: ID(a.id.to_string()),
                         name: a.name.clone(),
                         format: format!("{:?}", a.format).to_lowercase(),
-                        file_path: a.file_path.clone(),
+                        artifact_metadata_pointer: artifact_metadata_pointer_json(a),
                         report_kind: a.report_kind.clone(),
                         is_pinned: a.is_pinned,
                     });
@@ -952,7 +978,7 @@ async fn build_mediation_execution_attempts(
                 id: ID(a.id.to_string()),
                 name: a.name.clone(),
                 format: format!("{:?}", a.format).to_lowercase(),
-                file_path: a.file_path.clone(),
+                artifact_metadata_pointer: artifact_metadata_pointer_json(a),
                 report_kind: a.report_kind.clone(),
                 is_pinned: a.is_pinned,
             });
@@ -970,7 +996,7 @@ async fn build_mediation_execution_attempts(
                     id: ID(a.id.to_string()),
                     name: a.name.clone(),
                     format: format!("{:?}", a.format).to_lowercase(),
-                    file_path: a.file_path.clone(),
+                    artifact_metadata_pointer: artifact_metadata_pointer_json(a),
                     report_kind: a.report_kind.clone(),
                     is_pinned: a.is_pinned,
                 });
@@ -996,7 +1022,11 @@ async fn build_mediation_execution_attempts(
         let transcript_json = transcript_artifact.as_ref().map(|a| {
             Json(serde_json::json!({
                 "artifact_id": a.id.to_string(),
-                "file_path": a.file_path,
+                "artifact_metadata_pointer": artifact_metadata_pointer_value(
+                    &a.id.to_string(),
+                    a.checksum_sha256.as_deref(),
+                    a.size_bytes,
+                ),
                 "format": format!("{:?}", a.format).to_lowercase(),
             }))
         });

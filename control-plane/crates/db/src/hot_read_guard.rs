@@ -66,9 +66,9 @@ impl LivenessMode {
             Some("disabled") => Self::Disabled,
             Some("observe") => Self::Observe,
             None => Self::Observe,
-            Some(other) => {
+            Some(_) => {
                 tracing::warn!(
-                    mode = other,
+                    mode = "invalid",
                     "Unknown CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE value, defaulting to Observe"
                 );
                 Self::Observe

@@ -341,22 +341,25 @@ impl McpServer {
 
         match req.method.as_str() {
             "initialize" => {
-                // Record initialize traffic so the promotion budget tracks this governed surface.
-                let guard = hot_read_guard::HotReadGuard::new(self.pool.clone(), "initialize");
-                let _ = guard.record_success().await;
-                JsonRpcResponse::success(
+                let request_id = public_json_rpc_request_id(&id);
+                self.handle_hot_read_json_rpc(
                     id,
-                    serde_json::json!({
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {
-                            "tools": {}
-                        },
-                        "serverInfo": {
-                            "name": "chainworks-control-plane",
-                            "version": "0.1.0"
-                        }
-                    }),
+                    "initialize",
+                    async {
+                        Ok(serde_json::json!({
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {
+                                "tools": {}
+                            },
+                            "serverInfo": {
+                                "name": "chainworks-control-plane",
+                                "version": "0.1.0"
+                            }
+                        }))
+                    },
+                    &request_id,
                 )
+                .await
             }
 
             "tools/list" => {
@@ -572,8 +575,8 @@ impl McpServer {
         .await;
         let duration = start.elapsed();
         db::metrics::record_hot_read_latency(surface, duration);
-        // tools/list is the MCP handshake probe; runtime.health is the explicit liveness surface.
-        if surface == "runtime.health" || surface == "tools.list" {
+        // initialize/tools.list are MCP handshake probes; runtime.health is the explicit liveness surface.
+        if surface == "runtime.health" || surface == "tools.list" || surface == "initialize" {
             db::metrics::record_mcp_liveness_gate_duration(duration);
         }
 
@@ -674,6 +677,10 @@ impl McpServer {
                 .into();
             let stage_rows = projections::list_stages_projection(&self.pool, run_id).await?;
             let artifact_rows = projections::list_artifacts_projection(&self.pool, run_id).await?;
+            let public_artifact_index: Vec<_> = artifact_rows
+                .iter()
+                .map(tools::reports::public_artifact_index_row)
+                .collect();
             let run_artifacts =
                 db::repos::artifacts::list_by_run(&self.pool, run_id_parsed).await?;
             let (mcp_rollout_readback, run_report_rollout_readback) =
@@ -727,7 +734,7 @@ impl McpServer {
                 "rollout_contract_readback": mcp_rollout_readback,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
                 "closeout_readiness_summary": closeout_readiness_summary,
-                "artifact_index": artifact_rows,
+                "artifact_index": public_artifact_index,
                 "artifacts": artifact_payloads,
             }));
         }
@@ -2039,6 +2046,19 @@ mod tests {
             .iter()
             .find(|artifact| artifact["report_kind"] == serde_json::json!("validation_failure"))
             .expect("validation failure artifact");
+        let rendered = value.to_string();
+        assert!(
+            !rendered.contains("file_path"),
+            "report:// public payload must not expose raw file_path fields"
+        );
+        assert!(
+            !rendered.contains(payload_path.to_string_lossy().as_ref()),
+            "report:// public payload must not expose filesystem paths"
+        );
+        assert_eq!(
+            validation_failure["artifact_metadata_pointer"]["payloadPathRedacted"],
+            serde_json::json!(true)
+        );
 
         assert_eq!(
             validation_failure["validation_failure_record"]["failureSummary"],
@@ -2839,6 +2859,40 @@ mod tests {
             tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
         );
         assert_eq!(result["tool"], "tools.list");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_initialize_json_rpc_is_hot_read_guarded() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "initialize").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!("p087-initialize")),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        assert_eq!(result["error"], true);
+        assert_eq!(
+            result["errorCode"],
+            tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
+        );
+        assert_eq!(result["tool"], "initialize");
     }
 
     #[tokio::test]

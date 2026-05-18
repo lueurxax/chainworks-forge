@@ -77,18 +77,23 @@ pub async fn record_invalidation_internal(
 ) -> Result<()> {
     let now = Utc::now().timestamp_millis();
 
-    // Coalesce the key before measuring capacity so an update that replaces an
-    // already-queued invalidation is judged by its final backlog footprint.
-    // P087: only delete unconsumed rows during coalescing.
-    sqlx::query(
-        "DELETE FROM projection_invalidation_log 
+    let payload_str = payload_json
+        .map(|p| serde_json::to_string(&p))
+        .transpose()?;
+    let size_bytes = payload_str.as_ref().map(|s| s.len() as i64).unwrap_or(0);
+
+    let existing = sqlx::query(
+        "SELECT COUNT(*) as count, SUM(size_bytes) as total_bytes
+         FROM projection_invalidation_log
          WHERE projection_name = ? AND source_name = ? AND primary_key = ? AND is_consumed = 0",
     )
     .bind(projection_name)
     .bind(source_name)
     .bind(primary_key)
-    .execute(&mut *conn)
+    .fetch_one(&mut *conn)
     .await?;
+    let existing_count: i64 = existing.get("count");
+    let existing_bytes: i64 = existing.get::<Option<i64>, _>("total_bytes").unwrap_or(0);
 
     // 1. Check current backlog size
     let stats = sqlx::query(
@@ -103,6 +108,8 @@ pub async fn record_invalidation_internal(
 
     let count: i64 = stats.get("count");
     let total_bytes: i64 = stats.get::<Option<i64>, _>("total_bytes").unwrap_or(0);
+    let final_count = count - existing_count + 1;
+    let final_bytes = total_bytes - existing_bytes + size_bytes;
 
     crate::metrics::record_projection_backlog(
         projection_name,
@@ -111,13 +118,8 @@ pub async fn record_invalidation_internal(
         total_bytes as u64,
     );
 
-    let payload_str = payload_json
-        .map(|p| serde_json::to_string(&p))
-        .transpose()?;
-    let size_bytes = payload_str.as_ref().map(|s| s.len() as i64).unwrap_or(0);
-
     // 2. Handle 100% capacity (throttle/freeze)
-    if count + 1 > MAX_INVALIDATION_ROWS || total_bytes + size_bytes > MAX_INVALIDATION_BYTES {
+    if final_count > MAX_INVALIDATION_ROWS || final_bytes > MAX_INVALIDATION_BYTES {
         crate::metrics::increment_counter("projection_invalidation_backlog_exceeded_total");
         sqlx::query(
             "INSERT INTO projection_cursors (projection_name, source_name, watermark_ms, is_poisoned, last_error, updated_at_ms, throttled_until_ms)
@@ -141,6 +143,18 @@ pub async fn record_invalidation_internal(
         }
         .into());
     }
+
+    // Coalesce only after the final footprint is accepted. That preserves an
+    // existing valid invalidation when an oversized replacement is rejected.
+    sqlx::query(
+        "DELETE FROM projection_invalidation_log
+         WHERE projection_name = ? AND source_name = ? AND primary_key = ? AND is_consumed = 0",
+    )
+    .bind(projection_name)
+    .bind(source_name)
+    .bind(primary_key)
+    .execute(&mut *conn)
+    .await?;
 
     // 3. Handle 80% capacity (coalesce) - P087: same-key rows were coalesced
     // above before the final capacity check.
@@ -594,6 +608,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, MAX_INVALIDATION_ROWS);
+    }
+
+    #[tokio::test]
+    async fn proposal_087_projection_invalidation_oversized_replacement_preserves_prior_row() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        record_invalidation(
+            &pool,
+            "runs_home",
+            "runs",
+            "run-7",
+            "upsert",
+            Some(serde_json::json!({"status": "pending"})),
+        )
+        .await
+        .unwrap();
+
+        let payload = serde_json::json!({
+            "blob": "x".repeat((MAX_INVALIDATION_BYTES as usize) + 1)
+        });
+        let err = record_invalidation(&pool, "runs_home", "runs", "run-7", "upsert", Some(payload))
+            .await
+            .expect_err("oversized replacement must fail closed");
+        assert!(err
+            .downcast_ref::<ProjectionInvalidationThrottle>()
+            .is_some());
+
+        let row = sqlx::query(
+            "SELECT invalidation_kind, payload_json, is_consumed
+             FROM projection_invalidation_log
+             WHERE projection_name = 'runs_home' AND source_name = 'runs' AND primary_key = 'run-7'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("invalidation_kind"), "upsert");
+        assert_eq!(row.get::<i64, _>("is_consumed"), 0);
+        assert!(row
+            .get::<Option<String>, _>("payload_json")
+            .unwrap()
+            .contains("pending"));
     }
 
     #[tokio::test]

@@ -937,6 +937,11 @@ pub async fn runtime_health_projection(pool: &SqlitePool) -> Result<Value> {
 async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
     let mode = crate::hot_read_guard::LivenessMode::current();
     let mode_raw = std::env::var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE").ok();
+    let mode_configured_value = match mode_raw.as_deref() {
+        Some("observe" | "enforce" | "disabled") => mode_raw.clone(),
+        Some(_) => Some("invalid".to_string()),
+        None => None,
+    };
     let production_mode = std::env::var("CHAINWORKS_STORAGE_TIERING_PRODUCTION_MODE")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -1079,7 +1084,7 @@ async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
         "p087_restart_reaper_last_run": last_reaper,
         "p087_projection_invalidation_backlog_status": if backlog_exceeded { "exceeded" } else { status },
         "p087_liveness_mode_config_status": if invalid_mode { "invalid_observe_fallback" } else { "active" },
-        "p087_liveness_mode_configured_value": mode_raw,
+        "p087_liveness_mode_configured_value": mode_configured_value,
         "p087_liveness_mode_production_required": production_mode,
         "p087_liveness_mode_enforcement_status": liveness_mode_enforcement_status,
         "p087_would_open_rate": promotion_budget.worst_would_open_rate,
@@ -2096,6 +2101,33 @@ mod tests {
         );
 
         std::env::remove_var("CHAINWORKS_ENV");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_storage_health_redacts_invalid_liveness_mode_value() {
+        let _guard = P087_STORAGE_HEALTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "sk-secret-invalid-mode",
+        );
+
+        let health = storage_health(&pool).await.unwrap();
+        assert_eq!(
+            health["rollout"]["p087_liveness_mode_configured_value"],
+            "invalid"
+        );
+        assert_eq!(
+            health["rollout"]["p087_liveness_mode_config_status"],
+            "invalid_observe_fallback"
+        );
+        assert!(!health["rollout"]
+            .to_string()
+            .contains("sk-secret-invalid-mode"));
+
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
     }
 
     #[tokio::test]
