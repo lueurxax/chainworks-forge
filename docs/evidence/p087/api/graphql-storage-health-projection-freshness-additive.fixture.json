@@ -1,0 +1,19 @@
+{
+  "data": {
+    "storageHealth": {
+      "projectionFreshness": [
+        {
+          "projectionName": "run_summaries",
+          "sourceName": "runs",
+          "watermarkMs": 1715712000000,
+          "isPoisoned": false,
+          "lastError": null,
+          "updatedAtMs": 1715712000100,
+          "throttledUntilMs": null,
+          "backlogRows": 0,
+          "backlogBytes": 0
+        }
+      ]
+    }
+  }
+}

@@ -1,39 +1,19 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "087",
+  "negative_case": "breaks_graphql_storage_health_projections_compatibility",
+  "input": {
+    "query": "query { storageHealth { projections { pendingInvalidations projectionLagMs latencyMs rebuildDurationP95Ms } } }",
+    "invalid_response_shape": {
+      "storageHealth": {
+        "projections": []
+      }
+    }
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-087",
-    "p087"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:p087_breaks_graphql_storage_health_projections",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_decision": "fail",
+  "expected_failure_code": "p087_graphql_projection_compatibility_break",
+  "required_readback": [
+    "rollout_contract_status=fail",
+    "legacy_projection_field_shape"
+  ]
 }

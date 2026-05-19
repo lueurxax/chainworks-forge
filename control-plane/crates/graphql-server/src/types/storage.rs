@@ -109,33 +109,74 @@ pub struct GqlWalHealth {
 pub struct GqlProjectionStorageHealth {
     pub pending_invalidations: i64,
     pub projection_lag_ms: Option<i64>,
+    pub latency_ms: Option<i64>,
+    pub rebuild_duration_p95_ms: Option<f64>,
     pub coalesced_keys_pending: i64,
     pub coalesced_merged_total: i64,
     pub coalesced_flush_age_p95_ms: Option<f64>,
 }
 
 #[derive(SimpleObject, Debug, Clone)]
-#[graphql(name = "ReadPathMetricHealth", rename_fields = "camelCase")]
-pub struct GqlReadPathMetricHealth {
-    pub sample_count: i64,
-    pub last_ms: Option<i64>,
-    pub p95_ms: Option<i64>,
+#[graphql(name = "ProjectionFreshnessV1", rename_fields = "camelCase")]
+pub struct GqlProjectionFreshnessV1 {
+    pub projection_name: String,
+    pub source_name: Option<String>,
+    pub watermark_ms: i64,
+    pub is_poisoned: bool,
+    pub last_error: Option<String>,
+    pub updated_at_ms: i64,
+    pub throttled_until_ms: Option<i64>,
+    pub backlog_rows: i64,
+    pub backlog_bytes: i64,
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(name = "CircuitStatusV1")]
+pub enum GqlCircuitStatusV1 {
+    #[graphql(name = "CLOSED")]
+    Closed,
+    #[graphql(name = "OPEN")]
+    Open,
+    #[graphql(name = "HALF_OPEN")]
+    HalfOpen,
 }
 
 #[derive(SimpleObject, Debug, Clone)]
-#[graphql(name = "McpLivenessGateMetricHealth", rename_fields = "camelCase")]
-pub struct GqlMcpLivenessGateMetricHealth {
-    pub sample_count: i64,
-    pub last_ms: Option<i64>,
-    pub p95_ms: Option<i64>,
-    pub mcp_liveness_gate_duration_ms: Option<i64>,
+#[graphql(name = "HotReadCircuitStateV1", rename_fields = "camelCase")]
+pub struct GqlHotReadCircuitStateV1 {
+    pub governed_surface: String,
+    pub circuit_status: GqlCircuitStatusV1,
+    pub consecutive_successes: i32,
+    pub consecutive_failures: i32,
+    pub last_violation_kind: Option<String>,
+    pub would_open: bool,
+    pub last_opened_at_ms: Option<i64>,
+    pub retry_after_ms: Option<i64>,
+    pub updated_at_ms: i64,
+    pub latency_ms: Option<i64>,
 }
 
 #[derive(SimpleObject, Debug, Clone)]
-#[graphql(name = "StorageReadPathHealth", rename_fields = "camelCase")]
-pub struct GqlStorageReadPathHealth {
-    pub runs_list: GqlReadPathMetricHealth,
-    pub mcp_liveness_gate: GqlMcpLivenessGateMetricHealth,
+#[graphql(name = "MaintenanceOperationStatusV1", rename_fields = "camelCase")]
+pub struct GqlMaintenanceOperationStatusV1 {
+    pub id: String,
+    pub operation_kind: String,
+    pub status: String,
+    pub idempotency_key: String,
+    pub slot_generation: i64,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(SimpleObject, Debug, Clone)]
+#[graphql(name = "DegradedStateV1", rename_fields = "camelCase")]
+pub struct GqlDegradedStateV1 {
+    pub severity: String,
+    pub reason: String,
+    pub message: String,
 }
 
 #[derive(SimpleObject, Debug, Clone)]
@@ -161,7 +202,7 @@ pub struct GqlStorageKillSwitchState {
 }
 
 #[derive(SimpleObject, Debug, Clone)]
-#[graphql(name = "StorageHealth", rename_fields = "camelCase")]
+#[graphql(name = "StorageHealth", rename_fields = "camelCase", complex)]
 pub struct GqlStorageHealth {
     pub updated_at: String,
     pub stale_after_ms: i64,
@@ -169,11 +210,44 @@ pub struct GqlStorageHealth {
     pub db_state: GqlStorageDbState,
     pub writer: GqlDbWriterHealth,
     pub wal: GqlWalHealth,
+    #[graphql(skip)]
     pub projections: GqlProjectionStorageHealth,
-    pub read_path: GqlStorageReadPathHealth,
     pub evidence_spool: GqlEvidenceSpoolSummary,
     pub kill_switches: GqlStorageKillSwitchState,
     pub thresholds: Vec<GqlStorageHealthThreshold>,
+    pub projection_freshness: Vec<GqlProjectionFreshnessV1>,
+    pub hot_read_guards: Vec<GqlHotReadCircuitStateV1>,
+    pub maintenance_operations: Vec<GqlMaintenanceOperationStatusV1>,
+    pub degraded: Option<GqlDegradedStateV1>,
+    pub rollout: serde_json::Value,
+}
+
+#[ComplexObject]
+impl GqlStorageHealth {
+    async fn projections(&self) -> GqlProjectionStorageHealth {
+        db::metrics::increment_counter("storage_health_legacy_projection_field_compat_total");
+        self.projections.clone()
+    }
+
+    async fn projection_freshness_by_source(
+        &self,
+        #[graphql(default)] projection_name: Option<String>,
+        #[graphql(default)] source_name: Option<String>,
+    ) -> Vec<GqlProjectionFreshnessV1> {
+        self.projection_freshness
+            .iter()
+            .filter(|f| {
+                let name_match = projection_name
+                    .as_ref()
+                    .map_or(true, |p| &f.projection_name == p);
+                let source_match = source_name
+                    .as_ref()
+                    .map_or(true, |s| f.source_name.as_ref() == Some(s));
+                name_match && source_match
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 impl GqlStorageHealth {
@@ -240,28 +314,84 @@ impl GqlStorageHealth {
         let projections = GqlProjectionStorageHealth {
             pending_invalidations: proj["pendingInvalidations"].as_i64().unwrap_or(0),
             projection_lag_ms: proj["projectionLagMs"].as_i64(),
+            latency_ms: proj["latencyMs"].as_i64(),
+            rebuild_duration_p95_ms: proj["rebuildDurationP95Ms"].as_f64(),
             coalesced_keys_pending: proj["coalescedKeysPending"].as_i64().unwrap_or(0),
             coalesced_merged_total: proj["coalescedMergedTotal"].as_i64().unwrap_or(0),
             coalesced_flush_age_p95_ms: proj["coalescedFlushAgeP95Ms"].as_f64(),
         };
 
-        let read_path_json = &json["readPath"];
-        let runs_list_json = &read_path_json["runsList"];
-        let mcp_liveness_json = &read_path_json["mcpLivenessGate"];
-        let read_path = GqlStorageReadPathHealth {
-            runs_list: GqlReadPathMetricHealth {
-                sample_count: runs_list_json["sampleCount"].as_i64().unwrap_or(0),
-                last_ms: runs_list_json["lastMs"].as_i64(),
-                p95_ms: runs_list_json["p95Ms"].as_i64(),
-            },
-            mcp_liveness_gate: GqlMcpLivenessGateMetricHealth {
-                sample_count: mcp_liveness_json["sampleCount"].as_i64().unwrap_or(0),
-                last_ms: mcp_liveness_json["lastMs"].as_i64(),
-                p95_ms: mcp_liveness_json["p95Ms"].as_i64(),
-                mcp_liveness_gate_duration_ms: mcp_liveness_json["mcp_liveness_gate_duration_ms"]
-                    .as_i64(),
-            },
-        };
+        let projection_freshness = json["projectionFreshness"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|f| GqlProjectionFreshnessV1 {
+                        projection_name: f["projectionName"].as_str().unwrap_or("").to_string(),
+                        source_name: f["sourceName"].as_str().map(String::from),
+                        watermark_ms: f["watermarkMs"].as_i64().unwrap_or(0),
+                        is_poisoned: f["isPoisoned"].as_bool().unwrap_or(false),
+                        last_error: f["lastError"].as_str().map(String::from),
+                        updated_at_ms: f["updatedAtMs"].as_i64().unwrap_or(0),
+                        throttled_until_ms: f["throttledUntilMs"].as_i64(),
+                        backlog_rows: f["backlogRows"].as_i64().unwrap_or(0),
+                        backlog_bytes: f["backlogBytes"].as_i64().unwrap_or(0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let hot_read_guards = json["hotReadGuards"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|g| GqlHotReadCircuitStateV1 {
+                        governed_surface: g["governedSurface"].as_str().unwrap_or("").to_string(),
+                        circuit_status: match g["circuitStatus"].as_str().unwrap_or("CLOSED") {
+                            "OPEN" | "open" => GqlCircuitStatusV1::Open,
+                            "HALF_OPEN" | "half_open" => GqlCircuitStatusV1::HalfOpen,
+                            _ => GqlCircuitStatusV1::Closed,
+                        },
+                        consecutive_successes: g["consecutiveSuccesses"].as_i64().unwrap_or(0)
+                            as i32,
+                        consecutive_failures: g["consecutiveFailures"].as_i64().unwrap_or(0) as i32,
+                        last_violation_kind: g["lastViolationKind"].as_str().map(String::from),
+                        would_open: g["wouldOpen"].as_bool().unwrap_or(false),
+                        last_opened_at_ms: g["lastOpenedAtMs"].as_i64(),
+                        retry_after_ms: g["retryAfterMs"].as_i64(),
+                        updated_at_ms: g["updatedAtMs"].as_i64().unwrap_or(0),
+                        latency_ms: g["latencyMs"].as_i64(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let maintenance_operations = json["maintenanceOperations"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|o| GqlMaintenanceOperationStatusV1 {
+                        id: o["id"].as_str().unwrap_or("").to_string(),
+                        operation_kind: o["operationKind"].as_str().unwrap_or("").to_string(),
+                        status: o["status"].as_str().unwrap_or("").to_string(),
+                        idempotency_key: o["idempotencyKey"].as_str().unwrap_or("").to_string(),
+                        slot_generation: o["slotGeneration"].as_i64().unwrap_or(1),
+                        started_at_ms: o["startedAtMs"].as_i64(),
+                        completed_at_ms: o["completedAtMs"].as_i64(),
+                        error: o["error"].as_str().map(String::from),
+                        created_at_ms: o["createdAtMs"].as_i64().unwrap_or(0),
+                        updated_at_ms: o["updatedAtMs"].as_i64().unwrap_or(0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let degraded = json["degraded"].as_object().map(|d| GqlDegradedStateV1 {
+            severity: d["severity"].as_str().unwrap_or("info").to_string(),
+            reason: d["reason"].as_str().unwrap_or("").to_string(),
+            message: d["message"].as_str().unwrap_or("").to_string(),
+        });
+
+        let rollout = json["rollout"].clone();
 
         let ev = &json["evidenceSpool"];
         // Fail-closed: absent evidenceSpool.enabled is false, not true (SEC-005).
@@ -341,16 +471,19 @@ impl GqlStorageHealth {
         Ok(GqlStorageHealth {
             updated_at: json["updatedAt"].as_str().unwrap_or("").to_string(),
             stale_after_ms: json["staleAfterMs"].as_i64().unwrap_or(5000),
-            // Fail-closed: absent or malformed isStale defaults to true (SEC-003).
             is_stale: json["isStale"].as_bool().unwrap_or(true),
             db_state,
             writer,
             wal,
             projections,
-            read_path,
             evidence_spool,
             kill_switches,
             thresholds,
+            projection_freshness,
+            hot_read_guards,
+            maintenance_operations,
+            degraded,
+            rollout,
         })
     }
 }
@@ -373,22 +506,14 @@ mod tests {
                      "criticalSizeBytes": 536870912 },
             "projections": { "pendingInvalidations": 0, "coalescedKeysPending": 0,
                              "coalescedMergedTotal": 0 },
-            "readPath": {
-                "runsList": { "sampleCount": 2, "lastMs": 12, "p95Ms": 12 },
-                "mcpLivenessGate": {
-                    "sampleCount": 1,
-                    "lastMs": 8,
-                    "p95Ms": 8,
-                    "mcp_liveness_gate_duration_ms": 8
-                }
-            },
             "evidenceSpool": { "enabled": false, "filesWrittenTotal": 0, "bytesWrittenTotal": 0,
                                "metadataRowsTotal": 0, "orphanFiles": 0, "orphanBytes": 0,
                                "recoveredFiles": 0, "checksumMismatchFiles": 0,
                                "pendingDeleteFiles": 0 },
             "killSwitches": { "dbWriterBypassClasses": [], "coalescingDisabledKeys": [],
                               "evidenceSpoolDisabledKinds": [] },
-            "thresholds": []
+            "thresholds": [],
+            "rollout": {}
         })
     }
 
@@ -428,18 +553,101 @@ mod tests {
     }
 
     #[test]
-    fn proposal_087_storage_health_exposes_read_path_metrics() {
-        let json = minimal_health_json(serde_json::json!(false));
-        let gql = GqlStorageHealth::from_storage_health_json(json)
-            .expect("from_storage_health_json must include readPath");
-        assert_eq!(gql.read_path.runs_list.sample_count, 2);
-        assert_eq!(gql.read_path.runs_list.p95_ms, Some(12));
-        assert_eq!(gql.read_path.mcp_liveness_gate.sample_count, 1);
+    fn proposal_087_storage_health_v1_preservation() {
+        let health_json = serde_json::json!({
+            "updatedAt": "2024-01-01T00:00:00Z",
+            "staleAfterMs": 1000,
+            "isStale": false,
+            "dbState": "HEALTHY",
+            "writer": {
+                "alive": true,
+                "lanes": [],
+                "writeLockWaitP50Ms": 1,
+                "writeLockWaitP95Ms": 2,
+                "busyRetryRatePerMinute": 0.0,
+                "busyRetryExhaustedTotal": 0,
+                "rejectedTotal": 0,
+                "droppedTelemetryTotal": 0
+            },
+            "wal": {
+                "available": true,
+                "sizeBytes": 0,
+                "warnSizeBytes": 100,
+                "criticalSizeBytes": 200,
+                "checkpointDurationP95Ms": 1
+            },
+            "projections": {
+                "pendingInvalidations": 5,
+                "projectionLagMs": 100,
+                "latencyMs": 100,
+                "rebuildDurationP95Ms": 10,
+                "coalescedKeysPending": 0,
+                "coalescedMergedTotal": 0,
+                "coalescedFlushAgeP95Ms": null
+            },
+            "evidenceSpool": {
+                "enabled": true,
+                "filesWrittenTotal": 0,
+                "bytesWrittenTotal": 0,
+                "metadataRowsTotal": 0,
+                "orphanFiles": 0,
+                "orphanBytes": 0,
+                "recoveredFiles": 0,
+                "checksumMismatchFiles": 0,
+                "pendingDeleteFiles": 0
+            },
+            "killSwitches": {
+                "dbWriterBypassClasses": [],
+                "coalescingDisabledKeys": [],
+                "evidenceSpoolDisabledKinds": []
+            },
+            "thresholds": [],
+            "projectionFreshness": [],
+            "hotReadGuards": [],
+            "maintenanceOperations": [],
+            "rollout": {
+                "p087_storage_tiering_status": "active"
+            }
+        });
+
+        let health = GqlStorageHealth::from_storage_health_json(health_json).unwrap();
+        assert_eq!(health.projections.pending_invalidations, 5);
+        assert_eq!(health.projections.projection_lag_ms, Some(100));
+    }
+
+    #[test]
+    fn proposal_087_hot_read_guard_status_accepts_db_lowercase() {
+        let mut health_json = minimal_health_json(serde_json::json!(true));
+        health_json["hotReadGuards"] = serde_json::json!([
+            {
+                "governedSurface": "storage.health",
+                "circuitStatus": "open",
+                "consecutiveSuccesses": 0,
+                "consecutiveFailures": 3,
+                "lastViolationKind": "timeout",
+                "wouldOpen": false,
+                "lastOpenedAtMs": 1715712000000i64,
+                "retryAfterMs": 1715712030000i64,
+                "updatedAtMs": 1715712000000i64,
+                "latencyMs": 500
+            },
+            {
+                "governedSurface": "runs.list",
+                "circuitStatus": "half_open",
+                "consecutiveSuccesses": 1,
+                "consecutiveFailures": 0,
+                "wouldOpen": false,
+                "updatedAtMs": 1715712000000i64
+            }
+        ]);
+        let health = GqlStorageHealth::from_storage_health_json(health_json).unwrap();
         assert_eq!(
-            gql.read_path
-                .mcp_liveness_gate
-                .mcp_liveness_gate_duration_ms,
-            Some(8)
+            health.hot_read_guards[0].circuit_status,
+            GqlCircuitStatusV1::Open
+        );
+        assert_eq!(
+            health.hot_read_guards[1].circuit_status,
+            GqlCircuitStatusV1::HalfOpen
         );
     }
 }

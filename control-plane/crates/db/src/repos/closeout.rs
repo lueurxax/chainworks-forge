@@ -152,6 +152,11 @@ pub async fn execute_closeout_transaction(
     // Commit: crash before this leaves prior active truth authoritative.
     // Crash after commit exposes a coherent gate/readiness pair.
     tx.commit().await.context("commit closeout transaction")?;
+    if let Ok(run_id) = inputs.readiness.run_id.parse::<RunId>() {
+        crate::repos::projections::rebuild_run_summary(pool, run_id)
+            .await
+            .context("rebuild run summary after closeout transaction")?;
+    }
 
     // Return data to transition evaluation ONLY after commit.
     Ok(CloseoutTransactionResult {

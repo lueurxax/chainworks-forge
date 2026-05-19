@@ -78,6 +78,7 @@ pub struct XcodeTargetSnapshot {
 pub enum XcodeTargetSelectionConfidence {
     ExplicitPid,
     WorkspaceMatch,
+    SingleLiveFallback,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -120,6 +121,14 @@ impl XcodeTargetResolver {
                 .collect::<Vec<_>>();
             match matches.as_slice() {
                 [candidate] => (*candidate, XcodeTargetSelectionConfidence::WorkspaceMatch),
+                [] if live_candidates.len() == 1
+                    && live_candidates[0].workspace_identity.is_none() =>
+                {
+                    (
+                        live_candidates[0],
+                        XcodeTargetSelectionConfidence::SingleLiveFallback,
+                    )
+                }
                 [] => bail!(
                     "xcode_target_not_found: no live Xcode process matches workspace '{workspace_identity}'"
                 ),
@@ -193,7 +202,7 @@ impl XcodeTargetResolver {
 }
 
 pub fn target_resolver_failure_class(error: &anyhow::Error) -> XcodeRuntimeFailureClass {
-    let message = error.to_string();
+    let message = format!("{error:#}");
     if message.contains("xcode_target_not_found") {
         XcodeRuntimeFailureClass::XcodeTargetNotFound
     } else if message.contains("xcode_target_ambiguous") {
@@ -453,6 +462,20 @@ mod tests {
         assert_eq!(
             snapshot.selection_confidence,
             XcodeTargetSelectionConfidence::WorkspaceMatch
+        );
+    }
+
+    #[test]
+    fn resolver_uses_single_live_unidentified_xcode_as_controlled_fallback() {
+        let snapshot = XcodeTargetResolver
+            .resolve(&input(None), &host(vec![candidate(42, None)]))
+            .unwrap();
+
+        assert_eq!(snapshot.xcode_pid, 42);
+        assert_eq!(snapshot.workspace_identity, "/workspace");
+        assert_eq!(
+            snapshot.selection_confidence,
+            XcodeTargetSelectionConfidence::SingleLiveFallback
         );
     }
 

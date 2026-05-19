@@ -87,7 +87,7 @@ pub async fn execute(
                 "name": "mcp_execution_truth",
                 "contract_id": "mcp_execution_truth",
                 "format": "json",
-                "file_path": "",
+                "artifact_metadata_pointer": serde_json::Value::Null,
                 "checksum_sha256": serde_json::Value::Null,
                 "size_bytes": serde_json::Value::Null,
                 "provider": "system",
@@ -126,7 +126,15 @@ pub async fn execute(
                     "name": "canonical_artifact_contracts",
                     "contract_id": "canonical_artifact_contracts",
                     "format": "json",
-                    "file_path": projection.exported_active_index_path,
+                    "artifact_metadata_pointer": {
+                        "schemaVersion": "artifact_metadata_pointer.v1",
+                        "artifactId": "canonical_artifact_contracts",
+                        "checksumSha256": serde_json::Value::Null,
+                        "sizeBytes": serde_json::Value::Null,
+                        "authorizedPayloadRoute": serde_json::Value::Null,
+                        "payloadPathRedacted": true,
+                        "forbiddenFields": ["absolutePath", "filesystemPath", "rawPayload"]
+                    },
                     "checksum_sha256": serde_json::Value::Null,
                     "size_bytes": serde_json::Value::Null,
                     "provider": "system",
@@ -478,15 +486,7 @@ async fn mediation_execution_attempts_json(
                 let found = artifacts::find_by_id(pool, parsed_id).await.ok().flatten();
                 if let Some(ref a) = found {
                     seen_artifact_ids.insert(a.id.to_string());
-                    attempt_artifacts.push(serde_json::json!({
-                        "id": a.id.to_string(),
-                        "name": a.name,
-                        "format": format!("{:?}", a.format).to_lowercase(),
-                        "file_path": a.file_path,
-                        "report_kind": a.report_kind,
-                        "is_pinned": a.is_pinned,
-                        "linkage": "transcript_direct",
-                    }));
+                    attempt_artifacts.push(public_artifact_ref(a, "transcript_direct"));
                 }
                 found
             } else {
@@ -505,15 +505,7 @@ async fn mediation_execution_attempts_json(
             if !seen_artifact_ids.insert(a.id.to_string()) {
                 continue;
             }
-            attempt_artifacts.push(serde_json::json!({
-                "id": a.id.to_string(),
-                "name": a.name,
-                "format": format!("{:?}", a.format).to_lowercase(),
-                "file_path": a.file_path,
-                "report_kind": a.report_kind,
-                "is_pinned": a.is_pinned,
-                "linkage": "execution_id_direct",
-            }));
+            attempt_artifacts.push(public_artifact_ref(a, "execution_id_direct"));
         }
 
         // Tier 3: legacy `agent_id` correlation. Only reachable when
@@ -526,15 +518,7 @@ async fn mediation_execution_attempts_json(
                 if a.agent_id != execution.agent_id {
                     continue;
                 }
-                attempt_artifacts.push(serde_json::json!({
-                    "id": a.id.to_string(),
-                    "name": a.name,
-                    "format": format!("{:?}", a.format).to_lowercase(),
-                    "file_path": a.file_path,
-                    "report_kind": a.report_kind,
-                    "is_pinned": a.is_pinned,
-                    "linkage": "agent_id_correlation",
-                }));
+                attempt_artifacts.push(public_artifact_ref(a, "agent_id_correlation"));
             }
         }
 
@@ -576,7 +560,7 @@ async fn mediation_execution_attempts_json(
             "transcript_ref": match transcript_artifact.as_ref() {
                 Some(a) => serde_json::json!({
                     "artifact_id": a.id.to_string(),
-                    "file_path": a.file_path,
+                    "artifact_metadata_pointer": artifact_metadata_pointer(a),
                     "format": format!("{:?}", a.format).to_lowercase(),
                 }),
                 None => serde_json::Value::Null,
@@ -913,12 +897,26 @@ pub(crate) async fn rollout_contract_readback_json(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<serde_json::Value> {
-    Ok(
+    let base =
         rollout_contract_checks::find_terminal_rollout_contract_check_for_run(pool, run_id.inner())
             .await?
             .map(|check| check.operator_readback_json_for_lane("run_report"))
-            .unwrap_or(serde_json::Value::Null),
-    )
+            .unwrap_or(serde_json::Value::Null);
+
+    if base.is_null() {
+        return Ok(base);
+    }
+    // Merge live P087 fields into the run_report readback lane.
+    let p087 = db::repos::storage_health::p087_rollout_readback_fields(pool).await;
+    if let (Some(base_obj), Some(p087_obj)) = (base.as_object(), p087.as_object()) {
+        let mut merged = base_obj.clone();
+        for (k, v) in p087_obj {
+            merged.insert(k.clone(), v.clone());
+        }
+        Ok(serde_json::Value::Object(merged))
+    } else {
+        Ok(base)
+    }
 }
 
 /// P077: Serialize the active closeout readiness generation for MCP readback.
@@ -943,12 +941,90 @@ pub(crate) fn public_artifact_path(path: &str) -> String {
     }
 }
 
+fn artifact_metadata_pointer_value(
+    artifact_id: &str,
+    checksum_sha256: Option<&str>,
+    size_bytes: Option<i64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": "artifact_metadata_pointer.v1",
+        "artifactId": artifact_id,
+        "checksumSha256": checksum_sha256,
+        "sizeBytes": size_bytes,
+        "authorizedPayloadRoute": format!("/artifacts/{artifact_id}/payload"),
+        "payloadPathRedacted": true,
+        "forbiddenFields": ["absolutePath", "filesystemPath", "rawPayload"]
+    })
+}
+
+fn artifact_metadata_pointer(artifact: &Artifact) -> serde_json::Value {
+    artifact_metadata_pointer_value(
+        &artifact.id.to_string(),
+        artifact.checksum_sha256.as_deref(),
+        artifact.size_bytes,
+    )
+}
+
+fn public_artifact_ref(artifact: &Artifact, linkage: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": artifact.id.to_string(),
+        "name": artifact.name,
+        "format": format!("{:?}", artifact.format).to_lowercase(),
+        "artifact_metadata_pointer": artifact_metadata_pointer(artifact),
+        "report_kind": artifact.report_kind,
+        "is_pinned": artifact.is_pinned,
+        "linkage": linkage,
+    })
+}
+
+pub(crate) fn public_artifact_index_row(
+    row: &db::repos::projections::ArtifactIndexRow,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.id,
+        "run_id": row.run_id,
+        "stage_id": row.stage_id,
+        "agent_id": row.agent_id,
+        "name": row.name,
+        "contract_id": row.contract_id,
+        "format": row.format,
+        "artifact_metadata_pointer": artifact_metadata_pointer_value(
+            &row.id,
+            row.checksum_sha256.as_deref(),
+            row.size_bytes,
+        ),
+        "checksum_sha256": row.checksum_sha256,
+        "size_bytes": row.size_bytes,
+        "provider": row.provider,
+        "model": row.model,
+        "created_at": row.created_at,
+        "is_pinned": row.is_pinned,
+        "report_kind": row.report_kind,
+        "report_version": row.report_version,
+        "artifact_generation_id": row.artifact_generation_id,
+        "source_agent_execution_id": row.source_agent_execution_id,
+        "source_stage_execution_id": row.source_stage_execution_id,
+        "source_session_generation_id": row.source_session_generation_id,
+        "source_work_item_id": row.source_work_item_id,
+        "supersedes_artifact_generation_id": row.supersedes_artifact_generation_id,
+        "output_settlement": row.output_settlement,
+        "source_generation_verified": row.source_generation_verified,
+    })
+}
+
 pub(crate) async fn artifact_report_json(
     pool: &SqlitePool,
     artifact: &Artifact,
     rollout_contract_readback: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(artifact)?;
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.remove("file_path");
+        map.insert(
+            "artifact_metadata_pointer".to_string(),
+            artifact_metadata_pointer(artifact),
+        );
+    }
     let include_rollout_readback =
         artifact.report_kind.is_some() || is_release_report_artifact(&artifact.name);
 

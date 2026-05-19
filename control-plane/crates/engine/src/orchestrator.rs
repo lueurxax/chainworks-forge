@@ -20,7 +20,7 @@ use domain::artifact_contracts::{
 };
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::events::DomainEvent;
-use domain::ids::{ApprovalId, ArtifactId, RunId, StageExecutionId};
+use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, RunId, StageExecutionId};
 use domain::proposal_gate_result::{ProposalGateResult, ProposalGateStatus};
 use domain::retry_authority::{AdvanceRunPayloadV1, AdvanceRunTargetMode, RetryAuthorityState};
 use domain::run::RunStatus;
@@ -580,13 +580,21 @@ impl Orchestrator {
                             .filter(|w| w.status == db::work_item::WorkItemStatus::Failed)
                             .count();
                         let settled_work_items = completed_work_items + failed_work_items;
-                        let failed_agent_executions =
+                        let stage_agent_executions =
                             db::repos::agent_executions::find_by_stage(&self.pool, stage.id)
-                                .await?
+                                .await?;
+                        let stage_runtime_facts =
+                            agent_execution_runtime_facts::list_by_run(&self.pool, run_id).await?;
+                        let facts_by_execution: std::collections::HashMap<_, _> =
+                            stage_runtime_facts
                                 .iter()
-                                .filter(|execution| execution.status == AgentStatus::Failed)
-                                .count();
-                        let failed = failed_work_items + failed_agent_executions;
+                                .map(|facts| (facts.agent_execution_id, facts))
+                                .collect();
+                        let failed = authoritative_failed_stage_invokes(
+                            &stage_invokes,
+                            &stage_agent_executions,
+                            &facts_by_execution,
+                        );
                         let completed = total.saturating_sub(failed);
 
                         // Determine if this is a post-approval context (manual_gate
@@ -1203,9 +1211,20 @@ impl Orchestrator {
             .blocked_implementation_review_available(run_id, state)
             .await?
         {
-            let stage = self
-                .create_stage_for_state(run_id, &current_state_id, state)
-                .await?;
+            let stage = if let Some(pending_stage) =
+                current_stage.filter(|s| !stage_is_stale && s.status == StageStatus::Pending)
+            {
+                info!(
+                    run_id = %run_id,
+                    state = %current_state_id,
+                    stage_execution_id = %pending_stage.id,
+                    "Synthesizing blocked implementation review from pending targeted retry stage"
+                );
+                pending_stage.clone()
+            } else {
+                self.create_stage_for_state(run_id, &current_state_id, state)
+                    .await?
+            };
             stages::update_status(&self.pool, stage.id, StageStatus::Running).await?;
             let _ = self.events.send(DomainEvent::StageStatusChanged {
                 run_id,
@@ -2680,6 +2699,64 @@ impl Orchestrator {
             return Ok(None);
         }
         let source_provider = agent.provider.clone();
+
+        if is_code_writer_implementation_output_task(&agent.agent_id, task_outputs, output_contract)
+            && matches!(source_provider.as_str(), "junie" | "junie_acp")
+        {
+            let Some(catalog_json) = run.catalog_snapshot_json.as_deref() else {
+                return Ok(None);
+            };
+            let catalog: serde_json::Value = serde_json::from_str(catalog_json)
+                .context("parse catalog_snapshot_json for forced code_writer provider fallback")?;
+            let Some(profile) = catalog
+                .get("backend_profiles")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|profiles| profiles.get("claude_builder_high"))
+                .and_then(serde_json::Value::as_object)
+            else {
+                return Ok(None);
+            };
+            let Some(provider) = profile.get("provider").and_then(serde_json::Value::as_str) else {
+                return Ok(None);
+            };
+            if same_provider_family_for_health_fallback(&source_provider, provider) {
+                return Ok(None);
+            }
+
+            let from_provider = agent.provider.clone();
+            let from_backend_profile_id = agent.backend_profile_id.clone();
+            agent.backend_profile_id = Some("claude_builder_high".to_string());
+            agent.provider = provider.to_string();
+            agent.model = profile
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            agent.effort = profile
+                .get("effort")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            agent.max_turns = profile
+                .get("max_turns")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|turns| u32::try_from(turns).ok());
+
+            warn!(
+                run_id = %run_id,
+                agent_id = %agent.agent_id,
+                from_provider = %from_provider,
+                to_provider = %agent.provider,
+                to_backend_profile_id = "claude_builder_high",
+                "Applying forced code_writer provider fallback because Junie is unavailable"
+            );
+
+            return Ok(Some(serde_json::json!({
+                "reason": "junie_code_writer_unavailable",
+                "from_provider": from_provider,
+                "to_provider": agent.provider,
+                "from_backend_profile_id": from_backend_profile_id,
+                "to_backend_profile_id": "claude_builder_high",
+            })));
+        }
 
         let executions = agent_executions::list_by_run(&self.pool, run_id).await?;
         let runtime_facts = agent_execution_runtime_facts::list_by_run(&self.pool, run_id).await?;
@@ -6373,12 +6450,20 @@ fn is_health_fallback_eligible_task(
         || (agent_id == "docs_guardian" && output_contract == Some("docs_report_v1"))
         || (agent_id == "security_checker" && output_contract == Some("security_report_v1"))
         || (agent_id == "prepush_code_reviewer" && output_contract == Some("prepush_review_v1"))
+        || is_code_writer_implementation_output_task(agent_id, task_outputs, output_contract)
 }
 
 fn is_health_fallback_source_provider(provider: &str) -> bool {
     matches!(
         provider,
-        "claude" | "claude_acp" | "gemini" | "gemini_acp" | "codex" | "codex_acp"
+        "claude"
+            | "claude_acp"
+            | "gemini"
+            | "gemini_acp"
+            | "codex"
+            | "codex_acp"
+            | "junie"
+            | "junie_acp"
     )
 }
 
@@ -6393,7 +6478,34 @@ fn same_provider_family_for_health_fallback(left: &str, right: &str) -> bool {
             | ("gemini", "gemini_acp")
             | ("gemini_acp", "gemini")
             | ("gemini_acp", "gemini_acp")
+            | ("codex", "codex")
+            | ("codex", "codex_acp")
+            | ("codex_acp", "codex")
+            | ("codex_acp", "codex_acp")
+            | ("junie", "junie")
+            | ("junie", "junie_acp")
+            | ("junie_acp", "junie")
+            | ("junie_acp", "junie_acp")
     )
+}
+
+fn is_code_writer_implementation_output_task(
+    agent_id: &str,
+    task_outputs: &[String],
+    output_contract: Option<&str>,
+) -> bool {
+    agent_id == "code_writer"
+        && (output_contract == Some("implementation_self_assessment_v2")
+            || task_outputs.iter().any(|output| {
+                matches!(
+                    output.as_str(),
+                    "implementation_progress"
+                        | "implementation_self_assessment"
+                        | "implementation_self_assessment_v2"
+                        | "changed_files_manifest"
+                        | "tests_result"
+                )
+            }))
 }
 
 fn provider_health_fallback_failure(facts: &domain::agent::AgentExecutionRuntimeFacts) -> bool {
@@ -6414,6 +6526,11 @@ fn run_local_health_fallback_profile_candidates(
     output_contract: Option<&str>,
     source_provider: &str,
 ) -> Vec<&'static str> {
+    if is_code_writer_implementation_output_task(agent_id, task_outputs, output_contract)
+        && matches!(source_provider, "junie" | "junie_acp")
+    {
+        return vec!["claude_builder_high"];
+    }
     if agent_id == "lead_orchestrator"
         && task_outputs
             .iter()
@@ -6489,6 +6606,86 @@ fn run_local_health_fallback_profile_candidates(
 
 fn auto_contract_output_retry_reason(agent_id: &str) -> String {
     format!("auto_contract_output_retry:{agent_id}")
+}
+
+fn authoritative_failed_stage_invokes(
+    stage_invokes: &[&db::work_item::WorkItem],
+    stage_agent_executions: &[domain::agent::AgentExecution],
+    facts_by_execution: &std::collections::HashMap<
+        AgentExecutionId,
+        &domain::agent::AgentExecutionRuntimeFacts,
+    >,
+) -> usize {
+    stage_invokes
+        .iter()
+        .filter(|item| {
+            authoritative_invoke_failed(item, stage_agent_executions, facts_by_execution)
+        })
+        .count()
+}
+
+fn authoritative_invoke_failed(
+    item: &db::work_item::WorkItem,
+    stage_agent_executions: &[domain::agent::AgentExecution],
+    facts_by_execution: &std::collections::HashMap<
+        AgentExecutionId,
+        &domain::agent::AgentExecutionRuntimeFacts,
+    >,
+) -> bool {
+    if item.status == db::work_item::WorkItemStatus::Failed {
+        return true;
+    }
+    if item.status != db::work_item::WorkItemStatus::Completed {
+        return false;
+    }
+
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&item.payload_json) else {
+        return false;
+    };
+
+    if let Some(claimed_id) = payload
+        .pointer("/p058_claimed/agent_execution_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<AgentExecutionId>().ok())
+    {
+        return stage_agent_executions
+            .iter()
+            .find(|execution| execution.id == claimed_id)
+            .map(|execution| agent_execution_votes_failed(execution, facts_by_execution))
+            .unwrap_or(false);
+    }
+
+    let payload_agent_id = payload.get("agent_id").and_then(serde_json::Value::as_str);
+    let Some(latest_execution) = stage_agent_executions
+        .iter()
+        .filter(|execution| Some(execution.agent_id.as_str()) == payload_agent_id)
+        .max_by_key(|execution| execution.completed_at.unwrap_or(execution.started_at))
+    else {
+        return false;
+    };
+
+    agent_execution_votes_failed(latest_execution, facts_by_execution)
+}
+
+fn agent_execution_votes_failed(
+    execution: &domain::agent::AgentExecution,
+    facts_by_execution: &std::collections::HashMap<
+        AgentExecutionId,
+        &domain::agent::AgentExecutionRuntimeFacts,
+    >,
+) -> bool {
+    if execution.status == AgentStatus::Failed {
+        return true;
+    }
+    let Some(facts) = facts_by_execution.get(&execution.id) else {
+        return false;
+    };
+    facts.failure_kind.is_some()
+        || matches!(
+            facts.output_settlement,
+            AgentOutputSettlement::MissingRequiredOutputs
+                | AgentOutputSettlement::InvalidRequiredOutputs
+        )
 }
 
 fn work_item_matches_agent_execution(
@@ -7982,6 +8179,124 @@ mod tests {
             Some("claude_design_medium")
         );
         assert_eq!(fallback["from_provider"], serde_json::json!("gemini_acp"));
+        assert_eq!(fallback["to_provider"], serde_json::json!("claude_acp"));
+    }
+
+    #[tokio::test]
+    async fn run_local_provider_health_fallback_routes_junie_code_writer_to_sonnet() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(64);
+        let orchestrator =
+            Orchestrator::new(pool.clone(), events.clone(), WorkQueue::new(pool.clone()));
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.catalog_snapshot_json = Some(
+            serde_json::json!({
+                "backend_profiles": {
+                    "junie_code_editor_acp": {
+                        "provider": "junie",
+                        "model": "junie-default",
+                        "effort": "high",
+                        "max_turns": 24
+                    },
+                    "claude_builder_high": {
+                        "provider": "claude_acp",
+                        "model": "sonnet",
+                        "effort": "high",
+                        "max_turns": 24
+                    }
+                }
+            })
+            .to_string(),
+        );
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage_id = StageExecutionId::new();
+        let stage = StageExecution {
+            id: stage_id,
+            run_id,
+            stage_id: "state_10_implementation_refined".into(),
+            label: "implementation refined".into(),
+            status: StageStatus::Failed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let failed_exec_id = AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+                started_at, completed_at, owner_kind, owner_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'failed', ?7, ?8, 'stage_execution', ?2)"#,
+        )
+        .bind(failed_exec_id.to_string())
+        .bind(stage_id.to_string())
+        .bind("code_writer")
+        .bind("junie")
+        .bind("junie")
+        .bind("junie-default")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(failed_exec_id, Utc::now());
+        facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+        facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+        agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .unwrap();
+
+        let mut task = reviewer_task();
+        task.agent.agent_id = "code_writer".into();
+        task.agent.backend_profile_id = Some("junie_code_editor_acp".into());
+        task.agent.provider = "junie".into();
+        task.agent.model = Some("junie-default".into());
+        task.agent.output_contract = Some("implementation_self_assessment_v2".into());
+        task.outputs = vec![
+            "implementation_progress".into(),
+            "implementation_self_assessment".into(),
+            "changed_files_manifest".into(),
+            "tests_result".into(),
+        ];
+        let output_contract = task.agent.output_contract.clone();
+
+        let fallback = orchestrator
+            .apply_run_local_provider_health_fallback(
+                run_id,
+                &run,
+                &mut task.agent,
+                &task.outputs,
+                output_contract.as_deref(),
+            )
+            .await
+            .unwrap()
+            .expect("junie code_writer quota should route to Sonnet");
+
+        assert_eq!(task.agent.provider, "claude_acp");
+        assert_eq!(
+            task.agent.backend_profile_id.as_deref(),
+            Some("claude_builder_high")
+        );
+        assert_eq!(task.agent.model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            fallback["reason"],
+            serde_json::json!("junie_code_writer_unavailable")
+        );
+        assert_eq!(fallback["from_provider"], serde_json::json!("junie"));
         assert_eq!(fallback["to_provider"], serde_json::json!("claude_acp"));
     }
 

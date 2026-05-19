@@ -2,7 +2,8 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use domain::commands::{
-    Command, OverrideLegacyDiscoveryPolicyCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
+    Command, ExtendWorkflowLoopBudgetCmd, OverrideLegacyDiscoveryPolicyCmd,
+    ResolveWorkflowConflictTransitionCmd, RetryStageCmd, WorkflowLoopBudgetExtensionCmd,
 };
 use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::ids::{RunId, StageExecutionId};
@@ -76,7 +77,34 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "conflict_id": { "type": "string" },
                     "selected_transition_id": { "type": "string" },
                     "resolution_reason": { "type": "string" },
-                    "operator_instruction": { "type": "string", "description": "Optional one-shot operator instruction for the retry-created invocation scope (1-2000 chars, operator-only)." }
+                    "operator_instruction": { "type": "string", "description": "Optional one-shot operator instruction for the retry-created invocation scope (1-2000 chars, operator-only)." },
+                    "loop_budget_extension": {
+                        "type": "object",
+                        "description": "Optional atomic run-local frozen workflow loop budget extension applied before selecting the transition.",
+                        "required": ["counter", "additional_cycles", "reason"],
+                        "properties": {
+                            "counter": { "type": "string" },
+                            "additional_cycles": { "type": "integer", "minimum": 1, "maximum": 100 },
+                            "reason": { "type": "string" },
+                            "target_conflict_id": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+        },
+        McpTool {
+            name: "workflow_loop_budget.extend".to_string(),
+            description: "Extend a run-local frozen workflow loop budget and re-run orchestration"
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["run_id", "counter", "additional_cycles", "reason"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "counter": { "type": "string" },
+                    "additional_cycles": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "reason": { "type": "string" },
+                    "target_conflict_id": { "type": "string" }
                 }
             }),
         },
@@ -215,6 +243,8 @@ pub async fn execute(
                 .ok_or_else(|| anyhow::anyhow!("Missing 'resolution_reason'"))?
                 .to_string();
             let operator_instruction = params["operator_instruction"].as_str().map(String::from);
+            let loop_budget_extension =
+                parse_loop_budget_extension(params.get("loop_budget_extension"))?;
 
             let caller = mcp_caller(
                 &principal.id,
@@ -228,6 +258,7 @@ pub async fn execute(
                     selected_transition_id,
                     resolution_reason,
                     operator_instruction,
+                    loop_budget_extension,
                 });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             let (selected_transition_id, selected_next_state_id, retry_instruction_binding_id) =
@@ -253,8 +284,78 @@ pub async fn execute(
             }))
         }
 
+        "workflow_loop_budget.extend" => {
+            let run_id: RunId = params["run_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
+                .parse()?;
+            let extension = parse_loop_budget_extension(Some(&params))?
+                .ok_or_else(|| anyhow::anyhow!("Missing loop budget extension payload"))?;
+            let caller = mcp_caller(
+                &principal.id,
+                &principal.class,
+                "workflow_loop_budget.extend",
+            );
+            let commanded = cmd_handler
+                .handle(
+                    Command::ExtendWorkflowLoopBudget(ExtendWorkflowLoopBudgetCmd {
+                        run_id,
+                        extension,
+                    }),
+                    caller,
+                )
+                .await?;
+            let (counter, previous_max, new_max) = match &commanded.result {
+                engine::command_handler::CommandResult::WorkflowLoopBudgetExtended {
+                    counter,
+                    previous_max,
+                    new_max,
+                    ..
+                } => (counter.clone(), *previous_max, *new_max),
+                _ => anyhow::bail!("Unexpected command result"),
+            };
+            Ok(serde_json::json!({
+                "extended": true,
+                "counter": counter,
+                "previous_max": previous_max,
+                "new_max": new_max,
+                "journal_id": commanded.journal_id,
+            }))
+        }
+
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
     }
+}
+
+fn parse_loop_budget_extension(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<WorkflowLoopBudgetExtensionCmd>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let counter = value["counter"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing 'counter'"))?
+        .to_string();
+    let additional_cycles = value["additional_cycles"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("Missing 'additional_cycles'"))?;
+    let additional_cycles = u32::try_from(additional_cycles)
+        .map_err(|_| anyhow::anyhow!("additional_cycles is too large"))?;
+    let reason = value["reason"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+        .to_string();
+    let target_conflict_id = value["target_conflict_id"].as_str().map(String::from);
+    Ok(Some(WorkflowLoopBudgetExtensionCmd {
+        counter,
+        additional_cycles,
+        reason,
+        target_conflict_id,
+    }))
 }
 
 fn parse_legacy_broad_discovery_policy(value: &str) -> Result<LegacyBroadDiscoveryPolicy> {
@@ -320,6 +421,39 @@ mod tests {
                 .iter()
                 .any(|value| value == "operator_instruction"),
             "operator_instruction must remain optional"
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["loop_budget_extension"]["properties"]["counter"]
+                ["type"],
+            serde_json::json!("string")
+        );
+        assert!(
+            !spec.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "loop_budget_extension"),
+            "loop_budget_extension must remain optional"
+        );
+    }
+
+    #[test]
+    fn workflow_loop_budget_extend_schema_is_registered() {
+        let spec = tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "workflow_loop_budget.extend")
+            .expect("workflow_loop_budget.extend tool spec exists");
+        assert_eq!(
+            spec.input_schema["properties"]["additional_cycles"]["maximum"],
+            serde_json::json!(100)
+        );
+        assert!(
+            spec.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "reason"),
+            "standalone loop budget extension must require an audited reason"
         );
     }
 

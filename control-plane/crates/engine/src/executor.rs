@@ -25,7 +25,7 @@ use db::repos::{
     agent_execution_runtime_receipts, agent_executions, agent_retry_budget_ledger,
     artifact_contracts, artifacts, code_writer_completion_receipts, evidence_spool_refs, ideas,
     legacy_discovery_overrides, projections, rollout_contract_checks, scheduler, sessions, stages,
-    validation, work_items, workflow_conflicts,
+    storage_health, validation, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::{WriteLane, WriteResult};
@@ -83,9 +83,7 @@ use crate::session::policy::{
     invalidate_generation_after_missing_required_outputs_tx, SessionPolicyDecision,
     SessionPolicyInput,
 };
-use crate::side_effects::{
-    run_unresolved_effects_preflight, side_effects_enabled, DurableEffectCoordinator,
-};
+use crate::side_effects::{run_unresolved_effects_preflight, DurableEffectCoordinator};
 use crate::work_queue::WorkQueue;
 use crate::worktree_fingerprint::{
     capture_worktree_fingerprint_v1, CapturePhase, WorkChangeKind, WorktreeFingerprintInput,
@@ -2457,8 +2455,52 @@ fn is_reused_live_session_transport_error(message: &str) -> bool {
         || lower.contains("session closed during active prompt")
 }
 
-fn should_keep_invocation_session_alive(policy_session_present: bool) -> bool {
-    policy_session_present
+fn session_scope_can_remain_live_after_settlement(scope: &str) -> bool {
+    scope != "none"
+}
+
+fn should_keep_invocation_session_alive(
+    policy_decision: Option<&SessionPolicyDecision>,
+    declared_outputs_present: bool,
+) -> bool {
+    let Some(decision) = policy_decision else {
+        return false;
+    };
+    declared_outputs_present
+        || session_scope_can_remain_live_after_settlement(&decision.lineage.session_reuse_scope)
+}
+
+fn should_close_transient_invocation_session_after_settlement(
+    policy_decision: Option<&SessionPolicyDecision>,
+) -> bool {
+    policy_decision.is_some_and(|decision| {
+        !session_scope_can_remain_live_after_settlement(&decision.lineage.session_reuse_scope)
+    })
+}
+
+fn transient_invocation_session_close_timeout() -> Duration {
+    Duration::from_secs(2)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransientInvocationCloseOutcome {
+    Closed,
+    TimedOut,
+    Failed(String),
+}
+
+async fn await_transient_invocation_close_with_timeout<F>(
+    close: F,
+    timeout: Duration,
+) -> TransientInvocationCloseOutcome
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    match tokio::time::timeout(timeout, close).await {
+        Ok(Ok(())) => TransientInvocationCloseOutcome::Closed,
+        Ok(Err(error)) => TransientInvocationCloseOutcome::Failed(error.to_string()),
+        Err(_) => TransientInvocationCloseOutcome::TimedOut,
+    }
 }
 
 fn should_reuse_existing_invocation_session(
@@ -2491,6 +2533,9 @@ fn is_transient_persistence_contention_error(error: &Error) -> bool {
         || message.contains("sqlite_locked")
         || message.contains("database is locked")
         || message.contains("database is busy")
+        || (message.contains("dbwriter")
+            && message.contains("did not commit")
+            && message.contains("write_timeout"))
 }
 
 fn runtime_facts_for_execution_result(
@@ -3933,6 +3978,119 @@ impl BackgroundExecutor {
         .map(|(_, item)| item))
     }
 
+    async fn close_transient_invocation_session_after_settlement(
+        &self,
+        policy_decision: Option<&SessionPolicyDecision>,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let Some(decision) = policy_decision else {
+            return;
+        };
+        if !should_close_transient_invocation_session_after_settlement(Some(decision)) {
+            return;
+        }
+
+        let generation_id = decision.generation.id.clone();
+        let close_generation_id = generation_id.clone();
+        match await_transient_invocation_close_with_timeout(
+            self.acp.close_session(&close_generation_id),
+            transient_invocation_session_close_timeout(),
+        )
+        .await
+        {
+            TransientInvocationCloseOutcome::Closed => {}
+            TransientInvocationCloseOutcome::TimedOut => {
+                warn!(
+                    session_generation_id = %generation_id,
+                    timeout_ms = transient_invocation_session_close_timeout().as_millis(),
+                    "Timed out closing transient invocation ACP session after settlement; continuing settlement cleanup"
+                );
+            }
+            TransientInvocationCloseOutcome::Failed(error) => {
+                debug!(
+                session_generation_id = %generation_id,
+                error = %error,
+                "Transient invocation ACP session was already absent during settlement close"
+                );
+            }
+        }
+
+        let tx_started = Instant::now();
+        let mut tx = match self
+            .begin_executor_transaction(
+                "executor.close_transient_invocation_session",
+                format!("executor.close_transient_invocation_session:{generation_id}"),
+            )
+            .await
+        {
+            Ok(tx) => tx,
+            Err(error) => {
+                warn!(
+                    session_generation_id = %generation_id,
+                    error = %error,
+                    "Failed to start transient invocation session close transaction"
+                );
+                return;
+            }
+        };
+        let generation = match sessions::find_generation_by_id_tx(&mut tx, &generation_id).await {
+            Ok(generation) => generation,
+            Err(error) => {
+                warn!(
+                    session_generation_id = %generation_id,
+                    error = %error,
+                    "Failed to load transient invocation session generation for close"
+                );
+                return;
+            }
+        };
+        let Some(generation) = generation else {
+            return;
+        };
+        if generation.status != domain::session::SessionGenerationStatus::Active {
+            return;
+        }
+
+        let close_result = async {
+            sessions::end_generation_tx(
+                &mut tx,
+                &generation_id,
+                domain::session::SessionGenerationStatus::Closed,
+                "transient_invocation_complete",
+                completed_at,
+            )
+            .await?;
+            sessions::set_active_generation_tx(&mut tx, &decision.lineage.id, None).await?;
+            sessions::insert_event_tx(
+                &mut tx,
+                &domain::session::SessionEvent {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    lineage_id: decision.lineage.id.clone(),
+                    generation_id: generation_id.clone(),
+                    event_type: domain::session::SessionEventType::Closed,
+                    recorded_at: completed_at,
+                    details_json: Some(
+                        serde_json::json!({ "reason": "transient_invocation_complete" })
+                            .to_string(),
+                    ),
+                },
+            )
+            .await?;
+            tx.commit().await?;
+            Result::<()>::Ok(())
+        }
+        .await;
+        if let Err(error) = close_result {
+            warn!(
+                session_generation_id = %generation_id,
+                error = %error,
+                "Failed to mark transient invocation session generation closed"
+            );
+            return;
+        }
+        db::pool::log_write_transaction("executor.close_transient_invocation_session", tx_started);
+    }
+
     async fn auto_requeue_active_prompt_close(
         &self,
         item: &WorkItem,
@@ -5052,7 +5210,8 @@ impl BackgroundExecutor {
                     expected_output_paths,
                     expected_outputs: expected_outputs.clone(),
                     keep_session_alive: should_keep_invocation_session_alive(
-                        policy_decision.is_some(),
+                        policy_decision.as_ref(),
+                        !declared_outputs.is_empty(),
                     ),
                     reuse_existing_session: should_reuse_existing_invocation_session(
                         policy_decision
@@ -7260,6 +7419,12 @@ impl BackgroundExecutor {
                 )
                 .await?;
 
+                self.close_transient_invocation_session_after_settlement(
+                    policy_decision.as_ref(),
+                    completed_at,
+                )
+                .await;
+
                 if final_agent_status == AgentStatus::Failed {
                     crate::recovery::persist_failed_stage_recovery_snapshot(
                         &self.pool,
@@ -7537,25 +7702,6 @@ impl BackgroundExecutor {
             .map(|idea| idea.title)
             .unwrap_or_else(|| "Unknown".to_string());
 
-        // P078: refuse external writes when the durable side-effects ledger is disabled
-        if !side_effects_enabled() {
-            let error = anyhow::anyhow!(
-                "release agent {} blocked: CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED is not set \
-                 (rollback mode — enable P078 before dispatching release agents)",
-                agent_id
-            );
-            self.fail_release_agent_precondition(
-                run_id,
-                stage_execution_id,
-                agent_exec_id,
-                &stage_id,
-                &agent_id,
-                &provider,
-                now,
-            )
-            .await?;
-            return Err(error);
-        }
         let coordinator =
             DurableEffectCoordinator::new(self.pool.clone(), uuid::Uuid::new_v4().to_string());
 
@@ -7688,14 +7834,6 @@ impl BackgroundExecutor {
                         decision_json_hash: None,
                         disposition_id: None,
                     };
-                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
-                        .await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_success CAS missed for effect {}; canonical release state not mutated",
-                            commit_lease.effect_id
-                        ));
-                    }
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -7756,13 +7894,6 @@ impl BackgroundExecutor {
                         last_error: &error_str,
                         now: chrono::Utc::now(),
                     };
-                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_failure CAS missed for effect {}; canonical release state not mutated",
-                            commit_lease.effect_id
-                        ));
-                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -7928,14 +8059,6 @@ impl BackgroundExecutor {
                         decision_json_hash: None,
                         disposition_id: None,
                     };
-                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
-                        .await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_success CAS missed for effect {}; canonical release state not mutated",
-                            push_lease.effect_id
-                        ));
-                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -8014,13 +8137,6 @@ impl BackgroundExecutor {
                         last_error: &error_str,
                         now,
                     };
-                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_failure CAS missed for effect {}; canonical release state not mutated",
-                            push_lease.effect_id
-                        ));
-                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -8198,14 +8314,6 @@ impl BackgroundExecutor {
                         decision_json_hash: None,
                         disposition_id: None,
                     };
-                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
-                        .await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_success CAS missed for effect {}; canonical release state not mutated",
-                            build_lease.effect_id
-                        ));
-                    }
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -8266,13 +8374,6 @@ impl BackgroundExecutor {
                         last_error: &error_str,
                         now,
                     };
-                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_failure CAS missed for effect {}; canonical release state not mutated",
-                            build_lease.effect_id
-                        ));
-                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -8478,14 +8579,6 @@ impl BackgroundExecutor {
                         decision_json_hash: None,
                         disposition_id: None,
                     };
-                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
-                        .await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_success CAS missed for effect {}; canonical release state not mutated",
-                            connect_lease.effect_id
-                        ));
-                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -8585,13 +8678,6 @@ impl BackgroundExecutor {
                         last_error: &error_str,
                         now,
                     };
-                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
-                    {
-                        return Err(anyhow::anyhow!(
-                            "side_effect_cas_lost: settle_failure CAS missed for effect {}; canonical release state not mutated",
-                            connect_lease.effect_id
-                        ));
-                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -10238,13 +10324,32 @@ impl BackgroundExecutor {
         provider: &str,
         model: Option<String>,
     ) -> Result<Option<Artifact>> {
-        let rollout_contract_readback =
-            rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
+        let rollout_contract_readback = {
+            let base = rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
                 &self.pool,
                 run.id.inner(),
             )
             .await?
             .map(|check| check.operator_readback_json_for_lane("release_receipt"));
+            // Merge live P087 fields into the release_receipt readback lane.
+            match base {
+                Some(base_val) => {
+                    let p087 = storage_health::p087_rollout_readback_fields(&self.pool).await;
+                    if let (Some(base_obj), Some(p087_obj)) =
+                        (base_val.as_object(), p087.as_object())
+                    {
+                        let mut merged = base_obj.clone();
+                        for (k, v) in p087_obj {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                        Some(serde_json::Value::Object(merged))
+                    } else {
+                        Some(base_val)
+                    }
+                }
+                None => None,
+            }
+        };
         let receipt = match DeliveryReceiptBuilder::build_receipt(
             run,
             delivery_config,
@@ -12976,10 +13081,10 @@ fn code_writer_completion_repair_prompt(
         })
         .cloned()
         .collect();
-    let outputs_for_example = if failed_outputs.is_empty() {
-        declared_outputs.to_vec()
-    } else {
+    let outputs_for_example = if declared_outputs.is_empty() {
         failed_outputs
+    } else {
+        declared_outputs.to_vec()
     };
     for output in &outputs_for_example {
         append_status_allowed_values_for_declared_output(&mut prompt, output);
@@ -13052,6 +13157,15 @@ fn merge_contract_repair_result(initial: &mut acp::ExecutionResult, repair: acp:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dbwriter_write_timeout_is_transient_persistence_contention() {
+        let error = anyhow::anyhow!(
+            "DbWriter transaction projections.rebuild_run_summary did not commit: write_timeout"
+        );
+
+        assert!(is_transient_persistence_contention_error(&error));
+    }
 
     #[test]
     fn retry_state_7_reuses_existing_approved_proposal_instead_of_reemitting_it() {
@@ -13635,6 +13749,104 @@ mod tests {
     }
 
     #[test]
+    fn code_writer_completion_repair_prompt_includes_full_declared_output_set() {
+        let declared_outputs = vec![
+            DeclaredOutput {
+                output_name: "implementation_progress".to_string(),
+                target_path: "/workspace/.chainworks/implementation/progress.json".to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "implementation_progress".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec![
+                        "status".to_string(),
+                        "current_phase".to_string(),
+                        "completed_items".to_string(),
+                        "deferred_items".to_string(),
+                        "notes".to_string(),
+                    ],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "implementation_self_assessment".to_string(),
+                target_path: "/workspace/.chainworks/implementation/self-assessment.json"
+                    .to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "implementation_self_assessment_v2".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec![
+                        "implementation_complete".to_string(),
+                        "verification_green".to_string(),
+                        "remaining_code_tasks".to_string(),
+                        "handoff_tasks".to_string(),
+                        "known_risks".to_string(),
+                        "tests_run".to_string(),
+                        "docs_impacted".to_string(),
+                    ],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "tests_result".to_string(),
+                target_path: "/workspace/.chainworks/implementation/tests.json".to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "tests_result".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec!["status".to_string(), "summary".to_string()],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let validation = TaskValidationSummary {
+            output_results: vec![domain::validation::OutputValidationResult {
+                output_name: "implementation_self_assessment".to_string(),
+                contract_id: Some("implementation_self_assessment_v2".to_string()),
+                status: domain::validation::ValidationStatus::Failed,
+                missing_fields: vec![],
+                validation_error: Some(
+                    "/handoff_tasks/1/owner_class: unknown handoff owner_class: manual_code"
+                        .to_string(),
+                ),
+                raw_payload_size: 128,
+            }],
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: Some(domain::validation::ValidationFailureClass::OutputContractMismatch),
+            failure_summary: Some("implementation_self_assessment rejected".to_string()),
+        };
+
+        let prompt = code_writer_completion_repair_prompt(&validation, &declared_outputs);
+
+        assert!(prompt.contains("\"implementation_progress\""));
+        assert!(prompt.contains("\"implementation_self_assessment\""));
+        assert!(prompt.contains("\"tests_result\""));
+        assert!(prompt.contains("\"current_phase\":\"\""));
+        assert!(prompt.contains("\"verification_green\":false"));
+        assert!(prompt.contains("\"summary\":\"\""));
+    }
+
+    #[test]
     fn code_writer_completion_repair_prompt_lists_allowed_handoff_owner_classes() {
         let declared_outputs = vec![DeclaredOutput {
             output_name: "implementation_self_assessment".to_string(),
@@ -13817,14 +14029,96 @@ mod tests {
 
     #[test]
     fn output_contract_repair_keeps_xcode_shim_session_alive_without_cross_invocation_reuse() {
+        let transient_decision = test_session_policy_decision("none");
+        let reusable_decision = test_session_policy_decision("same_agent_family_within_run");
+
         assert!(
-            should_keep_invocation_session_alive(true),
-            "output contract repair needs the just-finished session even when Xcode shim was used"
+            should_keep_invocation_session_alive(Some(&transient_decision), true),
+            "output contract repair needs the just-finished transient session"
+        );
+        assert!(
+            should_close_transient_invocation_session_after_settlement(Some(&transient_decision)),
+            "scope=none sessions must close after settlement/repair so they do not leak subprocesses"
+        );
+        assert!(
+            should_keep_invocation_session_alive(Some(&reusable_decision), false),
+            "reusable scopes should stay live across invocation claims"
+        );
+        assert!(
+            !should_close_transient_invocation_session_after_settlement(Some(&reusable_decision)),
+            "reusable scopes remain available for future session reuse"
+        );
+        assert!(
+            !should_keep_invocation_session_alive(Some(&transient_decision), false),
+            "scope=none sessions without declared outputs do not need a post-prompt repair window"
         );
         assert!(
             !should_reuse_existing_invocation_session(true, true),
             "Xcode shim sessions remain isolated across separate invocation claims"
         );
+    }
+
+    #[tokio::test]
+    async fn transient_invocation_session_close_is_bounded() {
+        let started = Instant::now();
+        let outcome = await_transient_invocation_close_with_timeout(
+            std::future::pending::<Result<()>>(),
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert_eq!(outcome, TransientInvocationCloseOutcome::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "hung provider session close must not block settlement indefinitely"
+        );
+    }
+
+    fn test_session_policy_decision(session_reuse_scope: &str) -> SessionPolicyDecision {
+        let now = chrono::Utc::now();
+        let lineage = domain::session::SessionLineage {
+            id: format!("lineage-{session_reuse_scope}"),
+            run_id: "run-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            lineage_id: "agent-1".to_string(),
+            session_reuse_scope: session_reuse_scope.to_string(),
+            session_family_id: None,
+            active_generation_id: Some(format!("generation-{session_reuse_scope}")),
+            created_at: now,
+            closed_at: None,
+        };
+        let generation = domain::session::SessionGeneration {
+            id: format!("generation-{session_reuse_scope}"),
+            lineage_id: lineage.id.clone(),
+            generation: 1,
+            invocation_owner_key: "owner-1".to_string(),
+            provider_session_id: Some("provider-session-1".to_string()),
+            binding_fingerprint: "fingerprint-1".to_string(),
+            rehydrated_from_checkpoint_artifact_id: None,
+            working_directory: "/workspace".to_string(),
+            workspace_mode: "worktree".to_string(),
+            runtime_provider: "codex_acp".to_string(),
+            runtime_model: "gpt-5.5".to_string(),
+            status: domain::session::SessionGenerationStatus::Active,
+            turn_count: 1,
+            cumulative_prompt_tokens: 0,
+            cumulative_cost_cents: 0,
+            created_at: now,
+            ended_at: None,
+            end_reason: None,
+            estimated_input_tokens: 0,
+            last_activity_at: Some(now),
+            latest_cached_input_tokens: None,
+            latest_output_tokens: None,
+            latest_model_context_window: None,
+        };
+        SessionPolicyDecision {
+            lineage,
+            generation,
+            disposition: domain::session::SessionReuseDisposition::Fresh,
+            should_reuse_live_session: false,
+            session_reset_reason: None,
+        }
     }
 
     #[test]

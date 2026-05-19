@@ -84,4 +84,10 @@ pub enum DomainEvent {
         updated_at: chrono::DateTime<chrono::Utc>,
         stale_after_ms: i64,
     },
+    /// P087: CAS repair failed for a maintenance slot.
+    MaintenanceSlotReleaseCasFailed {
+        operation_id: String,
+        slot_generation: i64,
+        error: String,
+    },
 }
