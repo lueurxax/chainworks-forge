@@ -35,7 +35,7 @@ use std::sync::{
     Arc,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::{error, info, warn};
 
 use acp::{
@@ -74,9 +74,18 @@ use sqlx::SqlitePool;
 /// Matches `sysexits.h::EX_TEMPFAIL` so supervisors can distinguish a
 /// transient launch conflict from a normal daemon crash.
 const EX_TEMPFAIL: i32 = 75;
+const DAEMON_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(DAEMON_WORKER_STACK_BYTES)
+        .build()
+        .context("build daemon tokio runtime")?
+        .block_on(run_daemon())
+}
+
+async fn run_daemon() -> Result<()> {
     // ── §7.1 mode + paths ──────────────────────────────────────────────
     // Resolve mode/paths first so the log-sink decision below can route
     // packaged modes to the app-support log file per §9.1.
@@ -1314,6 +1323,19 @@ mcp:
         assert!(
             paths.log_path.is_none(),
             "dev mode must not allocate a file log sink (stderr only)"
+        );
+    }
+
+    #[test]
+    fn daemon_runtime_uses_explicit_large_worker_stack_for_mcp_commands() {
+        let source = include_str!("main.rs");
+        assert!(
+            !source.contains(concat!("#[", "tokio::main]")),
+            "the daemon must not rely on tokio's default worker stack; MCP command paths such as runs.cancel are too deep in debug builds"
+        );
+        assert!(
+            source.contains("thread_stack_size(DAEMON_WORKER_STACK_BYTES)"),
+            "the daemon runtime must set an explicit worker stack size for deep MCP command paths"
         );
     }
 }
