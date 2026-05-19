@@ -137,6 +137,7 @@ The `storageHealth` query returns a `GqlStorageHealth` object, providing a compr
 | | `hotReadGuards` | A list of `HotReadCircuitStateV1` objects exposing per-surface hot-read circuit state (closed, open, half-open) including `wouldOpen` observe-mode counters used by the P087 promotion budget. |
 | | `maintenanceOperations` | A list of `MaintenanceOperationStatusV1` objects describing active and recently terminal maintenance operations (e.g., `repair_slot`) with `operationId`, `slotGeneration`, and audit-bound state. |
 | | `degraded` | Optional `DegradedStateV1` carrying a compact severity, short reason, and inline-detail payload for the operator UI degraded-state pattern. |
+| | `rollout` | JSON readback of the active rollout contract for the storage tiering / read-path liveness surface, including `rollout_contract_status`, decision, enforcement mode, hold conditions, and P087 readback fields enumerated by the P087 rollout contract (P084 schema). |
 | | `updatedAt` | Timestamp of the last health status update. |
 | | `staleAfterMs` | Duration in milliseconds after which the health data is considered stale. |
 | | `isStale` | Boolean indicating if the current health data is considered stale. |

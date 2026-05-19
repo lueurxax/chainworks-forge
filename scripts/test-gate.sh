@@ -7903,7 +7903,7 @@ if not diag_file.exists():
     print(f"FAILED: Missing {diag_file}")
     sys.exit(1)
 diag_content = diag_file.read_text()
-for field in ["projectionFreshness", "hotReadGuards", "maintenanceOperations", "wouldOpen", "backlogRows", "throttledUntilMs", "hotRead", "maintenanceReaper"]:
+for field in ["projectionFreshness", "hotReadGuards", "maintenanceOperations", "wouldOpen", "backlogRows", "throttledUntilMs"]:
     if field not in diag_content:
         print(f"FAILED: DaemonLifecycleClient.swift missing P087 diagnostics field: {field}")
         sys.exit(1)

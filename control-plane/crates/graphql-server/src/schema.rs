@@ -7948,4 +7948,70 @@ mod tests {
             "violation calls must be persisted in hot_read_circuit_states; got {failures}"
         );
     }
+
+    /// Validate that the exact Swift storageDiagnosticsQuery executes without schema errors.
+    /// This catches query/schema drift that string-based gate checks cannot detect.
+    #[tokio::test]
+    async fn proposal_087_swift_storage_diagnostics_query_matches_graphql_schema() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        // Exact field set from DaemonLifecycleClient.swift storageDiagnosticsQuery.
+        // Must stay in sync: if schema changes break this test, update both the query and schema.
+        let query = r#"{
+          storageHealth {
+            updatedAt staleAfterMs isStale dbState
+            writer {
+              alive lastHeartbeatAt lastDrainAt totalQueued
+              lanes { lane capacity queuedDepth queuedDepthRatio oldestQueuedAgeMs rejectedTotal droppedTotal }
+              writeLockWaitP50Ms writeLockWaitP95Ms transactionDurationP95Ms
+              busyRetryRatePerMinute busyRetryExhaustedTotal rejectedTotal droppedTelemetryTotal
+            }
+            wal {
+              available unavailableReason sizeBytes warnSizeBytes criticalSizeBytes
+              lastCheckpointAt checkpointDurationP95Ms
+            }
+            projections {
+              pendingInvalidations projectionLagMs coalescedKeysPending
+              coalescedMergedTotal coalescedFlushAgeP95Ms
+            }
+            evidenceSpool {
+              enabled filesWrittenTotal bytesWrittenTotal metadataRowsTotal
+              orphanFiles orphanBytes recoveredFiles checksumMismatchFiles pendingDeleteFiles
+            }
+            killSwitches { dbWriterBypassClasses coalescingDisabledKeys evidenceSpoolDisabledKinds }
+            thresholds { metric warn critical unit action }
+            projectionFreshness {
+              projectionName sourceName watermarkMs isPoisoned lastError
+              updatedAtMs throttledUntilMs backlogRows backlogBytes
+            }
+            hotReadGuards {
+              governedSurface circuitStatus consecutiveSuccesses lastViolationKind
+              wouldOpen lastOpenedAtMs updatedAtMs latencyMs
+            }
+            maintenanceOperations {
+              id operationKind status idempotencyKey slotGeneration
+              startedAtMs completedAtMs error createdAtMs updatedAtMs
+            }
+            degraded { severity reason message }
+            rollout
+          }
+        }"#;
+
+        let response = schema
+            .execute(Request::new(query).data(test_principal()))
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "Swift storageDiagnosticsQuery must execute without schema errors: {:?}",
+            response.errors
+        );
+    }
 }

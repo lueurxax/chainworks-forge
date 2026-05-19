@@ -752,14 +752,7 @@ struct DaemonLifecycleClient {
           reason
           message
         }
-        hotRead {
-          status
-          circuitState
-          reason
-        }
-        maintenanceReaper {
-          status
-        }
+        rollout
       }
     }
     """

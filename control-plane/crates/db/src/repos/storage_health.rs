@@ -978,9 +978,25 @@ async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
         false
     };
 
+    // A repair_slot_poisoned diagnostic clears the hold once a later successful
+    // repair_slot row references the same target_operation_id. Rows with no
+    // target metadata cannot be matched to a repair, so they conservatively hold.
     let poisoned_hold = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM maintenance_operations
-         WHERE operation_kind = 'repair_slot_poisoned' AND status = 'failed' AND created_at_ms < ?",
+        "SELECT COUNT(*) FROM maintenance_operations poisoned
+         WHERE poisoned.operation_kind = 'repair_slot_poisoned'
+           AND poisoned.status = 'failed'
+           AND poisoned.created_at_ms < ?
+           AND (
+             json_extract(poisoned.metadata_json, '$.target_operation_id') IS NULL
+             OR NOT EXISTS (
+               SELECT 1 FROM maintenance_operations repaired
+               WHERE repaired.operation_kind = 'repair_slot'
+                 AND repaired.status = 'completed'
+                 AND repaired.created_at_ms >= poisoned.created_at_ms
+                 AND json_extract(repaired.metadata_json, '$.target_operation_id')
+                     = json_extract(poisoned.metadata_json, '$.target_operation_id')
+             )
+           )",
     )
     .bind(now_ms - 5 * 60 * 1000)
     .fetch_one(pool)
@@ -2177,6 +2193,76 @@ mod tests {
         let health = storage_health(&pool).await.unwrap();
         let rollout = &health["rollout"];
         assert_eq!(rollout["p087_storage_tiering_status"], "degraded");
+
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_repaired_poisoned_slot_clears_rollout_hold() {
+        // Regression: a repair_slot_poisoned diagnostic followed by a successful
+        // repair_slot for the same target_operation_id must NOT hold the rollout.
+        let _guard = P087_STORAGE_HEALTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let now = Utc::now().timestamp_millis();
+
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+
+        // Fresh reaper: clear of reaper-SLA hold.
+        sqlx::query("INSERT INTO maintenance_operations (id, operation_kind, status, idempotency_key, created_at_ms, updated_at_ms) VALUES ('r1', 'restart_reaper', 'completed', 'ik-r1', ?, ?)")
+            .bind(now - 10_000)
+            .bind(now - 10_000)
+            .execute(&pool).await.unwrap();
+
+        let target_op_id = "op-target-abc";
+        let repair_meta = serde_json::json!({
+            "target_operation_id": target_op_id,
+            "target_slot_generation": 1
+        });
+
+        // A stale repair that predates the poison diagnostic must not clear it.
+        sqlx::query("INSERT INTO maintenance_operations (id, operation_kind, status, idempotency_key, metadata_json, created_at_ms, updated_at_ms) VALUES ('rp0', 'repair_slot', 'completed', 'ik-rp0', ?, ?, ?)")
+            .bind(serde_json::to_string(&repair_meta).unwrap())
+            .bind(now - 7 * 60 * 1000)
+            .bind(now - 7 * 60 * 1000)
+            .execute(&pool).await.unwrap();
+
+        // Old repair_slot_poisoned diagnostic for a specific operation.
+        let poisoned_meta = serde_json::json!({
+            "target_operation_id": target_op_id,
+            "target_slot_generation": 1,
+            "failure_kind": "cas_retry_exhausted"
+        });
+        sqlx::query("INSERT INTO maintenance_operations (id, operation_kind, status, idempotency_key, metadata_json, created_at_ms, updated_at_ms) VALUES ('p1', 'repair_slot_poisoned', 'failed', 'ik-p1', ?, ?, ?)")
+            .bind(serde_json::to_string(&poisoned_meta).unwrap())
+            .bind(now - 6 * 60 * 1000)
+            .bind(now - 6 * 60 * 1000)
+            .execute(&pool).await.unwrap();
+
+        // Before a later repair: poisoned hold -> degraded.
+        let health = storage_health(&pool).await.unwrap();
+        assert_eq!(
+            health["rollout"]["p087_storage_tiering_status"], "degraded",
+            "expected degraded while poisoned slot is unrepaired by a later operation"
+        );
+
+        // Successful repair_slot for the same target_operation_id.
+        sqlx::query("INSERT INTO maintenance_operations (id, operation_kind, status, idempotency_key, metadata_json, created_at_ms, updated_at_ms) VALUES ('rp1', 'repair_slot', 'completed', 'ik-rp1', ?, ?, ?)")
+            .bind(serde_json::to_string(&repair_meta).unwrap())
+            .bind(now - 60_000)
+            .bind(now - 60_000)
+            .execute(&pool).await.unwrap();
+
+        // After a later repair: hold must clear -> active.
+        let health = storage_health(&pool).await.unwrap();
+        assert_eq!(
+            health["rollout"]["p087_storage_tiering_status"], "active",
+            "expected active after successful operator repair of the poisoned slot"
+        );
 
         std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
     }
