@@ -591,7 +591,7 @@ async fn evaluate_p087_metrics(
                     crate::metrics::get_runs_list_read_latency_p95().unwrap_or(0) as f64
                 }
                 "projection_lag_ms" => {
-                    crate::metrics::get_projection_lag_p95("run-summary").unwrap_or(0) as f64
+                    crate::metrics::get_projection_lag_p95("global").unwrap_or(0) as f64
                 }
                 "hot_read_circuit_open_total" => crate::metrics::get_counter(metric) as f64,
                 "projection_invalidation_backlog_exceeded_total" => {
@@ -1019,6 +1019,40 @@ async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
     .unwrap_or(0)
         > 0;
 
+    // Check projection freshness 48-hour healthy window.
+    // first_healthy_at_ms is set when a cursor first achieves healthy state and
+    // reset when it becomes poisoned or recovers from an unhealthy state.
+    // Promotion requires: all cursors have a valid first_healthy_at_ms AND
+    // it is at least 48 hours in the past (no flap during that window).
+    let required_freshness_ms: i64 = 48 * 60 * 60 * 1000;
+    let freshness_cursor_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM projection_cursors")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+    let freshness_failing = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM projection_cursors
+         WHERE first_healthy_at_ms IS NULL
+            OR ? - first_healthy_at_ms < ?",
+    )
+    .bind(now_ms)
+    .bind(required_freshness_ms)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(1);
+    let projection_freshness_window_met = freshness_cursor_count > 0 && freshness_failing == 0;
+
+    // Derive the per-projection freshness readback field from actual data.
+    let p087_per_projection_freshness = if projection_freshness_degraded {
+        "degraded"
+    } else if freshness_cursor_count == 0 {
+        "unproven"
+    } else if !projection_freshness_window_met {
+        "window_pending"
+    } else {
+        "active"
+    };
+
     // Check for sustained projection invalidation backlog exceeded events.
     let backlog_exceeded =
         crate::metrics::get_counter("projection_invalidation_backlog_exceeded_total") > 0;
@@ -1042,6 +1076,10 @@ async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
     if projection_freshness_degraded {
         hold_conditions.push("p087_projection_freshness_degraded");
         failure_reasons.push("p087_projection_freshness_degraded");
+    }
+    if !projection_freshness_window_met {
+        hold_conditions.push("p087_projection_freshness_window_not_met");
+        failure_reasons.push("p087_projection_freshness_window_not_met");
     }
     if backlog_exceeded {
         hold_conditions.push("p087_projection_invalidation_backlog_exceeded");
@@ -1093,8 +1131,8 @@ async fn rollout_readback(pool: &SqlitePool) -> Result<Value> {
         "p087_storage_exit_threshold_status": status,
         "p087_mcp_wire_compatibility_status": "active",
         "p087_graphql_storage_health_compatibility_status": "active",
-        "p087_per_tool_circuit_state": "active",
-        "p087_per_projection_freshness": "active",
+        "p087_per_tool_circuit_state": promotion_budget.aggregate_circuit_state,
+        "p087_per_projection_freshness": p087_per_projection_freshness,
         "p087_maintenance_active_count": m_count,
         "p087_maintenance_status_age_ms": m_age,
         "p087_restart_reaper_last_run": last_reaper,
@@ -1140,6 +1178,9 @@ struct PromotionBudget {
     min_flap_free_hours: f64,
     promotion_budget_met: bool,
     per_surface: serde_json::Value,
+    /// Aggregate circuit state across canonical surfaces: "active" if all closed,
+    /// "open" if any surface is open or half-open, "unproven" if no surfaces in DB.
+    aggregate_circuit_state: String,
 }
 
 /// The canonical set of hot-read governed surfaces that must all meet the
@@ -1164,18 +1205,21 @@ const CANONICAL_HOT_READ_SURFACES: &[&str] = &[
 /// floor, so promotion_budget_met remains false until every surface has sufficient traffic.
 async fn compute_promotion_budget(pool: &SqlitePool) -> Result<PromotionBudget> {
     let rows = sqlx::query(
-        "SELECT governed_surface, total_requests, total_would_open, last_state_change_at_ms, first_observed_at_ms
+        "SELECT governed_surface, circuit_status, total_requests, total_would_open, last_state_change_at_ms, first_observed_at_ms
          FROM hot_read_circuit_states",
     )
     .fetch_all(pool)
     .await?;
 
     // Build a lookup from DB rows; surfaces absent from the DB are treated as
-    // (0 requests, 0 would_open, no state change, never observed) — i.e. not yet ready.
-    let mut row_map: std::collections::HashMap<String, (i64, i64, Option<i64>, Option<i64>)> =
-        std::collections::HashMap::new();
+    // (closed, 0 requests, 0 would_open, no state change, never observed) — i.e. not yet ready.
+    let mut row_map: std::collections::HashMap<
+        String,
+        (String, i64, i64, Option<i64>, Option<i64>),
+    > = std::collections::HashMap::new();
     for row in &rows {
         let surface: String = row.get("governed_surface");
+        let circuit_status: String = row.get("circuit_status");
         let total_requests: i64 = row.get("total_requests");
         let total_would_open: i64 = row.get("total_would_open");
         let last_state_change: Option<i64> = row.get("last_state_change_at_ms");
@@ -1183,6 +1227,7 @@ async fn compute_promotion_budget(pool: &SqlitePool) -> Result<PromotionBudget> 
         row_map.insert(
             surface,
             (
+                circuit_status,
                 total_requests,
                 total_would_open,
                 last_state_change,
@@ -1197,10 +1242,19 @@ async fn compute_promotion_budget(pool: &SqlitePool) -> Result<PromotionBudget> 
     let mut worst_rate: f64 = 0.0;
     let mut min_requests: i64 = i64::MAX;
     let mut min_flap_free_ms: i64 = 0;
+    let mut any_circuit_not_closed = false;
 
     for &surface in CANONICAL_HOT_READ_SURFACES {
-        let (total_requests, total_would_open, last_state_change, first_observed) =
-            row_map.get(surface).copied().unwrap_or((0, 0, None, None));
+        let (circuit_status, total_requests, total_would_open, last_state_change, first_observed) =
+            row_map
+                .get(surface)
+                .cloned()
+                .unwrap_or_else(|| ("closed".to_string(), 0, 0, None, None));
+
+        let circuit_closed = circuit_status == "closed";
+        if !circuit_closed {
+            any_circuit_not_closed = true;
+        }
 
         let rate = if total_requests > 0 {
             (total_would_open as f64 / total_requests as f64) * 100.0
@@ -1224,13 +1278,18 @@ async fn compute_promotion_budget(pool: &SqlitePool) -> Result<PromotionBudget> 
         };
         let flap_free_hours = flap_free_ms as f64 / 3_600_000.0;
 
-        let surface_met = rate < 0.1
+        // Promotion requires circuit closed (not open or half-open) in addition to
+        // rate/request/window criteria. An open or half-open circuit means the surface
+        // is currently breaching the approved threshold and is not safe to promote.
+        let surface_met = circuit_closed
+            && rate < 0.1
             && total_requests >= 100
             && effective_window_start_ms.is_some()
             && flap_free_ms >= required_ms;
 
         per_surface.push(serde_json::json!({
             "governed_surface": surface,
+            "circuit_status": circuit_status,
             "total_requests": total_requests,
             "total_would_open": total_would_open,
             "would_open_rate_pct": (rate * 1000.0).round() / 1000.0,
@@ -1253,6 +1312,13 @@ async fn compute_promotion_budget(pool: &SqlitePool) -> Result<PromotionBudget> 
         .iter()
         .all(|s| s["promotion_ready"].as_bool().unwrap_or(false));
     let final_flap_free = (min_flap_free_ms as f64 / 3_600_000.0 * 10.0).round() / 10.0;
+    let aggregate_circuit_state = if any_circuit_not_closed {
+        "open".to_string()
+    } else if row_map.is_empty() {
+        "unproven".to_string()
+    } else {
+        "active".to_string()
+    };
 
     Ok(PromotionBudget {
         worst_would_open_rate: (worst_rate * 1000.0).round() / 1000.0,
@@ -1264,6 +1330,7 @@ async fn compute_promotion_budget(pool: &SqlitePool) -> Result<PromotionBudget> 
         min_flap_free_hours: final_flap_free,
         promotion_budget_met: all_met,
         per_surface: serde_json::json!(per_surface),
+        aggregate_circuit_state,
     })
 }
 
@@ -2408,6 +2475,165 @@ mod tests {
                 .iter()
                 .any(|c| c.as_str() == Some("p087_hot_read_promotion_budget_pending")),
             "hold_conditions must include p087_hot_read_promotion_budget_pending, got: {hold_conditions:?}"
+        );
+    }
+
+    /// Regression: promotion must be blocked when any canonical circuit is open or half-open.
+    /// Before this fix, compute_promotion_budget ignored circuit_status, so an open circuit
+    /// could still satisfy total_requests, would_open rate, and 48h window criteria.
+    #[tokio::test]
+    async fn proposal_087_promotion_blocked_when_circuit_open() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+        let old_enough = now_ms - (49 * 60 * 60 * 1000_i64); // > 48 hours ago
+
+        // Insert passing rows for all canonical surfaces but with one circuit open.
+        for (i, &surface) in CANONICAL_HOT_READ_SURFACES.iter().enumerate() {
+            let circuit = if i == 0 { "open" } else { "closed" };
+            sqlx::query(
+                "INSERT OR REPLACE INTO hot_read_circuit_states
+                 (governed_surface, circuit_status, consecutive_successes, consecutive_failures,
+                  last_opened_at_ms, retry_after_ms, would_open, updated_at_ms,
+                  total_requests, total_would_open, last_state_change_at_ms, first_observed_at_ms)
+                 VALUES (?, ?, 0, 0, NULL, NULL, 0, ?, 500, 0, NULL, ?)",
+            )
+            .bind(surface)
+            .bind(circuit)
+            .bind(now_ms)
+            .bind(old_enough)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let budget = compute_promotion_budget(&pool).await.unwrap();
+
+        assert!(
+            !budget.promotion_budget_met,
+            "promotion_budget_met must be false when a canonical circuit is open"
+        );
+        assert_eq!(
+            budget.aggregate_circuit_state, "open",
+            "aggregate_circuit_state must be 'open' when any surface is not closed"
+        );
+
+        // The open surface must not be promotion_ready.
+        let open_surface = budget
+            .per_surface
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["governed_surface"] == CANONICAL_HOT_READ_SURFACES[0])
+            .unwrap();
+        assert!(
+            !open_surface["promotion_ready"].as_bool().unwrap_or(true),
+            "open surface must not be promotion_ready"
+        );
+        assert_eq!(
+            open_surface["circuit_status"], "open",
+            "per_surface must expose circuit_status"
+        );
+    }
+
+    /// Regression: p087_per_tool_circuit_state must reflect actual circuit data.
+    /// Before this fix, it was hard-coded to "active" regardless of open circuits.
+    #[tokio::test]
+    async fn proposal_087_per_tool_circuit_state_reflects_actual_circuit_data() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+
+        // Insert an open circuit for one surface.
+        sqlx::query(
+            "INSERT OR REPLACE INTO hot_read_circuit_states
+             (governed_surface, circuit_status, consecutive_successes, consecutive_failures,
+              last_opened_at_ms, retry_after_ms, would_open, updated_at_ms,
+              total_requests, total_would_open, last_state_change_at_ms, first_observed_at_ms)
+             VALUES ('runs.list', 'open', 0, 3, NULL, NULL, 0, ?, 10, 0, NULL, ?)",
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fields = p087_rollout_readback_fields(&pool).await;
+        assert_eq!(
+            fields["p087_per_tool_circuit_state"], "open",
+            "p087_per_tool_circuit_state must be 'open' when any circuit is not closed, got: {}",
+            fields["p087_per_tool_circuit_state"]
+        );
+    }
+
+    /// Regression: rollout must hold when projection freshness 48-hour window is not met.
+    /// Before this fix, p087_per_projection_freshness was hard-coded to "active" and the
+    /// 48-hour healthy window was never checked.
+    #[tokio::test]
+    async fn proposal_087_rollout_holds_when_projection_freshness_window_not_met() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+
+        // Insert a cursor with first_healthy_at_ms set to only 1 hour ago (< 48h window).
+        let one_hour_ago = now_ms - 60 * 60 * 1000;
+        sqlx::query(
+            "INSERT INTO projection_cursors
+             (projection_name, source_name, watermark_ms, is_poisoned, updated_at_ms, first_healthy_at_ms)
+             VALUES ('run_summaries', 'runs', ?, 0, ?, ?)",
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(one_hour_ago)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fields = p087_rollout_readback_fields(&pool).await;
+
+        assert_eq!(
+            fields["p087_per_projection_freshness"], "window_pending",
+            "p087_per_projection_freshness must be 'window_pending' when < 48h healthy"
+        );
+        assert_eq!(
+            fields["rollout_contract_status"], "hold",
+            "rollout must hold when projection freshness window is not met"
+        );
+        let hold_conditions = fields["rollout_contract_hold_conditions"]
+            .as_array()
+            .expect("hold_conditions must be an array");
+        assert!(
+            hold_conditions
+                .iter()
+                .any(|c| c.as_str() == Some("p087_projection_freshness_window_not_met")),
+            "hold_conditions must include p087_projection_freshness_window_not_met: {hold_conditions:?}"
+        );
+    }
+
+    /// Regression: rollout must hold when a cursor has no first_healthy_at_ms (unproven freshness).
+    #[tokio::test]
+    async fn proposal_087_rollout_holds_when_projection_freshness_unproven() {
+        let pool = crate::pool::create_pool("sqlite::memory:").await.unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+
+        // Insert a cursor with first_healthy_at_ms = NULL (never achieved healthy state).
+        sqlx::query(
+            "INSERT INTO projection_cursors
+             (projection_name, source_name, watermark_ms, is_poisoned, updated_at_ms)
+             VALUES ('run_summaries', 'runs', ?, 0, ?)",
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fields = p087_rollout_readback_fields(&pool).await;
+
+        // Cursor has not achieved first_healthy_at_ms — should be window_pending, not active.
+        let freshness_status = fields["p087_per_projection_freshness"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            freshness_status == "window_pending" || freshness_status == "unproven",
+            "p087_per_projection_freshness must not be 'active' when first_healthy_at_ms is NULL; got: {freshness_status}"
         );
     }
 }

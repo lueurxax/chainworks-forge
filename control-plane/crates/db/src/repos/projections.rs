@@ -111,13 +111,17 @@ pub async fn invalidate_projections_terminal(
     }
 
     // 2. Cursor watermark: record position so background rebuilder can resume correctly.
+    // Set first_healthy_at_ms on first healthy advance (COALESCE keeps the earliest timestamp).
+    // A cursor that becomes poisoned will have first_healthy_at_ms reset to NULL there.
     sqlx::query(
-        "INSERT INTO projection_cursors (projection_name, source_name, watermark_ms, updated_at_ms)
-         VALUES ('run_summaries', 'runs', ?, ?)
+        "INSERT INTO projection_cursors (projection_name, source_name, watermark_ms, updated_at_ms, first_healthy_at_ms)
+         VALUES ('run_summaries', 'runs', ?, ?, ?)
          ON CONFLICT(projection_name, source_name) DO UPDATE SET
             watermark_ms = excluded.watermark_ms,
-            updated_at_ms = excluded.updated_at_ms",
+            updated_at_ms = excluded.updated_at_ms,
+            first_healthy_at_ms = CASE WHEN is_poisoned = 0 THEN COALESCE(projection_cursors.first_healthy_at_ms, excluded.first_healthy_at_ms) ELSE NULL END",
     )
+    .bind(now)
     .bind(now)
     .bind(now)
     .execute(&mut **tx)

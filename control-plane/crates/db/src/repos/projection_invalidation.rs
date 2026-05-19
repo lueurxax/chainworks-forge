@@ -122,13 +122,14 @@ pub async fn record_invalidation_internal(
     if final_count > MAX_INVALIDATION_ROWS || final_bytes > MAX_INVALIDATION_BYTES {
         crate::metrics::increment_counter("projection_invalidation_backlog_exceeded_total");
         sqlx::query(
-            "INSERT INTO projection_cursors (projection_name, source_name, watermark_ms, is_poisoned, last_error, updated_at_ms, throttled_until_ms)
-             VALUES (?, ?, ?, 1, 'projection_invalidation_backlog_exceeded', ?, ?)
-             ON CONFLICT(projection_name, source_name) DO UPDATE SET 
-                is_poisoned = 1, 
+            "INSERT INTO projection_cursors (projection_name, source_name, watermark_ms, is_poisoned, last_error, updated_at_ms, throttled_until_ms, first_healthy_at_ms)
+             VALUES (?, ?, ?, 1, 'projection_invalidation_backlog_exceeded', ?, ?, NULL)
+             ON CONFLICT(projection_name, source_name) DO UPDATE SET
+                is_poisoned = 1,
                 last_error = 'projection_invalidation_backlog_exceeded',
                 throttled_until_ms = excluded.throttled_until_ms,
-                updated_at_ms = excluded.updated_at_ms"
+                updated_at_ms = excluded.updated_at_ms,
+                first_healthy_at_ms = NULL"
         )
         .bind(projection_name)
         .bind(source_name)
@@ -223,9 +224,12 @@ pub async fn clear_backlog(
     .execute(&mut **tx)
     .await?;
 
+    // Reset first_healthy_at_ms: after clearing backlog, the cursor is no longer
+    // poisoned but lag is unknown. The 48-hour freshness window restarts from zero.
     sqlx::query(
         "UPDATE projection_cursors
-         SET is_poisoned = 0, last_error = NULL, throttled_until_ms = NULL, updated_at_ms = ?
+         SET is_poisoned = 0, last_error = NULL, throttled_until_ms = NULL,
+             updated_at_ms = ?, first_healthy_at_ms = NULL
          WHERE projection_name = ? AND source_name = ?",
     )
     .bind(now_ms)
@@ -273,9 +277,12 @@ pub async fn clear_poison(
     )
     .await?;
 
+    // Reset first_healthy_at_ms: after clearing poison, the cursor recovers but
+    // the 48-hour freshness window restarts from zero to prove sustained health.
     sqlx::query(
         "UPDATE projection_cursors
-         SET is_poisoned = 0, last_error = NULL, throttled_until_ms = NULL, updated_at_ms = ?
+         SET is_poisoned = 0, last_error = NULL, throttled_until_ms = NULL,
+             updated_at_ms = ?, first_healthy_at_ms = NULL
          WHERE projection_name = ? AND source_name = ?",
     )
     .bind(now_ms)
@@ -380,12 +387,13 @@ pub async fn freeze_cursor_after_retry_exhaustion(
 
     sqlx::query(
         "INSERT INTO projection_cursors
-             (projection_name, source_name, watermark_ms, is_poisoned, last_error, updated_at_ms)
-         VALUES (?, ?, ?, 1, 'projection_invalidation_consumer_retry_exhausted', ?)
+             (projection_name, source_name, watermark_ms, is_poisoned, last_error, updated_at_ms, first_healthy_at_ms)
+         VALUES (?, ?, ?, 1, 'projection_invalidation_consumer_retry_exhausted', ?, NULL)
          ON CONFLICT(projection_name, source_name) DO UPDATE SET
             is_poisoned = 1,
             last_error = 'projection_invalidation_consumer_retry_exhausted',
-            updated_at_ms = excluded.updated_at_ms",
+            updated_at_ms = excluded.updated_at_ms,
+            first_healthy_at_ms = NULL",
     )
     .bind(projection_name)
     .bind(source_name)

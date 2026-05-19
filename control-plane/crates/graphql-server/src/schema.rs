@@ -8014,4 +8014,125 @@ mod tests {
             response.errors
         );
     }
+
+    /// Executable negative introspection: proves StorageHealth.projections is of type
+    /// ProjectionStorageHealth (OBJECT), not a list or scalar. Fails if P087 breaks the
+    /// GraphQL type contract by changing this field to a different type.
+    #[tokio::test]
+    async fn proposal_087_graphql_storage_health_projections_type_is_projection_storage_health() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        // Introspect StorageHealth to verify the `projections` field type.
+        let introspect_query = r#"{
+          __type(name: "StorageHealth") {
+            fields {
+              name
+              type {
+                name
+                kind
+                ofType { name kind }
+              }
+            }
+          }
+        }"#;
+
+        let response = schema
+            .execute(Request::new(introspect_query).data(test_principal()))
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "StorageHealth introspection must succeed: {:?}",
+            response.errors
+        );
+
+        let data = response
+            .data
+            .into_json()
+            .expect("introspection data must serialize");
+        let fields = data["__type"]["fields"]
+            .as_array()
+            .expect("StorageHealth must have fields");
+
+        let projections_field = fields
+            .iter()
+            .find(|f| f["name"] == "projections")
+            .expect("StorageHealth must have a 'projections' field");
+
+        // The field type must be (non-null) ProjectionStorageHealth OBJECT, not a list or scalar.
+        // GraphQL wraps non-null fields as NON_NULL { ofType: { kind, name } }, so we must
+        // unwrap the outer NON_NULL layer to reach the actual type.
+        let outer_kind = projections_field["type"]["kind"].as_str().unwrap_or("");
+        let (resolved_kind, resolved_name) = if outer_kind == "NON_NULL" {
+            (
+                projections_field["type"]["ofType"]["kind"]
+                    .as_str()
+                    .unwrap_or(""),
+                projections_field["type"]["ofType"]["name"]
+                    .as_str()
+                    .unwrap_or(""),
+            )
+        } else {
+            (
+                outer_kind,
+                projections_field["type"]["name"].as_str().unwrap_or(""),
+            )
+        };
+        assert_eq!(
+            resolved_kind, "OBJECT",
+            "StorageHealth.projections must resolve to an OBJECT type, not {resolved_kind}. \
+             P087 must not change this field to a list, scalar, or union."
+        );
+        assert_eq!(
+            resolved_name, "ProjectionStorageHealth",
+            "StorageHealth.projections must resolve as ProjectionStorageHealth, got '{resolved_name}'. \
+             P087 must not rename or retype this field."
+        );
+
+        // Introspect ProjectionFreshnessV1 to verify identity fields projectionName and sourceName.
+        let freshness_introspect = r#"{
+          __type(name: "ProjectionFreshnessV1") {
+            fields { name }
+          }
+        }"#;
+
+        let freshness_response = schema
+            .execute(Request::new(freshness_introspect).data(test_principal()))
+            .await;
+
+        assert!(
+            freshness_response.errors.is_empty(),
+            "ProjectionFreshnessV1 introspection must succeed: {:?}",
+            freshness_response.errors
+        );
+
+        let freshness_data = freshness_response
+            .data
+            .into_json()
+            .expect("freshness introspection data must serialize");
+        let freshness_fields = freshness_data["__type"]["fields"]
+            .as_array()
+            .expect("ProjectionFreshnessV1 must have fields");
+
+        let field_names: Vec<&str> = freshness_fields
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .collect();
+
+        assert!(
+            field_names.contains(&"projectionName"),
+            "ProjectionFreshnessV1 must include projectionName identity field; got: {field_names:?}"
+        );
+        assert!(
+            field_names.contains(&"sourceName"),
+            "ProjectionFreshnessV1 must include sourceName identity field; got: {field_names:?}"
+        );
+    }
 }
