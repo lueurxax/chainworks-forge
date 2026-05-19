@@ -160,16 +160,30 @@ pub async fn list_completed(pool: &SqlitePool, limit: i64) -> Result<Vec<Run>> {
 }
 
 pub async fn update_status(pool: &SqlitePool, id: RunId, status: RunStatus) -> Result<()> {
+    let mut tx = crate::writer::begin_repository_transaction(pool, "runs.update_status").await?;
+    update_status_tx(&mut tx, id, status).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn update_status_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: RunId,
+    status: RunStatus,
+) -> Result<()> {
     let id_str = id.to_string();
     let status_str = status.to_string();
-    crate::execute_repository_write!(
-        pool,
-        "runs.update_status",
-        sqlx::query(r#"UPDATE runs SET status = ?1 WHERE id = ?2"#)
-            .bind(status_str)
-            .bind(id_str)
-    )
-    .context("update run status")?;
+    sqlx::query(r#"UPDATE runs SET status = ?1 WHERE id = ?2"#)
+        .bind(status_str)
+        .bind(id_str)
+        .execute(&mut **tx)
+        .await
+        .context("update run status")?;
+
+    if status.is_terminal() {
+        // P087: Trigger projection invalidation for terminal transition
+        crate::repos::projections::invalidate_projections_terminal(tx, id).await?;
+    }
     Ok(())
 }
 
@@ -262,18 +276,31 @@ pub async fn mark_cancelling_tx(
 }
 
 pub async fn mark_cancelled(pool: &SqlitePool, id: RunId, settled_at: DateTime<Utc>) -> Result<()> {
+    let mut tx = crate::writer::begin_repository_transaction(pool, "runs.mark_cancelled").await?;
+    mark_cancelled_tx(&mut tx, id, settled_at).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn mark_cancelled_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: RunId,
+    settled_at: DateTime<Utc>,
+) -> Result<()> {
     let id_str = id.to_string();
     let settled_at_str = settled_at.to_rfc3339();
     let status = RunStatus::Cancelled.to_string();
-    crate::execute_repository_write!(
-        pool,
-        "runs.mark_cancelled",
-        sqlx::query(r#"UPDATE runs SET status = ?1, cancellation_settled_at = ?2 WHERE id = ?3"#)
-            .bind(status)
-            .bind(settled_at_str)
-            .bind(id_str)
-    )
-    .context("mark run cancelled")?;
+    sqlx::query(r#"UPDATE runs SET status = ?1, cancellation_settled_at = ?2 WHERE id = ?3"#)
+        .bind(status)
+        .bind(settled_at_str)
+        .bind(id_str)
+        .execute(&mut **tx)
+        .await
+        .context("mark run cancelled")?;
+
+    // P087: Trigger projection invalidation for terminal transition
+    crate::repos::projections::invalidate_projections_terminal(tx, id).await?;
+
     Ok(())
 }
 
@@ -342,18 +369,31 @@ pub async fn mark_completed(
     id: RunId,
     completed_at: DateTime<Utc>,
 ) -> Result<()> {
+    let mut tx = crate::writer::begin_repository_transaction(pool, "runs.mark_completed").await?;
+    mark_completed_tx(&mut tx, id, completed_at).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn mark_completed_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: RunId,
+    completed_at: DateTime<Utc>,
+) -> Result<()> {
     let id_str = id.to_string();
     let completed_at_str = completed_at.to_rfc3339();
     let status = RunStatus::Completed.to_string();
-    crate::execute_repository_write!(
-        pool,
-        "runs.mark_completed",
-        sqlx::query(r#"UPDATE runs SET status = ?1, completed_at = ?2 WHERE id = ?3"#)
-            .bind(status)
-            .bind(completed_at_str)
-            .bind(id_str)
-    )
-    .context("mark run completed")?;
+    sqlx::query(r#"UPDATE runs SET status = ?1, completed_at = ?2 WHERE id = ?3"#)
+        .bind(status)
+        .bind(completed_at_str)
+        .bind(id_str)
+        .execute(&mut **tx)
+        .await
+        .context("mark run completed")?;
+
+    // P087: Trigger projection invalidation for terminal transition
+    crate::repos::projections::invalidate_projections_terminal(tx, id).await?;
+
     Ok(())
 }
 

@@ -2633,6 +2633,10 @@ async fn xcode_mcp_bridge_pool_resolves_target_snapshot_before_reserving_lease()
         failed.backend_failure_class,
         Some(XcodeRuntimeFailureClass::XcodeTargetNotFound)
     );
+    assert!(failed
+        .status_update
+        .as_deref()
+        .is_some_and(|status| status.contains("xcode_target_probe_diagnostics")));
 }
 
 #[cfg(unix)]
@@ -5158,18 +5162,17 @@ async fn runtime_manager_releases_brokered_xcode_lease_when_kept_session_fails()
         "failed prompt should not be kept alive even if close reports process exit: {result:?}"
     );
     assert!(
-        released.lock().await.is_empty(),
-        "failed kept session remains reusable for repair and must retain its brokered Xcode lease"
+        !released.lock().await.is_empty(),
+        "failed kept session whose provider process exited must release its brokered Xcode lease"
     );
     assert!(
-        manager.has_live_session("generation-failed", None).await,
-        "failed prompt should leave a reusable live session for repair"
+        !manager.has_live_session("generation-failed", None).await,
+        "failed prompt cannot remain reusable after the provider process exits"
     );
-    manager.close_session("generation-failed").await.unwrap();
     assert_eq!(
         released.lock().await.as_slice(),
         ["lease-failed"],
-        "explicit close must release the retained brokered Xcode lease"
+        "start_session must release the brokered Xcode lease once it observes the provider exit"
     );
 }
 

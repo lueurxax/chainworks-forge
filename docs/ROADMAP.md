@@ -21,6 +21,7 @@ These are not active workstreams:
 
 ## Recently Stabilized
 
+- **P087** Local storage tiering, read-path liveness, and SQLite exit criteria. Preserves existing GraphQL `StorageHealth.projections` while exposing new identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `StorageHealth.projectionFreshness` and `StorageHealth.projectionFreshnessBySource`.
 - **P073 freeze mode**.
 - **P084** minimal rollout-gate template and proposal readiness contract: template, linter, run-start preflight, authoritative storage, and four-lane operator readback.
 - **UI action boundary / P072 closeout gate**:
@@ -71,7 +72,7 @@ After the safety and UI recovery lanes stabilize:
 ## Backlog
 
 - Future **P086** agent limit observatory / runtime budget dashboard.
-- Future **P087** limit-aware session pool / runtime fallback policy.
+
 - Additional ACP runtime/provider expansion only after the stabilization window.
 - Additional UI polish only after P036/P032 restore stable operator ergonomics.
 

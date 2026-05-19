@@ -516,7 +516,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 34] {
+fn all_tool_capabilities() -> [CapabilityToolId; 38] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -534,14 +534,15 @@ fn all_tool_capabilities() -> [CapabilityToolId; 34] {
         CapabilityToolId::ApprovalsResolve,
         CapabilityToolId::StagesRetry,
         CapabilityToolId::WorkflowConflictsResolve,
+        CapabilityToolId::WorkflowLoopBudgetExtend,
         CapabilityToolId::LegacyDiscoveryOverrideCreate,
         CapabilityToolId::ReportsGet,
         CapabilityToolId::ArtifactsOverrideContract,
         CapabilityToolId::StewardRunAnalysis,
         CapabilityToolId::StewardListAnalyses,
         CapabilityToolId::StewardGetAnalysis,
-        CapabilityToolId::StorageHealth,
         CapabilityToolId::RuntimeHealth,
+        CapabilityToolId::StorageHealth,
         CapabilityToolId::StorageWritePressure,
         CapabilityToolId::StorageEvidenceSpoolSummary,
         CapabilityToolId::StorageReconcileEvidenceOrphans,
@@ -552,6 +553,9 @@ fn all_tool_capabilities() -> [CapabilityToolId; 34] {
         CapabilityToolId::EffectsMarkConflict,
         CapabilityToolId::EffectsMarkUnrecoverable,
         CapabilityToolId::EffectsClearAfterManualVerification,
+        CapabilityToolId::StorageMaintenanceRepairSlot,
+        CapabilityToolId::StorageProjectionsClearBacklog,
+        CapabilityToolId::StorageProjectionsClearPoison,
     ]
 }
 
@@ -581,6 +585,7 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::ApprovalsResolve => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StagesRetry => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::WorkflowConflictsResolve => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::WorkflowLoopBudgetExtend => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::LegacyDiscoveryOverrideCreate => {
             matches!(class, PrincipalClass::Operator)
         }
@@ -593,12 +598,14 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::StewardGetAnalysis => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
         }
+        CapabilityToolId::RuntimeHealth => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
         // SEC-004: storage diagnostics expose WAL, queue pressure, orphan counts, and
         // kill-switch state — restrict to Operator to match the GraphQL storageHealth boundary.
         CapabilityToolId::StorageHealth => {
             matches!(class, PrincipalClass::Operator)
         }
-        CapabilityToolId::RuntimeHealth => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StorageWritePressure => {
             matches!(class, PrincipalClass::Operator)
         }
@@ -618,6 +625,13 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::EffectsMarkConflict => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::EffectsMarkUnrecoverable => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::EffectsClearAfterManualVerification => {
+            matches!(class, PrincipalClass::Operator)
+        }
+        CapabilityToolId::StorageMaintenanceRepairSlot => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::StorageProjectionsClearBacklog => {
+            matches!(class, PrincipalClass::Operator)
+        }
+        CapabilityToolId::StorageProjectionsClearPoison => {
             matches!(class, PrincipalClass::Operator)
         }
     }
@@ -707,14 +721,15 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
         "stages.retry" => Some(CapabilityToolId::StagesRetry),
         "workflow_conflicts.resolve" => Some(CapabilityToolId::WorkflowConflictsResolve),
+        "workflow_loop_budget.extend" => Some(CapabilityToolId::WorkflowLoopBudgetExtend),
         "legacy_discovery_override_create" => Some(CapabilityToolId::LegacyDiscoveryOverrideCreate),
         "reports.get" => Some(CapabilityToolId::ReportsGet),
         "artifacts.override_contract" => Some(CapabilityToolId::ArtifactsOverrideContract),
         "steward.run_analysis" => Some(CapabilityToolId::StewardRunAnalysis),
         "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
-        "storage.health" => Some(CapabilityToolId::StorageHealth),
         "runtime.health" => Some(CapabilityToolId::RuntimeHealth),
+        "storage.health" => Some(CapabilityToolId::StorageHealth),
         "storage.write_pressure" => Some(CapabilityToolId::StorageWritePressure),
         "storage.evidence_spool_summary" => Some(CapabilityToolId::StorageEvidenceSpoolSummary),
         "storage.reconcile_evidence_orphans" => {
@@ -728,6 +743,11 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "effects.clear_after_manual_verification" => {
             Some(CapabilityToolId::EffectsClearAfterManualVerification)
         }
+        "storage.maintenance.repair_slot" => Some(CapabilityToolId::StorageMaintenanceRepairSlot),
+        "storage.projections.clear_backlog" => {
+            Some(CapabilityToolId::StorageProjectionsClearBacklog)
+        }
+        "storage.projections.clear_poison" => Some(CapabilityToolId::StorageProjectionsClearPoison),
         _ => None,
     }
 }
@@ -821,6 +841,26 @@ mod tests {
         assert!(is_tool_allowed(&p, "reports.get"));
         assert!(!is_tool_allowed(&p, "ideas.create"));
         assert!(!is_tool_allowed(&p, "runs.start"));
+    }
+
+    #[test]
+    fn proposal_087_storage_tools_are_operator_only() {
+        let op = Principal::new("op", PrincipalClass::Operator);
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+
+        let p087_tools = [
+            "storage.maintenance.repair_slot",
+            "storage.projections.clear_backlog",
+            "storage.projections.clear_poison",
+            "storage.health",
+        ];
+
+        for tool in p087_tools {
+            assert!(is_tool_allowed(&op, tool), "Operator should allow {}", tool);
+            assert!(!is_tool_allowed(&ag, tool), "Agent should deny {}", tool);
+            assert!(!is_tool_allowed(&ob, tool), "Observer should deny {}", tool);
+        }
     }
 
     #[test]
@@ -1419,6 +1459,17 @@ mod tests {
             assert!(!is_tool_allowed(&ob, tool), "Observer must not have {tool}");
             assert!(!is_tool_allowed(&ag, tool), "Agent must not have {tool}");
         }
+    }
+
+    #[test]
+    fn proposal_087_repair_slot_is_operator_only() {
+        let op = Principal::new("op-p087", PrincipalClass::Operator);
+        let ob = Principal::new("ob-p087", PrincipalClass::Observer);
+        let ag = Principal::new("ag-p087", PrincipalClass::Agent);
+
+        assert!(is_tool_allowed(&op, "storage.maintenance.repair_slot"));
+        assert!(!is_tool_allowed(&ob, "storage.maintenance.repair_slot"));
+        assert!(!is_tool_allowed(&ag, "storage.maintenance.repair_slot"));
     }
 
     #[test]

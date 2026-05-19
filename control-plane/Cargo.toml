@@ -28,4 +28,5 @@ async-graphql = { version = "7", features = ["uuid", "chrono"] }
 async-graphql-axum = "7"
 axum = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
 toml = { version = "0.8", features = ["parse"] }

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Extension, State};
+use axum::extract::{DefaultBodyLimit, Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -19,6 +19,8 @@ use tracing::info;
 use crate::protocol::JsonRpcRequest;
 use crate::request_context;
 use crate::server::McpServer;
+
+pub const MCP_HTTP_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
 /// Build the axum router for MCP HTTP transport.
 ///
@@ -31,6 +33,7 @@ use crate::server::McpServer;
 pub fn routes(mcp: Arc<McpServer>) -> Router {
     Router::new()
         .route("/mcp", post(handle_mcp_post))
+        .layer(DefaultBodyLimit::max(MCP_HTTP_BODY_LIMIT_BYTES))
         .with_state(mcp)
 }
 
@@ -179,6 +182,7 @@ mod tests {
     use engine::command_handler::CommandHandler;
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn test_mcp_http_rejects_missing_authorization_header() {
@@ -263,6 +267,35 @@ mod tests {
         let json = response_json(response).await;
         assert_eq!(json["error"]["code"], -32700);
         assert_eq!(json["error"]["data"]["request_id"], "rid-parse-1");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_mcp_http_rejects_oversized_unauthenticated_body_before_auth() {
+        let app = routes(test_server().await);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .body(Body::from("x".repeat(MCP_HTTP_BODY_LIMIT_BYTES + 1)))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn proposal_087_mcp_http_rejects_oversized_authenticated_body_before_parse() {
+        let app = routes(test_server().await);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("authorization", "Bearer test-token")
+            .body(Body::from("x".repeat(MCP_HTTP_BODY_LIMIT_BYTES + 1)))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     async fn test_server() -> Arc<McpServer> {

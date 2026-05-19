@@ -765,6 +765,147 @@ pub async fn requeue_running_advance_by_retry_authority_tx(
     Ok(requeued)
 }
 
+pub async fn requeue_stale_running_advance_items(
+    pool: &SqlitePool,
+    stale_before: DateTime<Utc>,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let tx_started = Instant::now();
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.requeue_stale_running_advance_items",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.requeue_stale_running_advance_items",
+        ),
+        "work_items.requeue_stale_running_advance_items",
+    )
+    .await?;
+    let requeued =
+        requeue_stale_running_advance_items_tx(&mut tx, stale_before, scheduled_at, reason).await?;
+    tx.commit()
+        .await
+        .context("commit stale running AdvanceRun watchdog requeue")?;
+    log_write_transaction("work_items.requeue_stale_running_advance_items", tx_started);
+    Ok(requeued)
+}
+
+pub async fn requeue_stale_running_advance_items_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    stale_before: DateTime<Utc>,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let rows = sqlx::query(
+        r#"SELECT id, run_id, payload_json
+           FROM work_items
+           WHERE kind = ?1
+             AND status = ?2
+             AND COALESCE(started_at, scheduled_at) <= ?3"#,
+    )
+    .bind(WorkItemKind::AdvanceRun.to_string())
+    .bind(WorkItemStatus::Running.to_string())
+    .bind(stale_before.to_rfc3339())
+    .fetch_all(&mut **tx)
+    .await
+    .context("select stale running AdvanceRun work items")?;
+
+    let mut requeued = 0;
+    for row in rows {
+        let id: String = row.get("id");
+        let run_id: Option<String> = row.get("run_id");
+        let payload: String = row.get("payload_json");
+        match classify_advance_payload_scope(&payload) {
+            AdvancePayloadScope::LegacyRunScoped => {
+                requeued +=
+                    requeue_running_advance_work_item_by_id_tx(tx, &id, scheduled_at, reason)
+                        .await?;
+            }
+            AdvancePayloadScope::Targeted => {
+                let payload = AdvanceRunPayloadV1::parse_json(&payload)
+                    .context("parse targeted stale AdvanceRun payload")?;
+                let Some(authority_id) = payload.retry_authority_id.as_deref() else {
+                    quarantine_advance_work_item_tx(
+                        tx,
+                        &id,
+                        "advance_run_payload_missing_retry_authority",
+                    )
+                    .await?;
+                    continue;
+                };
+                let Some(target_stage_execution_id) = payload.target_stage_execution_id else {
+                    quarantine_advance_work_item_tx(
+                        tx,
+                        &id,
+                        "advance_run_payload_missing_target_for_authority",
+                    )
+                    .await?;
+                    continue;
+                };
+                let payload_run_id = payload.run_id.to_string();
+                let active_authority =
+                    find_active_retry_authority_by_id_tx(tx, &payload_run_id, authority_id).await?;
+                let Some(active_authority) = active_authority else {
+                    continue;
+                };
+                let authority_target: String = active_authority.get("target_stage_execution_id");
+                if authority_target != target_stage_execution_id.to_string() {
+                    quarantine_advance_work_item_tx(
+                        tx,
+                        &id,
+                        "advance_run_payload_target_authority_mismatch",
+                    )
+                    .await?;
+                    continue;
+                }
+                if run_id.as_deref() != Some(payload.run_id.to_string().as_str()) {
+                    quarantine_advance_work_item_tx(tx, &id, "advance_run_payload_run_id_mismatch")
+                        .await?;
+                    continue;
+                }
+                requeued +=
+                    requeue_running_advance_work_item_by_id_tx(tx, &id, scheduled_at, reason)
+                        .await?;
+            }
+            AdvancePayloadScope::Malformed(code) => {
+                quarantine_advance_work_item_tx(tx, &id, code).await?;
+            }
+        }
+    }
+    Ok(requeued)
+}
+
+async fn requeue_running_advance_work_item_by_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    scheduled_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<u64> {
+    let result = sqlx::query(
+        r#"UPDATE work_items
+           SET status = ?1,
+               scheduled_at = ?2,
+               started_at = NULL,
+               failed_at = NULL,
+               attempt_count = attempt_count + 1,
+               last_error = ?3
+           WHERE id = ?4
+             AND kind = ?5
+             AND status = ?6"#,
+    )
+    .bind(WorkItemStatus::Pending.to_string())
+    .bind(scheduled_at.to_rfc3339())
+    .bind(reason)
+    .bind(id)
+    .bind(WorkItemKind::AdvanceRun.to_string())
+    .bind(WorkItemStatus::Running.to_string())
+    .execute(&mut **tx)
+    .await
+    .context("requeue stale running AdvanceRun work item")?;
+    Ok(result.rows_affected())
+}
+
 pub async fn requeue_running_steward_analysis_on_startup(
     pool: &SqlitePool,
     scheduled_at: DateTime<Utc>,
@@ -907,6 +1048,51 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
         requeued += updated;
     }
     Ok(requeued)
+}
+
+pub async fn complete_running_invoke_agents_with_terminal_valid_outputs_on_startup(
+    pool: &SqlitePool,
+    _reason: &str,
+) -> Result<u64> {
+    let rows = sqlx::query(
+        r#"
+        SELECT wi.id
+        FROM work_items wi
+        JOIN agent_executions ae
+          ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+         AND ae.status = ?1
+        JOIN agent_execution_runtime_facts facts
+          ON facts.agent_execution_id = ae.id
+         AND facts.output_settlement IN (?2, ?3)
+         AND COALESCE(facts.valid_required_outputs, 0) > 0
+        WHERE wi.kind = ?4
+          AND wi.status = ?5
+          AND wi.id NOT LIKE 'auto-contract-output-retry:%'
+          AND json_type(wi.payload_json, '$.retry_authority_id') IS NULL
+          AND json_type(wi.payload_json, '$.targeted_retry') IS NULL
+          AND json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id') IS NOT NULL
+        ORDER BY wi.scheduled_at ASC, wi.rowid ASC
+        "#,
+    )
+    .bind(AgentStatus::Completed.to_string())
+    .bind("valid_outputs_from_completed_execution")
+    .bind("valid_outputs_from_failed_execution")
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Running.to_string())
+    .fetch_all(pool)
+    .await
+    .context("select running InvokeAgent work items with terminal valid agent outputs")?;
+
+    let mut completed = 0_u64;
+    for row in rows {
+        let item_id: String = row.get("id");
+        complete(pool, &item_id)
+            .await
+            .with_context(|| format!("complete recovered InvokeAgent work item {item_id}"))?;
+        completed += 1;
+    }
+
+    Ok(completed)
 }
 
 pub async fn requeue_stale_starting_invoke_agent_sessions(
@@ -2081,7 +2267,7 @@ async fn build_post_invoke_advance_payload_tx(
     } else {
         None
     };
-    let active_authority = match (active_by_target, active_by_id) {
+    let mut active_authority = match (active_by_target, active_by_id) {
         (Some(target_row), Some(id_row)) => {
             let target_authority_id: String = target_row.get("id");
             let source_authority_id: String = id_row.get("id");
@@ -2104,11 +2290,24 @@ async fn build_post_invoke_advance_payload_tx(
         let source_invoke_work_item_id: Option<String> = active.get("source_invoke_work_item_id");
         if let Some(source_invoke_work_item_id) = source_invoke_work_item_id {
             if source_invoke_work_item_id != invoke_work_item_id {
-                anyhow::bail!(
-                    "advance_run_source_authority_mismatch: source invoke {invoke_work_item_id} does not match authority source invoke {source_invoke_work_item_id}"
-                );
+                if has_targeted_hint {
+                    anyhow::bail!(
+                        "advance_run_source_authority_mismatch: source invoke {invoke_work_item_id} does not match authority source invoke {source_invoke_work_item_id}"
+                    );
+                }
+                let retry_authority_id: String = active.get("id");
+                crate::repos::retry_stage_execution_authorities::mark_terminalized_tx(
+                    tx,
+                    &retry_authority_id,
+                    Utc::now(),
+                    "stale_targeted_authority_superseded_by_normal_invoke",
+                )
+                .await?;
+                active_authority = None;
             }
         }
+    }
+    if let Some(active) = active_authority.as_ref() {
         if let Some(source_stage_execution_id) = source_stage_execution_id.as_deref() {
             let authority_target: String = active.get("target_stage_execution_id");
             if authority_target != source_stage_execution_id {
@@ -3083,6 +3282,179 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn watchdog_requeues_stale_legacy_and_targeted_advance_items() {
+        let pool = test_pool().await;
+        let run_id = RunId::new();
+        let target = StageExecutionId::new();
+        let stale = Utc::now() - Duration::minutes(10);
+        let fresh = Utc::now();
+        sqlx::query(
+            r#"INSERT INTO ideas (id, title, body, status, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        )
+        .bind("idea-watchdog-advance")
+        .bind("Watchdog advance")
+        .bind("Watchdog")
+        .bind("active")
+        .bind(stale.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO runs
+               (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(run_id.to_string())
+        .bind("idea-watchdog-advance")
+        .bind("running")
+        .bind("wf-watchdog")
+        .bind("Watchdog")
+        .bind("/tmp/ws")
+        .bind("/tmp/artifacts")
+        .bind(stale.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO stage_executions
+               (id, run_id, stage_id, label, status, iteration, attempt_number, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(target.to_string())
+        .bind(run_id.to_string())
+        .bind("implement")
+        .bind("Implement")
+        .bind("running")
+        .bind(0_i64)
+        .bind(1_i64)
+        .bind(stale.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO retry_stage_execution_authorities
+               (id, run_id, stage_id, target_stage_execution_id, entry_kind,
+                source_invoke_work_item_id, authority_state, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+        )
+        .bind("auth-watchdog-targeted")
+        .bind(run_id.to_string())
+        .bind("implement")
+        .bind(target.to_string())
+        .bind("targeted_agent_retry")
+        .bind("invoke-watchdog-targeted")
+        .bind("active")
+        .bind(stale.to_rfc3339())
+        .bind(stale.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for item in [
+            WorkItem {
+                id: "advance-watchdog-legacy".to_string(),
+                kind: WorkItemKind::AdvanceRun,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "reason": "startup_catchup",
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: None,
+                created_at: stale,
+                scheduled_at: stale,
+                attempt_count: 0,
+                last_error: None,
+            },
+            WorkItem {
+                id: "advance-watchdog-targeted".to_string(),
+                kind: WorkItemKind::AdvanceRun,
+                payload_json: serde_json::json!({
+                    "schema_version": "advance_run_payload.v1",
+                    "run_id": run_id.to_string(),
+                    "stage_id": "implement",
+                    "target_stage_execution_id": target.to_string(),
+                    "retry_authority_id": "auth-watchdog-targeted",
+                    "enqueue_reason": "retry_stage",
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: Some("implement".to_string()),
+                created_at: stale,
+                scheduled_at: stale,
+                attempt_count: 2,
+                last_error: None,
+            },
+            WorkItem {
+                id: "advance-watchdog-fresh".to_string(),
+                kind: WorkItemKind::AdvanceRun,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "reason": "fresh",
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: None,
+                created_at: fresh,
+                scheduled_at: fresh,
+                attempt_count: 0,
+                last_error: None,
+            },
+        ] {
+            enqueue(&pool, &item).await.unwrap();
+            sqlx::query("UPDATE work_items SET started_at = ?1 WHERE id = ?2")
+                .bind(item.scheduled_at.to_rfc3339())
+                .bind(&item.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let requeued = requeue_stale_running_advance_items(
+            &pool,
+            Utc::now() - Duration::minutes(5),
+            Utc::now(),
+            "watchdog_stale_advance_run",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(requeued, 2);
+        let legacy = find_by_id(&pool, "advance-watchdog-legacy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.status, WorkItemStatus::Pending);
+        assert_eq!(legacy.attempt_count, 1);
+        assert_eq!(
+            legacy.last_error.as_deref(),
+            Some("watchdog_stale_advance_run")
+        );
+        let targeted = find_by_id(&pool, "advance-watchdog-targeted")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(targeted.status, WorkItemStatus::Pending);
+        assert_eq!(targeted.attempt_count, 3);
+        assert_eq!(
+            targeted.last_error.as_deref(),
+            Some("watchdog_stale_advance_run")
+        );
+        assert_eq!(
+            find_by_id(&pool, "advance-watchdog-fresh")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            WorkItemStatus::Running
+        );
+    }
+
     async fn seed_p091_post_invoke_rows(
         pool: &SqlitePool,
         run_id: RunId,
@@ -3224,6 +3596,71 @@ mod tests {
         assert_eq!(
             payload.source_stage_execution_id.map(|id| id.to_string()),
             Some(target.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn p091_normal_post_invoke_terminalizes_stale_targeted_authority_from_prior_retry() {
+        let pool = test_pool().await;
+        let run_id = RunId::new();
+        let target = StageExecutionId::new();
+        let agent_execution_id = AgentExecutionId::new();
+        seed_p091_post_invoke_rows(
+            &pool,
+            run_id,
+            target,
+            agent_execution_id,
+            "auto-contract-output-retry:old-source",
+        )
+        .await;
+
+        let mut tx = crate::pool::begin_immediate_with_retry(
+            &pool,
+            "p091-post-invoke-stale-targeted-authority",
+        )
+        .await
+        .unwrap();
+        let (payload_json, stage_id) = build_post_invoke_advance_payload_tx(
+            &mut tx,
+            &run_id.to_string(),
+            "invoke_agent_completed",
+            "completed_invoke_work_item_id",
+            "p058-invoke:normal-fanout",
+            &serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "implement",
+                "stage_execution_id": target.to_string(),
+                "p058_claimed": {
+                    "agent_execution_id": agent_execution_id.to_string()
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(stage_id, None);
+        let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(
+            payload["completed_invoke_work_item_id"],
+            serde_json::json!("p058-invoke:normal-fanout")
+        );
+        assert!(payload.get("retry_authority_id").is_none());
+        assert!(payload.get("target_stage_execution_id").is_none());
+
+        let authority =
+            crate::repos::retry_stage_execution_authorities::find_by_id(&pool, "auth-post-invoke")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            authority.authority_state,
+            domain::retry_authority::RetryAuthorityState::Terminalized
+        );
+        assert_eq!(
+            authority.terminal_reason.as_deref(),
+            Some("stale_targeted_authority_superseded_by_normal_invoke")
         );
     }
 
@@ -3435,6 +3872,196 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("startup_repair_abandoned_invoke_agent")
         );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_completes_running_invoke_when_agent_already_has_valid_outputs() {
+        let pool = test_pool().await;
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let agent_execution_id = AgentExecutionId::new();
+        let now = Utc::now();
+
+        let idea_id = domain::ids::IdeaId::new();
+        crate::repos::ideas::insert(
+            &pool,
+            &domain::idea::Idea {
+                id: idea_id,
+                title: "stale close recovery".to_string(),
+                body: "agent output already settled".to_string(),
+                workspace_root_path: Some("/tmp/chainworks-test".to_string()),
+                project_key: None,
+                status: domain::idea::IdeaStatus::Active,
+                created_at: now,
+                archived_at: None,
+            },
+        )
+        .await
+        .expect("insert idea");
+        crate::repos::runs::insert(
+            &pool,
+            &domain::run::Run {
+                id: run_id,
+                idea_id,
+                status: domain::run::RunStatus::Running,
+                workflow_id: "test-workflow".to_string(),
+                workflow_title: "Test Workflow".to_string(),
+                workspace_root: "/tmp/chainworks-test".to_string(),
+                artifact_root: "/tmp/chainworks-test/.chainworks".to_string(),
+                started_at: now,
+                completed_at: None,
+                cancellation_requested_at: None,
+                cancellation_settled_at: None,
+                cancellation_settlement_log: None,
+                current_state: Some("implementation_review".to_string()),
+                workflow_yaml_path: None,
+                agent_catalog_yaml_path: None,
+                worktree_root: None,
+                base_branch: None,
+                base_revision: None,
+                target_branch: None,
+                delivery_configuration_json: None,
+                delivery_preflight_json: None,
+                workflow_family: None,
+                project_key: None,
+                risk_class: None,
+                stack: None,
+                workflow_snapshot_hash: None,
+                catalog_snapshot_hash: None,
+                workflow_snapshot_json: None,
+                catalog_snapshot_json: None,
+                drift_detected_at: None,
+                drift_details_json: None,
+                chainworks_meta_root: None,
+                review_routing_json: None,
+                closeout_readiness_mode: None,
+            },
+        )
+        .await
+        .expect("insert run");
+        crate::repos::stages::insert(
+            &pool,
+            &domain::stage::StageExecution {
+                id: stage_execution_id,
+                run_id,
+                stage_id: "implementation_review".to_string(),
+                label: "Implementation Review".to_string(),
+                status: domain::stage::StageStatus::Running,
+                iteration: 1,
+                attempt_number: 1,
+                settlement_kind: None,
+                started_at: now,
+                completed_at: None,
+                owner_agent: Some("proposal_implementation_auditor".to_string()),
+                provider: Some("codex".to_string()),
+                model: Some("gpt-5.5".to_string()),
+                stage_type: None,
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: None,
+            },
+        )
+        .await
+        .expect("insert stage execution");
+        crate::repos::agent_executions::insert(
+            &pool,
+            &domain::agent::AgentExecution {
+                id: agent_execution_id,
+                stage_execution_id: Some(stage_execution_id),
+                agent_id: "proposal_implementation_auditor".to_string(),
+                provider: "codex".to_string(),
+                model: Some("gpt-5.5".to_string()),
+                started_at: now - Duration::minutes(30),
+                completed_at: Some(now - Duration::minutes(1)),
+                status: AgentStatus::Completed,
+                owner_execution_lineage_id: None,
+                session_lineage_id: None,
+                session_generation_id: None,
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: None,
+                session_reuse_scope: Some("none".to_string()),
+                session_family_id: None,
+                session_reuse_disposition: None,
+                session_reset_reason: None,
+                backend_profile_id: None,
+                requested_mcp_extensions_json: None,
+                predicted_mcp_extensions_json: None,
+                predicted_mcp_runtime_ids_json: None,
+                actual_mcp_extensions_json: None,
+                actual_mcp_runtime_ids_json: None,
+                denied_mcp_extensions_json: None,
+                mcp_blocking_issues_json: None,
+                actual_mcp_observation_json: None,
+                actual_xcode_runtime_observation_json: None,
+                mcp_session_startup_latency_ms: None,
+                owner_kind: None,
+                owner_id: None,
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
+                total_cost_cents: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
+            },
+        )
+        .await
+        .expect("insert completed agent execution");
+        let mut facts =
+            domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+        facts.output_settlement =
+            domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+        facts.valid_required_outputs = true;
+        crate::repos::agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .expect("insert runtime facts");
+        enqueue(
+            &pool,
+            &WorkItem {
+                id: "invoke-close-hung-after-output".to_string(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "implementation_review",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "p058_claimed": {
+                        "agent_execution_id": agent_execution_id.to_string(),
+                        "session_generation_id": uuid::Uuid::new_v4().to_string()
+                    }
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: Some("implementation_review".to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .expect("insert running work item");
+
+        let completed = complete_running_invoke_agents_with_terminal_valid_outputs_on_startup(
+            &pool,
+            "startup_repair_completed_agent_valid_outputs",
+        )
+        .await
+        .expect("complete stale running invoke");
+
+        assert_eq!(completed, 1);
+        let item = find_by_id(&pool, "invoke-close-hung-after-output")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.status, WorkItemStatus::Completed);
+        let advance = find_by_id(&pool, "advance-after-invoke:invoke-close-hung-after-output")
+            .await
+            .unwrap()
+            .expect("post-invoke advance");
+        assert_eq!(advance.status, WorkItemStatus::Pending);
     }
 
     #[tokio::test]

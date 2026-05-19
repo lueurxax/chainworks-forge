@@ -1,0 +1,9 @@
+{
+  "case": "legacy_projections_field_remains_object_not_list",
+  "query": "query { storageHealth { projections { pendingInvalidations projectionLagMs latencyMs rebuildDurationP95Ms } } }",
+  "expected": {
+    "accepted": true,
+    "fieldShape": "ProjectionStorageHealth",
+    "mustNotRequireProjectionFreshness": true
+  }
+}

@@ -147,57 +147,29 @@ impl GqlRun {
     pub fn from_projection_and_run(projection: RunProjectionRow, run: Run) -> Self {
         let mut gql = GqlRun::from(run);
         gql.status = projection.status;
-        gql.cancellation_settlement_summary = projection.cancellation_settlement_summary.clone();
-        gql.chainworks_meta_root = projection
-            .chainworks_meta_root
-            .clone()
-            .or(gql.chainworks_meta_root);
+        gql.cancellation_settlement_summary = projection.cancellation_settlement_summary;
+        gql.chainworks_meta_root = projection.chainworks_meta_root.or(gql.chainworks_meta_root);
         gql.total_stages = Some(projection.total_stages);
         gql.completed_stages = Some(projection.completed_stages);
         gql.failed_stages = Some(projection.failed_stages);
         gql.pending_approvals = Some(projection.pending_approvals);
         gql.projection_present = projection.projection_present;
-        gql.projection_updated_at = projection.projection_updated_at.clone();
+        gql.projection_updated_at = projection.projection_updated_at;
         gql.projection_lag = projection.projection_lag;
         gql.freshness_state = freshness_from_projection_lag(gql.projection_lag);
-        apply_projection_hot_read_payloads(
-            &mut gql,
-            projection.implementation_self_assessment_summary,
-            projection.implementation_completion,
-            projection.closeout_readiness_summary,
-            projection.implementation_closeout_readiness_summary,
-        );
         gql
-    }
-}
-
-fn apply_projection_hot_read_payloads(
-    gql: &mut GqlRun,
-    implementation_self_assessment_summary: Option<serde_json::Value>,
-    implementation_completion: serde_json::Value,
-    closeout_readiness_summary: Option<serde_json::Value>,
-    implementation_closeout_readiness_summary: Option<serde_json::Value>,
-) {
-    if let Some(summary) = implementation_self_assessment_summary
-        .and_then(|value| serde_json::from_value::<ImplementationSelfAssessmentSummary>(value).ok())
-    {
-        gql.implementation_self_assessment_summary = Some(summary.into());
-    }
-    gql.implementation_completion =
-        serde_json::from_value::<ImplementationCompletionSummary>(implementation_completion)
-            .map(Into::into)
-            .unwrap_or_else(|_| GqlImplementationCompletionSummary::not_attempted());
-    if let Some(summary) = closeout_readiness_summary {
-        gql.closeout_readiness_summary_json = Some(Json(summary.clone()));
-        gql.implementation_closeout_readiness_summary = Some(Json(summary));
-    } else if let Some(summary) = implementation_closeout_readiness_summary {
-        gql.closeout_readiness_summary_json = Some(Json(summary.clone()));
-        gql.implementation_closeout_readiness_summary = Some(Json(summary));
     }
 }
 
 impl From<RunProjectionRow> for GqlRun {
     fn from(r: RunProjectionRow) -> Self {
+        let implementation_completion = r
+            .implementation_completion
+            .clone()
+            .and_then(|value| serde_json::from_value::<ImplementationCompletionSummary>(value).ok())
+            .map(Into::into)
+            .unwrap_or_else(GqlImplementationCompletionSummary::not_attempted);
+        let closeout_readiness_summary_json = r.closeout_readiness_summary.clone().map(Json);
         GqlRun {
             id: ID(r.id),
             idea_id: ID(r.idea_id),
@@ -238,33 +210,18 @@ impl From<RunProjectionRow> for GqlRun {
             workflow_conflict: None,
             implementation_handoff_status_json: None,
             legacy_discovery_overrides_json: None,
-            implementation_self_assessment_summary: r
-                .implementation_self_assessment_summary
-                .and_then(|value| {
-                    serde_json::from_value::<ImplementationSelfAssessmentSummary>(value).ok()
-                })
-                .map(Into::into),
+            implementation_self_assessment_summary: None,
             main_sync_readback_json: None,
             knowledge_capsule_readback_json: None,
             rollout_contract_readback_json: None,
             side_effect_readback_json: None,
             code_writer_completion_receipts: Vec::new(),
-            implementation_completion: serde_json::from_value::<ImplementationCompletionSummary>(
-                r.implementation_completion,
-            )
-            .map(Into::into)
-            .unwrap_or_else(|_| GqlImplementationCompletionSummary::not_attempted()),
+            implementation_completion,
             retry_authority_json: None,
             retry_authority_history_json: None,
             p091_orphan_repair_readback_json: None,
-            closeout_readiness_summary_json: r
-                .closeout_readiness_summary
-                .as_ref()
-                .map(|summary| Json(summary.clone())),
-            implementation_closeout_readiness_summary: r
-                .implementation_closeout_readiness_summary
-                .or(r.closeout_readiness_summary)
-                .map(Json),
+            closeout_readiness_summary_json: closeout_readiness_summary_json.clone(),
+            implementation_closeout_readiness_summary: closeout_readiness_summary_json,
         }
     }
 }
@@ -841,9 +798,35 @@ pub struct GqlMediationAttemptArtifact {
     pub id: ID,
     pub name: String,
     pub format: String,
-    pub file_path: String,
+    pub artifact_metadata_pointer: Json<serde_json::Value>,
     pub report_kind: Option<String>,
     pub is_pinned: bool,
+}
+
+fn artifact_metadata_pointer_value(
+    artifact_id: &str,
+    checksum_sha256: Option<&str>,
+    size_bytes: Option<i64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": "artifact_metadata_pointer.v1",
+        "artifactId": artifact_id,
+        "checksumSha256": checksum_sha256,
+        "sizeBytes": size_bytes,
+        "authorizedPayloadRoute": format!("/artifacts/{artifact_id}/payload"),
+        "payloadPathRedacted": true,
+        "forbiddenFields": ["absolutePath", "filesystemPath", "rawPayload"]
+    })
+}
+
+fn artifact_metadata_pointer_json(
+    artifact: &domain::artifact::Artifact,
+) -> Json<serde_json::Value> {
+    Json(artifact_metadata_pointer_value(
+        &artifact.id.to_string(),
+        artifact.checksum_sha256.as_deref(),
+        artifact.size_bytes,
+    ))
 }
 
 impl From<&LeadConflictMediationRecord> for GqlLeadMediation {
@@ -969,7 +952,7 @@ async fn build_mediation_execution_attempts(
                         id: ID(a.id.to_string()),
                         name: a.name.clone(),
                         format: format!("{:?}", a.format).to_lowercase(),
-                        file_path: a.file_path.clone(),
+                        artifact_metadata_pointer: artifact_metadata_pointer_json(a),
                         report_kind: a.report_kind.clone(),
                         is_pinned: a.is_pinned,
                     });
@@ -995,7 +978,7 @@ async fn build_mediation_execution_attempts(
                 id: ID(a.id.to_string()),
                 name: a.name.clone(),
                 format: format!("{:?}", a.format).to_lowercase(),
-                file_path: a.file_path.clone(),
+                artifact_metadata_pointer: artifact_metadata_pointer_json(a),
                 report_kind: a.report_kind.clone(),
                 is_pinned: a.is_pinned,
             });
@@ -1013,7 +996,7 @@ async fn build_mediation_execution_attempts(
                     id: ID(a.id.to_string()),
                     name: a.name.clone(),
                     format: format!("{:?}", a.format).to_lowercase(),
-                    file_path: a.file_path.clone(),
+                    artifact_metadata_pointer: artifact_metadata_pointer_json(a),
                     report_kind: a.report_kind.clone(),
                     is_pinned: a.is_pinned,
                 });
@@ -1039,7 +1022,11 @@ async fn build_mediation_execution_attempts(
         let transcript_json = transcript_artifact.as_ref().map(|a| {
             Json(serde_json::json!({
                 "artifact_id": a.id.to_string(),
-                "file_path": a.file_path,
+                "artifact_metadata_pointer": artifact_metadata_pointer_value(
+                    &a.id.to_string(),
+                    a.checksum_sha256.as_deref(),
+                    a.size_bytes,
+                ),
                 "format": format!("{:?}", a.format).to_lowercase(),
             }))
         });

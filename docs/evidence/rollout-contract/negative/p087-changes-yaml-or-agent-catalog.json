@@ -1,39 +1,22 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "087",
+  "negative_case": "unexpected_yaml_or_agent_catalog_change",
+  "input": {
+    "changed_paths": [
+      "examples/workflows/full-mvp-live.yaml",
+      "examples/agents/agents.yaml"
+    ],
+    "allowed_p087_paths": [
+      "control-plane/**",
+      "docs/evidence/p087/**",
+      "docs/reference/query-projections-and-client-consumption-contract.md"
+    ]
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-087",
-    "p087"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:p087_changes_yaml_or_agent_catalog",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_decision": "fail",
+  "expected_failure_code": "p087_scope_drift",
+  "required_readback": [
+    "rollout_contract_status=fail",
+    "scope_drift_paths"
+  ]
 }

@@ -25,7 +25,7 @@ pub struct GqlArtifact {
     pub name: String,
     pub contract_id: String,
     pub format: String,
-    pub file_path: String,
+    pub artifact_metadata_pointer: Json<serde_json::Value>,
     pub checksum_sha256: Option<String>,
     pub size_bytes: Option<i64>,
     pub provider: String,
@@ -119,6 +119,8 @@ impl From<Artifact> for GqlArtifact {
     fn from(a: Artifact) -> Self {
         let artifact_id = a.id.to_string();
         let is_report = is_report_metadata(&a.format.to_string(), a.report_kind.as_deref());
+        let checksum_sha256 = a.checksum_sha256;
+        let size_bytes = a.size_bytes;
         GqlArtifact {
             id: ID(artifact_id.clone()),
             run_id: ID(a.run_id.to_string()),
@@ -127,9 +129,13 @@ impl From<Artifact> for GqlArtifact {
             name: a.name,
             contract_id: a.contract_id,
             format: a.format.to_string(),
-            file_path: a.file_path,
-            checksum_sha256: a.checksum_sha256,
-            size_bytes: a.size_bytes,
+            artifact_metadata_pointer: Json(artifact_metadata_pointer(
+                &artifact_id,
+                checksum_sha256.as_deref(),
+                size_bytes,
+            )),
+            checksum_sha256,
+            size_bytes,
             provider: a.provider,
             model: a.model,
             created_at: a.created_at.to_rfc3339(),
@@ -171,6 +177,8 @@ impl From<ArtifactIndexRow> for GqlArtifact {
             .as_deref()
             .and_then(output_settlement_from_db);
         let is_report = is_report_metadata(&r.format, r.report_kind.as_deref());
+        let checksum_sha256 = r.checksum_sha256;
+        let size_bytes = r.size_bytes;
         GqlArtifact {
             id: ID(r.id.clone()),
             run_id: ID(r.run_id),
@@ -179,9 +187,13 @@ impl From<ArtifactIndexRow> for GqlArtifact {
             name: r.name,
             contract_id: r.contract_id,
             format: r.format,
-            file_path: r.file_path,
-            checksum_sha256: r.checksum_sha256,
-            size_bytes: r.size_bytes,
+            artifact_metadata_pointer: Json(artifact_metadata_pointer(
+                &r.id,
+                checksum_sha256.as_deref(),
+                size_bytes,
+            )),
+            checksum_sha256,
+            size_bytes,
             provider: r.provider,
             model: r.model,
             created_at: r.created_at,
@@ -214,6 +226,22 @@ impl From<ArtifactIndexRow> for GqlArtifact {
             )),
         }
     }
+}
+
+fn artifact_metadata_pointer(
+    artifact_id: &str,
+    checksum_sha256: Option<&str>,
+    size_bytes: Option<i64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": "artifact_metadata_pointer.v1",
+        "artifactId": artifact_id,
+        "checksumSha256": checksum_sha256,
+        "sizeBytes": size_bytes,
+        "authorizedPayloadRoute": format!("/artifacts/{artifact_id}/payload"),
+        "payloadPathRedacted": true,
+        "forbiddenFields": ["absolutePath", "filesystemPath", "rawPayload"]
+    })
 }
 
 fn output_settlement_from_db(value: &str) -> Option<AgentOutputSettlement> {

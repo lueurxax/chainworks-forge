@@ -961,6 +961,62 @@ fn transcript_with_prompt_error(mut streamed_text: String, err_msg: &str) -> Opt
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderFailureEvent {
+    failure_phase: &'static str,
+    message: String,
+    detail: String,
+}
+
+fn classify_provider_failure_event(parsed: &Value, provider: &str) -> Option<ProviderFailureEvent> {
+    if !provider.eq_ignore_ascii_case("junie") {
+        return None;
+    }
+    find_junie_provider_failure_event(parsed)
+}
+
+fn find_junie_provider_failure_event(value: &Value) -> Option<ProviderFailureEvent> {
+    match value {
+        Value::Object(map) => {
+            if map.get("kind").and_then(Value::as_str) == Some("AgentFailureEvent") {
+                let error_code = map
+                    .get("errorCode")
+                    .or_else(|| map.get("error_code"))
+                    .and_then(Value::as_str);
+                let provider_message = map.get("message").and_then(Value::as_str).unwrap_or("");
+                if is_junie_quota_failure(error_code, provider_message) {
+                    let detail = format!(
+                        "kind=AgentFailureEvent;errorCode={};message={}",
+                        error_code.unwrap_or("unknown"),
+                        provider_message
+                    );
+                    return Some(ProviderFailureEvent {
+                        failure_phase: "provider_quota",
+                        message: format!(
+                            "provider quota/capacity failure: Junie AgentFailureEvent errorCode={}; message={}",
+                            error_code.unwrap_or("unknown"),
+                            provider_message
+                        ),
+                        detail,
+                    });
+                }
+            }
+            map.values().find_map(find_junie_provider_failure_event)
+        }
+        Value::Array(items) => items.iter().find_map(find_junie_provider_failure_event),
+        _ => None,
+    }
+}
+
+fn is_junie_quota_failure(error_code: Option<&str>, provider_message: &str) -> bool {
+    if matches!(error_code, Some("ExitPaymentRequired")) {
+        return true;
+    }
+    let lower = provider_message.to_ascii_lowercase();
+    lower.contains("insufficient account balance")
+        || (lower.contains("tokens") && lower.contains("balance") && lower.contains("spent"))
+}
+
 fn truncate_string_to_byte_len(text: &mut String, max_len: usize) {
     if text.len() <= max_len {
         return;
@@ -3622,6 +3678,36 @@ impl AcpTransportSession {
                             meaningful_progress,
                             detail,
                         );
+                        if let Some(provider_failure) =
+                            classify_provider_failure_event(&parsed, &self.provider)
+                        {
+                            runtime_receipt.push_event(
+                                "provider_failure",
+                                Some(provider_failure.detail.clone()),
+                            );
+                            runtime_receipt.note_terminal_response("failed");
+                            let receipt = runtime_receipt.build(
+                                &self.provider,
+                                self.model.as_ref(),
+                                &self.session_id,
+                                req.session_generation_id.as_ref(),
+                                self.xcode_shim_injected,
+                                self.requires_xcode_host_execution,
+                                "failed",
+                                Some(provider_failure.failure_phase.to_string()),
+                            );
+                            self.last_runtime_receipt = Some(receipt.clone());
+                            warn!(
+                                session_id = %self.session_id,
+                                provider = %self.provider,
+                                error = %provider_failure.message,
+                                "ACP provider reported terminal failure"
+                            );
+                            return Err(anyhow::Error::new(crate::AcpExecutionError::new(
+                                provider_failure.message,
+                                Some(receipt),
+                            )));
+                        }
                         for warning in residual_xcode_path_warnings_from_update(&parsed) {
                             let dedupe_key = format!(
                                 "{}\u{1f}{}\u{1f}{}",
@@ -4707,6 +4793,81 @@ mod tests {
             session_update_observation(&unknown_update),
             ("other", false, Some("unknown".to_string()))
         );
+    }
+
+    #[test]
+    fn junie_exit_payment_required_agent_failure_is_provider_quota() {
+        let update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "session-260516-192707-1rwl",
+                "event": {
+                    "state": "FAILED",
+                    "agentEvent": {
+                        "kind": "AgentFailureEvent",
+                        "message": "Junie: Insufficient Account Balance. All tokens on your balance are spent.",
+                        "errorCode": "ExitPaymentRequired"
+                    }
+                }
+            }
+        });
+
+        let failure = classify_provider_failure_event(&update, "junie").expect("provider failure");
+
+        assert_eq!(failure.failure_phase, "provider_quota");
+        assert!(failure.message.contains("provider quota/capacity failure"));
+        assert!(failure.message.contains("ExitPaymentRequired"));
+        assert!(failure.detail.contains("Insufficient Account Balance"));
+    }
+
+    #[test]
+    fn junie_provider_quota_detection_tolerates_wrapped_native_events() {
+        let update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "session-260516-192707-1rwl",
+                "update": {
+                    "type": "com.agentclientprotocol.rpc.JsonRpcNotification",
+                    "payload": {
+                        "event": {
+                            "agentEvent": {
+                                "kind": "AgentFailureEvent",
+                                "message": "Junie: Insufficient Account Balance. All tokens on your balance are spent.",
+                                "errorCode": "ExitPaymentRequired"
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            classify_provider_failure_event(&update, "junie")
+                .expect("wrapped provider failure")
+                .failure_phase,
+            "provider_quota"
+        );
+    }
+
+    #[test]
+    fn junie_provider_quota_detection_is_provider_scoped() {
+        let update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "event": {
+                    "agentEvent": {
+                        "kind": "AgentFailureEvent",
+                        "message": "Junie: Insufficient Account Balance. All tokens on your balance are spent.",
+                        "errorCode": "ExitPaymentRequired"
+                    }
+                }
+            }
+        });
+
+        assert!(classify_provider_failure_event(&update, "codex").is_none());
     }
 
     #[test]

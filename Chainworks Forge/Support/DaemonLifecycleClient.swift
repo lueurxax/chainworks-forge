@@ -727,6 +727,7 @@ struct DaemonLifecycleClient {
           isPoisoned
           lastError
           updatedAtMs
+          throttledUntilMs
           backlogRows
           backlogBytes
         }
@@ -757,6 +758,7 @@ struct DaemonLifecycleClient {
           reason
           message
         }
+        rollout
       }
     }
     """
