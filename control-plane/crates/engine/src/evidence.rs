@@ -5,13 +5,17 @@ use db::evidence_spool::write_spool_file;
 use db::repos::evidence_spool_refs::{
     insert_idempotent_via_dbwriter, EvidenceKind, EvidenceSpoolRef, EvidenceSpoolRefStatus,
 };
-use db::repos::{agent_execution_runtime_receipts, agent_executions, artifacts, stages};
+use db::repos::{
+    agent_execution_runtime_facts, agent_execution_runtime_receipts, agent_executions, artifacts,
+    stages,
+};
 use db::write_class::WriteResult;
 use db::writer::DbWriter;
 use domain::artifact::{Artifact, ArtifactFormat};
 use domain::ids::{AgentExecutionId, StageExecutionId};
 use domain::run::Run;
 use domain::stage::StageExecution;
+use domain::{agent::AgentOutputSettlement, agent::AgentStatus};
 
 pub struct FailedStageEvidenceInput<'a> {
     pub run: &'a Run,
@@ -259,6 +263,14 @@ pub async fn build_failed_stage_evidence_for_latest_execution(
     let Some(execution) = executions.last() else {
         return Ok(None);
     };
+    if latest_execution_has_valid_terminal_outputs(pool, execution).await? {
+        tracing::warn!(
+            stage_execution_id = %stage.id,
+            agent_execution_id = %execution.id,
+            "Refusing to build failed-stage evidence from historical failure because latest execution completed with valid outputs"
+        );
+        return Ok(None);
+    }
     build_and_persist_failed_stage_evidence(
         pool,
         FailedStageEvidenceInput {
@@ -277,14 +289,34 @@ pub async fn build_failed_stage_evidence_for_latest_execution(
     .map(Some)
 }
 
+async fn latest_execution_has_valid_terminal_outputs(
+    pool: &sqlx::SqlitePool,
+    execution: &domain::agent::AgentExecution,
+) -> Result<bool> {
+    if execution.status != AgentStatus::Completed {
+        return Ok(false);
+    }
+    let Some(facts) =
+        agent_execution_runtime_facts::find_by_execution_id(pool, execution.id).await?
+    else {
+        return Ok(false);
+    };
+    Ok(facts.failure_kind.is_none()
+        && facts.valid_required_outputs
+        && facts.output_settlement == AgentOutputSettlement::ValidOutputsFromCompletedExecution)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{agent_execution_runtime_receipts, agent_executions, ideas, runs, stages};
-    use domain::agent::{AgentExecution, AgentStatus};
+    use db::repos::{
+        agent_execution_runtime_facts, agent_execution_runtime_receipts, agent_executions, ideas,
+        runs, stages,
+    };
+    use domain::agent::{AgentExecution, AgentExecutionRuntimeFacts, AgentStatus};
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
     use domain::run::{Run, RunStatus};
@@ -550,5 +582,162 @@ mod tests {
             serde_json::json!(2)
         );
         assert!(full_packet["recovery_snapshot"].is_object());
+    }
+
+    #[tokio::test]
+    async fn latest_valid_execution_suppresses_historical_failed_stage_evidence() {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let db_writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, db_writer.clone())
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let failed_execution_id = AgentExecutionId::new();
+        let completed_execution_id = AgentExecutionId::new();
+        let now = Utc::now();
+
+        ideas::insert(
+            &pool,
+            &Idea {
+                id: idea_id,
+                title: "P086".into(),
+                body: "fan-in evidence guard".into(),
+                workspace_root_path: None,
+                project_key: None,
+                status: IdeaStatus::Active,
+                created_at: now,
+                archived_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let run = Run {
+            id: run_id,
+            idea_id,
+            status: RunStatus::Running,
+            workflow_id: "wf".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            artifact_root: tmp.path().join("artifacts").to_string_lossy().into_owned(),
+            started_at: now,
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: None,
+            review_routing_json: None,
+            closeout_readiness_mode: None,
+        };
+        runs::insert(&pool, &run).await.unwrap();
+        let stage = StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "state_10_implementation_refined".into(),
+            label: "Implementation refined".into(),
+            status: StageStatus::Failed,
+            iteration: 1,
+            attempt_number: 2,
+            settlement_kind: Some(StageSettlementKind::Failed),
+            started_at: now,
+            completed_at: Some(now),
+            owner_agent: Some("code_writer".into()),
+            provider: Some("claude".into()),
+            model: Some("sonnet".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+        for (id, status, completed_at) in [
+            (failed_execution_id, AgentStatus::Failed, Some(now)),
+            (completed_execution_id, AgentStatus::Completed, Some(now)),
+        ] {
+            agent_executions::insert(
+                &pool,
+                &AgentExecution {
+                    id,
+                    stage_execution_id: Some(stage_execution_id),
+                    agent_id: "code_writer".into(),
+                    provider: "claude".into(),
+                    model: Some("sonnet".into()),
+                    started_at: now,
+                    completed_at,
+                    status,
+                    owner_execution_lineage_id: None,
+                    session_lineage_id: None,
+                    session_generation_id: None,
+                    rehydrated_from_checkpoint_artifact_id: None,
+                    invocation_owner_key: None,
+                    session_reuse_scope: None,
+                    session_family_id: None,
+                    session_reuse_disposition: None,
+                    session_reset_reason: None,
+                    backend_profile_id: None,
+                    requested_mcp_extensions_json: None,
+                    predicted_mcp_extensions_json: None,
+                    predicted_mcp_runtime_ids_json: None,
+                    actual_mcp_extensions_json: None,
+                    actual_mcp_runtime_ids_json: None,
+                    denied_mcp_extensions_json: None,
+                    mcp_blocking_issues_json: None,
+                    actual_mcp_observation_json: None,
+                    actual_xcode_runtime_observation_json: None,
+                    mcp_session_startup_latency_ms: None,
+                    owner_kind: None,
+                    owner_id: None,
+                    lead_mediation_record_id: None,
+                    origin_stage_execution_id: None,
+                    total_cost_cents: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cached_input_tokens: None,
+                    transcript_artifact_id: None,
+                    actual_toolchain_mapping_diagnostics_json: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(completed_execution_id, now);
+        facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+        facts.valid_required_outputs = true;
+        agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .unwrap();
+
+        let artifact = build_failed_stage_evidence_for_latest_execution(&pool, &run, &stage, now)
+            .await
+            .unwrap();
+
+        assert!(artifact.is_none());
+        let stage = stages::find_by_id(&pool, stage_execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stage.evidence_packet_json.is_none());
     }
 }

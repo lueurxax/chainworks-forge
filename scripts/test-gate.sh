@@ -1173,11 +1173,10 @@ emit_forwarded_chainworks_env() {
   local key
   local -a allowed_chainworks_env=(
     CHAINWORKS_REMOTE_UI_TEST_HOSTS
-    CHAINWORKS_USE_UNSIGNED_UI_TESTS
-    CHAINWORKS_GUI_GATE_TIMEOUT_SECONDS
-    CHAINWORKS_CODESIGN_KEYCHAIN
-    CHAINWORKS_CODESIGN_KEYCHAIN_PASSWORD
-    CHAINWORKS_P013_UI_SUCCESS_GRACE_SECONDS
+	    CHAINWORKS_USE_UNSIGNED_UI_TESTS
+	    CHAINWORKS_GUI_GATE_TIMEOUT_SECONDS
+	    CHAINWORKS_CODESIGN_KEYCHAIN
+	    CHAINWORKS_P013_UI_SUCCESS_GRACE_SECONDS
     CHAINWORKS_P013_UI_HARD_TIMEOUT_SECONDS
     CHAINWORKS_P015_UI_SUCCESS_GRACE_SECONDS
     CHAINWORKS_P015_UI_HARD_TIMEOUT_SECONDS
@@ -1200,18 +1199,22 @@ run_gate_in_terminal_gui_session() {
   local gate_name="$1"
   local stamp command_path log_path rc_path resolved_unsigned_ui_tests
   stamp="$(make_stamp)"
-  command_path="$TMP_BASE/${gate_name}-${stamp}-gui.command"
-  log_path="$TMP_BASE/${gate_name}-${stamp}-gui.log"
-  rc_path="$TMP_BASE/${gate_name}-${stamp}-gui.rc"
-  mkdir -p "$TMP_BASE"
+	  command_path="$TMP_BASE/${gate_name}-${stamp}-gui.command"
+	  log_path="$TMP_BASE/${gate_name}-${stamp}-gui.log"
+	  rc_path="$TMP_BASE/${gate_name}-${stamp}-gui.rc"
+	  mkdir -p "$TMP_BASE"
+	  chmod 700 "$TMP_BASE" 2>/dev/null || true
 
-  if should_use_unsigned_ui_tests; then
-    resolved_unsigned_ui_tests=1
-  else
-    resolved_unsigned_ui_tests=0
-  fi
+	  if should_use_unsigned_ui_tests; then
+	    resolved_unsigned_ui_tests=1
+	  else
+	    resolved_unsigned_ui_tests=0
+	  fi
+	  if [[ -n ${CHAINWORKS_CODESIGN_KEYCHAIN_PASSWORD+x} ]]; then
+	    prepare_codesign_keychain
+	  fi
 
-  {
+	  {
     printf '#!/bin/zsh\n'
     printf 'cd %q || exit 97\n' "$ROOT_DIR"
     printf 'export CHAINWORKS_GUI_SESSION_WRAPPED=1\n'
@@ -1425,51 +1428,6 @@ if violations:
 PY
 }
 
-guard_xcode_cargo_cache_policy() {
-  log "Guard: Xcode Rust builds use shared Cargo cache policy"
-  python3 - "$ROOT_DIR" <<'PY'
-from pathlib import Path
-import sys
-
-root = Path(sys.argv[1])
-helper = root / "scripts" / "cargo-cache-env.sh"
-embed = root / "scripts" / "embed-control-plane-daemon.sh"
-violations = []
-
-if not helper.exists():
-    violations.append("missing scripts/cargo-cache-env.sh")
-else:
-    helper_text = helper.read_text(encoding="utf-8")
-    required_helper_fragments = [
-        "Library/Caches/Chainworks Forge/cargo-target",
-        "CHAINWORKS_XCODE_CARGO_TARGET_DIR",
-        "CHAINWORKS_SHARED_CARGO_TARGET_DIR",
-        "RUSTC_WRAPPER",
-        "sccache",
-    ]
-    for fragment in required_helper_fragments:
-        if fragment not in helper_text:
-            violations.append(f"cargo-cache-env.sh missing {fragment!r}")
-
-if not embed.exists():
-    violations.append("missing scripts/embed-control-plane-daemon.sh")
-else:
-    embed_text = embed.read_text(encoding="utf-8")
-    if 'source "${SRCROOT}/scripts/cargo-cache-env.sh"' not in embed_text:
-        violations.append("embed-control-plane-daemon.sh does not source cargo-cache-env.sh")
-    if "${TARGET_TEMP_DIR}/cargo-target" in embed_text:
-        violations.append("embed-control-plane-daemon.sh still defaults Cargo target to TARGET_TEMP_DIR")
-    if "${CARGO_TARGET_DIR}/${PROFILE_DIR}/control-plane" not in embed_text:
-        violations.append("embed-control-plane-daemon.sh does not copy from CARGO_TARGET_DIR profile output")
-
-if violations:
-    print("Xcode Cargo cache policy violations:", file=sys.stderr)
-    for violation in violations:
-        print(f"  {violation}", file=sys.stderr)
-    sys.exit(1)
-PY
-}
-
 guard_portability_paths() {
   log "Guard: portability-sensitive sources avoid hardcoded user paths"
   python3 - "$ROOT_DIR/Chainworks Forge" "$ROOT_DIR/Chainworks ForgeTests" <<'PY'
@@ -1518,6 +1476,51 @@ if violations:
     print("Portability violations:", file=sys.stderr)
     for v in violations:
         print(f"  {v}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+guard_xcode_cargo_cache_policy() {
+  log "Guard: Xcode Rust builds use shared Cargo cache policy"
+  python3 - "$ROOT_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+helper = root / "scripts" / "cargo-cache-env.sh"
+embed = root / "scripts" / "embed-control-plane-daemon.sh"
+violations = []
+
+if not helper.exists():
+    violations.append("missing scripts/cargo-cache-env.sh")
+else:
+    helper_text = helper.read_text(encoding="utf-8")
+    required_helper_fragments = [
+        "Library/Caches/Chainworks Forge/cargo-target",
+        "CHAINWORKS_XCODE_CARGO_TARGET_DIR",
+        "CHAINWORKS_SHARED_CARGO_TARGET_DIR",
+        "RUSTC_WRAPPER",
+        "sccache",
+    ]
+    for fragment in required_helper_fragments:
+        if fragment not in helper_text:
+            violations.append(f"cargo-cache-env.sh missing {fragment!r}")
+
+if not embed.exists():
+    violations.append("missing scripts/embed-control-plane-daemon.sh")
+else:
+    embed_text = embed.read_text(encoding="utf-8")
+    if 'source "${SRCROOT}/scripts/cargo-cache-env.sh"' not in embed_text:
+        violations.append("embed-control-plane-daemon.sh does not source cargo-cache-env.sh")
+    if "${TARGET_TEMP_DIR}/cargo-target" in embed_text:
+        violations.append("embed-control-plane-daemon.sh still defaults Cargo target to TARGET_TEMP_DIR")
+    if "${CARGO_TARGET_DIR}/${PROFILE_DIR}/control-plane" not in embed_text:
+        violations.append("embed-control-plane-daemon.sh does not copy from CARGO_TARGET_DIR profile output")
+
+if violations:
+    print("Xcode Cargo cache policy violations:", file=sys.stderr)
+    for violation in violations:
+        print(f"  {violation}", file=sys.stderr)
     sys.exit(1)
 PY
 }
@@ -2269,7 +2272,7 @@ Available gates:
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
   proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
-  proposal-087|p087  Proposal 087 projection-only hot read and MCP liveness gate
+  proposal-087|p087  Proposal 087 read-path liveness and storage tiering gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
   proposal-091|p091  Retained P091 targeted retry authority runtime proof gate
@@ -5517,7 +5520,7 @@ PLIST
       cargo test -p engine --test integration blocked_implementation_assessment_synthesizes_release_hold_review_summary -- --exact --nocapture &&
       cargo test -p graphql-server run_query_exposes_implementation_self_assessment_summary -- --nocapture &&
       cargo test -p mcp-server runs_get_returns_implementation_self_assessment_summary -- --nocapture &&
-      cargo test -p mcp-server runs_list_includes_implementation_self_assessment_summary -- --nocapture
+      cargo test -p mcp-server runs_get_includes_implementation_self_assessment_summary -- --nocapture
     )
     run_targeted_tests "proposal-054" "${PROPOSAL_054_SWIFT_TESTS[@]}"
     log "Proposal 054 gate passed"
@@ -6420,96 +6423,6 @@ for forbidden in ["reconcile", "retry", "clear", "push", "upload", "publish", "m
         raise SystemExit(f"proposal-078: macOS accessibility proof missing forbidden control check {forbidden}")
 PY
     log "Proposal 078 durable side-effect ledger gate passed"
-    ;;
-  proposal-087|p087)
-    log "Proposal 087 gate: projection-only hot reads and MCP liveness"
-    python3 - <<'PY'
-from pathlib import Path
-
-root = Path.cwd()
-runs_rs = root / "control-plane/crates/mcp-server/src/tools/runs.rs"
-runs_text = runs_rs.read_text()
-list_start = runs_text.index('"runs.list" => {')
-list_end = runs_text.index('\n        }\n\n        "runs.cancel"', list_start)
-list_block = runs_text[list_start:list_end]
-for forbidden in [
-    "attach_implementation_self_assessment_summary",
-    "attach_closeout_readiness_summary",
-    "build_side_effect_readback",
-    "load_closeout_readiness_summary",
-    "list_canonical_by_run",
-    "find_active_implementation_self_assessment_summary",
-]:
-    if forbidden in list_block:
-        raise SystemExit(f"proposal-087: runs.list still performs detail attachment via {forbidden}")
-if "projections::list_active_projection" not in list_block:
-    raise SystemExit("proposal-087: runs.list must read active runs through projection repo")
-
-schema_rs = root / "control-plane/crates/graphql-server/src/schema.rs"
-schema_text = schema_rs.read_text()
-runs_start = schema_text.index("async fn runs(&self")
-runs_end = schema_text.index("async fn run(&self", runs_start)
-gql_runs_block = schema_text[runs_start:runs_end]
-for forbidden in [
-    "runs_with_latest_summaries",
-    "run_with_latest_summary",
-    "enrich_run_with_artifact_contracts",
-    "find_active_implementation_self_assessment_summary",
-    "load_closeout_readiness_summary",
-    "list_canonical_by_run",
-]:
-    if forbidden in gql_runs_block:
-        raise SystemExit(f"proposal-087: GraphQL runs list still performs detail enrichment via {forbidden}")
-if "projections::list_active_projection" not in gql_runs_block:
-    raise SystemExit("proposal-087: GraphQL runs list must read active runs through projection repo")
-
-projections_rs = root / "control-plane/crates/db/src/repos/projections.rs"
-projection_text = projections_rs.read_text()
-for required in [
-    "implementation_self_assessment_summary_json",
-    "implementation_completion_json",
-    "closeout_readiness_summary_json",
-    "project_implementation_completion",
-]:
-    if required not in projection_text:
-        raise SystemExit(f"proposal-087: run projection missing hot-read payload {required}")
-
-storage_health_rs = root / "control-plane/crates/db/src/repos/storage_health.rs"
-storage_health_text = storage_health_rs.read_text()
-for required in [
-    "runtimeHealthProjection",
-    "artifactNoiseProjection",
-    "readPath",
-    "record_runs_list_read_latency",
-    "record_mcp_liveness_gate_duration",
-]:
-    if required not in storage_health_text:
-        raise SystemExit(f"proposal-087: storage health missing read-path/runtime projection {required}")
-
-mcp_tools_mod = root / "control-plane/crates/mcp-server/src/tools/mod.rs"
-mcp_tools_text = mcp_tools_mod.read_text()
-if "runtime.health" not in mcp_tools_text:
-    raise SystemExit("proposal-087: MCP registry must expose runtime.health")
-
-graphql_storage_rs = root / "control-plane/crates/graphql-server/src/types/storage.rs"
-graphql_storage_text = graphql_storage_rs.read_text()
-if "GqlStorageReadPathHealth" not in graphql_storage_text or "read_path" not in graphql_storage_text:
-    raise SystemExit("proposal-087: GraphQL storage health must expose readPath metrics")
-PY
-    (
-      cd control-plane
-      CARGO_TARGET_DIR=target/proposal-087-gate cargo test -p mcp-server --test proposal_077_closeout_readback_parity runs_list_uses_projected_p077_closeout_summary_without_detail_lookup -- --exact --nocapture
-      CARGO_TARGET_DIR=target/proposal-087-gate cargo test -p mcp-server --test proposal_088_code_writer_completion_readback proposal_088_mcp_runs_list_uses_projected_implementation_completion_without_receipt_lookup -- --exact --nocapture
-      CARGO_TARGET_DIR=target/proposal-087-gate cargo test -p mcp-server runs_list_includes_implementation_self_assessment_summary -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-087-gate cargo test -p mcp-server runs_list_records_production_read_latency_metric -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-087-gate cargo test -p mcp-server proposal_087_runs_list_p95_stays_under_budget_from_projection -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-087-gate cargo test -p mcp-server tools_list_records_mcp_liveness_duration_metric -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-087-gate cargo test -p mcp-server proposal_087_runtime_health_returns_projection_backed_summary -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-087-gate cargo test -p mcp-server proposal_087_mcp_liveness_gate_covers_required_read_sequence -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-087-gate cargo test -p db storage_health_exposes_p087_runtime_and_artifact_noise_projections -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-087-gate cargo test -p graphql-server proposal_087_storage_health_exposes_read_path_metrics -- --nocapture
-    )
-    log "Proposal 087 gate passed"
     ;;
   proposal-088|p088)
     log "Proposal 088 gate: code-writer completion handoff and diagnostics"
@@ -7919,6 +7832,434 @@ PY
     )
     run_targeted_tests "proposal-085" "${PROPOSAL_085_SWIFT_TESTS[@]}"
     log "Proposal 085 gate passed"
+    ;;
+  proposal-087|p087)
+    log "Proposal 087 gate: read-path liveness and storage tiering"
+    python3 - <<'PY'
+from pathlib import Path
+import sys
+
+migrations = Path("control-plane/crates/db/migrations")
+seen = {}
+for path in migrations.glob("*.sql"):
+    version = path.name.split("_", 1)[0]
+    if version in seen:
+        print(f"FAILED: duplicate DB migration version {version}: {seen[version].name}, {path.name}")
+        sys.exit(1)
+    seen[version] = path
+print("P087 DB migration versions verified")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      run_p087_cargo_test() {
+        local output status
+        set +e
+        output=$(CARGO_TARGET_DIR=target/proposal-087-gate cargo test "$@" 2>&1)
+        status=$?
+        set -e
+        printf '%s\n' "$output"
+        if [ "$status" -ne 0 ]; then
+          return "$status"
+        fi
+        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
+          echo "FAILED: P087 cargo test filter selected zero tests: cargo test $*" >&2
+          return 1
+        fi
+      }
+
+      # P087 Backend: Test CAS repair/audit, hot-read circuit, metrics, invalidation, and auth/tool registry.
+      run_p087_cargo_test -p db proposal_087 -- --nocapture
+      run_p087_cargo_test -p mcp-server proposal_087 -- --nocapture
+      run_p087_cargo_test -p mcp-server runs_get_and_list_expose_p077_documented_and_legacy_closeout_summary_names -- --nocapture
+      run_p087_cargo_test -p mcp-server proposal_088_mcp_runs_get_and_list_expose_implementation_completion -- --nocapture
+      run_p087_cargo_test -p auth proposal_087 -- --nocapture
+      run_p087_cargo_test -p engine --test integration proposal_087 -- --nocapture
+      run_p087_cargo_test -p graphql-server --lib storage_health_v1 -- --nocapture
+      run_p087_cargo_test -p graphql-server --lib proposal_087 -- --nocapture
+    )
+    # P087 UI: Verify projection lag tokens in the Swift read model.
+python3 - <<'PY'
+import json
+import sys
+from pathlib import Path
+root = Path.cwd()
+test_gate = (root / "scripts/test-gate.sh").read_text()
+env_forwarder = test_gate[
+    test_gate.index("emit_forwarded_chainworks_env()"):
+    test_gate.index("run_gate_in_terminal_gui_session()")
+]
+if "CHAINWORKS_CODESIGN_KEYCHAIN_PASSWORD" in env_forwarder:
+    print("FAILED: GUI gate env forwarder must not write keychain passwords into .command files")
+    sys.exit(1)
+
+# 1. Verify UI visual tokens
+view_file = root / "Chainworks Forge/Views/RunsHomeView.swift"
+if not view_file.exists():
+    print(f"FAILED: Missing {view_file}")
+    sys.exit(1)
+content = view_file.read_text()
+if "case .projectionLag:" not in content or "Projection lag" not in content:
+    print("FAILED: RunsHomeView.swift missing P087 projection lag visual tokens")
+    sys.exit(1)
+
+# 2. Verify Swift diagnostics query includes additive fields
+diag_file = root / "Chainworks Forge/Support/DaemonLifecycleClient.swift"
+if not diag_file.exists():
+    print(f"FAILED: Missing {diag_file}")
+    sys.exit(1)
+diag_content = diag_file.read_text()
+for field in ["projectionFreshness", "hotReadGuards", "maintenanceOperations", "wouldOpen", "backlogRows", "throttledUntilMs"]:
+    if field not in diag_content:
+        print(f"FAILED: DaemonLifecycleClient.swift missing P087 diagnostics field: {field}")
+        sys.exit(1)
+
+# 3. Verify write-operation-registry includes P087 lifecycle operations
+registry_file = root / "control-plane/crates/db/write-operation-registry.toml"
+if not registry_file.exists():
+    print(f"FAILED: Missing {registry_file}")
+    sys.exit(1)
+registry_content = registry_file.read_text()
+for op in [
+    "maintenance.reaper",
+    "maintenance.repair_slot_poisoned",
+    "projection.invalidation.mark_consumed",
+    "projection.invalidation.reap",
+]:
+    if f"operation_name = \"{op}\"" not in registry_content:
+        print(f"FAILED: write-operation-registry.toml missing {op}")
+        sys.exit(1)
+
+# 3. Verify GraphQL schema for additive fields and optional filters
+schema_file = root / "control-plane/crates/graphql-server/src/types/storage.rs"
+if not schema_file.exists():
+    print(f"FAILED: Missing {schema_file}")
+    sys.exit(1)
+schema_content = schema_file.read_text()
+if "#[graphql(default)] projection_name: Option<String>" not in schema_content:
+    print("FAILED: GraphQL storage schema missing optional projection_name filter with default")
+    sys.exit(1)
+if "pub would_open: bool" not in schema_content:
+    print("FAILED: GraphQL storage schema missing would_open field")
+    sys.exit(1)
+if "pub rollout: serde_json::Value" not in schema_content:
+    print("FAILED: GraphQL storage schema missing rollout field")
+    sys.exit(1)
+if "pub throttled_until_ms: Option<i64>" not in schema_content:
+    print("FAILED: GraphQL storage schema missing projection throttled_until_ms readback")
+    sys.exit(1)
+
+artifact_schema = (root / "control-plane/crates/graphql-server/src/types/artifact.rs").read_text()
+if "artifact_metadata_pointer" not in artifact_schema or "artifact_metadata_pointer.v1" not in artifact_schema:
+    print("FAILED: GraphQL artifact metadata missing P087 pointer contract")
+    sys.exit(1)
+mcp_server = (root / "control-plane/crates/mcp-server/src/server.rs").read_text()
+if '"artifact_metadata_pointer"' not in mcp_server or '"file_path": art.file_path' in mcp_server:
+    print("FAILED: MCP artifact resource metadata leaks file_path or misses pointer contract")
+    sys.exit(1)
+
+# 4. Verify P087 Evidence Fixtures
+evidence_dir = root / "docs/evidence/p087/api"
+required_fixtures = [
+    "graphql-storage-health-existing-projections-unchanged.fixture.json",
+    "graphql-storage-health-projection-freshness-additive.fixture.json",
+    "graphql-storage-health-projections-type-negative.fixture.json",
+    "artifact-metadata-pointer-v1.fixture.json",
+    "mcp-storage-health-compatibility.fixture.json",
+    "mcp-storage-health-typed-error.fixture.json"
+]
+fixtures = {}
+for fixture in required_fixtures:
+    path = evidence_dir / fixture
+    if not path.exists():
+        print(f"FAILED: Missing P087 evidence fixture: {fixture}")
+        sys.exit(1)
+    fixtures[fixture] = json.loads(path.read_text())
+
+projection_freshness = fixtures["graphql-storage-health-projection-freshness-additive.fixture.json"]["data"]["storageHealth"]["projectionFreshness"][0]
+for field in ["projectionName", "sourceName", "watermarkMs", "isPoisoned", "updatedAtMs", "throttledUntilMs", "backlogRows", "backlogBytes"]:
+    if field not in projection_freshness:
+        print(f"FAILED: P087 projection freshness fixture missing {field}")
+        sys.exit(1)
+
+legacy_projection = fixtures["graphql-storage-health-existing-projections-unchanged.fixture.json"]["data"]["storageHealth"]["projections"]
+for field in ["pendingInvalidations", "projectionLagMs", "latencyMs", "rebuildDurationP95Ms", "coalescedKeysPending", "coalescedMergedTotal", "coalescedFlushAgeP95Ms"]:
+    if field not in legacy_projection:
+        print(f"FAILED: P087 legacy projections fixture missing {field}")
+        sys.exit(1)
+
+mcp_compat = fixtures["mcp-storage-health-compatibility.fixture.json"]["response"]
+if mcp_compat.get("isError") is not False:
+    print("FAILED: P087 MCP storage.health compatibility fixture must be a successful tool result")
+    sys.exit(1)
+if "hotRead" not in mcp_compat.get("result", {}):
+    print("FAILED: P087 MCP storage.health compatibility fixture missing hotRead metadata")
+    sys.exit(1)
+
+mcp_error = fixtures["mcp-storage-health-typed-error.fixture.json"]["response"]
+if mcp_error.get("isError") is not False or "error" in mcp_error:
+    print("FAILED: P087 MCP typed error fixture must be a typed tool-result body, not JSON-RPC -32603")
+    sys.exit(1)
+content = mcp_error.get("result", {}).get("content", [])
+if not content or content[0].get("type") != "text":
+    print("FAILED: P087 MCP typed error fixture missing content[0].text")
+    sys.exit(1)
+try:
+    typed_body = json.loads(content[0]["text"])
+except Exception as exc:
+    print(f"FAILED: P087 MCP typed error content text is not JSON: {exc}")
+    sys.exit(1)
+for field in ["error", "errorCode", "tool", "requestId", "retryAfterMs", "hotRead"]:
+    if field not in typed_body:
+        print(f"FAILED: P087 MCP typed error body missing {field}")
+        sys.exit(1)
+if typed_body.get("error") is not True or typed_body.get("errorCode") != "hot_read_circuit_open":
+    print("FAILED: P087 MCP typed error body has wrong error/errorCode")
+    sys.exit(1)
+
+pointer = fixtures["artifact-metadata-pointer-v1.fixture.json"]
+if pointer.get("schemaVersion") != "artifact_metadata_pointer.v1" or pointer.get("payloadPathRedacted") is not True:
+    print("FAILED: P087 artifact metadata pointer fixture missing redacted pointer contract")
+    sys.exit(1)
+for forbidden in ["absolutePath", "filesystemPath", "rawPayload"]:
+    if forbidden not in pointer.get("forbiddenFields", []):
+        print(f"FAILED: P087 artifact pointer fixture missing forbidden field {forbidden}")
+        sys.exit(1)
+
+# 5. Verify Rollout Contract Evidence
+rollout_fixture = root / "docs/evidence/rollout-contract/operator-readback/p087-storage-tiering-full-surface.fixture.json"
+if not rollout_fixture.exists():
+    print(f"FAILED: Missing P087 rollout contract fixture")
+    sys.exit(1)
+rollout = json.loads(rollout_fixture.read_text())
+if rollout.get("rollout_contract_status") != "pass":
+    print("FAILED: P087 rollout contract fixture is still a placeholder or incomplete")
+    sys.exit(1)
+required_rollout_fields = [
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps",
+]
+for field in required_rollout_fields:
+    if field not in rollout:
+        print(f"FAILED: P087 rollout contract fixture missing {field}")
+        sys.exit(1)
+graphql_lane = rollout["parity_lanes"]["graphql"]
+mcp_lane = rollout["parity_lanes"]["mcp"]
+for lane in ["graphql", "mcp", "run_report", "release_receipt"]:
+    if lane not in rollout["parity_lanes"]:
+        print(f"FAILED: P087 rollout fixture missing parity lane {lane}")
+        sys.exit(1)
+for field in [
+    "p087_storage_tiering_status",
+    "p087_mcp_liveness_status",
+    "p087_runs_list_projection_only_status",
+    "p087_projection_rebuild_status",
+    "p087_hot_read_enforcement_status",
+    "p087_storage_exit_threshold_status",
+    "p087_graphql_storage_health_compatibility_status",
+    "p087_per_tool_circuit_state",
+    "p087_per_projection_freshness",
+    "p087_projection_invalidation_backlog_status",
+    "p087_restart_reaper_last_run",
+    "p087_maintenance_active_count",
+    "p087_would_open_rate",
+    "p087_total_requests_min",
+    "p087_flap_free_hours_min",
+    "p087_promotion_budget_met",
+    "p087_per_surface_promotion_budget",
+]:
+    if field not in graphql_lane:
+        print(f"FAILED: P087 rollout GraphQL lane missing {field}")
+        sys.exit(1)
+for field in [
+    "p087_mcp_wire_compatibility_status",
+    "p087_mcp_liveness_status",
+    "p087_hot_read_enforcement_status",
+    "p087_maintenance_active_count",
+    "p087_would_open_rate",
+    "p087_total_requests_min",
+    "p087_flap_free_hours_min",
+    "p087_promotion_budget_met",
+]:
+    if field not in mcp_lane:
+        print(f"FAILED: P087 rollout MCP lane missing {field}")
+        sys.exit(1)
+for lane_name, lane in rollout["parity_lanes"].items():
+    snake_required = [
+        "rollout_contract_status",
+        "rollout_contract_decision",
+        "rollout_contract_failure_reasons",
+        "rollout_contract_waiver_state",
+        "rollout_contract_waiver_expires_at",
+        "rollout_contract_enforcement_mode",
+        "rollout_contract_enforcement_mode_reason",
+        "rollout_contract_hold_conditions",
+        "rollout_contract_rollback_disposition",
+        "rollout_contract_source_lane",
+        "rollout_contract_enabled_state",
+        "rollout_contract_disabled_reason_code",
+        "rollout_contract_action_id",
+        "rollout_contract_operator_message",
+        "rollout_contract_projection_integrity",
+        "rollout_contract_cutover_policy_revision",
+        "rollout_contract_diagnostic_redaction",
+        "rollout_contract_next_steps",
+    ]
+    camel_required = [
+        "rolloutContractStatus",
+        "rolloutContractDecision",
+        "rolloutContractFailureReasons",
+        "rolloutContractWaiverState",
+        "rolloutContractWaiverExpiresAt",
+        "rolloutContractEnforcementMode",
+        "rolloutContractEnforcementModeReason",
+        "rolloutContractHoldConditions",
+        "rolloutContractRollbackDisposition",
+        "rolloutContractSourceLane",
+        "rolloutContractEnabledState",
+        "rolloutContractDisabledReasonCode",
+        "rolloutContractActionId",
+        "rolloutContractOperatorMessage",
+        "rolloutContractProjectionIntegrity",
+        "rolloutContractCutoverPolicyRevision",
+        "rolloutContractDiagnosticRedaction",
+        "rolloutContractNextSteps",
+    ]
+    expected = camel_required if lane_name == "graphql" else snake_required
+    for field in expected:
+        if field not in lane:
+            print(f"FAILED: P087 rollout {lane_name} lane missing {field}")
+            sys.exit(1)
+# Rollout "pass" must only appear when the promotion budget is met
+if rollout.get("rollout_contract_status") == "pass" and not rollout.get("p087_promotion_budget_met"):
+    print("FAILED: P087 rollout fixture claims rollout_contract_status=pass but p087_promotion_budget_met is false or missing")
+    sys.exit(1)
+if graphql_lane.get("rolloutContractStatus") == "pass" and not graphql_lane.get("p087_promotion_budget_met"):
+    print("FAILED: P087 rollout GraphQL lane claims rolloutContractStatus=pass but p087_promotion_budget_met is false or missing")
+    sys.exit(1)
+if mcp_lane.get("rollout_contract_status") == "pass" and not mcp_lane.get("p087_promotion_budget_met"):
+    print("FAILED: P087 rollout MCP lane claims rollout_contract_status=pass but p087_promotion_budget_met is false or missing")
+    sys.exit(1)
+
+# p087_per_surface_promotion_budget must enumerate all 6 canonical governed surfaces
+canonical_surfaces = {"initialize", "runs.list", "tools.list", "runtime.health", "storage.health", "artifacts.metadata.get"}
+graphql_per_surface = graphql_lane.get("p087_per_surface_promotion_budget", [])
+present_surfaces = {s["governed_surface"] for s in graphql_per_surface if isinstance(s, dict)}
+missing_surfaces = canonical_surfaces - present_surfaces
+if missing_surfaces:
+    print(f"FAILED: P087 rollout GraphQL lane p087_per_surface_promotion_budget is missing canonical surfaces: {sorted(missing_surfaces)}")
+    sys.exit(1)
+
+# MCP compat fixture must use current ProjectionFreshnessV1 field names
+mcp_compat_result = fixtures["mcp-storage-health-compatibility.fixture.json"]["response"]["result"]
+for pf_entry in mcp_compat_result.get("projectionFreshness", []):
+    for stale_field in ("freshnessMs", "backlogCount"):
+        if stale_field in pf_entry:
+            print(f"FAILED: P087 MCP compat fixture projectionFreshness uses stale field '{stale_field}' (should use updatedAtMs/backlogRows/backlogBytes)")
+            sys.exit(1)
+    for required_pf_field in ("updatedAtMs", "backlogRows", "backlogBytes"):
+        if required_pf_field not in pf_entry:
+            print(f"FAILED: P087 MCP compat fixture projectionFreshness missing required field '{required_pf_field}'")
+            sys.exit(1)
+
+required_metrics = set(rollout.get("required_metrics", []))
+for metric in [
+    "db_writer_alive",
+    "db_writer_queue_depth_by_lane",
+    "db_writer_write_rejection_total_by_lane",
+    "db_writer_write_wait_ms_p50",
+    "db_writer_write_wait_ms_p95",
+    "db_writer_write_wait_ms_p99",
+    "db_writer_transaction_duration_ms_p50",
+    "db_writer_transaction_duration_ms_p95",
+    "db_writer_transaction_duration_ms_p99",
+    "sqlite_wal_size_bytes",
+    "sqlite_checkpoint_duration_ms",
+    "sqlite_checkpoint_failed_total",
+    "evidence_spool_bytes_written_total",
+    "evidence_spool_orphan_count",
+    "projection_lag_count",
+    "projection_rebuild_duration_ms",
+    "runs_list_read_latency_ms",
+    "mcp_liveness_gate_duration_ms",
+]:
+    if metric not in required_metrics:
+        print(f"FAILED: P087 rollout fixture missing required metric {metric}")
+        sys.exit(1)
+
+metrics_file = root / "control-plane/crates/db/src/metrics.rs"
+metrics_content = metrics_file.read_text()
+for metric in required_metrics:
+    if metric not in metrics_content:
+        print(f"FAILED: P087 required metric not declared in metrics.rs: {metric}")
+        sys.exit(1)
+
+tools_mod = (root / "control-plane/crates/mcp-server/src/tools/mod.rs").read_text()
+for tool_id in ["StorageProjectionsClearBacklog", "StorageProjectionsClearPoison"]:
+    if f"CapabilityToolId::{tool_id}" not in tools_mod:
+        print(f"FAILED: P087 projection maintenance tool missing from tools/list capability inventory: {tool_id}")
+        sys.exit(1)
+
+negative_dir = root / "docs/evidence/rollout-contract/negative"
+for negative in negative_dir.glob("p087-*.json"):
+    text = negative.read_text()
+    if "placeholder" in text.lower():
+        print(f"FAILED: P087 negative fixture still contains placeholder text: {negative.name}")
+        sys.exit(1)
+    payload = json.loads(text)
+    for field in ["proposal_id", "negative_case", "input", "expected_decision", "expected_failure_code"]:
+        if field not in payload:
+            print(f"FAILED: P087 negative fixture {negative.name} missing {field}")
+            sys.exit(1)
+
+# 6. Verify production wiring of invalidation log (P087)
+db_repos = root / "control-plane/crates/db/src/repos"
+runs_repo = (db_repos / "runs.rs").read_text()
+if "invalidate_projections_terminal" not in runs_repo:
+    print("FAILED: runs.rs missing P087 invalidate_projections_terminal wiring")
+    sys.exit(1)
+
+proj_repo = (db_repos / "projections.rs").read_text()
+for call in ["mark_consumed_entity_tx", "mark_consumed_tx"]:
+    if call not in proj_repo:
+        print(f"FAILED: projections.rs missing P087 {call} wiring")
+        sys.exit(1)
+
+# 7. Verify P087 readback fields are wired into production run_report and release_receipt lanes
+reports_rs = (root / "control-plane/crates/mcp-server/src/tools/reports.rs").read_text()
+if "p087_rollout_readback_fields" not in reports_rs:
+    print("FAILED: reports.rs missing P087 rollout readback fields wiring for run_report lane")
+    sys.exit(1)
+
+executor_rs = (root / "control-plane/crates/engine/src/executor.rs").read_text()
+if "p087_rollout_readback_fields" not in executor_rs:
+    print("FAILED: executor.rs missing P087 rollout readback fields wiring for release_receipt lane")
+    sys.exit(1)
+
+# 8. Verify promotion budget enumerates canonical governed surfaces
+storage_health_rs = (db_repos / "storage_health.rs").read_text()
+if "CANONICAL_HOT_READ_SURFACES" not in storage_health_rs:
+    print("FAILED: storage_health.rs missing CANONICAL_HOT_READ_SURFACES enumeration for promotion budget")
+    sys.exit(1)
+
+print("P087 UI, schema, and evidence verified")
+PY
+    log "Proposal 087 gate passed"
     ;;
   *)
     print_usage >&2

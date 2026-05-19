@@ -18,14 +18,15 @@ pub enum CapabilityToolId {
     ApprovalsResolve,
     StagesRetry,
     WorkflowConflictsResolve,
+    WorkflowLoopBudgetExtend,
     LegacyDiscoveryOverrideCreate,
     ReportsGet,
     ArtifactsOverrideContract,
     StewardRunAnalysis,
     StewardListAnalyses,
     StewardGetAnalysis,
-    StorageHealth,
     RuntimeHealth,
+    StorageHealth,
     StorageWritePressure,
     StorageEvidenceSpoolSummary,
     StorageReconcileEvidenceOrphans,
@@ -43,6 +44,12 @@ pub enum CapabilityToolId {
     EffectsMarkUnrecoverable,
     /// P078: clear an effect after manual operator verification.
     EffectsClearAfterManualVerification,
+    /// P087: repair an orphaned maintenance slot.
+    StorageMaintenanceRepairSlot,
+    /// P087: clear projection invalidation backlog.
+    StorageProjectionsClearBacklog,
+    /// P087: clear projection poison flag.
+    StorageProjectionsClearPoison,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]

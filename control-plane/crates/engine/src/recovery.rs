@@ -459,6 +459,28 @@ impl RecoveryService {
                     );
                 }
             }
+            match self
+                .recover_completed_normal_invokes_blocked_by_stale_targeted_authority_for_run(run)
+                .await
+            {
+                Ok(recovered) => {
+                    if recovered > 0 {
+                        work_items_requeued += recovered;
+                        warn!(
+                            run_id = %run.id,
+                            recovered = recovered,
+                            "Startup recovery completed normal InvokeAgent items blocked by stale targeted retry authority"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run.id,
+                        error = %e,
+                        "Failed to recover normal InvokeAgent items blocked by stale targeted retry authority during startup"
+                    );
+                }
+            }
         }
         let requeued_steward_analyses = work_items::requeue_running_steward_analysis_on_startup(
             &self.pool,
@@ -471,6 +493,19 @@ impl RecoveryService {
             warn!(
                 requeued = requeued_steward_analyses,
                 "Startup recovery requeued abandoned StewardAnalysis work items"
+            );
+        }
+        let completed_invoke_agents =
+            work_items::complete_running_invoke_agents_with_terminal_valid_outputs_on_startup(
+                &self.pool,
+                "startup_repair_completed_agent_valid_outputs",
+            )
+            .await?;
+        if completed_invoke_agents > 0 {
+            work_items_requeued += completed_invoke_agents as usize;
+            warn!(
+                completed = completed_invoke_agents,
+                "Startup recovery completed InvokeAgent work items whose agent executions already had valid outputs"
             );
         }
         let requeued_invoke_agents = work_items::requeue_running_invoke_agent_on_startup(
@@ -574,13 +609,6 @@ impl RecoveryService {
                     );
                 }
             }
-            if let Err(e) = rebuild_operator_read_projections(&self.pool, run.id).await {
-                warn!(
-                    run_id = %run.id,
-                    error = %e,
-                    "Failed to rebuild operator read projections during startup"
-                );
-            }
             match self.repair_run(run).await {
                 Ok(requeued) => {
                     if requeued > 0 {
@@ -591,6 +619,13 @@ impl RecoveryService {
                 Err(e) => {
                     warn!(run_id = %run.id, error = %e, "Failed to repair run during startup");
                 }
+            }
+            if let Err(e) = rebuild_startup_read_projections(&self.pool, run.id).await {
+                warn!(
+                    run_id = %run.id,
+                    error = %e,
+                    "Failed to rebuild startup read projections"
+                );
             }
             if repaired_run {
                 runs_repaired += 1;
@@ -942,6 +977,62 @@ impl RecoveryService {
             projections::rebuild_all_for_run(&self.pool, run.id).await?;
         }
         Ok(repaired)
+    }
+
+    async fn recover_completed_normal_invokes_blocked_by_stale_targeted_authority_for_run(
+        &self,
+        run: &Run,
+    ) -> Result<usize> {
+        let rows = sqlx::query(
+            r#"
+            SELECT wi.id
+            FROM work_items wi
+            JOIN retry_stage_execution_authorities rsa
+              ON rsa.run_id = ?1
+             AND rsa.target_stage_execution_id = json_extract(wi.payload_json, '$.stage_execution_id')
+             AND rsa.authority_state = 'active'
+             AND rsa.source_invoke_work_item_id IS NOT NULL
+             AND rsa.source_invoke_work_item_id != wi.id
+            JOIN agent_executions ae
+              ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+             AND ae.status = 'completed'
+            JOIN agent_execution_runtime_facts facts
+              ON facts.agent_execution_id = ae.id
+             AND facts.output_settlement IN (
+                 'valid_outputs_from_completed_execution',
+                 'valid_outputs_from_failed_execution'
+             )
+            WHERE wi.run_id = ?1
+              AND wi.kind = 'invoke_agent'
+              AND wi.status = 'running'
+              AND wi.id NOT LIKE 'auto-contract-output-retry:%'
+              AND json_type(wi.payload_json, '$.retry_authority_id') IS NULL
+              AND json_type(wi.payload_json, '$.targeted_retry') IS NULL
+              AND json_extract(wi.payload_json, '$.stage_execution_id') IS NOT NULL
+              AND json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id') IS NOT NULL
+            ORDER BY wi.id
+            "#,
+        )
+        .bind(run.id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut recovered = 0usize;
+        for row in rows {
+            let item_id: String = row.get("id");
+            work_items::complete(&self.pool, &item_id).await?;
+            info!(
+                run_id = %run.id,
+                item_id = %item_id,
+                "Startup recovery completed normal InvokeAgent with terminal valid agent and stale targeted retry authority"
+            );
+            recovered += 1;
+        }
+
+        if recovered > 0 {
+            projections::rebuild_all_for_run(&self.pool, run.id).await?;
+        }
+        Ok(recovered)
     }
 
     async fn recover_failed_terminal_targeted_advance_authorities_for_run(
@@ -1470,13 +1561,9 @@ impl RecoveryService {
             .iter()
             .filter(|stage| matches!(stage.status, StageStatus::Pending | StageStatus::Running))
         {
-            if retry_stage_execution_authorities::find_active_by_target(&self.pool, stage.id)
-                .await?
-                .is_some()
-            {
-                pass.exclude(stage.id.to_string(), "active_retry_authority");
-                continue;
-            }
+            let active_retry_authority =
+                retry_stage_execution_authorities::find_active_by_target(&self.pool, stage.id)
+                    .await?;
             if stage_has_pending_or_running_invoke_work(&self.pool, run.id, stage.id).await?
                 || stage_has_pending_or_running_advance_work(&self.pool, run.id, stage.id).await?
             {
@@ -1575,7 +1662,10 @@ impl RecoveryService {
                 continue;
             }
             pass.would_repair_total += 1;
-            repair_targets.push(stage.clone());
+            repair_targets.push((
+                stage.clone(),
+                active_retry_authority.map(|authority| authority.id),
+            ));
         }
 
         self.record_p091_orphan_repair_pass(&pass, now).await?;
@@ -1583,7 +1673,7 @@ impl RecoveryService {
             return Ok(pass);
         }
 
-        for stage in repair_targets {
+        for (stage, active_authority_id) in repair_targets {
             let tx_started = std::time::Instant::now();
             let mut tx = self
                 .begin_transaction(
@@ -1599,16 +1689,26 @@ impl RecoveryService {
                 "stale_retry_recovered",
             )
             .await?;
-            retry_stage_execution_authorities::create_recovered_orphan_tx(
-                &mut tx,
-                format!("p091-recovered-orphan:{}", stage.id),
-                run.id,
-                stage.stage_id.clone(),
-                stage.id,
-                "stale_retry_recovered",
-                now,
-            )
-            .await?;
+            if let Some(authority_id) = active_authority_id {
+                retry_stage_execution_authorities::mark_terminalized_tx(
+                    &mut tx,
+                    &authority_id,
+                    now,
+                    "stale_retry_recovered_after_conflict_resolution",
+                )
+                .await?;
+            } else {
+                retry_stage_execution_authorities::create_recovered_orphan_tx(
+                    &mut tx,
+                    format!("p091-recovered-orphan:{}", stage.id),
+                    run.id,
+                    stage.stage_id.clone(),
+                    stage.id,
+                    "stale_retry_recovered",
+                    now,
+                )
+                .await?;
+            }
             tx.commit().await?;
             db::pool::log_write_transaction("recovery.p091_orphan_retry_repair", tx_started);
             pass.repaired_total += 1;
@@ -1901,12 +2001,9 @@ fn recovery_snapshot_represents_wait(raw: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-async fn rebuild_operator_read_projections(
+async fn rebuild_startup_read_projections(
     pool: &SqlitePool,
     run_id: domain::ids::RunId,
 ) -> Result<()> {
-    projections::rebuild_run_summary(pool, run_id).await?;
-    projections::rebuild_stage_summaries(pool, run_id).await?;
-    projections::rebuild_approval_inbox(pool, run_id).await?;
-    Ok(())
+    projections::rebuild_all_for_run(pool, run_id).await
 }

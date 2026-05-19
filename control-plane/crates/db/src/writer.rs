@@ -111,6 +111,12 @@ use chrono::{TimeZone, Utc};
 use sha2::Digest;
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
+
+tokio::task_local! {
+    /// P087: Propagate hot-read cancellation tokens through the task hierarchy.
+    pub static CANCELLATION_TOKEN: CancellationToken;
+}
 
 use crate::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
 
@@ -146,10 +152,14 @@ fn hash_idempotency_key(key: &str) -> String {
 ///
 /// The closure must be `'static + Send` so it can be sent through the lane channel
 /// to the executor task.
+/// P087: The closure receives a `CancellationToken` that is cancelled if the
+/// caller times out or drops the future.
 pub type WriteWork = Box<
-    dyn FnOnce(SqlitePool) -> Pin<Box<dyn Future<Output = anyhow::Result<u32>> + Send + 'static>>
-        + Send
-        + 'static,
+    dyn FnOnce(
+            SqlitePool,
+            tokio_util::sync::CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<u32>> + Send + 'static>>
+        + Send,
 >;
 
 pub type TransactionWork<T> = Box<
@@ -162,20 +172,21 @@ pub type TransactionWork<T> = Box<
 >;
 
 /// Box a generic closure into a [`WriteWork`].
-///
-/// ```no_run
-/// use db::writer::make_work;
-/// let work = make_work(|pool| async move {
-///     // transactional SQL here
-///     Ok(1u32)
-/// });
-/// ```
 pub fn make_work<W, Fut>(f: W) -> WriteWork
 where
     W: FnOnce(SqlitePool) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<u32>> + Send + 'static,
 {
-    Box::new(move |pool| Box::pin(f(pool)))
+    Box::new(|pool, _| Box::pin(f(pool)))
+}
+
+/// P087: Box a cancellable closure into a [`WriteWork`].
+pub fn make_cancellable_work<W, Fut>(f: W) -> WriteWork
+where
+    W: FnOnce(SqlitePool, tokio_util::sync::CancellationToken) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<u32>> + Send + 'static,
+{
+    Box::new(|pool, cancel| Box::pin(f(pool, cancel)))
 }
 
 pub fn class_a_operation(
@@ -216,7 +227,15 @@ pub fn repository_transaction_operation(operation_name: &'static str) -> WriteOp
     }
     if matches!(
         operation_name,
-        "storage_health.insert_write_pressure_snapshot"
+        "projection.invalidation.upsert"
+            | "projection.invalidation.delete"
+            | "projection.invalidation.generic"
+            | "projection.invalidation.mark_consumed"
+            | "projection.invalidation.freeze_cursor"
+            | "projection.invalidation.reap"
+            | "maintenance.reaper"
+            | "maintenance.reaper.record"
+            | "storage_health.insert_write_pressure_snapshot"
             | "scheduler.record_db_writer_wait_observation"
     ) {
         return WriteOperation {
@@ -233,6 +252,15 @@ pub fn repository_transaction_operation(operation_name: &'static str) -> WriteOp
             observed_at: None,
         };
     }
+    if matches!(
+        operation_name,
+        "maintenance.repair_slot"
+            | "maintenance.acquire_slot"
+            | "maintenance.release_slot"
+            | "maintenance.repair_slot_poisoned"
+    ) {
+        return class_a_operation(operation_name, WriteLane::OperatorCommand, operation_name);
+    }
     class_a_operation(operation_name, WriteLane::CriticalBarrier, operation_name)
 }
 
@@ -241,7 +269,8 @@ static SHARED_WRITERS: OnceLock<Mutex<HashMap<String, Arc<DbWriter>>>> = OnceLoc
 fn pool_registry_key(pool: &SqlitePool) -> Option<(String, bool)> {
     let options = pool.connect_options();
     let filename = options.get_filename().to_string_lossy().trim().to_string();
-    if filename.is_empty() || filename == ":memory:" {
+    if filename.is_empty() || filename == ":memory:" || filename.starts_with("file:sqlx-in-memory-")
+    {
         Some((format!("in-memory:{:p}", Arc::as_ptr(&options)), false))
     } else {
         Some((filename, true))
@@ -277,6 +306,19 @@ pub async fn begin_registered_immediate_transaction<'pool>(
     op: WriteOperation,
     context: &'static str,
 ) -> anyhow::Result<QueuedTransaction> {
+    let cancel = CANCELLATION_TOKEN
+        .try_with(|c| c.clone())
+        .unwrap_or_else(|_| CancellationToken::new());
+
+    begin_registered_immediate_transaction_cancellable(pool, op, context, cancel).await
+}
+
+pub async fn begin_registered_immediate_transaction_cancellable<'pool>(
+    pool: &'pool SqlitePool,
+    op: WriteOperation,
+    context: &'static str,
+    cancel: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<QueuedTransaction> {
     if let Err(rejected) = op.validate() {
         anyhow::bail!(
             "DbWriter rejected {context} before transaction start: {}",
@@ -284,7 +326,9 @@ pub async fn begin_registered_immediate_transaction<'pool>(
         );
     }
     if let Some(writer) = shared_writer_for(pool).await {
-        return writer.begin_immediate_transaction(op, context).await;
+        return writer
+            .begin_immediate_transaction_cancellable(op, context, cancel)
+            .await;
     }
     let Some((_key, file_backed)) = pool_registry_key(pool) else {
         anyhow::bail!("P075 shared DbWriter registry key unavailable for {context}");
@@ -293,7 +337,9 @@ pub async fn begin_registered_immediate_transaction<'pool>(
         anyhow::bail!("P075 shared DbWriter is not registered for {context}");
     }
     let writer = Arc::new(DbWriter::new(pool.clone()));
-    let mut tx = writer.begin_immediate_transaction(op, context).await?;
+    let mut tx = writer
+        .begin_immediate_transaction_cancellable(op, context, cancel)
+        .await?;
     tx.attach_owner(writer);
     Ok(tx)
 }
@@ -306,6 +352,20 @@ pub async fn begin_repository_transaction<'pool>(
         pool,
         repository_transaction_operation(operation_name),
         operation_name,
+    )
+    .await
+}
+
+pub async fn begin_repository_transaction_cancellable<'pool>(
+    pool: &'pool SqlitePool,
+    operation_name: &'static str,
+    cancel: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<QueuedTransaction> {
+    begin_registered_immediate_transaction_cancellable(
+        pool,
+        repository_transaction_operation(operation_name),
+        operation_name,
+        cancel,
     )
     .await
 }
@@ -413,6 +473,7 @@ pub struct QueuedTransaction {
     result_rx: Option<oneshot::Receiver<WriteResult>>,
     owned_writer: Option<Arc<DbWriter>>,
     context: &'static str,
+    _cancel_guard: tokio_util::sync::DropGuard,
 }
 
 impl QueuedTransaction {
@@ -658,6 +719,7 @@ struct CoalescedEntry {
     /// Monotonic counter assigned at submit time when `op.observed_at` is `None`
     /// (LIFT-REL-08). Used for last-writer-wins ordering.
     mono_counter: u64,
+    cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 /// Class B coalescing buffer: holds pending writes keyed by `idempotency_key`.
@@ -717,8 +779,8 @@ struct LaneMessage {
     op: WriteOperation,
     work: WriteWork,
     result_tx: oneshot::Sender<WriteResult>,
-    /// When the message entered the channel (for deadline accounting).
     enqueued_at: Instant,
+    cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,10 +1115,45 @@ impl DbWriter {
         W: FnOnce(SqlitePool) -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<u32>> + Send + 'static,
     {
-        self.submit_work(op, make_work(work)).await
+        let cancel = CANCELLATION_TOKEN
+            .try_with(|c| c.clone())
+            .unwrap_or_else(|_| CancellationToken::new());
+
+        let _guard = cancel.clone().drop_guard();
+        self.submit_work_cancellable(op, make_work(work), cancel)
+            .await
+    }
+
+    pub async fn submit_cancellable<W, Fut>(
+        &self,
+        op: WriteOperation,
+        work: W,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> WriteResult
+    where
+        W: FnOnce(SqlitePool, tokio_util::sync::CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<u32>> + Send + 'static,
+    {
+        let _guard = cancel.clone().drop_guard();
+        self.submit_work_cancellable(op, make_cancellable_work(work), cancel)
+            .await
     }
 
     pub async fn submit_work(&self, op: WriteOperation, work: WriteWork) -> WriteResult {
+        let cancel = CANCELLATION_TOKEN
+            .try_with(|c| c.clone())
+            .unwrap_or_else(|_| CancellationToken::new());
+
+        let _guard = cancel.clone().drop_guard();
+        self.submit_work_cancellable(op, work, cancel).await
+    }
+
+    pub async fn submit_work_cancellable(
+        &self,
+        op: WriteOperation,
+        work: WriteWork,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> WriteResult {
         if let Err(rejected) = op.validate() {
             return rejected;
         }
@@ -1083,7 +1180,7 @@ impl DbWriter {
 
         // Class B: route through coalescing buffer (last-writer-wins, LIFT-REL-08).
         if op.class == WriteClass::B {
-            return self.submit_class_b(op, work).await;
+            return self.submit_class_b(op, work, cancel).await;
         }
 
         tracing::debug!(
@@ -1102,9 +1199,10 @@ impl DbWriter {
         let (result_tx, result_rx) = oneshot::channel();
         let msg = LaneMessage {
             op: op.clone(),
-            work: make_work(work),
+            work,
             result_tx,
             enqueued_at: submit_start,
+            cancellation_token: cancel,
         };
 
         let lane_tx = self.lane_sender(op.lane);
@@ -1181,6 +1279,19 @@ impl DbWriter {
         op: WriteOperation,
         context: &'static str,
     ) -> anyhow::Result<QueuedTransaction> {
+        let cancel = CANCELLATION_TOKEN
+            .try_with(|c| c.clone())
+            .unwrap_or_else(|_| CancellationToken::new());
+        self.begin_immediate_transaction_cancellable(op, context, cancel)
+            .await
+    }
+
+    pub async fn begin_immediate_transaction_cancellable(
+        &self,
+        op: WriteOperation,
+        context: &'static str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<QueuedTransaction> {
         if let Err(rejected) = op.validate() {
             anyhow::bail!(
                 "DbWriter rejected {context} before transaction start: {}",
@@ -1204,9 +1315,12 @@ impl DbWriter {
         let (result_tx, result_rx) = oneshot::channel();
         let (tx_ready_tx, tx_ready_rx) = oneshot::channel();
         let (finish_tx, finish_rx) = oneshot::channel();
+        let transaction_cancel = cancel.child_token();
+        let cancel_guard = transaction_cancel.clone().drop_guard();
+
         let msg = LaneMessage {
             op: op.clone(),
-            work: make_work(move |pool| async move {
+            work: make_cancellable_work(move |pool, _cancel| async move {
                 let tx = crate::pool::begin_immediate_with_retry(&pool, context).await?;
                 tx_ready_tx
                     .send(tx)
@@ -1225,6 +1339,7 @@ impl DbWriter {
             }),
             result_tx,
             enqueued_at: submit_start,
+            cancellation_token: transaction_cancel,
         };
         let lane_tx = self.lane_sender(op.lane);
         match tokio::time::timeout(deadline, lane_tx.send(msg)).await {
@@ -1264,6 +1379,7 @@ impl DbWriter {
             result_rx: Some(result_rx),
             owned_writer: None,
             context,
+            _cancel_guard: cancel_guard,
         })
     }
 
@@ -1282,16 +1398,29 @@ impl DbWriter {
         T: Send + 'static,
     {
         let (value_tx, value_rx) = oneshot::channel();
+        let cancel = CANCELLATION_TOKEN
+            .try_with(|c| c.clone())
+            .unwrap_or_else(|_| CancellationToken::new());
         let result = self
-            .submit(op, move |pool| async move {
-                let mut tx = crate::pool::begin_immediate_with_retry(&pool, context).await?;
-                let (value, rows) = work(&mut tx).await?;
-                tx.commit().await?;
-                value_tx
-                    .send(value)
-                    .map_err(|_| anyhow::anyhow!("DbWriter transaction result receiver dropped"))?;
-                Ok(rows)
-            })
+            .submit_cancellable(
+                op,
+                move |pool, cancel| async move {
+                    let mut tx = crate::pool::begin_immediate_with_retry(&pool, context).await?;
+                    // P087: Pass cancellation token down?
+                    // Currently TransactionWork doesn't take it.
+                    // But we can check it here before commit.
+                    let (value, rows) = tokio::select! {
+                        _ = cancel.cancelled() => anyhow::bail!("cancelled"),
+                        res = work(&mut tx) => res?,
+                    };
+                    tx.commit().await?;
+                    value_tx.send(value).map_err(|_| {
+                        anyhow::anyhow!("DbWriter transaction result receiver dropped")
+                    })?;
+                    Ok(rows)
+                },
+                cancel,
+            )
             .await;
         match result {
             WriteResult::Committed => value_rx
@@ -1313,15 +1442,22 @@ impl DbWriter {
         context: &'static str,
         work: TransactionWork<()>,
     ) -> anyhow::Result<()> {
+        let cancel = CANCELLATION_TOKEN
+            .try_with(|c| c.clone())
+            .unwrap_or_else(|_| CancellationToken::new());
         let result = self
-            .submit_work(
+            .submit_cancellable(
                 op,
-                make_work(move |pool| async move {
+                move |pool, cancel| async move {
                     let mut tx = crate::pool::begin_immediate_with_retry(&pool, context).await?;
-                    let ((), rows) = work(&mut tx).await?;
+                    let ((), rows) = tokio::select! {
+                        _ = cancel.cancelled() => anyhow::bail!("cancelled"),
+                        res = work(&mut tx) => res?,
+                    };
                     tx.commit().await?;
                     Ok(rows)
-                }),
+                },
+                cancel,
             )
             .await;
         match result {
@@ -1405,7 +1541,12 @@ impl DbWriter {
     /// Last-writer-wins: if a buffered entry with the same `idempotency_key` exists,
     /// the one with the later `observed_at` (or higher monotonic counter when
     /// `observed_at` is absent) survives; the other receives `WriteResult::Coalesced`.
-    async fn submit_class_b(&self, op: WriteOperation, work: WriteWork) -> WriteResult {
+    async fn submit_class_b(
+        &self,
+        op: WriteOperation,
+        work: WriteWork,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> WriteResult {
         let deadline = op.deadline;
         let submit_start = Instant::now();
         let mono_counter = self.class_b_mono.fetch_add(1, Ordering::Relaxed);
@@ -1436,6 +1577,7 @@ impl DbWriter {
                             result_tx,
                             enqueued_at: submit_start,
                             mono_counter,
+                            cancellation_token: cancel,
                         },
                     );
                 } else {
@@ -1483,6 +1625,7 @@ impl DbWriter {
                         result_tx,
                         enqueued_at: submit_start,
                         mono_counter,
+                        cancellation_token: cancel,
                     },
                 );
             }
@@ -1520,6 +1663,7 @@ impl DbWriter {
                 work: entry.work,
                 result_tx: entry.result_tx,
                 enqueued_at: entry.enqueued_at,
+                cancellation_token: entry.cancellation_token,
             };
             if let Err(e) = self.coalesced_projection_tx.try_send(msg) {
                 // Channel is either closed or temporarily full; send WriteFailed to the waiting caller.
@@ -1602,6 +1746,7 @@ async fn flush_coalesced_to_channel(
             work: entry.work,
             result_tx: entry.result_tx,
             enqueued_at: entry.enqueued_at,
+            cancellation_token: entry.cancellation_token,
         };
         if let Err(e) = cp_tx.try_send(msg) {
             let result_tx = match e {
@@ -1658,12 +1803,9 @@ async fn execute_message(
     // because they occur inside the work closure (which calls begin_immediate_with_retry).
     let tx_start = Instant::now();
 
-    // Run work to completion without a timeout wrapper. Per P075
-    // §architecture.deadlines_and_results.in_flight_timeout, in-flight
-    // transactions are not cancelled mid-transaction; they complete or roll
-    // back under SQLite semantics. The caller-side result_rx timeout (in
-    // submit()) handles the case where the caller does not want to wait.
-    let work_result = (msg.work)(pool.clone()).await;
+    // Run work to completion. P087: now receives a cancellation token.
+    // Callers like MCP hot-reads can cancel this mid-transaction if they time out.
+    let work_result = (msg.work)(pool.clone(), msg.cancellation_token).await;
 
     let tx_duration_ms = tx_start.elapsed().as_millis() as u64;
 
@@ -2189,7 +2331,7 @@ mod tests {
                 replay_policy: ReplayPolicy::LastWriterWins,
                 observed_at: None,
             };
-            let work: WriteWork = Box::new(|_pool| Box::pin(async { Ok(1u32) }));
+            let work: WriteWork = Box::new(|_pool, _| Box::pin(async { Ok(1u32) }));
             buf.entries.insert(
                 key,
                 CoalescedEntry {
@@ -2198,6 +2340,7 @@ mod tests {
                     result_tx: tx,
                     enqueued_at: std::time::Instant::now(),
                     mono_counter: i as u64,
+                    cancellation_token: tokio_util::sync::CancellationToken::new(),
                 },
             );
         }

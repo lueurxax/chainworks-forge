@@ -1645,7 +1645,7 @@ agents:
   - id: code_writer
     title: Code Writer
     mode: implementation
-    backend_profile: junie_code_editor_acp
+    backend_profile: claude_builder_high
     permission_profile: CODE_WRITE
     skill_ref: code_writer_core
     session_reuse_scope: same_agent_family_within_run

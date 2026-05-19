@@ -5,15 +5,20 @@ import Foundation
 final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
     struct ExecutionRecord: Sendable {
         let task: String
-        let agent: String
+        let agentID: String
         let stageID: String
     }
 
     private var _executedTasks: [ExecutionRecord] = []
     private var _failingAgentIDs: Set<String> = []
     private var _customOutputs: [String: [String: Data]] = [:] // agentID -> [outputName -> Data]
+    let simulatedDelay: Double
 
     private let lock = NSLock()
+
+    init(simulatedDelay: Double = 0, catalog: AgentCatalog? = nil) {
+        self.simulatedDelay = simulatedDelay
+    }
 
     var executedTasks: [ExecutionRecord] {
         lock.lock(); defer { lock.unlock() }
@@ -43,7 +48,7 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
         context: ExecutionContext
     ) async throws -> AgentResult {
         lock.lock()
-        let record = ExecutionRecord(task: task.task, agent: agent.id, stageID: context.stageID)
+        let record = ExecutionRecord(task: task.task, agentID: agent.id, stageID: context.stageID)
         _executedTasks.append(record)
         let isFailing = _failingAgentIDs.contains(agent.id)
         let agentOutputs = _customOutputs[agent.id] ?? [:]
@@ -91,7 +96,7 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
             resolvedModel: agent.model,
             configuredProviderID: nil,
             adapterVersion: "sim-1.0",
-            outputPresence: .some
+            outputPresence: .durableOutput
         )
     }
 }
@@ -102,7 +107,7 @@ struct OutputContractTemplates {
         contractID: String,
         agentID: String,
         stageID: String
-    ) -> (Data, ArtifactFormat) {
+    ) -> (data: Data, format: ArtifactFormat) {
         switch contractID {
         case "proposal_review_v1", "prepush_review_v1":
             let json = ["status": "accepted", "findings": []] as [String : Any]

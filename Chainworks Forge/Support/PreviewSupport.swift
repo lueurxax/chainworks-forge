@@ -574,7 +574,7 @@ enum PreviewSupport {
         return try? encoder.encode(options)
     }
 
-    private static func repoExampleURL(_ relativePath: String) -> URL {
+    static func repoExampleURL(_ relativePath: String) -> URL {
         let trimmedPath = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let fileManager = FileManager.default
         let sourceRoot = previewWorkspaceRootURL

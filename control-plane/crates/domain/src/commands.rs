@@ -32,6 +32,7 @@ pub enum Command {
     RejectStage(RejectStageCmd),
     RetryStage(RetryStageCmd),
     ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd),
+    ExtendWorkflowLoopBudget(ExtendWorkflowLoopBudgetCmd),
     OverrideLegacyDiscoveryPolicy(OverrideLegacyDiscoveryPolicyCmd),
     MainSyncRequest(MainSyncRequestCmd),
     MainSyncRetry(MainSyncRetryCmd),
@@ -130,6 +131,23 @@ pub struct ResolveWorkflowConflictTransitionCmd {
     pub resolution_reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_instruction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_budget_extension: Option<WorkflowLoopBudgetExtensionCmd>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkflowLoopBudgetExtensionCmd {
+    pub counter: String,
+    pub additional_cycles: u32,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_conflict_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExtendWorkflowLoopBudgetCmd {
+    pub run_id: RunId,
+    pub extension: WorkflowLoopBudgetExtensionCmd,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

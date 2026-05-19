@@ -1770,7 +1770,9 @@ impl XcodeMcpBridgePool {
                     permission_profile_id: intent.permission_profile_id.clone(),
                     broker_contract_hash: broker_contract_hash.clone(),
                 };
-                resolver.resolve(&input, &host).map(Some)
+                resolver.resolve(&input, &host).map(Some).map_err(|err| {
+                    anyhow::anyhow!("{}; {}", err, xcode_target_probe_diagnostics(&input, &host))
+                })
             })
             .collect()
     }
@@ -2202,8 +2204,52 @@ fn target_snapshot_matches_host(snapshot: &XcodeTargetSnapshot, host: &HostProbe
                     .workspace_identity
                     .as_deref()
                     .is_some_and(|workspace| workspace == snapshot.workspace_identity),
+                XcodeTargetSelectionConfidence::SingleLiveFallback => candidate
+                    .workspace_identity
+                    .as_deref()
+                    .is_none_or(|workspace| workspace == snapshot.workspace_identity),
             }
     })
+}
+
+fn xcode_target_probe_diagnostics(
+    input: &XcodeTargetSelectionInput,
+    host: &HostProbeContext,
+) -> String {
+    let live_candidates = host
+        .candidate_xcodes
+        .iter()
+        .filter(|candidate| candidate.alive)
+        .map(|candidate| {
+            format!(
+                "pid={} uid={} workspace={} app={}",
+                candidate.pid,
+                candidate.uid,
+                candidate
+                    .workspace_identity
+                    .as_deref()
+                    .unwrap_or("<unresolved>"),
+                candidate.app_path.as_deref().unwrap_or("<unknown>")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "xcode_target_probe_diagnostics: requested_workspace='{}' selector={} live_candidate_count={} live_candidates=[{}] host_env={{expected_gui_uid={}, operator_home={}, darwin_tmpdir={}, developer_dir={}}}",
+        input.workspace_root,
+        input.xcode_pid_selector.as_deref().unwrap_or("<none>"),
+        host.candidate_xcodes
+            .iter()
+            .filter(|candidate| candidate.alive)
+            .count(),
+        live_candidates,
+        host.expected_gui_uid
+            .map(|uid| uid.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string()),
+        host.operator_home.as_deref().unwrap_or("<missing>"),
+        host.darwin_tmpdir.as_deref().unwrap_or("<missing>"),
+        host.developer_dir.as_deref().unwrap_or("<missing>")
+    )
 }
 
 fn operator_account_name(operator_home: &str) -> String {

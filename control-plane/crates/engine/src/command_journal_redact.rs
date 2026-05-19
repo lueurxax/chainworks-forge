@@ -105,6 +105,9 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
                 redact_field_if_present(obj, "operator_instruction");
             }
         }
+        Command::ExtendWorkflowLoopBudget(_) => {
+            // Preserve typed loop-budget extension fields for operator audit.
+        }
         Command::OverrideLegacyDiscoveryPolicy(_) => {
             // P053: preserve typed override fields for operator audit.
         }
@@ -197,11 +200,12 @@ mod tests {
     use super::*;
     use domain::commands::{
         ApprovalResolutionDecision, ApproveStageCmd, CancelRunCmd, Command,
-        KnowledgeCapsuleIgnoreCmd, MainSyncMode, MainSyncRecordRecoveryDecisionCmd,
-        MainSyncRecoveryDecision, MainSyncRepairStateCmd, MainSyncRequestCmd, MainSyncRetryCmd,
-        MainSyncSetRunOverrideCmd, MainSyncTriggerReason, OverrideLegacyDiscoveryPolicyCmd,
-        RejectStageCmd, ResetSessionCmd, ResolveApprovalCmd, ResolveLeadMediationConfirmationCmd,
-        ResolveWorkflowConflictTransitionCmd, RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
+        ExtendWorkflowLoopBudgetCmd, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
+        MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
+        MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
+        OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResetSessionCmd, ResolveApprovalCmd,
+        ResolveLeadMediationConfirmationCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
+        RunStewardAnalysisCmd, StartRunCmd, WorkflowLoopBudgetExtensionCmd,
     };
     use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::{IdeaId, RunId, StageExecutionId};
@@ -412,6 +416,7 @@ mod tests {
                 selected_transition_id: "review__to__refine__0".into(),
                 resolution_reason: "operator selected one extra refine".into(),
                 operator_instruction: Some("Focus only on the P041 CLI rendering blocker".into()),
+                loop_budget_extension: None,
             });
 
         let v = round_trip(&cmd);
@@ -534,6 +539,16 @@ mod tests {
                 selected_transition_id: "review__to__refine__0".into(),
                 resolution_reason: "operator selected loop-budget continuation".into(),
                 operator_instruction: Some("Focus on the requested blocker only".into()),
+                loop_budget_extension: None,
+            }),
+            Command::ExtendWorkflowLoopBudget(ExtendWorkflowLoopBudgetCmd {
+                run_id: RunId::new(),
+                extension: WorkflowLoopBudgetExtensionCmd {
+                    counter: "implementation_revision_cycles".into(),
+                    additional_cycles: 20,
+                    reason: "operator granted more refinement cycles".into(),
+                    target_conflict_id: Some("conflict-1".into()),
+                },
             }),
             Command::OverrideLegacyDiscoveryPolicy(OverrideLegacyDiscoveryPolicyCmd {
                 run_id: RunId::new(),
@@ -631,6 +646,7 @@ mod tests {
                 Command::RejectStage(_) => {}
                 Command::RetryStage(_) => {}
                 Command::ResolveWorkflowConflictTransition(_) => {}
+                Command::ExtendWorkflowLoopBudget(_) => {}
                 Command::OverrideLegacyDiscoveryPolicy(_) => {}
                 Command::MainSyncRequest(_) => {}
                 Command::MainSyncRetry(_) => {}

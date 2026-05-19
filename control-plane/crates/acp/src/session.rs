@@ -12,8 +12,8 @@ use crate::adapters::XcodeShimGrantCleanup;
 use crate::adapters::{CleanupPathPolicy, CleanupPathSpec};
 use crate::transport::{AcpSessionConfig, AcpTransportSession};
 use crate::{
-    AcpCloseDiagnostic, AcpExecutionError, AcpPromptProgressSink, ExecutionRequest,
-    ExecutionResult, NoopAcpPromptProgressSink, ProviderSessionStoreCapture,
+    AcpCloseDiagnostic, AcpExecutionError, AcpPromptProgressSink, AcpRuntimeReceipt,
+    ExecutionRequest, ExecutionResult, NoopAcpPromptProgressSink, ProviderSessionStoreCapture,
 };
 use domain::ids::AgentExecutionId;
 
@@ -281,10 +281,68 @@ impl AcpSession {
                 ),
             }
         }
+        if let AcpSessionCloseBehavior::ArchiveFailure(context) = &behavior {
+            let archive_result = (|| -> Result<()> {
+                if outcome.provider_session_store_capture.is_none() {
+                    outcome.provider_session_store_capture =
+                        stage_external_provider_session_store(context)?;
+                }
+                if let Some(receipt) = self.transport.runtime_receipt() {
+                    outcome.provider_session_store_capture = Some(stage_runtime_receipt_capture(
+                        outcome.provider_session_store_capture.take(),
+                        context,
+                        receipt,
+                    )?);
+                }
+                if let Some(capture) = outcome.provider_session_store_capture.as_ref() {
+                    finalize_provider_session_store_capture(capture, true, context)?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = archive_result {
+                warn!(
+                    provider = %context.provider,
+                    run_id = %context.run_id,
+                    stage_id = %context.stage_id,
+                    error = %error,
+                    "Failed to archive provider session store for failed ACP session"
+                );
+            }
+            outcome.provider_session_store_capture = None;
+        }
         for grant in self.xcode_shim_grants.drain(..) {
             grant.remove();
         }
         Ok(outcome)
+    }
+
+    /// Stage provider-native session evidence without closing the transport.
+    ///
+    /// The engine finalizes this staged copy after output settlement. Successful
+    /// executions delete it; failed settlement archives it with run metadata.
+    pub fn stage_provider_session_store_for_outcome(
+        &self,
+        context: &ProviderSessionStoreArchiveContext,
+    ) -> Result<Option<ProviderSessionStoreCapture>> {
+        let mut capture = None;
+        for spec in self.cleanup_paths.iter() {
+            match stage_cleanup_spec_for_outcome(spec) {
+                Ok(Some(staged)) => capture = Some(staged),
+                Ok(None) => {}
+                Err(error) => warn!(
+                    cleanup_path = %spec.path.display(),
+                    error = %error,
+                    "Failed to stage ACP session cleanup path for outcome"
+                ),
+            }
+        }
+        if capture.is_none() {
+            capture = stage_external_provider_session_store(context)?;
+        }
+        if let Some(receipt) = self.transport.runtime_receipt() {
+            capture = Some(stage_runtime_receipt_capture(capture, context, receipt)?);
+        }
+        Ok(capture)
     }
 
     pub fn is_live(&mut self) -> bool {
@@ -318,12 +376,19 @@ fn finalize_cleanup_spec(
             AcpSessionCloseBehavior::ArchiveFailure(context) => {
                 let capture = stage_codex_session_store(&spec.path)?;
                 remove_cleanup_dir(&spec.path)?;
-                if let Some(capture) = capture.as_ref() {
-                    finalize_provider_session_store_capture(capture, true, context)?;
-                }
-                Ok(None)
+                let _ = context;
+                Ok(capture)
             }
         },
+    }
+}
+
+fn stage_cleanup_spec_for_outcome(
+    spec: &CleanupPathSpec,
+) -> Result<Option<ProviderSessionStoreCapture>> {
+    match spec.policy {
+        CleanupPathPolicy::DeleteRecursively => Ok(None),
+        CleanupPathPolicy::StageCodexSessionStore => stage_codex_session_store(&spec.path),
     }
 }
 
@@ -348,12 +413,16 @@ fn app_support_runtime_root() -> PathBuf {
         .join("runtime")
 }
 
+fn pending_session_store_root(provider: &str) -> PathBuf {
+    app_support_runtime_root()
+        .join("pending-session-stores")
+        .join(provider)
+        .join(Uuid::new_v4().to_string())
+}
+
 fn stage_codex_session_store(runtime_home: &Path) -> Result<Option<ProviderSessionStoreCapture>> {
     let mut captured_subdirs = Vec::new();
-    let staging_root = app_support_runtime_root()
-        .join("pending-session-stores")
-        .join("codex")
-        .join(Uuid::new_v4().to_string());
+    let staging_root = pending_session_store_root("codex");
 
     for subdir in ["sessions", "archived_sessions"] {
         let source = runtime_home.join(subdir);
@@ -378,6 +447,166 @@ fn stage_codex_session_store(runtime_home: &Path) -> Result<Option<ProviderSessi
         staging_root: staging_root.to_string_lossy().into_owned(),
         captured_subdirs,
     }))
+}
+
+fn stage_external_provider_session_store(
+    context: &ProviderSessionStoreArchiveContext,
+) -> Result<Option<ProviderSessionStoreCapture>> {
+    match canonical_provider_for_capture(&context.provider).as_deref() {
+        Some("claude") => stage_claude_session_store(context),
+        Some("junie") => stage_junie_session_store(context),
+        _ => Ok(None),
+    }
+}
+
+fn canonical_provider_for_capture(provider: &str) -> Option<&'static str> {
+    let provider = provider.trim().to_ascii_lowercase();
+    match provider.as_str() {
+        "codex" => Some("codex"),
+        "claude" | "claude-code" | "claude_code" => Some("claude"),
+        "junie" => Some("junie"),
+        _ => None,
+    }
+}
+
+fn stage_claude_session_store(
+    context: &ProviderSessionStoreArchiveContext,
+) -> Result<Option<ProviderSessionStoreCapture>> {
+    let Some(provider_session_id) = non_empty(context.provider_session_id.as_deref()) else {
+        return Ok(None);
+    };
+    let projects_root = claude_projects_root();
+    if !projects_root.exists() {
+        return Ok(None);
+    }
+    let file_name = format!("{provider_session_id}.jsonl");
+    let Some(source) = find_file_named(&projects_root, &file_name)? else {
+        return Ok(None);
+    };
+    let relative = source.strip_prefix(&projects_root).unwrap_or(&source);
+    let staging_root = pending_session_store_root("claude");
+    let dest = staging_root.join("projects").join(relative);
+    copy_file(&source, &dest)
+        .with_context(|| format!("copy Claude provider transcript {}", source.display()))?;
+    Ok(Some(ProviderSessionStoreCapture {
+        provider: "claude".to_string(),
+        staging_root: staging_root.to_string_lossy().into_owned(),
+        captured_subdirs: vec![format!("projects/{}", relative.to_string_lossy())],
+    }))
+}
+
+fn stage_junie_session_store(
+    context: &ProviderSessionStoreArchiveContext,
+) -> Result<Option<ProviderSessionStoreCapture>> {
+    let Some(provider_session_id) = non_empty(context.provider_session_id.as_deref()) else {
+        return Ok(None);
+    };
+    let sessions_root = junie_sessions_root();
+    if !sessions_root.exists() {
+        return Ok(None);
+    }
+    let source = sessions_root.join(provider_session_id);
+    let source = if source.exists() {
+        Some(source)
+    } else {
+        find_dir_named(&sessions_root, provider_session_id)?
+    };
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let relative = source.strip_prefix(&sessions_root).unwrap_or(&source);
+    let staging_root = pending_session_store_root("junie");
+    let dest = staging_root.join("sessions").join(relative);
+    copy_dir_recursive(&source, &dest)
+        .with_context(|| format!("copy Junie provider session {}", source.display()))?;
+    Ok(Some(ProviderSessionStoreCapture {
+        provider: "junie".to_string(),
+        staging_root: staging_root.to_string_lossy().into_owned(),
+        captured_subdirs: vec![format!("sessions/{}", relative.to_string_lossy())],
+    }))
+}
+
+fn stage_runtime_receipt_capture(
+    capture: Option<ProviderSessionStoreCapture>,
+    context: &ProviderSessionStoreArchiveContext,
+    receipt: &AcpRuntimeReceipt,
+) -> Result<ProviderSessionStoreCapture> {
+    let provider = provider_slug_for_capture(&context.provider);
+    let mut capture = capture.unwrap_or_else(|| ProviderSessionStoreCapture {
+        provider: provider.clone(),
+        staging_root: pending_session_store_root(&provider)
+            .to_string_lossy()
+            .into_owned(),
+        captured_subdirs: Vec::new(),
+    });
+    let path = Path::new(&capture.staging_root).join("acp-runtime-receipt.json");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create runtime receipt parent {}", parent.display()))?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(receipt)?)
+        .with_context(|| format!("write runtime receipt {}", path.display()))?;
+    if !capture
+        .captured_subdirs
+        .iter()
+        .any(|entry| entry == "acp-runtime-receipt.json")
+    {
+        capture
+            .captured_subdirs
+            .push("acp-runtime-receipt.json".to_string());
+    }
+    Ok(capture)
+}
+
+fn provider_slug_for_capture(provider: &str) -> String {
+    if let Some(canonical) = canonical_provider_for_capture(provider) {
+        return canonical.to_string();
+    }
+    let slug: String = provider
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if slug.is_empty() {
+        "acp".to_string()
+    } else {
+        slug
+    }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn claude_projects_root() -> PathBuf {
+    if let Ok(explicit) = std::env::var("CHAINWORKS_CLAUDE_SESSION_STORE_ROOT") {
+        if !explicit.is_empty() {
+            return PathBuf::from(explicit);
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".claude")
+        .join("projects")
+}
+
+fn junie_sessions_root() -> PathBuf {
+    if let Ok(explicit) = std::env::var("CHAINWORKS_JUNIE_SESSION_STORE_ROOT") {
+        if !explicit.is_empty() {
+            return PathBuf::from(explicit);
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".junie")
+        .join("sessions")
 }
 
 pub fn finalize_provider_session_store_capture(
@@ -450,6 +679,16 @@ pub fn finalize_provider_session_store_capture(
     Ok(Some(archive_root))
 }
 
+fn copy_file(source: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create destination directory {}", parent.display()))?;
+    }
+    fs::copy(source, dest)
+        .with_context(|| format!("copy file from {} to {}", source.display(), dest.display()))?;
+    Ok(())
+}
+
 fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(dest)
         .with_context(|| format!("create destination directory {}", dest.display()))?;
@@ -473,6 +712,54 @@ fn copy_dir_recursive(source: &Path, dest: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn find_file_named(root: &Path, file_name: &str) -> Result<Option<PathBuf>> {
+    find_entry_named(root, file_name, true)
+}
+
+fn find_dir_named(root: &Path, dir_name: &str) -> Result<Option<PathBuf>> {
+    find_entry_named(root, dir_name, false)
+}
+
+fn find_entry_named(root: &Path, name: &str, want_file: bool) -> Result<Option<PathBuf>> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(dir) = stack.pop() {
+        visited += 1;
+        if visited > 20_000 {
+            warn!(
+                root = %root.display(),
+                "Provider session-store search stopped after scan limit"
+            );
+            return Ok(None);
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(
+                    path = %dir.display(),
+                    error = %error,
+                    "Skipping unreadable provider session-store directory"
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if entry.file_name().to_string_lossy() == name
+                && ((want_file && file_type.is_file()) || (!want_file && file_type.is_dir()))
+            {
+                return Ok(Some(path));
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Cloneable owned handle to a live ACP session.
@@ -530,6 +817,14 @@ impl AcpSessionHandle {
         session.close_with_behavior(behavior).await
     }
 
+    pub async fn stage_provider_session_store_for_outcome(
+        &self,
+        context: &ProviderSessionStoreArchiveContext,
+    ) -> Result<Option<ProviderSessionStoreCapture>> {
+        let session = self.inner.lock().await;
+        session.stage_provider_session_store_for_outcome(context)
+    }
+
     pub async fn provider_session_id(&self) -> String {
         let session = self.inner.lock().await;
         session.transport.session_id().to_string()
@@ -554,6 +849,44 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, body).unwrap();
+    }
+
+    fn archive_context(
+        provider: &str,
+        provider_session_id: Option<&str>,
+    ) -> ProviderSessionStoreArchiveContext {
+        ProviderSessionStoreArchiveContext {
+            provider: provider.into(),
+            run_id: "run-1".into(),
+            stage_id: "state_9".into(),
+            agent_id: "proposal_implementation_auditor".into(),
+            agent_execution_id: Some("agent-exec-1".into()),
+            session_generation_id: Some("session-gen-1".into()),
+            provider_session_id: provider_session_id.map(str::to_string),
+            failure_kind: "provider_timeout".into(),
+        }
+    }
+
+    fn runtime_receipt(provider: &str) -> AcpRuntimeReceipt {
+        AcpRuntimeReceipt {
+            schema_version: 1,
+            transport_family: "acp".into(),
+            provider: provider.into(),
+            model: None,
+            provider_session_id: Some("provider-session-1".into()),
+            session_generation_id: Some("session-gen-1".into()),
+            status: "failed".into(),
+            failure_phase: Some("read_poll_elapsed_without_message".into()),
+            started_at: "2026-05-16T00:00:00Z".into(),
+            completed_at: Some("2026-05-16T00:05:00Z".into()),
+            xcode_shim_injected: false,
+            requires_xcode_host_execution: false,
+            handshake: Default::default(),
+            counters: Default::default(),
+            permission_roundtrips: Vec::new(),
+            first_events: Vec::new(),
+            last_events: Vec::new(),
+        }
     }
 
     #[test]
@@ -591,6 +924,119 @@ mod tests {
 
         let capture = stage_codex_session_store(&runtime_home).unwrap();
         assert!(capture.is_none());
+    }
+
+    #[test]
+    fn stage_claude_session_store_copies_native_transcript_by_provider_session_id() {
+        let _guard = SESSION_STORE_ENV_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        std::env::set_var(
+            "CHAINWORKS_SESSION_STORE_ROOT",
+            temp.path()
+                .join("pending-root")
+                .to_string_lossy()
+                .to_string(),
+        );
+        std::env::set_var(
+            "CHAINWORKS_CLAUDE_SESSION_STORE_ROOT",
+            temp.path()
+                .join("claude-projects")
+                .to_string_lossy()
+                .to_string(),
+        );
+        let transcript = temp
+            .path()
+            .join("claude-projects")
+            .join("-workspace")
+            .join("provider-session-1.jsonl");
+        write_file(&transcript, "{\"type\":\"assistant\"}\n");
+
+        let capture = stage_external_provider_session_store(&archive_context(
+            "claude",
+            Some("provider-session-1"),
+        ))
+        .unwrap()
+        .expect("capture expected");
+
+        assert_eq!(capture.provider, "claude");
+        assert!(Path::new(&capture.staging_root)
+            .join("projects")
+            .join("-workspace")
+            .join("provider-session-1.jsonl")
+            .exists());
+        std::env::remove_var("CHAINWORKS_CLAUDE_SESSION_STORE_ROOT");
+        std::env::remove_var("CHAINWORKS_SESSION_STORE_ROOT");
+    }
+
+    #[test]
+    fn stage_junie_session_store_copies_native_session_directory() {
+        let _guard = SESSION_STORE_ENV_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        std::env::set_var(
+            "CHAINWORKS_SESSION_STORE_ROOT",
+            temp.path()
+                .join("pending-root")
+                .to_string_lossy()
+                .to_string(),
+        );
+        std::env::set_var(
+            "CHAINWORKS_JUNIE_SESSION_STORE_ROOT",
+            temp.path()
+                .join("junie-sessions")
+                .to_string_lossy()
+                .to_string(),
+        );
+        write_file(
+            &temp
+                .path()
+                .join("junie-sessions")
+                .join("session-1")
+                .join("events.jsonl"),
+            "{\"kind\":\"AgentMessageUpdatedEvent\"}\n",
+        );
+
+        let capture =
+            stage_external_provider_session_store(&archive_context("junie", Some("session-1")))
+                .unwrap()
+                .expect("capture expected");
+
+        assert_eq!(capture.provider, "junie");
+        assert!(Path::new(&capture.staging_root)
+            .join("sessions")
+            .join("session-1")
+            .join("events.jsonl")
+            .exists());
+        std::env::remove_var("CHAINWORKS_JUNIE_SESSION_STORE_ROOT");
+        std::env::remove_var("CHAINWORKS_SESSION_STORE_ROOT");
+    }
+
+    #[test]
+    fn stage_runtime_receipt_capture_creates_fallback_when_provider_store_missing() {
+        let _guard = SESSION_STORE_ENV_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        std::env::set_var(
+            "CHAINWORKS_SESSION_STORE_ROOT",
+            temp.path()
+                .join("pending-root")
+                .to_string_lossy()
+                .to_string(),
+        );
+
+        let capture = stage_runtime_receipt_capture(
+            None,
+            &archive_context("gemini", Some("provider-session-1")),
+            &runtime_receipt("gemini"),
+        )
+        .unwrap();
+
+        assert_eq!(capture.provider, "gemini");
+        assert!(Path::new(&capture.staging_root)
+            .join("acp-runtime-receipt.json")
+            .exists());
+        assert!(capture
+            .captured_subdirs
+            .contains(&"acp-runtime-receipt.json".to_string()));
+        std::env::remove_var("CHAINWORKS_SESSION_STORE_ROOT");
     }
 
     #[test]

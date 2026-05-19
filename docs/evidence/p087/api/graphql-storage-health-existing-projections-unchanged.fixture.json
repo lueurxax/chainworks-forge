@@ -1,0 +1,15 @@
+{
+  "data": {
+    "storageHealth": {
+      "projections": {
+        "pendingInvalidations": 0,
+        "projectionLagMs": 0,
+        "latencyMs": 0,
+        "rebuildDurationP95Ms": null,
+        "coalescedKeysPending": 0,
+        "coalescedMergedTotal": 0,
+        "coalescedFlushAgeP95Ms": null
+      }
+    }
+  }
+}

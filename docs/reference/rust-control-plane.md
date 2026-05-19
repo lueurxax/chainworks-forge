@@ -117,7 +117,10 @@ for the full authentication and capability filtering reference.
 - `POST /graphql` -- queries and mutations
 - `WS /graphql/ws` -- subscriptions
 
-Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`.
+Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`, `storageHealth`.
+
+**Storage Health Readback:**
+The `storageHealth` query exposes the current health state of the storage subsystem, including `DbWriter`, WAL, projections, evidence spool, and freshness details, aligning with the P087 proposal for local storage tiering and read-path liveness. Specifically, it now exposes identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `projectionFreshness` and `projectionFreshnessBySource`.
 
 **Escalation chain readback (Phase 0-1):**
 A dedicated `runEscalationReadback` query exposes ledger chains, events, and execution metadata. Full `Run`-type escalation fields (`featureFlagState`, `wouldSelectTierId`, `policyDriftState`, etc.) are planned for Phase 2+.
@@ -424,6 +427,8 @@ Escalation state is persisted in three main tables:
 2. `escalation_execution_metadata`: Stores per-attempt attribution (tier_id, trigger, digest_version).
 3. `escalation_events`: A journal of transitions (tier_advanced, chain_exhausted, pause_reason).
 
+The system's persistence model is designed to keep SQLite as a compact canonical state, storing high-volume evidence in file-backed storage, and facilitating hot operator reads on projections or bounded snapshots.
+
 ### SQLite configuration
 
 The `db` crate creates the pool at `crates/db/src/pool.rs`:
@@ -515,10 +520,12 @@ remaining byte budget is skipped without being read and truncates the pass.
 `storage.reconcile_evidence_orphans` exposes the sweep through MCP with camelCase
 `runId`, `dryRun`, and `maxFiles` parameters. `runId` is required for non-dry-run calls
 so recovered metadata is bound to a real run, and `artifact_root` is resolved
-server-side from `CHAINWORKS_META_ROOT` or the `DATABASE_URL` parent rather than
-accepted from the client. GraphQL `storageHealth` returns a typed `StorageHealth` SDL
-object (`writer`, `wal`, `projections`, `evidenceSpool`, `killSwitches`, `thresholds`,
-plus `updatedAt`/`staleAfterMs`/`isStale`) instead of an opaque JSON blob, with
+server-side from `CHAINWORKS_META_ROOT` or the `DATABASE_URL` parent rather than from
+client-supplied paths.
+
+GraphQL `storageHealth` returns a typed `StorageHealth` SDL
+object (`writer`, `wal`, `projections`, `evidenceSpool`, `killSwitches`, `thresholds`, `projectionFreshness`, `projectionFreshnessBySource`,
+  plus `updatedAt`/`staleAfterMs`/`isStale`) instead of an opaque JSON blob, with
 fail-closed defaults that map an absent or unrecognised `dbState` to `DEGRADED`,
 absent `writer.alive` to `false`, and no live writer heartbeat to stale/degraded
 readback. MCP storage diagnostics return typed error envelopes for `invalid_input`,
@@ -608,7 +615,7 @@ queue-wait latency.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`):
 
 | Table | Purpose |
 |---|---|

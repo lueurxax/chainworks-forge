@@ -424,7 +424,7 @@ struct WorkflowMapProjectionTests {
             run: run,
             plan: plan,
             workspace: workspace,
-            executor: SimulatedAgentExecutor(catalog: catalog),
+            executor: SimulatedAgentExecutor(),
             modelContext: context,
             catalog: catalog
         )
@@ -479,7 +479,7 @@ struct WorkflowMapProjectionTests {
             run: run,
             plan: plan,
             workspace: workspace,
-            executor: SimulatedAgentExecutor(catalog: catalog),
+            executor: SimulatedAgentExecutor(),
             modelContext: context,
             catalog: catalog
         )

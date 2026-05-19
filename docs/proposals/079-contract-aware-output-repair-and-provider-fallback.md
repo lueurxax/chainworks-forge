@@ -237,6 +237,8 @@ max_provider_fallback_attempts_per_invocation = 1
 
 Provider selection is deterministic and policy-driven. The runtime may choose an alternate provider only from the agent catalog/backend profile policy for that role. If no allowed alternate provider exists, fallback is skipped and the original failure proceeds to normal stage failure.
 
+Any hardcoded runtime reroute for already-frozen runs is temporary compatibility debt, not P079 architecture. In particular, the emergency `code_writer` implementation-output reroute from Junie snapshots to `claude_builder_high` must be removed once P079 provides a governed fallback-policy path that can apply to current frozen runs through an audited policy overlay. The final implementation must not keep provider-specific fallback branches in the orchestrator as durable behavior.
+
 Initial lead-orchestrator fallback policy:
 
 | Role | Failed provider profile | Fallback provider profile |
@@ -427,7 +429,8 @@ The gate must use deterministic fixture ACP transports only. It must not require
 3. Add transcript/provider-envelope recovery.
 4. Add controlled provider fallback for proposal writer/reviewer/lead roles, including `lead_orchestrator` fallback from `gemini_reasoning_pro_high` to `claude_orchestrator_high`.
 5. Wire P076 classification to the new evidence fields.
-6. After two dogfood cycles, evaluate whether `docs_guardian` and selected `code_writer` status artifacts should join fallback coverage.
+6. Replace the emergency hardcoded Junie-to-`claude_builder_high` current-frozen-run shim with governed P079 fallback policy overlay, then delete the provider-specific orchestrator branch.
+7. After two dogfood cycles, evaluate whether `docs_guardian` and selected `code_writer` status artifacts should join fallback coverage.
 
 ## 16. Risks and Mitigations
 
