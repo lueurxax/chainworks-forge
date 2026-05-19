@@ -18,6 +18,7 @@ pub enum CapabilityToolId {
     ApprovalsResolve,
     StagesRetry,
     WorkflowConflictsResolve,
+    WorkflowLoopBudgetExtend,
     LegacyDiscoveryOverrideCreate,
     ReportsGet,
     ArtifactsOverrideContract,

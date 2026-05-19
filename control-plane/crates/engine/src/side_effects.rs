@@ -18,7 +18,7 @@ use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
 use domain::side_effect::{
     EffectKind, PrepareEffectIntent, ReconciliationBlockReason,
     RequiresEffectReconciliationEnvelope, SideEffect, SideEffectAttemptId, SideEffectId,
-    SideEffectStatus, FEATURE_RELEASE_SIDE_EFFECTS_ENABLED,
+    SideEffectStatus,
 };
 
 fn emit_p078_metric(
@@ -156,43 +156,21 @@ fn force_ledger_readback_circuit_open_until_for_test(call_site: &str, open_until
         );
 }
 
-// ── Feature-flag check ────────────────────────────────────────────────────────
-
-pub fn side_effects_enabled() -> bool {
-    std::env::var(FEATURE_RELEASE_SIDE_EFFECTS_ENABLED)
-        .ok()
-        .as_deref()
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false)
-}
-
 // ── DurableEffectCoordinator ──────────────────────────────────────────────────
 
 pub struct DurableEffectCoordinator {
     pool: SqlitePool,
     instance_id: String,
-    /// Whether the side-effect feature is enabled. Set at construction from
-    /// the env var to avoid racy per-call env reads in tests.
-    enabled: bool,
 }
 
 impl DurableEffectCoordinator {
     pub fn new(pool: SqlitePool, instance_id: String) -> Self {
-        let enabled = side_effects_enabled();
-        Self {
-            pool,
-            instance_id,
-            enabled,
-        }
+        Self { pool, instance_id }
     }
 
     /// Construct with an explicit enabled flag (useful in tests).
-    pub fn new_with_enabled(pool: SqlitePool, instance_id: String, enabled: bool) -> Self {
-        Self {
-            pool,
-            instance_id,
-            enabled,
-        }
+    pub fn new_with_enabled(pool: SqlitePool, instance_id: String) -> Self {
+        Self { pool, instance_id }
     }
 
     /// Prepare a durable intent before executing any external operation.
@@ -201,15 +179,6 @@ impl DurableEffectCoordinator {
     /// If a row with the same idempotency_key already exists and is unresolved,
     /// returns requires_effect_reconciliation.
     pub async fn prepare_effect(&self, intent: PrepareEffectIntent) -> Result<SideEffectId> {
-        if !self.enabled {
-            emit_p078_metric(
-                "side_effect_prepare_denied_total",
-                Some(&intent.effect_kind),
-                None,
-            );
-            return Err(anyhow!("CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED is false"));
-        }
-
         let idempotency_key = &intent.idempotency_key;
 
         // Check for existing row with same idempotency key.
@@ -1153,20 +1122,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proposal_078_side_effects_enabled_env() {
-        // Feature flag defaults to false when env var is absent or "false"
-        assert!(!side_effects_enabled_from_env(false));
-        assert!(side_effects_enabled_from_env(true));
-    }
-
-    fn side_effects_enabled_from_env(val: bool) -> bool {
-        val
-    }
-
-    #[tokio::test]
     async fn proposal_078_prepare_effect_blocked_when_flag_off() {
         let pool = test_pool().await;
-        let coord = DurableEffectCoordinator::new_with_enabled(pool, "instance-1".into(), false);
+        let coord = DurableEffectCoordinator::new_with_enabled(pool, "instance-1".into());
         let intent = PrepareEffectIntent {
             run_id: RunId::new(),
             stage_execution_id: StageExecutionId::new(),
@@ -1188,8 +1146,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_078_prepare_effect_succeeds_when_flag_on() {
         let pool = test_pool().await;
-        let coord =
-            DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into(), true);
+        let coord = DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into());
         let run_id = RunId::new();
         let stage_id = StageExecutionId::new();
         let intent = PrepareEffectIntent {
@@ -1215,8 +1172,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_078_retry_preflight_blocks_when_unresolved_exist() {
         let pool = test_pool().await;
-        let coord =
-            DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into(), true);
+        let coord = DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into());
         let run_id = RunId::new();
         let stage_id = StageExecutionId::new();
 
@@ -1252,8 +1208,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_078_executor_start_cas_is_exclusive() {
         let pool = test_pool().await;
-        let coord =
-            DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into(), true);
+        let coord = DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into());
         let run_id = RunId::new();
         let stage_id = StageExecutionId::new();
 
@@ -1299,8 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_078_renew_lease_updates_settlement_observation() {
         let pool = test_pool().await;
-        let coord =
-            DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into(), true);
+        let coord = DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into());
         let run_id = RunId::new();
         let stage_id = StageExecutionId::new();
         let intent = PrepareEffectIntent {
@@ -1344,8 +1298,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_078_watchdog_transitions_expired_executing_effects_on_startup() {
         let pool = test_pool().await;
-        let coord =
-            DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into(), true);
+        let coord = DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into());
         let run_id = RunId::new();
         let stage_id = StageExecutionId::new();
         let intent = PrepareEffectIntent {
@@ -1392,8 +1345,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_078_watchdog_recovers_prepared_and_external_write_crash_windows() {
         let pool = test_pool().await;
-        let coord =
-            DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into(), true);
+        let coord = DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into());
         let run_id = RunId::new();
         let prepared_stage = StageExecutionId::new();
         let external_stage = StageExecutionId::new();
@@ -1464,8 +1416,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_078_watchdog_fails_closed_when_settled_evidence_manifest_is_missing() {
         let pool = test_pool().await;
-        let coord =
-            DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into(), true);
+        let coord = DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into());
         let run_id = RunId::new();
         let stage_id = StageExecutionId::new();
         let effect = coord
@@ -1554,8 +1505,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_078_run_level_preflight_blocks_scheduler_advancement() {
         let pool = test_pool().await;
-        let coord =
-            DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into(), true);
+        let coord = DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into());
         let run_id = RunId::new();
         let stage_id = StageExecutionId::new();
         let intent = PrepareEffectIntent {

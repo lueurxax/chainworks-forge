@@ -325,13 +325,45 @@ impl AcpRuntimeManager {
                 if let Some(generation_id) = registered_generation_id.as_ref() {
                     self.live_sessions.lock().await.remove(generation_id);
                 }
-                let _ = session.close().await;
+                let provider_session_id = session.provider_session_id().await;
+                let _ = session
+                    .close_with_behavior(AcpSessionCloseBehavior::ArchiveFailure(
+                        archive_context_for_runtime_manager_request(
+                            &req,
+                            registered_generation_id.as_deref(),
+                            Some(provider_session_id),
+                            "acp_prompt_error",
+                        ),
+                    ))
+                    .await;
                 self.release_xcode_leases(cleanup).await;
                 return Err(err);
             }
         };
-        let keep_session_alive =
+        let capture_context = archive_context_for_runtime_manager_request(
+            &req,
+            registered_generation_id.as_deref(),
+            result.provider_session_id.clone(),
+            "pending_settlement",
+        );
+        match session
+            .stage_provider_session_store_for_outcome(&capture_context)
+            .await
+        {
+            Ok(capture) => result.provider_session_store_capture = capture,
+            Err(error) => warn!(
+                provider = %req.provider,
+                run_id = %req.run_id,
+                stage_id = %req.stage_id,
+                error = %error,
+                "Failed to stage ACP provider session store for settlement"
+            ),
+        }
+        let mut keep_session_alive =
             should_keep_session_alive_after_prompt(req.keep_session_alive, &result.status);
+        if keep_session_alive && result.status == AgentStatus::Failed && !session.is_live().await {
+            keep_session_alive = false;
+        }
         if keep_session_alive {
             let generation_id = req.session_generation_id.clone().ok_or_else(|| {
                 anyhow::anyhow!("keep_session_alive requested without session_generation_id")
@@ -354,9 +386,11 @@ impl AcpRuntimeManager {
         if let Some(generation_id) = registered_generation_id.as_ref() {
             self.live_sessions.lock().await.remove(generation_id);
         }
-        let close_result = session.close().await;
+        let close_result = session
+            .close_with_behavior(AcpSessionCloseBehavior::Delete)
+            .await;
         self.release_xcode_leases(cleanup).await;
-        close_result?;
+        result.close_diagnostic = close_result?.diagnostic;
         result.session_generation_id = None;
         result.reused_existing_session = false;
         result.runtime_tool_path_preflight_json =
@@ -607,21 +641,15 @@ impl AcpRuntimeManager {
                     .lock()
                     .await
                     .remove(session_generation_id);
+                let provider_session_id = session.provider_session_id().await;
                 let _ = session
                     .close_with_behavior(AcpSessionCloseBehavior::ArchiveFailure(
-                        ProviderSessionStoreArchiveContext {
-                            provider: req.provider.clone(),
-                            run_id: req.run_id.to_string(),
-                            stage_id: req.stage_id.clone(),
-                            agent_id: req.agent_id.clone(),
-                            agent_execution_id: req
-                                .agent_execution_id
-                                .as_ref()
-                                .map(ToString::to_string),
-                            session_generation_id: Some(session_generation_id.to_string()),
-                            provider_session_id: req.provider_session_id.clone(),
-                            failure_kind: "acp_prompt_error".to_string(),
-                        },
+                        archive_context_for_runtime_manager_request(
+                            &req,
+                            Some(session_generation_id),
+                            Some(provider_session_id),
+                            "acp_prompt_error",
+                        ),
                     ))
                     .await;
                 self.release_xcode_leases(cleanup).await;
@@ -630,6 +658,25 @@ impl AcpRuntimeManager {
         };
         result.session_generation_id = Some(session_generation_id.to_string());
         result.reused_existing_session = true;
+        let capture_context = archive_context_for_runtime_manager_request(
+            &req,
+            Some(session_generation_id),
+            result.provider_session_id.clone(),
+            "pending_settlement",
+        );
+        match session
+            .stage_provider_session_store_for_outcome(&capture_context)
+            .await
+        {
+            Ok(capture) => result.provider_session_store_capture = capture,
+            Err(error) => warn!(
+                provider = %req.provider,
+                run_id = %req.run_id,
+                stage_id = %req.stage_id,
+                error = %error,
+                "Failed to stage reused ACP provider session store for settlement"
+            ),
+        }
         self.record_xcode_prompt_observations(&req, &result).await;
         Ok(result)
     }
@@ -875,6 +922,26 @@ impl Default for AcpRuntimeManager {
 
 fn should_keep_session_alive_after_prompt(requested: bool, status: &AgentStatus) -> bool {
     requested && matches!(status, AgentStatus::Completed | AgentStatus::Failed)
+}
+
+fn archive_context_for_runtime_manager_request(
+    req: &ExecutionRequest,
+    session_generation_id: Option<&str>,
+    provider_session_id: Option<String>,
+    failure_kind: &str,
+) -> ProviderSessionStoreArchiveContext {
+    ProviderSessionStoreArchiveContext {
+        provider: req.provider.clone(),
+        run_id: req.run_id.to_string(),
+        stage_id: req.stage_id.clone(),
+        agent_id: req.agent_id.clone(),
+        agent_execution_id: req.agent_execution_id.as_ref().map(ToString::to_string),
+        session_generation_id: session_generation_id
+            .map(ToString::to_string)
+            .or_else(|| req.session_generation_id.clone()),
+        provider_session_id: provider_session_id.or_else(|| req.provider_session_id.clone()),
+        failure_kind: failure_kind.to_string(),
+    }
 }
 
 #[cfg(test)]

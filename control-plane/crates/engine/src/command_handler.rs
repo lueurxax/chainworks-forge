@@ -1,7 +1,7 @@
 use acp::AcpRuntimeManager;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
@@ -25,7 +25,8 @@ use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSet
 use domain::approval::ApprovalDecision;
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::commands::{
-    CallerContext, Command, ProposalGateSettlementAction, SettleProposalGateCmd,
+    CallerContext, Command, ExtendWorkflowLoopBudgetCmd, ProposalGateSettlementAction,
+    SettleProposalGateCmd, WorkflowLoopBudgetExtensionCmd,
 };
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
@@ -38,6 +39,7 @@ use domain::retry_authority::{
     RetryAuthorityEntryKind, RetryAuthorityState, RetryStageExecutionAuthority,
 };
 use domain::run::{Run, RunStatus};
+use domain::side_effect::FEATURE_P078_HEURISTIC_RETRY_GUARD_ENABLED;
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::workflow_conflict::{
     CandidateTransitionEvaluation, CandidateTransitionResult, WorkflowConflictStatus,
@@ -96,6 +98,12 @@ pub enum CommandResult {
         selected_transition_id: String,
         selected_next_state_id: String,
         retry_instruction_binding_id: Option<String>,
+    },
+    WorkflowLoopBudgetExtended {
+        run_id: RunId,
+        counter: String,
+        previous_max: u64,
+        new_max: u64,
     },
     LegacyDiscoveryOverrideCreated {
         override_id: String,
@@ -713,6 +721,131 @@ fn validate_sha256_digest(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct LoopBudgetExtensionResult {
+    counter: String,
+    variable_name: String,
+    previous_max: u64,
+    new_max: u64,
+    additional_cycles: u32,
+    reason: String,
+    target_conflict_id: Option<String>,
+    workflow_snapshot_hash: String,
+}
+
+fn validate_loop_budget_extension(extension: &WorkflowLoopBudgetExtensionCmd) -> Result<()> {
+    if extension.counter.trim().is_empty() {
+        anyhow::bail!("loop budget counter is required");
+    }
+    if extension.additional_cycles == 0 {
+        anyhow::bail!("additional_cycles must be greater than zero");
+    }
+    if extension.additional_cycles > 100 {
+        anyhow::bail!("additional_cycles must be <= 100");
+    }
+    if extension.reason.trim().is_empty() {
+        anyhow::bail!("loop budget extension reason is required");
+    }
+    Ok(())
+}
+
+fn workflow_snapshot_hash(raw: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn find_loop_budget_variable(snapshot: &serde_json::Value, counter: &str) -> Result<(String, u64)> {
+    fn visit<'a>(value: &'a serde_json::Value, counter: &str) -> Option<&'a str> {
+        let object = value.as_object()?;
+        if object
+            .get("counter")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == counter)
+        {
+            if let Some(max_expr) = object.get("max").and_then(|value| value.as_str()) {
+                return Some(max_expr);
+            }
+        }
+        for child in object.values() {
+            if let Some(found) = visit(child, counter) {
+                return Some(found);
+            }
+            if let Some(array) = child.as_array() {
+                for item in array {
+                    if let Some(found) = visit(item, counter) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+    let max_expr = visit(snapshot, counter)
+        .ok_or_else(|| anyhow!("loop budget counter {counter} not found in workflow snapshot"))?;
+    let variable_name = max_expr
+        .strip_prefix("vars.")
+        .ok_or_else(|| anyhow!("loop budget counter {counter} max is not vars.*"))?
+        .to_string();
+    let previous_max = snapshot
+        .get("variables")
+        .and_then(|value| value.get(&variable_name))
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| anyhow!("loop budget variable {variable_name} is missing or not numeric"))?;
+    Ok((variable_name, previous_max))
+}
+
+async fn extend_workflow_loop_budget_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    extension: &WorkflowLoopBudgetExtensionCmd,
+) -> Result<LoopBudgetExtensionResult> {
+    validate_loop_budget_extension(extension)?;
+    let row = sqlx::query("SELECT workflow_snapshot_json FROM runs WHERE id = ?1")
+        .bind(run_id.to_string())
+        .fetch_one(&mut **tx)
+        .await
+        .context("load run workflow snapshot for loop budget extension")?;
+    let raw_snapshot: Option<String> = row.get("workflow_snapshot_json");
+    let raw_snapshot = raw_snapshot
+        .as_deref()
+        .filter(|raw| !raw.trim().is_empty())
+        .ok_or_else(|| anyhow!("Run {run_id} has no frozen workflow snapshot"))?;
+    let mut snapshot: serde_json::Value = serde_json::from_str(raw_snapshot)
+        .map_err(|e| anyhow!("parse workflow_snapshot_json for loop budget extension: {e}"))?;
+    let (variable_name, previous_max) =
+        find_loop_budget_variable(&snapshot, extension.counter.trim())?;
+    let new_max = previous_max
+        .checked_add(extension.additional_cycles as u64)
+        .ok_or_else(|| anyhow!("loop budget extension overflows u64"))?;
+    let variables = snapshot
+        .get_mut("variables")
+        .and_then(|value| value.as_object_mut())
+        .ok_or_else(|| anyhow!("workflow snapshot has no mutable variables object"))?;
+    variables.insert(variable_name.clone(), serde_json::json!(new_max));
+    let updated_snapshot = serde_json::to_string(&snapshot)?;
+    let updated_hash = workflow_snapshot_hash(&updated_snapshot);
+    sqlx::query(
+        "UPDATE runs SET workflow_snapshot_json = ?1, workflow_snapshot_hash = ?2 WHERE id = ?3",
+    )
+    .bind(updated_snapshot)
+    .bind(&updated_hash)
+    .bind(run_id.to_string())
+    .execute(&mut **tx)
+    .await
+    .context("persist extended workflow loop budget")?;
+    Ok(LoopBudgetExtensionResult {
+        counter: extension.counter.trim().to_string(),
+        variable_name,
+        previous_max,
+        new_max,
+        additional_cycles: extension.additional_cycles,
+        reason: extension.reason.trim().to_string(),
+        target_conflict_id: extension.target_conflict_id.clone(),
+        workflow_snapshot_hash: updated_hash,
+    })
+}
+
 struct PhaseBDogfoodMetricSnapshot {
     completion_rate: f64,
     sample_size: i64,
@@ -728,6 +861,7 @@ impl CommandJournalEntry {
             Command::RejectStage(_) => "RejectStage",
             Command::RetryStage(_) => "RetryStage",
             Command::ResolveWorkflowConflictTransition(_) => "ResolveWorkflowConflictTransition",
+            Command::ExtendWorkflowLoopBudget(_) => "ExtendWorkflowLoopBudget",
             Command::OverrideLegacyDiscoveryPolicy(_) => "OverrideLegacyDiscoveryPolicy",
             Command::MainSyncRequest(_) => "MainSyncRequest",
             Command::MainSyncRetry(_) => "MainSyncRetry",
@@ -751,6 +885,7 @@ impl CommandJournalEntry {
             Command::RejectStage(c) => Some(c.run_id.to_string()),
             Command::RetryStage(c) => Some(c.run_id.to_string()),
             Command::ResolveWorkflowConflictTransition(c) => Some(c.run_id.to_string()),
+            Command::ExtendWorkflowLoopBudget(c) => Some(c.run_id.to_string()),
             Command::OverrideLegacyDiscoveryPolicy(c) => Some(c.run_id.to_string()),
             Command::MainSyncRequest(c) => Some(c.run_id.to_string()),
             Command::MainSyncRetry(c) => Some(c.run_id.to_string()),
@@ -790,6 +925,7 @@ impl CommandJournalEntry {
                 | "RejectStage"
                 | "RetryStage"
                 | "ResolveWorkflowConflictTransition"
+                | "ExtendWorkflowLoopBudget"
                 | "OverrideLegacyDiscoveryPolicy"
                 | "CancelRun"
                 | "ResetSession"
@@ -998,6 +1134,18 @@ fn retry_requires_effect_reconciliation(
         || target_agent_id.is_some_and(is_release_agent)
 }
 
+fn p078_heuristic_retry_guard_enabled() -> bool {
+    std::env::var(FEATURE_P078_HEURISTIC_RETRY_GUARD_ENABLED)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Result<bool> {
     let plan = match (
         run.workflow_snapshot_json.as_deref(),
@@ -1182,45 +1330,59 @@ fn targeted_retry_provider_fallback(
     let from_provider = retry_payload.get("provider")?.as_str()?.to_string();
     if !matches!(
         from_provider.as_str(),
-        "gemini" | "gemini_acp" | "claude" | "claude_acp" | "codex" | "codex_acp"
+        "gemini"
+            | "gemini_acp"
+            | "claude"
+            | "claude_acp"
+            | "codex"
+            | "codex_acp"
+            | "junie"
+            | "junie_acp"
     ) {
         return None;
     }
     let output_contract = retry_payload
         .get("output_contract")
         .and_then(serde_json::Value::as_str);
+    let task_outputs: Vec<&str> = retry_payload
+        .get("task_outputs")
+        .and_then(serde_json::Value::as_array)
+        .map(|outputs| {
+            outputs
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect()
+        })
+        .unwrap_or_default();
     let is_proposal_review = output_contract == Some("proposal_review_v1");
-    let is_proposal_review_aggregation = agent_id == "lead_orchestrator"
-        && retry_payload
-            .get("task_outputs")
-            .and_then(serde_json::Value::as_array)
-            .map(|outputs| {
-                outputs
-                    .iter()
-                    .any(|value| value.as_str() == Some("proposal_review_summary"))
-            })
-            .unwrap_or(false);
-    let is_proposal_authoring = agent_id == "proposal_writer"
-        && retry_payload
-            .get("task_outputs")
-            .and_then(serde_json::Value::as_array)
-            .map(|outputs| {
-                outputs
-                    .iter()
-                    .any(|value| value.as_str() == Some("proposal_current"))
-            })
-            .unwrap_or(false);
+    let is_proposal_review_aggregation =
+        agent_id == "lead_orchestrator" && task_outputs.contains(&"proposal_review_summary");
+    let is_proposal_authoring =
+        agent_id == "proposal_writer" && task_outputs.contains(&"proposal_current");
     let is_docs_guardian = agent_id == "docs_guardian" && output_contract == Some("docs_report_v1");
     let is_security_checker =
         agent_id == "security_checker" && output_contract == Some("security_report_v1");
     let is_prepush_reviewer =
         agent_id == "prepush_code_reviewer" && output_contract == Some("prepush_review_v1");
+    let is_code_writer_implementation = agent_id == "code_writer"
+        && (output_contract == Some("implementation_self_assessment_v2")
+            || task_outputs.iter().any(|output| {
+                matches!(
+                    *output,
+                    "implementation_progress"
+                        | "implementation_self_assessment"
+                        | "implementation_self_assessment_v2"
+                        | "changed_files_manifest"
+                        | "tests_result"
+                )
+            }));
     if !is_proposal_review
         && !is_proposal_review_aggregation
         && !is_proposal_authoring
         && !is_docs_guardian
         && !is_security_checker
         && !is_prepush_reviewer
+        && !is_code_writer_implementation
     {
         return None;
     }
@@ -1266,6 +1428,7 @@ fn targeted_retry_provider_fallback(
         is_docs_guardian,
         is_security_checker,
         is_prepush_reviewer,
+        is_code_writer_implementation,
         profiles,
     )?;
     let profile = profiles.get(fallback_id)?.as_object()?;
@@ -1326,8 +1489,15 @@ fn targeted_retry_fallback_profile_id<'a>(
     is_docs_guardian: bool,
     is_security_checker: bool,
     is_prepush_reviewer: bool,
+    is_code_writer_implementation: bool,
     profiles: &'a serde_json::Map<String, serde_json::Value>,
 ) -> Option<&'a str> {
+    if is_code_writer_implementation && matches!(from_provider, "junie" | "junie_acp") {
+        return ["claude_builder_high"]
+            .iter()
+            .copied()
+            .find(|candidate| profiles.contains_key(*candidate));
+    }
     if is_proposal_review_aggregation {
         return ["codex_writer_high", "codex_architect_high"]
             .iter()
@@ -1646,6 +1816,11 @@ impl CommandHandler {
             anyhow::bail!(
                 "forbidden: ResolveWorkflowConflictTransition requires operator principal"
             );
+        }
+        if matches!(&cmd, Command::ExtendWorkflowLoopBudget(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: ExtendWorkflowLoopBudget requires operator principal");
         }
         if matches!(&cmd, Command::OverrideLegacyDiscoveryPolicy(_))
             && caller.principal_class != PrincipalClass::Operator
@@ -2477,12 +2652,16 @@ impl CommandHandler {
                     return Err(ledger_err);
                 }
 
-                // Heuristic guard: still catch release stages not yet wired to the ledger.
-                if retry_requires_effect_reconciliation(
-                    old_stage,
-                    None,
-                    has_release_post_approval_tasks,
-                ) {
+                // Ledger preflight above is authoritative. The legacy heuristic guard is
+                // opt-in only because it can block retries that failed before any durable
+                // side-effect intent was recorded.
+                if p078_heuristic_retry_guard_enabled()
+                    && retry_requires_effect_reconciliation(
+                        old_stage,
+                        None,
+                        has_release_post_approval_tasks,
+                    )
+                {
                     let error = requires_effect_reconciliation_error(old_stage);
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
@@ -2803,6 +2982,17 @@ impl CommandHandler {
                         conflict.current_state_id
                     );
                 }
+                if let Some(extension) = c.loop_budget_extension.as_ref() {
+                    if let Some(target_conflict_id) = extension.target_conflict_id.as_deref() {
+                        if target_conflict_id != c.conflict_id {
+                            anyhow::bail!(
+                                "loop budget extension target_conflict_id {} does not match resolved conflict {}",
+                                target_conflict_id,
+                                c.conflict_id
+                            );
+                        }
+                    }
+                }
 
                 let selected_candidate = conflict
                     .candidate_transitions
@@ -2817,6 +3007,12 @@ impl CommandHandler {
                     })?;
                 validate_operator_selected_candidate(selected_candidate)?;
                 let selected_next_state_id = selected_candidate.to_state_id.clone();
+                let loop_budget_extension_result =
+                    if let Some(extension) = c.loop_budget_extension.as_ref() {
+                        Some(extend_workflow_loop_budget_tx(&mut tx, c.run_id, extension).await?)
+                    } else {
+                        None
+                    };
 
                 let resolved_conflict = workflow_conflicts::transition_conflict_status_tx(
                     &mut tx,
@@ -2831,6 +3027,16 @@ impl CommandHandler {
                         "resolution_reason": c.resolution_reason,
                         "caller_principal_id": caller.principal_id,
                         "caller_tool": caller.caller_tool,
+                        "loop_budget_extension": loop_budget_extension_result.as_ref().map(|extension| serde_json::json!({
+                            "counter": extension.counter,
+                            "variable_name": extension.variable_name,
+                            "previous_max": extension.previous_max,
+                            "additional_cycles": extension.additional_cycles,
+                            "new_max": extension.new_max,
+                            "reason": extension.reason,
+                            "target_conflict_id": extension.target_conflict_id,
+                            "workflow_snapshot_hash": extension.workflow_snapshot_hash,
+                        })),
                     })),
                     None,
                     None,
@@ -3007,6 +3213,95 @@ impl CommandHandler {
                     selected_transition_id: c.selected_transition_id,
                     selected_next_state_id,
                     retry_instruction_binding_id,
+                })
+            }
+
+            Command::ExtendWorkflowLoopBudget(ExtendWorkflowLoopBudgetCmd {
+                run_id,
+                extension,
+            }) => {
+                let now = Utc::now();
+                let tx_started = Instant::now();
+                let mut tx = self
+                    .begin_command_transaction(
+                        "command.ExtendWorkflowLoopBudget",
+                        journal.id.clone(),
+                    )
+                    .await?;
+                command_journal::record_tx(
+                    &mut tx,
+                    &journal.id,
+                    journal.command_type,
+                    &journal.payload_json,
+                    journal.run_id.as_deref(),
+                    journal.created_at,
+                    journal.caller_surface.as_deref(),
+                    journal.caller_principal_id.as_deref(),
+                    journal.caller_principal_class.as_deref(),
+                    journal.caller_tool.as_deref(),
+                    journal.request_id.as_deref(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+
+                let run = runs::find_by_id_tx(&mut tx, run_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Run {run_id} not found"))?;
+                let result = extend_workflow_loop_budget_tx(&mut tx, run_id, &extension).await?;
+                sqlx::query("UPDATE runs SET status = ?1 WHERE id = ?2")
+                    .bind(RunStatus::Running.to_string())
+                    .bind(run_id.to_string())
+                    .execute(&mut **tx)
+                    .await?;
+                work_items::enqueue_tx(
+                    &mut tx,
+                    &WorkItem {
+                        id: format!(
+                            "workflow-loop-budget-extend:{}:{}",
+                            run_id,
+                            uuid::Uuid::new_v4()
+                        ),
+                        kind: WorkItemKind::AdvanceRun,
+                        payload_json: serde_json::json!({
+                            "schema_version": "advance_run_payload.v1",
+                            "run_id": run_id.to_string(),
+                            "reason": "workflow_loop_budget_extended",
+                            "counter": result.counter,
+                            "previous_max": result.previous_max,
+                            "new_max": result.new_max,
+                            "target_conflict_id": result.target_conflict_id,
+                        })
+                        .to_string(),
+                        status: WorkItemStatus::Pending,
+                        run_id: Some(run_id),
+                        stage_id: run.current_state.clone(),
+                        created_at: now,
+                        scheduled_at: now,
+                        attempt_count: 0,
+                        last_error: None,
+                    },
+                )
+                .await?;
+                let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+                    &mut tx,
+                    &self.capacity_config,
+                    now,
+                    "command.ExtendWorkflowLoopBudget",
+                    0,
+                )
+                .await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ExtendWorkflowLoopBudget", tx_started);
+                self.work_queue
+                    .publish_scheduler_notification(scheduler_refresh);
+                projections::rebuild_all_for_run(&self.pool, run_id).await?;
+
+                Ok(CommandResult::WorkflowLoopBudgetExtended {
+                    run_id,
+                    counter: result.counter,
+                    previous_max: result.previous_max,
+                    new_max: result.new_max,
                 })
             }
 
@@ -4372,11 +4667,13 @@ impl CommandHandler {
                 false
             }
         };
-        if retry_requires_effect_reconciliation(
-            &old_stage,
-            Some(&target_exec.agent_id),
-            has_release_post_approval_tasks,
-        ) {
+        if p078_heuristic_retry_guard_enabled()
+            && retry_requires_effect_reconciliation(
+                &old_stage,
+                Some(&target_exec.agent_id),
+                has_release_post_approval_tasks,
+            )
+        {
             let error = requires_effect_reconciliation_error(&old_stage);
             self.record_failed_command_transaction(
                 journal,

@@ -12,7 +12,7 @@ pub mod storage;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 36] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 38] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -30,6 +30,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 36] {
         CapabilityToolId::ApprovalsResolve,
         CapabilityToolId::StagesRetry,
         CapabilityToolId::WorkflowConflictsResolve,
+        CapabilityToolId::WorkflowLoopBudgetExtend,
         CapabilityToolId::LegacyDiscoveryOverrideCreate,
         CapabilityToolId::ReportsGet,
         CapabilityToolId::ArtifactsOverrideContract,
@@ -41,6 +42,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 36] {
         CapabilityToolId::StorageWritePressure,
         CapabilityToolId::StorageEvidenceSpoolSummary,
         CapabilityToolId::StorageReconcileEvidenceOrphans,
+        CapabilityToolId::ProposalGateSettle,
         CapabilityToolId::EffectsList,
         CapabilityToolId::EffectsInspect,
         CapabilityToolId::EffectsReconcile,
@@ -87,6 +89,7 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
         "stages.retry" => Some(CapabilityToolId::StagesRetry),
         "workflow_conflicts.resolve" => Some(CapabilityToolId::WorkflowConflictsResolve),
+        "workflow_loop_budget.extend" => Some(CapabilityToolId::WorkflowLoopBudgetExtend),
         "legacy_discovery_override_create" => Some(CapabilityToolId::LegacyDiscoveryOverrideCreate),
         "reports.get" => Some(CapabilityToolId::ReportsGet),
         "artifacts.override_contract" => Some(CapabilityToolId::ArtifactsOverrideContract),
@@ -135,6 +138,7 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "approvals_resolve" => "approvals.resolve",
         "stages_retry" => "stages.retry",
         "workflow_conflicts_resolve" => "workflow_conflicts.resolve",
+        "workflow_loop_budget_extend" => "workflow_loop_budget.extend",
         "reports_get" => "reports.get",
         "artifacts_override_contract" => "artifacts.override_contract",
         "steward_run_analysis" => "steward.run_analysis",
@@ -199,6 +203,9 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::StagesRetry => tool_spec_by_name(stages::tool_specs(), "stages.retry"),
         CapabilityToolId::WorkflowConflictsResolve => {
             tool_spec_by_name(stages::tool_specs(), "workflow_conflicts.resolve")
+        }
+        CapabilityToolId::WorkflowLoopBudgetExtend => {
+            tool_spec_by_name(stages::tool_specs(), "workflow_loop_budget.extend")
         }
         CapabilityToolId::LegacyDiscoveryOverrideCreate => {
             tool_spec_by_name(stages::tool_specs(), "legacy_discovery_override_create")
@@ -316,8 +323,16 @@ mod tests {
             Some(CapabilityToolId::WorkflowConflictsResolve)
         );
         assert_eq!(
+            super::capability_id_for("workflow_loop_budget.extend"),
+            Some(CapabilityToolId::WorkflowLoopBudgetExtend)
+        );
+        assert_eq!(
             super::capability_id_for("workflow_conflicts_resolve"),
             Some(CapabilityToolId::WorkflowConflictsResolve)
+        );
+        assert_eq!(
+            super::capability_id_for("workflow_loop_budget_extend"),
+            Some(CapabilityToolId::WorkflowLoopBudgetExtend)
         );
         assert_eq!(
             super::capability_id_for("runs_list"),
@@ -342,6 +357,10 @@ mod tests {
         assert_eq!(
             super::mcp_tool_for(CapabilityToolId::WorkflowConflictsResolve).name,
             "workflow_conflicts.resolve"
+        );
+        assert_eq!(
+            super::mcp_tool_for(CapabilityToolId::WorkflowLoopBudgetExtend).name,
+            "workflow_loop_budget.extend"
         );
         assert_eq!(super::capability_id_for("missing.tool"), None);
     }

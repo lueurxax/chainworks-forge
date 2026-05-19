@@ -30,7 +30,10 @@
 //! executor, steward runtime, and GraphQL/MCP mutations are never
 //! constructed in that path.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use anyhow::Result;
 use tracing::{error, info, warn};
@@ -47,9 +50,13 @@ use daemon::xcode_shim_socket::{
     bind_xcode_shim_listener, cleanup_xcode_shim_socket, ensure_xcode_shim_dir,
     spawn_xcode_shim_socket_service, XcodeShimGrantRegistry,
 };
-use db::migrate::{self, MigrationError, MigrationOutcome};
+use db::{
+    migrate::{self, MigrationError, MigrationOutcome},
+    repos::{scheduler, work_items},
+};
 use domain::lifecycle::{
-    DaemonLifecycleState, FailureKind, XcodeBrokerHealthSnapshot, XcodeBrokerHealthState,
+    DaemonLifecycleState, DegradedKind, FailureKind, XcodeBrokerHealthSnapshot,
+    XcodeBrokerHealthState,
 };
 use domain::provider::InvokeAgentCapacityConfig;
 use engine::command_handler::CommandHandler;
@@ -361,7 +368,13 @@ async fn main() -> Result<()> {
     // mode has no HTTP bind, so `Ready` fires before `run_stdio` there.
     match mode {
         DaemonMode::Mcp => {
-            let _executor_handle = executor.start();
+            let executor_handle = executor.start();
+            let _executor_watchdog_handle = spawn_background_executor_watchdog(
+                pool.clone(),
+                work_queue.clone(),
+                reporter.clone(),
+                executor_handle,
+            );
             info!("BackgroundExecutor started");
             reporter.set_state(DaemonLifecycleState::Ready);
             if let Err(e) = packaging::write_build_sha(&paths) {
@@ -438,7 +451,13 @@ async fn main() -> Result<()> {
                 )
             };
 
-            let _executor_handle = executor.start();
+            let executor_handle = executor.start();
+            let _executor_watchdog_handle = spawn_background_executor_watchdog(
+                pool.clone(),
+                work_queue.clone(),
+                reporter.clone(),
+                executor_handle,
+            );
             info!("BackgroundExecutor started");
 
             // §5.1: Ready only AFTER HTTP bind so a client receiving
@@ -646,6 +665,154 @@ fn xcode_broker_health_for_lifecycle(
         backend_session_count: health.backend_session_count,
         helper_cleanup_reaped_leases_total: health.helper_cleanup_reaped_leases_total,
     }
+}
+
+fn spawn_background_executor_watchdog(
+    pool: SqlitePool,
+    work_queue: WorkQueue,
+    reporter: LifecycleReporter,
+    executor_handle: tokio::task::JoinHandle<()>,
+) -> tokio::task::JoinHandle<()> {
+    let executor_alive = Arc::new(AtomicBool::new(true));
+    let join_alive = executor_alive.clone();
+    let join_reporter = reporter.clone();
+    tokio::spawn(async move {
+        match executor_handle.await {
+            Ok(()) => warn!("BackgroundExecutor work loop returned unexpectedly"),
+            Err(error) => error!(error = %error, "BackgroundExecutor work loop task failed"),
+        }
+        join_alive.store(false, Ordering::SeqCst);
+        join_reporter.raise_degraded(
+            DegradedKind::BackgroundExecutorStalled,
+            "background executor work loop terminated; work queue is not being serviced",
+        );
+    });
+
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(
+            std::env::var("CHAINWORKS_EXECUTOR_WATCHDOG_INTERVAL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30),
+        );
+        let stale_advance_after = chrono::Duration::seconds(
+            std::env::var("CHAINWORKS_ADVANCE_RUN_STALE_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(300),
+        );
+        let scheduler_health_stale_after = chrono::Duration::seconds(
+            std::env::var("CHAINWORKS_SCHEDULER_HEALTH_STALE_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(180),
+        );
+
+        loop {
+            tokio::time::sleep(interval).await;
+            let now = chrono::Utc::now();
+            let stale_before = now - stale_advance_after;
+            match work_items::requeue_stale_running_advance_items(
+                &pool,
+                stale_before,
+                now,
+                "watchdog_stale_advance_run",
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(requeued) => {
+                    warn!(
+                        requeued,
+                        "BackgroundExecutor watchdog requeued stale running AdvanceRun work items"
+                    );
+                    if let Err(error) = work_queue.refresh_scheduler_projection().await {
+                        warn!(
+                            error = %error,
+                            "BackgroundExecutor watchdog failed to refresh scheduler projection after stale AdvanceRun requeue"
+                        );
+                    }
+                }
+                Err(error) => warn!(
+                    error = %error,
+                    "BackgroundExecutor watchdog failed to inspect stale running AdvanceRun work items"
+                ),
+            }
+
+            let live_work_count = match pending_or_running_work_item_count(&pool).await {
+                Ok(count) => count,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "BackgroundExecutor watchdog could not count live work items"
+                    );
+                    continue;
+                }
+            };
+            let active_agents = match active_agent_execution_count(&pool).await {
+                Ok(count) => count,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "BackgroundExecutor watchdog could not count active agent executions"
+                    );
+                    continue;
+                }
+            };
+            let scheduler_stale = match scheduler::latest_health_snapshot(&pool).await {
+                Ok(Some(snapshot)) => {
+                    let explicit_stale_at = snapshot.updated_at
+                        + chrono::Duration::milliseconds(snapshot.stale_after_ms);
+                    let watchdog_stale_at = snapshot.updated_at + scheduler_health_stale_after;
+                    explicit_stale_at <= now || watchdog_stale_at <= now
+                }
+                Ok(None) => live_work_count > 0,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "BackgroundExecutor watchdog could not read scheduler health snapshot"
+                    );
+                    continue;
+                }
+            };
+
+            if !executor_alive.load(Ordering::SeqCst) {
+                continue;
+            }
+            if scheduler_stale && live_work_count > 0 && active_agents == 0 {
+                reporter.raise_degraded(
+                    DegradedKind::BackgroundExecutorStalled,
+                    format!(
+                        "scheduler heartbeat stale while {live_work_count} work item(s) are live and no agent executions are active"
+                    ),
+                );
+            } else {
+                reporter.clear_degraded(DegradedKind::BackgroundExecutorStalled);
+            }
+        }
+    })
+}
+
+async fn pending_or_running_work_item_count(pool: &SqlitePool) -> Result<i64> {
+    sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM work_items
+           WHERE status IN ('pending', 'running')"#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(Into::into)
+}
+
+async fn active_agent_execution_count(pool: &SqlitePool) -> Result<i64> {
+    sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM agent_executions
+           WHERE status = 'running'"#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(Into::into)
 }
 
 #[cfg(unix)]

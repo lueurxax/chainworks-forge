@@ -989,11 +989,16 @@ pub trait AcpAdapter: Send + Sync {
                 return Err(err);
             }
         };
+        let capture_context = archive_context_for_failed_request(&req, "pending_settlement");
+        let staged_capture = session
+            .stage_provider_session_store_for_outcome(&capture_context)
+            .await?;
         let close_outcome = session
-            .close_with_behavior(AcpSessionCloseBehavior::StageForOutcome)
+            .close_with_behavior(AcpSessionCloseBehavior::Delete)
             .await?;
         result.close_diagnostic = close_outcome.diagnostic;
-        result.provider_session_store_capture = close_outcome.provider_session_store_capture;
+        result.provider_session_store_capture =
+            staged_capture.or(close_outcome.provider_session_store_capture);
         result.session_generation_id = None;
         result.runtime_tool_path_preflight_json =
             mark_runtime_tool_path_preflight_provider_launched(
