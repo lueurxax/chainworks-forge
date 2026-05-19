@@ -1,0 +1,31 @@
+{
+  "schema_version": "mcp_tool_call_fixture.v1",
+  "tool": "storage.health",
+  "request": {
+    "requestId": "req-p087-mcp-error",
+    "params": {}
+  },
+  "response": {
+    "isError": false,
+    "result": {
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"error\":true,\"errorCode\":\"hot_read_circuit_open\",\"message\":\"hot read circuit is open for this surface\",\"tool\":\"storage.health\",\"requestId\":\"req-p087-mcp-error\",\"retryAfterMs\":5000,\"hotRead\":{\"status\":\"open\",\"lastOpenedAtMs\":1715800000000}}"
+        }
+      ],
+      "parsedText": {
+        "error": true,
+        "errorCode": "hot_read_circuit_open",
+        "message": "hot read circuit is open for this surface",
+        "tool": "storage.health",
+        "requestId": "req-p087-mcp-error",
+        "retryAfterMs": 5000,
+        "hotRead": {
+          "status": "open",
+          "lastOpenedAtMs": 1715800000000
+        }
+      }
+    }
+  }
+}

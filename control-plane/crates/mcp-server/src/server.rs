@@ -1,6 +1,8 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
@@ -11,6 +13,7 @@ use db::writer::DbWriterHeartbeat;
 use engine::command_handler::CommandHandler;
 use engine::event_bus::EventSender;
 
+use crate::hot_read_guard;
 use crate::protocol::JsonRpcRequest;
 use crate::protocol::JsonRpcResponse;
 use crate::protocol::McpTool;
@@ -30,6 +33,30 @@ async fn write_json_line<T: serde::Serialize>(stdout: &Arc<Mutex<tokio::io::Stdo
     if let Ok(json) = serde_json::to_string(value) {
         let mut stdout = stdout.lock().await;
         let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
+    }
+}
+
+fn public_json_rpc_request_id(id: &Option<serde_json::Value>) -> String {
+    let Some(value) = id.as_ref() else {
+        return uuid::Uuid::new_v4().to_string();
+    };
+
+    match value {
+        serde_json::Value::String(raw) => public_request_id_reference(raw),
+        serde_json::Value::Number(number) => public_request_id_reference(&number.to_string()),
+        _ => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
+fn public_request_id_reference(raw: &str) -> String {
+    if raw.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(raw.as_bytes());
+        let digest = hasher.finalize();
+        let short: String = format!("{digest:x}").chars().take(16).collect();
+        format!("request_id:sha256:{short}")
     }
 }
 
@@ -301,9 +328,7 @@ impl McpServer {
     ) -> JsonRpcResponse {
         let started = std::time::Instant::now();
         let response = self.handle_request_inner(req, principal).await;
-        db::repos::storage_health::record_mcp_liveness_gate_duration(
-            started.elapsed().as_millis() as u64
-        );
+        db::metrics::record_mcp_liveness_gate_duration(started.elapsed());
         response
     }
 
@@ -315,34 +340,51 @@ impl McpServer {
         let id = req.id.clone();
 
         match req.method.as_str() {
-            "initialize" => JsonRpcResponse::success(
-                id,
-                serde_json::json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
+            "initialize" => {
+                let request_id = public_json_rpc_request_id(&id);
+                self.handle_hot_read_json_rpc(
+                    id,
+                    "initialize",
+                    async {
+                        Ok(serde_json::json!({
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {
+                                "tools": {}
+                            },
+                            "serverInfo": {
+                                "name": "chainworks-control-plane",
+                                "version": "0.1.0"
+                            }
+                        }))
                     },
-                    "serverInfo": {
-                        "name": "chainworks-control-plane",
-                        "version": "0.1.0"
-                    }
-                }),
-            ),
+                    &request_id,
+                )
+                .await
+            }
 
             "tools/list" => {
-                let tools_json: Vec<serde_json::Value> = self
-                    .visible_tool_specs(principal)
-                    .into_iter()
-                    .map(|t| {
-                        serde_json::json!({
-                            "name": t.name,
-                            "description": t.description,
-                            "inputSchema": t.input_schema
-                        })
-                    })
-                    .collect();
+                let request_id = public_json_rpc_request_id(&id);
+                self.handle_hot_read_json_rpc(
+                    id,
+                    "tools.list",
+                    async {
+                        let tools_json: Vec<serde_json::Value> = self
+                            .visible_tool_specs(principal)
+                            .into_iter()
+                            .map(|t| {
+                                serde_json::json!({
+                                    "name": t.name,
+                                    "description": t.description,
+                                    "inputSchema": t.input_schema
+                                })
+                            })
+                            .collect();
 
-                JsonRpcResponse::success(id, serde_json::json!({ "tools": tools_json }))
+                        Ok(serde_json::json!({ "tools": tools_json }))
+                    },
+                    &request_id,
+                )
+                .await
             }
 
             "tools/call" => {
@@ -353,13 +395,15 @@ impl McpServer {
                         return JsonRpcResponse::error(id, -32602, "Missing tool name".to_string());
                     }
                 };
+                let request_id = public_json_rpc_request_id(&id);
 
                 let Some(tool_id) = tools::capability_id_for(&tool_name) else {
                     return JsonRpcResponse::error(
                         id,
                         -32601,
                         format!("Method not found: {tool_name}"),
-                    );
+                    )
+                    .with_error_request_id(Some(&request_id));
                 };
                 let canonical_tool_name = tools::canonical_tool_name(&tool_name);
 
@@ -368,7 +412,8 @@ impl McpServer {
                         id,
                         -32601,
                         format!("Method not found: {tool_name}"),
-                    );
+                    )
+                    .with_error_request_id(Some(&request_id));
                 }
 
                 if !principal.tool_capabilities.contains(&tool_id) {
@@ -377,6 +422,7 @@ impl McpServer {
                             canonical_tool_name,
                             tools::storage::ERR_UNAUTHORIZED,
                             "caller lacks storage diagnostics capability",
+                            Some(&request_id),
                         );
                         return JsonRpcResponse::success(
                             id,
@@ -388,17 +434,14 @@ impl McpServer {
                             }),
                         );
                     }
-                    return JsonRpcResponse::error(
-                        id,
-                        -32601,
-                        format!("Method not found: {tool_name}"),
-                    );
+                    return JsonRpcResponse::error(id, -32000, "unauthorized".to_string())
+                        .with_error_request_id(Some(&request_id));
                 }
 
                 let tool_params = params["arguments"].clone();
 
                 match self
-                    .dispatch_tool(canonical_tool_name, tool_params, principal)
+                    .dispatch_tool(canonical_tool_name, tool_params, principal, &request_id)
                     .await
                 {
                     Ok(result) => JsonRpcResponse::success(
@@ -410,7 +453,8 @@ impl McpServer {
                             }]
                         }),
                     ),
-                    Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+                    Err(e) => JsonRpcResponse::error(id, -32603, e.to_string())
+                        .with_error_request_id(Some(&request_id)),
                 }
             }
 
@@ -445,11 +489,27 @@ impl McpServer {
                         );
                     }
                 };
+                let request_id = public_json_rpc_request_id(&id);
                 if auth::match_resource_uri(principal, &uri, resource_template_id_for_uri).is_none()
                 {
                     return JsonRpcResponse::error(id, -32002, "Resource not found".to_string());
                 }
-                self.handle_resource_read(id, &uri, principal).await
+                self.handle_hot_read_json_rpc(
+                    id,
+                    "artifacts.metadata.get",
+                    async {
+                        let data = self.read_resource_for_principal(&uri, principal).await?;
+                        Ok(serde_json::json!({
+                            "contents": [{
+                                "uri": uri,
+                                "mimeType": "application/json",
+                                "text": data.to_string()
+                            }]
+                        }))
+                    },
+                    &request_id,
+                )
+                .await
             }
 
             "notifications/initialized" => {
@@ -476,26 +536,69 @@ impl McpServer {
             .collect()
     }
 
-    async fn handle_resource_read(
+    async fn handle_hot_read_json_rpc<F>(
         &self,
         id: Option<serde_json::Value>,
-        uri: &str,
-        principal: &auth::Principal,
-    ) -> JsonRpcResponse {
-        let result: anyhow::Result<serde_json::Value> =
-            self.read_resource_for_principal(uri, principal).await;
+        surface: &str,
+        read: F,
+        request_id: &str,
+    ) -> JsonRpcResponse
+    where
+        F: Future<Output = anyhow::Result<serde_json::Value>>,
+    {
+        let guard = hot_read_guard::HotReadGuard::new(self.pool.clone(), surface);
+        let check = match guard.check(Some(request_id)).await {
+            Ok(check) => check,
+            Err(error) => {
+                return JsonRpcResponse::error(id, -32603, error.to_string())
+                    .with_error_request_id(Some(request_id))
+            }
+        };
+        let (is_probe, _probe_guard) = match check {
+            hot_read_guard::CheckResult::Allowed {
+                is_probe,
+                probe_guard,
+            } => (is_probe, probe_guard),
+            hot_read_guard::CheckResult::Denied(err) => return JsonRpcResponse::success(id, err),
+        };
+
+        let timeout_ms = if is_probe { 500 } else { 10_000 };
+        let start = std::time::Instant::now();
+
+        // P087: Create a cancellation token so timeout-dropped futures release SQLite/metadata/lane resources.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_guard = cancel.clone().drop_guard();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            db::writer::CANCELLATION_TOKEN.scope(cancel, read),
+        )
+        .await;
+        let duration = start.elapsed();
+        db::metrics::record_hot_read_latency(surface, duration);
+        // initialize/tools.list are MCP handshake probes; runtime.health is the explicit liveness surface.
+        if surface == "runtime.health" || surface == "tools.list" || surface == "initialize" {
+            db::metrics::record_mcp_liveness_gate_duration(duration);
+        }
+
         match result {
-            Ok(data) => JsonRpcResponse::success(
-                id,
-                serde_json::json!({
-                    "contents": [{
-                        "uri": uri,
-                        "mimeType": "application/json",
-                        "text": data.to_string()
-                    }]
-                }),
-            ),
-            Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+            Ok(Ok(value)) => {
+                let _ = guard.record_success().await;
+                JsonRpcResponse::success(id, value)
+            }
+            Ok(Err(error)) => JsonRpcResponse::error(id, -32603, error.to_string())
+                .with_error_request_id(Some(request_id)),
+            Err(_) => {
+                let _ = guard.record_violation("timeout").await;
+                JsonRpcResponse::success(
+                    id,
+                    tools::storage::typed_error(
+                        surface,
+                        tools::storage::ERR_TIMEOUT,
+                        format!("hot read timeout ({timeout_ms}ms)"),
+                        Some(request_id),
+                    ),
+                )
+            }
         }
     }
 
@@ -547,7 +650,15 @@ impl McpServer {
                     "name": art.name,
                     "contract_id": art.contract_id,
                     "format": art.format.to_string(),
-                    "file_path": art.file_path,
+                    "artifact_metadata_pointer": {
+                        "schemaVersion": "artifact_metadata_pointer.v1",
+                        "artifactId": art.id.to_string(),
+                        "checksumSha256": art.checksum_sha256,
+                        "sizeBytes": art.size_bytes,
+                        "authorizedPayloadRoute": format!("/artifacts/{}/payload", art.id),
+                        "payloadPathRedacted": true,
+                        "forbiddenFields": ["absolutePath", "filesystemPath", "rawPayload"]
+                    },
                     "provider": art.provider,
                     "report_kind": art.report_kind,
                     "created_at": art.created_at.to_rfc3339(),
@@ -566,6 +677,10 @@ impl McpServer {
                 .into();
             let stage_rows = projections::list_stages_projection(&self.pool, run_id).await?;
             let artifact_rows = projections::list_artifacts_projection(&self.pool, run_id).await?;
+            let public_artifact_index: Vec<_> = artifact_rows
+                .iter()
+                .map(tools::reports::public_artifact_index_row)
+                .collect();
             let run_artifacts =
                 db::repos::artifacts::list_by_run(&self.pool, run_id_parsed).await?;
             let (mcp_rollout_readback, run_report_rollout_readback) =
@@ -619,7 +734,7 @@ impl McpServer {
                 "rollout_contract_readback": mcp_rollout_readback,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
                 "closeout_readiness_summary": closeout_readiness_summary,
-                "artifact_index": artifact_rows,
+                "artifact_index": public_artifact_index,
                 "artifacts": artifact_payloads,
             }));
         }
@@ -752,6 +867,157 @@ impl McpServer {
         tool_name: &str,
         params: serde_json::Value,
         principal: &auth::Principal,
+        request_id: &str,
+    ) -> Result<serde_json::Value> {
+        let span = tracing::info_span!("dispatch_tool", tool_name, request_id);
+        self.dispatch_tool_with_span(tool_name, params, principal, span, request_id)
+            .await
+    }
+
+    async fn dispatch_tool_with_span(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+        principal: &auth::Principal,
+        span: tracing::Span,
+        request_id: &str,
+    ) -> Result<serde_json::Value> {
+        use tracing::Instrument;
+        self.dispatch_tool_instrumented(tool_name, params, principal, request_id)
+            .instrument(span)
+            .await
+    }
+
+    async fn dispatch_tool_instrumented(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+        principal: &auth::Principal,
+        request_id: &str,
+    ) -> Result<serde_json::Value> {
+        let pool = &self.pool;
+
+        if hot_read_guard::is_hot_read_tool(tool_name) {
+            let guard = hot_read_guard::HotReadGuard::new(pool.clone(), tool_name);
+            let check = guard.check(Some(request_id)).await?;
+            let (is_probe, _probe_guard) = match check {
+                hot_read_guard::CheckResult::Allowed {
+                    is_probe,
+                    probe_guard,
+                } => (is_probe, probe_guard),
+                hot_read_guard::CheckResult::Denied(err) => return Ok(err),
+            };
+
+            // P087: Enforce probe budget capped at 500 ms, 10s cancellation for normal reads.
+            let timeout_ms = if is_probe { 500 } else { 10000 };
+            let start = std::time::Instant::now();
+
+            // P087: Create a cancellation token and link it to a drop guard.
+            // When tokio::time::timeout expires, the future is dropped, triggerring cancellation.
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let _cancel_guard = cancel.clone().drop_guard();
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                db::writer::CANCELLATION_TOKEN.scope(
+                    cancel.clone(),
+                    self.dispatch_tool_internal(tool_name, params, principal, cancel, request_id),
+                ),
+            )
+            .await;
+            let duration = start.elapsed();
+            db::metrics::record_hot_read_latency(tool_name, duration);
+            if tool_name == "runtime.health" {
+                db::metrics::record_mcp_liveness_gate_duration(duration);
+            }
+
+            let mut result = match result {
+                Ok(res) => res,
+                Err(_) => {
+                    let _ = guard.record_violation("timeout").await;
+                    return Ok(tools::storage::typed_error(
+                        tool_name,
+                        tools::storage::ERR_TIMEOUT,
+                        format!("hot read timeout ({}ms)", timeout_ms),
+                        Some(request_id),
+                    ));
+                }
+            };
+
+            match &result {
+                Ok(val) if val["error"].as_bool() == Some(true) => {
+                    // Domain error, check if it counts as violation
+                    let code = val["errorCode"].as_str().unwrap_or("");
+                    db::metrics::increment_counter_with_label(
+                        "mcp_hot_read_error_total_by_code",
+                        code,
+                    );
+                    if matches!(
+                        code,
+                        tools::storage::ERR_TIMEOUT
+                            | tools::storage::ERR_BUSY
+                            | tools::storage::ERR_UNAVAILABLE
+                    ) {
+                        let _ = guard.record_violation(code).await;
+                    }
+                }
+                Ok(val) => {
+                    let _ = guard.record_success().await;
+                    // P087: Inject hotRead success metadata if missing
+                    if val.is_object() && val["hotRead"].is_null() {
+                        if let Ok(obj) = result.as_mut() {
+                            if let Some(map) = obj.as_object_mut() {
+                                let (status, _, _, _, _, _) =
+                                    db::repos::hot_read_circuit::get_circuit_state(pool, tool_name)
+                                        .await
+                                        .unwrap_or((
+                                            db::repos::hot_read_circuit::CircuitStatus::Closed,
+                                            0,
+                                            0,
+                                            None,
+                                            None,
+                                            false,
+                                        ));
+                                map.insert(
+                                    "hotRead".to_string(),
+                                    serde_json::json!({
+                                        "status": "healthy",
+                                        "circuitState": status.as_str()
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("timeout")
+                        || msg.contains("busy")
+                        || msg.contains("unavailable")
+                    {
+                        let _ = guard.record_violation(&msg).await;
+                    }
+                }
+            }
+            result
+        } else {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            db::writer::CANCELLATION_TOKEN
+                .scope(
+                    cancel.clone(),
+                    self.dispatch_tool_internal(tool_name, params, principal, cancel, request_id),
+                )
+                .await
+        }
+    }
+
+    async fn dispatch_tool_internal(
+        &self,
+        tool_name: &str,
+        params: serde_json::Value,
+        principal: &auth::Principal,
+        cancel: tokio_util::sync::CancellationToken,
+        request_id: &str,
     ) -> Result<serde_json::Value> {
         let pool = &self.pool;
         let cmd = self.cmd_handler.as_ref();
@@ -773,10 +1039,12 @@ impl McpServer {
             tools::artifacts::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("steward.") {
             tools::steward::execute(tool_name, params, pool, cmd, principal).await
+        } else if tool_name == "runtime.health" {
+            tools::runtime::execute(params, pool).await
         } else if tool_name.starts_with("effects.") {
             tools::effects::execute(tool_name, params, pool, principal).await
         } else if tool_name.starts_with("runtime.") {
-            tools::runtime::execute(tool_name, params, pool).await
+            tools::runtime::execute_with_name(tool_name, params, pool).await
         } else if tool_name.starts_with("storage.") {
             tools::storage::execute_with_writer(
                 tool_name,
@@ -785,6 +1053,9 @@ impl McpServer {
                 self.storage_writer_heartbeat
                     .as_ref()
                     .map(|heartbeat| heartbeat.as_ref()),
+                principal,
+                cancel,
+                Some(request_id),
             )
             .await
         } else {
@@ -1775,6 +2046,19 @@ mod tests {
             .iter()
             .find(|artifact| artifact["report_kind"] == serde_json::json!("validation_failure"))
             .expect("validation failure artifact");
+        let rendered = value.to_string();
+        assert!(
+            !rendered.contains("file_path"),
+            "report:// public payload must not expose raw file_path fields"
+        );
+        assert!(
+            !rendered.contains(payload_path.to_string_lossy().as_ref()),
+            "report:// public payload must not expose filesystem paths"
+        );
+        assert_eq!(
+            validation_failure["artifact_metadata_pointer"]["payloadPathRedacted"],
+            serde_json::json!(true)
+        );
 
         assert_eq!(
             validation_failure["validation_failure_record"]["failureSummary"],
@@ -2347,10 +2631,45 @@ mod tests {
         assert_eq!(payload["tool"], "storage.reconcile_evidence_orphans");
     }
 
+    async fn open_hot_read_circuit(pool: &sqlx::SqlitePool, surface: &str) {
+        for _ in 0..3 {
+            db::repos::hot_read_circuit::record_violation(pool, surface, "timeout")
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn json_rpc_result(
+        server: &McpServer,
+        principal: &auth::Principal,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(format!("p087-{method}"))),
+            method: method.to_string(),
+            params,
+        };
+        let resp = server.handle_request(req, principal).await;
+        assert!(
+            resp.error.is_none(),
+            "P087 liveness request {method} returned JSON-RPC error: {:?}",
+            resp.error
+        );
+        resp.result
+            .unwrap_or_else(|| panic!("P087 liveness request {method} must return result"))
+    }
+
     #[tokio::test]
-    async fn test_mcp_tools_call_response_includes_journal_id_in_content_text() {
-        // runs.cancel is a command tool — its payload must carry journal_id
-        // inside the MCP content[0].text wire format.
+    async fn proposal_087_mcp_liveness_sequence_survives_running_maintenance_and_records_metrics() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
@@ -2358,27 +2677,422 @@ mod tests {
         runs::insert(&pool, &make_run(run_id, idea_id))
             .await
             .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO maintenance_operations \
+             (id, operation_kind, status, idempotency_key, slot_generation, created_at_ms, updated_at_ms) \
+             VALUES ('p087-running-maintenance', 'repair_slot', 'running', 'p087-running-maintenance', 1, ?, ?)",
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let server = McpServer::new(
             pool.clone(),
             make_command_handler(pool.clone()),
             auth::PrincipalTable::test_fixture(),
         );
-        let payload = call_tool_and_parse(
+        let principal = operator_principal();
+        let started = std::time::Instant::now();
+
+        json_rpc_result(
             &server,
-            &operator_principal(),
-            "runs.cancel",
-            serde_json::json!({ "run_id": run_id.to_string() }),
+            &principal,
+            "initialize",
+            Some(serde_json::json!({})),
         )
         .await;
-
-        let journal_id = payload["journal_id"]
-            .as_str()
-            .expect("runs.cancel response must contain journal_id as a string");
+        let tools_result = json_rpc_result(&server, &principal, "tools/list", None).await;
         assert!(
-            !journal_id.is_empty(),
-            "journal_id must be non-empty (uuid from CommandHandler::handle)"
+            tools_result["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| {
+                    tool["name"] == serde_json::json!("runtime.health")
+                        || tool["name"] == serde_json::json!("runtime_health")
+                }),
+            "P087 liveness inventory must include runtime.health"
         );
+        let runs_list =
+            call_tool_and_parse(&server, &principal, "runs.list", serde_json::json!({})).await;
+        assert!(
+            runs_list.as_array().is_some(),
+            "runs.list must remain a direct bounded read payload"
+        );
+        let runtime_health =
+            call_tool_and_parse(&server, &principal, "runtime.health", serde_json::json!({})).await;
+        assert_eq!(runtime_health["schemaVersion"], "runtime_health.v1");
+        assert_eq!(
+            runtime_health["runtimeHealthProjection"]["schemaVersion"],
+            "runtime_health_projection.v1"
+        );
+        assert!(runtime_health["runtimeHealthProjection"]["activeSessions"].is_number());
+        assert!(
+            runtime_health["runtimeHealthProjection"]["degradedFlags"]["hotReadCircuitOpen"]
+                .is_boolean()
+        );
+        assert!(
+            runtime_health["runtimeHealthProjection"]["writePressureFlags"]
+                ["writerHeartbeatRequiredForStorageHealth"]
+                .is_boolean()
+        );
+        assert!(runtime_health["runtimeHealthProjection"]["sideEffectUnresolvedCount"].is_number());
+        assert!(runtime_health["runtimeHealthProjection"]["continuationActiveCount"].is_number());
+        let storage_health =
+            call_tool_and_parse(&server, &principal, "storage.health", serde_json::json!({})).await;
+        assert_eq!(storage_health["tool"], "storage.health");
+        assert_eq!(
+            storage_health["errorCode"],
+            tools::storage::ERR_STALE,
+            "storage.health should fail fast with typed degraded status without a live writer"
+        );
+        json_rpc_result(
+            &server,
+            &principal,
+            "resources/read",
+            Some(serde_json::json!({"uri": format!("run://{run_id}")})),
+        )
+        .await;
+        let _elapsed = started.elapsed();
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        assert!(db::metrics::get_hot_read_p95("tools.list").is_some());
+        assert!(db::metrics::get_hot_read_p95("runs.list").is_some());
+        assert!(db::metrics::get_runs_list_read_latency_p95().is_some());
+        assert!(db::metrics::get_hot_read_p95("runtime.health").is_some());
+        assert!(db::metrics::get_hot_read_p95("storage.health").is_some());
+        assert!(db::metrics::get_hot_read_p95("artifacts.metadata.get").is_some());
+        assert!(db::metrics::get_mcp_liveness_gate_duration_p95().is_some());
+
+        let readback = db::repos::storage_health::storage_health(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            readback["artifactNoiseProjection"]["schemaVersion"],
+            "artifact_noise_projection.v1"
+        );
+        assert!(readback["readPathMetrics"]["runsListReadLatencyP95Ms"].is_number());
+        assert!(readback["readPathMetrics"]["mcpLivenessGateDurationP95Ms"].is_number());
+        assert_eq!(
+            readback["readPathMetrics"]["mcpLivenessGateDurationSource"],
+            "runtime.health"
+        );
+        assert!(readback["readPathMetrics"]["mcpLivenessGateLastRecordedAtMs"].is_number());
+    }
+
+    #[tokio::test]
+    async fn proposal_087_runs_list_seeded_load_stays_under_500ms_and_records_p95() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        for _ in 0..10 {
+            let run_id = RunId::new();
+            runs::insert(&pool, &make_run(run_id, idea_id))
+                .await
+                .unwrap();
+            db::repos::projections::rebuild_run_summary(&pool, run_id)
+                .await
+                .unwrap();
+        }
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let principal = operator_principal();
+
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            let payload =
+                call_tool_and_parse(&server, &principal, "runs.list", serde_json::json!({})).await;
+            let elapsed_ms = started.elapsed().as_millis();
+            assert!(
+                elapsed_ms < 500,
+                "P087 runs.list seeded hot-read budget exceeded: {elapsed_ms}ms"
+            );
+            assert!(
+                payload.as_array().is_some_and(|items| items.len() >= 10),
+                "runs.list must return the seeded active run projection set"
+            );
+        }
+
+        let p95 = db::metrics::get_runs_list_read_latency_p95()
+            .expect("runs.list p95 must be recorded by production hot-read wrapper");
+        assert!(p95 < 500, "P087 runs.list p95 budget exceeded: {p95}ms");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_tools_list_json_rpc_is_hot_read_guarded() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "tools.list").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!("p087-tools-list")),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        assert_eq!(result["error"], true);
+        assert_eq!(
+            result["errorCode"],
+            tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
+        );
+        assert_eq!(result["tool"], "tools.list");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_initialize_json_rpc_is_hot_read_guarded() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "initialize").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!("p087-initialize")),
+            method: "initialize".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        assert_eq!(result["error"], true);
+        assert_eq!(
+            result["errorCode"],
+            tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
+        );
+        assert_eq!(result["tool"], "initialize");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_tools_list_typed_error_sanitizes_request_id() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "tools.list").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let raw_id = format!("p087-tools-list\n{}", "x".repeat(2_048));
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(raw_id.clone())),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        let request_id = result["requestId"].as_str().unwrap();
+        assert_ne!(request_id, raw_id);
+        assert!(request_id.len() <= 128);
+        assert!(!request_id.contains('\n'));
+        assert!(request_id.starts_with("request_id:sha256:"));
+        assert_eq!(
+            result["errorCode"],
+            tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_087_tools_list_typed_error_rejects_structured_request_id() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "tools.list").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!({"raw": "do-not-publish"})),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        let request_id = result["requestId"].as_str().unwrap();
+        assert!(!request_id.contains("do-not-publish"));
+        assert!(uuid::Uuid::parse_str(request_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn proposal_087_storage_health_tool_call_open_circuit_is_typed_result() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "storage.health").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!("p087-storage-health")),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "storage.health",
+                "arguments": {}
+            })),
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        assert!(
+            resp.error.is_none(),
+            "storage.health hot-read denial must not become JSON-RPC -32603"
+        );
+        let result = resp.result.expect("typed tool-result body is returned");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("tools/call result text must be JSON");
+        let payload: serde_json::Value = serde_json::from_str(text).expect("typed error JSON");
+        assert_eq!(payload["error"], true);
+        assert_eq!(
+            payload["errorCode"],
+            tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
+        );
+        assert_eq!(payload["tool"], "storage.health");
+        assert!(payload["retryAfterMs"].as_i64().is_some());
+        assert_eq!(payload["hotRead"]["status"], "open");
+    }
+
+    #[tokio::test]
+    async fn proposal_087_resources_read_json_rpc_is_hot_read_guarded() {
+        let _guard = crate::hot_read_guard::P087_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var(
+            "CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE",
+            "enforce",
+        );
+        let pool = test_pool().await;
+        open_hot_read_circuit(&pool, "artifacts.metadata.get").await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!("p087-resource-read")),
+            method: "resources/read".to_string(),
+            params: Some(serde_json::json!({"uri": "run://00000000-0000-0000-0000-000000000001"})),
+        };
+        let resp = server.handle_request(req, &operator_principal()).await;
+        std::env::remove_var("CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE");
+
+        let result = resp.result.expect("hot-read denial is a typed result");
+        assert_eq!(result["error"], true);
+        assert_eq!(
+            result["errorCode"],
+            tools::storage::ERR_HOT_READ_CIRCUIT_OPEN
+        );
+        assert_eq!(result["tool"], "artifacts.metadata.get");
+    }
+
+    #[test]
+    fn test_mcp_tools_call_response_includes_journal_id_in_content_text() {
+        // runs.cancel exercises a deep async call chain (handle_request →
+        // dispatch_tool_instrumented → dispatch_tool_internal → CommandHandler).
+        // In debug builds the combined future state machines can overflow the
+        // default tokio worker-thread stack (2 MiB), so spawn on a dedicated
+        // thread with a larger stack.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let pool = test_pool().await;
+                        let idea_id = IdeaId::new();
+                        let run_id = RunId::new();
+                        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+                        runs::insert(&pool, &make_run(run_id, idea_id))
+                            .await
+                            .unwrap();
+
+                        let server = McpServer::new(
+                            pool.clone(),
+                            make_command_handler(pool.clone()),
+                            auth::PrincipalTable::test_fixture(),
+                        );
+                        let payload = call_tool_and_parse(
+                            &server,
+                            &operator_principal(),
+                            "runs.cancel",
+                            serde_json::json!({ "run_id": run_id.to_string() }),
+                        )
+                        .await;
+
+                        let journal_id = payload["journal_id"]
+                            .as_str()
+                            .expect("runs.cancel response must contain journal_id as a string");
+                        assert!(
+                            !journal_id.is_empty(),
+                            "journal_id must be non-empty (uuid from CommandHandler::handle)"
+                        );
+                    })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2430,7 +3144,12 @@ mod tests {
         let health = db::repos::storage_health::storage_health(&pool)
             .await
             .unwrap();
-        assert_eq!(health["readPath"]["mcpLivenessGate"]["sampleCount"], 1);
+        assert!(
+            health["readPath"]["mcpLivenessGate"]["sampleCount"]
+                .as_u64()
+                .is_some_and(|c| c >= 1),
+            "tools/list must record at least one mcp_liveness_gate_duration sample"
+        );
         assert!(
             health["readPath"]["mcpLivenessGate"]["mcp_liveness_gate_duration_ms"]
                 .as_u64()
@@ -2456,12 +3175,21 @@ mod tests {
         .await;
 
         assert_eq!(
-            payload["schemaVersion"], "runtime_health_projection.v1",
+            payload["schemaVersion"], "runtime_health.v1",
             "runtime.health must expose the compact projection-backed runtime summary"
         );
-        assert_eq!(payload["acpRuntimeFamily"], "acp");
-        assert!(payload["activeSessions"].as_i64().is_some());
-        assert!(payload["degradedFlags"].is_array());
+        assert_eq!(
+            payload["runtimeHealthProjection"]["schemaVersion"],
+            "runtime_health_projection.v1"
+        );
+        assert!(payload["runtimeHealthProjection"]["activeSessions"]
+            .as_i64()
+            .is_some());
+        assert!(
+            payload["runtimeHealthProjection"]["degradedFlags"]["hotReadCircuitOpen"]
+                .as_bool()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2535,8 +3263,9 @@ mod tests {
 
         let runtime_health =
             call_tool_and_parse(&server, &principal, "runtime.health", serde_json::json!({})).await;
+        assert_eq!(runtime_health["schemaVersion"], "runtime_health.v1");
         assert_eq!(
-            runtime_health["schemaVersion"],
+            runtime_health["runtimeHealthProjection"]["schemaVersion"],
             "runtime_health_projection.v1"
         );
 

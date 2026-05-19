@@ -100,6 +100,7 @@ The client must not infer:
 | Host interruption | `hostInterruptionEpochs` and `hostInterruptionAffectedExecutions` | `host_interruption_epochs` / `affected_executions` | Implemented | Render host sleep/wake and network migration history and impact. |
 | Report viewer | report metadata through `artifacts(runId:)`; dedicated report payload query remains future work | artifact/report projection and future payload owner | Partial | Report metadata can render; payload rendering stays disabled unless a server-owned GraphQL payload path exists. |
 | Daemon lifecycle | `daemonStatus` and `daemonStatusChanged` | [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md) | Implemented | Render daemon live/degraded/failed/unavailable state from the lifecycle read model; do not infer lifecycle state from arbitrary request failures. |
+| Storage health | `storageHealth` | `db::repos::storage_health::storage_health_with_writer` | Implemented | Render current health state of the storage subsystem, including DbWriter, WAL, projections, evidence spool, and freshness details. |
 | Experiment comparison | future comparison read query | future comparison/report owner | Deferred | Keep comparison disabled or placeholder-only. |
 
 ## Projection freshness fields
@@ -117,6 +118,51 @@ Client behavior:
 - Display a projection-updating label for projection-derived fields.
 - Disable actions that depend on projection-owned counters or decision flags until projection truth catches up.
 - Never convert `projectionPresent=false` into normal zero/false UI truth.
+
+## Storage Health Fields
+
+The `storageHealth` query returns a `GqlStorageHealth` object, providing a comprehensive view of the local storage subsystem's operational status. This includes details on the DbWriter, WAL (Write-Ahead Log), projection subsystem, evidence spooling, kill switches, and freshness of projection data.
+
+| GraphQL type | Fields | Semantics |
+|---|---|---|
+| `GqlStorageHealth` | `dbState` | Overall health status of the database (e.g., `HEALTHY`, `DEGRADED`, `STALE`). |
+| | `writer` | Details about the DbWriter, including alive status, queue depths for different write classes, and latency metrics. |
+| | `wal` | Status of the SQLite Write-Ahead Log, including availability, size, and checkpointing information. |
+| | `projections` | Health metrics for the projection subsystem, including pending invalidations and projection lag. |
+| | `evidenceSpool` | Summary of the evidence spooling mechanism, including file counts and orphan status. |
+| | `killSwitches` | State of various storage-related kill switches (e.g., disabled write classes, evidence spool kinds). |
+| | `thresholds` | Configured warning and critical thresholds for various storage metrics. |
+| | `projectionFreshness` | A list of `GqlProjectionFreshnessV1` objects, each detailing the freshness of a specific projection, including its watermark, poisoning status, and backlog. |
+| | `projectionFreshnessBySource(projectionName: String, sourceName: String)` | A filterable complex field returning `GqlProjectionFreshnessV1` objects. Allows clients to query freshness details for specific projections or data sources. |
+| | `hotReadGuards` | A list of `HotReadCircuitStateV1` objects exposing per-surface hot-read circuit state (closed, open, half-open) including `wouldOpen` observe-mode counters used by the P087 promotion budget. |
+| | `maintenanceOperations` | A list of `MaintenanceOperationStatusV1` objects describing active and recently terminal maintenance operations (e.g., `repair_slot`) with `operationId`, `slotGeneration`, and audit-bound state. |
+| | `degraded` | Optional `DegradedStateV1` carrying a compact severity, short reason, and inline-detail payload for the operator UI degraded-state pattern. |
+| | `rollout` | JSON readback of the active rollout contract for the storage tiering / read-path liveness surface, including `rollout_contract_status`, decision, enforcement mode, hold conditions, and P087 readback fields enumerated by the P087 rollout contract (P084 schema). |
+| | `updatedAt` | Timestamp of the last health status update. |
+| | `staleAfterMs` | Duration in milliseconds after which the health data is considered stale. |
+| | `isStale` | Boolean indicating if the current health data is considered stale. |
+
+Storage health diagnostics are public readback, not raw internal error transport. Unknown persisted error strings, idempotency material, hostnames, principal tokens, and provider-authored diagnostic text must be reduced to explicit public error codes or stable hash references before they leave the daemon. If a diagnostic subquery fails, `storageHealth` remains available with `degraded.reason = storage_health_partial_readback_unavailable` or a projection-local `storage_health_subquery_unavailable` marker instead of silently presenting missing data as absent data.
+
+P087 hot-read liveness mode defaults may be relaxed only for local development. Production mode (`CHAINWORKS_ENV=production` or `CHAINWORKS_STORAGE_TIERING_PRODUCTION_MODE=1|true`) requires `CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE=enforce`; any other value is a rollout hold reported as `p087_liveness_mode_not_enforced_in_production`.
+
+### GqlProjectionFreshnessV1
+
+Provides detailed freshness information for individual projections.
+
+| Field | Semantics |
+|---|---|
+| `projectionName` | The name of the projection. |
+| `sourceName` | The name of the data source for the projection (optional). |
+| `watermarkMs` | The highest timestamp (in milliseconds) processed by the projection. |
+| `isPoisoned` | Indicates if the projection is in a poisoned state due to errors. |
+| `lastError` | Details of the last error encountered by the projection (if any). |
+| `updatedAtMs` | Timestamp (in milliseconds) when this freshness record was last updated. |
+| `throttledUntilMs` | Optional timestamp (in milliseconds) until which producers for this projection/source are throttled because the invalidation backlog crossed bound thresholds; `null` when no throttle is active. |
+| `backlogRows` | Number of rows currently in the projection's processing backlog. |
+| `backlogBytes` | Size in bytes of the projection's processing backlog. |
+
+
 
 ## Freshness states
 
@@ -244,6 +290,20 @@ P043 V1 is operator-only for the production macOS client read path. Current Grap
 | Runtime health | Operator | Deferred | Deferred |
 
 Future non-operator read expansion must be explicit in auth/capability policy and covered by server-side query authorization/redaction tests.
+
+## Artifact Metadata Pointers
+
+Hot read surfaces expose artifact payload location as `artifact_metadata_pointer.v1`, not as a raw filesystem path. The pointer contains only:
+
+- `schemaVersion = artifact_metadata_pointer.v1`;
+- `artifactId`;
+- `checksumSha256`;
+- `sizeBytes`;
+- `authorizedPayloadRoute`;
+- `payloadPathRedacted = true`;
+- `forbiddenFields = ["absolutePath", "filesystemPath", "rawPayload"]`.
+
+The canonical on-disk path can remain in compact persistence and privileged diagnostic paths, but `artifact://...` MCP metadata readback and GraphQL artifact metadata must provide the pointer so list/detail hot reads do not leak host-local paths or raw payload bytes.
 
 ## Thin UI Consumption Contract
 

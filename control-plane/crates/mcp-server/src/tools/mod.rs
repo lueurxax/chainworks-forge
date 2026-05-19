@@ -12,7 +12,7 @@ pub mod storage;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 33] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 36] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -36,8 +36,8 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 33] {
         CapabilityToolId::StewardRunAnalysis,
         CapabilityToolId::StewardListAnalyses,
         CapabilityToolId::StewardGetAnalysis,
-        CapabilityToolId::StorageHealth,
         CapabilityToolId::RuntimeHealth,
+        CapabilityToolId::StorageHealth,
         CapabilityToolId::StorageWritePressure,
         CapabilityToolId::StorageEvidenceSpoolSummary,
         CapabilityToolId::StorageReconcileEvidenceOrphans,
@@ -47,6 +47,9 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 33] {
         CapabilityToolId::EffectsMarkConflict,
         CapabilityToolId::EffectsMarkUnrecoverable,
         CapabilityToolId::EffectsClearAfterManualVerification,
+        CapabilityToolId::StorageMaintenanceRepairSlot,
+        CapabilityToolId::StorageProjectionsClearBacklog,
+        CapabilityToolId::StorageProjectionsClearPoison,
     ]
 }
 
@@ -90,8 +93,8 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "steward.run_analysis" => Some(CapabilityToolId::StewardRunAnalysis),
         "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
-        "storage.health" => Some(CapabilityToolId::StorageHealth),
         "runtime.health" => Some(CapabilityToolId::RuntimeHealth),
+        "storage.health" => Some(CapabilityToolId::StorageHealth),
         "storage.write_pressure" => Some(CapabilityToolId::StorageWritePressure),
         "storage.evidence_spool_summary" => Some(CapabilityToolId::StorageEvidenceSpoolSummary),
         "storage.reconcile_evidence_orphans" => {
@@ -105,6 +108,11 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "effects.clear_after_manual_verification" => {
             Some(CapabilityToolId::EffectsClearAfterManualVerification)
         }
+        "storage.maintenance.repair_slot" => Some(CapabilityToolId::StorageMaintenanceRepairSlot),
+        "storage.projections.clear_backlog" => {
+            Some(CapabilityToolId::StorageProjectionsClearBacklog)
+        }
+        "storage.projections.clear_poison" => Some(CapabilityToolId::StorageProjectionsClearPoison),
         _ => None,
     }
 }
@@ -132,6 +140,7 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "steward_run_analysis" => "steward.run_analysis",
         "steward_list_analyses" => "steward.list_analyses",
         "steward_get_analysis" => "steward.get_analysis",
+        "runtime_health" => "runtime.health",
         "effects_list" => "effects.list",
         "effects_inspect" => "effects.inspect",
         "effects_reconcile" => "effects.reconcile",
@@ -139,10 +148,12 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "effects_mark_unrecoverable" => "effects.mark_unrecoverable",
         "effects_clear_after_manual_verification" => "effects.clear_after_manual_verification",
         "storage_health" => "storage.health",
-        "runtime_health" => "runtime.health",
         "storage_write_pressure" => "storage.write_pressure",
         "storage_evidence_spool_summary" => "storage.evidence_spool_summary",
         "storage_reconcile_evidence_orphans" => "storage.reconcile_evidence_orphans",
+        "storage_maintenance_repair_slot" => "storage.maintenance.repair_slot",
+        "storage_projections_clear_backlog" => "storage.projections.clear_backlog",
+        "storage_projections_clear_poison" => "storage.projections.clear_poison",
         _ => tool_name,
     }
 }
@@ -205,11 +216,11 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::StewardGetAnalysis => {
             tool_spec_by_name(steward::tool_specs(), "steward.get_analysis")
         }
-        CapabilityToolId::StorageHealth => {
-            tool_spec_by_name(storage::tool_specs(), "storage.health")
-        }
         CapabilityToolId::RuntimeHealth => {
             tool_spec_by_name(runtime::tool_specs(), "runtime.health")
+        }
+        CapabilityToolId::StorageHealth => {
+            tool_spec_by_name(storage::tool_specs(), "storage.health")
         }
         CapabilityToolId::StorageWritePressure => {
             tool_spec_by_name(storage::tool_specs(), "storage.write_pressure")
@@ -240,6 +251,15 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
             effects::tool_specs(),
             "effects.clear_after_manual_verification",
         ),
+        CapabilityToolId::StorageMaintenanceRepairSlot => {
+            tool_spec_by_name(storage::tool_specs(), "storage.maintenance.repair_slot")
+        }
+        CapabilityToolId::StorageProjectionsClearBacklog => {
+            tool_spec_by_name(storage::tool_specs(), "storage.projections.clear_backlog")
+        }
+        CapabilityToolId::StorageProjectionsClearPoison => {
+            tool_spec_by_name(storage::tool_specs(), "storage.projections.clear_poison")
+        }
     }
 }
 
@@ -252,8 +272,8 @@ pub fn all_tool_specs() -> Vec<McpTool> {
     specs.extend(reports::tool_specs());
     specs.extend(artifacts::tool_specs());
     specs.extend(steward::tool_specs());
-    specs.extend(effects::tool_specs());
     specs.extend(runtime::tool_specs());
+    specs.extend(effects::tool_specs());
     specs.extend(storage::tool_specs());
     specs
 }
@@ -304,8 +324,12 @@ mod tests {
             Some(CapabilityToolId::RunsList)
         );
         assert_eq!(
-            super::capability_id_for("runtime.health"),
-            Some(CapabilityToolId::RuntimeHealth)
+            super::capability_id_for("storage.maintenance.repair_slot"),
+            Some(CapabilityToolId::StorageMaintenanceRepairSlot)
+        );
+        assert_eq!(
+            super::capability_id_for("storage_maintenance_repair_slot"),
+            Some(CapabilityToolId::StorageMaintenanceRepairSlot)
         );
         assert_eq!(
             super::mcp_tool_for(CapabilityToolId::StewardGetAnalysis).name,
@@ -337,5 +361,21 @@ mod tests {
             "runs.knowledge_capsule.ignore"
         ));
         assert!(super::p064_operator_tool_enabled("runs.get"));
+    }
+
+    #[test]
+    fn proposal_087_repair_slot_tool_is_registered_for_codex_aliases() {
+        assert_eq!(
+            super::canonical_tool_name("storage_maintenance_repair_slot"),
+            "storage.maintenance.repair_slot"
+        );
+        assert_eq!(
+            super::capability_id_for("storage_maintenance_repair_slot"),
+            Some(CapabilityToolId::StorageMaintenanceRepairSlot)
+        );
+        assert_eq!(
+            super::mcp_tool_for(CapabilityToolId::StorageMaintenanceRepairSlot).name,
+            "storage.maintenance.repair_slot"
+        );
     }
 }

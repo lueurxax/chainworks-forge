@@ -303,6 +303,18 @@ async fn main() -> Result<()> {
         work_items_requeued = summary.work_items_requeued,
         "startup recovery complete"
     );
+    match db::repos::maintenance::run_reaper(&pool).await {
+        Ok(()) => {
+            info!("P087 startup maintenance reaper complete");
+        }
+        Err(err) => {
+            warn!(
+                err = %err,
+                "P087 startup maintenance reaper failed; continuing startup with degraded storage health readback"
+            );
+        }
+    }
+    let _maintenance_reaper = db::repos::maintenance::spawn_maintenance_reaper(pool.clone());
     match daemon::storage_startup::run_startup_evidence_orphan_sweep(&pool).await {
         Ok(summary) => {
             info!(
