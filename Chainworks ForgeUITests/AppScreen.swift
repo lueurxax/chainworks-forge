@@ -6,7 +6,8 @@ import XCTest
 struct AppScreen {
     let app: XCUIApplication
 
-    private static let knownTabLabels = ["Runs Home", "Ideas", "Approvals", "Agent Catalog", "Workflow Inspector", "Pilot Readiness", "Settings"]
+    // P036 consolidated tabs are listed first so waitForTabs detects the new shell immediately.
+    private static let knownTabLabels = ["Runs", "Ideas", "Definitions", "Settings", "Runs Home", "Approvals", "Agent Catalog", "Workflow Inspector", "Pilot Readiness"]
     private static let compactNavigationLabels = [
         "Show Sidebar",
         "Hide Sidebar",
@@ -30,6 +31,12 @@ struct AppScreen {
 
     private func tabIdentifier(for label: String) -> String? {
         switch label {
+        // P036 consolidated tab identifiers
+        case "Runs":
+            return "tab-runs"
+        case "Definitions":
+            return "tab-definitions"
+        // Legacy tab identifiers
         case "Runs Home":
             return "tab-runs-home"
         case "Ideas":
@@ -148,6 +155,18 @@ struct AppScreen {
 
     private func expectedRootVisible(for label: String) -> Bool {
         switch label {
+        // P036 consolidated tabs
+        case "Runs":
+            return identifiedAny("runs-home-owner-view").exists
+                || identifiedAny("runs-home-list").exists
+                || identifiedAny("runs-home-section-waiting-approval").exists
+                || identifiedAny("run-detail-panel").exists
+                || primaryWindow.staticTexts["Waiting Approval"].exists
+        case "Definitions":
+            return identifiedAny("definitions-view").exists
+                || identifiedAny("agent-catalog-view").exists
+                || identifiedAny("workflow-state-list").exists
+        // Legacy tabs
         case "Runs Home":
             return identifiedAny("runs-home-owner-view").exists
                 || identifiedAny("runs-home-list").exists

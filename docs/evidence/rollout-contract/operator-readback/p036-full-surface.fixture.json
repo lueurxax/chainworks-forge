@@ -1,128 +1,110 @@
 {
-  "fixture_purpose": "Engine materialized placeholder for a rollout_contract_v1 readback fixture declared by an approved proposal. Implementation must replace or update this fixture with concrete evidence before the proposal gate can be treated as release evidence.",
-  "parity_lanes": {
-    "graphql": {
-      "rolloutContractActionId": null,
-      "rolloutContractCutoverPolicyRevision": null,
-      "rolloutContractDecision": "hold",
-      "rolloutContractDiagnosticRedaction": "none",
-      "rolloutContractDisabledReasonCode": "placeholder_pending_implementation_evidence",
-      "rolloutContractEnabledState": "disabled",
-      "rolloutContractEnforcementMode": "enforce",
-      "rolloutContractEnforcementModeReason": "declared_fixture_placeholder",
-      "rolloutContractFailureReasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rolloutContractHoldConditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rolloutContractNextSteps": [
-        "Replace placeholder with concrete GraphQL readback evidence."
-      ],
-      "rolloutContractOperatorMessage": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rolloutContractProjectionIntegrity": "stale",
-      "rolloutContractRollbackDisposition": {
-        "dataLossRisk": "none",
-        "mode": "not_applicable"
-      },
-      "rolloutContractSourceLane": "graphql",
-      "rolloutContractStatus": "fail",
-      "rolloutContractWaiverExpiresAt": null,
-      "rolloutContractWaiverState": "none"
-    },
-    "mcp": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
-      "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete MCP readback evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
-      "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
-      },
-      "rollout_contract_source_lane": "mcp",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
-    },
-    "release_receipt": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
-      "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete release receipt evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
-      "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
-      },
-      "rollout_contract_source_lane": "release_receipt",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
-    }
+  "schema_version": "rollout_contract_v1",
+  "applicability": "required",
+  "gate_aliases": ["proposal-036", "p036"],
+  "commands": {
+    "allowlist": [
+      "./scripts/test-gate.sh proposal-036",
+      "./scripts/test-gate.sh p036"
+    ],
+    "commentary": "Gate commands are declarative expectations; the linter does not execute them."
   },
-  "placeholder": {
-    "materialized_by": "chainworks_engine",
-    "path": "docs/evidence/rollout-contract/operator-readback/p036-full-surface.fixture.json",
-    "status": "pending_implementation_evidence"
+  "migrations": {
+    "not_applicable": true,
+    "justification": "P036 is a Swift UI/navigation and presentation proposal over existing GraphQL read projections and governed approval mutations. It does not add database schema or persistence migrations."
   },
-  "proposal_id": "unknown",
-  "proposal_revision_id": "p036-r3-2026-05-09",
-  "rollout_contract_action_id": null,
-  "rollout_contract_cutover_policy_revision": null,
-  "rollout_contract_decision": "hold",
-  "rollout_contract_diagnostic_redaction": "none",
-  "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-  "rollout_contract_enabled_state": "disabled",
-  "rollout_contract_enforcement_mode": "enforce",
-  "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-  "rollout_contract_failure_reasons": [
-    "placeholder_pending_implementation_evidence"
+  "metrics": {
+    "adoption_metric": "p036_operator_navigation_completion_rate",
+    "operational_metrics": [
+      "p036_tab_route_resolution_total{source_tab,target_tab,result}",
+      "p036_global_attention_indicator_total{attention_kind,count_bucket,freshness_state}",
+      "p036_inline_approval_render_total{freshness_state,actionability_state}",
+      "p036_operator_task_attempt_total{task_id,result,blocked_reason}",
+      "p036_timeline_batch_flush_total{entry_count,flush_latency_bucket,reduce_motion}",
+      "p036_timeline_card_collapse_total{agent_status,collapse_reason}",
+      "p036_artifact_payload_state_total{payload_availability_state,render_kind}",
+      "p036_projection_gap_deferred_total{surface,gap_class}"
+    ]
+  },
+  "readback_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
+  "readback_fields": [
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps"
   ],
-  "rollout_contract_hold_conditions": [
-    "Replace engine materialized placeholder with proposal-specific rollout evidence."
+  "readback_fixture": "docs/evidence/rollout-contract/operator-readback/p036-full-surface.fixture.json",
+  "operator_report_fields": [
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps"
   ],
-  "rollout_contract_next_steps": [
-    "Replace placeholder with concrete operator readback evidence."
+  "hold_conditions": [
+    "P036 prep artifact is missing or incomplete.",
+    "Field-level projection/detail-read inventory is missing or incomplete for any governed UI surface.",
+    "Any Swift UI path reintroduces MCP UI calls, broad GraphQL mutations, local workflow truth, or raw artifact truth fallback.",
+    "Ideas exposes executable create, configure, archive, or launch controls inside Swift UI without a future approved write-transport proposal.",
+    "Inline approval context fails to preserve P085 actionability, stale, unauthorized, redacted, already-resolved, duplicate, or conflict behavior.",
+    "Standalone Approvals tab is removed before equivalent inline approval context, global attention indication, banner routing, keyboard routing, deep-link parity, and parity checklist evidence are verified.",
+    "Phase 2.5 dogfood evidence has fewer than five canonical task-set runs or fewer than two operators without an explicit release-manager waiver.",
+    "Remote UI smoke/accessibility evidence is unavailable for the consolidated navigation flow before release promotion.",
+    "Timeline batching drops terminal, diagnostic, conflict, or completion events, ignores Reduce Motion, or causes unreadable lag.",
+    "P036 rollout readback fixture or negative fixtures are missing, unsafe, stale, or fail the rollout contract linter."
   ],
-  "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-  "rollout_contract_projection_integrity": "stale",
-  "rollout_contract_rollback_disposition": {
+  "rollback_disposition": {
+    "mode": "feature_flag_or_navigation_route_revert",
     "data_loss_risk": "none",
-    "mode": "not_applicable"
+    "steps": [
+      "Disable consolidated navigation feature flag or restore legacy tab routing while preserving GraphQL thin-client reads.",
+      "Keep approval mutations governed by P085/P031 paths; do not restore removed local write controls.",
+      "Disable timeline batching/collapse flag if timeline evidence fails while preserving raw projected timeline entries.",
+      "Attach failed gate, dogfood, and remote UI evidence to release receipt.",
+      "Re-enable only after prep evidence, affordance tests, projection gap handling, dogfood minimum, and remote smoke pass."
+    ]
   },
-  "rollout_contract_source_lane": "run_report",
-  "rollout_contract_status": "fail",
-  "rollout_contract_waiver_expires_at": null,
-  "rollout_contract_waiver_state": "none",
-  "schema_version": "operator_readback_v1",
-  "source_lane": "run_report"
+  "decision_vocabulary": ["pass", "fail", "waived", "not_applicable", "timeout"],
+  "negative_fixtures": {
+    "approval_actionability_mismatch": "docs/evidence/rollout-contract/negative/p085-approval-actionability-mismatch.json",
+    "insufficient_dogfood_sample": "docs/evidence/rollout-contract/negative/p036-insufficient-dogfood-sample.json",
+    "missing_hold_and_rollback": "docs/evidence/rollout-contract/negative/missing-hold-and-rollback.json",
+    "missing_projection_inventory": "docs/evidence/rollout-contract/negative/p036-missing-projection-inventory.json",
+    "missing_required_surfaces": "docs/evidence/rollout-contract/negative/missing-required-surfaces.json",
+    "unsafe_local_truth_fallback": "docs/evidence/rollout-contract/negative/p085-unsafe-local-truth-fallback.json",
+    "unsafe_path_and_command": "docs/evidence/rollout-contract/negative/unsafe-path-and-command.json"
+  },
+  "cutover_policy": {
+    "revision": "p036-cutover-v1",
+    "applicable_to": "post_cutover_implementation_starts",
+    "enforcement_mode_at_cutover": "enforce",
+    "grandfathered_rendering": "not_applicable"
+  }
 }

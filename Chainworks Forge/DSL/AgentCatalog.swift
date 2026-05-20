@@ -49,6 +49,7 @@ nonisolated struct AgentCatalog: Codable, Sendable {
     /// Proposal 026: Catalog-owned runtime profile declarations.
     let runtimeProfiles: [String: RuntimeProfile]
     let agents: [AgentDefinition]
+    var agentOrder: [String]?
 
     enum CodingKeys: String, CodingKey {
         case app, paths, artifacts, skills, contracts, agents
@@ -526,4 +527,49 @@ struct ResolvedMCPProfile: Codable, Sendable, Equatable {
         requestedExtensions: [],
         fallbackPolicy: "allow_without_extensions"
     )
+}
+
+extension AgentCatalog {
+    func groupedAgents() -> [(label: String, agents: [AgentDefinition])] {
+        func getGroup(for agent: AgentDefinition) -> String {
+            if let group = agent.group?.trimmingCharacters(in: .whitespacesAndNewlines), !group.isEmpty {
+                return group
+            }
+            let mode = agent.mode.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !mode.isEmpty {
+                return mode.capitalized
+            }
+            let profile = agent.backendProfile.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !profile.isEmpty {
+                return profile
+            }
+            if let role = agent.skillRole?.trimmingCharacters(in: .whitespacesAndNewlines), !role.isEmpty {
+                return role
+            }
+            return "Other"
+        }
+
+        func normalizeLabel(_ label: String) -> String {
+            let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { return "Other" }
+            return trimmed.split(separator: " ")
+                .map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }
+                .joined(separator: " ")
+        }
+
+        var groups: [String: [AgentDefinition]] = [:]
+        var order: [String] = []
+        
+        for agent in agents {
+            let rawLabel = getGroup(for: agent)
+            let normalized = normalizeLabel(rawLabel)
+            if groups[normalized] == nil {
+                order.append(normalized)
+                groups[normalized] = []
+            }
+            groups[normalized]?.append(agent)
+        }
+        
+        return order.map { ($0, groups[$0]!) }
+    }
 }

@@ -91,6 +91,10 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
     case "subscription":
       operationKind = .subscription
     case "mutation":
+      // Reject documents with more than one mutation to prevent multi-operation allowlist bypass.
+      guard operations.filter({ $0.keyword == "mutation" }).count == 1 else {
+        throw P031GraphQLReadBoundaryError.mutationOperationForbidden(normalizedName)
+      }
       guard Self.isAllowedApprovalMutationDocument(normalizedDocument) else {
         throw P031GraphQLReadBoundaryError.mutationOperationForbidden(normalizedName)
       }
@@ -224,28 +228,126 @@ struct P031GraphQLReadRequest: Equatable, Sendable {
 
   nonisolated private static func isAllowedApprovalMutationDocument(_ document: String) -> Bool {
     let scanDocument = document.maskingGraphQLIgnoredTextForP031OperationScan()
-    let allowedFields = ["approveApproval", "rejectApproval"]
-    let forbiddenFields = [
-      "startRun",
-      "approveStage",
-      "rejectStage",
-      "retryStage",
-      "cancelRun",
-      "overrideLegacyDiscoveryPolicy",
-      "resetSession",
-      "resumeRun",
-      "cloneRun",
-      "compareRun",
-      "launchExperiment",
-      "runtimeHealth",
-      "agentReset",
-      "resetAgent",
-    ]
-    let allowedCount = allowedFields.reduce(0) { count, field in
-      count + (scanDocument.containsGraphQLFieldNamed(field) ? 1 : 0)
+    let allowedFields: Set<String> = ["approveApproval", "rejectApproval"]
+    guard let rootFields = mutationRootSelectionFields(in: scanDocument),
+          !rootFields.isEmpty
+    else { return false }
+    return rootFields.count == 1 && rootFields.allSatisfy { allowedFields.contains($0) }
+  }
+
+  // Extracts the root-level selection field names from the single mutation operation body.
+  // Returns nil if the body cannot be parsed, contains aliases, or contains fragment spreads.
+  // Caller must ensure the document has exactly one mutation before invoking this function.
+  nonisolated private static func mutationRootSelectionFields(in scanDocument: String) -> [String]? {
+    var index = scanDocument.startIndex
+    var globalDepth = 0
+
+    while index < scanDocument.endIndex {
+      let c = scanDocument[index]
+
+      if c == "{" {
+        globalDepth += 1
+        index = scanDocument.index(after: index)
+        continue
+      }
+      if c == "}" {
+        globalDepth = max(0, globalDepth - 1)
+        index = scanDocument.index(after: index)
+        continue
+      }
+
+      guard isGraphQLNameStart(c) else {
+        index = scanDocument.index(after: index)
+        continue
+      }
+
+      let tokenStart = index
+      index = scanDocument.index(after: index)
+      while index < scanDocument.endIndex, isGraphQLNameContinue(scanDocument[index]) {
+        index = scanDocument.index(after: index)
+      }
+
+      guard globalDepth == 0 else { continue }
+
+      let token = String(scanDocument[tokenStart..<index]).lowercased()
+      guard token == "mutation" else { continue }
+
+      // Skip optional variable definitions (inside parens) and directives to reach the body '{'.
+      var parenDepth = 0
+      var foundBody = false
+      while index < scanDocument.endIndex {
+        let bc = scanDocument[index]
+        if bc == "(" { parenDepth += 1 }
+        else if bc == ")" { parenDepth = max(0, parenDepth - 1) }
+        else if bc == "{", parenDepth == 0 {
+          index = scanDocument.index(after: index)
+          foundBody = true
+          globalDepth = 1
+          break
+        }
+        index = scanDocument.index(after: index)
+      }
+      guard foundBody else { continue }
+
+      // Extract root-level fields at globalDepth == 1 (inside mutation body).
+      var fields: [String] = []
+      var bodyParenDepth = 0
+
+      while index < scanDocument.endIndex, globalDepth > 0 {
+        let bc = scanDocument[index]
+        if bc == "(" {
+          bodyParenDepth += 1
+          index = scanDocument.index(after: index)
+          continue
+        }
+        if bc == ")" {
+          bodyParenDepth = max(0, bodyParenDepth - 1)
+          index = scanDocument.index(after: index)
+          continue
+        }
+        if bc == "{" {
+          if bodyParenDepth == 0 { globalDepth += 1 }
+          index = scanDocument.index(after: index)
+          continue
+        }
+        if bc == "}" {
+          if bodyParenDepth == 0 {
+            globalDepth -= 1
+            if globalDepth == 0 { break }
+          }
+          index = scanDocument.index(after: index)
+          continue
+        }
+        // Fragment spreads ("...") at root level are rejected.
+        if globalDepth == 1, bodyParenDepth == 0, bc == "." {
+          return nil
+        }
+        guard globalDepth == 1, bodyParenDepth == 0, isGraphQLNameStart(bc) else {
+          index = scanDocument.index(after: index)
+          continue
+        }
+        let fieldStart = index
+        index = scanDocument.index(after: index)
+        while index < scanDocument.endIndex, isGraphQLNameContinue(scanDocument[index]) {
+          index = scanDocument.index(after: index)
+        }
+        let fieldToken = String(scanDocument[fieldStart..<index])
+        // Reject aliases: "aliasName: fieldName".
+        var peekIdx = index
+        while peekIdx < scanDocument.endIndex, scanDocument[peekIdx].isWhitespace {
+          peekIdx = scanDocument.index(after: peekIdx)
+        }
+        if peekIdx < scanDocument.endIndex, scanDocument[peekIdx] == ":" {
+          return nil
+        }
+        // "on" is a keyword in inline fragments, not a selection field.
+        if fieldToken != "on" {
+          fields.append(fieldToken)
+        }
+      }
+      return fields.isEmpty ? nil : fields
     }
-    guard allowedCount == 1 else { return false }
-    return !forbiddenFields.contains { scanDocument.containsGraphQLFieldNamed($0) }
+    return nil
   }
 }
 
@@ -911,6 +1013,10 @@ enum P031DisabledReasonCode: String, Codable, CaseIterable, Equatable, Sendable 
   case projectionLag = "PROJECTION_LAG"
   case unauthorized = "UNAUTHORIZED"
   case unsupportedAction = "UNSUPPORTED_ACTION"
+  case redacted = "REDACTED"
+  case conflict = "CONFLICT"
+  case duplicate = "DUPLICATE"
+  case alreadyResolved = "ALREADY_RESOLVED"
 
   // Fail-closed: unknown server values decode to .writePathNotAvailable (most restrictive).
   init(from decoder: Decoder) throws {
@@ -1740,6 +1846,18 @@ struct P031RunRowReadModel: Decodable, Equatable, Sendable {
       implementationCompletion: implementationCompletion,
       sideEffectReadback: sideEffectReadback
     )
+  }
+
+  /// P036: canonical lane classification. Fails to .deferred for any status not in the
+  /// typed RunStatus vocabulary — never guesses terminality or blockage from string heuristics.
+  nonisolated var lane: P036RunLane {
+    if (pendingApprovals ?? 0) > 0 { return .waiting }
+    guard let bucket = RunStatus.from(serverValue: status) else { return .deferred }
+    switch bucket {
+    case .failed, .blocked: return .blocked
+    case .running, .cancelling, .pending, .ready, .waitingApproval: return .running
+    case .completed, .cancelled: return .completed
+    }
   }
 }
 
@@ -3244,7 +3362,7 @@ struct P031OperatorWritePathGuide: Decodable, Equatable, Sendable {
       return .documented(.automation)
     case .nonP031UI:
       return .documented(.nonP031UI)
-    case .temporarilyUnavailable, .unknown:
+    case .temporarilyUnavailable, .unknown(_):
       return .unavailable
     }
   }
@@ -3434,7 +3552,7 @@ struct P031OperatorWritePathGuideRow: Decodable, Equatable, Sendable {
       return trimmedUnavailableReason != nil && trimmedFollowUpID != nil
     case .cli, .mcpTerminal, .automation, .nonP031UI:
       return trimmedExternalWorkflowNameOrTool != nil && trimmedExpectedSuccessOutput != nil
-    case .unknown:
+    case .unknown(_):
       return false
     }
   }
@@ -3458,7 +3576,7 @@ struct P031OperatorWritePathGuideRow: Decodable, Equatable, Sendable {
     switch externalWorkflowKind {
     case .cli, .mcpTerminal, .automation, .nonP031UI:
       return true
-    case .temporarilyUnavailable, .unknown:
+    case .temporarilyUnavailable, .unknown(_):
       return false
     }
   }
@@ -3581,7 +3699,7 @@ enum P031OperatorWritePathGuidePresenter {
     switch row.externalWorkflowKind {
     case .temporarilyUnavailable:
       return "Temporarily unavailable"
-    case .cli, .mcpTerminal, .automation, .nonP031UI, .unknown:
+    case .cli, .mcpTerminal, .automation, .nonP031UI, .unknown(_):
       break
     }
     if row.supportsExternalWorkflow(requiringIdentifiers: Set(row.normalizedRequiredIdentifiers)) {
@@ -3621,7 +3739,7 @@ enum P031OperatorWritePathExternalWorkflowKind: Equatable, Sendable {
     switch self {
     case .cli, .mcpTerminal, .automation, .nonP031UI, .temporarilyUnavailable:
       return true
-    case .unknown:
+    case .unknown(_):
       return false
     }
   }
@@ -3720,6 +3838,14 @@ enum DisabledReasonPresenter {
       return "Unauthorized"
     case .unsupportedAction:
       return "Unsupported action"
+    case .redacted:
+      return "Redacted"
+    case .conflict:
+      return "Conflict"
+    case .duplicate:
+      return "Duplicate"
+    case .alreadyResolved:
+      return "Already resolved"
     }
   }
 }
@@ -3931,6 +4057,11 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
   let sideEffectSignalLabel: String?
   let freshnessState: P031FreshnessState
   let accessibilityLabel: String
+  // P036: Expose typed fields for workbench classification
+  let rawStatus: String
+  let failedStages: Int
+  let pendingApprovals: Int
+  let lane: P036RunLane
 
   nonisolated init(
     runID: String,
@@ -3943,7 +4074,10 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
     implementationCompletionSignalLabel: String? = nil,
     sideEffectSignalLabel: String? = nil,
     freshnessState: P031FreshnessState,
-    accessibilityLabel: String
+    accessibilityLabel: String,
+    rawStatus: String,
+    failedStages: Int,
+    pendingApprovals: Int
   ) {
     self.runID = runID
     self.title = title
@@ -3956,7 +4090,38 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
     self.sideEffectSignalLabel = sideEffectSignalLabel
     self.freshnessState = freshnessState
     self.accessibilityLabel = accessibilityLabel
+    self.rawStatus = rawStatus
+    self.failedStages = failedStages
+    self.pendingApprovals = pendingApprovals
+    
+    // P036: Canonical lane mapping
+    if pendingApprovals > 0 {
+      self.lane = .waiting
+    } else {
+      if let status = RunStatus.from(serverValue: rawStatus) {
+        switch status {
+        case .failed, .blocked:
+          self.lane = .blocked
+        case .running, .cancelling, .pending, .ready, .waitingApproval:
+          self.lane = .running
+        case .completed, .cancelled:
+          self.lane = .completed
+        }
+      } else {
+        self.lane = .deferred
+      }
+    }
   }
+}
+
+enum P036RunLane: String, Codable, Sendable, CaseIterable {
+  case waiting
+  case blocked
+  case running
+  case completed
+  // Server status was not in the known RunStatus vocabulary; renders projection-lag/deferred
+  // state instead of guessing terminality from local heuristics.
+  case deferred
 }
 
 struct P031RunsHomePresentation: Equatable, Sendable {
@@ -3987,6 +4152,11 @@ struct P031ApprovalInboxRowPresentation: Equatable, Sendable {
   let copyItems: [P031DiagnosticCopyItem]
   let freshnessState: P031FreshnessState
   let accessibilityLabel: String
+  // P036: Expose P085 affordance for workbench integration
+  let affordance: P085ApprovalAffordanceState
+
+  // M3: gated accessor — views must use this instead of reading `.affordance` directly
+  var deferredState: P036DeferredState? { P036DeferredState(from: affordance) }
 }
 
 struct P031ApprovalInboxPresentation: Equatable, Sendable {
@@ -4020,6 +4190,8 @@ struct P031ArtifactSummaryPresentation: Equatable, Sendable {
   let diagnosticCopyItems: [P031DiagnosticCopyItem]
   let freshnessState: P031FreshnessState
   let accessibilityLabel: String
+  // P036: Expose P085 affordance for workbench integration
+  let affordance: P085ArtifactAffordanceState
 }
 
 struct P031IdeaContextPresentation: Equatable, Sendable {
@@ -4097,6 +4269,13 @@ enum P077CloseoutReadinessVisualState: Equatable, Sendable {
   case warning
   case blocking
   case neutral
+
+  nonisolated static func == (lhs: P077CloseoutReadinessVisualState, rhs: P077CloseoutReadinessVisualState) -> Bool {
+    switch (lhs, rhs) {
+    case (.positive, .positive), (.warning, .warning), (.blocking, .blocking), (.neutral, .neutral): return true
+    default: return false
+    }
+  }
 }
 
 struct P077CloseoutReadinessPresentation: Equatable, Sendable {
@@ -4158,7 +4337,7 @@ struct P077CloseoutReadinessAnnouncementState: Equatable, Sendable {
 }
 
 enum P077CloseoutReadinessAnnouncementPolicy {
-  static let coalescingWindow: TimeInterval = 3
+  nonisolated static let coalescingWindow: TimeInterval = 3
 
   nonisolated static func announcement(
     for presentation: P077CloseoutReadinessPresentation,
@@ -4234,6 +4413,9 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let refreshFeedbackText: String
   let emptyStateTitle: String?
   let errorDescription: String?
+  // P036: Expose typed fields for workbench classification
+  let rawStatus: String
+  let failedStages: Int
 
   nonisolated init(
     title: String,
@@ -4255,7 +4437,9 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     freshness: P031FreshnessSnapshot,
     refreshFeedbackText: String,
     emptyStateTitle: String?,
-    errorDescription: String?
+    errorDescription: String?,
+    rawStatus: String,
+    failedStages: Int
   ) {
     self.title = title
     self.workflowLabel = workflowLabel
@@ -4277,6 +4461,8 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.refreshFeedbackText = refreshFeedbackText
     self.emptyStateTitle = emptyStateTitle
     self.errorDescription = errorDescription
+    self.rawStatus = rawStatus
+    self.failedStages = failedStages
   }
 }
 
@@ -4718,6 +4904,8 @@ struct P031ReportMetadataListPresentation: Equatable, Sendable {
 struct P031DaemonLifecyclePresentation: Equatable, Sendable {
   let state: P031DaemonLifecycleState?
   let buildSHA: String?
+  let pid: Int?
+  let uptimeSeconds: Int?
   let title: String
   let detailLabel: String?
   let badgeLabels: [String]
@@ -4831,7 +5019,10 @@ enum P031RunsHomePresenter {
       implementationCompletionSignalLabel: implementationCompletion?.compactSignalLabel,
       sideEffectSignalLabel: sideEffectReadback?.compactSignalLabel,
       freshnessState: run.freshnessState,
-      accessibilityLabel: accessibilityParts.joined(separator: ", ")
+      accessibilityLabel: accessibilityParts.joined(separator: ", "),
+      rawStatus: run.status,
+      failedStages: run.failedStages ?? 0,
+      pendingApprovals: pendingApprovals
     )
   }
 }
@@ -4940,7 +5131,8 @@ enum P031ApprovalInboxPresenter {
       followUpID: diagnostic.followUpID,
       copyItems: diagnostic.copyItems,
       freshnessState: approval.freshnessState,
-      accessibilityLabel: accessibilityParts.joined(separator: ", ")
+      accessibilityLabel: accessibilityParts.joined(separator: ", "),
+      affordance: p085Affordance
     )
   }
 }
@@ -5025,7 +5217,9 @@ enum P031RunDetailPresenter {
       ),
       refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .runDetail),
       emptyStateTitle: emptyStateTitle,
-      errorDescription: nil
+      errorDescription: nil,
+      rawStatus: run?.status ?? "unavailable",
+      failedStages: run?.failedStages ?? 0
     )
   }
 
@@ -5057,7 +5251,9 @@ enum P031RunDetailPresenter {
       ),
       refreshFeedbackText: P031ReadRefreshPresenter.feedbackText(for: .runDetail),
       emptyStateTitle: nil,
-      errorDescription: P031ReadErrorPresenter.description(for: error)
+      errorDescription: P031ReadErrorPresenter.description(for: error),
+      rawStatus: "unavailable",
+      failedStages: 0
     )
   }
 
@@ -5356,7 +5552,8 @@ enum P031StageTransitionPresenter {
     if status.contains("pending") || status.contains("waiting") || stage.hasPendingApproval == true {
       return .pending
     }
-    return .pending
+    // P036: unknown/unrecognized statuses must not infer runtime state locally.
+    return .unavailable
   }
 }
 
@@ -5375,18 +5572,12 @@ enum P031ArtifactViewerPresenter {
     let preparedPreview: ArtifactPreparedPreview?
     switch artifact.payloadAvailabilityState {
     case .metadataOnly, .payloadDeferred:
-      if let payloadText, hasPayload {
-        let preview = makePreparedPreview(
-          forPayload: payloadText,
-          normalizedFormat: normalizedFormat,
-          artifactName: artifact.name
-        )
-        renderMode = Self.renderMode(forIntent: preview.intent)
-        preparedPreview = preview
-      } else {
-        renderMode = .metadataOnly
-        preparedPreview = nil
-      }
+      // Fail closed: the server declared these states as non-available payloads.
+      // Rendering payloadText here would let an inconsistent server detail payload
+      // silently override the declared non-available state. A distinct authorized
+      // partial-preview state is required to render content.
+      renderMode = .metadataOnly
+      preparedPreview = nil
     case .generating, .unavailable:
       renderMode = .unavailable
       preparedPreview = nil
@@ -5411,8 +5602,22 @@ enum P031ArtifactViewerPresenter {
     ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
       .filter { !$0.isEmpty }
       .joined(separator: " / ")
+    // SEC-001: serverDebugDetail must only surface when the P085 diagnostic affordance
+    // is available and the payload is not in an unauthorized state. Routing through
+    // diagnosticAffordance ensures freshnessState == .unauthorized suppresses detail.
+    // The additional notAuthorized reason-code check prevents payload auth failures
+    // from leaking operator/server debug strings.
+    let freshnessStateForDiag = P085FreshnessState(artifact.freshnessState)
+    let diagnostic = P085AffordancePresenter.diagnosticAffordance(
+      diagnosticID: artifact.diagnosticID,
+      serverDebugDetail: artifact.serverDebugDetail,
+      freshnessState: freshnessStateForDiag
+    )
+    let payloadIsAuthorized = artifact.payloadUnavailableReasonCode != .notAuthorized
+    let guardedDebugDetail =
+      (diagnostic.isAvailable && payloadIsAuthorized) ? diagnostic.serverDebugDetail : nil
     let payloadUnavailableReason =
-      artifact.serverDebugDetail
+      guardedDebugDetail
       ?? artifact.payloadUnavailableReasonCode?.rawValue
       ?? (hasPayload ? nil : "Payload content is not exposed through GraphQL")
     let accessibilityParts = [
@@ -5572,7 +5777,8 @@ enum P031ArtifactPresenter {
       canOpenPayload: payload.canOpenPayload,
       diagnosticCopyItems: payload.copyItems,
       freshnessState: artifact.freshnessState,
-      accessibilityLabel: accessibilityParts.joined(separator: ", ")
+      accessibilityLabel: accessibilityParts.joined(separator: ", "),
+      affordance: p085Affordance
     )
   }
 }
@@ -5677,6 +5883,8 @@ enum P031DaemonLifecyclePresenter {
     return P031DaemonLifecyclePresentation(
       state: status.state,
       buildSHA: status.buildSHA,
+      pid: status.pid,
+      uptimeSeconds: nil, // Add uptime if available in status
       title: title,
       detailLabel: detailParts.isEmpty ? nil : detailParts.joined(separator: " / "),
       badgeLabels: badgeLabels(for: status.state),
@@ -5699,6 +5907,8 @@ enum P031DaemonLifecyclePresenter {
     P031DaemonLifecyclePresentation(
       state: nil,
       buildSHA: nil,
+      pid: nil,
+      uptimeSeconds: nil,
       title: "Daemon unavailable",
       detailLabel: nil,
       badgeLabels: ["Unavailable"],

@@ -635,6 +635,145 @@ struct Proposal085Tests {
     }
   }
 
+  // MARK: - Fail-closed for every P031DisabledReasonCode (security regression suite)
+  // Each test creates an approval with pending decision, available write path, and both
+  // approve/reject in availableActions. Only a non-nil disabledReasonCode should prevent
+  // actionability — the previous implementation only hard-disabled 3 of the 11 codes.
+
+  @Test("Approval is disabled for .redacted even with available writePathState and availableActions")
+  func approvalDisabledForRedacted() {
+    let approval = P031ApprovalReadModel(
+        id: "appr-r1", runID: "r-1", stageID: "s-1",
+        decision: "pending", freshnessState: .live,
+        disabledReasonCode: .redacted,
+        writePathState: .available,
+        diagnosticID: nil, serverDebugDetail: nil,
+        availableActions: ["approve", "reject"]
+    )
+    let state = P085AffordancePresenter.approvalAffordance(for: approval)
+    if case .disabled(let code, _) = state.approveAvailability {
+        #expect(code == .redacted)
+    } else {
+        Issue.record("Expected .disabled(.redacted) but got \(state.approveAvailability)")
+    }
+    if case .disabled(let code, _) = state.rejectAvailability {
+        #expect(code == .redacted)
+    } else {
+        Issue.record("Expected .disabled(.redacted) but got \(state.rejectAvailability)")
+    }
+  }
+
+  @Test("Approval is disabled for .conflict even with available writePathState and availableActions")
+  func approvalDisabledForConflict() {
+    let approval = P031ApprovalReadModel(
+        id: "appr-c1", runID: "r-1", stageID: "s-1",
+        decision: "pending", freshnessState: .live,
+        disabledReasonCode: .conflict,
+        writePathState: .available,
+        diagnosticID: nil, serverDebugDetail: nil,
+        availableActions: ["approve", "reject"]
+    )
+    let state = P085AffordancePresenter.approvalAffordance(for: approval)
+    if case .disabled(let code, _) = state.approveAvailability {
+        #expect(code == .conflict)
+    } else {
+        Issue.record("Expected .disabled(.conflict) but got \(state.approveAvailability)")
+    }
+  }
+
+  @Test("Approval is disabled for .duplicate even with available writePathState and availableActions")
+  func approvalDisabledForDuplicate() {
+    let approval = P031ApprovalReadModel(
+        id: "appr-d1", runID: "r-1", stageID: "s-1",
+        decision: "pending", freshnessState: .live,
+        disabledReasonCode: .duplicate,
+        writePathState: .available,
+        diagnosticID: nil, serverDebugDetail: nil,
+        availableActions: ["approve", "reject"]
+    )
+    let state = P085AffordancePresenter.approvalAffordance(for: approval)
+    if case .disabled(let code, _) = state.approveAvailability {
+        #expect(code == .duplicate)
+    } else {
+        Issue.record("Expected .disabled(.duplicate) but got \(state.approveAvailability)")
+    }
+  }
+
+  @Test("Approval is disabled for .alreadyResolved even with available writePathState and availableActions")
+  func approvalDisabledForAlreadyResolved() {
+    let approval = P031ApprovalReadModel(
+        id: "appr-ar1", runID: "r-1", stageID: "s-1",
+        decision: "pending", freshnessState: .live,
+        disabledReasonCode: .alreadyResolved,
+        writePathState: .available,
+        diagnosticID: nil, serverDebugDetail: nil,
+        availableActions: ["approve", "reject"]
+    )
+    let state = P085AffordancePresenter.approvalAffordance(for: approval)
+    if case .disabled(let code, _) = state.approveAvailability {
+        #expect(code == .alreadyResolved)
+    } else {
+        Issue.record("Expected .disabled(.alreadyResolved) but got \(state.approveAvailability)")
+    }
+  }
+
+  @Test("Approval is disabled for .managedOutsideUI even with available writePathState and availableActions")
+  func approvalDisabledForManagedOutsideUI() {
+    let approval = P031ApprovalReadModel(
+        id: "appr-mou1", runID: "r-1", stageID: "s-1",
+        decision: "pending", freshnessState: .live,
+        disabledReasonCode: .managedOutsideUI,
+        writePathState: .available,
+        diagnosticID: nil, serverDebugDetail: nil,
+        availableActions: ["approve", "reject"]
+    )
+    let state = P085AffordancePresenter.approvalAffordance(for: approval)
+    if case .disabled(let code, _) = state.approveAvailability {
+        #expect(code == .managedOutsideUI)
+    } else {
+        Issue.record("Expected .disabled(.managedOutsideUI) but got \(state.approveAvailability)")
+    }
+  }
+
+  @Test("Approval is disabled for .projectionLag with available writePathState and availableActions")
+  func approvalDisabledForProjectionLagWithAvailableActions() {
+    let approval = P031ApprovalReadModel(
+        id: "appr-pl1", runID: "r-1", stageID: "s-1",
+        decision: "pending", freshnessState: .projectionLag,
+        disabledReasonCode: .projectionLag,
+        writePathState: .available,
+        diagnosticID: nil, serverDebugDetail: nil,
+        availableActions: ["approve", "reject"]
+    )
+    let state = P085AffordancePresenter.approvalAffordance(for: approval)
+    if case .disabled(let code, _) = state.approveAvailability {
+        #expect(code == .projectionLag)
+    } else {
+        Issue.record("Expected .disabled(.projectionLag) but got \(state.approveAvailability)")
+    }
+  }
+
+  @Test("Every P031DisabledReasonCode fails closed when write path is available and action is present")
+  func allDisabledReasonCodesFailClosedWithAvailableWritePathAndActions() {
+    for reasonCode in P031DisabledReasonCode.allCases {
+      let approval = P031ApprovalReadModel(
+          id: "appr-exhaustive-\(reasonCode.rawValue)", runID: "r-1", stageID: "s-1",
+          decision: "pending", freshnessState: .live,
+          disabledReasonCode: reasonCode,
+          writePathState: .available,
+          diagnosticID: nil, serverDebugDetail: nil,
+          availableActions: ["approve", "reject"]
+      )
+      let state = P085AffordancePresenter.approvalAffordance(for: approval)
+      if case .actionable = state.approveAvailability {
+        Issue.record("disabledReasonCode \(reasonCode) unexpectedly produced .actionable (fail-open security bug)")
+      }
+      if case .actionable = state.rejectAvailability {
+        Issue.record("disabledReasonCode \(reasonCode) unexpectedly produced .actionable (fail-open security bug)")
+      }
+    }
+  }
+
   @Test("P031ApprovalReadModel.canApprove is true for decision=pending with availableActions")
   func canApproveIsTrueForPendingDecision() {
     let approval = P031ApprovalReadModel(

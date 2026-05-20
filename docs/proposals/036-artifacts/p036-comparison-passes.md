@@ -3,7 +3,10 @@
 ## Pass 1: Current vs. Pre-Control-Plane Baseline
 
 - **Lost affordances**: Local workflow creation/mutation (intentionally removed), direct filesystem artifact manipulation.
+  - *Rationale*: Shift to control-plane ownership and durable implementation worktrees.
+  - *Citations*: The legacy `New Idea`, `Archive`, and `Start New Run` controls are no longer reachable from the consolidated navigation surface; `ContentView.swift` retains only read-first Ideas affordances via `P031IdeasCompatibilitySurface`.
 - **Degraded affordances**: Timeline noise during high-concurrency tool runs (to be fixed in P036).
+  - *Fix*: `RunTimelineInspectorView.swift` `buildFocusedTimelineSpineEntries` performs tool reconciliation and text-chunk collapse.
 - **Unchanged affordances**: Run monitoring, artifact viewing (basic), settings.
 - **Intentionally removed**: Local SwiftData orchestrator fallback, raw artifact truth for workflow state.
 

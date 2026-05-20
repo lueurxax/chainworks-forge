@@ -1,9 +1,10 @@
 {
   "baseline_metadata": {
-    "recorded_at": "2026-05-10T21:16:00Z",
-    "operator_count": 0,
-    "session_count": 0,
-    "environment": "pre-P036-consolidation"
+    "recorded_at": "2026-05-11T21:34:00Z",
+    "operator_count": 1,
+    "session_count": 1,
+    "environment": "P036-refinement",
+    "baseline_git_ref": "HEAD"
   },
   "tasks": [
     {

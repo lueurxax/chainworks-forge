@@ -12,12 +12,14 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
     private var _executedTasks: [ExecutionRecord] = []
     private var _failingAgentIDs: Set<String> = []
     private var _customOutputs: [String: [String: Data]] = [:] // agentID -> [outputName -> Data]
-    let simulatedDelay: Double
 
     private let lock = NSLock()
+    let simulatedDelay: TimeInterval
+    let catalog: AgentCatalog?
 
-    init(simulatedDelay: Double = 0, catalog: AgentCatalog? = nil) {
+    init(simulatedDelay: TimeInterval = 0, catalog: AgentCatalog? = nil) {
         self.simulatedDelay = simulatedDelay
+        self.catalog = catalog
     }
 
     var executedTasks: [ExecutionRecord] {
@@ -35,11 +37,14 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
         set { lock.lock(); defer { lock.unlock() }; _customOutputs = newValue }
     }
 
-    func reset() {
+    func reset(
+        failingAgentIDs: Set<String> = [],
+        customOutputs: [String: [String: Data]] = [:]
+    ) {
         lock.lock(); defer { lock.unlock() }
         _executedTasks = []
-        _failingAgentIDs = []
-        _customOutputs = [:]
+        _failingAgentIDs = failingAgentIDs
+        _customOutputs = customOutputs
     }
 
     func execute(
@@ -47,6 +52,10 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
         agent: ResolvedAgent,
         context: ExecutionContext
     ) async throws -> AgentResult {
+        if simulatedDelay > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(simulatedDelay * 1_000_000_000))
+        }
+
         lock.lock()
         let record = ExecutionRecord(task: task.task, agentID: agent.id, stageID: context.stageID)
         _executedTasks.append(record)
@@ -75,12 +84,12 @@ final class SimulatedAgentExecutor: AgentExecutor, @unchecked Sendable {
         var finalOutputs = agentOutputs
         for outputName in agent.outputs {
             if finalOutputs[outputName] == nil {
-                let (data, _) = OutputContractTemplates.generate(
+                let generated = OutputContractTemplates.generate(
                     contractID: agent.outputContract ?? "default",
                     agentID: agent.id,
                     stageID: context.stageID
                 )
-                finalOutputs[outputName] = data
+                finalOutputs[outputName] = generated.data
             }
         }
 

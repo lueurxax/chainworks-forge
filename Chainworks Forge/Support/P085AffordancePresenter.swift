@@ -27,6 +27,15 @@ enum P085FreshnessState: Equatable, Sendable {
   case unauthorized
   case unknown(rawValue: String)
 
+  nonisolated static func == (lhs: P085FreshnessState, rhs: P085FreshnessState) -> Bool {
+    switch (lhs, rhs) {
+    case (.live, .live), (.refreshing, .refreshing), (.projectionLag, .projectionLag),
+         (.stale, .stale), (.unavailable, .unavailable), (.unauthorized, .unauthorized): return true
+    case (.unknown(let l), .unknown(let r)): return l == r
+    default: return false
+    }
+  }
+
   nonisolated init(_ p031State: P031FreshnessState) {
     switch p031State {
     case .live: self = .live
@@ -352,23 +361,22 @@ enum P085AffordancePresenter {
     action: String,
     approval: P031ApprovalReadModel
   ) -> P085ApprovalActionAvailability {
-    // Fail closed on caller-policy denial codes regardless of other fields.
-    if let code = approval.disabledReasonCode,
-       code == .unauthorized || code == .staleRead || code == .ambiguousApprovalIdentity {
+    // Fail closed: any non-nil disabledReasonCode from the server disables the action,
+    // regardless of writePathState or availableActions. This prevents redacted, conflict,
+    // duplicate, alreadyResolved, managedOutsideUI, and projectionLag codes from passing
+    // through to .actionable when those conditions are the only active constraint.
+    if let code = approval.disabledReasonCode {
       return .disabled(reasonCode: code, helpText: disabledHelpText(for: code))
     }
     // pending/requested are actionable; any other non-nil decision (granted/rejected/expired) is resolved.
     if let d = approval.decision, d != "pending", d != "requested" {
-      let reason = approval.disabledReasonCode ?? .unsupportedAction
-      return .disabled(reasonCode: reason, helpText: "Approval is already resolved.")
+      return .disabled(reasonCode: .unsupportedAction, helpText: "Approval is already resolved.")
     }
     guard approval.writePathState == .available else {
-      let reason = approval.disabledReasonCode ?? .writePathNotAvailable
-      return .disabled(reasonCode: reason, helpText: disabledHelpText(for: reason))
+      return .disabled(reasonCode: .writePathNotAvailable, helpText: disabledHelpText(for: .writePathNotAvailable))
     }
     guard approval.availableActions.contains(action) else {
-      let reason = approval.disabledReasonCode ?? .unsupportedAction
-      return .disabled(reasonCode: reason, helpText: disabledHelpText(for: reason))
+      return .disabled(reasonCode: .unsupportedAction, helpText: disabledHelpText(for: .unsupportedAction))
     }
     return .actionable
   }
@@ -383,6 +391,10 @@ enum P085AffordancePresenter {
       return "Projection lag detected. The action may be available after the projection catches up."
     case .unauthorized: return "You are not authorized to perform this action."
     case .unsupportedAction: return "This action is not supported."
+    case .redacted: return "This action has been redacted for security."
+    case .conflict: return "A conflict was detected. Refresh to see latest state."
+    case .duplicate: return "This action is a duplicate of an existing request."
+    case .alreadyResolved: return "This action has already been resolved."
     }
   }
 

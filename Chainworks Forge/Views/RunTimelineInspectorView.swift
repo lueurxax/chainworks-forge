@@ -4,19 +4,22 @@ import SwiftUI
 @MainActor
 final class P036TimelinePresentationModel: ObservableObject {
     @Published private(set) var entries: [FocusedTimelineSpineEntry] = []
-    
+
     private var buffer: (live: [LiveExecutionTimelineEntry], persisted: [WorkflowMapPersistedTimelineEntry], xcode: [WorkflowMapXcodeRuntimeObservation])?
     private var lastFlush = Date.distantPast
     private let flushInterval: TimeInterval = 2.0
     private var timer: AnyCancellable?
-    
+    private var reduceMotion: Bool = false
+
     func update(
         live: [LiveExecutionTimelineEntry],
         persisted: [WorkflowMapPersistedTimelineEntry],
-        xcode: [WorkflowMapXcodeRuntimeObservation]
+        xcode: [WorkflowMapXcodeRuntimeObservation],
+        reduceMotion: Bool = false
     ) {
         buffer = (live, persisted, xcode)
-        
+        self.reduceMotion = reduceMotion
+
         let now = Date()
         if now.timeIntervalSince(lastFlush) >= flushInterval {
             flush()
@@ -31,86 +34,274 @@ final class P036TimelinePresentationModel: ObservableObject {
                 }
         }
     }
-    
+
     private func flush() {
         timer?.cancel()
         timer = nil
-        
+
         guard let buffer = buffer else { return }
         self.buffer = nil
         lastFlush = Date()
-        
-        entries = buildFocusedTimelineSpineEntries(
+
+        let allEntries = buildFocusedTimelineSpineEntries(
             liveTimeline: buffer.live,
             persistedTimeline: buffer.persisted,
             xcodeRuntimeObservations: buffer.xcode
         )
+
+        P036UICounters.shared.recordTimelineBatchFlush(
+            entryCount: allEntries.count,
+            reduceMotion: reduceMotion
+        )
+        entries = allEntries
     }
 }
 
 struct FocusedTimelineSpineEntry: Identifiable, Sendable {
     let id: String
+    let kind: EntryKind
     let title: String
     let detail: String
     let timestamp: Date
     let stageID: String
     let surfaceLabel: String
     let sessionID: String?
+    let agentID: String?
+    let isCollapsed: Bool
     let liveEvent: ExecutionEvent?
+    
+    enum EntryKind: String, Sendable {
+        case text
+        case mergedTool = "merged_tool"
+        case sessionEvent = "session_event"
+        case agentSummary = "agent_summary"
+        case policyWarning = "policy_warning"
+        case implementationCompletion = "implementation_completion"
+        case persisted
+    }
 }
 
 func buildFocusedTimelineSpineEntries(
     liveTimeline: [LiveExecutionTimelineEntry],
     persistedTimeline: [WorkflowMapPersistedTimelineEntry],
-    xcodeRuntimeObservations: [WorkflowMapXcodeRuntimeObservation] = []
+    xcodeRuntimeObservations: [WorkflowMapXcodeRuntimeObservation] = [],
+    implementationCompletion: P088ImplementationCompletionPresentation? = nil,
+    implementationCompletionTimestamp: Date? = nil
 ) -> [FocusedTimelineSpineEntry] {
-    let liveEntries = liveTimeline.map { entry in
-        FocusedTimelineSpineEntry(
+    var rawEntries: [FocusedTimelineSpineEntry] = []
+    
+    if let completion = implementationCompletion, let timestamp = implementationCompletionTimestamp {
+        let detail = [
+            "\(completion.statusLabel): \(completion.outputFreshnessLabel)",
+            completion.primaryEvidencePath
+        ].compactMap { $0 }.joined(separator: " \u{00B7} ")
+        
+        rawEntries.append(FocusedTimelineSpineEntry(
+            id: "implementation_completion",
+            kind: .implementationCompletion,
+            title: "Implementation Completion",
+            detail: detail,
+            timestamp: timestamp,
+            stageID: "completion",
+            surfaceLabel: "implementation_completion",
+            sessionID: nil,
+            agentID: nil,
+            isCollapsed: false,
+            liveEvent: nil
+        ))
+    }
+    
+    // Group live events by compound identity (agentID:sessionID:requestID) for reconciliation.
+    // Keying on requestID alone allows concurrent agents sharing a requestID to erase each other.
+    var toolCalls: [String: (start: LiveExecutionTimelineEntry, finish: LiveExecutionTimelineEntry?)] = [:]
+    var otherLive: [LiveExecutionTimelineEntry] = []
+
+    for entry in liveTimeline {
+        if let requestId = entry.event.requestID {
+            let compoundKey = "\(entry.agentID):\(entry.event.sessionID ?? ""):\(requestId)"
+            if entry.event.type == .toolCallStarted {
+                toolCalls[compoundKey] = (start: entry, finish: nil)
+            } else if entry.event.type == .toolCallFinished {
+                if var existing = toolCalls[compoundKey] {
+                    existing.finish = entry
+                    toolCalls[compoundKey] = existing
+                } else {
+                    otherLive.append(entry)
+                }
+            } else {
+                otherLive.append(entry)
+            }
+        } else {
+            otherLive.append(entry)
+        }
+    }
+
+    // Pre-compute completedAgents before building any entries so merged tool cards
+    // and other entries are collapsed in the same pass.
+    var completedAgents = Set<String>()
+    for entry in otherLive {
+        if entry.event.type == .finalOutput || entry.event.type == .finish {
+            completedAgents.insert(entry.agentID)
+        }
+    }
+
+    // Collect all entries for the unified collapse pass.
+    var entriesForCollapse: [FocusedTimelineSpineEntry] = []
+
+    // Create merged tool entries — added to entriesForCollapse so the collapse pass
+    // marks them isCollapsed when their agent has completed.
+    for (compoundKey, call) in toolCalls {
+        let isFinished = call.finish != nil
+        entriesForCollapse.append(FocusedTimelineSpineEntry(
+            id: compoundKey,
+            kind: .mergedTool,
+            title: call.start.agentTitle,
+            detail: "Tool: \(call.start.event.toolName ?? "unknown") (\(isFinished ? "completed" : "running"))",
+            timestamp: call.start.event.timestamp,
+            stageID: call.start.stageID,
+            surfaceLabel: "tool",
+            sessionID: call.start.event.sessionID,
+            agentID: call.start.agentID,
+            isCollapsed: false,
+            liveEvent: call.start.event
+        ))
+    }
+
+    // Map other live entries. Do NOT skip duplicate summaries here;
+    // the final reverse-chrono pass keeps the latest one per agent.
+    for entry in otherLive {
+        let kind: FocusedTimelineSpineEntry.EntryKind = {
+            switch entry.event.type {
+            case .textChunk: return .text
+            case .sessionStarted, .sessionClosed: return .sessionEvent
+            case .finalOutput, .finish: return .agentSummary
+            case .toolCallFinished: return .sessionEvent // Diagnostic for out-of-order
+            default: return .text
+            }
+        }()
+
+        let title: String = {
+            if entry.event.type == .toolCallFinished {
+                return "Diagnostic: \(entry.agentTitle)"
+            }
+            return entry.agentTitle
+        }()
+
+        entriesForCollapse.append(FocusedTimelineSpineEntry(
             id: entry.id.uuidString,
-            title: entry.agentTitle,
+            kind: kind,
+            title: title,
             detail: entry.event.detail,
             timestamp: entry.event.timestamp,
             stageID: entry.stageID,
             surfaceLabel: entry.event.type.rawValue,
             sessionID: entry.event.sessionID,
+            agentID: entry.agentID,
+            isCollapsed: false,
             liveEvent: entry.event
-        )
+        ))
     }
 
-    let persistedEntries = persistedTimeline.map { entry in
-        FocusedTimelineSpineEntry(
+    // Collapse pass: text and merged-tool entries for completed agents are collapsed.
+    for entry in entriesForCollapse {
+        let shouldCollapse = (entry.kind == .text || entry.kind == .mergedTool) && completedAgents.contains(entry.agentID ?? "")
+        rawEntries.append(FocusedTimelineSpineEntry(
             id: entry.id,
+            kind: entry.kind,
+            title: entry.title,
+            detail: entry.detail,
+            timestamp: entry.timestamp,
+            stageID: entry.stageID,
+            surfaceLabel: entry.surfaceLabel,
+            sessionID: entry.sessionID,
+            agentID: entry.agentID,
+            isCollapsed: shouldCollapse,
+            liveEvent: entry.liveEvent
+        ))
+    }
+    
+    // Map persisted entries
+    for entry in persistedTimeline {
+        rawEntries.append(FocusedTimelineSpineEntry(
+            id: entry.id,
+            kind: .persisted,
             title: entry.title,
             detail: entry.detail,
             timestamp: entry.timestamp,
             stageID: "persisted",
             surfaceLabel: "persisted",
             sessionID: entry.sessionID,
+            agentID: entry.agentID,
+            isCollapsed: false,
             liveEvent: nil
-        )
+        ))
     }
-
-    let xcodePolicyWarnings = xcodeRuntimeObservations.flatMap { observation in
-        observation.coalescedShimWarnings.enumerated().map { index, warning in
-            FocusedTimelineSpineEntry(
+    
+    // Map policy warnings
+    for observation in xcodeRuntimeObservations {
+        for (index, warning) in observation.coalescedShimWarnings.enumerated() {
+            rawEntries.append(FocusedTimelineSpineEntry(
                 id: "\(observation.id)::policy-warning::\(index)",
+                kind: .policyWarning,
                 title: "Policy Warning",
                 detail: "\(warning.policyReason): \(warning.matchedSubstring)",
                 timestamp: warning.timestamp ?? Date(timeIntervalSince1970: 0),
                 stageID: observation.stageID,
                 surfaceLabel: "policy_warning",
                 sessionID: nil,
+                agentID: observation.agentExecutionID.uuidString,
+                isCollapsed: false,
                 liveEvent: nil
-            )
+            ))
         }
     }
-
-    return (liveEntries + persistedEntries + xcodePolicyWarnings).sorted { lhs, rhs in
+    
+    // Sorting and simple collapse rules (reverse chronological for top-down display)
+    let sorted = rawEntries.sorted { lhs, rhs in
         if lhs.timestamp == rhs.timestamp {
-            return lhs.id > rhs.id
+            return lhs.id < rhs.id
         }
         return lhs.timestamp > rhs.timestamp
     }
+    
+    var finalEntries: [FocusedTimelineSpineEntry] = []
+    var seenAgentsWithSummary = Set<String>()
+    
+    for entry in sorted {
+        // one-summary-per-completed-agent logic
+        if entry.kind == .agentSummary, let agentID = entry.agentID {
+            if seenAgentsWithSummary.contains(agentID) {
+                continue
+            }
+            seenAgentsWithSummary.insert(agentID)
+        }
+
+        if let last = finalEntries.last,
+           last.kind == .text && entry.kind == .text,
+           last.sessionID == entry.sessionID {
+            // Collapse consecutive text from same session
+            continue 
+        }
+        finalEntries.append(entry)
+    }
+
+    // Apply lossless 40-entry cap: preserve terminal/priority entries, fill remaining from normal.
+    // sessionEvent covers terminal session events (started/closed) and diagnostic out-of-order
+    // tool finishes — these must never be dropped per the P036 lossless policy.
+    let cap = 40
+    guard finalEntries.count > cap else { return finalEntries }
+    let priority: Set<FocusedTimelineSpineEntry.EntryKind> = [
+        .implementationCompletion, .agentSummary, .policyWarning, .sessionEvent, .persisted
+    ]
+    let reserved = finalEntries.filter { priority.contains($0.kind) }
+    let normal = finalEntries.filter { !priority.contains($0.kind) }
+    let remaining = max(0, cap - reserved.count)
+    var capped = reserved + Array(normal.prefix(remaining))
+    capped.sort { lhs, rhs in
+        if lhs.timestamp == rhs.timestamp { return lhs.id < rhs.id }
+        return lhs.timestamp > rhs.timestamp
+    }
+    return capped
 }
 
 struct RunTimelineInspectorView: View {
@@ -120,132 +311,180 @@ struct RunTimelineInspectorView: View {
     @StateObject private var model = P036TimelinePresentationModel()
     @Environment(\.accessibilityReduceMotion) var reduceMotion
 
+    private var isDogfood: Bool {
+        #if DEBUG
+        return true
+        #else
+        return ProcessInfo.processInfo.environment["CHAINWORKS_DOGFOOD"] == "1"
+        #endif
+    }
+
     var body: some View {
-        let bridgeProgressStatus = latestXcodeBridgeProgressStatus(
-            in: projection.xcodeRuntimeObservations
-        )
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    if showsTitle {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Timeline")
-                                .font(.title3.weight(.semibold))
-                            Text("Focused run-detail timeline combining live execution and durable supervision history.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    if let bridgeProgressStatus {
-                        Label {
-                            Text(bridgeProgressStatus.label)
-                                .font(.callout.weight(.semibold))
-                        } icon: {
-                            Image(systemName: bridgeProgressStatus.kind == .actionRequired ? "exclamationmark.shield" : "point.3.connected.trianglepath.dotted")
-                        }
-                        .foregroundStyle(bridgeProgressStatus.kind == .actionRequired ? .orange : .secondary)
-                        .accessibilityIdentifier("xcode-bridge-progress-status")
-                    }
-
-                    if !projection.xcodeRuntimeObservations.isEmpty {
-                        XcodeRuntimeObservationsView(observations: projection.xcodeRuntimeObservations)
-                    }
-
-                    if model.entries.isEmpty {
-                        ContentUnavailableView(
-                            "No Timeline Data",
-                            systemImage: "waveform.path.ecg",
-                            description: Text("No live or persisted timeline events yet.")
-                        )
-                        .frame(maxWidth: .infinity)
-                        .frame(maxHeight: .infinity)
-                    } else {
-                        GroupBox("Timeline") {
-                            VStack(alignment: .leading, spacing: 10) {
-                                ForEach(model.entries) { entry in
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        HStack {
-                                            Text(entry.title)
-                                                .font(.subheadline.weight(.semibold))
-                                            Spacer()
-                                            Text(entry.surfaceLabel)
-                                                .font(.caption2)
-                                                .foregroundStyle(.secondary)
-                                        }
-
-                                        if let liveEvent = entry.liveEvent {
-                                            TimelineEventDetailView(event: liveEvent)
-                                        } else if entry.surfaceLabel == "policy_warning" {
-                                            Label {
-                                                Text(entry.detail)
-                                                    .font(.caption)
-                                                    .textSelection(.enabled)
-                                            } icon: {
-                                                Image(systemName: "exclamationmark.shield")
-                                            }
-                                            .foregroundStyle(.orange)
-                                            .accessibilityIdentifier("xcode-policy-warning")
-                                        } else {
-                                            Text(entry.detail)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                                .textSelection(.enabled)
-                                        }
-
-                                        HStack(spacing: 8) {
-                                            Text(entry.stageID)
-                                            if let sessionID = entry.sessionID {
-                                                Text(sessionID)
-                                            }
-                                            Text(entry.timestamp, format: .dateTime.hour().minute().second())
-                                        }
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(10)
-                                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                                    .transition(.asymmetric(
-                                        insertion: .push(from: .bottom).combined(with: .opacity),
-                                        removal: .opacity
-                                    ))
+        Group {
+            if !isDogfood {
+                P031OperatorPlaceholder(
+                    title: "Timeline Unavailable",
+                    message: "Durable timeline requires dogfood flag activation.",
+                    identifier: "timeline-dogfood-gated",
+                    titleIdentifier: "timeline-dogfood-title"
+                )
+            } else {
+                let bridgeProgressStatus = latestXcodeBridgeProgressStatus(
+                    in: projection.xcodeRuntimeObservations
+                )
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            if showsTitle {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Timeline")
+                                        .font(.title3.weight(.semibold))
+                                    Text("Focused run-detail timeline combining live execution and durable supervision history.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                 }
                             }
-                        }
-                        .animation(reduceMotion ? .linear(duration: 0.1) : .spring(response: 0.45, dampingFraction: 0.82), value: model.entries.map(\.id))
-                    }
 
-                    // Invisible anchor used to auto-scroll to the latest entry
-                    Color.clear
-                        .frame(height: 1)
-                        .id("live-timeline-bottom")
+                            if let bridgeProgressStatus {
+                                Label {
+                                    Text(bridgeProgressStatus.label)
+                                        .font(.callout.weight(.semibold))
+                                } icon: {
+                                    Image(systemName: bridgeProgressStatus.kind == .actionRequired ? "exclamationmark.shield" : "point.3.connected.trianglepath.dotted")
+                                }
+                                .foregroundStyle(bridgeProgressStatus.kind == .actionRequired ? .orange : .secondary)
+                                .accessibilityIdentifier("xcode-bridge-progress-status")
+                            }
+
+                            if !projection.xcodeRuntimeObservations.isEmpty {
+                                XcodeRuntimeObservationsView(observations: projection.xcodeRuntimeObservations)
+                            }
+
+                            if model.entries.isEmpty {
+                                ContentUnavailableView(
+                                    "No Timeline Data",
+                                    systemImage: "waveform.path.ecg",
+                                    description: Text("No live or persisted timeline events yet.")
+                                )
+                                .frame(maxWidth: .infinity)
+                                .frame(maxHeight: .infinity)
+                            } else {
+                                GroupBox("Timeline") {
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        ForEach(model.entries) { entry in
+                                            if !entry.isCollapsed {
+                                                VStack(alignment: .leading, spacing: 4) {
+                                                    HStack {
+                                                        entryIcon(for: entry.kind)
+                                                        Text(entry.title)
+                                                            .font(.subheadline.weight(.semibold))
+                                                        Spacer()
+                                                        Text(entry.surfaceLabel)
+                                                            .font(.caption2)
+                                                            .foregroundStyle(.secondary)
+                                                    }
+
+                                                    if entry.kind == .mergedTool {
+                                                        Label(entry.detail, systemImage: "hammer.fill")
+                                                            .font(.caption)
+                                                            .foregroundStyle(.primary)
+                                                            .padding(6)
+                                                            .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+                                                    } else if let liveEvent = entry.liveEvent {
+                                                        TimelineEventDetailView(event: liveEvent)
+                                                    } else if entry.kind == .policyWarning {
+                                                        Label {
+                                                            Text(entry.detail)
+                                                                .font(.caption)
+                                                                .textSelection(.enabled)
+                                                        } icon: {
+                                                            Image(systemName: "exclamationmark.shield")
+                                                        }
+                                                        .foregroundStyle(.orange)
+                                                        .accessibilityIdentifier("xcode-policy-warning")
+                                                    } else {
+                                                        Text(entry.detail)
+                                                            .font(.caption)
+                                                            .foregroundStyle(.secondary)
+                                                            .textSelection(.enabled)
+                                                    }
+
+                                                    HStack(spacing: 8) {
+                                                        Text(entry.stageID)
+                                                        if let agentID = entry.agentID {
+                                                            Text(agentID)
+                                                        }
+                                                        if let sessionID = entry.sessionID {
+                                                            Text(sessionID)
+                                                        }
+                                                        Text(entry.timestamp, format: .dateTime.hour().minute().second())
+                                                    }
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.tertiary)
+                                                }
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .padding(10)
+                                                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                                .transition(reduceMotion ? .opacity : .asymmetric(
+                                                    insertion: .push(from: .bottom).combined(with: .opacity),
+                                                    removal: .opacity
+                                                ))
+                                            }
+                                        }
+                                    }
+                                }
+                                .animation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82), value: model.entries.map(\.id))
+                            }
+
+                            // Invisible anchor used to auto-scroll to the latest entry
+                            Color.clear
+                                .frame(height: 1)
+                                .id("live-timeline-bottom")
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                    }
+                    .onChange(of: model.entries.count) {
+                        withAnimation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82)) {
+                            proxy.scrollTo("live-timeline-bottom", anchor: .bottom)
+                        }
+                    }
+                    .onAppear {
+                        model.update(
+                            live: projection.liveTimeline,
+                            persisted: projection.persistedTimeline,
+                            xcode: projection.xcodeRuntimeObservations,
+                            reduceMotion: reduceMotion
+                        )
+                    }
+                    .onChange(of: projection) {
+                        model.update(
+                            live: projection.liveTimeline,
+                            persisted: projection.persistedTimeline,
+                            xcode: projection.xcodeRuntimeObservations,
+                            reduceMotion: reduceMotion
+                        )
+                    }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
-            }
-            .onChange(of: model.entries.count) {
-                withAnimation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82)) {
-                    proxy.scrollTo("live-timeline-bottom", anchor: .bottom)
-                }
-            }
-            .onAppear {
-                model.update(
-                    live: projection.liveTimeline,
-                    persisted: projection.persistedTimeline,
-                    xcode: projection.xcodeRuntimeObservations
-                )
-            }
-            .onChange(of: projection) { _, newValue in
-                model.update(
-                    live: newValue.liveTimeline,
-                    persisted: newValue.persistedTimeline,
-                    xcode: newValue.xcodeRuntimeObservations
-                )
             }
         }
         .frame(minWidth: 480, minHeight: 420)
         .accessibilityIdentifier("run-timeline-inspector-view")
+    }
+
+    private func entryIcon(for kind: FocusedTimelineSpineEntry.EntryKind) -> some View {
+        let name: String = {
+            switch kind {
+            case .text: return "text.alignleft"
+            case .mergedTool: return "hammer"
+            case .sessionEvent: return "person.2.fill"
+            case .agentSummary: return "doc.text.magnifyingglass"
+            case .policyWarning: return "shield.lefthalf.filled"
+            case .implementationCompletion: return "checkmark.seal.fill"
+            case .persisted: return "clock.fill"
+            }
+        }()
+        return Image(systemName: name).font(.caption).foregroundStyle(.secondary)
     }
 }
 

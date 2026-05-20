@@ -74,13 +74,11 @@ It assumes that workflow truth, artifacts, approvals, and recovery matter more t
 
 Today the app exposes these top-level operator surfaces through the thin GraphQL read boundary:
 
-- `Runs Home` for active, blocked, running, and completed runs (GraphQL-only)
-- `Ideas` for capturing and managing work (Create Idea is outside the governed thin UI write path)
-- `Approvals` for pending human decisions (supported in-app via GraphQL write transport; diagnostic-only for external resolution)
-- `Agent Catalog` for inspecting the resolved agent catalog
-- `Workflow Inspector` for YAML workflow inspection and validation
-- `Pilot Readiness` for readiness and sign-off support
-- `Settings` for provider configuration, diagnostics, and remediation
+- `Runs` for active, blocked, running, and completed runs, with inline approval context and an attention badge (GraphQL-only)
+- `Ideas` for browsing idea context with compact run status strips that deep-link into Runs (read-first; non-approval writes remain outside the governed thin UI write path)
+- `Approvals` for pending human decisions (DEBUG-only Phase 1 transitional surface; production builds route old `Approvals` deep links to Runs focused on waiting approval until the Phase 2c parity checklist passes; supported in-app via GraphQL write transport; diagnostic-only for external resolution)
+- `Definitions` for browsing the resolved Agent Catalog and Workflow Inspector through a segmented surface
+- `Settings` for provider configuration, diagnostics, remediation, and System Readiness (formerly Pilot Readiness)
 
 The current MVP provider set is:
 
@@ -141,7 +139,7 @@ The repository is no longer a scaffold. It already contains the core control-pla
   - report/export surfaces
 - provider platform slices:
   - provider settings
-  - pilot readiness
+  - System Readiness (formerly Pilot Readiness; now a Settings section per Proposal 036)
   - ACP-oriented runtime dispatch and provider bindings
   - Goose compatibility diagnostics and remediation
   - frozen provider/model provenance truth
@@ -160,6 +158,7 @@ The repository is no longer a scaffold. It already contains the core control-pla
   - replayable `GO/HOLD` decision snapshots
   - approved-host current-head proof gates
 - layered test gates for fast runtime validation, remote UI smoke, and full sign-off
+- Proposal 036 foundation: four-tab navigation shell with old-route compatibility, `RunsWorkbenchPresentationModel` and shared deferred-state types, Definitions segmented surface over Agent Catalog and Workflow Inspector, System Readiness inside Settings, and timeline batching/Reduce Motion behavior behind the dogfood flag (Phase 2.5 dogfood and Phase 4 remote UI evidence still pending)
 
 ## Repository Layout
 

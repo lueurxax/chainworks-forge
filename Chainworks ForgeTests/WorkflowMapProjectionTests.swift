@@ -196,7 +196,7 @@ struct WorkflowMapProjectionTests {
         #expect((projection?.pendingOccurrenceCount ?? 0) > 0)
         #expect((projection?.communicationCount ?? 0) > 0)
         #expect((projection?.loops.count ?? 0) == 1)
-        #expect((projection?.edges.contains(where: { $0.kind == .transition }) ?? false))
+        #expect((projection?.edges.contains(where: { $0.kind == WorkflowMapEdgeKind.transition }) ?? false))
         #expect((projection?.edges.contains(where: { $0.kind == .fanout || $0.kind == .join || $0.kind == .sequence }) ?? false))
     }
 
@@ -440,7 +440,7 @@ struct WorkflowMapProjectionTests {
         executionService.registerTestingOrchestrator(orchestrator)
 
         let projection = try #require(service.projection(for: run))
-        #expect(projection.runStatus == .running)
+        #expect(projection.runStatus == RunStatus.running)
         #expect(projection.currentStageID == plan.initialStateID)
         #expect(projection.liveTimeline.isEmpty == false)
     }
@@ -494,7 +494,7 @@ struct WorkflowMapProjectionTests {
         )
         executionService.registerTestingOrchestrator(orchestrator)
 
-        #expect(service.runStatus(for: run) == .running)
+        #expect(service.runStatus(for: run) == RunStatus.running)
     }
 
     @Test("Snapshot loader preserves transport and output truth for persisted agent attempts")
@@ -675,8 +675,8 @@ struct WorkflowMapProjectionTests {
         let futureStage = try #require(projection.stages.first(where: { $0.id == "state_2_proposal_drafted" }))
 
         #expect(projection.currentStageID == "state_1_idea_received")
-        #expect(currentStage.status == .running)
-        #expect(futureStage.status != .running)
-        #expect(futureStage.occurrences.contains(where: { $0.state == .thinking }) == false)
+        #expect(currentStage.status == WorkflowMapStageState.running)
+        #expect(futureStage.status != WorkflowMapStageState.running)
+        #expect(futureStage.occurrences.contains(where: { $0.state == WorkflowMapOccurrenceState.thinking }) == false)
     }
 }

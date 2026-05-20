@@ -6,26 +6,30 @@ import AppKit
 
 struct RunsHomeView: View {
     @StateObject private var model: P031ThinReadDashboardModel
-    @StateObject private var workbench: RunsWorkbenchPresentationModel
+    @ObservedObject var workbench: RunsWorkbenchPresentationModel
     @State private var selectedRunDetailTab: P031RunDetailTab = .overview
     @State private var focusedArtifactStageID: String?
     @State private var closeoutReadinessScrollRequest = 0
     @FocusState private var closeoutReadinessFocus: P077CloseoutReadinessFocus?
+    // PC-003: sidebar lane filter context — set when a deep-link or banner routes here
+    // specifically to surface waiting approvals. Cleared when the user manually selects any run.
+    @State private var focusedLaneID: String? = nil
 
     @MainActor
-    init() {
+    init(workbench: RunsWorkbenchPresentationModel) {
         let model = P031ThinReadDashboardModel.bootstrap()
         _model = StateObject(wrappedValue: model)
-        _workbench = StateObject(wrappedValue: RunsWorkbenchPresentationModel())
+        self.workbench = workbench
         _selectedRunDetailTab = State(initialValue: .overview)
     }
 
     init(
         model: P031ThinReadDashboardModel,
+        workbench: RunsWorkbenchPresentationModel,
         initialTab: P031RunDetailTab
     ) {
         _model = StateObject(wrappedValue: model)
-        _workbench = StateObject(wrappedValue: RunsWorkbenchPresentationModel())
+        self.workbench = workbench
         _selectedRunDetailTab = State(initialValue: initialTab)
     }
 
@@ -53,6 +57,50 @@ struct RunsHomeView: View {
             }
             .disabled(model.isLoading)
         }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("chainworks.selectRunDetailTab"))) { notification in
+            guard
+                let userInfo = notification.userInfo,
+                let rawValue = userInfo["tab"] as? String,
+                let tab = P031RunDetailTab(rawValue: rawValue)
+            else {
+                #if DEBUG
+                if let rawValue = notification.userInfo?["tab"] as? String {
+                    print("[P036] selectRunDetailTab: unknown rawValue '\(rawValue)'")
+                }
+                #endif
+                return
+            }
+            selectedRunDetailTab = tab
+        }
+    }
+
+    private func runRow(row: P031RunsHomeRowPresentation) -> some View {
+        Button {
+            selectedRunDetailTab = .overview
+            focusedArtifactStageID = nil
+            focusedLaneID = nil  // PC-003: clear filter context on manual selection
+            model.selectRun(row.runID)
+        } label: {
+            P031RunsHomeRowCard(
+                row: row,
+                isSelected: model.selectedRunID == row.runID
+            )
+        }
+        .buttonStyle(.plain)
+        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+    }
+
+    // PC-003: extracted to break up the type-checker load in runsSidebar body.
+    @ViewBuilder
+    private func laneSectionHeader(for lane: RunsWorkbenchPresentationModel.SidebarLane) -> some View {
+        if focusedLaneID == lane.id {
+            Label(lane.title, systemImage: "scope")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Color.accentColor)
+                .accessibilityIdentifier("lane-focused-\(lane.id)")
+        } else {
+            Text(lane.title)
+        }
     }
 
     private var runsSidebar: some View {
@@ -60,12 +108,17 @@ struct RunsHomeView: View {
             if workbench.sidebarLanes.isEmpty {
                 Section {
                     if model.isLoading {
-                        ProgressView("Checking latest data")
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForgeSkeleton.text(width: 120)
+                            ForgeSkeleton.text(width: 180)
+                            ForgeSkeleton.text(width: 140)
+                        }
+                        .padding(.vertical, 8)
                     } else {
-                        P031EmptySectionRow(
+                        ForgeEmptyState(
                             title: model.runsHome?.emptyStateTitle ?? "No runs",
-                            detail: model.runsHome?.errorDescription ?? model.runsHome?.refreshFeedbackText ?? ""
+                            systemImage: "house",
+                            description: model.runsHome?.errorDescription ?? model.runsHome?.refreshFeedbackText ?? ""
                         )
                     }
                 } header: {
@@ -75,35 +128,69 @@ struct RunsHomeView: View {
                 ForEach(workbench.sidebarLanes) { lane in
                     Section {
                         ForEach(lane.runs, id: \.runID) { row in
-                            Button {
-                                selectedRunDetailTab = .overview
-                                focusedArtifactStageID = nil
-                                model.selectRun(row.runID)
-                            } label: {
-                                P031RunsHomeRowCard(
-                                    row: row,
-                                    isSelected: model.selectedRunID == row.runID
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                            runRow(row: row)
                         }
                     } header: {
-                        Text(lane.title)
+                        laneSectionHeader(for: lane)
                     }
                 }
             }
         }
         .listStyle(.sidebar)
         .accessibilityIdentifier("runs-home-list")
-        .onChange(of: model.runsHome) { _, newValue in
-            if let newValue {
+        .onChange(of: model.runDetail) {
+            if let newValue = model.runDetail {
                 workbench.populate(from: newValue)
             }
         }
-        .onChange(of: model.runDetail) { _, newValue in
-            if let newValue {
+        .onChange(of: model.approvalInbox) {
+            if let newValue = model.approvalInbox {
                 workbench.populate(from: newValue)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { notification in
+            if let runID = notification.object as? String {
+                selectedRunDetailTab = .overview
+                focusedArtifactStageID = nil
+                model.selectRun(runID)
+            }
+        }
+        // PC-003: approvals deep-link → Runs focused on waiting approval lane.
+        // Always set focusedLaneID so the sidebar shows the filter context even when
+        // no run is currently waiting (the empty-state message remains informative).
+        // focusedLaneID is kept set so .onChange(of: workbench.sidebarLanes) below can
+        // replay the selection once lanes populate (fixes the startup notification race).
+        .onReceive(NotificationCenter.default.publisher(for: .chainworksFocusWaitingApprovalLane)) { _ in
+            focusedLaneID = "waiting"
+            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == "waiting" }),
+               let firstRun = waitingLane.runs.first {
+                selectedRunDetailTab = .approvals
+                model.selectRun(firstRun.runID)
+            }
+        }
+        // PC-003 workbench-flag race fix: ContentView sets pendingFocusWaitingApprovalLane before
+        // switching tabs so the flag is present when RunsHomeView mounts. initial:true fires on
+        // first render covering the tab-switch case where the notification fires before the view
+        // is in the hierarchy. The handler sets focusedLaneID so the lanes-change fallback below
+        // still auto-selects if lanes haven't loaded yet when this fires.
+        .onChange(of: workbench.pendingFocusWaitingApprovalLane, initial: true) {
+            guard workbench.pendingFocusWaitingApprovalLane else { return }
+            workbench.clearFocusWaitingApprovalLane()
+            focusedLaneID = "waiting"
+            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == "waiting" }),
+               let firstRun = waitingLane.runs.first {
+                selectedRunDetailTab = .approvals
+                model.selectRun(firstRun.runID)
+            }
+        }
+        // PC-003 lanes-change fallback: if focusedLaneID was set (by notification or workbench flag)
+        // before lanes populated, auto-select once lanes arrive.
+        .onChange(of: workbench.sidebarLanes) {
+            guard focusedLaneID == "waiting", model.selectedRunID == nil else { return }
+            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == "waiting" }),
+               let firstRun = waitingLane.runs.first {
+                selectedRunDetailTab = .approvals
+                model.selectRun(firstRun.runID)
             }
         }
     }
@@ -139,59 +226,6 @@ struct RunsHomeView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .windowBackgroundColor))
         .accessibilityIdentifier("run-detail-panel")
-    }
-
-    @ViewBuilder
-    private var inlineApprovalsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach(workbench.inlineApprovals) { approval in
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(approval.title)
-                            .font(.headline)
-                        if let reason = approval.disabledReason {
-                            Text(reason)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    
-                    Spacer()
-                    
-                    if approval.isActionable {
-                        HStack(spacing: 8) {
-                            Button("Approve") {
-                                Task {
-                                    await model.settleApproval(approval.id, action: .approve)
-                                }
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(.green)
-                            
-                            Button("Reject") {
-                                Task {
-                                    await model.settleApproval(approval.id, action: .reject(reason: "Rejected from inline view"))
-                                }
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(.red)
-                        }
-                        .disabled(model.resolvingApprovalIDs.contains(approval.id))
-                    } else if let state = approval.deferredState {
-                        HStack(spacing: 4) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                            Text(state.rawValue)
-                        }
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                    }
-                }
-                .padding(12)
-                .background(Color.primary.opacity(0.04))
-                .cornerRadius(8)
-            }
-        }
-        .padding(.top, 4)
     }
 
     @ViewBuilder
@@ -243,72 +277,93 @@ struct RunsHomeView: View {
                 VStack(alignment: .leading, spacing: 20) {
                     switch selectedRunDetailTab {
                     case .overview:
-                        P031RunDetailSummaryCard(
-                            presentation: runDetail,
-                            onCompactCloseoutActivated: activateCloseoutReadinessFromCompactSignal
-                        )
-                        if !workbench.inlineApprovals.isEmpty {
-                            inlineApprovalsSection
-                        }
-                        if let closeoutReadiness = runDetail.closeoutReadiness {
-                            P077CloseoutReadinessCard(
-                                presentation: closeoutReadiness,
-                                closeoutFocus: $closeoutReadinessFocus,
-                                onReturnToCloseoutReadiness: focusCloseoutPrimaryUnblock
+                        if let header = workbench.summaryHeader {
+                            P036RunDetailSummaryCard(
+                                header: header,
+                                onCheckSystemReadiness: {
+                                    NotificationCenter.default.post(
+                                        name: .chainworksOpenSystemReadiness,
+                                        object: nil
+                                    )
+                                }
                             )
-                            .id(P077CloseoutReadinessAnchor.card)
                         }
-                        if let implementationCompletion = runDetail.implementationCompletion {
-                            P088ImplementationCompletionCard(presentation: implementationCompletion)
+                        
+                        if !workbench.inlineApprovals.isEmpty {
+                            P036ApprovalWorkbenchCard(
+                                rows: workbench.inlineApprovals,
+                                onApprove: { id in await model.settleApproval(id, action: .approve) },
+                                onReject: { id in await model.settleApproval(id, action: .reject(reason: "inline_ui_reject")) },
+                                resolvingIDs: model.resolvingApprovalIDs
+                            )
                         }
-                        if let sideEffectReadback = runDetail.sideEffectReadback {
-                            P078SideEffectReadbackCard(presentation: sideEffectReadback)
+                        
+                        if let stageMap = workbench.stageMap {
+                            P036StageMapCard(map: stageMap)
                         }
-                        P031IdeaContextCard(presentation: runDetail.ideaContext)
-                        P031CatalogContextCard(presentation: runDetail.catalogContext)
+                        
+                        if !workbench.artifactsAndReports.isEmpty {
+                            P036ArtifactWorkbenchCard(rows: workbench.artifactsAndReports)
+                        }
+                        
+                        if !workbench.recoveryEvidence.isEmpty {
+                            P036RecoveryEvidenceCard(rows: workbench.recoveryEvidence)
+                        }
+                        
+                        if let health = workbench.freshnessAndHealth {
+                            P036SystemReadinessCard(health: health)
+                        }
                     case .stages:
-                        P031StageTransitionMapCard(
-                            rows: runDetail.stageTransitions,
-                            artifactCountsByStageID: artifactCountsByStageID(for: runDetail),
-                            onArtifactsSelected: { stageID in
-                                focusedArtifactStageID = stageID
-                                selectedRunDetailTab = .artifacts
-                            }
-                        )
+                        if let stageMap = workbench.stageMap {
+                            P036StageMapCard(map: stageMap)
+                        }
                     case .artifacts:
                         P031ArtifactViewerCard(
                             rows: runDetail.artifactViewerRows,
                             focusedStageID: focusedArtifactStageID,
-                            loadArtifactPreview: model.loadArtifactPreview
+                            loadArtifactPreview: { id in await model.loadArtifactPreview(artifactID: id) }
                         )
                     case .approvals:
-                        P031ApprovalInboxCard(
-                            presentation: model.approvalInbox,
-                            actionError: model.approvalActionError,
-                            isResolving: { model.isResolvingApproval($0) },
-                            onApprove: { approvalID in
-                                Task { await model.settleApproval(approvalID, action: .approve) }
-                            },
-                            onReject: { approvalID in
-                                Task { await model.settleApproval(approvalID, action: .reject(reason: "Rejected from Chainworks Forge UI")) }
-                            }
+                        P036ApprovalWorkbenchCard(
+                            rows: workbench.inlineApprovals,
+                            onApprove: { id in await model.settleApproval(id, action: .approve) },
+                            onReject: { id in await model.settleApproval(id, action: .reject(reason: "inline_ui_reject")) },
+                            resolvingIDs: model.resolvingApprovalIDs
                         )
+                    case .timeline:
+                        // P036 Phase 1-2: live agent-execution event timeline is deferred until
+                        // Phase 3 projection plumbing is validated (dogfood Phase 2.5).
+                        // p036_projection_gap_deferred_total{surface=timeline,gap_class=live_events}
+                        P031OperatorPlaceholder(
+                            title: "Timeline Deferred",
+                            message: "Live timeline requires a control-plane event-projection feed. Available in Phase 3 after dogfood validation (Phase 2.5).",
+                            identifier: "timeline-projection-deferred",
+                            titleIdentifier: "timeline-projection-title"
+                        )
+                        .onAppear {
+                            P036UICounters.shared.recordProjectionGapDeferred(
+                                count: 1,
+                                surface: "timeline",
+                                gapClass: "live_events"
+                            )
+                        }
                     case .reports:
-                        P031ReportMetadataCard(rows: runDetail.reportRows)
+                        P031ReportMetadataCard(rows: workbench.reportRows)
                     case .system:
-                        P031DaemonLifecycleCard(presentation: model.daemonLifecycle)
+                        if let health = workbench.freshnessAndHealth {
+                            P036SystemReadinessCard(health: health)
+                        }
                     }
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 20)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
             }
-            .onChange(of: closeoutReadinessScrollRequest) { _, _ in
+            .onChange(of: closeoutReadinessScrollRequest) {
                 guard selectedRunDetailTab == .overview else { return }
                 withAnimation(.easeInOut(duration: 0.16)) {
                     proxy.scrollTo(P077CloseoutReadinessAnchor.card, anchor: .top)
                 }
-                closeoutReadinessFocus = .primaryUnblock
             }
         }
     }
@@ -343,6 +398,7 @@ enum P031RunDetailTab: String, CaseIterable, Identifiable {
     case stages
     case artifacts
     case approvals
+    case timeline
     case reports
     case system
 
@@ -358,6 +414,8 @@ enum P031RunDetailTab: String, CaseIterable, Identifiable {
             return "Artifacts"
         case .approvals:
             return "Approvals"
+        case .timeline:
+            return "Timeline"
         case .reports:
             return "Reports"
         case .system:
@@ -390,6 +448,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     @Published private(set) var runDetail: P031RunDetailPresentation?
     @Published private(set) var approvalInbox: P031ApprovalInboxPresentation?
     @Published private(set) var daemonLifecycle: P031DaemonLifecyclePresentation?
+    @Published private(set) var schedulerHealth: SchedulerHealthReadback?
     @Published private(set) var isLoading = false
     @Published private(set) var isRestartingDaemon = false
     @Published private(set) var resolvingApprovalIDs: Set<String> = []
@@ -406,6 +465,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private let loadArtifactPreviewAction: (String) async -> P031ArtifactViewerPresentation?
     private let loadApprovalInboxAction: @Sendable (P031FreshnessSnapshot) async -> P031ApprovalInboxPresentation
     private let loadDaemonLifecycleAction: @Sendable (P031FreshnessSnapshot) async -> P031DaemonLifecyclePresentation
+    private let loadSchedulerHealthAction: @Sendable () async -> SchedulerHealthReadback?
     private let subscribeRunStatusAction: @Sendable (String, P031FreshnessSnapshot) throws -> AsyncThrowingStream<P031RunStatusSubscriptionPresentation, Error>
     private let settleApprovalAction: @Sendable (String, P072ApprovalDecisionAction) async -> String?
     private let restartDaemonAction: @MainActor @Sendable () async -> String?
@@ -452,11 +512,13 @@ final class P031ThinReadDashboardModel: ObservableObject {
         },
         bundledDaemonBuildSHAAction: @escaping @Sendable () -> String? = {
             P031ThinReadDashboardModel.bundledDaemonBuildSHA()
-        }
+        },
+        loadSchedulerHealthAction: @escaping @Sendable () async -> SchedulerHealthReadback? = { nil }
     ) {
         self.settleApprovalAction = settleApprovalAction
         self.restartDaemonAction = restartDaemonAction
         self.bundledDaemonBuildSHAAction = bundledDaemonBuildSHAAction
+        self.loadSchedulerHealthAction = loadSchedulerHealthAction
         loadRunsHomeAction = { currentFreshness, showFirstRunOrientation in
             await coordinator.loadRunsHome(
                 currentFreshness: currentFreshness,
@@ -502,6 +564,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
             store: store,
             writePathGuideData: guideResource.data
         )
+        let lifecycleClient = DaemonLifecycleClient(endpoint: endpoint)
         return P031ThinReadDashboardModel(
             coordinator: coordinator,
             settleApprovalAction: { approvalID, action in
@@ -519,6 +582,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 } catch {
                     return P031ReadErrorPresenter.description(for: error)
                 }
+            },
+            loadSchedulerHealthAction: {
+                try? await lifecycleClient.schedulerReadback()
             }
         )
     }
@@ -557,7 +623,10 @@ final class P031ThinReadDashboardModel: ObservableObject {
                     implementationCompletionSignalLabel: detail.implementationCompletion?.compactSignalLabel,
                     sideEffectSignalLabel: detail.sideEffectReadback?.compactSignalLabel,
                     freshnessState: .live,
-                    accessibilityLabel: "Proposal review run, running"
+                    accessibilityLabel: "Proposal review run, running",
+                    rawStatus: "running",
+                    failedStages: 0,
+                    pendingApprovals: 0
                 ),
                 P031RunsHomeRowPresentation(
                     runID: "preview-run-implementation",
@@ -566,8 +635,12 @@ final class P031ThinReadDashboardModel: ObservableObject {
                     statusLabel: "Completed",
                     progressLabel: "9 stages, 31 artifacts",
                     pendingApprovalsLabel: nil,
+                    closeoutReadinessSignalLabel: nil,
                     freshnessState: .live,
-                    accessibilityLabel: "Implementation closeout, completed"
+                    accessibilityLabel: "Implementation closeout, completed",
+                    rawStatus: "completed",
+                    failedStages: 0,
+                    pendingApprovals: 0
                 ),
             ],
             freshness: freshness,
@@ -585,6 +658,8 @@ final class P031ThinReadDashboardModel: ObservableObject {
         let daemon = P031DaemonLifecyclePresentation(
             state: .ready,
             buildSHA: "preview",
+            pid: 1234,
+            uptimeSeconds: 3600,
             title: "Control plane daemon",
             detailLabel: "Running on local GraphQL endpoint",
             badgeLabels: ["Running", "Live"],
@@ -624,6 +699,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
         settleApprovalAction = { _, _ in nil }
         restartDaemonAction = { nil }
         bundledDaemonBuildSHAAction = { "preview" }
+        loadSchedulerHealthAction = { nil }
 
         self.runsHome = runsHome
         self.runDetail = runDetail
@@ -718,7 +794,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
             freshness: freshness,
             refreshFeedbackText: "Live projection",
             emptyStateTitle: nil,
-            errorDescription: nil
+            errorDescription: nil,
+            rawStatus: "running",
+            failedStages: 0
         )
     }
 
@@ -878,10 +956,12 @@ final class P031ThinReadDashboardModel: ObservableObject {
         async let runsTask = loadRunsHomeAction(runsFreshness, false)
         async let approvalsTask = loadApprovalInboxAction(approvalFreshness)
         async let daemonTask = loadDaemonLifecycleAction(daemonFreshness)
+        async let schedulerTask = loadSchedulerHealthAction()
 
         let runsPresentation = await runsTask
         let approvalsPresentation = await approvalsTask
         let daemonPresentation = await daemonTask
+        let schedulerResult = await schedulerTask
 
         runsFreshness = runsPresentation.freshness
         approvalFreshness = approvalsPresentation.freshness
@@ -890,6 +970,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
         runsHome = runsPresentation
         approvalInbox = approvalsPresentation
         daemonLifecycle = daemonPresentation
+        schedulerHealth = schedulerResult
 
         let availableRunIDs = runsPresentation.rows.map { $0.runID }
         if let selectedRunID, availableRunIDs.contains(selectedRunID) {
@@ -951,6 +1032,15 @@ final class P031ThinReadDashboardModel: ObservableObject {
         await refreshAll()
     }
 
+    func refreshDaemonLifecycle() async {
+        let presentation = await loadDaemonLifecycleAction(daemonFreshness)
+        daemonFreshness = presentation.freshness
+        daemonLifecycle = presentation
+        
+        let schedulerResult = await loadSchedulerHealthAction()
+        schedulerHealth = schedulerResult
+    }
+
     private func loadRunDetail(for runID: String) async {
         let presentation = await loadRunDetailAction(runID, runDetailFreshness)
         runDetailFreshness = presentation.freshness
@@ -990,10 +1080,12 @@ final class P031ThinReadDashboardModel: ObservableObject {
         async let runsTask = loadRunsHomeAction(runsFreshness, false)
         async let approvalsTask = loadApprovalInboxAction(approvalFreshness)
         async let detailTask = loadRunDetailAction(runID, runDetailFreshness)
+        async let schedulerTask = loadSchedulerHealthAction()
 
         let runsPresentation = await runsTask
         let approvalsPresentation = await approvalsTask
         let detailPresentation = await detailTask
+        let schedulerResult = await schedulerTask
 
         guard selectedRunID == runID else { return }
         runsFreshness = runsPresentation.freshness
@@ -1002,6 +1094,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
         runsHome = runsPresentation
         approvalInbox = approvalsPresentation
         runDetail = detailPresentation
+        schedulerHealth = schedulerResult
     }
 
     private static func restartPackagedDaemon() async -> String? {
@@ -1225,38 +1318,68 @@ private struct P031RunsHomeRowCard: View {
     }
 }
 
+private struct TimelineEntryRow: View {
+    let entry: RunsWorkbenchPresentationModel.TimelineEntry
+    
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: iconName)
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.message)
+                    .font(.subheadline)
+                Text(entry.timestamp, format: .dateTime.hour().minute().second())
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+    
+    private var iconName: String {
+        switch entry.kind {
+        case .text: return "text.alignleft"
+        case .mergedTool: return "hammer"
+        case .sessionEvent: return "person.2.fill"
+        case .agentSummary: return "doc.text.magnifyingglass"
+        case .policyWarning: return "exclamationmark.shield"
+        case .implementationCompletion: return "flag.checkered"
+        case .persisted: return "tray.full"
+        }
+    }
+}
+
 private struct P031RunDetailSummaryCard: View {
-    let presentation: P031RunDetailPresentation
+    let header: RunsWorkbenchPresentationModel.SummaryHeader
     let onCompactCloseoutActivated: () -> Void
+    let onCheckSystemReadiness: () -> Void
 
     var body: some View {
         P031CalloutCard(
-            title: presentation.title,
+            title: header.title,
             bodyText: detailBody,
             accentColor: .accentColor
         ) {
             HStack(spacing: 10) {
                 P031RunsHomeAccessibilityMarker(
-                    identifier: "p031-run-detail-summary-\(presentation.freshness.state.rawValue)",
-                    label: presentation.title
+                    identifier: "p031-run-detail-summary-\(header.freshness)",
+                    label: header.title
                 )
-                P031FreshnessBadge(snapshot: presentation.freshness)
-                if let closeoutReadiness = presentation.closeoutReadiness {
-                    P077CompactSignalCapsule(
-                        label: closeoutReadiness.compactSignalLabel,
-                        systemImage: "checkmark.seal",
-                        accentColor: P077CloseoutReadinessChrome.accentColor(
-                            for: closeoutReadiness.visualState
-                        ),
-                        accessibilityLabel: closeoutReadiness.compactActivationAccessibilityLabel,
-                        accessibilityIdentifier: "p077-closeout-readiness-compact-action",
-                        action: onCompactCloseoutActivated
-                    )
+                if let errorDescription = header.errorDescription {
+                    ForgeWarningBanner.error(errorDescription)
                 }
-                if let errorDescription = presentation.errorDescription {
-                    Text(errorDescription)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                
+                if header.status == "blocked" || header.status == "failed" {
+                    Button {
+                        onCheckSystemReadiness()
+                    } label: {
+                        Label("Check System Readiness", systemImage: "stethoscope")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
             }
         }
@@ -1264,20 +1387,15 @@ private struct P031RunDetailSummaryCard: View {
 
     private var detailBody: String {
         [
-            presentation.workflowLabel,
-            presentation.statusLabel,
-            rolloutDecisionText,
-            presentation.progressLabel,
-            presentation.pendingApprovalsLabel,
-            presentation.refreshFeedbackText,
+            header.workflowLabel,
+            header.status,
+            header.rolloutDecisionSummary,
+            header.progressLabel,
+            header.pendingApprovalsLabel,
+            header.refreshFeedbackText,
         ]
         .compactMap { $0 }
         .joined(separator: " • ")
-    }
-
-    private var rolloutDecisionText: String? {
-        guard let rollout = presentation.rolloutDecisionSummary else { return nil }
-        return "Rollout \(rollout.backendDecision)"
     }
 }
 
@@ -1586,11 +1704,11 @@ private struct P077CloseoutReadinessCard: View {
         .onAppear {
             recordCloseoutAnnouncement(sheetOwnsFocus: isDiagnosticsPresented)
         }
-        .onChange(of: presentation) { _, _ in
+        .onChange(of: presentation) {
             recordCloseoutAnnouncement(sheetOwnsFocus: isDiagnosticsPresented)
         }
-        .onChange(of: isDiagnosticsPresented) { _, sheetOwnsFocus in
-            recordCloseoutAnnouncement(sheetOwnsFocus: sheetOwnsFocus)
+        .onChange(of: isDiagnosticsPresented) {
+            recordCloseoutAnnouncement(sheetOwnsFocus: isDiagnosticsPresented)
         }
         .sheet(
             isPresented: $isDiagnosticsPresented,
@@ -1854,7 +1972,7 @@ private struct P031IdeaContextCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Idea")
+            Text("Run context")
                 .font(.headline)
             if let presentation {
                 VStack(alignment: .leading, spacing: 10) {
@@ -1890,9 +2008,10 @@ private struct P031IdeaContextCard: View {
                 .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
                 .accessibilityLabel(presentation.accessibilityLabel)
             } else {
-                P031EmptySectionRow(
-                    title: "Idea context unavailable",
-                    detail: "The selected run did not include a GraphQL-readable idea reference."
+                ForgeEmptyState(
+                    title: "Run context unavailable",
+                    systemImage: "lightbulb",
+                    description: "The selected run did not include a GraphQL-readable run reference."
                 )
             }
         }
@@ -1900,72 +2019,74 @@ private struct P031IdeaContextCard: View {
 }
 
 private struct P031StageTransitionMapCard: View {
-    let rows: [P031StageTransitionPresentation]
-    let artifactCountsByStageID: [String: Int]
+    let stages: [RunsWorkbenchPresentationModel.StageCard]
     let onArtifactsSelected: (String) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Stage transitions")
                 .font(.headline)
-            if rows.isEmpty {
-                P031EmptySectionRow(title: "No transitions", detail: "No stage projections returned.")
+            if stages.isEmpty {
+                ForgeEmptyState(
+                    title: "No transitions",
+                    systemImage: "list.bullet",
+                    description: "No stage projections returned."
+                )
             } else {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(rows.enumerated()), id: \.element.stageExecutionID) { index, row in
+                    ForEach(Array(stages.enumerated()), id: \.element.id) { index, stage in
                         HStack(alignment: .top, spacing: 12) {
                             VStack(spacing: 0) {
                                 Circle()
-                                    .fill(color(for: row.connectorState))
+                                    .fill(color(for: stage.status))
                                     .frame(width: 12, height: 12)
                                     .overlay(Circle().stroke(.white.opacity(0.85), lineWidth: 1))
-                                if index < rows.count - 1 {
+                                if index < stages.count - 1 {
                                     Rectangle()
-                                        .fill(color(for: row.connectorState).opacity(0.45))
+                                        .fill(color(for: stage.status).opacity(0.45))
                                         .frame(width: 2, height: 42)
                                 }
                             }
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack(alignment: .firstTextBaseline) {
-                                    Text(row.stageTitle)
+                                    Text(stage.title)
                                         .font(.subheadline.weight(.semibold))
                                     Spacer()
-                                    Text(row.statusText)
+                                    Text(statusLabel(for: stage.status))
                                         .font(.caption.weight(.medium))
-                                        .foregroundStyle(color(for: row.connectorState))
+                                        .foregroundStyle(color(for: stage.status))
                                 }
-                                if let attemptText = row.attemptText {
+                                if let attemptText = stage.attemptText {
                                     Text(attemptText)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
-                                if let startedLabel = row.startedLabel {
+                                if let startedLabel = stage.startedLabel {
                                     Text(startedLabel)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
-                                if let completedLabel = row.completedLabel {
+                                if let completedLabel = stage.completedLabel {
                                     Text(completedLabel)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
-                                if let durationLabel = row.durationLabel {
+                                if let durationLabel = stage.durationLabel {
                                     Text(durationLabel)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
-                                let artifactCount = artifactCountsByStageID[row.stageExecutionID] ?? 0
-                                let evidenceLabels = evidenceLabels(for: row, artifactCount: artifactCount)
-                                if !evidenceLabels.isEmpty {
-                                    P031BadgeRow(labels: evidenceLabels)
+                                
+                                if !stage.evidenceLabels.isEmpty {
+                                    P031BadgeRow(labels: stage.evidenceLabels)
                                 }
-                                if artifactCount > 0 {
+                                if stage.artifactCount > 0 {
                                     Button {
-                                        onArtifactsSelected(row.stageExecutionID)
+                                        onArtifactsSelected(stage.id)
                                     } label: {
                                         HStack(spacing: 5) {
                                             Image(systemName: "doc.text.magnifyingglass")
-                                            Text("\(artifactCount) artifact\(artifactCount == 1 ? "" : "s")")
+                                            Text("\(stage.artifactCount) artifact\(stage.artifactCount == 1 ? "" : "s")")
                                         }
                                         .font(.caption.weight(.medium))
                                         .foregroundStyle(Color.accentColor)
@@ -1977,9 +2098,8 @@ private struct P031StageTransitionMapCard: View {
                                     .controlSize(.small)
                                 }
                             }
-                            .padding(.bottom, index < rows.count - 1 ? 16 : 0)
+                            .padding(.bottom, index < stages.count - 1 ? 16 : 0)
                         }
-                        .accessibilityLabel(row.accessibilityLabel)
                     }
                 }
                 .padding(14)
@@ -1989,26 +2109,25 @@ private struct P031StageTransitionMapCard: View {
         }
     }
 
-    private func evidenceLabels(
-        for row: P031StageTransitionPresentation,
-        artifactCount: Int
-    ) -> [String] {
-        guard artifactCount > 0 else { return row.evidenceLabels }
-        return row.evidenceLabels.filter { $0 != "Artifacts" }
+    private func color(for status: String) -> Color {
+        switch status {
+        case "terminal": return .green
+        case "active": return .blue
+        case "blocked": return .red
+        case "pending": return .orange
+        case "unavailable": return .secondary
+        default: return .secondary
+        }
     }
-
-    private func color(for state: P031StageConnectorState) -> Color {
-        switch state {
-        case .completed:
-            return .green
-        case .blocked:
-            return .red
-        case .running:
-            return .blue
-        case .pending:
-            return .orange
-        case .unavailable:
-            return .secondary
+    
+    private func statusLabel(for status: String) -> String {
+        switch status {
+        case "terminal": return "Completed"
+        case "active": return "Running"
+        case "blocked": return "Blocked"
+        case "pending": return "Pending"
+        case "unavailable": return "Unavailable"
+        default: return status.capitalized
         }
     }
 }
@@ -2031,15 +2150,14 @@ private struct P031ApprovalInboxCard: View {
                 }
             }
             if let actionError {
-                Text(actionError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
+                ForgeWarningBanner.error(actionError)
             }
             if let presentation {
                 if presentation.rows.isEmpty {
-                    P031EmptySectionRow(
+                    ForgeEmptyState(
                         title: presentation.emptyStateTitle ?? "No pending approvals",
-                        detail: presentation.errorDescription ?? presentation.refreshFeedbackText
+                        systemImage: "checkmark.seal",
+                        description: presentation.errorDescription ?? presentation.refreshFeedbackText
                     )
                 } else {
                     ForEach(presentation.rows, id: \.approvalID) { row in
@@ -2079,6 +2197,10 @@ private struct P031ApprovalInboxCard: View {
                                     Label(actionLabel, systemImage: "terminal")
                                         .font(.caption)
                                 }
+                                
+                                if let state = row.deferredState {
+                                    ForgeWarningBanner(state.displayLabel, tint: state.tint)
+                                }
                                 if let followUpID = row.followUpID {
                                     Text(followUpID)
                                         .font(.caption.monospaced())
@@ -2092,7 +2214,10 @@ private struct P031ApprovalInboxCard: View {
                     }
                 }
             } else {
-                ProgressView("Updating approvals")
+                VStack(alignment: .leading, spacing: 10) {
+                    ForgeSkeleton.card()
+                    ForgeSkeleton.card()
+                }
             }
         }
     }
@@ -2106,7 +2231,11 @@ private struct P031ArtifactListCard: View {
             Text("Artifacts")
                 .font(.headline)
             if rows.isEmpty {
-                P031EmptySectionRow(title: "No artifacts", detail: "No artifact projections returned.")
+                ForgeEmptyState(
+                    title: "No artifacts",
+                    systemImage: "doc",
+                    description: "No artifact projections returned."
+                )
             } else {
                 ForEach(rows, id: \.artifactID) { row in
                     VStack(alignment: .leading, spacing: 8) {
@@ -2221,7 +2350,11 @@ private struct P031ArtifactViewerCard: View {
             Text("Artifacts")
                 .font(.headline)
             if rows.isEmpty {
-                P031EmptySectionRow(title: "No artifacts", detail: "No artifact projections returned.")
+                ForgeEmptyState(
+                    title: "No artifacts",
+                    systemImage: "doc",
+                    description: "No artifact projections returned."
+                )
             } else {
                 VStack(alignment: .leading, spacing: 12) {
                     filterControls(visibleCount: visibleRows.count)
@@ -2250,11 +2383,11 @@ private struct P031ArtifactViewerCard: View {
             applyFocusedStageIfNeeded(focusedStageID)
             synchronizeSelection(with: visibleRows)
         }
-        .onChange(of: focusedStageID) { _, newValue in
-            applyFocusedStageIfNeeded(newValue)
+        .onChange(of: focusedStageID) {
+            applyFocusedStageIfNeeded(focusedStageID)
             synchronizeSelection(with: visibleRows)
         }
-        .onChange(of: visibleRows.map(\.artifactID)) { _, _ in
+        .onChange(of: visibleRows.map(\.artifactID)) {
             synchronizeSelection(with: visibleRows)
         }
     }
@@ -2329,9 +2462,10 @@ private struct P031ArtifactViewerCard: View {
         ScrollViewReader { proxy in
             List {
                 if visibleRows.isEmpty {
-                    P031EmptySectionRow(
+                    ForgeEmptyState(
                         title: "No matching artifacts",
-                        detail: "Adjust artifact filters or search text."
+                        systemImage: "line.3.horizontal.decrease.circle",
+                        description: "Adjust artifact filters or search text."
                     )
                 } else {
                     ForEach(groupedRows) { group in
@@ -2346,8 +2480,8 @@ private struct P031ArtifactViewerCard: View {
             }
             .listStyle(.plain)
             .accessibilityIdentifier("p031-artifact-list-scroll")
-            .onChange(of: selectedRowID) { _, newValue in
-                guard let newValue else { return }
+            .onChange(of: selectedRowID) {
+                guard let newValue = selectedRowID else { return }
                 withAnimation(.easeInOut(duration: 0.16)) {
                     proxy.scrollTo(newValue, anchor: .center)
                 }
@@ -2461,7 +2595,7 @@ private struct P031ArtifactViewerCard: View {
                     .frame(maxWidth: .infinity, alignment: .topLeading)
             }
             .accessibilityIdentifier("p031-artifact-preview-scroll")
-            .onChange(of: selectedRow?.artifactID) { _, _ in
+            .onChange(of: selectedRow?.artifactID) {
                 proxy.scrollTo(artifactPreviewTopAnchorID, anchor: .top)
             }
             .task(id: selectedListRow?.artifactID) {
@@ -2494,24 +2628,30 @@ private struct P031ArtifactViewerCard: View {
                 Divider()
                 if loadingPreviewArtifactID == selectedRow.artifactID,
                    selectedRow.preparedPreview == nil {
-                    ProgressView("Loading artifact preview")
-                        .frame(maxWidth: .infinity, minHeight: 180, alignment: .topLeading)
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForgeSkeleton.headline(width: 250)
+                        ForgeSkeleton.text(width: .infinity)
+                        ForgeSkeleton.text(width: .infinity)
+                        ForgeSkeleton.text(width: 300)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 180, alignment: .topLeading)
                 } else if let preparedPreview = selectedRow.preparedPreview,
                    let context = renderContext(for: selectedRow) {
                     ArtifactContentRenderer(preparedPreview: preparedPreview, context: context)
                         .frame(maxWidth: .infinity, minHeight: 180, alignment: .topLeading)
                 } else {
-                    P031EmptySectionRow(
+                    ForgeEmptyState(
                         title: "Payload unavailable",
-                        detail: selectedRow.unavailableReason
-                            ?? "GraphQL did not return renderable artifact content."
+                        systemImage: "exclamationmark.triangle",
+                        description: selectedRow.unavailableReason ?? "GraphQL did not return renderable artifact content."
                     )
                 }
             }
         } else if !rows.isEmpty {
-            P031EmptySectionRow(
+            ForgeEmptyState(
                 title: "No artifact selected",
-                detail: "The first visible artifact is selected automatically when filters match results."
+                systemImage: "doc.text.magnifyingglass",
+                description: "The first visible artifact is selected automatically when filters match results."
             )
         }
     }
@@ -2958,9 +3098,10 @@ private struct P031CatalogContextCard: View {
                 .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
                 .accessibilityLabel(presentation.accessibilityLabel)
             } else {
-                P031EmptySectionRow(
+                ForgeEmptyState(
                     title: "Catalog unavailable",
-                    detail: "The selected run did not include GraphQL-readable workflow catalog metadata."
+                    systemImage: "book",
+                    description: "The selected run did not include GraphQL-readable workflow catalog metadata."
                 )
             }
         }
@@ -2975,7 +3116,11 @@ private struct P031ReportMetadataCard: View {
             Text("Reports")
                 .font(.headline)
             if rows.isEmpty {
-                P031EmptySectionRow(title: "No reports", detail: "No report metadata projections returned.")
+                ForgeEmptyState(
+                    title: "No reports",
+                    systemImage: "terminal",
+                    description: "No report metadata projections returned."
+                )
             } else {
                 ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
                     VStack(alignment: .leading, spacing: 8) {
@@ -3034,7 +3179,11 @@ private struct P031DaemonLifecycleCard: View {
                     }
                 }
             } else {
-                ProgressView("Checking daemon status")
+                VStack(alignment: .leading, spacing: 6) {
+                    ForgeSkeleton.headline(width: 200)
+                    ForgeSkeleton.text(width: 150)
+                }
+                .padding()
             }
         }
         .accessibilityIdentifier("p031-daemon-lifecycle-card")
@@ -3142,52 +3291,394 @@ private struct P031FreshnessBadge: View {
     }
 }
 
-private struct P031EmptySectionRow: View {
-    let title: String
-    let detail: String
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-            Text(detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-    }
-}
-
-private struct FlowLayout<Content: View>: View {
-    let spacing: CGFloat
-    @ViewBuilder let content: Content
-
-    init(spacing: CGFloat, @ViewBuilder content: () -> Content) {
-        self.spacing = spacing
-        self.content = content()
-    }
-
-    var body: some View {
-        HStack(alignment: .top, spacing: spacing) {
-            content
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
 
 #Preview("Stages") {
-    RunsHomeView(model: .previewLoaded(), initialTab: .stages)
+    RunsHomeView(model: .previewLoaded(), workbench: RunsWorkbenchPresentationModel(), initialTab: .stages)
         .frame(width: 1200, height: 780)
 }
 
 #Preview("Artifacts") {
-    RunsHomeView(model: .previewLoaded(), initialTab: .artifacts)
+    RunsHomeView(model: .previewLoaded(), workbench: RunsWorkbenchPresentationModel(), initialTab: .artifacts)
         .frame(width: 1200, height: 780)
 }
 
 #Preview("Overview") {
-    RunsHomeView(model: .previewLoaded(), initialTab: .overview)
+    RunsHomeView(model: .previewLoaded(), workbench: RunsWorkbenchPresentationModel(), initialTab: .overview)
         .frame(width: 1200, height: 780)
+}
+
+private struct P036SystemReadinessCard: View {
+    let health: RunsWorkbenchPresentationModel.FreshnessHealth
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("System Readiness")
+                    .font(.headline)
+                Spacer()
+                if health.isReadinessDeferred {
+                    Label("Readiness Pending", systemImage: "clock.badge.questionmark")
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("readiness-deferred")
+                } else if health.isSystemReady {
+                    Label("Ready", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                } else {
+                    Label("Action Required", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+            }
+            
+            Divider()
+            
+            Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 10) {
+                GridRow {
+                    Text("Daemon")
+                    Text(health.daemonHealth)
+                        .foregroundStyle(.secondary)
+                }
+                GridRow {
+                    Text("MCP Hub")
+                    Text(health.mcpHubStatus)
+                        .foregroundStyle(.secondary)
+                }
+                GridRow {
+                    Text("Capabilities")
+                    Text(health.capabilitiesStatus)
+                        .foregroundStyle(.secondary)
+                }
+                if let scheduler = health.schedulerHealth {
+                    GridRow {
+                        Text("Scheduler")
+                        Text(scheduler)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                GridRow {
+                    Text("Freshness")
+                    Text(health.freshness)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.subheadline)
+        }
+        .padding(20)
+        .background(Color.primary.opacity(0.03))
+        .cornerRadius(12)
+    }
+}
+
+private struct P036RunDetailSummaryCard: View {
+    let header: RunsWorkbenchPresentationModel.SummaryHeader
+    let onCheckSystemReadiness: () -> Void
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(header.title)
+                        .font(.title2.weight(.bold))
+                    Text(header.status)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                
+                Button(action: onCheckSystemReadiness) {
+                    Label("Check Readiness", systemImage: "checkmark.shield")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding(20)
+        .background(Color.primary.opacity(0.03))
+        .cornerRadius(12)
+    }
+}
+
+private struct P036StageMapCard: View {
+    let map: RunsWorkbenchPresentationModel.StageMap
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Execution Stages")
+                .font(.headline)
+            
+            FlowLayout(spacing: 8) {
+                ForEach(map.stages) { stage in
+                    HStack(spacing: 6) {
+                        stageIcon(for: stage.status)
+                        Text(stage.title)
+                            .font(.caption.weight(.medium))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(stageColor(for: stage.status).opacity(0.12))
+                    .foregroundStyle(stageColor(for: stage.status))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(stageColor(for: stage.status).opacity(0.24), lineWidth: 1)
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .background(Color.primary.opacity(0.03))
+        .cornerRadius(12)
+    }
+    
+    @ViewBuilder
+    private func stageIcon(for status: String) -> some View {
+        switch status {
+        case "terminal": Image(systemName: "checkmark.circle.fill")
+        case "active": Image(systemName: "play.circle.fill")
+        case "blocked": Image(systemName: "exclamationmark.octagon.fill")
+        case "pending": Image(systemName: "clock.fill")
+        default: Image(systemName: "questionmark.circle.fill")
+        }
+    }
+    
+    private func stageColor(for status: String) -> Color {
+        switch status {
+        case "terminal": return .green
+        case "active": return .blue
+        case "blocked": return .red
+        case "pending": return .secondary
+        default: return .secondary
+        }
+    }
+}
+
+private struct P036ApprovalWorkbenchCard: View {
+    let rows: [RunsWorkbenchPresentationModel.ApprovalRow]
+    let onApprove: (String) async -> Void
+    let onReject: (String) async -> Void
+    let resolvingIDs: Set<String>
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Pending Approvals")
+                .font(.headline)
+
+            if rows.isEmpty {
+                Text("No pending approvals for this run.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(rows) { row in
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(row.title)
+                                    .font(.subheadline.weight(.medium))
+                                if let body = row.body {
+                                    Text(body)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(3)
+                                }
+                                // PC-001: follow-up reference (e.g. ticket or issue ID)
+                                if let followUpID = row.followUpID {
+                                    Label(followUpID, systemImage: "link")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                if let deferred = row.deferredState {
+                                    Text(deferred.displayLabel)
+                                        .font(.caption2)
+                                        .foregroundStyle(.orange)
+                                }
+                            }
+                            Spacer()
+
+                            HStack(spacing: 8) {
+                                // PC-001: diagnostic copy menu when copy items are available
+                                if !row.copyItems.isEmpty {
+                                    Menu {
+                                        ForEach(row.copyItems, id: \.label) { item in
+                                            Button(item.label) {
+                                                #if os(macOS)
+                                                NSPasteboard.general.clearContents()
+                                                NSPasteboard.general.setString(item.value, forType: .string)
+                                                #endif
+                                            }
+                                        }
+                                    } label: {
+                                        Image(systemName: "doc.on.doc")
+                                            .imageScale(.small)
+                                    }
+                                    .menuStyle(.borderlessButton)
+                                    .controlSize(.small)
+                                    .help("Copy diagnostic details")
+                                }
+
+                                Button("Reject") {
+                                    Task { await onReject(row.id) }
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .tint(.red)
+                                .disabled(!row.canReject || resolvingIDs.contains(row.id))
+                                .help(row.rejectDisabledReason ?? "")
+
+                                Button("Approve") {
+                                    Task { await onApprove(row.id) }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .tint(.green)
+                                .disabled(!row.canApprove || resolvingIDs.contains(row.id))
+                                .help(row.approveDisabledReason ?? "")
+                            }
+                        }
+                        .padding(10)
+                        .background(Color.primary.opacity(0.04))
+                        .cornerRadius(8)
+                        .accessibilityLabel(row.accessibilityLabel)
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .background(Color.primary.opacity(0.03))
+        .cornerRadius(12)
+    }
+}
+
+private struct P036ArtifactWorkbenchCard: View {
+    let rows: [RunsWorkbenchPresentationModel.ArtifactReportRow]
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Artifacts & Reports")
+                .font(.headline)
+            
+            if rows.isEmpty {
+                Text("No artifacts available.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(rows) { row in
+                        ArtifactRowView(row: row)
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .background(Color.primary.opacity(0.03))
+        .cornerRadius(12)
+    }
+
+    private struct ArtifactRowView: View {
+        let row: RunsWorkbenchPresentationModel.ArtifactReportRow
+        
+        var body: some View {
+            HStack {
+                Label(row.title, systemImage: "doc.fill")
+                    .font(.subheadline)
+                Spacer()
+                availabilityBadge(row.payloadAvailability)
+            }
+            .padding(10)
+            .background(Color.primary.opacity(0.04))
+            .cornerRadius(8)
+        }
+        
+        @ViewBuilder
+        private func availabilityBadge(_ availability: RunsWorkbenchPresentationModel.ArtifactPayloadAvailability) -> some View {
+            let color = availabilityColor(availability)
+            Text(availability.rawValue.capitalized)
+                .font(.caption2)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(color.opacity(0.15))
+                .foregroundStyle(color)
+                .clipShape(Capsule())
+        }
+        
+        private func availabilityColor(_ availability: RunsWorkbenchPresentationModel.ArtifactPayloadAvailability) -> Color {
+            switch availability {
+            case .available: return .green
+            case .metadataOnly: return .blue
+            case .generating: return .orange
+            case .deferred: return .secondary
+            case .unavailable, .unknown: return .red
+            }
+        }
+    }
+}
+
+private struct P036RecoveryEvidenceCard: View {
+    let rows: [RunsWorkbenchPresentationModel.RecoveryEvidenceRow]
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Recovery Evidence")
+                .font(.headline)
+            
+            if rows.isEmpty {
+                Text("No recovery evidence found.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(rows) { row in
+                        Label(row.title, systemImage: "bandage.fill")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .background(Color.primary.opacity(0.03))
+        .cornerRadius(12)
+    }
+}
+
+/// Simple flow layout for stage cards
+private struct FlowLayout: Layout {
+    var spacing: CGFloat
+    
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? 0
+        var currentX: CGFloat = 0
+        var currentY: CGFloat = 0
+        var maxHeight: CGFloat = 0
+        
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX + size.width > width && currentX > 0 {
+                currentX = 0
+                currentY += maxHeight + spacing
+                maxHeight = 0
+            }
+            currentX += size.width + spacing
+            maxHeight = max(maxHeight, size.height)
+        }
+        
+        return CGSize(width: width, height: currentY + maxHeight)
+    }
+    
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var currentX: CGFloat = bounds.minX
+        var currentY: CGFloat = bounds.minY
+        var maxHeight: CGFloat = 0
+        
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX + size.width > bounds.maxX && currentX > bounds.minX {
+                currentX = bounds.minX
+                currentY += maxHeight + spacing
+                maxHeight = 0
+            }
+            subview.place(at: CGPoint(x: currentX, y: currentY), proposal: .unspecified)
+            currentX += size.width + spacing
+            maxHeight = max(maxHeight, size.height)
+        }
+    }
 }

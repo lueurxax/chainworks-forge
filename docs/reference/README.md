@@ -49,6 +49,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [provider-platform.md](provider-platform.md) — Provider/settings baseline: registry, adapters, settings, preflight, receipts, capacity caps, first-run and pilot surfaces
 - [design-system-and-brand-application.md](design-system-and-brand-application.md) — Forge token lane, bounded brand assets, and shell/run/setup/recovery visual adoption
 - [p077-closeout-readiness-ui-evidence.md](p077-closeout-readiness-ui-evidence.md) — Retained historical alias evidence file for closeout-readiness token, contrast, diagnostic, focus, recovery, and accessibility proof
+- [p036-ux-consolidation-evidence.md](p036-ux-consolidation-evidence.md) — Proposal 036 UX consolidation Phase 1 evidence: four-tab navigation parity, Definitions segmented wrapper, Runs workbench presentation model, timeline batching/Reduce Motion, and pending Phase 2.5/4 evidence
 - [ui-quality-and-polish.md](ui-quality-and-polish.md) — UI readability, bounded accessibility, shared status semantics, and owner-surface proof contract
 - [run-control.md](run-control.md) — Stop vs archive boundary, two-phase cancellation settlement, operator-visible `cancelling`/`cancelled` truth, northbound reader split
 - [release-gate.md](release-gate.md) — Manual release gate: post-approval task execution, N-phase ordering, native deterministic git/publish, canonical release artifacts, **durable side-effect ledger**, and `delivery_receipt` settlement

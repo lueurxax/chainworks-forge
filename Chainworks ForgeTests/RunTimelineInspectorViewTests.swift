@@ -21,7 +21,8 @@ struct RunTimelineInspectorViewTests {
             title: "Implementation continued",
             detail: "Persisted automatic watchdog retry exhausted",
             timestamp: Date(timeIntervalSince1970: 100),
-            sessionID: "persisted-session-1"
+            sessionID: "persisted-session-1",
+            agentID: "code_writer"
         )
 
         let spine = buildFocusedTimelineSpineEntries(
@@ -301,6 +302,150 @@ struct RunTimelineInspectorViewTests {
         #expect(agent.xcodeBrokerRequired == true)
         #expect(agent.xcodeShimInjectionSignal == true)
         #expect(agent.requiresXcodeHostExecution == true)
+    }
+
+    // MARK: - Timeline lossless 40-entry cap: sessionEvent preservation
+
+    @Test("sessionEvent entries survive the 40-entry cap when mixed with excess text entries")
+    func sessionEventEntriesSurviveFortyEntryCap() {
+        // Build 50 text entries (all for same agent) and 5 session events.
+        // After capping, all 5 session events must be present.
+        var liveEntries: [LiveExecutionTimelineEntry] = []
+
+        // 50 text chunk entries
+        for i in 0..<50 {
+            liveEntries.append(LiveExecutionTimelineEntry(
+                agentID: "agent-a",
+                agentTitle: "Agent A",
+                stageID: "stage-1",
+                event: ExecutionEvent(
+                    type: .textChunk,
+                    timestamp: Date(timeIntervalSince1970: Double(i)),
+                    detail: "chunk \(i)"
+                )
+            ))
+        }
+
+        // 5 session-started events for different agents
+        for i in 0..<5 {
+            liveEntries.append(LiveExecutionTimelineEntry(
+                agentID: "agent-\(i)",
+                agentTitle: "Agent \(i)",
+                stageID: "stage-1",
+                event: ExecutionEvent(
+                    type: .sessionStarted,
+                    timestamp: Date(timeIntervalSince1970: Double(100 + i)),
+                    detail: "session \(i) started"
+                )
+            ))
+        }
+
+        let spine = buildFocusedTimelineSpineEntries(
+            liveTimeline: liveEntries,
+            persistedTimeline: []
+        )
+
+        #expect(spine.count <= 40, "Cap should trim to at most 40 entries")
+        let sessionEventCount = spine.filter { $0.kind == .sessionEvent }.count
+        #expect(sessionEventCount == 5, "All 5 sessionEvent entries must survive the cap; got \(sessionEventCount)")
+    }
+
+    @Test("agentSummary entries survive the 40-entry cap alongside sessionEvent entries")
+    func agentSummaryAndSessionEventBothSurviveCap() {
+        var liveEntries: [LiveExecutionTimelineEntry] = []
+
+        // 50 text chunk entries to push us well past the cap
+        for i in 0..<50 {
+            liveEntries.append(LiveExecutionTimelineEntry(
+                agentID: "agent-a",
+                agentTitle: "Agent A",
+                stageID: "stage-1",
+                event: ExecutionEvent(
+                    type: .textChunk,
+                    timestamp: Date(timeIntervalSince1970: Double(i)),
+                    detail: "chunk \(i)"
+                )
+            ))
+        }
+
+        // 3 agent completions (agentSummary kind)
+        for i in 0..<3 {
+            liveEntries.append(LiveExecutionTimelineEntry(
+                agentID: "agent-x\(i)",
+                agentTitle: "Agent X\(i)",
+                stageID: "stage-1",
+                event: ExecutionEvent(
+                    type: .finalOutput,
+                    timestamp: Date(timeIntervalSince1970: Double(200 + i)),
+                    detail: "completed"
+                )
+            ))
+        }
+
+        // 2 session-closed events (sessionEvent kind)
+        for i in 0..<2 {
+            liveEntries.append(LiveExecutionTimelineEntry(
+                agentID: "agent-y\(i)",
+                agentTitle: "Agent Y\(i)",
+                stageID: "stage-1",
+                event: ExecutionEvent(
+                    type: .sessionClosed,
+                    timestamp: Date(timeIntervalSince1970: Double(300 + i)),
+                    detail: "session closed"
+                )
+            ))
+        }
+
+        let spine = buildFocusedTimelineSpineEntries(
+            liveTimeline: liveEntries,
+            persistedTimeline: []
+        )
+
+        #expect(spine.count <= 40)
+        let sessionEventCount = spine.filter { $0.kind == .sessionEvent }.count
+        let agentSummaryCount = spine.filter { $0.kind == .agentSummary }.count
+        #expect(sessionEventCount == 2, "sessionEvent entries must survive; got \(sessionEventCount)")
+        #expect(agentSummaryCount == 3, "agentSummary entries must survive; got \(agentSummaryCount)")
+    }
+
+    @Test("persisted entries survive the 40-entry cap alongside live text entries")
+    func persistedEntriesSurviveFortyEntryCap() {
+        // 50 text chunk entries to push well past the cap
+        var liveEntries: [LiveExecutionTimelineEntry] = []
+        for i in 0..<50 {
+            liveEntries.append(LiveExecutionTimelineEntry(
+                agentID: "agent-a",
+                agentTitle: "Agent A",
+                stageID: "stage-1",
+                event: ExecutionEvent(
+                    type: .textChunk,
+                    timestamp: Date(timeIntervalSince1970: Double(i)),
+                    detail: "chunk \(i)"
+                )
+            ))
+        }
+
+        // 6 persisted entries (durable supervision history)
+        var persistedEntries: [WorkflowMapPersistedTimelineEntry] = []
+        for i in 0..<6 {
+            persistedEntries.append(WorkflowMapPersistedTimelineEntry(
+                id: "persisted-\(i)",
+                title: "Persisted event \(i)",
+                detail: "Durable supervision record",
+                timestamp: Date(timeIntervalSince1970: Double(200 + i)),
+                sessionID: nil,
+                agentID: "agent-a"
+            ))
+        }
+
+        let spine = buildFocusedTimelineSpineEntries(
+            liveTimeline: liveEntries,
+            persistedTimeline: persistedEntries
+        )
+
+        #expect(spine.count <= 40, "Cap must limit to at most 40 entries")
+        let persistedCount = spine.filter { $0.kind == .persisted }.count
+        #expect(persistedCount == 6, "All persisted entries must survive the cap; got \(persistedCount)")
     }
 
     private func xcodeObservation(

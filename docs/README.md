@@ -84,6 +84,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/idea-lifecycle.md](reference/idea-lifecycle.md) — Archive/restore lifecycle for ideas
 - [reference/ui-quality-and-polish.md](reference/ui-quality-and-polish.md) — UI readability, accessibility, shared status semantics
 - [reference/design-system-and-brand-application.md](reference/design-system-and-brand-application.md) — Forge token lane, brand assets, visual rollout
+- [reference/p036-ux-consolidation-evidence.md](reference/p036-ux-consolidation-evidence.md) — Proposal 036 UX consolidation: four-tab navigation, Definitions segmented wrapper, Runs workbench presenter, timeline batching/Reduce Motion evidence
 
 ### System health
 

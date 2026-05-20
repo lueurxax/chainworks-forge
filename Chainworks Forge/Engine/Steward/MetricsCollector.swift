@@ -31,6 +31,21 @@ struct MetricsSnapshot: Codable, Hashable, Sendable {
     let blockedRunRate: Double
     let driftEventCount: Int
     let resumedRunCount: Int
+    
+    // P036 UX Consolidation metrics
+    let p036NavigationTabSelection: Int
+    let p036WorkbenchLaneCount: Int
+    let p036TimelineEntryCount: Int
+
+    // P036 required operational metrics (event counters; zero until event-site instrumentation lands)
+    let p036TabRouteResolutionTotal: Int
+    let p036GlobalAttentionIndicatorTotal: Int
+    let p036InlineApprovalRenderTotal: Int
+    let p036OperatorTaskAttemptTotal: Int
+    let p036TimelineBatchFlushTotal: Int
+    let p036TimelineCardCollapseTotal: Int
+    let p036ArtifactPayloadStateTotal: Int
+    let p036ProjectionGapDeferredTotal: Int
 }
 
 /// Collects deterministic metrics from a set of completed runs.
@@ -110,6 +125,20 @@ struct MetricsCollector {
 
         let sortedDates = allRuns.map(\.startedAt).sorted()
 
+        // P036 Metrics (ARCH-036) — derived from loopCounters where recorded
+        let navSelections = allRuns.compactMap { $0.loopCounters["p036_navigation_tab_selection"] }.reduce(0, +)
+        let laneCount = allRuns.compactMap { $0.loopCounters["p036_workbench_lane_count"] }.sorted().last ?? 0
+        let timelineEntryCount = allRuns.compactMap { $0.loopCounters["p036_timeline_entry_count"] }.sorted().last ?? 0
+        // Required named metrics (event-site counters; accumulated from loopCounters, zero until wired)
+        let tabRouteResTotal = allRuns.compactMap { $0.loopCounters["p036_tab_route_resolution_total"] }.reduce(0, +)
+        let attentionTotal = allRuns.compactMap { $0.loopCounters["p036_global_attention_indicator_total"] }.reduce(0, +)
+        let approvalRenderTotal = allRuns.compactMap { $0.loopCounters["p036_inline_approval_render_total"] }.reduce(0, +)
+        let taskAttemptTotal = allRuns.compactMap { $0.loopCounters["p036_operator_task_attempt_total"] }.reduce(0, +)
+        let batchFlushTotal = allRuns.compactMap { $0.loopCounters["p036_timeline_batch_flush_total"] }.reduce(0, +)
+        let cardCollapseTotal = allRuns.compactMap { $0.loopCounters["p036_timeline_card_collapse_total"] }.reduce(0, +)
+        let artifactPayloadTotal = allRuns.compactMap { $0.loopCounters["p036_artifact_payload_state_total"] }.reduce(0, +)
+        let projectionGapTotal = allRuns.compactMap { $0.loopCounters["p036_projection_gap_deferred_total"] }.reduce(0, +)
+
         return MetricsSnapshot(
             runCount: allRuns.count,
             windowStart: sortedDates.first ?? Date(),
@@ -127,7 +156,18 @@ struct MetricsCollector {
             failedRunRate: allRuns.isEmpty ? 0 : Double(failedRuns.count) / Double(allRuns.count),
             blockedRunRate: allRuns.isEmpty ? 0 : Double(blockedRuns.count) / Double(allRuns.count),
             driftEventCount: driftEvents.count,
-            resumedRunCount: resumedRuns.count
+            resumedRunCount: resumedRuns.count,
+            p036NavigationTabSelection: navSelections,
+            p036WorkbenchLaneCount: laneCount,
+            p036TimelineEntryCount: timelineEntryCount,
+            p036TabRouteResolutionTotal: tabRouteResTotal,
+            p036GlobalAttentionIndicatorTotal: attentionTotal,
+            p036InlineApprovalRenderTotal: approvalRenderTotal,
+            p036OperatorTaskAttemptTotal: taskAttemptTotal,
+            p036TimelineBatchFlushTotal: batchFlushTotal,
+            p036TimelineCardCollapseTotal: cardCollapseTotal,
+            p036ArtifactPayloadStateTotal: artifactPayloadTotal,
+            p036ProjectionGapDeferredTotal: projectionGapTotal
         )
     }
 
@@ -138,7 +178,12 @@ struct MetricsCollector {
             proposalLoopMean: 0, implementationLoopMean: 0, retriesPerStageMean: [:],
             approvalRejectionRate: 0, auditPassRate: 1.0,
             costPerRunMedianCents: nil, costByStageFamily: [:],
-            failedRunRate: 0, blockedRunRate: 0, driftEventCount: 0, resumedRunCount: 0
+            failedRunRate: 0, blockedRunRate: 0, driftEventCount: 0, resumedRunCount: 0,
+            p036NavigationTabSelection: 0, p036WorkbenchLaneCount: 0, p036TimelineEntryCount: 0,
+            p036TabRouteResolutionTotal: 0, p036GlobalAttentionIndicatorTotal: 0,
+            p036InlineApprovalRenderTotal: 0, p036OperatorTaskAttemptTotal: 0,
+            p036TimelineBatchFlushTotal: 0, p036TimelineCardCollapseTotal: 0,
+            p036ArtifactPayloadStateTotal: 0, p036ProjectionGapDeferredTotal: 0
         )
     }
 

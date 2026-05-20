@@ -287,6 +287,16 @@ enum RunStatus: String, Codable, Equatable {
     case failed
     case cancelled
     case cancelling
+
+    /// Parses a server-emitted status string, handling both Swift camelCase (local persistence)
+    /// and Rust snake_case (control-plane GraphQL responses, e.g. "waiting_approval").
+    nonisolated static func from(serverValue: String) -> RunStatus? {
+        if let status = RunStatus(rawValue: serverValue) { return status }
+        switch serverValue {
+        case "waiting_approval": return .waitingApproval
+        default: return nil
+        }
+    }
 }
 
 // MARK: - Run Presentation Status (Proposal 011 — REQ-002)

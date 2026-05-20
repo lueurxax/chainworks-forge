@@ -11,6 +11,9 @@ struct RunPlan: Sendable {
     /// Resolved state machine: state ID -> ExecutableState
     let states: [String: ExecutableState]
     let initialStateID: String
+    
+    /// Preservation of YAML source order for states
+    let stateOrder: [String]?
 
     /// Resolved agent catalog bindings: agent ID -> ResolvedAgent
     let agentBindings: [String: ResolvedAgent]
@@ -45,6 +48,7 @@ struct RunPlan: Sendable {
         workflowTitle: String,
         states: [String: ExecutableState],
         initialStateID: String,
+        stateOrder: [String]? = nil,
         agentBindings: [String: ResolvedAgent],
         variables: [String: AnyCodableValue],
         scoring: ScoringConfig?,
@@ -60,6 +64,7 @@ struct RunPlan: Sendable {
         self.workflowTitle = workflowTitle
         self.states = states
         self.initialStateID = initialStateID
+        self.stateOrder = stateOrder
         self.agentBindings = agentBindings
         self.variables = variables
         self.scoring = scoring

@@ -31,7 +31,12 @@ struct YAMLParser: Sendable {
     nonisolated static func loadWorkflow(from url: URL) throws -> WorkflowDefinition {
         let yamlString = try readFile(at: url)
         do {
-            return try YAMLDecoder().decode(WorkflowDefinition.self, from: yamlString)
+            var workflow = try YAMLDecoder().decode(WorkflowDefinition.self, from: yamlString)
+            if let node = try? Yams.compose(yaml: yamlString),
+               let statesMapping = node["states"]?.mapping {
+                workflow.stateOrder = statesMapping.compactMap { $0.key.string }
+            }
+            return workflow
         } catch {
             throw YAMLParserError.decodingFailed(url.path, error)
         }

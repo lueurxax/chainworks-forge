@@ -83,6 +83,28 @@ struct YAMLValidator: Sendable {
             issues.append(ValidationIssue(severity: .warning, message: "State '\(orphan)' is unreachable from initial_state", location: "states.\(orphan)"))
         }
 
+        // stateOrder reconciliation: detect hostile ordering that cannot be reconciled
+        // with the reachable state graph. A phantom ID or missing initialState makes the
+        // source-order display misleading; warn so operators can notice and fix the YAML.
+        if let order = workflow.stateOrder {
+            let knownIDs = Set(workflow.states.keys)
+            let phantomIDs = order.filter { !knownIDs.contains($0) }
+            if !phantomIDs.isEmpty {
+                issues.append(ValidationIssue(
+                    severity: .warning,
+                    message: "state_order contains unknown state IDs: \(phantomIDs.sorted().joined(separator: ", "))",
+                    location: "states"
+                ))
+            }
+            if !order.contains(workflow.initialState) {
+                issues.append(ValidationIssue(
+                    severity: .warning,
+                    message: "state_order does not include initial_state '\(workflow.initialState)'; source ordering is misleading",
+                    location: "states"
+                ))
+            }
+        }
+
         return issues
     }
 

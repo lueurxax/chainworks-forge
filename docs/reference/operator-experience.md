@@ -27,10 +27,10 @@ Related stable docs:
 
 This reference covers the primarily **read-side** and repo-agnostic operator layer (per the [UI action boundary](ui-action-boundary.md)):
 
-- `RunsHomeView` as the primary landing surface (GraphQL-only reads)
+- The `Runs` tab as the primary landing surface (GraphQL-only reads)
 - idea/archive visibility truth across operator surfaces
 - immutable run reports plus mutable latest summaries (metadata inspection only)
-- diagnostic-only guidance for non-approval actions; in-app resolution for approvals
+- diagnostic-only guidance for non-approval actions; in-app approval resolution directly within the Runs tab
 - deterministic run comparison (read-only)
 - run-detail workflow topology and agent activity surfaces
 - artifact inspection with provenance and traceability
@@ -38,9 +38,9 @@ This reference covers the primarily **read-side** and repo-agnostic operator lay
 
 It does **NOT** define broad in-app write/recovery. Recovery, retry, reset, compact, run start/cancel, clone, experiment, runtime, and context actions remain external MCP-only actions. Approval resolution is the only exception, supported via governed GraphQL mutations.
 
-## Runs Home
+## Runs Tab
 
-`RunsHomeView` is the operator landing surface. It consumes workflow truth exclusively through GraphQL projections.
+The `Runs` tab is the operator landing surface, offering a single source of truth for the run lifecycle. It consumes workflow truth exclusively through GraphQL projections. It features an inline approval panel for resolving approvals directly within the run detail and an idea origin badge on each run row for quick traceability.
 
 Runs are grouped into:
 
@@ -95,8 +95,8 @@ Surfaces for backpressure visibility:
   top backpressure reason.
 - **Stage Detail**: Includes a "Backpressured Agents" disclosure showing pending
   agents by provider and reason.
-- **Scheduler Health**: A dedicated section in PilotReadinessView showing system-wide
-  capacity, write pressure, and command latency.
+- **Scheduler Health**: A dedicated section in the Settings tab's System Readiness segment showing system-wide
+  capacity, write pressure, and command latency. Blocked/failed Runs expose a "Check System Readiness" deep link that routes to this section (`chainworksOpenSystemReadiness`).
 - **Sustained Backpressure Alerts**: Notifications trigger when work remains queued
   longer than the configured threshold (default 5 minutes).
 
@@ -153,7 +153,7 @@ The current trust states are:
 
 That provenance appears in:
 
-- `RunsHomeView`
+- The Runs tab
 - run reports
 - run comparison
 - artifact metadata
@@ -314,7 +314,7 @@ Presence surfaces include:
 
 - dock badge,
 - optional menu bar extra,
-- foreground banner while the app is active.
+- foreground banner while the app is active, navigating to the Runs tab for pending approvals.
 
 ## Contracts consumed by later work
 

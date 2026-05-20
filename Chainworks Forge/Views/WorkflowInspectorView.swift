@@ -4,6 +4,13 @@ struct WorkflowInspectorView: View {
     @State private var fullState: LoadState<WorkflowDefinition> = .loading
     @State private var compactState: LoadState<CompactWorkflowDefinition> = .loading
     @State private var selectedView: WorkflowViewMode = .full
+    
+    enum SortMode: String, CaseIterable {
+        case execution = "Execution Order"
+        case source = "Source Order"
+    }
+    @State private var sortMode: SortMode = .execution
+    
     @State private var catalogForValidation: AgentCatalog?
     @State private var overrideWorkflowURL: URL?
     @State private var overrideCompactURL: URL?
@@ -47,8 +54,17 @@ struct WorkflowInspectorView: View {
     private var fullWorkflowView: some View {
         switch fullState {
         case .loading:
-            ProgressView("Loading workflow.yaml...")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(alignment: .leading, spacing: 14) {
+                ForEach(0..<10) { _ in
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForgeSkeleton.headline(width: 180)
+                        ForgeSkeleton.text(width: 120)
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+            .padding()
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         case .loaded(let workflow, let issues):
             fullWorkflowContent(workflow, issues: issues)
         case .fileNotFound(let path):
@@ -65,15 +81,48 @@ struct WorkflowInspectorView: View {
 
         return VStack(spacing: 0) {
             fullSummaryStrip(workflow: workflow, errorCount: errorCount, warnCount: warnCount)
+            
+            Picker("Sort Mode", selection: $sortMode) {
+                ForEach(SortMode.allCases, id: \.self) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
 
             NavigationSplitView {
                 List {
-                    Section("Execution Path") {
-                        ForEach(sorted.reachable, id: \.self) { stateID in
-                            NavigationLink {
-                                stateDetail(stateID: stateID, state: workflow.states[stateID]!)
-                            } label: {
-                                stateRow(stateID: stateID, state: workflow.states[stateID]!)
+                    if sortMode == .execution {
+                        Section("Primary Path") {
+                            ForEach(sorted.primaryPath, id: \.self) { stateID in
+                                NavigationLink {
+                                    stateDetail(stateID: stateID, state: workflow.states[stateID]!)
+                                } label: {
+                                    stateRow(stateID: stateID, state: workflow.states[stateID]!)
+                                }
+                            }
+                        }
+                        
+                        if !sorted.branches.isEmpty {
+                            Section("Branches") {
+                                ForEach(sorted.branches, id: \.self) { stateID in
+                                    NavigationLink {
+                                        stateDetail(stateID: stateID, state: workflow.states[stateID]!)
+                                    } label: {
+                                        stateRow(stateID: stateID, state: workflow.states[stateID]!)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        Section("All States (Source Order)") {
+                            ForEach(sorted.primaryPath, id: \.self) { stateID in
+                                NavigationLink {
+                                    stateDetail(stateID: stateID, state: workflow.states[stateID]!)
+                                } label: {
+                                    stateRow(stateID: stateID, state: workflow.states[stateID]!)
+                                }
                             }
                         }
                     }
@@ -90,6 +139,7 @@ struct WorkflowInspectorView: View {
                         }
                     }
                 }
+                .accessibilityIdentifier("workflow-state-list")
             } detail: {
                 if !issues.isEmpty {
                     issuesView(issues)
@@ -102,36 +152,62 @@ struct WorkflowInspectorView: View {
     }
 
     struct SortedStates {
-        let reachable: [String]
+        let primaryPath: [String]
+        let branches: [String]
         let unreachable: [String]
     }
 
     private var sortedStates: SortedStates {
-        guard case .loaded(let workflow, _) = fullState else { return SortedStates(reachable: [], unreachable: []) }
+        guard case .loaded(let workflow, _) = fullState else { 
+            return SortedStates(primaryPath: [], branches: [], unreachable: []) 
+        }
         
-        // P036: Deterministic execution order sorting
-        var ordered: [String] = []
+        var primary: [String] = []
+        var branches: [String] = []
         var visited = Set<String>()
         
-        func traverse(_ id: String) {
-            guard !visited.contains(id) else { return }
+        // DFS to find execution path; skip unknown transition targets to prevent force-unwrap crash.
+        func traverse(_ id: String, isPrimary: Bool) {
+            guard !visited.contains(id), workflow.states[id] != nil else { return }
             visited.insert(id)
-            ordered.append(id)
+            
+            if isPrimary {
+                primary.append(id)
+            } else {
+                branches.append(id)
+            }
             
             if let transitions = workflow.states[id]?.transitions {
-                // Declared transition order is preserved in the array
-                for t in transitions {
-                    traverse(t.to)
+                for (index, t) in transitions.enumerated() {
+                    traverse(t.to, isPrimary: isPrimary && index == 0)
                 }
             }
         }
         
-        traverse(workflow.initialState)
+        traverse(workflow.initialState, isPrimary: true)
         
-        // Unvisited states (unreachable or separate islands)
-        let unvisited = workflow.states.keys.filter { !visited.contains($0) }.sorted()
+        // Unvisited states (islands)
+        let unvisited = workflow.states.keys.sorted().filter { !visited.contains($0) }
         
-        return SortedStates(reachable: ordered, unreachable: unvisited)
+        if sortMode == .source {
+            // P036: Use explicit state_order from YAML only when reconcilable with the known
+            // state graph (no phantom IDs, initialState present). Fall back to execution-biased
+            // deterministic order for hostile orderings (L1 fix).
+            if let order = workflow.stateOrder {
+                let knownIDs = Set(workflow.states.keys)
+                let hasPhantoms = order.contains { !knownIDs.contains($0) }
+                let missingInitial = !order.contains(workflow.initialState)
+                if !hasPhantoms && !missingInitial {
+                    return SortedStates(primaryPath: order, branches: [], unreachable: [])
+                }
+            }
+
+            // Fallback: Combine primary, branches, and unvisited into a single deterministic list
+            let combined = primary + branches + unvisited
+            return SortedStates(primaryPath: combined, branches: [], unreachable: [])
+        }
+        
+        return SortedStates(primaryPath: primary, branches: branches, unreachable: unvisited)
     }
 
     private func fullSummaryStrip(workflow: WorkflowDefinition, errorCount: Int, warnCount: Int) -> some View {
@@ -252,8 +328,14 @@ struct WorkflowInspectorView: View {
     private var compactWorkflowView: some View {
         switch compactState {
         case .loading:
-            ProgressView("Loading compact workflow...")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(alignment: .leading, spacing: 12) {
+                ForgeSkeleton.headline(width: 200)
+                ForgeSkeleton.text(width: nil)
+                ForgeSkeleton.text(width: nil)
+                ForgeSkeleton.text(width: 250)
+            }
+            .padding()
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         case .loaded(let compact, let issues):
             compactContent(compact, issues: issues)
         case .fileNotFound(let path):
@@ -332,43 +414,23 @@ struct WorkflowInspectorView: View {
     // MARK: - Shared Error Views
 
     private func fileNotFoundView(path: String, openFile: @escaping () -> Void) -> some View {
-        VStack(spacing: 12) {
-            ContentUnavailableView(
-                "File Not Found",
-                systemImage: "doc.questionmark",
-                description: Text(path)
-            )
-            Button("Open File\u{2026}", action: openFile)
-                .buttonStyle(.bordered)
-        }
+        ForgeEmptyState(
+            title: "File Not Found",
+            systemImage: "doc.questionmark",
+            description: path,
+            actionTitle: "Open File\u{2026}",
+            action: openFile
+        )
     }
 
     private func decodeErrorView(path: String, error: Error, reload: @escaping () -> Void) -> some View {
-        VStack(spacing: 12) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.largeTitle).foregroundStyle(.red)
-            Text("Decode Error").font(.headline)
-            Text(path).font(.caption).foregroundStyle(.secondary)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(error.localizedDescription)
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled)
-
-                    if let rawContent = rawExcerpt(at: path) {
-                        Divider()
-                        Text("Raw YAML excerpt:")
-                            .font(.caption).foregroundStyle(.secondary)
-                        Text(rawContent)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                    }
-                }
-                .padding()
-            }
-            Button("Reload", action: reload)
-        }
-        .padding()
+        ForgeEmptyState(
+            title: "Decode Error",
+            systemImage: "exclamationmark.triangle",
+            description: "\(path)\n\n\(error.localizedDescription)",
+            actionTitle: "Retry",
+            action: reload
+        )
     }
 
     private func issuesView(_ issues: [ValidationIssue]) -> some View {

@@ -11,12 +11,15 @@ nonisolated struct WorkflowDefinition: Codable, Sendable {
     let scoring: ScoringConfig?
     let initialState: String
     let states: [String: WorkflowState]
+    var stateOrder: [String]? = nil
 
     enum CodingKeys: String, CodingKey {
         case workflow, discovery, variables, scoring, states
         case schemaVersion = "schema_version"
         case failurePolicy = "failure_policy"
         case initialState = "initial_state"
+        // state_order is intentionally not in CodingKeys; it is populated by YAMLParser
+        // from the YAML mapping key order, not from an explicit schema field.
     }
 
     init(

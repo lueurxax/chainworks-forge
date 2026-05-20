@@ -31,8 +31,17 @@ struct AgentCatalogView: View {
         NavigationSplitView {
             switch state {
             case .loading:
-                ProgressView("Loading agents.yaml...")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(0..<8) { _ in
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForgeSkeleton.headline(width: 150)
+                            ForgeSkeleton.text(width: 100)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+                .padding()
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
             case .loaded(let catalog, let issues):
                 VStack(spacing: 0) {
@@ -83,42 +92,22 @@ struct AgentCatalogView: View {
                 }
 
             case .fileNotFound(let path):
-                VStack(spacing: 12) {
-                    ContentUnavailableView(
-                        "File Not Found",
-                        systemImage: "doc.questionmark",
-                        description: Text(path)
-                    )
-                    Button("Open File\u{2026}") { openFilePicker() }
-                        .buttonStyle(.bordered)
-                }
+                ForgeEmptyState(
+                    title: "File Not Found",
+                    systemImage: "doc.questionmark",
+                    description: path,
+                    actionTitle: "Open File\u{2026}",
+                    action: { openFilePicker() }
+                )
 
             case .decodeError(let path, let error):
-                VStack(spacing: 12) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.largeTitle).foregroundStyle(.red)
-                    Text("Decode Error").font(.headline)
-                    Text(path).font(.caption).foregroundStyle(.secondary)
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(error.localizedDescription)
-                                .font(.system(.body, design: .monospaced))
-                                .textSelection(.enabled)
-
-                            if let rawContent = rawExcerpt(at: path) {
-                                Divider()
-                                Text("Raw YAML excerpt:")
-                                    .font(.caption).foregroundStyle(.secondary)
-                                Text(rawContent)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .textSelection(.enabled)
-                            }
-                        }
-                        .padding()
-                    }
-                    Button("Reload") { loadCatalog() }
-                }
-                .padding()
+                ForgeEmptyState(
+                    title: "Decode Error",
+                    systemImage: "exclamationmark.triangle",
+                    description: "\(path)\n\n\(error.localizedDescription)",
+                    actionTitle: "Retry",
+                    action: { loadCatalog() }
+                )
             }
         } detail: {
             switch state {
@@ -144,56 +133,15 @@ struct AgentCatalogView: View {
         }
         .navigationSplitViewColumnWidth(min: 200, ideal: 250)
         .accessibilityIdentifier("agent-catalog-view")
-        .onChange(of: selectedAgentID) { _, newValue in
-            selectionState?.wrappedValue = newValue
+        .onChange(of: selectedAgentID) {
+            selectionState?.wrappedValue = selectedAgentID
         }
         .task { loadCatalog() }
     }
 
     private var groupedAgents: [(String, [AgentDefinition])] {
         guard case .loaded(let catalog, _) = state else { return [] }
-        // P036: Deterministic agent grouping with source-order fallback
-        // Precedence: explicit supported group field, then mode, then profile, then role, then Other.
-        
-        func getGroup(for agent: AgentDefinition) -> String {
-            if let group = agent.group?.trimmingCharacters(in: .whitespacesAndNewlines), !group.isEmpty {
-                return group
-            }
-            if !agent.mode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return agent.mode
-            }
-            if !agent.backendProfile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return agent.backendProfile
-            }
-            if let role = agent.skillRole?.trimmingCharacters(in: .whitespacesAndNewlines), !role.isEmpty {
-                return role
-            }
-            return "Other"
-        }
-        
-        func normalizeLabel(_ label: String) -> String {
-            let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { return "Other" }
-            // Title case normalization
-            return trimmed.split(separator: " ")
-                .map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }
-                .joined(separator: " ")
-        }
-
-        var groups: [String: [AgentDefinition]] = [:]
-        var order: [String] = []
-        
-        for agent in catalog.agents {
-            let rawLabel = getGroup(for: agent)
-            let normalized = normalizeLabel(rawLabel)
-            if groups[normalized] == nil {
-                order.append(normalized)
-                groups[normalized] = []
-            }
-            groups[normalized]?.append(agent)
-        }
-        
-        return order.map { ($0, groups[$0]!) }
+        return catalog.groupedAgents().map { ($0.label, $0.agents) }
     }
 
     private func summaryStrip(catalog: AgentCatalog, issues: [ValidationIssue]) -> some View {

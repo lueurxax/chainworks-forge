@@ -214,7 +214,7 @@ Each required row includes:
 | **source_graphql_fields** | `approvalInbox`, approval durable state, caller policy readback, `availableActions`, `disabledReasonCode`, `writePathState`, `diagnosticId`, `serverDebugDetail` |
 | **local_presentation_state** | `P085ApprovalAffordanceState.approveAvailability` — `.actionable`, `.disabled(reasonCode:helpText:)`, `.hidden` |
 | **actionable_state** | Actionable only when durable approval state is pending/requested, caller policy allows approve, `availableActions` contains `"approve"`, `writePathState == .available`, and `approveApproval` is authorized |
-| **disabled_reason_code** | `P031DisabledReasonCode` value from server: `WRITE_PATH_NOT_AVAILABLE`, `UNSUPPORTED_ACTION`, `PROJECTION_LAG`, `UNAUTHORIZED`, `AMBIGUOUS_APPROVAL_IDENTITY`, `STALE_READ`, `MANAGED_OUTSIDE_UI` |
+| **disabled_reason_code** | `P031DisabledReasonCode` value from server: `WRITE_PATH_NOT_AVAILABLE`, `UNSUPPORTED_ACTION`, `PROJECTION_LAG`, `UNAUTHORIZED`, `AMBIGUOUS_APPROVAL_IDENTITY`, `STALE_READ`, `MANAGED_OUTSIDE_UI`, `REDACTED`, `CONFLICT`, `DUPLICATE`, `ALREADY_RESOLVED` |
 | **fallback_text** | Derived from `disabledReasonCode`; maps to stable help text via `P085AffordancePresenter` |
 | **mutation_availability** | `approveApproval` |
 | **mutation_idempotency** | Duplicate, stale, conflicting, or non-pending submit returns success or `already_resolved` with current durable decision when the backend can journal the attempt. Transient transport/server failures stay GraphQL errors and are not silently retried by Swift; unknown future conflict codes fail closed to `.unknown(rawValue:)` |

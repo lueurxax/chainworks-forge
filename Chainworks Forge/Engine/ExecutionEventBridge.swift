@@ -512,7 +512,7 @@ enum ExecutionEventBridgeError: LocalizedError {
 // MARK: - ExecutionEvent (app-friendly event)
 
 /// App-friendly execution event. The UI and receipt builder consume this.
-struct ExecutionEvent: Sendable, Identifiable {
+struct ExecutionEvent: Sendable, Identifiable, Equatable {
     let id: UUID = UUID()
     let type: EventType
     let timestamp: Date
@@ -537,7 +537,7 @@ struct ExecutionEvent: Sendable, Identifiable {
         self.toolName = toolName
     }
 
-    enum EventType: String, Sendable {
+    enum EventType: String, Sendable, Equatable {
         case sessionStarted = "session_started"
         case promptSubmitted = "prompt_submitted"
         case toolCallStarted = "tool_call_started"

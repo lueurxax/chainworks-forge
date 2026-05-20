@@ -141,4 +141,60 @@ struct ArtifactContentRendererTests {
         #expect(MarkdownTextViewUpdatePolicy.shouldInvalidateLayout(previousWidth: 240, newWidth: 240.2) == false)
         #expect(MarkdownTextViewUpdatePolicy.shouldInvalidateLayout(previousWidth: 240, newWidth: 244))
     }
+
+  // MARK: - SEC-001 regression: relative path through symlinked ancestor directory
+
+  @Test("Markdown image source policy rejects relative path under symlinked ancestor directory")
+  func markdownImageSourcePolicyRejectsRelativePathUnderSymlinkedAncestor() throws {
+    let fm = FileManager.default
+    let tempRoot = fm.temporaryDirectory
+      .appendingPathComponent("p036-test-ancestor-root-\(UUID().uuidString)")
+    let outsideDir = fm.temporaryDirectory
+      .appendingPathComponent("p036-test-ancestor-outside-\(UUID().uuidString)")
+    try fm.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+    try fm.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+    defer {
+      try? fm.removeItem(at: tempRoot)
+      try? fm.removeItem(at: outsideDir)
+    }
+    let secretFile = outsideDir.appendingPathComponent("secret.png")
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: secretFile)
+    // Symlinked directory inside root pointing to the outside directory.
+    let symlinkDir = tempRoot.appendingPathComponent("subdir")
+    try fm.createSymbolicLink(at: symlinkDir, withDestinationURL: outsideDir)
+
+    let result = MarkdownImageSourcePolicy.v1.resolve(
+      source: "subdir/secret.png",
+      localRoots: [tempRoot]
+    )
+    #expect(result == nil, "Relative path through symlinked ancestor directory must be rejected")
+  }
+
+  // MARK: - SEC-002 regression: symlink escape outside allowed root
+
+  @Test("Markdown image source policy rejects symlink pointing outside allowed root")
+  func markdownImageSourcePolicyRejectsSymlinkEscape() throws {
+    let fm = FileManager.default
+    let tempRoot = fm.temporaryDirectory
+      .appendingPathComponent("p036-test-symlink-root-\(UUID().uuidString)")
+    let outsideDir = fm.temporaryDirectory
+      .appendingPathComponent("p036-test-outside-\(UUID().uuidString)")
+    try fm.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+    try fm.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+    defer {
+      try? fm.removeItem(at: tempRoot)
+      try? fm.removeItem(at: outsideDir)
+    }
+    let outsideImage = outsideDir.appendingPathComponent("secret.png")
+    // Minimal 4-byte PNG header to make the file non-empty and valid-looking.
+    try Data([0x89, 0x50, 0x4E, 0x47]).write(to: outsideImage)
+    let symlinkInsideRoot = tempRoot.appendingPathComponent("escape.png")
+    try fm.createSymbolicLink(at: symlinkInsideRoot, withDestinationURL: outsideImage)
+
+    let result = MarkdownImageSourcePolicy.v1.resolve(
+      source: symlinkInsideRoot.path,
+      localRoots: [tempRoot]
+    )
+    #expect(result == nil, "Symlink escape to path outside allowed root must be rejected")
+  }
 }

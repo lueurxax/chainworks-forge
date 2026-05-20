@@ -46,6 +46,40 @@ struct Chainworks_ForgeApp: App {
         }
         .commands {
             CommandGroup(replacing: .newItem) { }
+            CommandMenu("Navigation") {
+                Button("Runs") {
+                    NotificationCenter.default.post(
+                        name: .chainworksSelectTab,
+                        object: "Runs",
+                        userInfo: ["tab": "Runs"]
+                    )
+                }
+                .keyboardShortcut("1", modifiers: .command)
+                Button("Ideas") {
+                    NotificationCenter.default.post(
+                        name: .chainworksSelectTab,
+                        object: "Ideas",
+                        userInfo: ["tab": "Ideas"]
+                    )
+                }
+                .keyboardShortcut("2", modifiers: .command)
+                Button("Definitions") {
+                    NotificationCenter.default.post(
+                        name: .chainworksSelectTab,
+                        object: "Definitions",
+                        userInfo: ["tab": "Definitions"]
+                    )
+                }
+                .keyboardShortcut("3", modifiers: .command)
+                Button("Settings") {
+                    NotificationCenter.default.post(
+                        name: .chainworksSelectTab,
+                        object: "Settings",
+                        userInfo: ["tab": "Settings"]
+                    )
+                }
+                .keyboardShortcut("4", modifiers: .command)
+            }
         }
     }
 
@@ -249,7 +283,7 @@ private actor DebugPackagedDaemonProcess {
             if process.isRunning {
                 kill(process.processIdentifier, SIGKILL)
             }
-        } else if let pid = existingPackagedDaemonPID() {
+        } else if let pid = existingPackagedDaemonPID(), packagedDaemonPIDIsRunning(pid) {
             kill(pid, SIGTERM)
             let deadline = Date().addingTimeInterval(2)
             while packagedDaemonPIDIsRunning(pid) && Date() < deadline {

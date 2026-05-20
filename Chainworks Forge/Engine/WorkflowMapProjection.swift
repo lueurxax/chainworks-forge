@@ -93,6 +93,7 @@ struct WorkflowMapPersistedTimelineEntry: Identifiable, Sendable, Equatable {
     let detail: String
     let timestamp: Date
     let sessionID: String?
+    let agentID: String?
 }
 
 struct WorkflowMapXcodeRuntimeObservation: Identifiable, Sendable, Equatable {
@@ -648,6 +649,9 @@ struct WorkflowMapTopologyBuilder {
     let plan: RunPlan
 
     func orderedStateIDs() -> [String] {
+        // Always use execution-order traversal (initial state → declared transition order → unreachable).
+        // plan.stateOrder carries YAML source order for the Definitions view source-order toggle only;
+        // it must not override the stage-map ordering used by the Runs workbench.
         var ordered: [String] = []
         var seen = Set<String>()
         var queue: [String] = [plan.initialStateID]

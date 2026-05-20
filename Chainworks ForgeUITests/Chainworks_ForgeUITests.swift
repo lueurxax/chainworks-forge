@@ -2930,4 +2930,94 @@ final class Chainworks_ForgeUITests: XCTestCase {
         )
         screenshot(app, name: "P014_ForegroundBanner")
     }
+
+    func testProposal036NavigationShellParity() throws {
+        let app = makeApp(initialTab: "Runs")
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        let screen = AppScreen(app: app)
+
+        try XCTSkipUnless(
+            screen.waitForTabs(timeout: 20),
+            "Skipping: macOS SwiftUI tabs not discoverable in this environment"
+        )
+
+        // P036 Phase 2c: exactly four visible top-level tabs.
+        let runsTab = screen.tab("Runs")
+        let ideasTab = screen.tab("Ideas")
+        let definitionsTab = screen.tab("Definitions")
+        let settingsTab = screen.tab("Settings")
+
+        XCTAssertTrue(runsTab.exists, "P036: 'Runs' tab must be visible")
+        XCTAssertTrue(ideasTab.exists, "P036: 'Ideas' tab must be visible")
+        XCTAssertTrue(definitionsTab.exists, "P036: 'Definitions' tab must be visible")
+        XCTAssertTrue(settingsTab.exists, "P036: 'Settings' tab must be visible")
+
+        // Old tabs that should NOT appear as visible top-level items.
+        let approvalTab = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == 'Approvals' AND identifier == 'tab-approvals'"))
+            .firstMatch
+        XCTAssertFalse(approvalTab.exists, "P036: standalone 'Approvals' tab must not be visible in production builds")
+
+        // Verify navigating to Definitions reaches the expected surface.
+        XCTAssertTrue(screen.selectTab("Definitions", timeout: 10), "P036: can navigate to Definitions tab")
+        let definitionsView = anyElement(app, identifier: "definitions-view")
+        XCTAssertTrue(definitionsView.waitForExistence(timeout: 10), "P036: Definitions view must render after tab selection")
+
+        // Verify navigating to Settings reaches the expected surface.
+        XCTAssertTrue(screen.selectTab("Settings", timeout: 10), "P036: can navigate to Settings tab")
+
+        // Verify Runs tab routes old 'Approvals' alias correctly — select via Runs.
+        XCTAssertTrue(screen.selectTab("Runs", timeout: 10), "P036: can navigate to Runs tab")
+
+        screenshot(app, name: "P036_NavigationShellParity")
+    }
+
+    func testProposal036DefinitionsSegmentedWrapper() throws {
+        let app = makeApp(initialTab: "Definitions")
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        let screen = AppScreen(app: app)
+
+        try XCTSkipUnless(
+            screen.waitForTabs(timeout: 20),
+            "Skipping: macOS SwiftUI tabs not discoverable in this environment"
+        )
+
+        // Navigate to Definitions.
+        XCTAssertTrue(screen.selectTab("Definitions", timeout: 10), "P036: can navigate to Definitions tab")
+
+        let definitionsView = anyElement(app, identifier: "definitions-view")
+        XCTAssertTrue(definitionsView.waitForExistence(timeout: 10), "P036: Definitions view must render")
+
+        // The segmented control must expose both segments.
+        let win = app.windows.firstMatch
+        let agentsSegment = win.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS[c] 'Agents'"))
+            .firstMatch
+        let workflowsSegment = win.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS[c] 'Workflows'"))
+            .firstMatch
+        XCTAssertTrue(agentsSegment.waitForExistence(timeout: 10), "P036: 'Agents' segment must be present in Definitions")
+        XCTAssertTrue(workflowsSegment.waitForExistence(timeout: 10), "P036: 'Workflows' segment must be present in Definitions")
+
+        // Default segment (Agents) must show the agent catalog.
+        let agentCatalogView = anyElement(app, identifier: "agent-catalog-view")
+        XCTAssertTrue(agentCatalogView.waitForExistence(timeout: 10), "P036: Agent Catalog must render in Agents segment")
+
+        // Switch to Workflows segment and verify workflow state list appears.
+        if workflowsSegment.isHittable {
+            workflowsSegment.click()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+            let workflowStateList = anyElement(app, identifier: "workflow-state-list")
+            let workflowStateCount = anyElement(app, identifier: "workflow-state-count")
+            let workflowSurface = workflowStateList.waitForExistence(timeout: 10)
+                || workflowStateCount.waitForExistence(timeout: 5)
+            XCTAssertTrue(workflowSurface, "P036: Workflow state list must render in Workflows segment")
+        }
+
+        screenshot(app, name: "P036_DefinitionsSegmentedWrapper")
+    }
 }

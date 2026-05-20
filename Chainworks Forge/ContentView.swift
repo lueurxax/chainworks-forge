@@ -4,18 +4,32 @@ import SwiftUI
 extension Notification.Name {
     static let chainworksSelectTab = Notification.Name("chainworks.selectTab")
     static let chainworksOpenRunInRunsHome = Notification.Name("chainworks.openRunInRunsHome")
+    // P036: deep-link from blocked/failed Runs to Settings System Readiness section
+    static let chainworksOpenSystemReadiness = Notification.Name("chainworks.openSystemReadiness")
+    // P036: signal RunsHomeView to scroll/select into the waiting-approval lane
+    static let chainworksFocusWaitingApprovalLane = Notification.Name("chainworks.focusWaitingApprovalLane")
 }
 
 struct ContentView: View {
     @State private var selectedTab: Tab
+    @State private var definitionsSegmentRequest: DefinitionsView.Segment? = nil
+    // P036: return target so operators can navigate back to the originating run after
+    // inspecting System Readiness from a blocked/failed run detail.
+    @State private var systemReadinessReturnRunID: String? = nil
     @StateObject private var daemonStatus = DaemonStatusViewModel.bootstrap()
     @StateObject private var schedulerHealth = SchedulerHealthViewModel.bootstrap()
     @StateObject private var runsModel = P031ThinReadDashboardModel.bootstrap()
+    @StateObject private var workbench = RunsWorkbenchPresentationModel()
 
     private let forcedInitialTab: Tab?
     private let forcedUISurface: UISurface?
+    // P036: set true when CHAINWORKS_UI_TEST_INITIAL_TAB maps to "approvals" so
+    // RunsHomeView can focus the waiting-approval lane after the view hierarchy loads.
+    private let focusWaitingApprovalOnLoad: Bool
 
-    enum Tab: String, CaseIterable {
+    // P036 cutover: legacy Approvals routes are mapped into Runs with waiting-approval focus;
+    // there is no standalone top-level Approvals tab.
+    enum Tab: String {
         case runs = "Runs"
         case ideas = "Ideas"
         case definitions = "Definitions"
@@ -25,11 +39,11 @@ struct ContentView: View {
             switch rawValue {
             case "Runs Home", "runsHome", "Runs": return .runs
             case "Ideas", "ideas": return .ideas
+            // P036 old_route_mapping: legacy Approvals routes redirect to Runs.
             case "Approvals", "approvals": return .runs
             case "Agent Catalog", "agentCatalog", "Definitions": return .definitions
             case "Workflow Inspector", "workflowInspector": return .definitions
-            case "Pilot Readiness", "pilotReadiness", "Settings": return .settings
-            case "Settings", "providerSettings": return .settings
+            case "Pilot Readiness", "pilotReadiness", "Settings", "providerSettings": return .settings
             default: return Tab(rawValue: rawValue)
             }
         }
@@ -40,14 +54,31 @@ struct ContentView: View {
         case p077CloseoutReadiness = "p077_closeout_readiness"
     }
 
+
     init() {
         let environment = ProcessInfo.processInfo.environment
-        let initialTab = environment["CHAINWORKS_UI_TEST_INITIAL_TAB"]
-            .flatMap(Tab.from(rawValue:))
+        let rawInitialTab = environment["CHAINWORKS_UI_TEST_INITIAL_TAB"] ?? ""
+        let initialTab = Tab.from(rawValue: rawInitialTab)
         forcedInitialTab = initialTab
+        focusWaitingApprovalOnLoad = rawInitialTab == "Approvals" || rawInitialTab == "approvals"
+        #if DEBUG
         forcedUISurface = environment["CHAINWORKS_UI_TEST_DIRECT_SURFACE"]
             .flatMap(UISurface.init(rawValue:))
+        #else
+        forcedUISurface = nil
+        #endif
         _selectedTab = State(initialValue: initialTab ?? .runs)
+        // P036 initial segment routing: map legacy route names to Definitions segments
+        // so CHAINWORKS_UI_TEST_INITIAL_TAB=workflowInspector opens the Workflow segment
+        // rather than the default Agents segment.
+        switch rawInitialTab {
+        case "workflowInspector", "Workflow Inspector":
+            _definitionsSegmentRequest = State(initialValue: .workflows)
+        case "agentCatalog", "Agent Catalog":
+            _definitionsSegmentRequest = State(initialValue: .agents)
+        default:
+            break
+        }
     }
 
     var body: some View {
@@ -73,6 +104,9 @@ struct ContentView: View {
                 .task {
                     await schedulerHealth.refresh()
                 }
+                .task {
+                    await runsModel.loadIfNeeded()
+                }
             }
         }
     }
@@ -80,7 +114,7 @@ struct ContentView: View {
     private var tabShell: some View {
         TabView(selection: $selectedTab) {
             tabContent(.runs) {
-                RunsHomeView(model: runsModel, initialTab: .overview)
+                RunsHomeView(model: runsModel, workbench: workbench, initialTab: .overview)
             }
             .tabItem { Label("Runs", systemImage: "house") }
             .tag(Tab.runs)
@@ -112,31 +146,123 @@ struct ContentView: View {
                         environmentKey: nil,
                         bundleName: "proposal-to-release",
                         repoRelativePath: "examples/workflows/proposal-to-release.yaml"
-                    )
+                    ),
+                    segmentRequest: $definitionsSegmentRequest
                 )
             }
             .tabItem { Label("Definitions", systemImage: "square.grid.2x2") }
             .tag(Tab.definitions)
 
             tabContent(.settings) {
-                SettingsView()
+                SettingsView(
+                    runsModel: runsModel,
+                    workbench: workbench,
+                    returnRunID: systemReadinessReturnRunID,
+                    onClearReturnRunID: { systemReadinessReturnRunID = nil }
+                )
             }
             .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
             .tag(Tab.settings)
+
         }
         .task(id: forcedInitialTab?.rawValue ?? "default") {
             guard let forcedInitialTab, selectedTab != forcedInitialTab else { return }
             selectedTab = forcedInitialTab
         }
+        // P036: when CHAINWORKS_UI_TEST_INITIAL_TAB=approvals, post the waiting-approval
+        // focus notification after the view has loaded and data may have settled.
+        .task(id: focusWaitingApprovalOnLoad ? "approvals-focus" : "noop") {
+            guard focusWaitingApprovalOnLoad else { return }
+            // PC-003: set workbench flag so RunsHomeView handles it on mount even if
+            // lanes haven't loaded yet (onChange initial:true picks it up).
+            workbench.requestFocusWaitingApprovalLane()
+            NotificationCenter.default.post(name: .chainworksFocusWaitingApprovalLane, object: nil)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .chainworksSelectTab)) { notification in
-            guard
-                let rawValue = notification.userInfo?["tab"] as? String,
-                let tab = Tab.from(rawValue: rawValue)
-            else { return }
+            let rawValueFromUserInfo = notification.userInfo?["tab"] as? String
+            let rawValueFromObject = notification.object as? String
+            let rawValue = rawValueFromUserInfo ?? rawValueFromObject
+
+            guard let rawValue, let tab = Tab.from(rawValue: rawValue) else {
+                #if DEBUG
+                if let rawValue {
+                    print("[P036] chainworksSelectTab: unknown rawValue '\(rawValue)'")
+                }
+                #endif
+                return
+            }
+            let previousTab = selectedTab
             selectedTab = tab
+            P036UICounters.shared.recordTabRouteResolution(
+                source: previousTab.rawValue,
+                target: tab.rawValue,
+                result: "routed"
+            )
+
+            // Segment routing: honor both camelCase and title-case alias forms so
+            // CHAINWORKS_UI_TEST_INITIAL_TAB and notification routing stay in sync.
+            switch rawValue {
+            case "workflowInspector", "Workflow Inspector":
+                definitionsSegmentRequest = .workflows
+            case "agentCatalog", "Agent Catalog":
+                definitionsSegmentRequest = .agents
+            case "Approvals", "approvals":
+                // PC-003: set workbench flag before posting notification. The flag survives
+                // the tab-switch render cycle so RunsHomeView picks it up on mount even
+                // if the notification fires before the view is in the hierarchy.
+                workbench.requestFocusWaitingApprovalLane()
+                NotificationCenter.default.post(name: .chainworksFocusWaitingApprovalLane, object: nil)
+            default:
+                break
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { _ in
             selectedTab = .runs
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenSystemReadiness)) { _ in
+            // Capture the currently selected run as a return target before switching tabs,
+            // so the operator can navigate back to the exact run after inspecting readiness.
+            systemReadinessReturnRunID = runsModel.selectedRunID
+            selectedTab = .settings
+        }
+        .onChange(of: runsModel.runsHome) {
+            if let newValue = runsModel.runsHome {
+                workbench.populate(from: newValue)
+            }
+        }
+        .onChange(of: runsModel.runDetail) {
+            if let newValue = runsModel.runDetail {
+                workbench.populate(from: newValue)
+            }
+        }
+        .onChange(of: runsModel.daemonLifecycle) {
+            workbench.populate(daemon: runsModel.daemonLifecycle, scheduler: runsModel.schedulerHealth)
+        }
+        .onChange(of: runsModel.schedulerHealth) {
+            workbench.populate(daemon: runsModel.daemonLifecycle, scheduler: runsModel.schedulerHealth)
+        }
+        .onOpenURL { url in
+            guard url.scheme == "chainworks" else { return }
+            switch url.host {
+            case "runs":
+                selectedTab = .runs
+                if let runID = url.pathComponents.last, runID != "/" {
+                    runsModel.selectRun(runID)
+                }
+            case "ideas":
+                selectedTab = .ideas
+            case "definitions":
+                selectedTab = .definitions
+            case "settings":
+                selectedTab = .settings
+            case "approvals":
+                selectedTab = .runs
+                // PC-003: set workbench flag before notification for same race fix as selectTab path.
+                workbench.requestFocusWaitingApprovalLane()
+                NotificationCenter.default.post(name: .chainworksFocusWaitingApprovalLane, object: nil)
+            default:
+                break
+            }
         }
     }
 
@@ -156,12 +282,17 @@ struct ContentView: View {
     private func directSurfaceView(for surface: UISurface) -> some View {
         switch surface {
         case .completedExportHub:
+#if DEBUG
             P031CompletedExportHubCompatibilitySurface()
+#else
+            RunsHomeView(workbench: workbench)
+#endif
         case .p077CloseoutReadiness:
 #if DEBUG
             ZStack(alignment: .topLeading) {
                 RunsHomeView(
                     model: P031ThinReadDashboardModel.previewLoadedWithCloseoutReadiness(),
+                    workbench: workbench,
                     initialTab: .overview
                 )
                 P031AccessibilityMarker(identifier: "ui-test-direct-surface-ready-p077_closeout_readiness")
@@ -169,7 +300,7 @@ struct ContentView: View {
                     .opacity(0.01)
             }
 #else
-            RunsHomeView()
+            RunsHomeView(workbench: workbench)
 #endif
         }
     }
@@ -190,27 +321,6 @@ struct ContentView: View {
             repoRelativePath: repoRelativePath,
             bundledURL: Bundle.main.url(forResource: bundleName, withExtension: "yaml")
         )
-    }
-}
-
-private struct P031ApprovalCompatibilitySurface: View {
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Approvals")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text("Approval Inbox")
-                .font(.title2.weight(.semibold))
-            ContentUnavailableView(
-                "No Pending Approvals",
-                systemImage: "checkmark.seal",
-                description: Text("Approval decisions remain available through the daemon-backed approval surface.")
-            )
-            .accessibilityIdentifier("approval-inbox-empty-state")
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(24)
-        .accessibilityIdentifier("approval-inbox-view")
     }
 }
 
@@ -351,7 +461,7 @@ private struct P031DaemonIdeaDetail: View {
                     VStack(alignment: .leading, spacing: 8) {
                         metadataRow("Status", P031DaemonIdeasModel.displayStatus(idea.status))
                         metadataRow("Project", idea.projectKey)
-                        metadataRow("Workspace", idea.workspaceRootPath)
+                        metadataRow("Workspace", idea.workspaceRootPath.map(redactedPath))
                         metadataRow("Created", idea.createdAt)
                     }
 
@@ -361,16 +471,22 @@ private struct P031DaemonIdeaDetail: View {
                 Text("Run Status")
                     .font(.headline)
                 
-                let waitingCount = runs.filter { ($0.pendingApprovals ?? 0) > 0 }.count
-                let blockedCount = runs.filter { $0.status.lowercased().contains("blocked") || $0.status.lowercased().contains("failed") }.count
-                let runningCount = runs.filter { $0.status.lowercased().contains("running") || $0.status.lowercased().contains("active") }.count
-                let completedCount = runs.filter { $0.status.lowercased().contains("completed") || $0.status.lowercased().contains("success") }.count
-                
+                // P036: use the canonical projected lane. .deferred surfaces unknown server
+                // statuses as an explicit projection-lag row rather than silently miscounting.
+                let waitingCount = runs.filter { $0.lane == .waiting }.count
+                let blockedCount = runs.filter { $0.lane == .blocked }.count
+                let runningCount = runs.filter { $0.lane == .running }.count
+                let completedCount = runs.filter { $0.lane == .completed }.count
+                let deferredCount = runs.filter { $0.lane == .deferred }.count
+
                 VStack(alignment: .leading, spacing: 8) {
                     compactStatusStrip(label: "Waiting Approval", count: waitingCount, color: .orange)
                     compactStatusStrip(label: "Blocked or Failed", count: blockedCount, color: .red)
                     compactStatusStrip(label: "Running", count: runningCount, color: .blue)
                     compactStatusStrip(label: "Completed", count: completedCount, color: .green)
+                    if deferredCount > 0 {
+                        compactStatusStrip(label: "Status Unknown", count: deferredCount, color: .gray)
+                    }
                 }
             }
         } else if isLoading {
@@ -386,6 +502,13 @@ private struct P031DaemonIdeaDetail: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(24)
         }
+    }
+
+    private func redactedPath(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path.hasPrefix(home) { return "~" + path.dropFirst(home.count) }
+        if path.hasPrefix("/") { return "<redacted>" }
+        return path
     }
 
     @ViewBuilder
@@ -604,8 +727,6 @@ private struct P031IdeasCompatibilitySurface: View {
                     Text("Ideas")
                         .font(.title2.weight(.semibold))
                     Spacer()
-                    Button("New Idea") {}
-                        .accessibilityIdentifier("ideas-new-idea-inline")
                 }
                 HStack(spacing: 8) {
                     Text("Total 1")
@@ -634,9 +755,6 @@ private struct P031IdeasCompatibilitySurface: View {
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("idea-row-\(seedTitle)")
 
-                Button("Archive") {}
-                    .accessibilityIdentifier("ideas-open-archive")
-
                 Spacer()
             }
             .frame(width: 300)
@@ -652,14 +770,6 @@ private struct P031IdeasCompatibilitySurface: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                TextField("Workspace", text: .constant(""))
-                    .accessibilityIdentifier("idea-workspace-root-path-field")
-
-                Button("Start New Run") {
-                    isShowingStartRun = true
-                }
-                .accessibilityIdentifier("start-new-run-button")
-
                 P031RunProgressCompatibilitySurface()
                 Spacer()
             }
@@ -668,12 +778,6 @@ private struct P031IdeasCompatibilitySurface: View {
         }
         .onAppear {
             selectedTitle = seedTitle
-        }
-        .sheet(isPresented: $isShowingStartRun) {
-            P031StartRunCompatibilitySheet(
-                forceLiveRuntimeUnavailable: forceLiveRuntimeUnavailable,
-                isPresented: $isShowingStartRun
-            )
         }
     }
 }
@@ -716,9 +820,10 @@ private struct P031StartRunCompatibilitySheet: View {
                 Spacer()
                 Button("Compile") {}
                     .accessibilityIdentifier("workflow-compile-button")
+                    .disabled(true)
                 Button("Start Run") {}
                     .accessibilityIdentifier("workflow-start-run-confirm-button")
-                    .disabled(forceLiveRuntimeUnavailable)
+                    .disabled(true)
             }
         }
         .padding(24)
@@ -750,11 +855,13 @@ private struct P031CompletedExportHubCompatibilitySurface: View {
     @State private var exportMessage: String?
 
     private var exportBaseURL: URL {
+        #if DEBUG
         let raw = ProcessInfo.processInfo.environment["CHAINWORKS_UI_TEST_EXPORT_BASE_PATH"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if let raw, !raw.isEmpty {
             return URL(fileURLWithPath: raw, isDirectory: true)
         }
+        #endif
         return FileManager.default.temporaryDirectory
             .appendingPathComponent("ChainworksUITestExports", isDirectory: true)
     }
@@ -816,6 +923,14 @@ private struct P031CompletedExportHubCompatibilitySurface: View {
     }
 }
 
+
+// P036 Phase 2c: production allCases returns the four consolidated tabs only.
+// Legacy Approvals routes are compatibility aliases, not tab cases.
+extension ContentView.Tab: CaseIterable {
+    static var allCases: [ContentView.Tab] {
+        [.runs, .ideas, .definitions, .settings]
+    }
+}
 
 #Preview {
     ContentView()

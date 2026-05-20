@@ -4,6 +4,7 @@ import Testing
 @testable import Chainworks_Forge
 
 @Suite("P031 thin GraphQL read boundary", .tags(.fast))
+@MainActor
 struct Proposal031ThinGraphQLReadBoundaryTests {
   @Test("GraphQL read request accepts queries and rejects mutations before transport")
   func readRequestRejectsMutationDocuments() async throws {
@@ -420,6 +421,10 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
         "PROJECTION_LAG",
         "UNAUTHORIZED",
         "UNSUPPORTED_ACTION",
+        "REDACTED",
+        "CONFLICT",
+        "DUPLICATE",
+        "ALREADY_RESOLVED",
       ])
     #expect(
       P031WritePathState.allCases.map(\.rawValue) == [
@@ -2063,11 +2068,11 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(runDetail.progressLabel == "1/2 stages")
     #expect(runDetail.pendingApprovalsLabel == "1 approvals pending")
     #expect(runDetail.stageTransitions.first?.stageExecutionID == "stage-exec-1")
-    #expect(runDetail.stageTransitions.first?.statusText == "Completed")
+    #expect(runDetail.stageTransitions.first?.statusText == "Projection Lag")
     #expect(runDetail.approvalRows.map(\.approvalID) == ["approval-1"])
     #expect(runDetail.approvalRows.first?.actionLabel == "Execute via CLI")
     #expect(runDetail.artifactRows.map(\.artifactID) == ["artifact-1"])
-    #expect(runDetail.artifactRows.first?.payloadAvailabilityLabel == "Metadata")
+    #expect(runDetail.artifactRows.first?.payloadAvailabilityLabel == "summary — metadata only")
     #expect(runDetail.artifactRows.first?.canOpenPayload == false)
     #expect(runDetail.artifactRows.first?.diagnosticCopyItems.map(\.label) == ["diagnostic_id"])
     #expect(runDetail.reportRows.map(\.title) == ["release report"])
@@ -2283,6 +2288,25 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(presentation.startedLabel == "Started: 2026-05-09 10:00")
     #expect(presentation.completedLabel == nil)
     #expect(presentation.durationLabel == "Duration: 5m 52s")
+  }
+
+  // P036: unknown/unrecognized status strings must not infer runtime state locally.
+  // The connector must be .unavailable rather than .pending for unrecognized status values.
+  @Test("Stage connector is unavailable for unrecognized status strings (P036 no-local-inference rule)")
+  func stageConnectorIsUnavailableForUnrecognizedStatus() {
+    let stage = makeStage(id: "stage-unknown-status", status: "UNKNOWN_STATUS_FROM_DAEMON")
+    let presentation = P031StageTransitionPresenter.presentation(for: stage)
+    #expect(
+      presentation.connectorState == .unavailable,
+      "Unrecognized status must not infer .pending — it must defer to .unavailable per P036"
+    )
+  }
+
+  @Test("Stage connector is unavailable for projection-lag stages regardless of status")
+  func stageConnectorIsUnavailableForProjectionLagStage() {
+    let stage = makeStage(id: "stage-lag", status: "running", projectionLag: true)
+    let presentation = P031StageTransitionPresenter.presentation(for: stage)
+    #expect(presentation.connectorState == .unavailable)
   }
 
   @Test("Artifact viewer joins duplicate stage IDs through source stage execution ID")
@@ -2502,8 +2526,10 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(presentation.preparedPreview?.previewNotice?.renderedAsRawText == true)
   }
 
-  @Test("Artifact viewer renders deferred payload preview when GraphQL supplies partial text")
-  func artifactViewerRendersDeferredPayloadPreviewWhenGraphQLSuppliesPartialText() {
+  // SEC-P036-002 regression: metadataOnly/payloadDeferred must fail closed even when
+  // payloadText is present — the server-declared non-available state takes precedence.
+  @Test("Artifact viewer fails closed for metadataOnly state even when payloadText is present")
+  func artifactViewerFailsClosedForMetadataOnlyWhenPayloadTextPresent() {
     let previewLines = (1...200).map { "line \($0)" }
     let payload = previewLines.joined(separator: "\n")
     let artifact = makeArtifact(
@@ -2518,11 +2544,127 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
 
     let presentation = P031ArtifactViewerPresenter.presentation(for: artifact)
 
-    #expect(presentation.renderMode == .plainText)
+    #expect(presentation.renderMode == .metadataOnly,
+            "metadataOnly state must not render payload even when payloadText is non-empty")
+    #expect(presentation.preparedPreview == nil,
+            "No prepared preview must be produced for metadataOnly state")
     #expect(presentation.payloadState == .metadataOnly)
-    #expect(presentation.preparedPreview?.content == payload)
-    #expect(presentation.preparedPreview?.content.split(separator: "\n").count == 200)
-    #expect(presentation.unavailableReason == nil)
+  }
+
+  @Test("Artifact viewer fails closed for payloadDeferred state even when payloadText is present")
+  func artifactViewerFailsClosedForPayloadDeferredWhenPayloadTextPresent() {
+    let artifact = makeArtifact(
+      id: "artifact-payload-deferred",
+      name: "stage_output",
+      format: "markdown",
+      payloadAvailabilityState: .payloadDeferred,
+      payloadUnavailableReasonCode: .payloadDeferredByP031,
+      diagnosticID: nil,
+      payloadText: "some server-supplied partial text"
+    )
+
+    let presentation = P031ArtifactViewerPresenter.presentation(for: artifact)
+
+    #expect(presentation.renderMode == .metadataOnly,
+            "payloadDeferred state must not render payload even when payloadText is non-empty")
+    #expect(presentation.preparedPreview == nil,
+            "No prepared preview must be produced for payloadDeferred state")
+  }
+
+  // MARK: - SEC-001 regression: serverDebugDetail must not leak through unauthorized states
+
+  @Test("Artifact viewer suppresses serverDebugDetail when freshness is unauthorized")
+  func artifactViewerSuppressesServerDebugDetailWhenFreshnessIsUnauthorized() {
+    let artifact = P031ArtifactReadModel(
+      id: "artifact-sec001-a",
+      runID: "run-1",
+      stageID: "stage-1",
+      name: "report.json",
+      contractID: "report",
+      format: "json",
+      freshnessState: .unauthorized,
+      payloadAvailabilityState: .unavailable,
+      payloadUnavailableReasonCode: .notAuthorized,
+      payloadText: nil,
+      diagnosticID: "diag-1",
+      serverDebugDetail: "SENSITIVE: operator token = abc123"
+    )
+    let presentation = P031ArtifactViewerPresenter.presentation(for: artifact)
+    #expect(presentation.unavailableReason != "SENSITIVE: operator token = abc123",
+            "serverDebugDetail must not surface when freshness is unauthorized")
+    #expect(
+      presentation.accessibilityLabel.contains("SENSITIVE") == false,
+      "Accessibility label must not contain suppressed debug detail"
+    )
+  }
+
+  @Test("Artifact viewer suppresses serverDebugDetail when payload reason is notAuthorized")
+  func artifactViewerSuppressesServerDebugDetailWhenPayloadReasonIsNotAuthorized() {
+    let artifact = P031ArtifactReadModel(
+      id: "artifact-sec001-b",
+      runID: "run-1",
+      stageID: "stage-1",
+      name: "artifact.json",
+      contractID: "artifact",
+      format: "json",
+      freshnessState: .live,
+      payloadAvailabilityState: .unavailable,
+      payloadUnavailableReasonCode: .notAuthorized,
+      payloadText: nil,
+      diagnosticID: "diag-2",
+      serverDebugDetail: "SENSITIVE: internal path /Users/admin/.chainworks/secret"
+    )
+    let presentation = P031ArtifactViewerPresenter.presentation(for: artifact)
+    #expect(presentation.unavailableReason != "SENSITIVE: internal path /Users/admin/.chainworks/secret",
+            "serverDebugDetail must not surface when payload reason is notAuthorized")
+    #expect(
+      presentation.accessibilityLabel.contains("/Users/admin") == false,
+      "Accessibility label must not contain suppressed debug detail"
+    )
+  }
+
+  @Test("Artifact viewer allows serverDebugDetail when diagnostic is available and payload is authorized")
+  func artifactViewerAllowsServerDebugDetailWhenAvailableAndAuthorized() {
+    let artifact = P031ArtifactReadModel(
+      id: "artifact-sec001-c",
+      runID: "run-1",
+      stageID: "stage-1",
+      name: "artifact.json",
+      contractID: "artifact",
+      format: "json",
+      freshnessState: .live,
+      payloadAvailabilityState: .unavailable,
+      payloadUnavailableReasonCode: .notAvailable,
+      payloadText: nil,
+      diagnosticID: "diag-3",
+      serverDebugDetail: "Artifact generation failed: timeout"
+    )
+    let presentation = P031ArtifactViewerPresenter.presentation(for: artifact)
+    #expect(presentation.unavailableReason == "Artifact generation failed: timeout",
+            "serverDebugDetail should surface when diagnostic is available and payload is authorized")
+  }
+
+  @Test("Artifact viewer falls back to reasonCode when serverDebugDetail is suppressed")
+  func artifactViewerFallsBackToReasonCodeWhenDebugDetailIsSuppressed() {
+    let artifact = P031ArtifactReadModel(
+      id: "artifact-sec001-d",
+      runID: "run-1",
+      stageID: "stage-1",
+      name: "artifact.json",
+      contractID: "artifact",
+      format: "json",
+      freshnessState: .unauthorized,
+      payloadAvailabilityState: .unavailable,
+      payloadUnavailableReasonCode: .notAuthorized,
+      payloadText: nil,
+      diagnosticID: "diag-4",
+      serverDebugDetail: "SENSITIVE: auth bypass detail"
+    )
+    let presentation = P031ArtifactViewerPresenter.presentation(for: artifact)
+    // When serverDebugDetail is suppressed, fallback is payloadUnavailableReasonCode.rawValue
+    #expect(presentation.unavailableReason == "NOT_AUTHORIZED" ||
+            presentation.unavailableReason == nil,
+            "Fallback must be reasonCode or nil, not debug detail")
   }
 
   @Test("P031 artifact viewer keeps artifact list and preview in independent scroll panes")
@@ -2602,7 +2744,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     )
 
     #expect(artifacts.rows.map(\.artifactID) == ["artifact-1"])
-    #expect(artifacts.rows.first?.payloadAvailabilityLabel == "Metadata")
+    #expect(artifacts.rows.first?.payloadAvailabilityLabel == "summary — metadata only")
     #expect(artifacts.refreshFeedbackText == "Refreshing artifacts")
     #expect(artifacts.freshness.state == .live)
     #expect(reports.rows.map(\.title) == ["release summary"])
@@ -2729,6 +2871,150 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(daemon.title == "Daemon unavailable")
     #expect(daemon.freshness.state == .unavailable)
     #expect(daemon.errorDescription == presentation.errorDescription)
+  }
+
+  // M3 guard: P031ApprovalInboxRowPresentation.deferredState must route through
+  // the centralized P036DeferredState mapper, not be computed ad-hoc in views.
+  @Test("P031ApprovalInboxRowPresentation.deferredState matches centralized P036 mapper")
+  func approvalInboxRowDeferredStateMatchesCentralizedMapper() {
+    let diagnostic = P085DiagnosticAffordanceState(
+      diagnosticID: nil, serverDebugDetail: nil, isAvailable: false)
+
+    let redactedAffordance = P085ApprovalAffordanceState(
+      approvalID: "x",
+      approveAvailability: .disabled(reasonCode: .redacted, helpText: "raw detail"),
+      rejectAvailability: .disabled(reasonCode: .redacted, helpText: ""),
+      freshnessState: .live,
+      diagnostic: diagnostic,
+      projectionLagIsOnlyConstraint: false
+    )
+    let row = P031ApprovalInboxRowPresentation(
+      approvalID: "x", title: "T", body: "B",
+      canApprove: false, canReject: false,
+      actionLabel: nil, followUpID: nil, copyItems: [],
+      freshnessState: .live, accessibilityLabel: "label",
+      affordance: redactedAffordance
+    )
+    // deferredState must equal the result of the centralized mapper
+    #expect(row.deferredState == P036DeferredState(from: redactedAffordance))
+    #expect(row.deferredState == .redacted)
+
+    // Stale freshness takes precedence
+    let staleAffordance = P085ApprovalAffordanceState(
+      approvalID: "y",
+      approveAvailability: .actionable,
+      rejectAvailability: .actionable,
+      freshnessState: .stale,
+      diagnostic: diagnostic,
+      projectionLagIsOnlyConstraint: false
+    )
+    let staleRow = P031ApprovalInboxRowPresentation(
+      approvalID: "y", title: "T2", body: "B2",
+      canApprove: true, canReject: true,
+      actionLabel: nil, followUpID: nil, copyItems: [],
+      freshnessState: .stale, accessibilityLabel: "label2",
+      affordance: staleAffordance
+    )
+    #expect(staleRow.deferredState == P036DeferredState(from: staleAffordance))
+    #expect(staleRow.deferredState == .stale)
+  }
+
+  // MARK: - SEC-001 regression: multi-mutation allowlist bypass
+
+  @Test("Mutation allowlist rejects multi-mutation document even when one mutation is an approval")
+  func mutationAllowlistRejectsMultiMutationDocuments() throws {
+    // A document containing an allowed approval mutation plus a second mutation with a field
+    // name not in the denylist (runsStart was not in the old denylist) must be rejected.
+    let multiMutationDoc = """
+      mutation ApproveThis($approvalId: ID!) {
+        approveApproval(approvalId: $approvalId) {
+          approval { id }
+          journalId
+        }
+      }
+      mutation RunsStartBypass {
+        runsStart { id }
+      }
+      """
+    #expect(throws: P031GraphQLReadBoundaryError.self) {
+      _ = try P031GraphQLReadRequest(
+        operationName: "RunsStartBypass",
+        document: multiMutationDoc
+      )
+    }
+    #expect(throws: P031GraphQLReadBoundaryError.self) {
+      _ = try P031GraphQLReadRequest(
+        operationName: "ApproveThis",
+        document: multiMutationDoc
+      )
+    }
+  }
+
+  @Test("Mutation allowlist rejects aliased approval root field")
+  func mutationAllowlistRejectsAliasedRootField() throws {
+    #expect(throws: P031GraphQLReadBoundaryError.mutationOperationForbidden("P072AliasedApproval")) {
+      _ = try P031GraphQLReadRequest(
+        operationName: "P072AliasedApproval",
+        document: """
+          mutation P072AliasedApproval($approvalId: ID!) {
+            myAlias: approveApproval(approvalId: $approvalId) {
+              approval { id }
+            }
+          }
+          """
+      )
+    }
+  }
+
+  @Test("Mutation allowlist rejects non-approval root field not previously in denylist")
+  func mutationAllowlistRejectsNonApprovalRootField() throws {
+    // runsStart was not in the old denylist — the allowlist-only approach must reject it.
+    #expect(throws: P031GraphQLReadBoundaryError.self) {
+      _ = try P031GraphQLReadRequest(
+        operationName: "RunsStartMutation",
+        document: "mutation RunsStartMutation { runsStart { id } }"
+      )
+    }
+  }
+
+  @Test("Mutation allowlist still passes valid single-operation approval mutations")
+  func mutationAllowlistPassesValidApprovalMutation() throws {
+    let req = try P031GraphQLReadRequest(
+      operationName: "P072ApproveApproval",
+      document: P031GraphQLDocuments.approveApproval,
+      variables: ["approvalId": .string("approval-1")]
+    )
+    #expect(req.operationKind == .mutation)
+  }
+
+  @Test("Mutation allowlist rejects combined approve and reject root fields in one mutation")
+  func mutationAllowlistRejectsCombinedApproveAndRejectRootFields() {
+    #expect(throws: P031GraphQLReadBoundaryError.self) {
+      _ = try P031GraphQLReadRequest(
+        operationName: "P072CombinedApprovals",
+        document: """
+          mutation P072CombinedApprovals($id1: ID!, $id2: ID!) {
+            approveApproval(approvalId: $id1) { approval { id } journalId }
+            rejectApproval(approvalId: $id2, reason: "test") { approval { id } journalId }
+          }
+          """
+      )
+    }
+  }
+
+  @Test("Mutation allowlist rejects two identical approve fields in one mutation")
+  func mutationAllowlistRejectsDuplicateApproveRootFields() {
+    #expect(throws: P031GraphQLReadBoundaryError.self) {
+      _ = try P031GraphQLReadRequest(
+        operationName: "P072DoubleApprove",
+        document: """
+          mutation P072DoubleApprove($id1: ID!, $id2: ID!) {
+            approveApproval(approvalId: $id1) { approval { id } journalId }
+            approveApproval(approvalId: $id2) { approval { id } journalId }
+          }
+          """
+      )
+    }
   }
 }
 

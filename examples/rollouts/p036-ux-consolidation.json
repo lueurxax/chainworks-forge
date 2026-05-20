@@ -1,0 +1,31 @@
+{
+  "fixtures": [
+    {
+      "id": "p036-runs-home-loading",
+      "description": "Runs Home in loading state with skeletons",
+      "state": {
+        "isLoading": true,
+        "runs": []
+      }
+    },
+    {
+      "id": "p036-run-with-inline-approvals",
+      "description": "Run detail showing inline approvals card",
+      "state": {
+        "selectedRun": "run-123",
+        "approvals": [
+          { "id": "app-1", "title": "Proposal Approval", "status": "requested" }
+        ]
+      }
+    },
+    {
+      "id": "p036-settings-diagnostics",
+      "description": "Settings with diagnostics disclosure expanded",
+      "state": {
+        "settings": {
+          "diagnosticsExpanded": true
+        }
+      }
+    }
+  ]
+}

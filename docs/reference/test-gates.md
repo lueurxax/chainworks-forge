@@ -522,6 +522,40 @@ Important:
 - this gate hard-depends on `proposal-029`
 - `proposal-033` is the repo-owned proof lane for [acp-runtime-transport.md](acp-runtime-transport.md)
 
+### `proposal-036|p036`
+
+UX consolidation and navigation simplification gate.
+
+Scope:
+
+- `Proposal036UXConsolidationTests` — navigation shell, route compatibility, presenter, Definitions, and timeline batching coverage
+- `Proposal031ThinGraphQLReadBoundaryTests` — thin GraphQL read boundary parity after Runs workbench presenter consolidation
+- `RunTimelineInspectorViewTests` — timeline presentation model, batching, Reduce Motion, and summary-card behavior
+- UI smoke cases `testProposal036NavigationShellParity` and `testProposal036DefinitionsSegmentedWrapper` (remote-only by repo policy)
+
+Use when:
+
+- changing the four-tab navigation shell, route compatibility map, or `CHAINWORKS_UI_TEST_INITIAL_TAB` handling
+- changing `RunsWorkbenchPresentationModel`, P036 deferred-state types, or Runs/Definitions/Settings layout ownership
+- changing timeline batching, Reduce Motion behavior, or agent completion summary cards
+
+Host policy:
+
+- unit/runtime tests run locally
+- UI smoke tests are remote-only per repository policy and must run via the approved host (`test@SMacBook.local`)
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-036
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-036"
+```
+
+Important:
+
+- this gate is the repo-owned proof lane for proposal-036 UX consolidation
+- inline approval rendering follows the [thin-client read-model affordance contract](thin-client-read-model-affordance-contract.md); legacy Approvals routes redirect into Runs with waiting-approval focus after the Phase 2c top-level tab removal
+
 ### `proposal-037`
 
 ACP execution supervision and idle-watchdog gate.

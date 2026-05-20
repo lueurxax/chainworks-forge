@@ -496,7 +496,8 @@ final class WorkflowMapProjectionService {
                     title: stageLabel,
                     detail: "Persisted stage status: \(stage.status.rawValue.replacingOccurrences(of: "_", with: " "))",
                     timestamp: timestamp,
-                    sessionID: nil
+                    sessionID: nil,
+                    agentID: nil
                 )
             )
 
@@ -511,7 +512,8 @@ final class WorkflowMapProjectionService {
                             title: agent.agentTitle,
                             detail: "Persisted agent \(statusLabel) in session \(sessionID)",
                             timestamp: agentTimestamp,
-                            sessionID: sessionID
+                            sessionID: sessionID,
+                            agentID: agent.id.uuidString
                         )
                     )
                 }
@@ -523,7 +525,8 @@ final class WorkflowMapProjectionService {
                             title: agent.agentTitle,
                             detail: "Persisted supervision: \(supervision.defaultSummary)",
                             timestamp: agentTimestamp,
-                            sessionID: agent.runtimeSessionID
+                            sessionID: agent.runtimeSessionID,
+                            agentID: agent.id.uuidString
                         )
                     )
                 }
@@ -546,7 +549,8 @@ final class WorkflowMapProjectionService {
                             title: agent.agentTitle,
                             detail: retryDetail,
                             timestamp: agent.startedAt,
-                            sessionID: agent.runtimeSessionID
+                            sessionID: agent.runtimeSessionID,
+                            agentID: agent.id.uuidString
                         )
                     )
                 }
@@ -561,7 +565,8 @@ final class WorkflowMapProjectionService {
                         title: stageLabel,
                         detail: recommended.explanation,
                         timestamp: snapshot.timestamp,
-                        sessionID: nil
+                        sessionID: nil,
+                        agentID: nil
                     )
                 )
             }
@@ -576,7 +581,8 @@ final class WorkflowMapProjectionService {
                     title: stageLabel,
                     detail: "Persisted approval \(approval.decision.rawValue.replacingOccurrences(of: "_", with: " "))",
                     timestamp: timestamp,
-                    sessionID: nil
+                    sessionID: nil,
+                    agentID: nil
                 )
             )
         }

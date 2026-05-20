@@ -92,23 +92,28 @@ nonisolated enum MarkdownImageSourcePolicy {
             return resolveLocalURL(candidate, localRoots: localRoots)
         }
 
-        var allowedCandidates: [URL] = []
+        // Route through the full symlink-safe check to prevent escape via symlinked ancestor dirs.
         for root in localRoots {
             let candidate = root.appendingPathComponent(trimmed).standardizedFileURL
-            if isAllowed(candidate, within: localRoots) {
-                if isSafeRenderableLocalFile(candidate) {
-                    return candidate
-                }
-                allowedCandidates.append(candidate)
+            if let safe = resolveLocalURL(candidate, localRoots: localRoots) {
+                return safe
             }
         }
-
-        return allowedCandidates.first(where: isSafeRenderableLocalFile)
+        return nil
     }
 
     private func resolveLocalURL(_ url: URL, localRoots: [URL]) -> URL? {
         let standardized = url.standardizedFileURL
         guard isAllowed(standardized, within: localRoots) else { return nil }
+        // Resolve symlinks and re-check against canonical roots to prevent symlink escape.
+        let resolved = standardized.resolvingSymlinksInPath()
+        let canonicalRoots = localRoots.map { $0.resolvingSymlinksInPath() }
+        let resolvedPath = resolved.path
+        let symlinkSafe = canonicalRoots.contains { root in
+            let rootPath = root.path
+            return resolvedPath == rootPath || resolvedPath.hasPrefix(rootPath + "/")
+        }
+        guard symlinkSafe else { return nil }
         return isSafeRenderableLocalFile(standardized) ? standardized : nil
     }
 
@@ -900,8 +905,14 @@ struct MarkdownDocumentView: View {
     var body: some View {
         Group {
             if isLoadingBlocks {
-                ProgressView("Rendering document…")
-                    .frame(maxWidth: .infinity, minHeight: 160, alignment: .center)
+                VStack(alignment: .leading, spacing: 12) {
+                    ForgeSkeleton.headline(width: 200)
+                    ForgeSkeleton.text(width: nil)
+                    ForgeSkeleton.text(width: nil)
+                    ForgeSkeleton.text(width: 250)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
             } else {
                 LazyVStack(alignment: .leading, spacing: 18) {
                     ForEach(blocks.indices, id: \.self) { index in
@@ -996,8 +1007,11 @@ private enum MarkdownAttributedStringBuilder {
                 attributes[.foregroundColor] = foregroundColor(for: role, inlineIntent: inlineIntent, link: run.link)
 
                 if let link = run.link {
-                    attributes[.link] = link
-                    attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                    let scheme = link.scheme?.lowercased() ?? ""
+                    if scheme == "https" || scheme == "http" {
+                        attributes[.link] = link
+                        attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                    }
                 }
 
                 if inlineIntent?.contains(.code) == true {

@@ -557,6 +557,84 @@ struct Proposal017Tests {
         #expect(rejection.advisoryHintProvenance.first?.sourceAgentExecutionID == "agent-exec-review-1")
     }
 
+    // SEC-P036-001 regression: advisory_path symlink inside workspace must not escape the boundary.
+    @MainActor
+    @Test("Advisory path symlink inside workspace pointing outside is rejected")
+    func advisoryPathSymlinkInsideWorkspacePointingOutsideIsRejected() async throws {
+        let (_, context) = try makeTestModelContainer()
+        let workspace = makeTestWorkspace()
+        defer { cleanupWorkspace(workspace) }
+
+        // Create a real advisory file OUTSIDE the workspace boundary.
+        let outsideDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("outside-workspace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outsideDir) }
+        let outsideFile = outsideDir.appendingPathComponent("secret.json")
+        try Data("""
+            {"next_stage":"state_3_proposal_drafted","next_action":"revise_proposal"}
+            """.utf8).write(to: outsideFile)
+
+        // Place a symlink INSIDE the workspace pointing to the outside file.
+        let symlinkInsideWorkspace = workspace.artifactRoot
+            .appendingPathComponent("advisory-escape.json")
+        try FileManager.default.createSymbolicLink(
+            at: symlinkInsideWorkspace,
+            withDestinationURL: outsideFile
+        )
+
+        let run = makeP017Run(workspace: workspace)
+        context.insert(run)
+
+        let projection = Data("""
+            {
+              "contract_id": "run_state_projection_v1",
+              "active_index": {
+                "advisory_artifacts": [
+                  {
+                    "advisory_id": "escape-attempt",
+                    "advisory_path": "\(symlinkInsideWorkspace.path)",
+                    "source_agent_execution_id": "agent-exec-escape"
+                  }
+                ]
+              }
+            }
+            """.utf8)
+
+        let executor = SharedStaticResultExecutor(
+            result: AgentResult(
+                outputs: ["run_state_projection": projection],
+                logSnippet: "escape attempt",
+                costCents: nil,
+                succeeded: true,
+                errorMessage: nil,
+                sessionID: "session-escape",
+                durationSeconds: 0,
+                providerReceipt: nil,
+                resolvedModel: nil,
+                configuredProviderID: nil,
+                adapterVersion: nil,
+                outputPresence: .durableOutput
+            )
+        )
+        let orchestrator = WorkflowOrchestrator(
+            run: run,
+            plan: makeP017AdvisoryReplayPlan(outputs: ["run_state_projection"]),
+            workspace: workspace,
+            executor: executor,
+            modelContext: context
+        )
+
+        await orchestrator.start()
+
+        // With the fix: the symlink resolves to a path outside the workspace boundary, so
+        // isWorkspaceOwnedProjectionAdvisoryURL returns false and the advisory is silently dropped.
+        // No advisory-driven conflict/rejection records should exist.
+        let rejections = run.workflowConflictBridgeV1.advisoryRejections
+        #expect(rejections.isEmpty,
+                "Symlink advisory resolving outside workspace must be silently dropped — no advisory rejections")
+    }
+
     @Test("Swift candidate evaluation distinguishes undeclared artifacts from missing inputs")
     func swiftCandidateEvaluationDistinguishesUnknownAndMissingInputs() {
         let context = TransitionEvaluator.EvaluationContext(

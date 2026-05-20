@@ -51,6 +51,7 @@ final class RunPlanCompiler {
             workflowTitle: workflow.workflow.name,
             states: executableStates,
             initialStateID: workflow.initialState,
+            stateOrder: workflow.stateOrder,
             agentBindings: agentBindings,
             variables: workflow.variables ?? [:],
             scoring: workflow.scoring,

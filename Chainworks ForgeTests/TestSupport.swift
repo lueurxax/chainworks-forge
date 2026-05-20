@@ -507,3 +507,86 @@ func awaitCondition(
         confirm()
     }
 }
+
+extension PreviewSupport {
+    @MainActor
+    static func makeExecutionService(
+        modelContext: ModelContext,
+        executor: AgentExecutor = SimulatedAgentExecutor()
+    ) -> ExecutionService {
+        return ExecutionService(modelContext: modelContext, executor: executor)
+    }
+}
+
+struct SampleRunLauncher: Sendable {
+    let modelContext: ModelContext
+    let executionService: ExecutionService
+    let appConfigurationStore: AppConfigurationStore
+    let providerRegistry: ProviderRegistry
+
+    @MainActor
+    func launchSampleRun(autostart: Bool = false) async throws -> Run {
+        let config = appConfigurationStore.configuration
+        let workflowURL = URL(fileURLWithPath: config.workflowSourcePath)
+        let catalogURL = URL(fileURLWithPath: config.agentCatalogSourcePath)
+
+        let workflow = try YAMLParser.loadWorkflow(from: workflowURL)
+        let catalog = try YAMLParser.loadAgentCatalog(from: catalogURL)
+
+        let compiler = RunPlanCompiler(modelContext: modelContext)
+        let plan = try compiler.previewCompile(
+            workflow: workflow,
+            catalog: catalog,
+            catalogSourcePath: config.agentCatalogSourcePath
+        )
+
+        let startOptions = RunStartOptions.empty
+        let resolver = BackendProfileResolverV2(providerRegistry: providerRegistry)
+        let bindings = try resolver.resolveBindings(
+            plan: plan,
+            startOptions: startOptions,
+            runtimeProfiles: catalog.runtimeProfiles
+        )
+
+        let encoder = JSONEncoder()
+        let bindingsJSON = try encoder.encode(bindings)
+        let startOptionsJSON = try encoder.encode(startOptions)
+
+        let runID = UUID()
+        let runsBase = URL(fileURLWithPath: config.runStorageBasePath, isDirectory: true)
+        let workspaceRoot = runsBase.appendingPathComponent(runID.uuidString, isDirectory: true)
+        let artifactRoot = workspaceRoot.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactRoot, withIntermediateDirectories: true)
+
+        let startSnapshot = RunStartSnapshot(
+            providerBindingSnapshotJSON: bindingsJSON,
+            startOptionsJSON: startOptionsJSON,
+            frozenWorkspaceRootPath: workspaceRoot.path
+        )
+
+        let workflowResult = try DefinitionHasher.hash(workflow)
+        let catalogResult = try DefinitionHasher.hash(catalog)
+        let workflowData = workflowResult.data
+        let workflowHash = workflowResult.sha256
+        let catalogData = catalogResult.data
+        let catalogHash = catalogResult.sha256
+
+        let run = Run(
+            id: runID,
+            workflowID: plan.workflowID,
+            workflowTitle: plan.workflowTitle,
+            workflowSnapshotHash: workflowHash,
+            catalogSnapshotHash: catalogHash,
+            workflowSourcePath: config.workflowSourcePath,
+            catalogSourcePath: config.agentCatalogSourcePath,
+            workflowSnapshotJSON: workflowData,
+            catalogSnapshotJSON: catalogData,
+            workspaceRoot: workspaceRoot.path,
+            artifactRoot: artifactRoot.path,
+            planCompilerVersion: plan.planCompilerVersion
+        )
+        startSnapshot.apply(to: run)
+        modelContext.insert(run)
+        return run
+    }
+}

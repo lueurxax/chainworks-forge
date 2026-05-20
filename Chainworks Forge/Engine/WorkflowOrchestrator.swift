@@ -18,7 +18,7 @@ struct ApprovalRequest: Identifiable, Sendable {
     let approvalPolicy: String?
 }
 
-struct LiveExecutionTimelineEntry: Identifiable, Sendable {
+struct LiveExecutionTimelineEntry: Identifiable, Sendable, Equatable {
     let id: UUID
     let agentID: String
     let agentTitle: String
@@ -4209,9 +4209,13 @@ final class WorkflowOrchestrator {
             }
             guard seenPaths.insert(path).inserted else { continue }
 
-            let url = URL(fileURLWithPath: path).standardizedFileURL
-            guard isWorkspaceOwnedProjectionAdvisoryURL(url) else { continue }
-            guard let data = try? Data(contentsOf: url),
+            let candidateURL = URL(fileURLWithPath: path).standardizedFileURL
+            let resolvedURL = candidateURL.resolvingSymlinksInPath()
+            guard isWorkspaceOwnedProjectionAdvisoryURL(resolvedURL) else { continue }
+            // Reject non-regular files (directories, symlinks, devices) to close the
+            // symlink-escape path: an advisory inside the workspace could point outside.
+            guard (try? FileManager.default.attributesOfItem(atPath: resolvedURL.path)[.type] as? FileAttributeType) == .typeRegular else { continue }
+            guard let data = try? Data(contentsOf: resolvedURL),
                 let advisoryJSON = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else {
                 continue
@@ -4257,10 +4261,12 @@ final class WorkflowOrchestrator {
     }
 
     private func isWorkspaceOwnedProjectionAdvisoryURL(_ url: URL) -> Bool {
+        // url is expected to be already resolved via resolvingSymlinksInPath().
+        // Roots are also resolved so a symlinked workspace root cannot widen the allowed set.
         let advisoryPath = url.path
         let allowedRoots = [
-            workspace.workspaceRoot.standardizedFileURL.path,
-            workspace.artifactRoot.standardizedFileURL.path
+            workspace.workspaceRoot.standardizedFileURL.resolvingSymlinksInPath().path,
+            workspace.artifactRoot.standardizedFileURL.resolvingSymlinksInPath().path
         ]
         return allowedRoots.contains { root in
             advisoryPath == root || advisoryPath.hasPrefix(root + "/")

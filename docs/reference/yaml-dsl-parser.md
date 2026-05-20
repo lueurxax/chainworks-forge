@@ -210,7 +210,7 @@ Type-erased `Codable` enum for heterogeneous YAML maps (e.g. workflow `variables
 
 **File:** `DSL/CompactWorkflowDefinition.swift`
 
-A simplified pipeline format using `stages` / `needs` / `gate` instead of explicit state machines. This format is **not executable** by the workflow engine; it is displayed in the Workflow Inspector as a structural preview.
+A simplified pipeline format using `stages` / `needs` / `gate` instead of explicit state machines. This format is **not executable** by the workflow engine; it is displayed in the Definitions tab's Workflow segment as a structural preview.
 
 ```
 CompactWorkflowDefinition
@@ -331,24 +331,29 @@ Types like `WorkflowDefinition.states`, `variables`, `backendProfiles`, and `per
 
 ## Verification scaffold UI
 
-The app replaces the Xcode template with a three-tab verification scaffold:
+Under proposal-036 the YAML verification surfaces are consolidated into the
+four-tab navigation shell: the **Ideas** tab covers idea persistence, and the
+**Definitions** tab hosts the parsed catalog and workflow under a segmented
+picker (Agent Catalog / Workflow). The legacy top-level `Agent Catalog` and
+`Workflow Inspector` tabs no longer exist as independent surfaces; their
+behavior is preserved as segments of Definitions.
 
-### Tab 1: Ideas
+### Ideas tab
 
 - SwiftData CRUD: create and delete ideas (title + body + optional attachment path)
 - Empty state: "No ideas yet. Create your first idea."
 - Summary strip with idea counts
 - No workflow actions — persistence verification only
 
-### Tab 2: Agent Catalog
+### Definitions tab — Agent Catalog segment
 
 - Loads `agents.yaml` and displays parsed `AgentCatalog`
 - Agent list with drill-down: identity, backend profile, permissions, skill, inputs/outputs, prompt
 - Summary strip: agent count, backend count, permission count, error/warning count
 - Validation issues section when issues exist
-- Read-only inspection
+- Read-only inspection; deterministic grouping per proposal-036 (supported group, mode, profile, role, Other)
 
-### Tab 3: Workflow Inspector
+### Definitions tab — Workflow segment
 
 Two sub-views toggled by a segmented picker:
 

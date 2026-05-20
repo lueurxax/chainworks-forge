@@ -61,7 +61,7 @@ Implemented readability fixes include:
 Implemented hierarchy/state work includes:
 
 - structured provider settings rather than one undifferentiated settings wall,
-- pilot readiness summary treatment,
+- System Readiness summary treatment (formerly Pilot Readiness; relocated under Settings per Proposal 036),
 - step-oriented first-run setup presentation,
 - visible journey/probing feedback in provider diagnostics and setup,
 - surface-local loading, success, and retry copy for bounded async actions.
@@ -103,8 +103,8 @@ It does not invent new persistence or engine semantics.
 The shared design-system rollout remains intentionally bounded.
 The first-adopter surfaces are:
 
-- `RunsHomeView` status, provenance, and archive badges,
-- `WorkflowMapView` status badges,
+- Runs tab status, provenance, and archive badges,
+- Definitions tab (Workflow segment) status badges,
 - `ReleaseGateView` status and artifact-semantic badges,
 - `DeliveryPreflightReportView` status badges,
 - touched `IdeaListView` chips/summary indicators.
@@ -124,12 +124,12 @@ These surfaces now define the stable proof-owning UI quality baseline:
 | Surface | Primary proof type | Notes |
 |---|---|---|
 | `ContentView` shell | Preview + shell smoke | shell grouping, foreground attention, tab stability |
-| `RunsHomeView` | Min-window + accessibility runtime proof | owner summary, list readability, grouped run lanes |
+| `Runs tab` | Min-window + accessibility runtime proof | owner summary, list readability, grouped run lanes, and inline approval panel |
 | `RunDetailPanel` | Interaction/runtime proof | above-the-fold contextual actions |
 | `IdeaListView` | Preview + min-window proof | summary chips, ideas density, selection readability |
 | `NewIdeaSheetView` | Preview | form structure and local validation treatment |
 | `ProviderSettingsView` | Preview + provider gate | hierarchy and inline async feedback |
-| `PilotReadinessView` | Preview + provider gate | verdict summary and grouped readiness state |
+| `SettingsView` System Readiness segment | Preview + provider gate | verdict summary and grouped readiness state (proposal-036 successor to the former `PilotReadinessView`) |
 | `FirstRunSetupWizard` | Preview + interaction/runtime proof | steps, validation, launch feedback |
 | `ArchivedIdeasView` | Preview | empty-state/readability consistency |
 | `DeliveryPreflightReportView` | Preview + adopter-slice accessibility proof | positive and negative status rendering |
