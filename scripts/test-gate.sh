@@ -166,6 +166,8 @@ PROPOSAL_036_TESTS=(
   "Chainworks ForgeTests/RunTimelineInspectorViewTests"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal036NavigationShellParity"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal036DefinitionsSegmentedWrapper"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal036RunsApprovalTimelineAndSettingsReadinessFlow"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal036IdeasDeepLinkToRunsFlow"
 )
 
 PROPOSAL_037_TESTS=(
@@ -1183,7 +1185,8 @@ emit_forwarded_chainworks_env() {
     CHAINWORKS_REMOTE_UI_TEST_HOSTS
 	    CHAINWORKS_USE_UNSIGNED_UI_TESTS
 	    CHAINWORKS_GUI_GATE_TIMEOUT_SECONDS
-	    CHAINWORKS_CODESIGN_KEYCHAIN
+    CHAINWORKS_CODESIGN_KEYCHAIN
+    CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON
 	    CHAINWORKS_P013_UI_SUCCESS_GRACE_SECONDS
     CHAINWORKS_P013_UI_HARD_TIMEOUT_SECONDS
     CHAINWORKS_P015_UI_SUCCESS_GRACE_SECONDS
@@ -1358,6 +1361,30 @@ require_remote_ui_host() {
   printf 'approved remote hosts: %s\n' "$(IFS=', '; printf '%s' "${approved[*]}")" >&2
   printf 'observed host names: %s\n' "$(IFS=', '; printf '%s' "${observed[*]}")" >&2
   exit 3
+}
+
+is_approved_remote_ui_host() {
+  local approved host allowed
+  approved=()
+  while IFS= read -r host; do
+    approved+=("$host")
+  done < <(
+    approved_remote_ui_hosts \
+      | while IFS= read -r host; do
+          printf '%s\n' "$(normalize_host "$host")"
+        done \
+      | awk '!seen[$0]++'
+  )
+
+  while IFS= read -r host; do
+    for allowed in "${approved[@]}"; do
+      if [[ "$host" == "$allowed" ]]; then
+        return 0
+      fi
+    done
+  done < <(observed_host_names)
+
+  return 1
 }
 
 check_idle_environment() {
@@ -2180,6 +2207,23 @@ run_split_targeted_gate() {
   fi
 }
 
+run_non_ui_targeted_gate() {
+  local gate_name="$1"
+  shift
+
+  local non_ui_tests=()
+  local test_id
+  for test_id in "$@"; do
+    if [[ "$test_id" != Chainworks\ ForgeUITests/* ]]; then
+      non_ui_tests+=("$test_id")
+    fi
+  done
+
+  if [[ ${#non_ui_tests[@]} -gt 0 ]]; then
+    run_targeted_tests "${gate_name}-non-ui" "${non_ui_tests[@]}"
+  fi
+}
+
 run_full_suite() {
   local stamp derived_data result_bundle
   local -a signing_args=()
@@ -2285,6 +2329,7 @@ Available gates:
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
   proposal-091|p091  Retained P091 targeted retry authority runtime proof gate
+  proposal-092|p092  Retained historical alias for P092 retry payload target invariants runtime proof gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -2862,7 +2907,13 @@ PY
     fi
     guard_direct_run_insertion
     run_build "proposal-036"
-    run_targeted_tests "proposal-036" "${PROPOSAL_036_TESTS[@]}"
+    if is_approved_remote_ui_host; then
+      prepare_codesign_keychain
+      run_targeted_tests "proposal-036" "${PROPOSAL_036_TESTS[@]}"
+    else
+      run_non_ui_targeted_gate "proposal-036" "${PROPOSAL_036_TESTS[@]}"
+      log "proposal-036 UI smoke is remote-only; run the same gate on test@SMacBook.local for UI proof"
+    fi
     ;;
   proposal-037|p037)
     check_idle_environment allow_app
@@ -7537,6 +7588,108 @@ PY
       CARGO_TARGET_DIR=target/proposal-091-gate cargo test -p mcp-server --test proposal_091_retry_authority_readback retry_authority_history_and_current_readback_include_active_authority
     )
     log "Proposal 091 gate passed"
+    ;;
+  proposal-092|p092)
+    log "Proposal 092 retained gate: retry payload target invariants runtime proof"
+    python3 - "$ROOT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+reference = root / "docs/reference/rust-control-plane.md"
+gates_doc = root / "docs/reference/test-gates.md"
+runner = root / "scripts/test-gate.sh"
+
+def fail(message):
+    raise SystemExit(f"proposal-092: {message}")
+
+if not reference.exists():
+    fail("missing docs/reference/rust-control-plane.md")
+
+reference_text = reference.read_text()
+required_reference_terms = [
+    "Retry payload target invariants and recovery",
+    "Top-level routing fields describe the current run, stage, stage execution, target stage execution, and retry authority only.",
+    "targeted_retry.source_stage_execution_id",
+    "sanitize_targeted_retry_invoke_payload",
+    "auto-contract output retry and operator targeted retry",
+    "Post-invoke completion is authority/current-truth driven",
+    "retry_authority_target_agent_stage_mismatch",
+    "retry_authority_missing_for_targeted_invoke",
+    "Startup recovery runs this check before generic abandoned-invoke requeue",
+    "The daemon watchdog runs the same reconciliation after stale `AdvanceRun` inspection",
+    "CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE",
+    "CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED",
+    "CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_BATCH_LIMIT",
+    "retry_payload_recovery_events",
+    "`candidates_total`, `repaired_total`, `excluded_total`",
+    "GraphQL attaches the latest durable event to `Run.retryAuthorityJson.retry_payload_recovery`",
+    "MCP `runs.get` exposes `retry_authority.retry_payload_recovery`",
+    "Missing-authority hard mismatch rows are represented as history entries with `authority_state = missing_authority`",
+    "retryPayloadRecovery",
+    "retry_payload_recovery",
+    "unknown_reason_code = true",
+    "valid_retry_invoke_completion_recovered",
+    "retry_payload_stale_target_stage_repaired",
+    "retry_payload_source_provenance_ignored_for_target",
+    "`./scripts/test-gate.sh proposal-092` / `p092`",
+    "retired proposal document is not the operational source of truth",
+]
+for term in required_reference_terms:
+    if term not in reference_text:
+        fail(f"docs/reference/rust-control-plane.md missing {term!r}")
+
+if "Proposal 092: Retry Authority Payload Target Invariants and Recovery" in reference_text:
+    fail("stable reference still reads like the retired proposal")
+
+if not gates_doc.exists():
+    fail("missing docs/reference/test-gates.md")
+gates_text = gates_doc.read_text()
+for term in [
+    "### `proposal-092|p092`",
+    "Retained historical alias",
+    "retry payload target invariants runtime proof",
+    "rust-control-plane.md#retry-payload-target-invariants-and-recovery",
+    "targeted retry sanitizer",
+    "post-invoke fail-closed behavior",
+    "bounded startup and live recovery entry points",
+    "durable `retry_payload_recovery_events` storage",
+    "configurable live batch limiting",
+    "explicit `excluded_total` diagnostics",
+    "GraphQL/MCP nullable missing-authority readback",
+    "GraphQL, MCP, and report readback schema placement",
+    "retired proposal document is not the source of operational truth",
+    "proposal-090|p090",
+    "retained Junie runtime-hardening",
+]:
+    if term not in gates_text:
+        fail(f"docs/reference/test-gates.md missing {term!r}")
+
+runner_text = runner.read_text()
+for term in [
+    "proposal-092|p092  Retained historical alias for P092 retry payload target invariants runtime proof gate",
+    "proposal-092|p092)",
+]:
+    if term not in runner_text:
+        fail(f"scripts/test-gate.sh missing {term!r}")
+
+print("proposal-092 readiness validation passed")
+PY
+    log "Proposal 092 retained runtime authority payload tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p domain --lib retry_authority
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p db p092_post_invoke -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p db p091_post_invoke_authority_target_mismatch_fails_closed -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p db --test proposal_092_retry_payload_recovery -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p engine auto_contract_output_retry_schedules_targeted_fallback_before_stage_blocks -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p engine --test integration test_retry_stage_with_agent_execution_id_schedules_single_invoke_attempt -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p engine --test integration p092_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p graphql-server --lib run_query_exposes_p091_retry_authority_history_and_repair_readback -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p mcp-server --test proposal_091_retry_authority_readback retry_authority_history_and_current_readback_include_active_authority -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo check -p daemon
+    )
+    log "Proposal 092 retained gate passed"
     ;;
   proposal-085|p085)
     log "Proposal 085 gate: thin-client read-model parity and affordance contract"

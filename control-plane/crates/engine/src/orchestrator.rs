@@ -22,7 +22,10 @@ use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::events::DomainEvent;
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, RunId, StageExecutionId};
 use domain::proposal_gate_result::{ProposalGateResult, ProposalGateStatus};
-use domain::retry_authority::{AdvanceRunPayloadV1, AdvanceRunTargetMode, RetryAuthorityState};
+use domain::retry_authority::{
+    sanitize_targeted_retry_invoke_payload, AdvanceRunPayloadV1, AdvanceRunTargetMode,
+    RetryAuthorityState, TargetedRetryPayloadIdentity,
+};
 use domain::run::RunStatus;
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::workflow_conflict::{
@@ -230,8 +233,14 @@ impl Orchestrator {
                         run_id = %payload.run_id,
                         retry_authority_id = %authority.id,
                         state = %authority.authority_state,
-                        "advance_run_authority_superseded: targeted AdvanceRun already terminal; no-op"
+                        "advance_run_authority_superseded: targeted AdvanceRun already terminal; checking run-scoped catch-up"
                     );
+                    self.catch_up_active_run_after_terminal_target(
+                        payload.run_id,
+                        &authority.id,
+                        "terminalized_authority_terminal_target",
+                    )
+                    .await?;
                     return Ok(());
                 }
                 anyhow::bail!(
@@ -272,8 +281,14 @@ impl Orchestrator {
                 stage_execution_id = %target_stage.id,
                 stage_status = %target_stage.status,
                 retry_authority_id = %authority.id,
-                "targeted AdvanceRun observed already terminal target; terminalized authority"
+                "targeted AdvanceRun observed already terminal target; terminalized authority and checking run-scoped catch-up"
             );
+            self.catch_up_active_run_after_terminal_target(
+                payload.run_id,
+                &authority.id,
+                "active_authority_terminal_target",
+            )
+            .await?;
             return Ok(());
         }
 
@@ -344,6 +359,49 @@ impl Orchestrator {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn catch_up_active_run_after_terminal_target(
+        &self,
+        run_id: RunId,
+        retry_authority_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let Some(run) = runs::find_by_id(&self.pool, run_id).await? else {
+            return Ok(());
+        };
+        if run.status.is_terminal() {
+            projections::rebuild_all_for_run(&self.pool, run_id).await?;
+            return Ok(());
+        }
+
+        let has_live_work = db::repos::work_items::list_by_run(&self.pool, run_id)
+            .await?
+            .iter()
+            .any(|item| {
+                matches!(
+                    item.status,
+                    db::work_item::WorkItemStatus::Pending | db::work_item::WorkItemStatus::Running
+                )
+            });
+        if has_live_work {
+            info!(
+                run_id = %run_id,
+                retry_authority_id = retry_authority_id,
+                reason = reason,
+                "terminal targeted AdvanceRun catch-up skipped because live work exists"
+            );
+            return Ok(());
+        }
+
+        info!(
+            run_id = %run_id,
+            retry_authority_id = retry_authority_id,
+            reason = reason,
+            current_state = ?run.current_state,
+            "terminal targeted AdvanceRun running run-scoped catch-up"
+        );
+        self.advance_run(run_id).await
     }
 
     // =====================================================================
@@ -3026,20 +3084,28 @@ impl Orchestrator {
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned);
 
+            if !retry_payload.is_object() {
+                continue;
+            }
+            let source_work_item_id = source_item.id.clone();
+            sanitize_targeted_retry_invoke_payload(
+                &mut retry_payload,
+                &TargetedRetryPayloadIdentity {
+                    run_id,
+                    stage_id: stage.stage_id.clone(),
+                    target_stage_execution_id: new_stage.id,
+                    retry_authority_id: retry_authority_id.clone(),
+                    source_stage_execution_id: stage.id,
+                    source_agent_execution_id: Some(execution.id.to_string()),
+                    source_work_item_id: source_work_item_id.clone(),
+                    reason: "auto_contract_output_retry".to_string(),
+                    journal_id: None,
+                },
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
             let Some(object) = retry_payload.as_object_mut() else {
                 continue;
             };
-            object.insert("run_id".into(), serde_json::json!(run_id.to_string()));
-            object.insert("stage_id".into(), serde_json::json!(stage.stage_id));
-            object.insert(
-                "stage_execution_id".into(),
-                serde_json::json!(new_stage.id.to_string()),
-            );
-            object.insert(
-                "retry_authority_id".into(),
-                serde_json::json!(retry_authority_id),
-            );
-            object.remove("p058_claimed");
             object.insert(
                 "provider".into(),
                 serde_json::json!(fallback_provider.to_string()),
@@ -3061,23 +3127,21 @@ impl Orchestrator {
             if let Some(max_turns) = profile.get("max_turns").cloned() {
                 object.insert("max_turns".into(), max_turns);
             }
-            object.insert(
-                "targeted_retry".into(),
-                serde_json::json!({
-                    "source_stage_execution_id": stage.id.to_string(),
-                    "source_agent_execution_id": execution.id.to_string(),
-                    "source_work_item_id": source_item.id,
-                    "retry_authority_id": retry_authority_id,
-                    "reason": "auto_contract_output_retry",
-                    "provider_fallback": {
+            if let Some(targeted_retry) = object
+                .get_mut("targeted_retry")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                targeted_retry.insert(
+                    "provider_fallback".into(),
+                    serde_json::json!({
                         "reason": "source_contract_outputs_missing",
                         "from_backend_profile_id": from_backend_profile_id,
                         "from_provider": source_provider.clone(),
                         "to_backend_profile_id": fallback_profile_id,
                         "to_provider": fallback_provider,
-                    }
-                }),
-            );
+                    }),
+                );
+            }
 
             let tx_started = std::time::Instant::now();
             let mut tx = self
@@ -8479,8 +8543,31 @@ mod tests {
             serde_json::json!(authority.id)
         );
         assert_eq!(
+            payload["target_stage_execution_id"],
+            serde_json::json!(retry_stage.id.to_string())
+        );
+        assert_eq!(
+            payload["stage_execution_id"],
+            serde_json::json!(retry_stage.id.to_string())
+        );
+        assert!(payload.get("source_stage_execution_id").is_none());
+        assert!(payload.get("source_agent_execution_id").is_none());
+        assert!(payload.get("source_work_item_id").is_none());
+        assert_eq!(
             payload.pointer("/targeted_retry/retry_authority_id"),
             Some(&serde_json::json!(authority.id.clone()))
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/source_stage_execution_id"),
+            Some(&serde_json::json!(stage_id.to_string()))
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/source_agent_execution_id"),
+            Some(&serde_json::json!(failed_exec_id.to_string()))
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/source_work_item_id"),
+            Some(&serde_json::json!(format!("p058-invoke:{stage_id}:0")))
         );
 
         let retry_exec_id = AgentExecutionId::new();
@@ -9358,6 +9445,183 @@ permission_profiles:
             state_9_stages.len(),
             2,
             "Should have created a new stage for state_9 because the old one is stale"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_targeted_advance_catches_up_transitioned_run_without_followup_work() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(16);
+        let orchestrator = Orchestrator::new(
+            pool.clone(),
+            events,
+            crate::work_queue::WorkQueue::new(pool.clone()),
+        );
+        let now = Utc::now();
+        let idea = domain::idea::Idea {
+            id: IdeaId::new(),
+            title: "Targeted advance catch-up".into(),
+            body: "terminal targeted advance should recover missing state-transition work".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: now,
+            archived_at: None,
+        };
+        db::repos::ideas::insert(&pool, &idea).await.unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wf_path = temp_dir.path().join("wf.yaml");
+        let cat_path = temp_dir.path().join("catalog.yaml");
+        std::fs::write(
+            &wf_path,
+            "
+workflow:
+  id: test_wf
+initial_state: state_9
+states:
+  state_9:
+    label: Review
+    owner: reviewer
+    transitions:
+      - to: state_10
+        when: 'false'
+  state_10:
+    label: Refine
+    owner: refiner
+    transitions:
+      - to: state_9
+        when: 'true'
+",
+        )
+        .unwrap();
+        std::fs::write(
+            &cat_path,
+            "
+agents:
+  - id: reviewer
+    backend_profile: reviewer_profile
+    system_role: lead
+    permission_profile: default
+    lead_resolution_contract: proposal_review_v1
+  - id: refiner
+    backend_profile: refiner_profile
+    permission_profile: default
+backend_profiles:
+  reviewer_profile:
+    provider: codex
+  refiner_profile:
+    provider: codex
+contracts:
+  proposal_review_v1:
+    format: json
+permission_profiles:
+  default: {}
+",
+        )
+        .unwrap();
+
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.idea_id = idea.id;
+        run.current_state = Some("state_9".into());
+        run.workflow_yaml_path = Some(wf_path.to_str().unwrap().into());
+        run.agent_catalog_yaml_path = Some(cat_path.to_str().unwrap().into());
+        db::repos::runs::insert(&pool, &run).await.unwrap();
+
+        let old_review = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "state_9".into(),
+            label: "Review".into(),
+            status: StageStatus::Completed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: now - chrono::Duration::minutes(10),
+            completed_at: Some(now - chrono::Duration::minutes(9)),
+            owner_agent: Some("reviewer".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        db::repos::stages::insert(&pool, &old_review).await.unwrap();
+
+        let completed_retry_target = StageExecution {
+            id: StageExecutionId::new(),
+            run_id,
+            stage_id: "state_10".into(),
+            label: "Refine retry".into(),
+            status: StageStatus::Completed,
+            iteration: 2,
+            attempt_number: 7,
+            settlement_kind: None,
+            started_at: now - chrono::Duration::minutes(5),
+            completed_at: Some(now - chrono::Duration::minutes(4)),
+            owner_agent: Some("refiner".into()),
+            provider: Some("codex".into()),
+            model: Some("test".into()),
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: Some("operator_retry".into()),
+        };
+        db::repos::stages::insert(&pool, &completed_retry_target)
+            .await
+            .unwrap();
+
+        let authority_id = format!("p091-retry-authority:{}", completed_retry_target.id);
+        sqlx::query(
+            r#"INSERT INTO retry_stage_execution_authorities
+               (id, run_id, stage_id, target_stage_execution_id, entry_kind,
+                authority_state, created_at, updated_at, terminal_reason)
+               VALUES (?1, ?2, ?3, ?4, 'full_stage_retry', 'terminalized', ?5, ?5, 'target_stage_terminal')"#,
+        )
+        .bind(&authority_id)
+        .bind(run_id.to_string())
+        .bind("state_10")
+        .bind(completed_retry_target.id.to_string())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let payload =
+            domain::retry_authority::AdvanceRunPayloadV1::parse_value(&serde_json::json!({
+                "schema_version": "advance_run_payload.v1",
+                "run_id": run_id.to_string(),
+                "stage_id": "state_10",
+                "target_stage_execution_id": completed_retry_target.id.to_string(),
+                "retry_authority_id": authority_id,
+                "enqueue_reason": "post_invoke_completion",
+                "reason": "invoke_agent_completed",
+                "source_invoke_work_item_id": "p058-invoke:terminal-target:0",
+                "source_work_item_id": "p058-invoke:terminal-target:0",
+                "completed_invoke_work_item_id": "p058-invoke:terminal-target:0",
+                "source_stage_execution_id": completed_retry_target.id.to_string(),
+                "source_agent_execution_id": AgentExecutionId::new().to_string()
+            }))
+            .unwrap();
+
+        orchestrator
+            .advance_run_from_payload(&payload)
+            .await
+            .unwrap();
+
+        let all_stages = db::repos::stages::list_by_run(&pool, run_id).await.unwrap();
+        let review_stages: Vec<_> = all_stages
+            .iter()
+            .filter(|stage| stage.stage_id == "state_9")
+            .collect();
+        assert_eq!(
+            review_stages.len(),
+            2,
+            "terminal targeted AdvanceRun must catch up the already-transitioned run by creating the next review stage"
         );
     }
 

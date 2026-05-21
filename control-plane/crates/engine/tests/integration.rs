@@ -8,8 +8,8 @@ use db::pool::create_pool;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
     code_writer_completion_receipts, ideas, projections, retry_operator_instructions,
-    retry_stage_execution_authorities, runs, sessions, side_effects, stages, work_items,
-    workflow_conflicts,
+    retry_payload_recovery_events, retry_stage_execution_authorities, runs, sessions, side_effects,
+    stages, work_items, workflow_conflicts,
 };
 use domain::agent::{
     AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
@@ -48,6 +48,7 @@ use sqlx::Row;
 
 static CODEX_CONFIG_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static META_ROOT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static P092_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct EnvVarRestore {
     key: &'static str,
@@ -3748,6 +3749,413 @@ async fn p091_post_invoke_completion_failure_settle_exact_retry_target_end_to_en
     }
 }
 
+async fn seed_p092_stranded_retry_payload_case(
+    pool: &sqlx::SqlitePool,
+) -> (RunId, StageExecutionId, StageExecutionId, String) {
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let target_id = StageExecutionId::new();
+    let stale_id = StageExecutionId::new();
+    let agent_execution_id = AgentExecutionId::new();
+    let invoke_id = format!("auto-contract-output-retry:{target_id}:old-agent");
+    let now = Utc::now();
+    ideas::insert(pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.current_state = Some("state_8_implementation_continued".into());
+    runs::insert(pool, &run).await.unwrap();
+
+    let mut target = make_stage(target_id, run_id, StageStatus::Running);
+    target.stage_id = "state_8_implementation_continued".into();
+    target.attempt_number = 2;
+    stages::insert(pool, &target).await.unwrap();
+    let mut stale = make_stage(stale_id, run_id, StageStatus::Failed);
+    stale.stage_id = "state_8_implementation_continued".into();
+    stale.attempt_number = 1;
+    stages::insert(pool, &stale).await.unwrap();
+
+    insert_p091_authority_row(
+        pool,
+        &format!("p091-retry-authority:{target_id}"),
+        run_id,
+        "state_8_implementation_continued",
+        target_id,
+        "targeted_agent_retry",
+        "active",
+        Some(&invoke_id),
+    )
+    .await;
+
+    let mut execution = make_agent_execution(target_id, AgentStatus::Completed);
+    execution.id = agent_execution_id;
+    execution.agent_id = "code_writer".into();
+    execution.provider = "junie".into();
+    execution.completed_at = Some(now);
+    agent_executions::insert(pool, &execution).await.unwrap();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+    facts.valid_required_outputs = true;
+    agent_execution_runtime_facts::upsert(pool, &facts)
+        .await
+        .unwrap();
+
+    work_items::enqueue(
+        pool,
+        &db::work_item::WorkItem {
+            id: invoke_id.clone(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "state_8_implementation_continued",
+                "stage_execution_id": target_id.to_string(),
+                "target_stage_execution_id": stale_id.to_string(),
+                "source_stage_execution_id": stale_id.to_string(),
+                "source_agent_execution_id": "old-agent",
+                "source_work_item_id": "old-work-item",
+                "retry_authority_id": format!("p091-retry-authority:{target_id}"),
+                "targeted_retry": {
+                    "retry_authority_id": format!("p091-retry-authority:{target_id}"),
+                    "source_stage_execution_id": stale_id.to_string(),
+                    "source_agent_execution_id": "old-agent",
+                    "source_work_item_id": "old-work-item"
+                },
+                "p058_claimed": {
+                    "agent_execution_id": agent_execution_id.to_string()
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("state_8_implementation_continued".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    (run_id, target_id, stale_id, invoke_id)
+}
+
+#[tokio::test]
+async fn p092_startup_diagnostic_records_stranded_retry_and_skips_generic_requeue() {
+    let _env_lock = P092_ENV_LOCK.lock().await;
+    let _mode = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE", "diagnostic");
+    let _disabled = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED", "0");
+    let pool = test_pool().await;
+    let (run_id, _target_id, _stale_id, invoke_id) =
+        seed_p092_stranded_retry_payload_case(&pool).await;
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+
+    recovery.run_startup_repair().await.unwrap();
+
+    let invoke = work_items::find_by_id(&pool, &invoke_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invoke.status, db::work_item::WorkItemStatus::Running);
+    let events = retry_payload_recovery_events::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].mode, "diagnostic");
+    assert_eq!(
+        events[0].reason_code,
+        "retry_payload_stale_target_stage_repaired"
+    );
+    assert!(!events[0].repaired);
+    assert_eq!(
+        events[0].repaired_fields_json.as_ref().unwrap(),
+        &serde_json::json!([
+            "target_stage_execution_id",
+            "source_stage_execution_id",
+            "source_agent_execution_id",
+            "source_work_item_id"
+        ])
+    );
+}
+
+#[tokio::test]
+async fn p092_startup_enforce_completes_stranded_retry_and_enqueues_targeted_advance() {
+    let _env_lock = P092_ENV_LOCK.lock().await;
+    let _mode = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE", "enforce");
+    let _disabled = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED", "0");
+    let pool = test_pool().await;
+    let (run_id, target_id, _stale_id, invoke_id) =
+        seed_p092_stranded_retry_payload_case(&pool).await;
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+
+    recovery.run_startup_repair().await.unwrap();
+
+    let invoke = work_items::find_by_id(&pool, &invoke_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invoke.status, db::work_item::WorkItemStatus::Completed);
+    let payload: serde_json::Value = serde_json::from_str(&invoke.payload_json).unwrap();
+    assert_eq!(
+        payload["target_stage_execution_id"],
+        serde_json::json!(target_id.to_string())
+    );
+    assert!(payload.get("source_stage_execution_id").is_none());
+    assert!(payload.get("source_agent_execution_id").is_none());
+    assert!(payload.get("source_work_item_id").is_none());
+
+    let advance = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| {
+            item.kind == db::work_item::WorkItemKind::AdvanceRun
+                && item.status == db::work_item::WorkItemStatus::Pending
+        })
+        .expect("P092 recovery should enqueue post-invoke AdvanceRun");
+    let advance_payload =
+        domain::retry_authority::AdvanceRunPayloadV1::parse_json(&advance.payload_json).unwrap();
+    assert_eq!(advance_payload.target_stage_execution_id, Some(target_id));
+
+    let events = retry_payload_recovery_events::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].mode, "enforce");
+    assert!(events[0].repaired);
+}
+
+#[tokio::test]
+async fn p092_live_helper_promotes_existing_diagnostic_row_idempotently() {
+    let _env_lock = P092_ENV_LOCK.lock().await;
+    let _diagnostic =
+        EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE", "diagnostic");
+    let _disabled = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED", "0");
+    let pool = test_pool().await;
+    let (run_id, target_id, _stale_id, invoke_id) =
+        seed_p092_stranded_retry_payload_case(&pool).await;
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+
+    recovery
+        .run_p092_retry_payload_recovery_for_active_runs()
+        .await
+        .unwrap();
+    drop(_diagnostic);
+    let _enforce = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE", "enforce");
+    let repaired = recovery
+        .run_p092_retry_payload_recovery_for_active_runs()
+        .await
+        .unwrap();
+
+    assert_eq!(repaired, 1);
+    let invoke = work_items::find_by_id(&pool, &invoke_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invoke.status, db::work_item::WorkItemStatus::Completed);
+    let advance = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| {
+            item.kind == db::work_item::WorkItemKind::AdvanceRun
+                && item.status == db::work_item::WorkItemStatus::Pending
+        })
+        .expect("live helper should enqueue post-invoke AdvanceRun");
+    let advance_payload =
+        domain::retry_authority::AdvanceRunPayloadV1::parse_json(&advance.payload_json).unwrap();
+    assert_eq!(advance_payload.target_stage_execution_id, Some(target_id));
+
+    let events = retry_payload_recovery_events::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].mode, "enforce");
+    assert!(events[0].repaired);
+}
+
+#[tokio::test]
+async fn p092_live_helper_honors_configured_batch_limit() {
+    let _env_lock = P092_ENV_LOCK.lock().await;
+    let _mode = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE", "enforce");
+    let _disabled = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED", "0");
+    let _batch = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_BATCH_LIMIT", "1");
+    let pool = test_pool().await;
+    let (_first_run_id, _first_target_id, _first_stale_id, first_invoke_id) =
+        seed_p092_stranded_retry_payload_case(&pool).await;
+    let (_second_run_id, _second_target_id, _second_stale_id, second_invoke_id) =
+        seed_p092_stranded_retry_payload_case(&pool).await;
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+
+    let repaired = recovery
+        .run_p092_retry_payload_recovery_for_active_runs()
+        .await
+        .unwrap();
+
+    assert_eq!(repaired, 1);
+    let first = work_items::find_by_id(&pool, &first_invoke_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = work_items::find_by_id(&pool, &second_invoke_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let completed = [first.status, second.status]
+        .into_iter()
+        .filter(|status| *status == db::work_item::WorkItemStatus::Completed)
+        .count();
+    assert_eq!(completed, 1, "batch limit must cap repairs per live tick");
+}
+
+#[tokio::test]
+async fn p092_live_helper_emits_source_provenance_reason_for_source_only_repair() {
+    let _env_lock = P092_ENV_LOCK.lock().await;
+    let _mode = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE", "diagnostic");
+    let _disabled = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED", "0");
+    let pool = test_pool().await;
+    let (run_id, target_id, _stale_id, invoke_id) =
+        seed_p092_stranded_retry_payload_case(&pool).await;
+    let mut invoke = work_items::find_by_id(&pool, &invoke_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut payload: serde_json::Value = serde_json::from_str(&invoke.payload_json).unwrap();
+    payload["target_stage_execution_id"] = serde_json::json!(target_id.to_string());
+    invoke.payload_json = serde_json::to_string(&payload).unwrap();
+    sqlx::query("UPDATE work_items SET payload_json = ?1 WHERE id = ?2")
+        .bind(&invoke.payload_json)
+        .bind(&invoke_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+
+    recovery
+        .run_p092_retry_payload_recovery_for_active_runs()
+        .await
+        .unwrap();
+
+    let events = retry_payload_recovery_events::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].reason_code,
+        "retry_payload_source_provenance_ignored_for_target"
+    );
+}
+
+#[tokio::test]
+async fn p092_live_helper_emits_valid_recovery_reason_for_clean_stranded_retry() {
+    let _env_lock = P092_ENV_LOCK.lock().await;
+    let _mode = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE", "diagnostic");
+    let _disabled = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED", "0");
+    let pool = test_pool().await;
+    let (run_id, target_id, _stale_id, invoke_id) =
+        seed_p092_stranded_retry_payload_case(&pool).await;
+    let invoke = work_items::find_by_id(&pool, &invoke_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut payload: serde_json::Value = serde_json::from_str(&invoke.payload_json).unwrap();
+    payload["target_stage_execution_id"] = serde_json::json!(target_id.to_string());
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("source_stage_execution_id");
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("source_agent_execution_id");
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("source_work_item_id");
+    sqlx::query("UPDATE work_items SET payload_json = ?1 WHERE id = ?2")
+        .bind(serde_json::to_string(&payload).unwrap())
+        .bind(&invoke_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+
+    recovery
+        .run_p092_retry_payload_recovery_for_active_runs()
+        .await
+        .unwrap();
+
+    let events = retry_payload_recovery_events::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].reason_code,
+        "valid_retry_invoke_completion_recovered"
+    );
+}
+
+#[tokio::test]
+async fn p092_live_helper_disabled_records_excluded_counter() {
+    let _env_lock = P092_ENV_LOCK.lock().await;
+    let _mode = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE", "enforce");
+    let _disabled = EnvVarRestore::set("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED", "1");
+    let pool = test_pool().await;
+    let (run_id, _target_id, _stale_id, invoke_id) =
+        seed_p092_stranded_retry_payload_case(&pool).await;
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(64),
+    );
+
+    let repaired = recovery
+        .run_p092_retry_payload_recovery_for_active_runs()
+        .await
+        .unwrap();
+
+    assert_eq!(repaired, 0);
+    let invoke = work_items::find_by_id(&pool, &invoke_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(invoke.status, db::work_item::WorkItemStatus::Running);
+    let events = retry_payload_recovery_events::list_by_run(&pool, run_id)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].diagnostic_json.as_ref().unwrap()["excluded_total"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        events[0].diagnostic_json.as_ref().unwrap()["disabled"],
+        serde_json::json!(1)
+    );
+}
+
 #[tokio::test]
 async fn test_retry_stage_creates_missing_run_meta_root_before_new_attempt() {
     let pool = test_pool().await;
@@ -4270,10 +4678,25 @@ async fn test_retry_stage_with_agent_execution_id_schedules_single_invoke_attemp
         payload["stage_execution_id"],
         serde_json::json!(retry_stage.id.to_string())
     );
+    assert_eq!(
+        payload["target_stage_execution_id"],
+        serde_json::json!(retry_stage.id.to_string())
+    );
     assert!(payload.get("p058_claimed").is_none());
+    assert!(payload.get("source_stage_execution_id").is_none());
+    assert!(payload.get("source_agent_execution_id").is_none());
+    assert!(payload.get("source_work_item_id").is_none());
     assert_eq!(
         payload.pointer("/targeted_retry/source_agent_execution_id"),
         Some(&serde_json::json!(failed_lead_id.to_string()))
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/source_stage_execution_id"),
+        Some(&serde_json::json!(old_stage_exec_id.to_string()))
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/source_work_item_id"),
+        Some(&serde_json::json!(source_work_item_id))
     );
 }
 
@@ -12222,6 +12645,8 @@ impl acp::adapters::AcpAdapter for P088StaleImplementationActiveAdapter {
             session_generation_id: req.session_generation_id.clone(),
             status: "failed".into(),
             failure_phase: Some("read_poll_elapsed_without_message".into()),
+            jsonrpc_error_code: None,
+            provider_error_message_redacted: None,
             started_at: now.clone(),
             completed_at: Some(now),
             xcode_shim_injected: false,

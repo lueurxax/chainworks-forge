@@ -2,11 +2,14 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use db::pool::create_pool;
-use db::repos::{ideas, retry_stage_execution_authorities, runs, stages};
+use db::repos::{
+    ideas, retry_payload_recovery_events, retry_stage_execution_authorities, runs, stages,
+};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{IdeaId, RunId, StageExecutionId};
 use domain::retry_authority::{
-    RetryAuthorityEntryKind, RetryAuthorityState, RetryStageExecutionAuthority,
+    RetryAuthorityEntryKind, RetryAuthorityState, RetryPayloadRecoveryEvent,
+    RetryStageExecutionAuthority,
 };
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
@@ -136,6 +139,65 @@ async fn seed_retry_authority(pool: &sqlx::SqlitePool) -> (RunId, String) {
     )
     .await
     .unwrap();
+    retry_payload_recovery_events::upsert(
+        pool,
+        &RetryPayloadRecoveryEvent {
+            idempotency_key: "p092:mcp-readback".into(),
+            run_id,
+            invoke_work_item_id: "invoke-work-1".into(),
+            retry_authority_id: Some("p091-active-authority".into()),
+            target_stage_execution_id: Some(target_stage_execution_id),
+            completed_agent_execution_id: Some("agent-exec-1".into()),
+            reason_code: "valid_retry_invoke_completion_recovered".into(),
+            mode: "diagnostic".into(),
+            repaired: false,
+            current_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "target_stage_execution_id": target_stage_execution_id.to_string(),
+                "retry_authority_id": "p091-active-authority",
+                "completed_agent_execution_id": "agent-exec-1",
+                "invoke_work_item_id": "invoke-work-1"
+            }),
+            provenance_json: Some(serde_json::json!({
+                "source_agent_execution_id": "old-agent"
+            })),
+            repaired_fields_json: Some(serde_json::json!(["target_stage_execution_id"])),
+            diagnostic_json: Some(serde_json::json!({"would_repair": true})),
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    retry_payload_recovery_events::upsert(
+        pool,
+        &RetryPayloadRecoveryEvent {
+            idempotency_key: "p092:mcp-missing-authority".into(),
+            run_id,
+            invoke_work_item_id: "invoke-missing-authority".into(),
+            retry_authority_id: None,
+            target_stage_execution_id: Some(target_stage_execution_id),
+            completed_agent_execution_id: None,
+            reason_code: "retry_authority_missing_for_targeted_invoke".into(),
+            mode: "enforce".into(),
+            repaired: false,
+            current_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "target_stage_execution_id": target_stage_execution_id.to_string(),
+                "retry_authority_id": null,
+                "invoke_work_item_id": "invoke-missing-authority"
+            }),
+            provenance_json: Some(serde_json::json!({
+                "payload_retry_authority_id": "stale-auth"
+            })),
+            repaired_fields_json: Some(serde_json::json!([])),
+            diagnostic_json: Some(serde_json::json!({"fail_closed": true})),
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
 
     sqlx::query(
         r#"INSERT INTO p091_orphan_repair_passes
@@ -188,6 +250,20 @@ async fn retry_authority_history_and_current_readback_include_active_authority()
     assert_eq!(mcp_truth["retryAuthority"]["id"], authority_id);
     assert_eq!(mcp_truth["retryAuthorityHistory"][0]["id"], authority_id);
     assert_eq!(
+        mcp_truth["retryAuthority"]["retryPayloadRecovery"]["reason_code"],
+        "valid_retry_invoke_completion_recovered"
+    );
+    let report_missing = mcp_truth["retryAuthorityHistory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["authority_state"] == serde_json::json!("missing_authority"))
+        .expect("report missing-authority history row");
+    assert_eq!(
+        report_missing["retryPayloadRecovery"]["reason_code"],
+        "retry_authority_missing_for_targeted_invoke"
+    );
+    assert_eq!(
         mcp_truth["p091OrphanRepairReadback"]["latest_pass"]["candidates_total"],
         2
     );
@@ -205,6 +281,20 @@ async fn retry_authority_history_and_current_readback_include_active_authority()
     assert_eq!(
         run_payload["retry_authority_history"][0]["id"],
         authority_id
+    );
+    assert_eq!(
+        run_payload["retry_authority"]["retry_payload_recovery"]["current"]["invoke_work_item_id"],
+        "invoke-work-1"
+    );
+    let run_missing = run_payload["retry_authority_history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["authority_state"] == serde_json::json!("missing_authority"))
+        .expect("runs.get missing-authority history row");
+    assert_eq!(
+        run_missing["retry_payload_recovery"]["current"]["retry_authority_id"],
+        serde_json::Value::Null
     );
     assert_eq!(
         run_payload["p091_orphan_repair_readback"]["latest_pass"]["would_repair_total"],

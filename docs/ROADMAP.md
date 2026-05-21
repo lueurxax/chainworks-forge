@@ -21,7 +21,8 @@ These are not active workstreams:
 
 ## Recently Stabilized
 
-- **P087** Local storage tiering, read-path liveness, and SQLite exit criteria. Preserves existing GraphQL `StorageHealth.projections` while exposing new identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `StorageHealth.projectionFreshness` and `StorageHealth.projectionFreshnessBySource`.
+- **Storage tiering/read-path liveness (retained alias: P087)**. Preserves existing GraphQL `StorageHealth.projections` while exposing identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `StorageHealth.projectionFreshness` and `StorageHealth.projectionFreshnessBySource`. Operational truth lives in [query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) and [rust-control-plane.md](reference/rust-control-plane.md).
+- **Retry authority payload target invariants and recovery (retained historical alias: P092)**. Targeted retry payloads keep current target routing separate from source provenance, valid completed retry invokes can be recovered through startup/live reconciliation, and durable `retry_payload_recovery_events` back GraphQL/MCP/report readback. Operational truth lives in [rust-control-plane.md](reference/rust-control-plane.md#retry-payload-target-invariants-and-recovery) and [test-gates.md](reference/test-gates.md#proposal-092p092-retained-historical-alias).
 - **P073 freeze mode**.
 - **P084** minimal rollout-gate template and proposal readiness contract: template, linter, run-start preflight, authoritative storage, and four-lane operator readback.
 - **UI action boundary / P072 closeout gate**:
@@ -41,7 +42,7 @@ These are not active workstreams:
 This lane may proceed in parallel with durable side-effect stabilization as long as it preserves the implemented write-budget contract and does not add non-approval UI mutations.
 
 - **P085** thin-client read-model parity and affordance contract.
-- **P036** visual/navigation restoration over the GraphQL read model.
+- Implemented macOS operator navigation baseline over the GraphQL read model ([reference](reference/macos-operator-navigation.md)).
 - **P032** productization, dogfood evidence, accessibility/readiness, and honest operator sign-off.
 
 Goal:
@@ -74,7 +75,7 @@ After the safety and UI recovery lanes stabilize:
 - Future **P086** agent limit observatory / runtime budget dashboard.
 
 - Additional ACP runtime/provider expansion only after the stabilization window.
-- Additional UI polish only after P036/P032 restore stable operator ergonomics.
+- Additional UI polish builds on the implemented macOS operator navigation baseline and the P032 productization lane.
 
 ## Current critical path
 
@@ -98,6 +99,6 @@ Parallel UI lane:
 ```text
 P081 stable enough
 → P085 read-model/affordance contract
-→ P036 visual/navigation restoration
+→ implemented macOS operator navigation baseline
 → P032 dogfood/productization closeout
 ```

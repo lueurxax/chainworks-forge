@@ -524,7 +524,7 @@ Important:
 
 ### `proposal-036|p036`
 
-UX consolidation and navigation simplification gate.
+macOS operator navigation and read-model UX gate. The alias retains the historical proposal number; the stable behavior contract is [macos-operator-navigation.md](macos-operator-navigation.md).
 
 Scope:
 
@@ -541,7 +541,8 @@ Use when:
 
 Host policy:
 
-- unit/runtime tests run locally
+- on local hosts, `proposal-036` runs the build plus unit/runtime slices and skips the UI smoke slice
+- on approved remote UI hosts, the same `proposal-036` gate also runs the UI smoke cases
 - UI smoke tests are remote-only per repository policy and must run via the approved host (`test@SMacBook.local`)
 
 Command:
@@ -553,7 +554,7 @@ ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-ga
 
 Important:
 
-- this gate is the repo-owned proof lane for proposal-036 UX consolidation
+- this gate is the repo-owned proof lane for the consolidated macOS operator shell
 - inline approval rendering follows the [thin-client read-model affordance contract](thin-client-read-model-affordance-contract.md); legacy Approvals routes redirect into Runs with waiting-approval focus after the Phase 2c top-level tab removal
 
 ### `proposal-037`
@@ -1977,6 +1978,29 @@ Important:
 - `payload_deferred` must never collapse to `unavailable`; enforced by the Swift test slice
 - unknown GraphQL enum values must produce `.unknown` states; proved by `unknownPayloadStateFailsClosed` and `unknownFreshnessStateFailsClosed` tests
 
+### `proposal-087|p087`
+
+Retained historical alias for the local storage tiering, read-path liveness, and SQLite exit-criteria gate. Operational truth lives in [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) and [rust-control-plane.md](rust-control-plane.md).
+
+Scope:
+
+- verifies the storage-tiering migrations, projection freshness schema, hot-read circuit state, maintenance-operation readback, invalidation wiring, and typed MCP storage-health error contract
+- validates retained evidence fixtures under `docs/evidence/p087/api/`, `docs/evidence/rollout-contract/operator-readback/p087-storage-tiering-full-surface.fixture.json`, and `docs/evidence/rollout-contract/negative/p087-*.json`
+- runs focused Rust slices for DB, auth, engine, MCP, and GraphQL storage-health behavior plus Swift source checks for projection-lag and daemon lifecycle diagnostics readback
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-087
+./scripts/test-gate.sh p087
+```
+
+Important:
+
+- `proposal-087|p087` is retained as a historical gate alias; the retired proposal document is not the source of operational truth
+- `p087_*` remains stable rollout-readback vocabulary for this implemented contract
+- the gate is a focused proof path for storage tiering and read-path liveness, not a substitute for the full repository gate
+
 ### `proposal-088|p088`
 
 Code-writer completion handoff, output freshness, and repair diagnostics gate.
@@ -2114,6 +2138,37 @@ Important:
 - full-stage retry is `AdvanceRun`-first; targeted-agent retry is `InvokeAgent`-first
 - historical orphan recovery settles as `status = skipped` with `terminal_reason = stale_retry_recovered` and a non-active recovered authority provenance row
 - `terminal_reason` is stage-owned and authority-history-owned for recovered orphan rows
+
+### `proposal-092|p092` retained historical alias
+
+Retained historical alias for the implemented retry authority payload target invariants and recovery contract. Operational truth lives in [`rust-control-plane.md#retry-payload-target-invariants-and-recovery`](rust-control-plane.md#retry-payload-target-invariants-and-recovery).
+Short label: retry payload target invariants runtime proof.
+
+Scope:
+
+- verifies the stable Rust control-plane reference owns the current-target/provenance split, targeted retry sanitizer, post-invoke fail-closed behavior, startup/live recovery, and retained gate naming
+- verifies the retained alias does not reuse the Junie runtime-hardening `proposal-090|p090` identity
+- verifies the implementation covers all targeted retry producers, including auto-contract retry and `CommandHandler::RetryAgentExecution`
+- verifies bounded startup and live recovery entry points are owned directly by the recovery service and daemon watchdog
+- verifies durable `retry_payload_recovery_events` storage is the backing source for GraphQL, MCP, and report readback
+- verifies rollout controls for diagnostic/enforce mode, disable switch, live batch limit, cooldown, counters, and idempotent repair keys are specified
+- verifies startup diagnostic/enforce behavior is explicit and diagnostic startup does not fall through to generic abandoned-invoke blind retry for retry payload recovery candidates
+- verifies GraphQL, MCP, and report readback schema placement for `retryPayloadRecovery` / `retry_payload_recovery`
+- runs focused runtime tests for forward producer sanitization, post-invoke hard mismatch, durable recovery event storage, configurable live batch limiting, explicit `excluded_total` diagnostics, startup diagnostic/enforce recovery, GraphQL/MCP nullable missing-authority readback, and daemon live-hook compilation
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-092  # retained historical alias
+./scripts/test-gate.sh p092          # retained historical alias
+```
+
+Important:
+
+- this gate proves the retry payload recovery runtime contract with focused Rust tests; it is not a full workspace regression substitute
+- `proposal-092|p092` is a retained historical alias; the retired proposal document is not the source of operational truth
+- the alias does not replace P091 targeted retry authority or the retained Junie runtime-hardening `proposal-090|p090` gate
+- live recovery is intentionally bounded to active runs with running `invoke_agent` work items and active retry authority, and defaults to diagnostic mode
 
 ### `proposal-075|p075`
 

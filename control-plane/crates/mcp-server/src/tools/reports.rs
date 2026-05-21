@@ -6,8 +6,8 @@ use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
     agent_execution_runtime_receipts, agent_executions, artifact_contracts, artifacts, closeout,
     code_writer_completion_receipts, lead_conflict_mediations, legacy_discovery_overrides,
-    retry_stage_execution_authorities, rollout_contract_checks, sessions, validation,
-    workflow_conflicts,
+    retry_payload_recovery_events, retry_stage_execution_authorities, rollout_contract_checks,
+    sessions, validation, workflow_conflicts,
 };
 use db::write_class::WriteLane;
 use db::writer::class_a_operation;
@@ -161,22 +161,55 @@ pub(crate) async fn retry_authority_history_json(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<serde_json::Value> {
-    Ok(serde_json::to_value(
-        retry_stage_execution_authorities::list_by_run(pool, run_id).await?,
-    )?)
+    let events = retry_payload_recovery_events::latest_by_authority_for_run(pool, run_id).await?;
+    let mut values = retry_stage_execution_authorities::list_by_run(pool, run_id)
+        .await?
+        .into_iter()
+        .map(|authority| {
+            let mut value = serde_json::to_value(&authority)?;
+            if let Some(event) = events.get(&authority.id) {
+                let readback = event.readback_json();
+                value["retryPayloadRecovery"] = readback.clone();
+                value["retry_payload_recovery"] = readback;
+            }
+            Ok::<_, anyhow::Error>(value)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for event in retry_payload_recovery_events::list_by_run(pool, run_id).await? {
+        if event.retry_authority_id.is_none() {
+            let readback = event.readback_json();
+            values.push(serde_json::json!({
+                "schema_version": "retry_payload_recovery_history_v1",
+                "authority_state": "missing_authority",
+                "run_id": event.run_id.to_string(),
+                "source_invoke_work_item_id": event.invoke_work_item_id,
+                "retryPayloadRecovery": readback.clone(),
+                "retry_payload_recovery": readback,
+            }));
+        }
+    }
+    Ok(serde_json::Value::Array(values))
 }
 
 pub(crate) async fn retry_authority_current_json(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<serde_json::Value> {
+    let events = retry_payload_recovery_events::latest_by_authority_for_run(pool, run_id).await?;
     let history = retry_stage_execution_authorities::list_by_run(pool, run_id).await?;
-    Ok(history
+    let Some(authority) = history
         .into_iter()
         .find(|authority| authority.authority_state.to_string() == "active")
-        .map(serde_json::to_value)
-        .transpose()?
-        .unwrap_or(serde_json::Value::Null))
+    else {
+        return Ok(serde_json::Value::Null);
+    };
+    let mut value = serde_json::to_value(&authority)?;
+    if let Some(event) = events.get(&authority.id) {
+        let readback = event.readback_json();
+        value["retryPayloadRecovery"] = readback.clone();
+        value["retry_payload_recovery"] = readback;
+    }
+    Ok(value)
 }
 
 pub(crate) async fn p091_orphan_repair_readback_json(

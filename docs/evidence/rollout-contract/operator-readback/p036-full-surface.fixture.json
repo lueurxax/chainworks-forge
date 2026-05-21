@@ -1,110 +1,127 @@
 {
-  "schema_version": "rollout_contract_v1",
-  "applicability": "required",
-  "gate_aliases": ["proposal-036", "p036"],
-  "commands": {
-    "allowlist": [
-      "./scripts/test-gate.sh proposal-036",
-      "./scripts/test-gate.sh p036"
-    ],
-    "commentary": "Gate commands are declarative expectations; the linter does not execute them."
-  },
-  "migrations": {
-    "not_applicable": true,
-    "justification": "P036 is a Swift UI/navigation and presentation proposal over existing GraphQL read projections and governed approval mutations. It does not add database schema or persistence migrations."
-  },
-  "metrics": {
-    "adoption_metric": "p036_operator_navigation_completion_rate",
-    "operational_metrics": [
-      "p036_tab_route_resolution_total{source_tab,target_tab,result}",
-      "p036_global_attention_indicator_total{attention_kind,count_bucket,freshness_state}",
-      "p036_inline_approval_render_total{freshness_state,actionability_state}",
-      "p036_operator_task_attempt_total{task_id,result,blocked_reason}",
-      "p036_timeline_batch_flush_total{entry_count,flush_latency_bucket,reduce_motion}",
-      "p036_timeline_card_collapse_total{agent_status,collapse_reason}",
-      "p036_artifact_payload_state_total{payload_availability_state,render_kind}",
-      "p036_projection_gap_deferred_total{surface,gap_class}"
-    ]
-  },
-  "readback_lanes": ["run_report", "mcp", "release_receipt", "graphql"],
-  "readback_fields": [
-    "rollout_contract_status",
-    "rollout_contract_decision",
-    "rollout_contract_failure_reasons",
-    "rollout_contract_waiver_state",
-    "rollout_contract_waiver_expires_at",
-    "rollout_contract_enforcement_mode",
-    "rollout_contract_enforcement_mode_reason",
-    "rollout_contract_hold_conditions",
-    "rollout_contract_rollback_disposition",
-    "rollout_contract_source_lane",
-    "rollout_contract_enabled_state",
-    "rollout_contract_disabled_reason_code",
-    "rollout_contract_action_id",
-    "rollout_contract_operator_message",
-    "rollout_contract_projection_integrity",
-    "rollout_contract_cutover_policy_revision",
-    "rollout_contract_diagnostic_redaction",
-    "rollout_contract_next_steps"
-  ],
-  "readback_fixture": "docs/evidence/rollout-contract/operator-readback/p036-full-surface.fixture.json",
-  "operator_report_fields": [
-    "rollout_contract_status",
-    "rollout_contract_decision",
-    "rollout_contract_failure_reasons",
-    "rollout_contract_waiver_state",
-    "rollout_contract_waiver_expires_at",
-    "rollout_contract_enforcement_mode",
-    "rollout_contract_enforcement_mode_reason",
-    "rollout_contract_hold_conditions",
-    "rollout_contract_rollback_disposition",
-    "rollout_contract_source_lane",
-    "rollout_contract_enabled_state",
-    "rollout_contract_disabled_reason_code",
-    "rollout_contract_action_id",
-    "rollout_contract_operator_message",
-    "rollout_contract_projection_integrity",
-    "rollout_contract_cutover_policy_revision",
-    "rollout_contract_diagnostic_redaction",
-    "rollout_contract_next_steps"
-  ],
-  "hold_conditions": [
-    "P036 prep artifact is missing or incomplete.",
-    "Field-level projection/detail-read inventory is missing or incomplete for any governed UI surface.",
-    "Any Swift UI path reintroduces MCP UI calls, broad GraphQL mutations, local workflow truth, or raw artifact truth fallback.",
-    "Ideas exposes executable create, configure, archive, or launch controls inside Swift UI without a future approved write-transport proposal.",
-    "Inline approval context fails to preserve P085 actionability, stale, unauthorized, redacted, already-resolved, duplicate, or conflict behavior.",
-    "Standalone Approvals tab is removed before equivalent inline approval context, global attention indication, banner routing, keyboard routing, deep-link parity, and parity checklist evidence are verified.",
-    "Phase 2.5 dogfood evidence has fewer than five canonical task-set runs or fewer than two operators without an explicit release-manager waiver.",
-    "Remote UI smoke/accessibility evidence is unavailable for the consolidated navigation flow before release promotion.",
-    "Timeline batching drops terminal, diagnostic, conflict, or completion events, ignores Reduce Motion, or causes unreadable lag.",
-    "P036 rollout readback fixture or negative fixtures are missing, unsafe, stale, or fail the rollout contract linter."
-  ],
-  "rollback_disposition": {
+  "schema_version": "operator_readback_v1",
+  "fixture_purpose": "P036 consolidated UX/navigation rollout operator decision surface. Proves all required operator_readback_v1 fields are present across governed readback lanes.",
+  "proposal_id": "036",
+  "proposal_revision_id": "p036-2026-05-21-full-surface-proof",
+  "rollout_contract_status": "pass",
+  "rollout_contract_decision": "pass",
+  "rollout_contract_failure_reasons": [],
+  "rollout_contract_waiver_state": "active",
+  "rollout_contract_waiver_expires_at": "2026-05-24T23:59:59+03:00",
+  "rollout_contract_enforcement_mode": "enforce",
+  "rollout_contract_enforcement_mode_reason": "p036_consolidated_navigation_remote_and_local_proof_passed",
+  "rollout_contract_hold_conditions": [],
+  "rollout_contract_rollback_disposition": {
     "mode": "feature_flag_or_navigation_route_revert",
-    "data_loss_risk": "none",
-    "steps": [
-      "Disable consolidated navigation feature flag or restore legacy tab routing while preserving GraphQL thin-client reads.",
-      "Keep approval mutations governed by P085/P031 paths; do not restore removed local write controls.",
-      "Disable timeline batching/collapse flag if timeline evidence fails while preserving raw projected timeline entries.",
-      "Attach failed gate, dogfood, and remote UI evidence to release receipt.",
-      "Re-enable only after prep evidence, affordance tests, projection gap handling, dogfood minimum, and remote smoke pass."
-    ]
+    "data_loss_risk": "none"
   },
-  "decision_vocabulary": ["pass", "fail", "waived", "not_applicable", "timeout"],
-  "negative_fixtures": {
-    "approval_actionability_mismatch": "docs/evidence/rollout-contract/negative/p085-approval-actionability-mismatch.json",
-    "insufficient_dogfood_sample": "docs/evidence/rollout-contract/negative/p036-insufficient-dogfood-sample.json",
-    "missing_hold_and_rollback": "docs/evidence/rollout-contract/negative/missing-hold-and-rollback.json",
-    "missing_projection_inventory": "docs/evidence/rollout-contract/negative/p036-missing-projection-inventory.json",
-    "missing_required_surfaces": "docs/evidence/rollout-contract/negative/missing-required-surfaces.json",
-    "unsafe_local_truth_fallback": "docs/evidence/rollout-contract/negative/p085-unsafe-local-truth-fallback.json",
-    "unsafe_path_and_command": "docs/evidence/rollout-contract/negative/unsafe-path-and-command.json"
+  "rollout_contract_source_lane": "run_report",
+  "rollout_contract_enabled_state": "enabled",
+  "rollout_contract_disabled_reason_code": null,
+  "rollout_contract_action_id": "p036-release-readback-20260521",
+  "rollout_contract_operator_message": "P036 consolidated navigation proof is passing with dogfood waiver and full remote UI coverage.",
+  "rollout_contract_projection_integrity": "valid",
+  "rollout_contract_cutover_policy_revision": "p036-cutover-v1",
+  "rollout_contract_diagnostic_redaction": "none",
+  "rollout_contract_next_steps": [],
+  "p036_evidence": {
+    "dogfood": "docs/evidence/macos-operator-navigation/dogfood-validation-2026-05-21.json",
+    "remote_ui_accessibility": "docs/evidence/macos-operator-navigation/remote-ui-accessibility-proof-2026-05-21.json",
+    "live_rollout_readback": "docs/evidence/macos-operator-navigation/rollout-readback-live-2026-05-21.json"
   },
-  "cutover_policy": {
-    "revision": "p036-cutover-v1",
-    "applicable_to": "post_cutover_implementation_starts",
-    "enforcement_mode_at_cutover": "enforce",
-    "grandfathered_rendering": "not_applicable"
+  "parity_lanes": {
+    "run_report": {
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "pass",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "active",
+      "rollout_contract_waiver_expires_at": "2026-05-24T23:59:59+03:00",
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "p036_consolidated_navigation_remote_and_local_proof_passed",
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "mode": "feature_flag_or_navigation_route_revert",
+        "data_loss_risk": "none"
+      },
+      "rollout_contract_source_lane": "run_report",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p036-release-readback-20260521",
+      "rollout_contract_operator_message": "P036 consolidated navigation proof is passing with dogfood waiver and full remote UI coverage.",
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_cutover_policy_revision": "p036-cutover-v1",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": []
+    },
+    "mcp": {
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "pass",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "active",
+      "rollout_contract_waiver_expires_at": "2026-05-24T23:59:59+03:00",
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "p036_consolidated_navigation_remote_and_local_proof_passed",
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "mode": "feature_flag_or_navigation_route_revert",
+        "data_loss_risk": "none"
+      },
+      "rollout_contract_source_lane": "mcp",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p036-release-readback-20260521",
+      "rollout_contract_operator_message": "P036 consolidated navigation proof is passing with dogfood waiver and full remote UI coverage.",
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_cutover_policy_revision": "p036-cutover-v1",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": []
+    },
+    "release_receipt": {
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "pass",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "active",
+      "rollout_contract_waiver_expires_at": "2026-05-24T23:59:59+03:00",
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "p036_consolidated_navigation_remote_and_local_proof_passed",
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "mode": "feature_flag_or_navigation_route_revert",
+        "data_loss_risk": "none"
+      },
+      "rollout_contract_source_lane": "release_receipt",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p036-release-readback-20260521",
+      "rollout_contract_operator_message": "P036 consolidated navigation proof is passing with dogfood waiver and full remote UI coverage.",
+      "rollout_contract_projection_integrity": "valid",
+      "rollout_contract_cutover_policy_revision": "p036-cutover-v1",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_next_steps": []
+    },
+    "graphql": {
+      "schemaVersion": "operator_readback_v1",
+      "rolloutContractStatus": "pass",
+      "rolloutContractDecision": "pass",
+      "rolloutContractFailureReasons": [],
+      "rolloutContractWaiverState": "active",
+      "rolloutContractWaiverExpiresAt": "2026-05-24T23:59:59+03:00",
+      "rolloutContractEnforcementMode": "enforce",
+      "rolloutContractEnforcementModeReason": "p036_consolidated_navigation_remote_and_local_proof_passed",
+      "rolloutContractHoldConditions": [],
+      "rolloutContractRollbackDisposition": {
+        "mode": "feature_flag_or_navigation_route_revert",
+        "dataLossRisk": "none"
+      },
+      "rolloutContractSourceLane": "graphql",
+      "rolloutContractEnabledState": "enabled",
+      "rolloutContractDisabledReasonCode": null,
+      "rolloutContractActionId": "p036-release-readback-20260521",
+      "rolloutContractOperatorMessage": "P036 consolidated navigation proof is passing with dogfood waiver and full remote UI coverage.",
+      "rolloutContractProjectionIntegrity": "valid",
+      "rolloutContractCutoverPolicyRevision": "p036-cutover-v1",
+      "rolloutContractDiagnosticRedaction": "none",
+      "rolloutContractNextSteps": []
+    }
   }
 }

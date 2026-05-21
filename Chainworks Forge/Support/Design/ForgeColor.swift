@@ -25,4 +25,14 @@ enum ForgeColor {
     enum Badge {
         static let backgroundOpacity: Double = 0.15
     }
+
+    enum Status {
+        static let success = Color(red: 0.20, green: 0.78, blue: 0.35)
+        static let warning = Color(red: 1.00, green: 0.62, blue: 0.04)
+        static let approval = Color(red: 1.00, green: 0.84, blue: 0.04)
+        static let error = Color(red: 1.00, green: 0.23, blue: 0.19)
+        static let running = Color(red: 0.04, green: 0.52, blue: 1.00)
+        static let neutral = Color.secondary
+        static let cancelled = Color.gray
+    }
 }

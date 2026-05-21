@@ -1,39 +1,68 @@
 {
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative:insufficient_dogfood_sample",
   "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
   "gate_aliases": [
     "proposal-036",
     "p036"
   ],
-  "hold_conditions": [
-    "placeholder negative fixture"
+  "decision_vocabulary": [
+    "pass",
+    "fail"
   ],
+  "commands": {
+    "allowlist": [
+      "./scripts/test-gate.sh proposal-036",
+      "./scripts/test-gate.sh p036",
+      "ssh test@SMacBook.local \"cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-036\""
+    ]
+  },
   "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
+    "adoption_metric": "p036_operator_navigation_completion_rate",
+    "guardrail_metrics": [
+      "p036_tab_route_resolution_total",
+      "p036_inline_approval_render_total",
+      "p036_timeline_card_collapse_total"
+    ]
   },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
+  "dogfood_sample": {
+    "required_task_set_runs": 5,
+    "observed_task_set_runs": 3,
+    "required_operator_count": 2,
+    "observed_operator_count": 1,
+    "timeline_readability_ratings": [
+      4,
+      4,
+      5
+    ]
   },
-  "operator_report_fields": [
-    "rollout_contract_status"
+  "hold_conditions": [
+    "dogfood_sample_below_required_task_set_runs",
+    "dogfood_sample_below_required_operator_count"
   ],
-  "placeholder_fixture_kind": "negative:insufficient_dogfood_sample",
+  "expected_decision": "fail",
+  "operator_report_fields": [
+    "rollout_contract_status",
+    "p036_operator_navigation_completion_rate",
+    "p036_dogfood_sample_summary"
+  ],
   "readback_fields": [
-    "rollout_contract_status"
+    "rollout_contract_status",
+    "p036_operator_navigation_completion_rate",
+    "p036_dogfood_sample_summary"
   ],
   "readback_lanes": [
-    "run_report"
+    "run_report",
+    "mcp",
+    "release_receipt",
+    "graphql"
   ],
   "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
+    "mode": "diagnostic_hold",
+    "data_loss_risk": "none"
   },
-  "schema_version": "rollout_contract_v1"
+  "migrations": {
+    "not_applicable": true,
+    "justification": "P036 changes SwiftUI presentation and readback surfaces only; this fixture validates rollout evidence readiness."
+  }
 }

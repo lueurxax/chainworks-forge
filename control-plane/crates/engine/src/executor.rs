@@ -93,6 +93,7 @@ use domain::side_effect::{EffectKind, PrepareEffectIntent};
 
 const ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS: i64 = 3;
 const JUNIE_PROVIDER_CAPACITY_RETRY_DELAY_SECONDS: i64 = 15;
+const DEFAULT_PROVIDER_QUOTA_RETRY_DELAY_SECONDS: i64 = 30 * 60;
 const APPROVED_PROPOSAL_OUTPUT_NAME: &str = "approved_proposal";
 const IMPLEMENTATION_STARTED_STAGE_ID: &str = "state_7_implementation_started";
 const FREEZE_PROPOSAL_TASK_NAME: &str = "freeze_proposal_and_provision_worktree";
@@ -203,6 +204,23 @@ impl acp::AcpPromptProgressSink for DbAcpPromptProgressSink {
             return Ok(());
         };
         sessions::touch_generation_activity(&self.pool, generation_id, chrono::Utc::now()).await?;
+        if let Some(title) = update.title.as_deref() {
+            let _ = self
+                .events
+                .send(domain::events::DomainEvent::RuntimeTimelineEvent {
+                    run_id: update.run_id,
+                    stage_id: update.stage_id.clone(),
+                    agent_id: update.agent_id.clone(),
+                    provider: update.provider.clone(),
+                    event_kind: acp_prompt_progress_kind_label(&update.kind).to_string(),
+                    title: title.to_string(),
+                    detail: update.detail.clone(),
+                    surface_label: update.surface_label.clone().unwrap_or_else(|| {
+                        acp_prompt_progress_kind_label(&update.kind).to_string()
+                    }),
+                    session_generation_id: update.session_generation_id.clone(),
+                });
+        }
         if let Some(stage_execution_id) = update.stage_execution_id.as_deref() {
             match stage_execution_id.parse::<domain::ids::StageExecutionId>() {
                 Ok(stage_execution_id) => {
@@ -228,6 +246,15 @@ impl acp::AcpPromptProgressSink for DbAcpPromptProgressSink {
             }
         }
         Ok(())
+    }
+}
+
+fn acp_prompt_progress_kind_label(kind: &acp::AcpPromptProgressKind) -> &'static str {
+    match kind {
+        acp::AcpPromptProgressKind::PromptSent => "prompt_sent",
+        acp::AcpPromptProgressKind::MessageReceived => "message_received",
+        acp::AcpPromptProgressKind::MeaningfulProgress => "meaningful_progress",
+        acp::AcpPromptProgressKind::ProviderLocalActivity => "provider_local_activity",
     }
 }
 
@@ -445,6 +472,9 @@ async fn invoke_item_has_start_capacity(
     }
     let provider_family =
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
+    if provider_quota_retry_wait_active(pool, &provider_family, chrono::Utc::now()).await? {
+        return Ok(false);
+    }
 
     let running_status = AgentStatus::Running.to_string();
     let total_active: i64 = sqlx::query_scalar(
@@ -509,6 +539,30 @@ async fn invoke_item_has_start_capacity(
     }
 
     Ok(true)
+}
+
+async fn provider_quota_retry_wait_active(
+    pool: &SqlitePool,
+    provider_family: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM agent_retry_budget_ledger ledger
+           INNER JOIN agent_executions ae ON ae.id = ledger.agent_execution_id
+           WHERE ledger.failure_kind = ?1
+             AND ledger.normal_budget_consumed = 0
+             AND ledger.state = 'waiting_for_reset'
+             AND ledger.retry_after IS NOT NULL
+             AND ledger.retry_after > ?2
+             AND COALESCE(ae.provider_family, ae.provider) = ?3"#,
+    )
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .bind(now.to_rfc3339())
+    .bind(provider_family)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
 }
 
 fn invoke_payload_requires_xcode_mcp(payload: &serde_json::Value) -> bool {
@@ -2262,9 +2316,9 @@ fn runtime_facts_for_acp_error(
     let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
     let message = error.to_string();
     let classification = classify_observation(observation_from_acp_error_message(&message));
+    facts.retry_after = retry_after_or_default_for_provider_quota(&classification, now);
     facts.failure_kind = Some(classification.failure_kind);
     facts.operator_action_hint = Some(classification.operator_action_hint);
-    facts.retry_after = classification.retry_after;
     facts.failure_kind_raw_debug = Some(redact_runtime_message(&format!("{error:#}")));
     facts.failure_message_redacted = Some(redact_runtime_message(&message));
     facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
@@ -2298,6 +2352,21 @@ fn runtime_receipt_record_from_receipt(
         created_at: now,
         updated_at: now,
     })
+}
+
+fn retry_after_or_default_for_provider_quota(
+    classification: &RuntimeFailureClassification,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if classification.failure_kind == AgentFailureKind::ProviderQuota {
+        Some(
+            classification.retry_after.unwrap_or(
+                now + chrono::Duration::seconds(DEFAULT_PROVIDER_QUOTA_RETRY_DELAY_SECONDS),
+            ),
+        )
+    } else {
+        classification.retry_after
+    }
 }
 
 fn runtime_prompt_receipt_record_from_receipt(
@@ -2567,7 +2636,7 @@ fn runtime_facts_for_execution_result(
             let classification = provider_quota_classification.expect("checked above");
             facts.failure_kind = Some(classification.failure_kind.clone());
             facts.operator_action_hint = Some(classification.operator_action_hint.clone());
-            facts.retry_after = classification.retry_after;
+            facts.retry_after = retry_after_or_default_for_provider_quota(classification, now);
             facts.transport_error_code = classification.transport_error_code.clone();
             facts.supervision_classification = classification.supervision_classification.clone();
             facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
@@ -2588,7 +2657,7 @@ fn runtime_facts_for_execution_result(
             if let Some(classification) = observed_failure_classification.as_ref() {
                 facts.failure_kind = Some(classification.failure_kind.clone());
                 facts.operator_action_hint = Some(classification.operator_action_hint.clone());
-                facts.retry_after = classification.retry_after;
+                facts.retry_after = retry_after_or_default_for_provider_quota(classification, now);
                 facts.transport_error_code = classification.transport_error_code.clone();
                 facts.supervision_classification =
                     classification.supervision_classification.clone();
@@ -2602,7 +2671,7 @@ fn runtime_facts_for_execution_result(
             if let Some(classification) = observed_failure_classification.as_ref() {
                 facts.failure_kind = Some(classification.failure_kind.clone());
                 facts.operator_action_hint = Some(classification.operator_action_hint.clone());
-                facts.retry_after = classification.retry_after;
+                facts.retry_after = retry_after_or_default_for_provider_quota(classification, now);
                 facts.transport_error_code = classification.transport_error_code.clone();
                 facts.supervision_classification =
                     classification.supervision_classification.clone();
@@ -3192,6 +3261,35 @@ fn observed_failure_classification_for_execution_result(
         return None;
     }
     transcript_text.map(|text| classify_observation(observation_from_acp_error_message(text)))
+}
+
+fn output_contract_repair_skip_classification(
+    result_status: &AgentStatus,
+    transcript_text: Option<&str>,
+    runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
+) -> Option<RuntimeFailureClassification> {
+    if *result_status != AgentStatus::Failed {
+        return None;
+    }
+    if runtime_receipt
+        .and_then(|receipt| receipt.failure_phase.as_deref())
+        .is_some_and(|phase| phase == "provider_quota")
+    {
+        return Some(classify_observation(
+            crate::failure_classifier::RuntimeFailureObservation::ProviderQuota {
+                retry_after: transcript_text
+                    .map(observation_from_acp_error_message)
+                    .and_then(|observation| match observation {
+                        crate::failure_classifier::RuntimeFailureObservation::ProviderQuota {
+                            retry_after,
+                        } => retry_after,
+                        _ => None,
+                    }),
+            },
+        ));
+    }
+    observed_failure_classification_for_execution_result(result_status, transcript_text)
+        .filter(|classification| classification.failure_kind == AgentFailureKind::ProviderQuota)
 }
 
 fn redact_runtime_message(message: &str) -> String {
@@ -5982,22 +6080,54 @@ impl BackgroundExecutor {
                         )
                         .await?;
                     if validation_summary_requires_output_contract_repair(&validation) {
-                        let p088_work_change_kind = p088_post_original_fingerprint
-                            .as_ref()
-                            .map(|fingerprint| fingerprint.summary.work_change_kind);
-                        let p088_completion_eligible = p088_code_writer_completion_candidate
-                            && (matches!(
-                                p088_work_change_kind,
-                                Some(WorkChangeKind::CurrentAttemptDiff)
-                            ) || p088_operator_retry_completion_recovery);
-                        if let Some(session_generation_id) =
-                            result.session_generation_id.clone().or_else(|| {
-                                policy_decision
-                                    .as_ref()
-                                    .map(|decision| decision.generation.id.clone())
-                            })
+                        if let Some(skip_classification) =
+                            output_contract_repair_skip_classification(
+                                &result.status,
+                                result.transcript_text.as_deref(),
+                                result.runtime_receipt.as_ref(),
+                            )
                         {
-                            let failed_generic_repair_count =
+                            warn!(
+                                run_id = %run_id,
+                                stage_id = %stage_id,
+                                agent_id = %agent_id,
+                                agent_execution_id = %agent_exec_id,
+                                failure_kind = %skip_classification.failure_kind,
+                                "Output contract repair skipped because provider failed before producing assistant output"
+                            );
+                            self.record_output_contract_repair_event(
+                                policy_decision.as_ref(),
+                                domain::session::SessionEventType::OutputContractRepairSkipped,
+                                serde_json::json!({
+                                    "agent_execution_id": agent_exec_id.to_string(),
+                                    "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                    "failure_kind": skip_classification.failure_kind.to_string(),
+                                    "operator_action_hint": skip_classification.operator_action_hint.to_string(),
+                                    "retry_after": skip_classification.retry_after.map(|dt| dt.to_rfc3339()),
+                                    "reason": "provider_failed_before_assistant_output",
+                                }),
+                                run_id,
+                                &stage_id,
+                                &agent_id,
+                            )
+                            .await;
+                        } else {
+                            let p088_work_change_kind = p088_post_original_fingerprint
+                                .as_ref()
+                                .map(|fingerprint| fingerprint.summary.work_change_kind);
+                            let p088_completion_eligible = p088_code_writer_completion_candidate
+                                && (matches!(
+                                    p088_work_change_kind,
+                                    Some(WorkChangeKind::CurrentAttemptDiff)
+                                ) || p088_operator_retry_completion_recovery);
+                            if let Some(session_generation_id) =
+                                result.session_generation_id.clone().or_else(|| {
+                                    policy_decision
+                                        .as_ref()
+                                        .map(|decision| decision.generation.id.clone())
+                                })
+                            {
+                                let failed_generic_repair_count =
                                 sessions::count_generation_events_for_agent_execution(
                                     &self.pool,
                                     &session_generation_id,
@@ -6006,26 +6136,26 @@ impl BackgroundExecutor {
                                 )
                                 .await
                                 .unwrap_or(0);
-                            let generic_repair_already_failed =
-                                p088_should_block_after_generic_repair_failed(
-                                    p088_code_writer_completion_candidate,
-                                    p088_completion_eligible,
-                                    failed_generic_repair_count,
-                                );
-                            if generic_repair_already_failed {
-                                p088_completion_turn_result = Some(
+                                let generic_repair_already_failed =
+                                    p088_should_block_after_generic_repair_failed(
+                                        p088_code_writer_completion_candidate,
+                                        p088_completion_eligible,
+                                        failed_generic_repair_count,
+                                    );
+                                if generic_repair_already_failed {
+                                    p088_completion_turn_result = Some(
                                     "generic_repair_already_failed_completion_contract_required"
                                         .to_string(),
                                 );
-                                warn!(
-                                    run_id = %run_id,
-                                    stage_id = %stage_id,
-                                    agent_id = %agent_id,
-                                    agent_execution_id = %agent_exec_id,
-                                    session_generation_id = %session_generation_id,
-                                    "P088 blocked ineligible code_writer completion attempt after failed generic repair"
-                                );
-                                self.record_output_contract_repair_event(
+                                    warn!(
+                                        run_id = %run_id,
+                                        stage_id = %stage_id,
+                                        agent_id = %agent_id,
+                                        agent_execution_id = %agent_exec_id,
+                                        session_generation_id = %session_generation_id,
+                                        "P088 blocked ineligible code_writer completion attempt after failed generic repair"
+                                    );
+                                    self.record_output_contract_repair_event(
                                     policy_decision.as_ref(),
                                     domain::session::SessionEventType::OutputContractRepairSkipped,
                                     serde_json::json!({
@@ -6038,7 +6168,7 @@ impl BackgroundExecutor {
                                     &agent_id,
                                 )
                                 .await;
-                                self.record_code_writer_completion_event(
+                                    self.record_code_writer_completion_event(
                                     policy_decision.as_ref(),
                                     domain::session::SessionEventType::CodeWriterCompletionFailed,
                                     serde_json::json!({
@@ -6052,67 +6182,73 @@ impl BackgroundExecutor {
                                     &agent_id,
                                 )
                                 .await;
-                            } else {
-                                let mut repair_req = req.clone();
-                                repair_req.prompt = if p088_completion_eligible {
-                                    code_writer_completion_repair_prompt(
-                                        &validation,
-                                        &declared_outputs,
-                                    )
                                 } else {
-                                    output_contract_repair_prompt(&validation, &declared_outputs)
-                                };
-                                repair_req.reuse_existing_session = true;
-                                repair_req.keep_session_alive = true;
-                                repair_req.session_generation_id =
-                                    Some(session_generation_id.clone());
-                                repair_req.provider_session_id = result
-                                    .provider_session_id
-                                    .clone()
-                                    .or_else(|| repair_req.provider_session_id.clone());
-                                let repair_prompt_text = repair_req.prompt.clone();
-                                let repair_prompt_bytes = repair_req.prompt.len();
-                                let failed_outputs = failed_output_validation_details(&validation);
-                                let p088_repair_prompt_artifact_path = if p088_completion_eligible {
-                                    persist_p088_prompt_artifact(
-                                        &run.artifact_root,
-                                        agent_exec_id,
-                                        "code_writer_completion_repair",
-                                        1,
-                                        &repair_prompt_text,
-                                    )
-                                    .await
-                                    .ok()
-                                } else {
-                                    None
-                                };
-                                let p088_expected_output_snapshot = if p088_completion_eligible {
-                                    persist_p088_expected_output_snapshot(
-                                        &run.artifact_root,
-                                        agent_exec_id,
-                                        "code_writer_completion_repair",
-                                        1,
-                                        &declared_outputs,
-                                    )
-                                    .await
-                                    .ok()
-                                } else {
-                                    None
-                                };
-                                if p088_completion_eligible {
-                                    p088_completion_turn_attempted = true;
-                                }
-                                info!(
-                                    run_id = %run_id,
-                                    stage_id = %stage_id,
-                                    agent_id = %agent_id,
-                                    agent_execution_id = %agent_exec_id,
-                                    session_generation_id = %session_generation_id,
-                                    failed_output_count = failed_outputs.len(),
-                                    repair_prompt_bytes,
-                                    "Output contract repair turn starting"
-                                );
-                                self.record_output_contract_repair_event(
+                                    let mut repair_req = req.clone();
+                                    repair_req.prompt = if p088_completion_eligible {
+                                        code_writer_completion_repair_prompt(
+                                            &validation,
+                                            &declared_outputs,
+                                        )
+                                    } else {
+                                        output_contract_repair_prompt(
+                                            &validation,
+                                            &declared_outputs,
+                                        )
+                                    };
+                                    repair_req.reuse_existing_session = true;
+                                    repair_req.keep_session_alive = true;
+                                    repair_req.session_generation_id =
+                                        Some(session_generation_id.clone());
+                                    repair_req.provider_session_id = result
+                                        .provider_session_id
+                                        .clone()
+                                        .or_else(|| repair_req.provider_session_id.clone());
+                                    let repair_prompt_text = repair_req.prompt.clone();
+                                    let repair_prompt_bytes = repair_req.prompt.len();
+                                    let failed_outputs =
+                                        failed_output_validation_details(&validation);
+                                    let p088_repair_prompt_artifact_path =
+                                        if p088_completion_eligible {
+                                            persist_p088_prompt_artifact(
+                                                &run.artifact_root,
+                                                agent_exec_id,
+                                                "code_writer_completion_repair",
+                                                1,
+                                                &repair_prompt_text,
+                                            )
+                                            .await
+                                            .ok()
+                                        } else {
+                                            None
+                                        };
+                                    let p088_expected_output_snapshot = if p088_completion_eligible
+                                    {
+                                        persist_p088_expected_output_snapshot(
+                                            &run.artifact_root,
+                                            agent_exec_id,
+                                            "code_writer_completion_repair",
+                                            1,
+                                            &declared_outputs,
+                                        )
+                                        .await
+                                        .ok()
+                                    } else {
+                                        None
+                                    };
+                                    if p088_completion_eligible {
+                                        p088_completion_turn_attempted = true;
+                                    }
+                                    info!(
+                                        run_id = %run_id,
+                                        stage_id = %stage_id,
+                                        agent_id = %agent_id,
+                                        agent_execution_id = %agent_exec_id,
+                                        session_generation_id = %session_generation_id,
+                                        failed_output_count = failed_outputs.len(),
+                                        repair_prompt_bytes,
+                                        "Output contract repair turn starting"
+                                    );
+                                    self.record_output_contract_repair_event(
                                 policy_decision.as_ref(),
                                 domain::session::SessionEventType::OutputContractRepairStarted,
                                 serde_json::json!({
@@ -6126,8 +6262,8 @@ impl BackgroundExecutor {
                                 &agent_id,
                             )
                             .await;
-                                if p088_completion_eligible {
-                                    self.record_code_writer_completion_event(
+                                    if p088_completion_eligible {
+                                        self.record_code_writer_completion_event(
                                     policy_decision.as_ref(),
                                     domain::session::SessionEventType::CodeWriterCompletionStarted,
                                     serde_json::json!({
@@ -6141,92 +6277,100 @@ impl BackgroundExecutor {
                                     &agent_id,
                                 )
                                 .await;
-                                }
+                                    }
 
-                                let p088_pre_completion_repair_fingerprint =
-                                    if p088_completion_eligible && worktree_write_enabled {
-                                        match capture_worktree_fingerprint_v1(
-                                            WorktreeFingerprintInput {
-                                                worktree_root: PathBuf::from(
-                                                    &effective_working_directory,
-                                                ),
-                                                run_id: run_id.to_string(),
-                                                stage_execution_id: stage_execution_id
-                                                    .map(|id| id.to_string())
-                                                    .unwrap_or_else(|| stage_id.clone()),
-                                                agent_execution_id: agent_exec_id.to_string(),
-                                                session_generation_id: session_generation_id
-                                                    .clone(),
-                                                capture_phase: CapturePhase::PreCompletionRepair,
-                                                active_proposal_id: Some("088".to_string()),
-                                                baseline: p088_post_original_fingerprint.as_ref(),
-                                            },
-                                        )
-                                        .await
-                                        {
-                                            Ok(fingerprint) => {
-                                                let _ = persist_p088_worktree_fingerprint(
-                                                    &run.artifact_root,
-                                                    agent_exec_id,
-                                                    &fingerprint,
-                                                )
-                                                .await;
-                                                Some(fingerprint)
-                                            }
-                                            Err(error) => {
-                                                warn!(
-                                                    run_id = %run_id,
-                                                    stage_id = %stage_id,
-                                                    agent_id = %agent_id,
-                                                    agent_execution_id = %agent_exec_id,
-                                                    error = %error,
-                                                    "P088 pre-completion repair worktree fingerprint capture failed"
-                                                );
-                                                None
-                                            }
-                                        }
-                                    } else {
-                                        None
-                                    };
-
-                                match self
-                                    .acp
-                                    .prompt_session(&session_generation_id, repair_req)
-                                    .await
-                                {
-                                    Ok(repair_result) => {
-                                        output_contract_repair_turn_count += 1;
-                                        if p088_completion_eligible {
-                                            p088_completion_repair_text_capture =
-                                                Some(repair_result.completion_text_capture.clone());
-                                            p088_completion_repair_runtime_receipt =
-                                                repair_result.runtime_receipt.clone();
-                                            if let Some(runtime_receipt) =
-                                                repair_result.runtime_receipt.as_ref()
+                                    let p088_pre_completion_repair_fingerprint =
+                                        if p088_completion_eligible && worktree_write_enabled {
+                                            match capture_worktree_fingerprint_v1(
+                                                WorktreeFingerprintInput {
+                                                    worktree_root: PathBuf::from(
+                                                        &effective_working_directory,
+                                                    ),
+                                                    run_id: run_id.to_string(),
+                                                    stage_execution_id: stage_execution_id
+                                                        .map(|id| id.to_string())
+                                                        .unwrap_or_else(|| stage_id.clone()),
+                                                    agent_execution_id: agent_exec_id.to_string(),
+                                                    session_generation_id: session_generation_id
+                                                        .clone(),
+                                                    capture_phase:
+                                                        CapturePhase::PreCompletionRepair,
+                                                    active_proposal_id: Some("088".to_string()),
+                                                    baseline: p088_post_original_fingerprint
+                                                        .as_ref(),
+                                                },
+                                            )
+                                            .await
                                             {
-                                                if let Ok(receipt_record) =
-                                                    runtime_prompt_receipt_record_from_receipt(
+                                                Ok(fingerprint) => {
+                                                    let _ = persist_p088_worktree_fingerprint(
+                                                        &run.artifact_root,
                                                         agent_exec_id,
-                                                        runtime_receipt,
-                                                        chrono::Utc::now(),
-                                                        "code_writer_completion_repair",
-                                                        output_contract_repair_turn_count,
-                                                        "code_writer_completion_repair_v1",
-                                                        "1",
-                                                        &repair_prompt_text,
-                                                        "missing_required_outputs",
-                                                        p088_repair_prompt_artifact_path.as_deref(),
-                                                        p088_expected_output_snapshot
-                                                            .as_ref()
-                                                            .map(|snapshot| snapshot.0.as_str()),
-                                                        p088_expected_output_snapshot
-                                                            .as_ref()
-                                                            .map(|snapshot| snapshot.1.as_str()),
+                                                        &fingerprint,
                                                     )
+                                                    .await;
+                                                    Some(fingerprint)
+                                                }
+                                                Err(error) => {
+                                                    warn!(
+                                                        run_id = %run_id,
+                                                        stage_id = %stage_id,
+                                                        agent_id = %agent_id,
+                                                        agent_execution_id = %agent_exec_id,
+                                                        error = %error,
+                                                        "P088 pre-completion repair worktree fingerprint capture failed"
+                                                    );
+                                                    None
+                                                }
+                                            }
+                                        } else {
+                                            None
+                                        };
+
+                                    match self
+                                        .acp
+                                        .prompt_session(&session_generation_id, repair_req)
+                                        .await
+                                    {
+                                        Ok(repair_result) => {
+                                            output_contract_repair_turn_count += 1;
+                                            if p088_completion_eligible {
+                                                p088_completion_repair_text_capture = Some(
+                                                    repair_result.completion_text_capture.clone(),
+                                                );
+                                                p088_completion_repair_runtime_receipt =
+                                                    repair_result.runtime_receipt.clone();
+                                                if let Some(runtime_receipt) =
+                                                    repair_result.runtime_receipt.as_ref()
                                                 {
-                                                    p088_completion_repair_runtime_prompt_receipt =
+                                                    if let Ok(receipt_record) =
+                                                        runtime_prompt_receipt_record_from_receipt(
+                                                            agent_exec_id,
+                                                            runtime_receipt,
+                                                            chrono::Utc::now(),
+                                                            "code_writer_completion_repair",
+                                                            output_contract_repair_turn_count,
+                                                            "code_writer_completion_repair_v1",
+                                                            "1",
+                                                            &repair_prompt_text,
+                                                            "missing_required_outputs",
+                                                            p088_repair_prompt_artifact_path
+                                                                .as_deref(),
+                                                            p088_expected_output_snapshot
+                                                                .as_ref()
+                                                                .map(|snapshot| {
+                                                                    snapshot.0.as_str()
+                                                                }),
+                                                            p088_expected_output_snapshot
+                                                                .as_ref()
+                                                                .map(|snapshot| {
+                                                                    snapshot.1.as_str()
+                                                                }),
+                                                        )
+                                                    {
+                                                        p088_completion_repair_runtime_prompt_receipt =
                                                         Some(receipt_record.clone());
-                                                    if let Err(error) =
+                                                        if let Err(error) =
                                                     agent_execution_runtime_receipts::upsert_prompt_receipt(
                                                         &self.pool,
                                                         &receipt_record,
@@ -6242,12 +6386,53 @@ impl BackgroundExecutor {
                                                         "Failed to persist P088 completion repair runtime receipt"
                                                     );
                                                 }
+                                                    }
                                                 }
                                             }
-                                        }
-                                        let p088_completion_repair_mutation_failure =
-                                            if p088_completion_eligible && worktree_write_enabled {
-                                                match capture_worktree_fingerprint_v1(
+                                            if !p088_completion_eligible {
+                                                if let Some(runtime_receipt) =
+                                                    repair_result.runtime_receipt.as_ref()
+                                                {
+                                                    if let Ok(receipt_record) =
+                                                        runtime_prompt_receipt_record_from_receipt(
+                                                            agent_exec_id,
+                                                            runtime_receipt,
+                                                            chrono::Utc::now(),
+                                                            "output_contract_repair",
+                                                            output_contract_repair_turn_count,
+                                                            "output_contract_repair_v1",
+                                                            "1",
+                                                            &repair_prompt_text,
+                                                            "missing_required_outputs",
+                                                            None,
+                                                            None,
+                                                            None,
+                                                        )
+                                                    {
+                                                        if let Err(error) =
+                                                        agent_execution_runtime_receipts::upsert_prompt_receipt(
+                                                            &self.pool,
+                                                            &receipt_record,
+                                                        )
+                                                        .await
+                                                    {
+                                                        warn!(
+                                                            run_id = %run_id,
+                                                            stage_id = %stage_id,
+                                                            agent_id = %agent_id,
+                                                            agent_execution_id = %agent_exec_id,
+                                                            error = %error,
+                                                            "Failed to persist output contract repair runtime receipt"
+                                                        );
+                                                    }
+                                                    }
+                                                }
+                                            }
+                                            let p088_completion_repair_mutation_failure =
+                                                if p088_completion_eligible
+                                                    && worktree_write_enabled
+                                                {
+                                                    match capture_worktree_fingerprint_v1(
                                                     WorktreeFingerprintInput {
                                                         worktree_root: PathBuf::from(
                                                             &effective_working_directory,
@@ -6297,24 +6482,24 @@ impl BackgroundExecutor {
                                                         Some("completion_repair_mutation_guard_unavailable")
                                                     }
                                                 }
-                                            } else {
-                                                None
-                                            };
-                                        if let Some(failure_kind) =
-                                            p088_completion_repair_mutation_failure
-                                        {
-                                            p088_completion_turn_result =
-                                                Some(failure_kind.to_string());
-                                            warn!(
-                                                run_id = %run_id,
-                                                stage_id = %stage_id,
-                                                agent_id = %agent_id,
-                                                agent_execution_id = %agent_exec_id,
-                                                session_generation_id = %session_generation_id,
-                                                failure_kind,
-                                                "P088 completion repair rejected by mutation guard"
-                                            );
-                                            self.record_output_contract_repair_event(
+                                                } else {
+                                                    None
+                                                };
+                                            if let Some(failure_kind) =
+                                                p088_completion_repair_mutation_failure
+                                            {
+                                                p088_completion_turn_result =
+                                                    Some(failure_kind.to_string());
+                                                warn!(
+                                                    run_id = %run_id,
+                                                    stage_id = %stage_id,
+                                                    agent_id = %agent_id,
+                                                    agent_execution_id = %agent_exec_id,
+                                                    session_generation_id = %session_generation_id,
+                                                    failure_kind,
+                                                    "P088 completion repair rejected by mutation guard"
+                                                );
+                                                self.record_output_contract_repair_event(
                                             policy_decision.as_ref(),
                                             domain::session::SessionEventType::OutputContractRepairFailed,
                                             serde_json::json!({
@@ -6327,8 +6512,8 @@ impl BackgroundExecutor {
                                             &agent_id,
                                         )
                                         .await;
-                                            if p088_completion_eligible {
-                                                self.record_code_writer_completion_event(
+                                                if p088_completion_eligible {
+                                                    self.record_code_writer_completion_event(
                                                 policy_decision.as_ref(),
                                                 domain::session::SessionEventType::CodeWriterCompletionFailed,
                                                 serde_json::json!({
@@ -6343,23 +6528,23 @@ impl BackgroundExecutor {
                                                 &agent_id,
                                             )
                                             .await;
-                                            }
-                                        } else {
-                                            match Ok::<_, anyhow::Error>(
-                                                build_declared_output_discovery_settlement(
-                                                    &expected_outputs,
-                                                    &repair_result.discovered_artifacts,
-                                                    &repair_result.pre_prompt_expected_outputs,
-                                                ),
-                                            ) {
-                                                Ok(repair_settlement) => {
-                                                    let repair_captured =
+                                                }
+                                            } else {
+                                                match Ok::<_, anyhow::Error>(
+                                                    build_declared_output_discovery_settlement(
+                                                        &expected_outputs,
+                                                        &repair_result.discovered_artifacts,
+                                                        &repair_result.pre_prompt_expected_outputs,
+                                                    ),
+                                                ) {
+                                                    Ok(repair_settlement) => {
+                                                        let repair_captured =
                                                     build_captured_outputs_from_discovery_decisions(
                                                         &declared_outputs,
                                                         &repair_settlement.decisions,
                                                         &repair_settlement.accepted_payloads,
                                                     );
-                                                    let merged_repair_settlement =
+                                                        let merged_repair_settlement =
                                                         declared_output_settlement
                                                             .as_ref()
                                                             .map(|original_settlement| {
@@ -6371,20 +6556,20 @@ impl BackgroundExecutor {
                                                             .unwrap_or_else(|| {
                                                                 repair_settlement.clone()
                                                             });
-                                                    let merged_repair_captured =
-                                                        merge_repair_captured_outputs(
-                                                            &captured,
-                                                            &repair_captured,
+                                                        let merged_repair_captured =
+                                                            merge_repair_captured_outputs(
+                                                                &captured,
+                                                                &repair_captured,
+                                                            );
+                                                        let (
+                                                            repair_found_count,
+                                                            repair_missing_count,
+                                                            repair_stale_count,
+                                                            repair_rejected_count,
+                                                        ) = output_discovery_decision_counts(
+                                                            &repair_settlement.decisions,
                                                         );
-                                                    let (
-                                                        repair_found_count,
-                                                        repair_missing_count,
-                                                        repair_stale_count,
-                                                        repair_rejected_count,
-                                                    ) = output_discovery_decision_counts(
-                                                        &repair_settlement.decisions,
-                                                    );
-                                                    let repair_validation = self
+                                                        let repair_validation = self
                                                 .validate_task_outputs_with_conflict_resolution_context(
                                                     run_id,
                                                     &stage_id,
@@ -6392,12 +6577,12 @@ impl BackgroundExecutor {
                                                     &merged_repair_captured,
                                                 )
                                                 .await?;
-                                                    let staged_repair_materialization =
-                                                        if p090_staged_repair_settlement_enabled(
-                                                            &provider,
-                                                        ) && stage_execution_id.is_some()
-                                                        {
-                                                            Some(stage_p090_repair_materialization(
+                                                        let staged_repair_materialization =
+                                                            if p090_staged_repair_settlement_enabled(
+                                                                &provider,
+                                                            ) && stage_execution_id.is_some()
+                                                            {
+                                                                Some(stage_p090_repair_materialization(
                                                                 &run.artifact_root,
                                                                 run_id,
                                                                 &stage_id,
@@ -6421,48 +6606,51 @@ impl BackgroundExecutor {
                                                                 &repair_validation,
                                                                 chrono::Utc::now(),
                                                             )?)
-                                                        } else if repair_validation
-                                                            .failure_class
-                                                            .is_none()
-                                                        {
-                                                            materialize_validated_discovery_decisions(
+                                                            } else if repair_validation
+                                                                .failure_class
+                                                                .is_none()
+                                                            {
+                                                                materialize_validated_discovery_decisions(
                                                                 &declared_outputs,
                                                                 &repair_settlement,
                                                                 &repair_validation,
                                                             )?;
-                                                            None
-                                                        } else {
-                                                            None
-                                                        };
-                                                    let repair_materialized_partially =
-                                                        repair_validation.failure_class.is_some()
-                                                            && repair_found_count > 0;
-                                                    p090_staged_repair_materialization =
-                                                        staged_repair_materialization;
-                                                    declared_output_settlement =
-                                                        Some(merged_repair_settlement);
-                                                    if repair_validation.failure_class.is_none() {
-                                                        if p088_completion_eligible {
-                                                            p088_completion_turn_result =
-                                                                Some("succeeded".to_string());
-                                                        }
-                                                        merge_contract_repair_result(
-                                                            &mut result,
-                                                            repair_result,
-                                                        );
-                                                        info!(
-                                                            run_id = %run_id,
-                                                            stage_id = %stage_id,
-                                                            agent_id = %agent_id,
-                                                            agent_execution_id = %agent_exec_id,
-                                                            session_generation_id = %session_generation_id,
-                                                            repair_found_count,
-                                                            repair_missing_count,
-                                                            repair_stale_count,
-                                                            repair_rejected_count,
-                                                            "Output contract repair turn produced valid declared outputs"
-                                                        );
-                                                        self.record_output_contract_repair_event(
+                                                                None
+                                                            } else {
+                                                                None
+                                                            };
+                                                        let repair_materialized_partially =
+                                                            repair_validation
+                                                                .failure_class
+                                                                .is_some()
+                                                                && repair_found_count > 0;
+                                                        p090_staged_repair_materialization =
+                                                            staged_repair_materialization;
+                                                        declared_output_settlement =
+                                                            Some(merged_repair_settlement);
+                                                        if repair_validation.failure_class.is_none()
+                                                        {
+                                                            if p088_completion_eligible {
+                                                                p088_completion_turn_result =
+                                                                    Some("succeeded".to_string());
+                                                            }
+                                                            merge_contract_repair_result(
+                                                                &mut result,
+                                                                repair_result,
+                                                            );
+                                                            info!(
+                                                                run_id = %run_id,
+                                                                stage_id = %stage_id,
+                                                                agent_id = %agent_id,
+                                                                agent_execution_id = %agent_exec_id,
+                                                                session_generation_id = %session_generation_id,
+                                                                repair_found_count,
+                                                                repair_missing_count,
+                                                                repair_stale_count,
+                                                                repair_rejected_count,
+                                                                "Output contract repair turn produced valid declared outputs"
+                                                            );
+                                                            self.record_output_contract_repair_event(
                                                         policy_decision.as_ref(),
                                                         domain::session::SessionEventType::OutputContractRepairSucceeded,
                                                         serde_json::json!({
@@ -6478,8 +6666,8 @@ impl BackgroundExecutor {
                                                         &agent_id,
                                                     )
                                                     .await;
-                                                        if p088_completion_eligible {
-                                                            self.record_code_writer_completion_event(
+                                                            if p088_completion_eligible {
+                                                                self.record_code_writer_completion_event(
                                                             policy_decision.as_ref(),
                                                             domain::session::SessionEventType::CodeWriterCompletionSucceeded,
                                                             serde_json::json!({
@@ -6497,37 +6685,38 @@ impl BackgroundExecutor {
                                                             &agent_id,
                                                         )
                                                         .await;
-                                                        }
-                                                    } else {
-                                                        if p088_completion_eligible {
-                                                            p088_completion_turn_result = Some(
-                                                                if repair_materialized_partially {
-                                                                    "partial_outputs_materialized_missing_outputs".to_string()
-                                                                } else {
-                                                                    "failed_missing_outputs"
-                                                                        .to_string()
-                                                                },
+                                                            }
+                                                        } else {
+                                                            if p088_completion_eligible {
+                                                                p088_completion_turn_result = Some(
+                                                                    if repair_materialized_partially
+                                                                    {
+                                                                        "partial_outputs_materialized_missing_outputs".to_string()
+                                                                    } else {
+                                                                        "failed_missing_outputs"
+                                                                            .to_string()
+                                                                    },
+                                                                );
+                                                            }
+                                                            let repair_failed_outputs =
+                                                                failed_output_validation_details(
+                                                                    &repair_validation,
+                                                                );
+                                                            warn!(
+                                                                run_id = %run_id,
+                                                                stage_id = %stage_id,
+                                                                agent_id = %agent_id,
+                                                                agent_execution_id = %agent_exec_id,
+                                                                session_generation_id = %session_generation_id,
+                                                                repair_found_count,
+                                                                repair_missing_count,
+                                                                repair_stale_count,
+                                                                repair_rejected_count,
+                                                                failed_output_count = repair_failed_outputs.len(),
+                                                                failure = ?repair_validation.failure_summary,
+                                                                "Output contract repair turn did not produce valid declared outputs"
                                                             );
-                                                        }
-                                                        let repair_failed_outputs =
-                                                            failed_output_validation_details(
-                                                                &repair_validation,
-                                                            );
-                                                        warn!(
-                                                            run_id = %run_id,
-                                                            stage_id = %stage_id,
-                                                            agent_id = %agent_id,
-                                                            agent_execution_id = %agent_exec_id,
-                                                            session_generation_id = %session_generation_id,
-                                                            repair_found_count,
-                                                            repair_missing_count,
-                                                            repair_stale_count,
-                                                            repair_rejected_count,
-                                                            failed_output_count = repair_failed_outputs.len(),
-                                                            failure = ?repair_validation.failure_summary,
-                                                            "Output contract repair turn did not produce valid declared outputs"
-                                                        );
-                                                        self.record_output_contract_repair_event(
+                                                            self.record_output_contract_repair_event(
                                                         policy_decision.as_ref(),
                                                         domain::session::SessionEventType::OutputContractRepairFailed,
                                                         serde_json::json!({
@@ -6546,8 +6735,8 @@ impl BackgroundExecutor {
                                                         &agent_id,
                                                     )
                                                     .await;
-                                                        if p088_completion_eligible {
-                                                            self.record_code_writer_completion_event(
+                                                            if p088_completion_eligible {
+                                                                self.record_code_writer_completion_event(
                                                             policy_decision.as_ref(),
                                                             domain::session::SessionEventType::CodeWriterCompletionFailed,
                                                             serde_json::json!({
@@ -6568,25 +6757,26 @@ impl BackgroundExecutor {
                                                             &agent_id,
                                                         )
                                                         .await;
+                                                            }
                                                         }
                                                     }
-                                                }
-                                                Err(error) => {
-                                                    if p088_completion_eligible {
-                                                        p088_completion_turn_result = Some(
-                                                            "failed_missing_outputs".to_string(),
+                                                    Err(error) => {
+                                                        if p088_completion_eligible {
+                                                            p088_completion_turn_result = Some(
+                                                                "failed_missing_outputs"
+                                                                    .to_string(),
+                                                            );
+                                                        }
+                                                        warn!(
+                                                            run_id = %run_id,
+                                                            stage_id = %stage_id,
+                                                            agent_id = %agent_id,
+                                                            agent_execution_id = %agent_exec_id,
+                                                            session_generation_id = %session_generation_id,
+                                                            error = %error,
+                                                            "Output contract repair settlement failed"
                                                         );
-                                                    }
-                                                    warn!(
-                                                        run_id = %run_id,
-                                                        stage_id = %stage_id,
-                                                        agent_id = %agent_id,
-                                                        agent_execution_id = %agent_exec_id,
-                                                        session_generation_id = %session_generation_id,
-                                                        error = %error,
-                                                        "Output contract repair settlement failed"
-                                                    );
-                                                    self.record_output_contract_repair_event(
+                                                        self.record_output_contract_repair_event(
                                                     policy_decision.as_ref(),
                                                     domain::session::SessionEventType::OutputContractRepairFailed,
                                                     serde_json::json!({
@@ -6600,8 +6790,8 @@ impl BackgroundExecutor {
                                                     &agent_id,
                                                 )
                                                 .await;
-                                                    if p088_completion_eligible {
-                                                        self.record_code_writer_completion_event(
+                                                        if p088_completion_eligible {
+                                                            self.record_code_writer_completion_event(
                                                         policy_decision.as_ref(),
                                                         domain::session::SessionEventType::CodeWriterCompletionFailed,
                                                         serde_json::json!({
@@ -6617,26 +6807,26 @@ impl BackgroundExecutor {
                                                         &agent_id,
                                                     )
                                                     .await;
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
-                                    }
-                                    Err(error) => {
-                                        if p088_completion_eligible {
-                                            p088_completion_turn_result =
-                                                Some("failed_missing_outputs".to_string());
-                                        }
-                                        warn!(
-                                            run_id = %run_id,
-                                            stage_id = %stage_id,
-                                            agent_id = %agent_id,
-                                            agent_execution_id = %agent_exec_id,
-                                            session_generation_id = %session_generation_id,
-                                            error = %error,
-                                            "Output contract repair turn failed"
-                                        );
-                                        self.record_output_contract_repair_event(
+                                        Err(error) => {
+                                            if p088_completion_eligible {
+                                                p088_completion_turn_result =
+                                                    Some("failed_missing_outputs".to_string());
+                                            }
+                                            warn!(
+                                                run_id = %run_id,
+                                                stage_id = %stage_id,
+                                                agent_id = %agent_id,
+                                                agent_execution_id = %agent_exec_id,
+                                                session_generation_id = %session_generation_id,
+                                                error = %error,
+                                                "Output contract repair turn failed"
+                                            );
+                                            self.record_output_contract_repair_event(
                                         policy_decision.as_ref(),
                                         domain::session::SessionEventType::OutputContractRepairFailed,
                                         serde_json::json!({
@@ -6650,8 +6840,8 @@ impl BackgroundExecutor {
                                         &agent_id,
                                     )
                                     .await;
-                                        if p088_completion_eligible {
-                                            self.record_code_writer_completion_event(
+                                            if p088_completion_eligible {
+                                                self.record_code_writer_completion_event(
                                             policy_decision.as_ref(),
                                             domain::session::SessionEventType::CodeWriterCompletionFailed,
                                             serde_json::json!({
@@ -6667,22 +6857,22 @@ impl BackgroundExecutor {
                                             &agent_id,
                                         )
                                         .await;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        } else {
-                            if p088_code_writer_completion_candidate {
-                                p088_completion_turn_result =
-                                    Some("skipped_no_live_session".to_string());
-                            }
-                            warn!(
-                                run_id = %run_id,
-                                stage_id = %stage_id,
-                                agent_id = %agent_id,
-                                "Output contract repair skipped because no live session generation is available"
-                            );
-                            self.record_output_contract_repair_event(
+                            } else {
+                                if p088_code_writer_completion_candidate {
+                                    p088_completion_turn_result =
+                                        Some("skipped_no_live_session".to_string());
+                                }
+                                warn!(
+                                    run_id = %run_id,
+                                    stage_id = %stage_id,
+                                    agent_id = %agent_id,
+                                    "Output contract repair skipped because no live session generation is available"
+                                );
+                                self.record_output_contract_repair_event(
                                 policy_decision.as_ref(),
                                 domain::session::SessionEventType::OutputContractRepairSkipped,
                                 serde_json::json!({
@@ -6695,6 +6885,7 @@ impl BackgroundExecutor {
                                 &agent_id,
                             )
                             .await;
+                            }
                         }
                     }
                 }
@@ -14874,6 +15065,43 @@ mod tests {
     }
 
     #[test]
+    fn provider_quota_prompt_error_skips_output_contract_repair() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 1,
+                session_update_count: 0,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 0,
+                unknown_notification_count: 0,
+            },
+            Some("provider_quota"),
+        );
+        receipt.provider = "gemini".into();
+        receipt.provider_error_message_redacted =
+            Some("You have exhausted your capacity on this model.".into());
+
+        let classification = output_contract_repair_skip_classification(
+            &AgentStatus::Failed,
+            Some("ACP session/prompt error: You have exhausted your capacity on this model."),
+            Some(&receipt),
+        )
+        .expect("provider quota should skip output contract repair");
+
+        assert_eq!(classification.failure_kind, AgentFailureKind::ProviderQuota);
+        assert_eq!(
+            classification.operator_action_hint,
+            OperatorActionHint::WaitUntilRetryAfter
+        );
+    }
+
+    #[test]
     fn acp_initialize_runtime_facts_keep_redacted_error_chain_detail() {
         let error = anyhow::anyhow!(
             "JsonRpc error -32000: Directory does not exist: /workspace/.chainworks/runs/run-1 token=abc123"
@@ -14913,6 +15141,8 @@ mod tests {
             session_generation_id: Some("generation-1".into()),
             status: "failed".into(),
             failure_phase: failure_phase.map(str::to_string),
+            jsonrpc_error_code: None,
+            provider_error_message_redacted: None,
             started_at: "2026-05-10T04:35:44Z".into(),
             completed_at: Some("2026-05-10T04:41:06Z".into()),
             xcode_shim_injected: false,

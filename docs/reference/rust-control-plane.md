@@ -120,7 +120,7 @@ for the full authentication and capability filtering reference.
 Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`, `storageHealth`.
 
 **Storage Health Readback:**
-The `storageHealth` query exposes the current health state of the storage subsystem, including `DbWriter`, WAL, projections, evidence spool, and freshness details, aligning with the P087 proposal for local storage tiering and read-path liveness. Specifically, it now exposes identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `projectionFreshness` and `projectionFreshnessBySource`.
+The `storageHealth` query exposes the current health state of the storage subsystem, including `DbWriter`, WAL, projections, evidence spool, and freshness details for the implemented local storage tiering and read-path liveness contract. It preserves the legacy `projections` field and exposes identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `projectionFreshness` and `projectionFreshnessBySource`.
 
 **Implementation self-assessment summary extension:**
 The `Run` type includes a nullable `implementationSelfAssessmentSummary` field that exposes structured assessment truth (status, verification, code tasks, handoff tasks) without requiring raw artifact parsing.
@@ -673,6 +673,7 @@ migrated to a general owner model:
 | `session_lineages` | Session reuse/reset metadata per agent |
 | `agent_execution_runtime_facts` | Durable provider-independent execution truth |
 | `artifact_source_claims` | CAS-backed ownership for artifact generation |
+| `retry_payload_recovery_events` | Durable targeted-retry payload recovery diagnostics and repair evidence |
 
 ### Projection rebuild
 
@@ -738,6 +739,53 @@ Startup repair is controlled by two environment variables:
 - `CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR=1` disables mutation and records disabled readback.
 
 Each startup repair pass writes `p091_orphan_repair_passes` with mode, kill-switch state, candidate/exclusion/repair counts, and bounded samples. Public readback surfaces those counters through `p091_orphan_repair_readback`; the retained counter vocabulary includes `p091_orphan_repair_candidates_total`. The retained gate alias `./scripts/test-gate.sh proposal-091` proves the evidence fixture, typed payload parser, DB authority repository, work-item semantics, runtime settlement, recovery exclusions, GraphQL readback, and MCP `retryAuthorityHistory` readback.
+
+### Retry payload target invariants and recovery
+
+Targeted retry `InvokeAgent` payloads keep current routing and source provenance separate. Top-level routing fields describe the current run, stage, stage execution, target stage execution, and retry authority only. Older failed attempts remain provenance under `targeted_retry.source_stage_execution_id`, `targeted_retry.source_agent_execution_id`, and `targeted_retry.source_work_item_id`; those source fields never select the current target during completion.
+
+All targeted retry producers use the shared sanitizer in `domain::retry_authority::sanitize_targeted_retry_invoke_payload` before enqueueing an invoke. This covers auto-contract output retry and operator targeted retry. The sanitizer clears stale settlement/routing fields (`p058_claimed`, stale `target_stage_execution_id`, top-level source fields, and prior `retry_authority_id`) before writing the current target and authority.
+
+Post-invoke completion is authority/current-truth driven:
+
+- if `retry_authority_id` is present, the active authority row is loaded by id;
+- the authority target is the current target stage execution;
+- `stage_execution_id` and `target_stage_execution_id` must match the authority target or be backfilled from it;
+- `p058_claimed.agent_execution_id` is the current completed-agent truth when present;
+- `targeted_retry.source_*` is copied as diagnostics/provenance only.
+
+Contradictions fail closed with typed recovery events. A claimed agent on a different stage records `retry_authority_target_agent_stage_mismatch`; a targeted invoke with no active authority or no current completed-agent truth records `retry_authority_missing_for_targeted_invoke` and does not enqueue post-invoke advance.
+
+The recovery service handles the valid stranded retry shape directly. A candidate is a running `InvokeAgent` with active retry authority, a running authority target stage, a completed agent execution on that target, and runtime facts showing valid required outputs. Startup recovery runs this check before generic abandoned-invoke requeue so a valid completed retry is not converted into blind retry work. The daemon watchdog runs the same reconciliation after stale `AdvanceRun` inspection and before degraded-state reporting.
+
+Runtime controls:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE` | `diagnostic` | Retained historical alias name; `diagnostic` records candidates without mutation; `enforce` repairs through normal invoke completion. |
+| `CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED` | unset / false | Retained historical alias name; disables mutation while still recording readback diagnostics. |
+| `CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_BATCH_LIMIT` | `20` | Retained historical alias name; caps live recovery candidates per watchdog tick; accepted values are clamped to 1..100. |
+
+Recovery events are stored in `retry_payload_recovery_events` using an idempotency key derived from `(run_id, invoke_work_item_id, retry_authority_id, completed_agent_execution_id)`. Diagnostic rows can be promoted by enforce-mode repair without creating duplicate rows. Event JSON separates:
+
+- `current_json`: run, invoke work item, target stage execution, retry authority, completed agent;
+- `provenance_json`: source stage, source agent, and source work item;
+- `repaired_fields_json`: stale fields corrected or that would be corrected;
+- `diagnostic_json`: bounded counters such as `candidates_total`, `repaired_total`, `excluded_total`, disabled state, and fail-closed metadata.
+
+GraphQL attaches the latest durable event to `Run.retryAuthorityJson.retry_payload_recovery` and per-history rows in `Run.retryAuthorityHistoryJson[].retry_payload_recovery`. MCP `runs.get` exposes `retry_authority.retry_payload_recovery`; MCP `reports.get` and run report JSON expose both `retryPayloadRecovery` and `retry_payload_recovery` on current/history authority objects. Missing-authority hard mismatch rows are represented as history entries with `authority_state = missing_authority` rather than as an active current authority.
+
+Recognized retry payload recovery reason codes are:
+
+- `retry_payload_stale_target_stage_repaired`
+- `retry_payload_source_provenance_ignored_for_target`
+- `valid_retry_invoke_completion_recovered`
+- `retry_authority_target_agent_stage_mismatch`
+- `retry_authority_missing_for_targeted_invoke`
+
+Unknown reason codes round-trip in readback with `unknown_reason_code = true`.
+
+The retained historical alias `./scripts/test-gate.sh proposal-092` / `p092` proves the sanitizer, post-invoke fail-closed paths, recovery event storage, configurable live batch limit, disabled/excluded diagnostics, startup diagnostic/enforce behavior, GraphQL/MCP missing-authority readback, and daemon live-hook compilation. The retired proposal document is not the operational source of truth.
 
 ## Capacity-aware Scheduling
 

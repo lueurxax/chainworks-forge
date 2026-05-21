@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -12,8 +12,9 @@ use tracing::{info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts,
-    code_writer_completion_receipts, projections, retry_stage_execution_authorities, runs,
-    sessions, side_effects, stages, startup_repairs, work_items, workflow_conflicts,
+    code_writer_completion_receipts, projections, retry_payload_recovery_events,
+    retry_stage_execution_authorities, runs, sessions, side_effects, stages, startup_repairs,
+    work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
@@ -25,7 +26,7 @@ use domain::code_writer_completion::{
     CodeWriterCompletionTextCaptureRecord,
 };
 use domain::provider::InvokeAgentCapacityConfig;
-use domain::retry_authority::RetryAuthorityState;
+use domain::retry_authority::{RetryAuthorityState, RetryPayloadRecoveryEvent};
 use domain::run::Run;
 use domain::stage::{StageSettlementKind, StageStatus};
 use sqlx::Row;
@@ -39,6 +40,92 @@ pub struct RecoveryService {
     #[allow(dead_code)]
     events: EventSender,
     db_writer: Arc<DbWriter>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum P092RecoveryMode {
+    Diagnostic,
+    Enforce,
+}
+
+impl P092RecoveryMode {
+    fn from_env() -> Self {
+        match std::env::var("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE")
+            .unwrap_or_else(|_| "diagnostic".to_string())
+            .as_str()
+        {
+            "enforce" => Self::Enforce,
+            _ => Self::Diagnostic,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Diagnostic => "diagnostic",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+struct P092RecoverySummary {
+    candidates: usize,
+    excluded: usize,
+    repaired: usize,
+    mode: &'static str,
+    disabled: bool,
+}
+
+fn p092_recovery_disabled() -> bool {
+    std::env::var("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn p092_recovery_batch_limit() -> usize {
+    std::env::var("CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_BATCH_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(100))
+        .unwrap_or(20)
+}
+
+fn p092_stale_payload_fields(
+    payload_target_stage_execution_id: Option<&str>,
+    current_target_stage_execution_id: &str,
+    top_source_stage_execution_id: Option<&str>,
+    top_source_agent_execution_id: Option<&str>,
+    top_source_work_item_id: Option<&str>,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if payload_target_stage_execution_id
+        .is_some_and(|value| value != current_target_stage_execution_id)
+    {
+        fields.push("target_stage_execution_id");
+    }
+    if top_source_stage_execution_id.is_some() {
+        fields.push("source_stage_execution_id");
+    }
+    if top_source_agent_execution_id.is_some() {
+        fields.push("source_agent_execution_id");
+    }
+    if top_source_work_item_id.is_some() {
+        fields.push("source_work_item_id");
+    }
+    fields
+}
+
+fn p092_recovery_reason_code(stale_fields: &[&'static str]) -> &'static str {
+    if stale_fields.contains(&"target_stage_execution_id") {
+        "retry_payload_stale_target_stage_repaired"
+    } else if stale_fields
+        .iter()
+        .any(|field| field.starts_with("source_"))
+    {
+        "retry_payload_source_provenance_ignored_for_target"
+    } else {
+        "valid_retry_invoke_completion_recovered"
+    }
 }
 
 #[cfg(test)]
@@ -414,7 +501,35 @@ impl RecoveryService {
                 "Startup recovery settled terminal preclaimed InvokeAgent executions"
             );
         }
+        let mut p092_recovered = 0usize;
         for run in &active_runs {
+            match self
+                .recover_p092_retry_payload_candidates_for_run(run, p092_recovery_batch_limit())
+                .await
+            {
+                Ok(summary) => {
+                    if summary.candidates > 0 {
+                        p092_recovered += summary.repaired;
+                        work_items_requeued += summary.repaired;
+                        warn!(
+                            run_id = %run.id,
+                            candidates = summary.candidates,
+                            excluded = summary.excluded,
+                            repaired = summary.repaired,
+                            mode = %summary.mode,
+                            disabled = summary.disabled,
+                            "Startup recovery inspected P092 retry payload recovery candidates"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run.id,
+                        error = %e,
+                        "Failed to inspect P092 retry payload recovery candidates during startup"
+                    );
+                }
+            }
             match self
                 .repair_auto_contract_retry_authority_gaps_for_run(run)
                 .await
@@ -520,6 +635,9 @@ impl RecoveryService {
                 requeued = requeued_invoke_agents,
                 "Startup recovery requeued abandoned InvokeAgent work items"
             );
+        }
+        if p092_recovered > 0 {
+            self.work_queue.refresh_scheduler_projection().await?;
         }
 
         for run in &active_runs {
@@ -708,6 +826,25 @@ impl RecoveryService {
         })
     }
 
+    pub async fn run_p092_retry_payload_recovery_for_active_runs(&self) -> Result<usize> {
+        let mut repaired = 0usize;
+        let mut remaining = p092_recovery_batch_limit();
+        for run in runs::list_active(&self.pool).await? {
+            if remaining == 0 {
+                break;
+            }
+            let summary = self
+                .recover_p092_retry_payload_candidates_for_run(&run, remaining)
+                .await?;
+            repaired += summary.repaired;
+            remaining = remaining.saturating_sub(summary.candidates);
+        }
+        if repaired > 0 {
+            self.work_queue.refresh_scheduler_projection().await?;
+        }
+        Ok(repaired)
+    }
+
     pub async fn repair_stale_invoke_agent_startups(
         &self,
         now: DateTime<Utc>,
@@ -831,6 +968,239 @@ impl RecoveryService {
         Ok(recovered)
     }
 
+    async fn recover_p092_retry_payload_candidates_for_run(
+        &self,
+        run: &Run,
+        batch_limit: usize,
+    ) -> Result<P092RecoverySummary> {
+        let mode = P092RecoveryMode::from_env();
+        let disabled = p092_recovery_disabled();
+        let rows = sqlx::query(
+            r#"
+            SELECT wi.id AS invoke_work_item_id,
+                   wi.payload_json,
+                   wi.stage_id AS work_stage_id,
+                   auth.id AS retry_authority_id,
+                   auth.stage_id AS authority_stage_id,
+                   auth.target_stage_execution_id,
+                   ae.id AS completed_agent_execution_id,
+                   json_extract(wi.payload_json, '$.target_stage_execution_id') AS payload_target_stage_execution_id,
+                   json_extract(wi.payload_json, '$.source_stage_execution_id') AS top_source_stage_execution_id,
+                   json_extract(wi.payload_json, '$.source_agent_execution_id') AS top_source_agent_execution_id,
+                   json_extract(wi.payload_json, '$.source_work_item_id') AS top_source_work_item_id,
+                   json_extract(wi.payload_json, '$.targeted_retry.source_stage_execution_id') AS nested_source_stage_execution_id,
+                   json_extract(wi.payload_json, '$.targeted_retry.source_agent_execution_id') AS nested_source_agent_execution_id,
+                   json_extract(wi.payload_json, '$.targeted_retry.source_work_item_id') AS nested_source_work_item_id
+            FROM work_items wi
+            JOIN retry_stage_execution_authorities auth
+              ON auth.run_id = wi.run_id
+             AND auth.authority_state = 'active'
+             AND (
+                 auth.id = json_extract(wi.payload_json, '$.retry_authority_id')
+              OR auth.id = json_extract(wi.payload_json, '$.targeted_retry.retry_authority_id')
+              OR auth.source_invoke_work_item_id = wi.id
+              OR auth.target_stage_execution_id = json_extract(wi.payload_json, '$.stage_execution_id')
+              OR auth.target_stage_execution_id = json_extract(wi.payload_json, '$.target_stage_execution_id')
+             )
+            JOIN stage_executions se
+              ON se.id = auth.target_stage_execution_id
+             AND se.status = 'running'
+            JOIN agent_executions ae
+              ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+             AND ae.stage_execution_id = auth.target_stage_execution_id
+             AND ae.status = 'completed'
+            JOIN agent_execution_runtime_facts facts
+              ON facts.agent_execution_id = ae.id
+             AND facts.output_settlement IN ('valid_outputs_from_completed_execution', 'valid_outputs_from_failed_execution')
+             AND COALESCE(facts.valid_required_outputs, 0) > 0
+            WHERE wi.run_id = ?1
+              AND wi.kind = 'invoke_agent'
+              AND wi.status = 'running'
+            ORDER BY wi.scheduled_at ASC, wi.rowid ASC
+            LIMIT ?2
+            "#,
+        )
+        .bind(run.id.to_string())
+        .bind(batch_limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("select P092 retry payload recovery candidates")?;
+
+        let candidate_count = rows.len();
+        let mut summary = P092RecoverySummary {
+            candidates: candidate_count,
+            excluded: if disabled { candidate_count } else { 0 },
+            repaired: 0,
+            mode: mode.as_str(),
+            disabled,
+        };
+        for row in rows {
+            let invoke_work_item_id: String = row.get("invoke_work_item_id");
+            let retry_authority_id: String = row.get("retry_authority_id");
+            let target_stage_execution_id_raw: String = row.get("target_stage_execution_id");
+            let completed_agent_execution_id: String = row.get("completed_agent_execution_id");
+            let target_stage_execution_id = target_stage_execution_id_raw
+                .parse()
+                .context("parse P092 target stage execution id")?;
+            let payload_json: String = row.get("payload_json");
+            let payload = serde_json::from_str::<serde_json::Value>(&payload_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let payload_target: Option<String> = row.get("payload_target_stage_execution_id");
+            let top_source_stage: Option<String> = row.get("top_source_stage_execution_id");
+            let top_source_agent: Option<String> = row.get("top_source_agent_execution_id");
+            let top_source_work_item: Option<String> = row.get("top_source_work_item_id");
+            let nested_source_stage: Option<String> = row.get("nested_source_stage_execution_id");
+            let nested_source_agent: Option<String> = row.get("nested_source_agent_execution_id");
+            let nested_source_work_item: Option<String> = row.get("nested_source_work_item_id");
+            let stale_fields = p092_stale_payload_fields(
+                payload_target.as_deref(),
+                &target_stage_execution_id_raw,
+                top_source_stage.as_deref(),
+                top_source_agent.as_deref(),
+                top_source_work_item.as_deref(),
+            );
+            let provenance = serde_json::json!({
+                "source_stage_execution_id": nested_source_stage.or(top_source_stage),
+                "source_agent_execution_id": nested_source_agent.or(top_source_agent),
+                "source_work_item_id": nested_source_work_item.or(top_source_work_item),
+            });
+            let now = Utc::now();
+            let idempotency_key = format!(
+                "p092:{}:{}:{}:{}",
+                run.id, invoke_work_item_id, retry_authority_id, completed_agent_execution_id
+            );
+            let event = RetryPayloadRecoveryEvent {
+                idempotency_key,
+                run_id: run.id,
+                invoke_work_item_id: invoke_work_item_id.clone(),
+                retry_authority_id: Some(retry_authority_id.clone()),
+                target_stage_execution_id: Some(target_stage_execution_id),
+                completed_agent_execution_id: Some(completed_agent_execution_id.clone()),
+                reason_code: p092_recovery_reason_code(&stale_fields).to_string(),
+                mode: mode.as_str().to_string(),
+                repaired: false,
+                current_json: serde_json::json!({
+                    "run_id": run.id.to_string(),
+                    "target_stage_execution_id": target_stage_execution_id_raw,
+                    "retry_authority_id": retry_authority_id,
+                    "completed_agent_execution_id": completed_agent_execution_id,
+                    "invoke_work_item_id": invoke_work_item_id,
+                }),
+                provenance_json: Some(provenance),
+                repaired_fields_json: Some(serde_json::Value::Array(
+                    stale_fields
+                        .iter()
+                        .map(|field| serde_json::Value::String((*field).to_string()))
+                        .collect(),
+                )),
+                diagnostic_json: Some(serde_json::json!({
+                    "would_repair": !disabled,
+                    "disabled": if disabled { 1 } else { 0 },
+                    "candidates_total": candidate_count,
+                    "excluded_total": if disabled { candidate_count } else { 0 },
+                    "repaired_total": 0,
+                    "payload_was_object": payload.is_object(),
+                })),
+                created_at: now,
+                updated_at: now,
+            };
+            retry_payload_recovery_events::upsert(&self.pool, &event).await?;
+            if matches!(mode, P092RecoveryMode::Enforce) && !disabled {
+                self.repair_p092_invoke_payload_and_complete(
+                    &event.invoke_work_item_id,
+                    &event.current_json,
+                    event.provenance_json.as_ref(),
+                )
+                .await?;
+                let mut repaired_event = event;
+                repaired_event.repaired = true;
+                repaired_event.updated_at = Utc::now();
+                retry_payload_recovery_events::upsert(&self.pool, &repaired_event).await?;
+                summary.repaired += 1;
+            }
+        }
+        Ok(summary)
+    }
+
+    async fn repair_p092_invoke_payload_and_complete(
+        &self,
+        invoke_work_item_id: &str,
+        current: &serde_json::Value,
+        provenance: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        let mut tx = self
+            .begin_transaction(
+                "recovery.P092RetryPayloadRepair",
+                format!("recovery.P092RetryPayloadRepair:{invoke_work_item_id}"),
+            )
+            .await?;
+        let row =
+            sqlx::query("SELECT payload_json FROM work_items WHERE id = ?1 AND status = 'running'")
+                .bind(invoke_work_item_id)
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("P092 candidate {invoke_work_item_id} is no longer running")
+                })?;
+        let payload_json: String = row.get("payload_json");
+        let mut payload = serde_json::from_str::<serde_json::Value>(&payload_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let object = payload
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("P092 candidate {invoke_work_item_id} payload is not object"))?;
+        object.remove("source_stage_execution_id");
+        object.remove("source_agent_execution_id");
+        object.remove("source_work_item_id");
+        object.insert("run_id".to_string(), current["run_id"].clone());
+        object.insert(
+            "stage_execution_id".to_string(),
+            current["target_stage_execution_id"].clone(),
+        );
+        object.insert(
+            "target_stage_execution_id".to_string(),
+            current["target_stage_execution_id"].clone(),
+        );
+        object.insert(
+            "retry_authority_id".to_string(),
+            current["retry_authority_id"].clone(),
+        );
+        let mut targeted_retry = object
+            .remove("targeted_retry")
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        targeted_retry.insert(
+            "retry_authority_id".to_string(),
+            current["retry_authority_id"].clone(),
+        );
+        targeted_retry.insert(
+            "target_stage_execution_id".to_string(),
+            current["target_stage_execution_id"].clone(),
+        );
+        if let Some(provenance) = provenance {
+            for key in [
+                "source_stage_execution_id",
+                "source_agent_execution_id",
+                "source_work_item_id",
+            ] {
+                if !provenance[key].is_null() {
+                    targeted_retry.insert(key.to_string(), provenance[key].clone());
+                }
+            }
+        }
+        object.insert(
+            "targeted_retry".to_string(),
+            serde_json::Value::Object(targeted_retry),
+        );
+        sqlx::query("UPDATE work_items SET payload_json = ?1 WHERE id = ?2 AND status = 'running'")
+            .bind(serde_json::to_string(&payload)?)
+            .bind(invoke_work_item_id)
+            .execute(&mut **tx)
+            .await?;
+        tx.commit().await?;
+        self.work_queue.complete(invoke_work_item_id).await?;
+        Ok(())
+    }
+
     async fn repair_auto_contract_retry_authority_gaps_for_run(&self, run: &Run) -> Result<usize> {
         let rows = sqlx::query(
             r#"
@@ -847,6 +1217,14 @@ impl RecoveryService {
                   AND status = 'running'
                   AND id LIKE 'auto-contract-output-retry:%'
                   AND json_extract(payload_json, '$.targeted_retry.reason') = 'auto_contract_output_retry'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM retry_payload_recovery_events p092
+                      WHERE p092.invoke_work_item_id = work_items.id
+                        AND p092.mode = 'diagnostic'
+                        AND p092.repaired = 0
+                        AND COALESCE(json_extract(p092.diagnostic_json, '$.disabled'), 0) = 0
+                  )
             )
             SELECT c.id,
                    c.payload_json,

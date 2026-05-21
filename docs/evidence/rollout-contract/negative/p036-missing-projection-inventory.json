@@ -1,39 +1,74 @@
 {
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative:missing_projection_inventory",
   "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
   "gate_aliases": [
     "proposal-036",
     "p036"
   ],
-  "hold_conditions": [
-    "placeholder negative fixture"
+  "decision_vocabulary": [
+    "pass",
+    "fail"
   ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
+  "commands": {
+    "allowlist": [
+      "./scripts/test-gate.sh proposal-036",
+      "./scripts/test-gate.sh p036"
+    ]
   },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
+  "projection_inventory": {
+    "path": "docs/reference/macos-operator-navigation.md",
+    "required_surfaces": [
+      "runs_home",
+      "run_detail",
+      "inline_approvals",
+      "timeline",
+      "settings_readiness"
+    ],
+    "observed_surfaces": [
+      "runs_home",
+      "run_detail",
+      "inline_approvals"
+    ],
+    "missing_governed_fields": [
+      "timeline.entries.kind",
+      "timeline.entries.collapsed",
+      "settings.provider_health.active_count",
+      "settings.system_readiness.capabilities_status"
+    ]
+  },
+  "hold_conditions": [
+    "projection_inventory_missing_required_surface",
+    "projection_inventory_missing_governed_field"
+  ],
+  "expected_decision": "fail",
+  "metrics": {
+    "adoption_metric": "p036_operator_navigation_completion_rate",
+    "guardrail_metrics": [
+      "p036_projection_gap_deferred_total",
+      "p036_artifact_payload_state_total"
+    ]
   },
   "operator_report_fields": [
-    "rollout_contract_status"
+    "rollout_contract_status",
+    "p036_projection_inventory_summary"
   ],
-  "placeholder_fixture_kind": "negative:missing_projection_inventory",
   "readback_fields": [
-    "rollout_contract_status"
+    "rollout_contract_status",
+    "p036_projection_inventory_summary"
   ],
   "readback_lanes": [
-    "run_report"
+    "run_report",
+    "mcp",
+    "release_receipt",
+    "graphql"
   ],
   "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
+    "mode": "diagnostic_hold",
+    "data_loss_risk": "none"
   },
-  "schema_version": "rollout_contract_v1"
+  "migrations": {
+    "not_applicable": true,
+    "justification": "P036 projection inventory is documentation/evidence only; this fixture validates that incomplete inventory fails rollout readiness."
+  }
 }

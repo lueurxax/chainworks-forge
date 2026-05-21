@@ -61,7 +61,7 @@ Implemented readability fixes include:
 Implemented hierarchy/state work includes:
 
 - structured provider settings rather than one undifferentiated settings wall,
-- System Readiness summary treatment (formerly Pilot Readiness; relocated under Settings per Proposal 036),
+- System Readiness summary treatment (formerly Pilot Readiness; now under Settings in the consolidated operator shell),
 - step-oriented first-run setup presentation,
 - visible journey/probing feedback in provider diagnostics and setup,
 - surface-local loading, success, and retry copy for bounded async actions.
@@ -129,7 +129,7 @@ These surfaces now define the stable proof-owning UI quality baseline:
 | `IdeaListView` | Preview + min-window proof | summary chips, ideas density, selection readability |
 | `NewIdeaSheetView` | Preview | form structure and local validation treatment |
 | `ProviderSettingsView` | Preview + provider gate | hierarchy and inline async feedback |
-| `SettingsView` System Readiness segment | Preview + provider gate | verdict summary and grouped readiness state (proposal-036 successor to the former `PilotReadinessView`) |
+| `SettingsView` System Readiness segment | Preview + provider gate | verdict summary and grouped readiness state (successor to the former `PilotReadinessView`) |
 | `FirstRunSetupWizard` | Preview + interaction/runtime proof | steps, validation, launch feedback |
 | `ArchivedIdeasView` | Preview | empty-state/readability consistency |
 | `DeliveryPreflightReportView` | Preview + adopter-slice accessibility proof | positive and negative status rendering |

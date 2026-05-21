@@ -169,6 +169,46 @@ pub struct GqlAgentExecution {
     pub actual_toolchain_mapping_diagnostics: GqlToolchainMappingDiagnostics,
 }
 
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "RunStageTopologyOccurrence", rename_fields = "camelCase")]
+pub struct GqlRunStageTopologyOccurrence {
+    pub agent_id: String,
+    pub agent_title: String,
+    pub task_name: String,
+    pub status: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub execution_count: i64,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "RunStageTopologyTransition", rename_fields = "camelCase")]
+pub struct GqlRunStageTopologyTransition {
+    pub to_stage_id: String,
+    pub to_label: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "RunStageTopologyNode", rename_fields = "camelCase")]
+pub struct GqlRunStageTopologyNode {
+    pub stage_id: String,
+    pub label: String,
+    pub order: i64,
+    pub owner_agent_id: String,
+    pub owner_agent_title: String,
+    pub status: String,
+    pub is_current: bool,
+    pub iteration: Option<i64>,
+    pub attempt_number: Option<i64>,
+    pub approval_required: bool,
+    pub artifact_count: i64,
+    pub communication_count: i64,
+    pub occurrences: Vec<GqlRunStageTopologyOccurrence>,
+    pub transitions: Vec<GqlRunStageTopologyTransition>,
+}
+
 impl From<domain::agent::AgentExecution> for GqlAgentExecution {
     fn from(execution: domain::agent::AgentExecution) -> Self {
         GqlAgentExecution {

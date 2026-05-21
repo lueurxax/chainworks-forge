@@ -975,6 +975,48 @@ fn classify_provider_failure_event(parsed: &Value, provider: &str) -> Option<Pro
     find_junie_provider_failure_event(parsed)
 }
 
+fn classify_prompt_error_response(
+    provider: &str,
+    jsonrpc_error_code: Option<i64>,
+    err_msg: &str,
+) -> ProviderFailureEvent {
+    if is_provider_quota_or_capacity_failure(provider, err_msg) {
+        return ProviderFailureEvent {
+            failure_phase: "provider_quota",
+            message: format!("provider quota/capacity failure: {provider}: {err_msg}"),
+            detail: format!(
+                "jsonrpc_error_code={};message={}",
+                jsonrpc_error_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                truncate_runtime_receipt_detail(err_msg)
+            ),
+        };
+    }
+    ProviderFailureEvent {
+        failure_phase: "prompt_error_response",
+        message: format!("ACP session/prompt returned error: {err_msg}"),
+        detail: format!(
+            "jsonrpc_error_code={};message={}",
+            jsonrpc_error_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            truncate_runtime_receipt_detail(err_msg)
+        ),
+    }
+}
+
+fn is_provider_quota_or_capacity_failure(provider: &str, message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let provider = provider.to_ascii_lowercase();
+    lower.contains("quota")
+        || lower.contains("rate limit")
+        || lower.contains("hit your limit")
+        || lower.contains("exhausted your capacity")
+        || lower.contains("capacity on this model")
+        || (provider == "gemini" && lower.contains("capacity"))
+}
+
 fn find_junie_provider_failure_event(value: &Value) -> Option<ProviderFailureEvent> {
     match value {
         Value::Object(map) => {
@@ -2365,6 +2407,8 @@ impl RuntimeReceiptTracker {
             session_generation_id: session_generation_id.cloned(),
             status: status.to_string(),
             failure_phase,
+            jsonrpc_error_code: None,
+            provider_error_message_redacted: None,
             started_at: self.started_at_wall.to_rfc3339(),
             completed_at: Some(chrono::Utc::now().to_rfc3339()),
             xcode_shim_injected,
@@ -2481,6 +2525,92 @@ fn session_update_observation(parsed: &Value) -> (&'static str, bool, Option<Str
     (kind, meaningful_progress, detail)
 }
 
+fn timeline_title_for_update(update_kind: &str) -> &'static str {
+    match update_kind {
+        "tool_call" => "Tool call",
+        "tool_call_update" => "Tool update",
+        "agent_message_chunk" | "text_chunk" => "Agent response",
+        "agent_thought_chunk" => "Agent thought",
+        "plan" => "Plan update",
+        "provider_activity" => "Provider activity",
+        _ => "Runtime update",
+    }
+}
+
+fn timeline_detail_for_update(
+    update_kind: &str,
+    parsed: &Value,
+    fallback: Option<&str>,
+) -> Option<String> {
+    if matches!(
+        update_kind,
+        "agent_message_chunk" | "text_chunk" | "agent_thought_chunk"
+    ) {
+        if let Some(chunk) =
+            extract_text_chunk(parsed).and_then(|chunk| bounded_timeline_detail(&chunk))
+        {
+            return Some(chunk);
+        }
+    }
+
+    let update = parsed
+        .pointer("/params/update")
+        .or_else(|| parsed.pointer("/params"))
+        .unwrap_or(parsed);
+    let mut parts = Vec::new();
+    collect_first_string_for_keys(
+        update,
+        &["title", "name", "command", "cmd", "path", "status", "kind"],
+        &mut parts,
+        4,
+    );
+    if !parts.is_empty() {
+        return bounded_timeline_detail(&parts.join(" · "));
+    }
+    fallback.and_then(bounded_timeline_detail)
+}
+
+fn collect_first_string_for_keys(
+    value: &Value,
+    keys: &[&str],
+    parts: &mut Vec<String>,
+    limit: usize,
+) {
+    if parts.len() >= limit {
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if parts.len() >= limit {
+                    return;
+                }
+                if let Some(text) = map.get(*key).and_then(Value::as_str) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() && !parts.iter().any(|part| part == trimmed) {
+                        parts.push(trimmed.to_string());
+                    }
+                }
+            }
+            for nested in map.values() {
+                collect_first_string_for_keys(nested, keys, parts, limit);
+                if parts.len() >= limit {
+                    return;
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_first_string_for_keys(item, keys, parts, limit);
+                if parts.len() >= limit {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn provider_activity_type_marker(type_markers: &[String]) -> Option<&'static str> {
     if type_markers.iter().any(|marker| marker == "read") {
         Some("read")
@@ -2519,6 +2649,27 @@ async fn record_prompt_progress_for_session(
     provider_session_id: &str,
     kind: AcpPromptProgressKind,
 ) {
+    record_prompt_progress_detail_for_session(
+        req,
+        progress_sink,
+        provider_session_id,
+        kind,
+        None,
+        None,
+        None,
+    )
+    .await;
+}
+
+async fn record_prompt_progress_detail_for_session(
+    req: &ExecutionRequest,
+    progress_sink: &Arc<dyn AcpPromptProgressSink>,
+    provider_session_id: &str,
+    kind: AcpPromptProgressKind,
+    title: Option<String>,
+    detail: Option<String>,
+    surface_label: Option<String>,
+) {
     let update = AcpPromptProgressUpdate {
         run_id: req.run_id,
         stage_execution_id: req.stage_execution_id.clone(),
@@ -2528,6 +2679,9 @@ async fn record_prompt_progress_for_session(
         session_generation_id: req.session_generation_id.clone(),
         provider_session_id: provider_session_id.to_string(),
         kind,
+        title,
+        detail,
+        surface_label,
     };
     if let Err(error) = progress_sink.record_acp_prompt_progress(update).await {
         warn!(
@@ -2536,6 +2690,25 @@ async fn record_prompt_progress_for_session(
             "ACP: prompt progress sink failed"
         );
     }
+}
+
+fn bounded_timeline_detail(text: &str) -> Option<String> {
+    let mut normalized = strip_ansi(text)
+        .replace('\r', "\n")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    normalized = normalized.trim().to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+    const LIMIT: usize = 1400;
+    if normalized.len() > LIMIT {
+        truncate_string_to_byte_len(&mut normalized, LIMIT);
+        normalized.push_str("…");
+    }
+    Some(normalized)
 }
 
 async fn poll_claude_local_activity_watchdog(
@@ -3255,8 +3428,16 @@ impl AcpTransportSession {
             return Err(error);
         }
         runtime_receipt.note_prompt_sent(&prompt_id);
-        self.record_prompt_progress(req, &progress_sink, AcpPromptProgressKind::PromptSent)
-            .await;
+        record_prompt_progress_detail_for_session(
+            req,
+            &progress_sink,
+            &self.session_id,
+            AcpPromptProgressKind::PromptSent,
+            Some("Prompt sent".to_string()),
+            bounded_timeline_detail(&req.prompt),
+            Some("operator_prompt".to_string()),
+        )
+        .await;
 
         let mut line = String::new();
         let mut last_acp_activity = Instant::now();
@@ -3604,6 +3785,16 @@ impl AcpTransportSession {
                             let normalized_req_id =
                                 normalize_jsonrpc_id(req_id).unwrap_or_else(|| req_id.to_string());
                             let request_summary = summarize_permission_request(req_id, &params);
+                            record_prompt_progress_detail_for_session(
+                                req,
+                                &progress_sink,
+                                &self.session_id,
+                                AcpPromptProgressKind::MeaningfulProgress,
+                                Some("Permission requested".to_string()),
+                                Some(request_summary.clone()),
+                                Some("permission_request".to_string()),
+                            )
+                            .await;
                             runtime_receipt.note_permission_request(
                                 &normalized_req_id,
                                 Some(request_summary.clone()),
@@ -3634,6 +3825,16 @@ impl AcpTransportSession {
                                         Some(grant_summary.clone()),
                                         json_for_runtime_receipt(&grant),
                                     );
+                                    record_prompt_progress_detail_for_session(
+                                        req,
+                                        &progress_sink,
+                                        &self.session_id,
+                                        AcpPromptProgressKind::MeaningfulProgress,
+                                        Some("Permission granted".to_string()),
+                                        Some(grant_summary.clone()),
+                                        Some("permission_grant".to_string()),
+                                    )
+                                    .await;
                                     debug!(
                                         session_id = %self.session_id,
                                         grant = %grant_summary,
@@ -3673,6 +3874,18 @@ impl AcpTransportSession {
                         debug!(session_id = %self.session_id, "ACP: session/update notification");
                         let (update_kind, meaningful_progress, detail) =
                             session_update_observation(&parsed);
+                        if meaningful_progress {
+                            record_prompt_progress_detail_for_session(
+                                req,
+                                &progress_sink,
+                                &self.session_id,
+                                AcpPromptProgressKind::MeaningfulProgress,
+                                Some(timeline_title_for_update(update_kind).to_string()),
+                                timeline_detail_for_update(update_kind, &parsed, detail.as_deref()),
+                                Some(update_kind.to_string()),
+                            )
+                            .await;
+                        }
                         runtime_receipt.note_session_update(
                             update_kind,
                             meaningful_progress,
@@ -3762,8 +3975,16 @@ impl AcpTransportSession {
                 if id == prompt_id {
                     if parsed.get("error").is_some() {
                         let err_msg = parsed["error"]["message"].as_str().unwrap_or("ACP error");
+                        let jsonrpc_error_code = parsed["error"]["code"].as_i64();
+                        let provider_failure = classify_prompt_error_response(
+                            &self.provider,
+                            jsonrpc_error_code,
+                            err_msg,
+                        );
+                        runtime_receipt
+                            .push_event("provider_failure", Some(provider_failure.detail.clone()));
                         runtime_receipt.note_terminal_response("failed");
-                        self.last_runtime_receipt = Some(runtime_receipt.build(
+                        let mut receipt = runtime_receipt.build(
                             &self.provider,
                             self.model.as_ref(),
                             &self.session_id,
@@ -3771,10 +3992,15 @@ impl AcpTransportSession {
                             self.xcode_shim_injected,
                             self.requires_xcode_host_execution,
                             "failed",
-                            Some("prompt_error_response".to_string()),
-                        ));
+                            Some(provider_failure.failure_phase.to_string()),
+                        );
+                        receipt.jsonrpc_error_code = jsonrpc_error_code;
+                        receipt.provider_error_message_redacted =
+                            Some(truncate_runtime_receipt_detail(err_msg));
+                        self.last_runtime_receipt = Some(receipt);
                         warn!(
                             session_id = %self.session_id,
+                            failure_phase = provider_failure.failure_phase,
                             "ACP session/prompt returned error: {err_msg}"
                         );
                         return Ok((
@@ -3800,6 +4026,16 @@ impl AcpTransportSession {
                     }
                     if let Some(chunk) = extract_text_chunk(&parsed) {
                         completion_capture.set_terminal_final_response(&chunk);
+                        record_prompt_progress_detail_for_session(
+                            req,
+                            &progress_sink,
+                            &self.session_id,
+                            AcpPromptProgressKind::MeaningfulProgress,
+                            Some("Final response".to_string()),
+                            bounded_timeline_detail(&chunk),
+                            Some("final_response".to_string()),
+                        )
+                        .await;
                         push_streamed_transcript_chunk(
                             &mut streamed_text,
                             &chunk,
@@ -4868,6 +5104,19 @@ mod tests {
         });
 
         assert!(classify_provider_failure_event(&update, "codex").is_none());
+    }
+
+    #[test]
+    fn gemini_capacity_prompt_error_is_provider_quota() {
+        let failure = classify_prompt_error_response(
+            "gemini",
+            Some(500),
+            "You have exhausted your capacity on this model.",
+        );
+
+        assert_eq!(failure.failure_phase, "provider_quota");
+        assert!(failure.message.contains("provider quota/capacity failure"));
+        assert!(failure.detail.contains("jsonrpc_error_code=500"));
     }
 
     #[test]

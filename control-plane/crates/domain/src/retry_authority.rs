@@ -91,6 +91,136 @@ pub struct RetryStageExecutionAuthority {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryPayloadRecoveryEvent {
+    pub idempotency_key: String,
+    pub run_id: RunId,
+    pub invoke_work_item_id: String,
+    pub retry_authority_id: Option<String>,
+    pub target_stage_execution_id: Option<StageExecutionId>,
+    pub completed_agent_execution_id: Option<String>,
+    pub reason_code: String,
+    pub mode: String,
+    pub repaired: bool,
+    pub current_json: Value,
+    pub provenance_json: Option<Value>,
+    pub repaired_fields_json: Option<Value>,
+    pub diagnostic_json: Option<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl RetryPayloadRecoveryEvent {
+    pub fn unknown_reason_code(&self) -> bool {
+        !matches!(
+            self.reason_code.as_str(),
+            "retry_payload_stale_target_stage_repaired"
+                | "retry_payload_source_provenance_ignored_for_target"
+                | "valid_retry_invoke_completion_recovered"
+                | "retry_authority_target_agent_stage_mismatch"
+                | "retry_authority_missing_for_targeted_invoke"
+        )
+    }
+
+    pub fn readback_json(&self) -> Value {
+        serde_json::json!({
+            "schema_version": "retry_payload_recovery_v1",
+            "reason_code": self.reason_code,
+            "mode": self.mode,
+            "repaired": self.repaired,
+            "current": self.current_json,
+            "provenance": self.provenance_json.clone().unwrap_or(Value::Null),
+            "repaired_fields": self.repaired_fields_json.clone().unwrap_or_else(|| serde_json::json!([])),
+            "diagnostic": self.diagnostic_json.clone().unwrap_or_else(|| serde_json::json!({})),
+            "unknown_reason_code": self.unknown_reason_code(),
+            "recorded_at": self.updated_at.to_rfc3339(),
+            "idempotency_key": self.idempotency_key,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetedRetryPayloadIdentity {
+    pub run_id: RunId,
+    pub stage_id: String,
+    pub target_stage_execution_id: StageExecutionId,
+    pub retry_authority_id: String,
+    pub source_stage_execution_id: StageExecutionId,
+    pub source_agent_execution_id: Option<String>,
+    pub source_work_item_id: String,
+    pub reason: String,
+    pub journal_id: Option<String>,
+}
+
+pub fn sanitize_targeted_retry_invoke_payload(
+    payload: &mut Value,
+    identity: &TargetedRetryPayloadIdentity,
+) -> Result<(), String> {
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| "targeted retry payload is not an object".to_string())?;
+
+    for key in [
+        "p058_claimed",
+        "target_stage_execution_id",
+        "source_stage_execution_id",
+        "source_agent_execution_id",
+        "source_work_item_id",
+        "retry_authority_id",
+    ] {
+        object.remove(key);
+    }
+
+    object.insert(
+        "run_id".into(),
+        serde_json::json!(identity.run_id.to_string()),
+    );
+    object.insert("stage_id".into(), serde_json::json!(identity.stage_id));
+    object.insert(
+        "stage_execution_id".into(),
+        serde_json::json!(identity.target_stage_execution_id.to_string()),
+    );
+    object.insert(
+        "target_stage_execution_id".into(),
+        serde_json::json!(identity.target_stage_execution_id.to_string()),
+    );
+    object.insert(
+        "retry_authority_id".into(),
+        serde_json::json!(identity.retry_authority_id),
+    );
+
+    let mut targeted_retry = serde_json::Map::new();
+    targeted_retry.insert(
+        "retry_authority_id".into(),
+        serde_json::json!(identity.retry_authority_id),
+    );
+    targeted_retry.insert(
+        "target_stage_execution_id".into(),
+        serde_json::json!(identity.target_stage_execution_id.to_string()),
+    );
+    targeted_retry.insert(
+        "source_stage_execution_id".into(),
+        serde_json::json!(identity.source_stage_execution_id.to_string()),
+    );
+    if let Some(source_agent_execution_id) = identity.source_agent_execution_id.as_deref() {
+        targeted_retry.insert(
+            "source_agent_execution_id".into(),
+            serde_json::json!(source_agent_execution_id),
+        );
+    }
+    targeted_retry.insert(
+        "source_work_item_id".into(),
+        serde_json::json!(identity.source_work_item_id),
+    );
+    targeted_retry.insert("reason".into(), serde_json::json!(identity.reason));
+    if let Some(journal_id) = identity.journal_id.as_deref() {
+        targeted_retry.insert("journal_id".into(), serde_json::json!(journal_id));
+    }
+    object.insert("targeted_retry".into(), Value::Object(targeted_retry));
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdvanceRunTargetMode {
     LegacyRunScoped,
@@ -417,6 +547,69 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn p092_targeted_retry_sanitizer_keeps_provenance_only_under_targeted_retry() {
+        let run_id = RunId::new();
+        let target = StageExecutionId::new();
+        let source = StageExecutionId::new();
+        let mut payload = json!({
+            "run_id": run_id.to_string(),
+            "stage_id": "old",
+            "stage_execution_id": source.to_string(),
+            "target_stage_execution_id": source.to_string(),
+            "retry_authority_id": "old-auth",
+            "source_stage_execution_id": source.to_string(),
+            "source_agent_execution_id": "old-agent",
+            "source_work_item_id": "old-work",
+            "p058_claimed": {"agent_execution_id": "old-agent"},
+            "targeted_retry": {"source_agent_execution_id": "old-agent"}
+        });
+
+        sanitize_targeted_retry_invoke_payload(
+            &mut payload,
+            &TargetedRetryPayloadIdentity {
+                run_id,
+                stage_id: "implement".to_string(),
+                target_stage_execution_id: target,
+                retry_authority_id: "auth-current".to_string(),
+                source_stage_execution_id: source,
+                source_agent_execution_id: Some("old-agent".to_string()),
+                source_work_item_id: "old-work".to_string(),
+                reason: "operator_targeted_retry".to_string(),
+                journal_id: Some("journal-1".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(payload["stage_id"], json!("implement"));
+        assert_eq!(payload["stage_execution_id"], json!(target.to_string()));
+        assert_eq!(
+            payload["target_stage_execution_id"],
+            json!(target.to_string())
+        );
+        assert_eq!(payload["retry_authority_id"], json!("auth-current"));
+        assert!(payload.get("p058_claimed").is_none());
+        assert!(payload.get("source_stage_execution_id").is_none());
+        assert!(payload.get("source_agent_execution_id").is_none());
+        assert!(payload.get("source_work_item_id").is_none());
+        assert_eq!(
+            payload.pointer("/targeted_retry/source_stage_execution_id"),
+            Some(&json!(source.to_string()))
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/source_agent_execution_id"),
+            Some(&json!("old-agent"))
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/source_work_item_id"),
+            Some(&json!("old-work"))
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/journal_id"),
+            Some(&json!("journal-1"))
+        );
+    }
 
     #[test]
     fn run_scoped_advance_payload_remains_valid_for_legacy_work() {

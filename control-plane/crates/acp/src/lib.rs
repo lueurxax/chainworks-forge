@@ -225,6 +225,12 @@ pub struct AcpPromptProgressUpdate {
     pub session_generation_id: Option<String>,
     pub provider_session_id: String,
     pub kind: AcpPromptProgressKind,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub surface_label: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -417,6 +423,10 @@ pub struct AcpRuntimeReceipt {
     pub status: String,
     #[serde(default)]
     pub failure_phase: Option<String>,
+    #[serde(default)]
+    pub jsonrpc_error_code: Option<i64>,
+    #[serde(default)]
+    pub provider_error_message_redacted: Option<String>,
     pub started_at: String,
     #[serde(default)]
     pub completed_at: Option<String>,

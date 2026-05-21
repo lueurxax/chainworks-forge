@@ -8,6 +8,7 @@ domain = { path = "../domain" }
 db = { path = "../db" }
 engine = { path = "../engine" }
 auth = { path = "../auth" }
+workflow = { path = "../workflow" }
 async-graphql = { workspace = true }
 async-graphql-axum = { workspace = true }
 axum = { workspace = true }

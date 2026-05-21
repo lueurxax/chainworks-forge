@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,7 +30,10 @@ use crate::types::p031::{
 };
 use crate::types::run::GqlRun;
 use crate::types::scheduler::{GqlStartupRecoverySummary, GqlToolchainCacheHousekeepingSummary};
-use crate::types::stage::{GqlAgentExecution, GqlStageExecution};
+use crate::types::stage::{
+    GqlAgentExecution, GqlRunStageTopologyNode, GqlRunStageTopologyOccurrence,
+    GqlRunStageTopologyTransition, GqlStageExecution,
+};
 use crate::types::steward::{
     GqlStewardAnalysis, GqlStewardAnalysisRunLink, GqlStewardRecommendation,
 };
@@ -230,6 +234,202 @@ async fn stage_from_projection_or_canonical(
     }
 }
 
+fn p036_stage_topology_order(plan: &workflow::plan::RunPlan) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+    let mut queue = VecDeque::from([plan.initial_state.clone()]);
+
+    while let Some(stage_id) = queue.pop_front() {
+        if !seen.insert(stage_id.clone()) {
+            continue;
+        }
+        let Some(state) = plan.states.get(&stage_id) else {
+            continue;
+        };
+        ordered.push(stage_id.clone());
+        for transition in &state.transitions {
+            if !seen.contains(&transition.to) {
+                queue.push_back(transition.to.clone());
+            }
+        }
+    }
+
+    let mut remaining: Vec<_> = plan
+        .states
+        .keys()
+        .filter(|stage_id| !seen.contains(*stage_id))
+        .cloned()
+        .collect();
+    remaining.sort();
+    ordered.extend(remaining);
+    ordered
+}
+
+fn p036_agent_title(agent_id: &str) -> String {
+    let words: Vec<String> = agent_id
+        .split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        agent_id.to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
+fn p036_latest_stage_rows_by_stage_id(
+    rows: Vec<projections::StageSummaryRow>,
+) -> HashMap<String, projections::StageSummaryRow> {
+    let mut latest = HashMap::new();
+    for row in rows {
+        latest
+            .entry(row.stage_id.clone())
+            .and_modify(|existing: &mut projections::StageSummaryRow| {
+                if row.started_at >= existing.started_at {
+                    *existing = row.clone();
+                }
+            })
+            .or_insert(row);
+    }
+    latest
+}
+
+fn p036_status_for_topology(row: Option<&projections::StageSummaryRow>) -> String {
+    match row {
+        Some(row) if row.projection_lag || !row.projection_present => "unavailable".into(),
+        Some(row) => row.status.clone(),
+        None => "pending".into(),
+    }
+}
+
+fn p036_is_current_stage(
+    run: &domain::run::Run,
+    stage_id: &str,
+    row: Option<&projections::StageSummaryRow>,
+) -> bool {
+    if let Some(current_state) = run.current_state.as_deref() {
+        return current_state == stage_id;
+    }
+    matches!(
+        row.map(|row| row.status.as_str()),
+        Some("running" | "blocked" | "waiting_approval" | "pending_approval")
+    )
+}
+
+fn p036_topology_nodes(
+    run: &domain::run::Run,
+    plan: &workflow::plan::RunPlan,
+    stage_rows: Vec<projections::StageSummaryRow>,
+    artifacts: Vec<domain::artifact::Artifact>,
+    agent_executions: Vec<domain::agent::AgentExecution>,
+) -> Vec<GqlRunStageTopologyNode> {
+    let latest_by_stage_id = p036_latest_stage_rows_by_stage_id(stage_rows);
+    let stage_execution_to_stage_id: HashMap<String, String> = latest_by_stage_id
+        .values()
+        .map(|row| (row.id.clone(), row.stage_id.clone()))
+        .collect();
+
+    let mut artifacts_by_stage_id: HashMap<String, i64> = HashMap::new();
+    for artifact in artifacts {
+        *artifacts_by_stage_id.entry(artifact.stage_id).or_default() += 1;
+    }
+
+    let mut executions_by_stage_id: HashMap<String, Vec<domain::agent::AgentExecution>> =
+        HashMap::new();
+    for execution in agent_executions {
+        let Some(stage_execution_id) = execution.stage_execution_id else {
+            continue;
+        };
+        if let Some(stage_id) = stage_execution_to_stage_id.get(&stage_execution_id.to_string()) {
+            executions_by_stage_id
+                .entry(stage_id.clone())
+                .or_default()
+                .push(execution);
+        }
+    }
+
+    p036_stage_topology_order(plan)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, stage_id)| {
+            let state = plan.states.get(&stage_id)?;
+            let latest = latest_by_stage_id.get(&stage_id);
+            let executions = executions_by_stage_id
+                .get(&stage_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+
+            let occurrences: Vec<GqlRunStageTopologyOccurrence> = state
+                .tasks
+                .iter()
+                .chain(state.post_approval_tasks.iter())
+                .map(|task| {
+                    let matching: Vec<_> = executions
+                        .iter()
+                        .filter(|execution| execution.agent_id == task.agent.agent_id)
+                        .collect();
+                    let status = matching
+                        .iter()
+                        .max_by_key(|execution| execution.started_at)
+                        .map(|execution| execution.status.to_string())
+                        .unwrap_or_else(|| "pending".into());
+                    GqlRunStageTopologyOccurrence {
+                        agent_id: task.agent.agent_id.clone(),
+                        agent_title: p036_agent_title(&task.agent.agent_id),
+                        task_name: task.task_name.clone(),
+                        status,
+                        provider: task.agent.provider.clone(),
+                        model: task.agent.model.clone(),
+                        effort: task.agent.effort.clone(),
+                        execution_count: matching.len() as i64,
+                    }
+                })
+                .collect();
+
+            let transitions: Vec<GqlRunStageTopologyTransition> = state
+                .transitions
+                .iter()
+                .map(|transition| GqlRunStageTopologyTransition {
+                    to_stage_id: transition.to.clone(),
+                    to_label: plan
+                        .states
+                        .get(&transition.to)
+                        .map(|target| target.label.clone()),
+                    detail: match transition.condition.trim() {
+                        "" | "true" => None,
+                        condition => Some(condition.to_string()),
+                    },
+                })
+                .collect();
+
+            Some(GqlRunStageTopologyNode {
+                stage_id: stage_id.clone(),
+                label: state.label.clone(),
+                order: index as i64 + 1,
+                owner_agent_id: state.owner.agent_id.clone(),
+                owner_agent_title: p036_agent_title(&state.owner.agent_id),
+                status: p036_status_for_topology(latest),
+                is_current: p036_is_current_stage(run, &stage_id, latest),
+                iteration: latest.map(|row| row.iteration),
+                attempt_number: latest.map(|row| row.attempt_number),
+                approval_required: state.is_manual_gate
+                    || latest.is_some_and(|row| row.has_pending_approval),
+                artifact_count: artifacts_by_stage_id.get(&stage_id).copied().unwrap_or(0),
+                communication_count: occurrences.len() as i64 + transitions.len() as i64,
+                occurrences,
+                transitions,
+            })
+        })
+        .collect()
+}
+
 #[Object]
 impl QueryRoot {
     async fn ideas(
@@ -382,6 +582,72 @@ impl QueryRoot {
         let pool = ctx.data::<SqlitePool>()?;
         let items = projections::list_stages_projection(pool, run_id.as_str()).await?;
         Ok(items.into_iter().map(GqlStageExecution::from).collect())
+    }
+
+    async fn run_stage_topology(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<Vec<GqlRunStageTopologyNode>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let run_id: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let Some(run) = runs::find_by_id(pool, run_id).await? else {
+            return Ok(vec![]);
+        };
+        let Some(workflow_snapshot_json) = run.workflow_snapshot_json.as_deref() else {
+            return Ok(vec![]);
+        };
+        let Some(catalog_snapshot_json) = run.catalog_snapshot_json.as_deref() else {
+            return Ok(vec![]);
+        };
+        if workflow_snapshot_json.trim().is_empty() || catalog_snapshot_json.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or(".");
+        let plan = match workflow::compiler::compile_from_snapshot_json(
+            workflow_snapshot_json,
+            catalog_snapshot_json,
+            catalog_path,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                warn!(
+                    run_id = %run.id,
+                    error = %error,
+                    "P036 runStageTopology failed closed because frozen snapshots did not compile"
+                );
+                return Ok(vec![]);
+            }
+        };
+
+        let stage_rows = projections::list_stages_projection(pool, &run_id.to_string()).await?;
+        let artifact_rows = artifacts::list_by_run(pool, run_id).await?;
+        let agent_execution_rows = db::repos::agent_executions::list_by_run(pool, run_id).await?;
+        Ok(p036_topology_nodes(
+            &run,
+            &plan,
+            stage_rows,
+            artifact_rows,
+            agent_execution_rows,
+        ))
+    }
+
+    async fn active_agent_executions(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<Vec<GqlAgentExecution>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let run_id: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let items = db::repos::agent_executions::list_running_by_run(pool, run_id).await?;
+        Ok(items.into_iter().map(GqlAgentExecution::from).collect())
     }
 
     /// Work-queue counts for all items associated with a run.
@@ -1093,10 +1359,12 @@ async fn enrich_run_with_p091_retry_authority(
     run: &mut GqlRun,
 ) -> Result<()> {
     let history = db::repos::retry_stage_execution_authorities::list_by_run(pool, run_id).await?;
-    let history_json: Vec<_> = history
+    let p092_events =
+        db::repos::retry_payload_recovery_events::latest_by_authority_for_run(pool, run_id).await?;
+    let mut history_json: Vec<_> = history
         .iter()
         .map(|authority| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "id": authority.id,
                 "run_id": authority.run_id.to_string(),
                 "stage_id": authority.stage_id,
@@ -1110,21 +1378,40 @@ async fn enrich_run_with_p091_retry_authority(
                 "created_at": authority.created_at.to_rfc3339(),
                 "updated_at": authority.updated_at.to_rfc3339(),
                 "terminal_reason": authority.terminal_reason,
-            })
+            });
+            if let Some(event) = p092_events.get(&authority.id) {
+                value["retry_payload_recovery"] = event.readback_json();
+            }
+            value
         })
         .collect();
+    for event in db::repos::retry_payload_recovery_events::list_by_run(pool, run_id).await? {
+        if event.retry_authority_id.is_none() {
+            history_json.push(serde_json::json!({
+                "schema_version": "retry_payload_recovery_history_v1",
+                "authority_state": "missing_authority",
+                "run_id": event.run_id.to_string(),
+                "source_invoke_work_item_id": event.invoke_work_item_id,
+                "retry_payload_recovery": event.readback_json(),
+            }));
+        }
+    }
     run.retry_authority_json = history
         .iter()
         .find(|authority| authority.authority_state.to_string() == "active")
         .map(|authority| {
-            Json(serde_json::json!({
+            let mut value = serde_json::json!({
                 "id": authority.id,
                 "stage_id": authority.stage_id,
                 "target_stage_execution_id": authority.target_stage_execution_id.to_string(),
                 "entry_kind": authority.entry_kind.to_string(),
                 "authority_state": authority.authority_state.to_string(),
                 "terminal_reason": authority.terminal_reason,
-            }))
+            });
+            if let Some(event) = p092_events.get(&authority.id) {
+                value["retry_payload_recovery"] = event.readback_json();
+            }
+            Json(value)
         });
     run.retry_authority_history_json = Some(Json(serde_json::Value::Array(history_json)));
     run.p091_orphan_repair_readback_json =
@@ -1884,6 +2171,7 @@ impl SubscriptionRoot {
                     | DomainEvent::ApprovalRequested { run_id, .. }
                     | DomainEvent::ArtifactCreated { run_id, .. }
                     | DomainEvent::RuntimeStatusChanged { run_id, .. }
+                    | DomainEvent::RuntimeTimelineEvent { run_id, .. }
                     | DomainEvent::MediationConfirmationResolved { run_id, .. }
                     | DomainEvent::RoutingCompleted { run_id, .. } => Some(run_id),
                     DomainEvent::ApprovalResolved { approval_id, .. } => {
@@ -2042,6 +2330,39 @@ impl SubscriptionRoot {
                             agent_id,
                             provider,
                             event_kind,
+                            title: None,
+                            detail: None,
+                            surface_label: None,
+                            session_generation_id: None,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        })))
+                    }
+                    DomainEvent::RuntimeTimelineEvent {
+                        run_id,
+                        stage_id,
+                        agent_id,
+                        provider,
+                        event_kind,
+                        title,
+                        detail,
+                        surface_label,
+                        session_generation_id,
+                    } => {
+                        if let Some(fid) = filter_run_id {
+                            if run_id != fid {
+                                return None;
+                            }
+                        }
+                        Some(Ok(Some(GqlRuntimeEvent {
+                            run_id: ID(run_id.to_string()),
+                            stage_id,
+                            agent_id,
+                            provider,
+                            event_kind,
+                            title: Some(title),
+                            detail,
+                            surface_label: Some(surface_label),
+                            session_generation_id,
                             timestamp: chrono::Utc::now().to_rfc3339(),
                         })))
                     }
@@ -2104,6 +2425,10 @@ pub struct GqlRuntimeEvent {
     pub provider: String,
     /// "session_started" | "session_completed" | "session_failed"
     pub event_kind: String,
+    pub title: Option<String>,
+    pub detail: Option<String>,
+    pub surface_label: Option<String>,
+    pub session_generation_id: Option<String>,
     pub timestamp: String,
 }
 
@@ -3633,6 +3958,243 @@ mod tests {
         assert_eq!(
             json["agentExecutions"][0]["actualMcpObservationJson"],
             serde_json::json!(r#"{"source":"provider_session_new_response"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn p036_run_stage_topology_query_is_available() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
+        let catalog_path = "../../../examples/agents/agents.yaml";
+        let workflow_snapshot = workflow::definition::load(workflow_path).unwrap();
+        let catalog_snapshot = workflow::catalog::load(catalog_path).unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        run.current_state = Some("state_2_proposal_drafted".into());
+        run.workflow_yaml_path = Some(workflow_path.into());
+        run.agent_catalog_yaml_path = Some(catalog_path.into());
+        run.workflow_snapshot_json = Some(serde_json::to_string(&workflow_snapshot).unwrap());
+        run.catalog_snapshot_json = Some(serde_json::to_string(&catalog_snapshot).unwrap());
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage_execution_id = domain::ids::StageExecutionId::new();
+        db::repos::stages::insert(
+            &pool,
+            &domain::stage::StageExecution {
+                id: stage_execution_id,
+                run_id,
+                stage_id: "state_2_proposal_drafted".into(),
+                label: "Proposal drafted".into(),
+                status: domain::stage::StageStatus::Running,
+                iteration: 1,
+                attempt_number: 2,
+                settlement_kind: None,
+                started_at: Utc::now(),
+                completed_at: None,
+                owner_agent: Some("proposal_writer".into()),
+                provider: Some("codex".into()),
+                model: Some("gpt-5.5".into()),
+                stage_type: None,
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::repos::agent_executions::insert(
+            &pool,
+            &domain::agent::AgentExecution {
+                id: domain::ids::AgentExecutionId::new(),
+                stage_execution_id: Some(stage_execution_id),
+                agent_id: "proposal_writer".into(),
+                provider: "codex".into(),
+                model: Some("gpt-5.5".into()),
+                started_at: Utc::now(),
+                completed_at: None,
+                status: domain::agent::AgentStatus::Running,
+                owner_execution_lineage_id: None,
+                session_lineage_id: None,
+                session_generation_id: None,
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: None,
+                session_reuse_scope: None,
+                session_family_id: None,
+                session_reuse_disposition: None,
+                session_reset_reason: None,
+                backend_profile_id: Some("codex".into()),
+                requested_mcp_extensions_json: None,
+                predicted_mcp_extensions_json: None,
+                predicted_mcp_runtime_ids_json: None,
+                actual_mcp_extensions_json: None,
+                actual_mcp_runtime_ids_json: None,
+                denied_mcp_extensions_json: None,
+                mcp_blocking_issues_json: None,
+                actual_mcp_observation_json: None,
+                actual_xcode_runtime_observation_json: None,
+                mcp_session_startup_latency_ms: None,
+                owner_kind: None,
+                owner_id: None,
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
+                total_cost_cents: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: ArtifactId::new(),
+                run_id,
+                stage_id: "state_2_proposal_drafted".into(),
+                agent_id: "proposal_writer".into(),
+                name: "proposal.md".into(),
+                contract_id: "proposal_markdown_v1".into(),
+                format: ArtifactFormat::Markdown,
+                file_path: "/tmp/proposal.md".into(),
+                checksum_sha256: None,
+                size_bytes: Some(42),
+                provider: "codex".into(),
+                model: Some("gpt-5.5".into()),
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+                agent_execution_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                query P036StageTopology {{
+                  runStageTopology(runId: "{run_id}") {{
+                    stageId
+                    label
+                    ownerAgentTitle
+                    status
+                    isCurrent
+                    artifactCount
+                    transitions {{ toStageId toLabel detail }}
+                    occurrences {{ agentId agentTitle taskName status provider model }}
+                  }}
+                }}
+                "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "runStageTopology should be part of the GraphQL read contract: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let topology = json["runStageTopology"].as_array().unwrap();
+        assert!(
+            topology.len() > 2,
+            "topology should come from the frozen workflow snapshot"
+        );
+        assert_eq!(
+            topology[0]["stageId"],
+            serde_json::json!("state_1_idea_received")
+        );
+        let proposal = topology
+            .iter()
+            .find(|stage| stage["stageId"] == serde_json::json!("state_2_proposal_drafted"))
+            .expect("proposal stage should be present");
+        assert_eq!(proposal["label"], serde_json::json!("Proposal drafted"));
+        assert_eq!(
+            proposal["ownerAgentTitle"],
+            serde_json::json!("Proposal Writer")
+        );
+        assert_eq!(proposal["status"], serde_json::json!("running"));
+        assert_eq!(proposal["isCurrent"], serde_json::json!(true));
+        assert_eq!(proposal["artifactCount"], serde_json::json!(1));
+        assert_eq!(
+            proposal["occurrences"][0]["agentId"],
+            serde_json::json!("proposal_writer")
+        );
+        assert_eq!(
+            proposal["occurrences"][0]["status"],
+            serde_json::json!("running")
+        );
+        assert_eq!(
+            proposal["transitions"][0]["toStageId"],
+            serde_json::json!("state_3_initial_proposal_approval")
+        );
+        let refined_index = topology
+            .iter()
+            .position(|stage| {
+                stage["stageId"] == serde_json::json!("state_10_implementation_refined")
+            })
+            .expect("implementation refined stage should be present");
+        let complete_index = topology
+            .iter()
+            .position(|stage| stage["stageId"] == serde_json::json!("state_12_workflow_complete"))
+            .expect("workflow complete stage should be present");
+        assert!(
+            refined_index < complete_index,
+            "topology order should not place Workflow complete before the refinement branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn p036_run_stage_topology_fails_closed_without_frozen_snapshots() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"query {{ runStageTopology(runId: "{run_id}") {{ stageId label }} }}"#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "missing snapshots should fail closed as empty readback, not an API error: {response:?}"
+        );
+        assert_eq!(
+            response.data.into_json().unwrap()["runStageTopology"],
+            serde_json::json!([])
         );
     }
 
@@ -5654,6 +6216,65 @@ mod tests {
         )
         .await
         .unwrap();
+        db::repos::retry_payload_recovery_events::upsert(
+            &pool,
+            &domain::retry_authority::RetryPayloadRecoveryEvent {
+                idempotency_key: "p092:graphql".to_string(),
+                run_id,
+                invoke_work_item_id: "invoke-p092".to_string(),
+                retry_authority_id: Some("p091-auth-test".to_string()),
+                target_stage_execution_id: Some(stage_execution_id),
+                completed_agent_execution_id: Some("agent-p092".to_string()),
+                reason_code: "valid_retry_invoke_completion_recovered".to_string(),
+                mode: "diagnostic".to_string(),
+                repaired: false,
+                current_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "target_stage_execution_id": stage_execution_id.to_string(),
+                    "retry_authority_id": "p091-auth-test",
+                    "completed_agent_execution_id": "agent-p092",
+                    "invoke_work_item_id": "invoke-p092"
+                }),
+                provenance_json: Some(serde_json::json!({
+                    "source_agent_execution_id": "old-agent"
+                })),
+                repaired_fields_json: Some(serde_json::json!(["target_stage_execution_id"])),
+                diagnostic_json: Some(serde_json::json!({"would_repair": true})),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        db::repos::retry_payload_recovery_events::upsert(
+            &pool,
+            &domain::retry_authority::RetryPayloadRecoveryEvent {
+                idempotency_key: "p092:graphql-missing-authority".to_string(),
+                run_id,
+                invoke_work_item_id: "invoke-p092-missing-authority".to_string(),
+                retry_authority_id: None,
+                target_stage_execution_id: Some(stage_execution_id),
+                completed_agent_execution_id: None,
+                reason_code: "retry_authority_missing_for_targeted_invoke".to_string(),
+                mode: "enforce".to_string(),
+                repaired: false,
+                current_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "target_stage_execution_id": stage_execution_id.to_string(),
+                    "retry_authority_id": null,
+                    "invoke_work_item_id": "invoke-p092-missing-authority"
+                }),
+                provenance_json: Some(serde_json::json!({
+                    "payload_retry_authority_id": "stale-auth"
+                })),
+                repaired_fields_json: Some(serde_json::json!([])),
+                diagnostic_json: Some(serde_json::json!({"fail_closed": true})),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
         sqlx::query(
             r#"INSERT INTO p091_orphan_repair_passes
                (id, mode, disabled, run_id, candidates_total, excluded_total,
@@ -5709,6 +6330,28 @@ mod tests {
         assert_eq!(
             json["run"]["retryAuthorityHistoryJson"][0]["target_stage_execution_id"],
             serde_json::json!(stage_execution_id.to_string())
+        );
+        assert_eq!(
+            json["run"]["retryAuthorityJson"]["retry_payload_recovery"]["reason_code"],
+            serde_json::json!("valid_retry_invoke_completion_recovered")
+        );
+        assert_eq!(
+            json["run"]["retryAuthorityHistoryJson"][0]["retry_payload_recovery"]["current"]
+                ["invoke_work_item_id"],
+            serde_json::json!("invoke-p092")
+        );
+        let history = json["run"]["retryAuthorityHistoryJson"].as_array().unwrap();
+        let missing_authority = history
+            .iter()
+            .find(|entry| entry["authority_state"] == serde_json::json!("missing_authority"))
+            .expect("missing-authority P092 history row");
+        assert_eq!(
+            missing_authority["retry_payload_recovery"]["reason_code"],
+            serde_json::json!("retry_authority_missing_for_targeted_invoke")
+        );
+        assert_eq!(
+            missing_authority["retry_payload_recovery"]["current"]["retry_authority_id"],
+            serde_json::Value::Null
         );
         assert_eq!(
             json["run"]["p091OrphanRepairReadbackJson"]["latest_pass"]["excluded_total"],

@@ -240,7 +240,7 @@ P031 should not own:
 - create/start/cancel/retry/reset/compact/clone,
 - broader dogfood/productization tails.
 
-Those remain [P032](../proposals/032-polish-stabilization-and-productization-backlog.md), [P036](../proposals/036-ux-consolidation-and-navigation-simplification.md), and future work.
+Those remain [P032](../proposals/032-polish-stabilization-and-productization-backlog.md), the implemented [macOS operator navigation baseline](../reference/macos-operator-navigation.md), and future work.
 
 ### 3.4 Parallel infrastructure slice
 

@@ -75,7 +75,7 @@ The provider-platform baseline consists of:
 | `SettingsTransferService` | Import/export secret-safe settings packages |
 | `SupportBundleExporter` | Export diagnostic bundles distinct from settings transfer |
 | `FirstRunSetupWizard` | Guided machine bootstrap |
-| `SettingsView` System Readiness segment | Operator-facing health summary for the provider/platform slice (formerly `PilotReadinessView`, absorbed into Settings per proposal-036) |
+| `SettingsView` System Readiness segment | Operator-facing health summary for the provider/platform slice (formerly `PilotReadinessView`, now under Settings in the consolidated operator shell) |
 
 ## Durable configuration model
 
@@ -269,7 +269,7 @@ The provider-platform baseline includes:
 - `FirstRunSetupWizard`
 - `ProviderSettingsView`
 - `PreflightReportView`
-- `SettingsView` System Readiness segment (proposal-036 successor to the former `PilotReadinessView`)
+- `SettingsView` System Readiness segment (successor to the former `PilotReadinessView`)
 - `ProviderSetupEvidencePanel`
 
 Those surfaces cover:

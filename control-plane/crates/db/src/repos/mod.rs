@@ -21,6 +21,7 @@ pub mod p077_rollout;
 pub mod projection_invalidation;
 pub mod projections;
 pub mod retry_operator_instructions;
+pub mod retry_payload_recovery_events;
 pub mod retry_stage_execution_authorities;
 pub mod rollout_contract_checks;
 pub mod routing_receipts;

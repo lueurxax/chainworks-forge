@@ -31,7 +31,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 
 ## Control Plane
 
-- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, side-effect ledger, targeted retry authority, boundary shape, configuration, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, **mediation settlement**, and generated-state housekeeping
+- [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, side-effect ledger, targeted retry authority and retry payload recovery, boundary shape, configuration, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, **mediation settlement**, and generated-state housekeeping
 - [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md) — Local daemon lifecycle, supervision, health/readiness, packaged-mode paths, SQLite startup safety, failed-serve behavior, diagnostics, and packaging proof lanes
 - [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) — Bearer auth, caller-scoped capability filtering, per-command audit journaling, **mixed inbox (stage approvals + mediation confirmations)**, and `journal_id` surfacing on MCP + GraphQL northbound surfaces
 - [ui-action-boundary.md](ui-action-boundary.md) — Governed SwiftUI action boundary: GraphQL reads/subscriptions plus approval mutations; non-approval operations are MCP-only
@@ -42,14 +42,14 @@ If you need a current-head orientation first, start with [current-system-baselin
 ## Live Execution
 
 - [live-provider-execution-slice.md](live-provider-execution-slice.md) — Live proposal-loop slice: runtime boundary, safety contract, approval flow, app surfaces, verification
-- [operator-experience.md](operator-experience.md) — Read-only operator shell baseline: Runs Home, reports, recovery guidance, comparison, artifact inspection, notifications, **mediation resolution**, backpressure visibility, and host interruption labels
+- [operator-experience.md](operator-experience.md) — Read-only operator shell baseline: Runs workbench, reports, recovery guidance, comparison, artifact inspection, notifications, **mediation resolution**, backpressure visibility, and host interruption labels
 - [p031-operator-write-path-guide.md](p031-operator-write-path-guide.md) — External workflow mapping for removed governed thin UI write controls; the `p031` filename is a retained gate alias
+- [macos-operator-navigation.md](macos-operator-navigation.md) — Consolidated macOS operator navigation, Runs workbench, Ideas read-first surface, Definitions, Settings System Readiness, Timeline, metrics, and retained proof aliases
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) — Segmented run shells, pane routing, focused timeline, canonical artifact hierarchy, and metadata-demotion continuity
 - [artifact-content-rendering.md](artifact-content-rendering.md) — Unified rendering contract for read-only markdown and JSON artifacts
 - [provider-platform.md](provider-platform.md) — Provider/settings baseline: registry, adapters, settings, preflight, receipts, capacity caps, first-run and pilot surfaces
 - [design-system-and-brand-application.md](design-system-and-brand-application.md) — Forge token lane, bounded brand assets, and shell/run/setup/recovery visual adoption
 - [p077-closeout-readiness-ui-evidence.md](p077-closeout-readiness-ui-evidence.md) — Retained historical alias evidence file for closeout-readiness token, contrast, diagnostic, focus, recovery, and accessibility proof
-- [p036-ux-consolidation-evidence.md](p036-ux-consolidation-evidence.md) — Proposal 036 UX consolidation Phase 1 evidence: four-tab navigation parity, Definitions segmented wrapper, Runs workbench presentation model, timeline batching/Reduce Motion, and pending Phase 2.5/4 evidence
 - [ui-quality-and-polish.md](ui-quality-and-polish.md) — UI readability, bounded accessibility, shared status semantics, and owner-surface proof contract
 - [run-control.md](run-control.md) — Stop vs archive boundary, two-phase cancellation settlement, operator-visible `cancelling`/`cancelled` truth, northbound reader split
 - [release-gate.md](release-gate.md) — Manual release gate: post-approval task execution, N-phase ordering, native deterministic git/publish, canonical release artifacts, **durable side-effect ledger**, and `delivery_receipt` settlement

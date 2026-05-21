@@ -36,7 +36,8 @@ use domain::proposal_gate_result::{
 };
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::retry_authority::{
-    RetryAuthorityEntryKind, RetryAuthorityState, RetryStageExecutionAuthority,
+    sanitize_targeted_retry_invoke_payload, RetryAuthorityEntryKind, RetryAuthorityState,
+    RetryStageExecutionAuthority, TargetedRetryPayloadIdentity,
 };
 use domain::run::{Run, RunStatus};
 use domain::side_effect::FEATURE_P078_HEURISTIC_RETRY_GUARD_ENABLED;
@@ -4788,46 +4789,25 @@ impl CommandHandler {
             new_stage.id, agent_execution_id
         );
         let retry_authority_id = format!("p091-retry-authority:{}", new_stage.id);
-        if let Some(object) = retry_payload.as_object_mut() {
-            object.insert("run_id".into(), serde_json::json!(run_id.to_string()));
-            object.insert("stage_id".into(), serde_json::json!(stage_id));
-            object.insert(
-                "stage_execution_id".into(),
-                serde_json::json!(new_stage.id.to_string()),
-            );
-            object.insert(
-                "target_stage_execution_id".into(),
-                serde_json::json!(new_stage.id.to_string()),
-            );
-            object.insert(
-                "retry_authority_id".into(),
-                serde_json::json!(retry_authority_id.clone()),
-            );
-            object.insert(
-                "source_stage_execution_id".into(),
-                serde_json::json!(old_stage.id.to_string()),
-            );
-            object.insert(
-                "source_agent_execution_id".into(),
-                serde_json::json!(agent_execution_id.to_string()),
-            );
-            object.insert(
-                "source_work_item_id".into(),
-                serde_json::json!(source_item.id.clone()),
-            );
-            object.remove("p058_claimed");
-            object.insert(
-                "targeted_retry".into(),
-                serde_json::json!({
-                    "journal_id": journal_id,
-                    "retry_authority_id": retry_authority_id.clone(),
-                    "target_stage_execution_id": new_stage.id.to_string(),
-                    "source_stage_execution_id": old_stage.id.to_string(),
-                    "source_agent_execution_id": agent_execution_id.to_string(),
-                    "source_work_item_id": source_item.id.clone(),
-                    "reason": "operator_targeted_retry"
-                }),
-            );
+        if retry_payload.as_object().is_some() {
+            sanitize_targeted_retry_invoke_payload(
+                &mut retry_payload,
+                &TargetedRetryPayloadIdentity {
+                    run_id,
+                    stage_id: stage_id.to_string(),
+                    target_stage_execution_id: new_stage.id,
+                    retry_authority_id: retry_authority_id.clone(),
+                    source_stage_execution_id: old_stage.id,
+                    source_agent_execution_id: Some(agent_execution_id.to_string()),
+                    source_work_item_id: source_item.id.clone(),
+                    reason: "operator_targeted_retry".to_string(),
+                    journal_id: Some(journal_id.to_string()),
+                },
+            )
+            .map_err(|error| anyhow!(error))?;
+            let object = retry_payload
+                .as_object_mut()
+                .expect("sanitized targeted retry payload stays object");
             if let Some(evidence_path) = p088_completion_retry_evidence.as_deref() {
                 attach_p088_operator_retry_completion_recovery_payload(
                     object,

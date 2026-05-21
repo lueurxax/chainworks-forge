@@ -138,15 +138,11 @@ struct RunsHomeView: View {
         }
         .listStyle(.sidebar)
         .accessibilityIdentifier("runs-home-list")
-        .onChange(of: model.runDetail) {
-            if let newValue = model.runDetail {
-                workbench.populate(from: newValue)
-            }
+        .onReceive(model.$runDetail.compactMap { $0 }) { newValue in
+            workbench.populate(from: newValue)
         }
-        .onChange(of: model.approvalInbox) {
-            if let newValue = model.approvalInbox {
-                workbench.populate(from: newValue)
-            }
+        .onReceive(model.$approvalInbox.compactMap { $0 }) { newValue in
+            workbench.populate(from: newValue)
         }
         .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { notification in
             if let runID = notification.object as? String {
@@ -158,7 +154,7 @@ struct RunsHomeView: View {
         // PC-003: approvals deep-link → Runs focused on waiting approval lane.
         // Always set focusedLaneID so the sidebar shows the filter context even when
         // no run is currently waiting (the empty-state message remains informative).
-        // focusedLaneID is kept set so .onChange(of: workbench.sidebarLanes) below can
+        // focusedLaneID is kept set so the sidebar-lane publisher below can
         // replay the selection once lanes populate (fixes the startup notification race).
         .onReceive(NotificationCenter.default.publisher(for: .chainworksFocusWaitingApprovalLane)) { _ in
             focusedLaneID = "waiting"
@@ -185,9 +181,9 @@ struct RunsHomeView: View {
         }
         // PC-003 lanes-change fallback: if focusedLaneID was set (by notification or workbench flag)
         // before lanes populated, auto-select once lanes arrive.
-        .onChange(of: workbench.sidebarLanes) {
+        .onReceive(workbench.$sidebarLanes) { sidebarLanes in
             guard focusedLaneID == "waiting", model.selectedRunID == nil else { return }
-            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == "waiting" }),
+            if let waitingLane = sidebarLanes.first(where: { $0.id == "waiting" }),
                let firstRun = waitingLane.runs.first {
                 selectedRunDetailTab = .approvals
                 model.selectRun(firstRun.runID)
@@ -288,7 +284,7 @@ struct RunsHomeView: View {
                                 }
                             )
                         }
-                        
+
                         if !workbench.inlineApprovals.isEmpty {
                             P036ApprovalWorkbenchCard(
                                 rows: workbench.inlineApprovals,
@@ -297,19 +293,19 @@ struct RunsHomeView: View {
                                 resolvingIDs: model.resolvingApprovalIDs
                             )
                         }
-                        
+
                         if let stageMap = workbench.stageMap {
                             P036StageMapCard(map: stageMap)
                         }
-                        
+
                         if !workbench.artifactsAndReports.isEmpty {
                             P036ArtifactWorkbenchCard(rows: workbench.artifactsAndReports)
                         }
-                        
+
                         if !workbench.recoveryEvidence.isEmpty {
                             P036RecoveryEvidenceCard(rows: workbench.recoveryEvidence)
                         }
-                        
+
                         if let health = workbench.freshnessAndHealth {
                             P036SystemReadinessCard(health: health)
                         }
@@ -331,22 +327,7 @@ struct RunsHomeView: View {
                             resolvingIDs: model.resolvingApprovalIDs
                         )
                     case .timeline:
-                        // P036 Phase 1-2: live agent-execution event timeline is deferred until
-                        // Phase 3 projection plumbing is validated (dogfood Phase 2.5).
-                        // p036_projection_gap_deferred_total{surface=timeline,gap_class=live_events}
-                        P031OperatorPlaceholder(
-                            title: "Timeline Deferred",
-                            message: "Live timeline requires a control-plane event-projection feed. Available in Phase 3 after dogfood validation (Phase 2.5).",
-                            identifier: "timeline-projection-deferred",
-                            titleIdentifier: "timeline-projection-title"
-                        )
-                        .onAppear {
-                            P036UICounters.shared.recordProjectionGapDeferred(
-                                count: 1,
-                                surface: "timeline",
-                                gapClass: "live_events"
-                            )
-                        }
+                        P036TimelineWorkbenchCard(entries: timelineEntriesForSelectedRun())
                     case .reports:
                         P031ReportMetadataCard(rows: workbench.reportRows)
                     case .system:
@@ -382,6 +363,25 @@ struct RunsHomeView: View {
         }
     }
 
+    private func timelineEntriesForSelectedRun() -> [RunsWorkbenchPresentationModel.TimelineEntry] {
+        let liveEntries = model.runtimeTimelineEvents.map { event in
+            RunsWorkbenchPresentationModel.TimelineEntry(
+                id: event.id,
+                kind: RunsWorkbenchPresentationModel.TimelineEntryKind(rawValue: event.surfaceLabel) ?? .sessionEvent,
+                title: event.title,
+                detail: event.detail,
+                timestamp: event.timestamp,
+                displayTime: event.timestamp.formatted(date: .omitted, time: .standard),
+                stageID: event.stageID,
+                surfaceLabel: event.surfaceLabel,
+                agentID: event.agentID,
+                sessionID: event.sessionGenerationID,
+                isCollapsed: false
+            )
+        }
+        return liveEntries.isEmpty ? workbench.timelineEntries : liveEntries
+    }
+
     private func artifactCountsByStageID(
         for runDetail: P031RunDetailPresentation
     ) -> [String: Int] {
@@ -390,6 +390,170 @@ struct RunsHomeView: View {
             by: { $0.stageExecutionID ?? $0.stageID }
         )
         .mapValues { $0.count }
+    }
+}
+
+struct P036RuntimeTimelineBuffer {
+    private static let liveResponseDetailLimit = 64_000
+    private static let completedResponseDetailLimit = 48_000
+
+    private(set) var events: [P031RuntimeTimelineEventPresentation] = []
+
+    mutating func reset() {
+        events = []
+    }
+
+    mutating func record(
+        _ event: P031RuntimeTimelineEventPresentation,
+        selectedRunID: String?
+    ) {
+        guard selectedRunID == event.runID else { return }
+
+        if event.surfaceLabel == "final_response" {
+            collapseResponseChunks(
+                matching: event,
+                fallbackTerminalEvent: event,
+                terminalDetailOverride: event.detail
+            )
+            return
+        }
+
+        if event.eventKind == "session_completed" || event.eventKind == "session_failed" {
+            collapseResponseChunks(
+                matching: event,
+                fallbackTerminalEvent: event,
+                terminalDetailOverride: nil
+            )
+            return
+        }
+
+        if Self.isResponseChunk(event) {
+            mergeResponseChunk(event)
+            return
+        }
+
+        append(event)
+    }
+
+    private mutating func append(_ event: P031RuntimeTimelineEventPresentation) {
+        events.append(event)
+        trimToVisibleLimit()
+    }
+
+    private mutating func trimToVisibleLimit() {
+        while events.count > 40 {
+            if let removableIndex = events.indices.first(where: { !Self.isResponseChunk(events[$0]) }) {
+                events.remove(at: removableIndex)
+            } else {
+                events.removeFirst()
+            }
+        }
+    }
+
+    private mutating func mergeResponseChunk(_ event: P031RuntimeTimelineEventPresentation) {
+        guard let existingIndex = events.indices.reversed().first(where: { index in
+            let existing = events[index]
+            return Self.isResponseChunk(existing)
+                && Self.matchesAgentSession(existing, terminalEvent: event)
+        })
+        else {
+            append(event)
+            return
+        }
+
+        let previous = events.remove(at: existingIndex)
+        append(P031RuntimeTimelineEventPresentation(
+            id: previous.id,
+            runID: event.runID,
+            stageID: event.stageID ?? previous.stageID,
+            agentID: event.agentID,
+            provider: event.provider,
+            eventKind: event.eventKind,
+            title: event.title,
+            detail: Self.boundedLiveResponseDetail(previous.detail + event.detail),
+            surfaceLabel: event.surfaceLabel,
+            sessionGenerationID: previous.sessionGenerationID ?? event.sessionGenerationID,
+            timestamp: event.timestamp
+        ))
+    }
+
+    private mutating func collapseResponseChunks(
+        matching terminalEvent: P031RuntimeTimelineEventPresentation,
+        fallbackTerminalEvent: P031RuntimeTimelineEventPresentation,
+        terminalDetailOverride: String?
+    ) {
+        let matchingChunks = events.filter { existing in
+            Self.isResponseChunk(existing)
+                && Self.matchesAgentSession(existing, terminalEvent: terminalEvent)
+        }
+        let summaryDetail = Self.summaryDetail(
+            for: matchingChunks,
+            override: terminalDetailOverride
+        )
+        guard !summaryDetail.isEmpty else { return }
+
+        events.removeAll { existing in
+            Self.isResponseChunk(existing)
+                && Self.matchesAgentSession(existing, terminalEvent: terminalEvent)
+        }
+
+        let lastChunk = matchingChunks.last ?? fallbackTerminalEvent
+        append(
+            P031RuntimeTimelineEventPresentation(
+                id: "\(fallbackTerminalEvent.id):response-summary",
+                runID: fallbackTerminalEvent.runID,
+                stageID: lastChunk.stageID ?? fallbackTerminalEvent.stageID,
+                agentID: fallbackTerminalEvent.agentID,
+                provider: fallbackTerminalEvent.provider,
+                eventKind: fallbackTerminalEvent.eventKind,
+                title: fallbackTerminalEvent.eventKind == "session_failed"
+                    ? "Agent response failed"
+                    : "Agent response complete",
+                detail: summaryDetail,
+                surfaceLabel: "agent_summary",
+                sessionGenerationID: lastChunk.sessionGenerationID,
+                timestamp: fallbackTerminalEvent.timestamp
+            )
+        )
+    }
+
+    private static func isResponseChunk(_ event: P031RuntimeTimelineEventPresentation) -> Bool {
+        event.surfaceLabel == "agent_message_chunk" || event.surfaceLabel == "text_chunk"
+    }
+
+    private static func matchesAgentSession(
+        _ event: P031RuntimeTimelineEventPresentation,
+        terminalEvent: P031RuntimeTimelineEventPresentation
+    ) -> Bool {
+        guard event.agentID == terminalEvent.agentID else { return false }
+        guard event.runID == terminalEvent.runID else { return false }
+        if let terminalSessionID = terminalEvent.sessionGenerationID {
+            return event.sessionGenerationID == terminalSessionID
+        }
+        return true
+    }
+
+    private static func boundedLiveResponseDetail(_ detail: String) -> String {
+        guard detail.count > liveResponseDetailLimit else { return detail }
+        return String(detail.suffix(liveResponseDetailLimit))
+    }
+
+    private static func summaryDetail(
+        for chunks: [P031RuntimeTimelineEventPresentation],
+        override: String?
+    ) -> String {
+        var detail = chunks
+            .map(\.detail)
+            .filter { !$0.isEmpty }
+            .joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if detail.isEmpty {
+            detail = override?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+        if detail.count > completedResponseDetailLimit {
+            detail = String(detail.suffix(completedResponseDetailLimit))
+        }
+        return detail
     }
 }
 
@@ -455,6 +619,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     @Published private(set) var approvalActionError: String?
     @Published private(set) var daemonRestartError: String?
     @Published private(set) var selectedRunID: String?
+    @Published private(set) var runtimeTimelineEvents: [P031RuntimeTimelineEventPresentation] = []
 
     var totalPendingApprovalCount: Int {
         approvalInbox?.rows.count ?? 0
@@ -467,6 +632,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private let loadDaemonLifecycleAction: @Sendable (P031FreshnessSnapshot) async -> P031DaemonLifecyclePresentation
     private let loadSchedulerHealthAction: @Sendable () async -> SchedulerHealthReadback?
     private let subscribeRunStatusAction: @Sendable (String, P031FreshnessSnapshot) throws -> AsyncThrowingStream<P031RunStatusSubscriptionPresentation, Error>
+    private let subscribeRuntimeTimelineAction: @Sendable (String) throws -> AsyncThrowingStream<P031RuntimeTimelineEventPresentation, Error>
     private let settleApprovalAction: @Sendable (String, P072ApprovalDecisionAction) async -> String?
     private let restartDaemonAction: @MainActor @Sendable () async -> String?
     private let bundledDaemonBuildSHAAction: @Sendable () -> String?
@@ -477,7 +643,13 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private var approvalFreshness = P031FreshnessSnapshot(state: .refreshing)
     private var daemonFreshness = P031FreshnessSnapshot(state: .refreshing)
     private var runStatusSubscriptionTask: Task<Void, Never>?
+    private var runtimeTimelineSubscriptionTask: Task<Void, Never>?
+    private var runtimeTimelinePublishTask: Task<Void, Never>?
     private var subscribedRunID: String?
+    private var subscribedRuntimeTimelineRunID: String?
+    private var runtimeTimelineBuffer = P036RuntimeTimelineBuffer()
+    private var runtimeTimelineLastPublish = Date.distantPast
+    private let runtimeTimelineFlushInterval: TimeInterval
 
     var daemonSchemaMismatchMessage: String? {
         [
@@ -513,12 +685,14 @@ final class P031ThinReadDashboardModel: ObservableObject {
         bundledDaemonBuildSHAAction: @escaping @Sendable () -> String? = {
             P031ThinReadDashboardModel.bundledDaemonBuildSHA()
         },
-        loadSchedulerHealthAction: @escaping @Sendable () async -> SchedulerHealthReadback? = { nil }
+        loadSchedulerHealthAction: @escaping @Sendable () async -> SchedulerHealthReadback? = { nil },
+        runtimeTimelineFlushInterval: TimeInterval = 2.0
     ) {
         self.settleApprovalAction = settleApprovalAction
         self.restartDaemonAction = restartDaemonAction
         self.bundledDaemonBuildSHAAction = bundledDaemonBuildSHAAction
         self.loadSchedulerHealthAction = loadSchedulerHealthAction
+        self.runtimeTimelineFlushInterval = runtimeTimelineFlushInterval
         loadRunsHomeAction = { currentFreshness, showFirstRunOrientation in
             await coordinator.loadRunsHome(
                 currentFreshness: currentFreshness,
@@ -544,10 +718,15 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 currentFreshness: currentFreshness
             )
         }
+        subscribeRuntimeTimelineAction = { runID in
+            try subscriptionCoordinator.runtimeTimelinePresentations(runID: runID)
+        }
     }
 
     deinit {
         runStatusSubscriptionTask?.cancel()
+        runtimeTimelineSubscriptionTask?.cancel()
+        runtimeTimelinePublishTask?.cancel()
     }
 
     static func bootstrap() -> P031ThinReadDashboardModel {
@@ -696,10 +875,16 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 continuation.finish()
             }
         }
+        subscribeRuntimeTimelineAction = { _ in
+            AsyncThrowingStream { continuation in
+                continuation.finish()
+            }
+        }
         settleApprovalAction = { _, _ in nil }
         restartDaemonAction = { nil }
         bundledDaemonBuildSHAAction = { "preview" }
         loadSchedulerHealthAction = { nil }
+        runtimeTimelineFlushInterval = 2.0
 
         self.runsHome = runsHome
         self.runDetail = runDetail
@@ -975,27 +1160,39 @@ final class P031ThinReadDashboardModel: ObservableObject {
         let availableRunIDs = runsPresentation.rows.map { $0.runID }
         if let selectedRunID, availableRunIDs.contains(selectedRunID) {
             await loadRunDetail(for: selectedRunID)
-            startRunStatusSubscription(for: selectedRunID)
+            startLiveSubscriptions(for: selectedRunID)
         } else if let firstRunID = availableRunIDs.first {
             selectedRunID = firstRunID
             await loadRunDetail(for: firstRunID)
-            startRunStatusSubscription(for: firstRunID)
+            startLiveSubscriptions(for: firstRunID)
         } else {
             selectedRunID = nil
             runDetail = nil
-            stopRunStatusSubscription()
+            stopLiveSubscriptions()
         }
     }
 
     func selectRun(_ runID: String) {
         guard selectedRunID != runID else { return }
+        P036UICounters.shared.recordOperatorTaskAttempt(
+            taskID: "runs.select_run",
+            result: "started",
+            blockedReason: nil
+        )
         selectedRunID = runID
-        startRunStatusSubscription(for: runID)
+        resetRuntimeTimelineBuffer()
+        startLiveSubscriptions(for: runID)
         Task { await loadRunDetail(for: runID) }
     }
 
     func loadArtifactPreview(artifactID: String) async -> P031ArtifactViewerPresentation? {
-        await loadArtifactPreviewAction(artifactID)
+        let preview = await loadArtifactPreviewAction(artifactID)
+        P036UICounters.shared.recordOperatorTaskAttempt(
+            taskID: "runs.load_artifact_preview",
+            result: preview == nil ? "blocked" : "succeeded",
+            blockedReason: preview == nil ? "payload_unavailable" : nil
+        )
+        return preview
     }
 
     func isResolvingApproval(_ approvalID: String) -> Bool {
@@ -1003,15 +1200,32 @@ final class P031ThinReadDashboardModel: ObservableObject {
     }
 
     func settleApproval(_ approvalID: String, action: P072ApprovalDecisionAction) async {
-        guard !resolvingApprovalIDs.contains(approvalID) else { return }
+        guard !resolvingApprovalIDs.contains(approvalID) else {
+            P036UICounters.shared.recordOperatorTaskAttempt(
+                taskID: "runs.settle_approval",
+                result: "blocked",
+                blockedReason: "already_resolving"
+            )
+            return
+        }
         resolvingApprovalIDs.insert(approvalID)
         approvalActionError = nil
         defer { resolvingApprovalIDs.remove(approvalID) }
 
         if let error = await settleApprovalAction(approvalID, action) {
             approvalActionError = error
+            P036UICounters.shared.recordOperatorTaskAttempt(
+                taskID: "runs.settle_approval",
+                result: "blocked",
+                blockedReason: "write_failed"
+            )
             return
         }
+        P036UICounters.shared.recordOperatorTaskAttempt(
+            taskID: "runs.settle_approval",
+            result: "succeeded",
+            blockedReason: nil
+        )
         await refreshAll()
     }
 
@@ -1020,15 +1234,32 @@ final class P031ThinReadDashboardModel: ObservableObject {
     }
 
     func restartDaemonForUpdateRequired() async {
-        guard !isRestartingDaemon else { return }
+        guard !isRestartingDaemon else {
+            P036UICounters.shared.recordOperatorTaskAttempt(
+                taskID: "system.restart_daemon",
+                result: "blocked",
+                blockedReason: "already_restarting"
+            )
+            return
+        }
         isRestartingDaemon = true
         daemonRestartError = nil
         defer { isRestartingDaemon = false }
 
         if let error = await restartDaemonAction() {
             daemonRestartError = error
+            P036UICounters.shared.recordOperatorTaskAttempt(
+                taskID: "system.restart_daemon",
+                result: "blocked",
+                blockedReason: "restart_failed"
+            )
             return
         }
+        P036UICounters.shared.recordOperatorTaskAttempt(
+            taskID: "system.restart_daemon",
+            result: "succeeded",
+            blockedReason: nil
+        )
         await refreshAll()
     }
 
@@ -1036,7 +1267,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
         let presentation = await loadDaemonLifecycleAction(daemonFreshness)
         daemonFreshness = presentation.freshness
         daemonLifecycle = presentation
-        
+
         let schedulerResult = await loadSchedulerHealthAction()
         schedulerHealth = schedulerResult
     }
@@ -1045,6 +1276,11 @@ final class P031ThinReadDashboardModel: ObservableObject {
         let presentation = await loadRunDetailAction(runID, runDetailFreshness)
         runDetailFreshness = presentation.freshness
         runDetail = presentation
+    }
+
+    private func startLiveSubscriptions(for runID: String) {
+        startRunStatusSubscription(for: runID)
+        startRuntimeTimelineSubscription(for: runID)
     }
 
     private func startRunStatusSubscription(for runID: String) {
@@ -1068,10 +1304,91 @@ final class P031ThinReadDashboardModel: ObservableObject {
         }
     }
 
+    private func startRuntimeTimelineSubscription(for runID: String) {
+        guard subscribedRuntimeTimelineRunID != runID else { return }
+        runtimeTimelineSubscriptionTask?.cancel()
+        subscribedRuntimeTimelineRunID = runID
+        resetRuntimeTimelineBuffer()
+        runtimeTimelineSubscriptionTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let stream = try self.subscribeRuntimeTimelineAction(runID)
+                for try await event in stream {
+                    try Task.checkCancellation()
+                    self.recordRuntimeTimelineEvent(event)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func stopLiveSubscriptions() {
+        stopRunStatusSubscription()
+        runtimeTimelineSubscriptionTask?.cancel()
+        runtimeTimelineSubscriptionTask = nil
+        runtimeTimelinePublishTask?.cancel()
+        runtimeTimelinePublishTask = nil
+        subscribedRuntimeTimelineRunID = nil
+        resetRuntimeTimelineBuffer()
+    }
+
     private func stopRunStatusSubscription() {
         runStatusSubscriptionTask?.cancel()
         runStatusSubscriptionTask = nil
         subscribedRunID = nil
+    }
+
+    private func recordRuntimeTimelineEvent(_ event: P031RuntimeTimelineEventPresentation) {
+        let forcePublish = Self.isRuntimeTimelineTerminalEvent(event)
+        runtimeTimelineBuffer.record(event, selectedRunID: selectedRunID)
+        scheduleRuntimeTimelinePublish(force: forcePublish || runtimeTimelineEvents.isEmpty)
+    }
+
+    private func scheduleRuntimeTimelinePublish(force: Bool) {
+        guard !runtimeTimelineBuffer.events.isEmpty else { return }
+        let elapsed = Date().timeIntervalSince(runtimeTimelineLastPublish)
+        if force || runtimeTimelineFlushInterval <= 0 || elapsed >= runtimeTimelineFlushInterval {
+            publishRuntimeTimelineEvents()
+            return
+        }
+        guard runtimeTimelinePublishTask == nil else { return }
+        let delay = max(0, runtimeTimelineFlushInterval - elapsed)
+        runtimeTimelinePublishTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            await MainActor.run {
+                self?.publishRuntimeTimelineEvents()
+            }
+        }
+    }
+
+    private func publishRuntimeTimelineEvents() {
+        runtimeTimelinePublishTask?.cancel()
+        runtimeTimelinePublishTask = nil
+        runtimeTimelineEvents = runtimeTimelineBuffer.events
+        runtimeTimelineLastPublish = Date()
+        P036UICounters.shared.recordTimelineBatchFlush(
+            entryCount: runtimeTimelineEvents.count,
+            reduceMotion: false
+        )
+    }
+
+    private func resetRuntimeTimelineBuffer() {
+        runtimeTimelinePublishTask?.cancel()
+        runtimeTimelinePublishTask = nil
+        runtimeTimelineBuffer.reset()
+        runtimeTimelineEvents = []
+        runtimeTimelineLastPublish = Date.distantPast
+    }
+
+    private static func isRuntimeTimelineTerminalEvent(
+        _ event: P031RuntimeTimelineEventPresentation
+    ) -> Bool {
+        event.surfaceLabel == "final_response"
+            || event.eventKind == "session_completed"
+            || event.eventKind == "session_failed"
     }
 
     private func refreshSelectedRunAfterSubscriptionEvent(runID: String) async {
@@ -1319,25 +1636,74 @@ private struct P031RunsHomeRowCard: View {
 }
 
 private struct TimelineEntryRow: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     let entry: RunsWorkbenchPresentationModel.TimelineEntry
-    
+
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: iconName)
-                .foregroundStyle(.secondary)
-                .frame(width: 16)
-            
-            VStack(alignment: .leading, spacing: 2) {
-                Text(entry.message)
-                    .font(.subheadline)
-                Text(entry.timestamp, format: .dateTime.hour().minute().second())
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(entry.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.primary)
+                    .lineLimit(1)
+
+                if entry.isCollapsed {
+                    StatusCapsule(
+                        text: "Collapsed",
+                        color: ForgeStatusColor.neutral,
+                        icon: "rectangle.compress.vertical",
+                        size: .small
+                    )
+                }
+
+                Spacer(minLength: 8)
+
+                Text(entry.surfaceLabel)
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .lineLimit(1)
             }
+
+            if !entry.detail.isEmpty {
+                Text(previewDetail)
+                    .font(.caption)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .lineLimit(previewLineLimit)
+                    .fixedSize(horizontal: false, vertical: false)
+                    .frame(maxHeight: previewMaxHeight, alignment: .top)
+                    .clipped()
+            }
+
+            HStack(spacing: 8) {
+                if let stageID = entry.stageID, !stageID.isEmpty {
+                    Text(stageID)
+                }
+                if let sessionID = entry.sessionID, !sessionID.isEmpty {
+                    Text(sessionID)
+                }
+                if let displayTime = entry.displayTime {
+                    Text(displayTime)
+                        .monospacedDigit()
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(ForgeColor.Text.tertiary)
+            .lineLimit(1)
         }
-        .padding(.vertical, 4)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(tint.opacity(entry.isCollapsed ? 0.10 : 0.20), lineWidth: 1)
+        )
+        .transition(reduceMotion ? .opacity : .asymmetric(
+            insertion: .push(from: .bottom).combined(with: .opacity),
+            removal: .opacity
+        ))
     }
-    
+
     private var iconName: String {
         switch entry.kind {
         case .text: return "text.alignleft"
@@ -1348,6 +1714,39 @@ private struct TimelineEntryRow: View {
         case .implementationCompletion: return "flag.checkered"
         case .persisted: return "tray.full"
         }
+    }
+
+    private var tint: Color {
+        switch entry.kind {
+        case .implementationCompletion: return ForgeStatusColor.success
+        case .policyWarning: return ForgeStatusColor.approval
+        case .sessionEvent: return ForgeStatusColor.running
+        case .agentSummary: return ForgeStatusColor.neutral
+        case .persisted: return ForgeColor.Brand.accent
+        case .mergedTool: return ForgeStatusColor.warning
+        case .text: return ForgeStatusColor.neutral
+        }
+    }
+
+    private var previewDetail: String {
+        guard isResponseEntry else { return entry.detail }
+        let limit = 16_000
+        guard entry.detail.count > limit else { return entry.detail }
+        return "...\n" + String(entry.detail.suffix(limit))
+    }
+
+    private var previewLineLimit: Int {
+        isResponseEntry ? 40 : 3
+    }
+
+    private var previewMaxHeight: CGFloat {
+        isResponseEntry ? 560 : 54
+    }
+
+    private var isResponseEntry: Bool {
+        entry.surfaceLabel == "text_chunk"
+            || entry.surfaceLabel == "agent_message_chunk"
+            || entry.surfaceLabel == "agent_summary"
     }
 }
 
@@ -1370,12 +1769,12 @@ private struct P031RunDetailSummaryCard: View {
                 if let errorDescription = header.errorDescription {
                     ForgeWarningBanner.error(errorDescription)
                 }
-                
+
                 if header.status == "blocked" || header.status == "failed" {
                     Button {
                         onCheckSystemReadiness()
                     } label: {
-                        Label("Check System Readiness", systemImage: "stethoscope")
+                        Label("Check system readiness", systemImage: "stethoscope")
                             .font(.subheadline.weight(.semibold))
                     }
                     .buttonStyle(.bordered)
@@ -2076,7 +2475,7 @@ private struct P031StageTransitionMapCard: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
-                                
+
                                 if !stage.evidenceLabels.isEmpty {
                                     P031BadgeRow(labels: stage.evidenceLabels)
                                 }
@@ -2119,7 +2518,7 @@ private struct P031StageTransitionMapCard: View {
         default: return .secondary
         }
     }
-    
+
     private func statusLabel(for status: String) -> String {
         switch status {
         case "terminal": return "Completed"
@@ -2197,7 +2596,7 @@ private struct P031ApprovalInboxCard: View {
                                     Label(actionLabel, systemImage: "terminal")
                                         .font(.caption)
                                 }
-                                
+
                                 if let state = row.deferredState {
                                     ForgeWarningBanner(state.displayLabel, tint: state.tint)
                                 }
@@ -2511,10 +2910,10 @@ private struct P031ArtifactViewerCard: View {
                 if isLatestGroup {
                     Text("Latest")
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.green)
+                        .foregroundStyle(ForgeStatusColor.success)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(Color.green.opacity(0.12), in: Capsule())
+                        .background(ForgeStatusColor.success.opacity(0.12), in: Capsule())
                 }
                 Spacer()
                 Text("\(group.rows.count)")
@@ -3294,44 +3693,115 @@ private struct P031FreshnessBadge: View {
 
 
 #Preview("Stages") {
-    RunsHomeView(model: .previewLoaded(), workbench: RunsWorkbenchPresentationModel(), initialTab: .stages)
+    P036RunsHomePreviewHost(initialTab: .stages)
         .frame(width: 1200, height: 780)
 }
 
 #Preview("Artifacts") {
-    RunsHomeView(model: .previewLoaded(), workbench: RunsWorkbenchPresentationModel(), initialTab: .artifacts)
+    P036RunsHomePreviewHost(initialTab: .artifacts)
         .frame(width: 1200, height: 780)
 }
 
 #Preview("Overview") {
-    RunsHomeView(model: .previewLoaded(), workbench: RunsWorkbenchPresentationModel(), initialTab: .overview)
+    P036RunsHomePreviewHost(initialTab: .overview)
         .frame(width: 1200, height: 780)
+}
+
+#Preview("Timeline") {
+    P036RunsHomePreviewHost(initialTab: .timeline)
+        .frame(width: 1200, height: 780)
+}
+
+private struct P036RunsHomePreviewHost: View {
+    let initialTab: P031RunDetailTab
+
+    @StateObject private var model = P031ThinReadDashboardModel.previewLoaded()
+    @StateObject private var workbench = RunsWorkbenchPresentationModel()
+
+    var body: some View {
+        RunsHomeView(model: model, workbench: workbench, initialTab: initialTab)
+            .onAppear {
+                if let runsHome = model.runsHome {
+                    workbench.populate(from: runsHome)
+                }
+                if let runDetail = model.runDetail {
+                    workbench.populate(from: runDetail)
+                }
+                workbench.populate(daemon: model.daemonLifecycle, scheduler: model.schedulerHealth)
+            }
+    }
+}
+
+#Preview("Timeline Card") {
+    P036TimelineWorkbenchCard(entries: [
+        RunsWorkbenchPresentationModel.TimelineEntry(
+            id: "agent-session",
+            kind: .sessionEvent,
+            title: "Code Writer",
+            detail: "Session started",
+            timestamp: Date(),
+            displayTime: "08:00",
+            stageID: "implementation_refined",
+            surfaceLabel: "session_event",
+            agentID: "code-writer",
+            sessionID: "session-active",
+            isCollapsed: false
+        ),
+        RunsWorkbenchPresentationModel.TimelineEntry(
+            id: "agent-tool",
+            kind: .mergedTool,
+            title: "Code Writer",
+            detail: "Tool: edit (running)",
+            timestamp: Date(),
+            displayTime: "08:01",
+            stageID: "implementation_refined",
+            surfaceLabel: "merged_tool",
+            agentID: "code-writer",
+            sessionID: "session-active",
+            isCollapsed: false
+        ),
+        RunsWorkbenchPresentationModel.TimelineEntry(
+            id: "completed-agent-noise",
+            kind: .text,
+            title: "Previous Agent",
+            detail: "Collapsed after completion",
+            timestamp: Date(),
+            displayTime: "07:58",
+            stageID: "implementation_reviewed",
+            surfaceLabel: "text",
+            agentID: "previous-agent",
+            sessionID: "session-complete",
+            isCollapsed: true
+        )
+    ])
+    .frame(width: 760)
+    .padding()
 }
 
 private struct P036SystemReadinessCard: View {
     let health: RunsWorkbenchPresentationModel.FreshnessHealth
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Text("System Readiness")
-                    .font(.headline)
+                Text("System readiness")
+                    .font(ForgeTypography.sectionHeader)
                 Spacer()
                 if health.isReadinessDeferred {
-                    Label("Readiness Pending", systemImage: "clock.badge.questionmark")
+                    Label("Readiness pending", systemImage: "clock.badge.questionmark")
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("readiness-deferred")
                 } else if health.isSystemReady {
                     Label("Ready", systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+                        .foregroundStyle(ForgeStatusColor.success)
                 } else {
-                    Label("Action Required", systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
+                    Label("Action required", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(ForgeStatusColor.warning)
                 }
             }
-            
+
             Divider()
-            
+
             Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 10) {
                 GridRow {
                     Text("Daemon")
@@ -3372,7 +3842,7 @@ private struct P036SystemReadinessCard: View {
 private struct P036RunDetailSummaryCard: View {
     let header: RunsWorkbenchPresentationModel.SummaryHeader
     let onCheckSystemReadiness: () -> Void
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -3384,9 +3854,9 @@ private struct P036RunDetailSummaryCard: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                
+
                 Button(action: onCheckSystemReadiness) {
-                    Label("Check Readiness", systemImage: "checkmark.shield")
+                        Label("Check readiness", systemImage: "checkmark.shield")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -3400,55 +3870,288 @@ private struct P036RunDetailSummaryCard: View {
 
 private struct P036StageMapCard: View {
     let map: RunsWorkbenchPresentationModel.StageMap
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Execution Stages")
-                .font(.headline)
-            
-            FlowLayout(spacing: 8) {
-                ForEach(map.stages) { stage in
-                    HStack(spacing: 6) {
-                        stageIcon(for: stage.status)
-                        Text(stage.title)
-                            .font(.caption.weight(.medium))
+            ForgeSectionHeader(
+                title: "Stages",
+                subtitle: "Frozen workflow snapshot · \(map.stages.count) stage\(map.stages.count == 1 ? "" : "s")",
+                symbol: "point.topleft.down.curvedto.point.bottomright.up"
+            )
+
+            if map.stages.isEmpty {
+                Text("No topology readback yet")
+                    .font(ForgeTypography.body)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 92, alignment: .center)
+                    .background(ForgeColor.Surface.muted, in: RoundedRectangle(cornerRadius: 8))
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 10) {
+                        ForEach(Array(map.stages.enumerated()), id: \.element.id) { index, stage in
+                            if index > 0 {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(ForgeColor.Text.tertiary)
+                                    .frame(width: 18, height: 164)
+                                    .accessibilityHidden(true)
+                            }
+                            P036StageTopologyCard(stage: stage)
+                        }
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(stageColor(for: stage.status).opacity(0.12))
-                    .foregroundStyle(stageColor(for: stage.status))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 6)
-                            .strokeBorder(stageColor(for: stage.status).opacity(0.24), lineWidth: 1)
+                    .padding(.vertical, 2)
+                    .padding(.trailing, 4)
+                }
+            }
+        }
+        .forgePanel()
+    }
+}
+
+private struct P036StageTopologyCard: View {
+    let stage: RunsWorkbenchPresentationModel.StageCard
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 8) {
+                Text(String(format: "%02d", stage.ordinal))
+                    .font(ForgeTypography.micro.monospacedDigit())
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                    .frame(width: 24, alignment: .leading)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(stage.title)
+                        .font(ForgeTypography.cardTitle)
+                        .foregroundStyle(ForgeColor.Text.primary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(stage.ownerAgentTitle)
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                StatusCapsule(
+                    text: statusLabel(for: stage.status),
+                    color: stageColor(for: stage.status),
+                    icon: statusIconName(for: stage.status),
+                    size: .small
+                )
+            }
+
+            HStack(spacing: 6) {
+                ForEach(stageMetadataChips, id: \.self) { label in
+                    Text(label)
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                        .lineLimit(1)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(ForgeColor.Surface.muted, in: Capsule())
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(stage.occurrences) { occurrence in
+                    P036StageOccurrenceRow(occurrence: occurrence)
+                }
+                if stage.hiddenOccurrenceCount > 0 {
+                    Text("+ \(stage.hiddenOccurrenceCount) more")
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(ForgeColor.Text.tertiary)
+                }
+            }
+            .frame(minHeight: 46, alignment: .topLeading)
+
+            if !stage.transitions.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(stage.transitions.prefix(2)) { transition in
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.right")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(ForgeColor.Text.tertiary)
+                            Text(transition.toLabel)
+                                .font(ForgeTypography.micro)
+                                .foregroundStyle(ForgeColor.Text.secondary)
+                                .lineLimit(1)
+                        }
                     }
                 }
             }
         }
-        .padding(20)
-        .background(Color.primary.opacity(0.03))
-        .cornerRadius(12)
-    }
-    
-    @ViewBuilder
-    private func stageIcon(for status: String) -> some View {
-        switch status {
-        case "terminal": Image(systemName: "checkmark.circle.fill")
-        case "active": Image(systemName: "play.circle.fill")
-        case "blocked": Image(systemName: "exclamationmark.octagon.fill")
-        case "pending": Image(systemName: "clock.fill")
-        default: Image(systemName: "questionmark.circle.fill")
+        .frame(width: 272, alignment: .topLeading)
+        .frame(minHeight: 164, alignment: .topLeading)
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(stage.isCurrent ? ForgeStatusColor.running.opacity(0.08) : ForgeColor.Surface.elevated)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(
+                    stage.isCurrent ? ForgeStatusColor.running : ForgeColor.Surface.border,
+                    lineWidth: stage.isCurrent ? 2 : 1
+                )
         }
+        .modifier(P036RunningPulse(isActive: stage.status == "active" && stage.isCurrent))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(stage.ordinal). \(stage.title), \(stage.ownerAgentTitle), \(statusLabel(for: stage.status)), \(stageMetadata)")
     }
-    
+
+    private var stageMetadata: String {
+        let parts = stageMetadataChips + stage.evidenceLabels
+        return parts.isEmpty ? "No stage evidence yet" : parts.joined(separator: " · ")
+    }
+
+    private var stageMetadataChips: [String] {
+        [
+            stage.iterationText,
+            stage.attemptText,
+            stage.approvalRequired ? "Approval" : nil,
+            stage.artifactCount > 0 ? "\(stage.artifactCount) artifacts" : nil
+        ].compactMap { $0 }.filter { !$0.isEmpty }
+    }
+
     private func stageColor(for status: String) -> Color {
         switch status {
-        case "terminal": return .green
-        case "active": return .blue
-        case "blocked": return .red
-        case "pending": return .secondary
-        default: return .secondary
+        case "terminal": return ForgeStatusColor.success
+        case "active": return ForgeStatusColor.running
+        case "blocked": return ForgeStatusColor.error
+        case "pending": return ForgeStatusColor.neutral
+        default: return ForgeStatusColor.neutral
         }
+    }
+
+    private func statusLabel(for status: String) -> String {
+        switch status {
+        case "terminal": return "Completed"
+        case "active": return "Running"
+        case "blocked": return "Blocked"
+        case "pending": return "Pending"
+        default: return "Unavailable"
+        }
+    }
+
+    private func statusIconName(for status: String) -> String {
+        switch status {
+        case "terminal": return "checkmark.circle.fill"
+        case "active": return "play.circle.fill"
+        case "blocked": return "exclamationmark.octagon.fill"
+        case "pending": return "clock.fill"
+        default: return "questionmark.circle.fill"
+        }
+    }
+}
+
+private struct P036StageOccurrenceRow: View {
+    let occurrence: RunsWorkbenchPresentationModel.StageOccurrence
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "person.crop.circle")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(ForgeColor.Text.tertiary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(occurrence.agentTitle)
+                    .font(ForgeTypography.micro.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.primary)
+                    .lineLimit(1)
+                Text(detailText)
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    private var detailText: String {
+        [
+            occurrence.taskName,
+            occurrence.statusText,
+            occurrence.executionCountLabel,
+            occurrence.providerLabel.isEmpty ? nil : occurrence.providerLabel
+        ].compactMap { $0 }.joined(separator: " · ")
+    }
+}
+
+private struct P036RunningPulse: ViewModifier {
+    let isActive: Bool
+
+    func body(content: Content) -> some View {
+        if isActive {
+            content
+                .shadow(color: ForgeStatusColor.running.opacity(0.35), radius: 5)
+        } else {
+            content
+        }
+    }
+}
+
+private struct P036TimelineWorkbenchCard: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    let entries: [RunsWorkbenchPresentationModel.TimelineEntry]
+
+    private var visibleEntries: [RunsWorkbenchPresentationModel.TimelineEntry] {
+        entries.filter { !$0.isCollapsed }
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Timeline")
+                        .font(.title3.weight(.semibold))
+                    Text(timelineSubtitle)
+                        .font(.caption)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                }
+
+                if visibleEntries.isEmpty {
+                    ContentUnavailableView(
+                        "No Timeline Data",
+                        systemImage: "waveform.path.ecg",
+                        description: Text("No active control-plane timeline events for the selected agent yet.")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 160)
+                } else {
+                    GroupBox("Timeline") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(visibleEntries) { entry in
+                                TimelineEntryRow(entry: entry)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .animation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82), value: visibleEntries.map(\.id))
+                }
+
+                Color.clear
+                    .frame(height: 1)
+                    .id("live-timeline-bottom")
+            }
+            .onChange(of: visibleEntries.count) {
+                withAnimation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82)) {
+                    proxy.scrollTo("live-timeline-bottom", anchor: .bottom)
+                }
+            }
+            .onChange(of: visibleEntries.last?.id) {
+                withAnimation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82)) {
+                    proxy.scrollTo("live-timeline-bottom", anchor: .bottom)
+                }
+            }
+        }
+        .forgePanel()
+        .accessibilityIdentifier("p036-timeline-workbench-card")
+    }
+
+    private var timelineSubtitle: String {
+        if visibleEntries.isEmpty {
+            return "Focused run-detail timeline from control-plane active-agent readback."
+        }
+        return "\(visibleEntries.count) focused event\(visibleEntries.count == 1 ? "" : "s") from the selected active agent."
     }
 }
 
@@ -3460,8 +4163,8 @@ private struct P036ApprovalWorkbenchCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Pending Approvals")
-                .font(.headline)
+            Text("Pending approvals")
+                .font(ForgeTypography.sectionHeader)
 
             if rows.isEmpty {
                 Text("No pending approvals for this run.")
@@ -3489,7 +4192,7 @@ private struct P036ApprovalWorkbenchCard: View {
                                 if let deferred = row.deferredState {
                                     Text(deferred.displayLabel)
                                         .font(.caption2)
-                                        .foregroundStyle(.orange)
+                                    .foregroundStyle(deferred.tint)
                                 }
                             }
                             Spacer()
@@ -3520,7 +4223,7 @@ private struct P036ApprovalWorkbenchCard: View {
                                 }
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
-                                .tint(.red)
+                                .tint(ForgeStatusColor.error)
                                 .disabled(!row.canReject || resolvingIDs.contains(row.id))
                                 .help(row.rejectDisabledReason ?? "")
 
@@ -3529,7 +4232,7 @@ private struct P036ApprovalWorkbenchCard: View {
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.small)
-                                .tint(.green)
+                                .tint(ForgeStatusColor.success)
                                 .disabled(!row.canApprove || resolvingIDs.contains(row.id))
                                 .help(row.approveDisabledReason ?? "")
                             }
@@ -3542,40 +4245,56 @@ private struct P036ApprovalWorkbenchCard: View {
                 }
             }
         }
-        .padding(20)
-        .background(Color.primary.opacity(0.03))
-        .cornerRadius(12)
+        .forgePanel(tint: rows.isEmpty ? ForgeColor.Surface.border : ForgeStatusColor.approval)
     }
 }
 
 private struct P036ArtifactWorkbenchCard: View {
     let rows: [RunsWorkbenchPresentationModel.ArtifactReportRow]
-    
+
+    private let visibleRowLimit = 24
+
+    private var visibleRows: ArraySlice<RunsWorkbenchPresentationModel.ArtifactReportRow> {
+        rows.prefix(visibleRowLimit)
+    }
+
+    private var hiddenRowCount: Int {
+        max(0, rows.count - visibleRows.count)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Artifacts & Reports")
-                .font(.headline)
-            
+            ForgeSectionHeader(
+                title: "Artifacts and reports",
+                subtitle: rows.isEmpty ? "No durable outputs yet" : "\(rows.count) durable output\(rows.count == 1 ? "" : "s")",
+                symbol: "doc.text"
+            )
+
             if rows.isEmpty {
                 Text("No artifacts available.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             } else {
                 VStack(spacing: 8) {
-                    ForEach(rows) { row in
+                    ForEach(visibleRows) { row in
                         ArtifactRowView(row: row)
+                    }
+                    if hiddenRowCount > 0 {
+                        Text("\(hiddenRowCount) more durable output\(hiddenRowCount == 1 ? "" : "s") available in artifact detail")
+                            .font(ForgeTypography.micro)
+                            .foregroundStyle(ForgeColor.Text.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 2)
                     }
                 }
             }
         }
-        .padding(20)
-        .background(Color.primary.opacity(0.03))
-        .cornerRadius(12)
+        .forgePanel()
     }
 
     private struct ArtifactRowView: View {
         let row: RunsWorkbenchPresentationModel.ArtifactReportRow
-        
+
         var body: some View {
             HStack {
                 Label(row.title, systemImage: "doc.fill")
@@ -3587,7 +4306,7 @@ private struct P036ArtifactWorkbenchCard: View {
             .background(Color.primary.opacity(0.04))
             .cornerRadius(8)
         }
-        
+
         @ViewBuilder
         private func availabilityBadge(_ availability: RunsWorkbenchPresentationModel.ArtifactPayloadAvailability) -> some View {
             let color = availabilityColor(availability)
@@ -3599,14 +4318,14 @@ private struct P036ArtifactWorkbenchCard: View {
                 .foregroundStyle(color)
                 .clipShape(Capsule())
         }
-        
+
         private func availabilityColor(_ availability: RunsWorkbenchPresentationModel.ArtifactPayloadAvailability) -> Color {
             switch availability {
-            case .available: return .green
-            case .metadataOnly: return .blue
-            case .generating: return .orange
+            case .available: return ForgeStatusColor.success
+            case .metadataOnly: return ForgeStatusColor.running
+            case .generating: return ForgeStatusColor.warning
             case .deferred: return .secondary
-            case .unavailable, .unknown: return .red
+            case .unavailable, .unknown: return ForgeStatusColor.error
             }
         }
     }
@@ -3614,12 +4333,15 @@ private struct P036ArtifactWorkbenchCard: View {
 
 private struct P036RecoveryEvidenceCard: View {
     let rows: [RunsWorkbenchPresentationModel.RecoveryEvidenceRow]
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Recovery Evidence")
-                .font(.headline)
-            
+            ForgeSectionHeader(
+                title: "Recovery evidence",
+                subtitle: rows.isEmpty ? "No recovery facts yet" : "\(rows.count) diagnostic row\(rows.count == 1 ? "" : "s")",
+                symbol: "bandage"
+            )
+
             if rows.isEmpty {
                 Text("No recovery evidence found.")
                     .font(.subheadline)
@@ -3634,22 +4356,20 @@ private struct P036RecoveryEvidenceCard: View {
                 }
             }
         }
-        .padding(20)
-        .background(Color.primary.opacity(0.03))
-        .cornerRadius(12)
+        .forgePanel()
     }
 }
 
 /// Simple flow layout for stage cards
 private struct FlowLayout: Layout {
     var spacing: CGFloat
-    
+
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         let width = proposal.width ?? 0
         var currentX: CGFloat = 0
         var currentY: CGFloat = 0
         var maxHeight: CGFloat = 0
-        
+
         for subview in subviews {
             let size = subview.sizeThatFits(.unspecified)
             if currentX + size.width > width && currentX > 0 {
@@ -3660,15 +4380,15 @@ private struct FlowLayout: Layout {
             currentX += size.width + spacing
             maxHeight = max(maxHeight, size.height)
         }
-        
+
         return CGSize(width: width, height: currentY + maxHeight)
     }
-    
+
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
         var currentX: CGFloat = bounds.minX
         var currentY: CGFloat = bounds.minY
         var maxHeight: CGFloat = 0
-        
+
         for subview in subviews {
             let size = subview.sizeThatFits(.unspecified)
             if currentX + size.width > bounds.maxX && currentX > bounds.minX {

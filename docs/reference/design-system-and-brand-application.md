@@ -107,7 +107,7 @@ The implemented design-system slice now owns visual consistency across:
 The same system is carried into:
 
 - `ProviderSettingsView`
-- `SettingsView` System Readiness segment (proposal-036 successor to the former `PilotReadinessView`)
+- `SettingsView` System Readiness segment (successor to the former `PilotReadinessView`)
 - `FirstRunSetupWizard`
 - `ProviderSetupEvidencePanel`
 - `ProviderTroubleshootingPanel`

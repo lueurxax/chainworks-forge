@@ -1009,6 +1009,7 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+ "workflow",
 ]
 
 [[package]]

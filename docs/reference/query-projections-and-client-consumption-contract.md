@@ -12,7 +12,7 @@ This document is the canonical implemented GraphQL read contract for the thin ma
 | Composed downstream gate | `./scripts/test-gate.sh p031` |
 | Scope | Rust control-plane GraphQL read contract for thin macOS UI consumption. Command/control (MCP mutations) is explicitly NOT part of this contract, with the exception of the governed approval mutation path. See [ui-action-boundary.md](ui-action-boundary.md). |
 | Current UI boundary | Thin macOS UI (read-side and human-gate mutation consumer over server-owned projections). |
-| Stabilization owners | P032 for productization and honest operator dogfood; P036 for visual/navigation restoration over this read model. |
+| Stabilization owners | P032 for productization and honest operator dogfood; [macos-operator-navigation.md](macos-operator-navigation.md) for the implemented visual/navigation shell over this read model. |
 
 ## Thin UI Boundary
 
@@ -84,6 +84,7 @@ The client must not infer:
 |---|---|---|---|---|
 | Runs home | `runs(ideaId:)` and `runs` | `db::repos::projections::{list_by_idea_projection,list_active_projection}` | Implemented | Render run list from projection-backed `GqlRun`; do not compute state from local rows or files. |
 | Run detail | `run(id:)` with projection enrichment | Canonical run row enriched by `db::repos::projections::find_run_projection` | Implemented | Use projection-backed counters and summaries; show projection lag when projection truth is missing or stale. **P065 expansion**: includes compact retry-instruction provenance. |
+| Retry authority recovery readback | `run(id:)` fields `retryAuthorityJson`, `retryAuthorityHistoryJson`, `p091OrphanRepairReadbackJson` | `retry_stage_execution_authorities`, `retry_payload_recovery_events`, and `p091_orphan_repair_passes` | Implemented | Render targeted retry authority, retry payload recovery diagnostics, nullable missing-authority history rows, and recovery counters from server-owned JSON readback only. |
 | Stage list / progress | `stages(runId:)` | `db::repos::projections::list_stages_projection` | Implemented | Use projection-owned decision flags; disable dependent actions when `projectionLag` is true. |
 | Stage detail | `stage(id:)` plus `agentExecutions(stageExecutionId:)` | Canonical stage row enriched by stage summary projection and agent execution readback | Implemented | Use server-owned stage flags and execution truth; do not compute retry/reset/resume eligibility in Swift. **P065 expansion**: includes `retry_instruction` group and delivery status. |
 | Approval inbox | `approvalInbox` | `db::repos::projections::list_pending_inbox_projection` | Implemented | Render pending approvals from projection truth. Resolution is supported via governed GraphQL mutations or operator-side MCP action (`approvals.resolve`). |
@@ -134,17 +135,19 @@ The `storageHealth` query returns a `GqlStorageHealth` object, providing a compr
 | | `thresholds` | Configured warning and critical thresholds for various storage metrics. |
 | | `projectionFreshness` | A list of `GqlProjectionFreshnessV1` objects, each detailing the freshness of a specific projection, including its watermark, poisoning status, and backlog. |
 | | `projectionFreshnessBySource(projectionName: String, sourceName: String)` | A filterable complex field returning `GqlProjectionFreshnessV1` objects. Allows clients to query freshness details for specific projections or data sources. |
-| | `hotReadGuards` | A list of `HotReadCircuitStateV1` objects exposing per-surface hot-read circuit state (closed, open, half-open) including `wouldOpen` observe-mode counters used by the P087 promotion budget. |
+| | `hotReadGuards` | A list of `HotReadCircuitStateV1` objects exposing per-surface hot-read circuit state (closed, open, half-open) including `wouldOpen` observe-mode counters used by the storage-tiering promotion budget. |
 | | `maintenanceOperations` | A list of `MaintenanceOperationStatusV1` objects describing active and recently terminal maintenance operations (e.g., `repair_slot`) with `operationId`, `slotGeneration`, and audit-bound state. |
 | | `degraded` | Optional `DegradedStateV1` carrying a compact severity, short reason, and inline-detail payload for the operator UI degraded-state pattern. |
-| | `rollout` | JSON readback of the active rollout contract for the storage tiering / read-path liveness surface, including `rollout_contract_status`, decision, enforcement mode, hold conditions, and P087 readback fields enumerated by the P087 rollout contract (P084 schema). |
+| | `rollout` | JSON readback of the active rollout contract for the storage tiering / read-path liveness surface, including `rollout_contract_status`, decision, enforcement mode, hold conditions, and retained `p087_*` readback fields enumerated by the rollout contract (P084 schema). |
 | | `updatedAt` | Timestamp of the last health status update. |
 | | `staleAfterMs` | Duration in milliseconds after which the health data is considered stale. |
 | | `isStale` | Boolean indicating if the current health data is considered stale. |
 
 Storage health diagnostics are public readback, not raw internal error transport. Unknown persisted error strings, idempotency material, hostnames, principal tokens, and provider-authored diagnostic text must be reduced to explicit public error codes or stable hash references before they leave the daemon. If a diagnostic subquery fails, `storageHealth` remains available with `degraded.reason = storage_health_partial_readback_unavailable` or a projection-local `storage_health_subquery_unavailable` marker instead of silently presenting missing data as absent data.
 
-P087 hot-read liveness mode defaults may be relaxed only for local development. Production mode (`CHAINWORKS_ENV=production` or `CHAINWORKS_STORAGE_TIERING_PRODUCTION_MODE=1|true`) requires `CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE=enforce`; any other value is a rollout hold reported as `p087_liveness_mode_not_enforced_in_production`.
+Hot-read liveness mode defaults may be relaxed only for local development. Production mode (`CHAINWORKS_ENV=production` or `CHAINWORKS_STORAGE_TIERING_PRODUCTION_MODE=1|true`) requires `CHAINWORKS_STORAGE_TIERING_READ_PATH_LIVENESS_MODE=enforce`; any other value is a rollout hold reported as `p087_liveness_mode_not_enforced_in_production`.
+
+The `p087_*` field prefix is a retained schema and rollout-readback alias for this implemented storage-tiering contract. It is stable wire vocabulary, not a dependency on the retired proposal document.
 
 ### GqlProjectionFreshnessV1
 
@@ -366,4 +369,4 @@ The gate fails closed when this reference document omits required surfaces, stat
 - Report payload rendering needs a server-owned GraphQL payload path before it can be a full thin-client surface.
 - Adapter/runtime health beyond the daemon lifecycle read model remains deferred unless a future server-owned read surface publishes it.
 - Experiment comparison has no current GraphQL read owner and stays deferred.
-- Broader operator dogfood/productization is owned by P032, and visual/navigation restoration is owned by P036. Those tails do not change the thin UI boundary for new feature work.
+- Broader operator dogfood/productization is owned by P032, and the implemented visual/navigation shell is owned by [macos-operator-navigation.md](macos-operator-navigation.md). Those tails do not change the thin UI boundary for new feature work.

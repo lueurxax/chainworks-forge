@@ -877,6 +877,8 @@ mod tests {
             session_generation_id: Some("session-gen-1".into()),
             status: "failed".into(),
             failure_phase: Some("read_poll_elapsed_without_message".into()),
+            jsonrpc_error_code: None,
+            provider_error_message_redacted: None,
             started_at: "2026-05-16T00:00:00Z".into(),
             completed_at: Some("2026-05-16T00:05:00Z".into()),
             xcode_shim_injected: false,

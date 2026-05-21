@@ -381,6 +381,8 @@ async fn run_daemon() -> Result<()> {
             let _executor_watchdog_handle = spawn_background_executor_watchdog(
                 pool.clone(),
                 work_queue.clone(),
+                events.clone(),
+                db_writer.clone(),
                 reporter.clone(),
                 executor_handle,
             );
@@ -464,6 +466,8 @@ async fn run_daemon() -> Result<()> {
             let _executor_watchdog_handle = spawn_background_executor_watchdog(
                 pool.clone(),
                 work_queue.clone(),
+                events.clone(),
+                db_writer.clone(),
                 reporter.clone(),
                 executor_handle,
             );
@@ -679,6 +683,8 @@ fn xcode_broker_health_for_lifecycle(
 fn spawn_background_executor_watchdog(
     pool: SqlitePool,
     work_queue: WorkQueue,
+    events: engine::event_bus::EventSender,
+    db_writer: Arc<db::writer::DbWriter>,
     reporter: LifecycleReporter,
     executor_handle: tokio::task::JoinHandle<()>,
 ) -> tokio::task::JoinHandle<()> {
@@ -745,6 +751,29 @@ fn spawn_background_executor_watchdog(
                 Err(error) => warn!(
                     error = %error,
                     "BackgroundExecutor watchdog failed to inspect stale running AdvanceRun work items"
+                ),
+            }
+
+            let p092_recovery = RecoveryService::new_with_db_writer(
+                pool.clone(),
+                work_queue.clone(),
+                events.clone(),
+                db_writer.clone(),
+            );
+            match p092_recovery
+                .run_p092_retry_payload_recovery_for_active_runs()
+                .await
+            {
+                Ok(0) => {}
+                Ok(repaired) => {
+                    warn!(
+                        repaired,
+                        "BackgroundExecutor watchdog repaired P092 retry payload recovery candidates"
+                    );
+                }
+                Err(error) => warn!(
+                    error = %error,
+                    "BackgroundExecutor watchdog failed to inspect P092 retry payload recovery candidates"
                 ),
             }
 

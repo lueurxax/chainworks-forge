@@ -761,6 +761,15 @@ backend_profiles:
     structured_output: preferred
     mcp: []
     runtime_profile: codex_acp
+  codex_orchestrator_high:
+    provider: codex_acp
+    model: gpt-5.5
+    effort: high
+    temperature: 0.1
+    max_turns: 16
+    structured_output: required
+    mcp: []
+    runtime_profile: codex_acp
   auggie_orchestrator_acp:
     provider: auggie
     model: auggie-default
@@ -1190,7 +1199,7 @@ agents:
     title: Lead / Orchestrator
     mode: orchestration
     system_role: lead
-    backend_profile: gemini_reasoning_pro_high
+    backend_profile: codex_orchestrator_high
     permission_profile: ORCH
     lead_resolution_contract: LeadResolutionContract
     skill_ref: orchestrator_core

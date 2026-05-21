@@ -382,6 +382,28 @@ pub async fn list_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<AgentEx
     rows.iter().map(parse_agent_execution_row).collect()
 }
 
+pub async fn list_running_by_run(pool: &SqlitePool, run_id: RunId) -> Result<Vec<AgentExecution>> {
+    let prefixed_select_cols = SELECT_COLS
+        .split(',')
+        .map(|col| format!("ae.{}", col.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT {prefixed_select_cols}
+         FROM agent_executions ae
+         INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
+         WHERE se.run_id = ? AND ae.status = ?
+         ORDER BY ae.started_at ASC"
+    );
+    let rows = sqlx::query(&query)
+        .bind(run_id.to_string())
+        .bind(AgentStatus::Running.to_string())
+        .fetch_all(pool)
+        .await?;
+
+    rows.iter().map(parse_agent_execution_row).collect()
+}
+
 pub async fn list_by_run_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: RunId,

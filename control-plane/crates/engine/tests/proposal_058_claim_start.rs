@@ -916,6 +916,186 @@ async fn proposal_058_xcode_mcp_invoke_claim_respects_configured_xcode_capacity(
 }
 
 #[tokio::test]
+async fn provider_quota_wait_blocks_same_provider_family_claim_only() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "Provider quota guard".into(),
+            body: "provider quota should hold only matching provider family".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "implementation".into(),
+            label: "Implementation".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let failed_gemini_execution_id = AgentExecutionId::new();
+    agent_executions::insert(
+        &pool,
+        &AgentExecution {
+            id: failed_gemini_execution_id,
+            stage_execution_id: Some(stage_execution_id),
+            agent_id: "lead_orchestrator".into(),
+            provider: "gemini".into(),
+            model: Some("gemini-3.1-pro-preview".into()),
+            status: AgentStatus::Failed,
+            started_at: Utc::now() - Duration::minutes(10),
+            completed_at: Some(Utc::now() - Duration::minutes(5)),
+            owner_execution_lineage_id: Some(stage_execution_id.to_string()),
+            session_lineage_id: Some("lineage-gemini".into()),
+            session_generation_id: Some("generation-gemini".into()),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some("owner-key".into()),
+            session_reuse_scope: Some("same_agent_family_within_run".into()),
+            session_family_id: Some("orchestration_loop".into()),
+            session_reuse_disposition: Some("fresh".into()),
+            session_reset_reason: None,
+            backend_profile_id: Some("gemini_reasoning_pro_high".into()),
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+        },
+    )
+    .await
+    .unwrap();
+    let retry_after = Utc::now() + Duration::hours(1);
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        stage_execution_id,
+        failed_gemini_execution_id,
+        Some(retry_after),
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    for (id, provider) in [
+        ("gemini-invoke-held", "gemini"),
+        ("codex-invoke-allowed", "codex_acp"),
+    ] {
+        work_items::enqueue(
+            &pool,
+            &WorkItem {
+                id: id.into(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "stage_id": "implementation",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "agent_id": id,
+                    "provider": provider,
+                    "model": "test-model",
+                    "prompt": "run",
+                    "task_name": id,
+                    "task_inputs": ["input"],
+                    "task_outputs": ["output"],
+                    "declared_outputs": [],
+                    "requested_mcp_server_ids": [],
+                    "session_reuse_scope": "same_agent_family_within_run",
+                    "session_family_id": id,
+                    "worktree_write_enabled": false
+                })
+                .to_string(),
+                status: WorkItemStatus::Pending,
+                run_id: Some(run_id),
+                stage_id: Some("implementation".into()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 0,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("non-degraded provider should still claim");
+    assert_eq!(claimed.source_work_item_id, "codex-invoke-allowed");
+
+    let pending = work_items::list_by_status(&pool, WorkItemStatus::Pending)
+        .await
+        .unwrap();
+    assert!(
+        pending.iter().any(|item| item.id == "gemini-invoke-held"),
+        "Gemini work item should remain pending while provider quota wait is active"
+    );
+
+    sqlx::query(
+        "UPDATE agent_retry_budget_ledger SET normal_budget_consumed = 1, state = 'early_retry_consumed' WHERE id = ?1",
+    )
+    .bind(&ledger.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let claimed_after_budget_override = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("explicit quota budget consumption should allow Gemini claim");
+    assert_eq!(
+        claimed_after_budget_override.source_work_item_id,
+        "gemini-invoke-held"
+    );
+}
+
+#[tokio::test]
 async fn proposal_090_junie_preflight_running_does_not_consume_provider_capacity_until_launch() {
     let pool = test_pool().await;
     let idea_id = IdeaId::new();

@@ -589,6 +589,12 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       readTransport.requests.first { $0.operationName == "P031RunDetail" }?.document
         .contains("approvalInbox(runId: $runId)") == true)
     #expect(
+      readTransport.requests.first { $0.operationName == "P031RunDetail" }?.document
+        .contains("activeAgentExecutions(runId: $runId)") == true)
+    #expect(
+      readTransport.requests.first { $0.operationName == "P031RunDetail" }?.document
+        .contains("runStageTopology(runId: $runId)") == true)
+    #expect(
       readTransport.requests.map(\.variables) == [
         ["runId": "run-1"],
         ["stageExecutionId": "stage-exec-1"],
@@ -962,6 +968,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       daemonStatus: P031GraphQLDocuments.daemonStatus,
       ideaTitle: P031GraphQLDocuments.ideaTitle,
       runStatusChanged: P031GraphQLDocuments.runStatusChanged,
+      runtimeStatusChanged: P031GraphQLDocuments.runtimeStatusChanged,
       daemonStatusChanged: P031GraphQLDocuments.daemonStatusChanged
     )
     let readTransport = CapturingP031ReadTransport(
@@ -3420,6 +3427,12 @@ private struct FailingP031WorkflowReadStore: P031WorkflowReadStore {
 
   nonisolated func subscribeToRunStatus(runID: String) throws -> AsyncThrowingStream<
     P031RunStatusChangedReadModel, Error
+  > {
+    throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
+  }
+
+  nonisolated func subscribeToRuntimeTimeline(runID: String) throws -> AsyncThrowingStream<
+    P031RuntimeTimelineEventReadModel, Error
   > {
     throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
   }
