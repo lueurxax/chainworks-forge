@@ -2525,6 +2525,23 @@ fn session_update_observation(parsed: &Value) -> (&'static str, bool, Option<Str
     (kind, meaningful_progress, detail)
 }
 
+fn session_update_refreshes_progress_deadline(
+    update_kind: &str,
+    meaningful_progress: bool,
+) -> bool {
+    meaningful_progress
+        && matches!(
+            update_kind,
+            "tool_call_update"
+                | "tool_call"
+                | "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "plan"
+                | "provider_activity"
+                | "text_chunk"
+        )
+}
+
 fn timeline_title_for_update(update_kind: &str) -> &'static str {
     match update_kind {
         "tool_call" => "Tool call",
@@ -2693,13 +2710,7 @@ async fn record_prompt_progress_detail_for_session(
 }
 
 fn bounded_timeline_detail(text: &str) -> Option<String> {
-    let mut normalized = strip_ansi(text)
-        .replace('\r', "\n")
-        .lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n");
-    normalized = normalized.trim().to_string();
+    let mut normalized = normalized_timeline_detail(text)?;
     if normalized.is_empty() {
         return None;
     }
@@ -2709,6 +2720,22 @@ fn bounded_timeline_detail(text: &str) -> Option<String> {
         normalized.push_str("…");
     }
     Some(normalized)
+}
+
+fn normalized_timeline_detail(text: &str) -> Option<String> {
+    let normalized = strip_ansi(text)
+        .replace('\r', "\n")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 async fn poll_claude_local_activity_watchdog(
@@ -3434,7 +3461,7 @@ impl AcpTransportSession {
             &self.session_id,
             AcpPromptProgressKind::PromptSent,
             Some("Prompt sent".to_string()),
-            bounded_timeline_detail(&req.prompt),
+            normalized_timeline_detail(&req.prompt),
             Some("operator_prompt".to_string()),
         )
         .await;
@@ -3875,6 +3902,12 @@ impl AcpTransportSession {
                         let (update_kind, meaningful_progress, detail) =
                             session_update_observation(&parsed);
                         if meaningful_progress {
+                            if session_update_refreshes_progress_deadline(
+                                update_kind,
+                                meaningful_progress,
+                            ) {
+                                last_acp_progress = Instant::now();
+                            }
                             record_prompt_progress_detail_for_session(
                                 req,
                                 &progress_sink,
@@ -5029,6 +5062,27 @@ mod tests {
             session_update_observation(&unknown_update),
             ("other", false, Some("unknown".to_string()))
         );
+    }
+
+    #[test]
+    fn meaningful_session_updates_refresh_progress_deadline() {
+        assert!(session_update_refreshes_progress_deadline(
+            "provider_activity",
+            true
+        ));
+        assert!(session_update_refreshes_progress_deadline(
+            "tool_call",
+            true
+        ));
+        assert!(session_update_refreshes_progress_deadline(
+            "tool_call_update",
+            true
+        ));
+        assert!(session_update_refreshes_progress_deadline(
+            "text_chunk",
+            true
+        ));
+        assert!(!session_update_refreshes_progress_deadline("other", false));
     }
 
     #[test]

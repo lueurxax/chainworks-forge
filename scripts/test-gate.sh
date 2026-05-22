@@ -170,6 +170,25 @@ PROPOSAL_036_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal036IdeasDeepLinkToRunsFlow"
 )
 
+PROPOSAL_093_TESTS=(
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testRuntimeTimelineAppendsChunksIntoOneLiveResponse()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testRuntimeTimelineBufferKeepsStableResponseIdentityWhileAppendingChunks()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testRuntimeTimelineCollapsesChunksOnlyAfterResponseEndsIntoSummaryCard()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testRuntimeTimelineTruncatedRawDetailDoesNotClaimFullAvailability()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testTimelineRowsUseP093ExpandableCardContract()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093RuntimeReadbackRequestsOwnedTimelineFields()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093RuntimeTimelineMissingRawDetailBytesStaysNil()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093SwiftResolvesRawDetailOnlyThroughDaemonResolver()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093TimelineUsesNewestFirstOrderAndAgentSelector()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093FormatterEnforcesBudgetsAndLRUCache()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093FormatterBudgetFallsBackWithInjectedClock()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093FormatterHandlesFencedBlocksAndJSON()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093CollapsedStreamingResponseUsesMetadataOnlyBody()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093RawDetailHandleIsNotResolvedThroughSwiftFilesystem()"
+  "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal093TimelineCardExpansionRemoteProof"
+)
+
 PROPOSAL_037_TESTS=(
   "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorFailClosesACPProposalReviewReadLoopStallsBeforeWatchdogAndEmitsDurableFailureEvidence()"
   "Chainworks ForgeTests/RuntimeAgentExecutorTests/acpProposalReviewerReadLoopStallFailsEarlyWithDurableFailureEvidence()"
@@ -1122,9 +1141,23 @@ should_use_unsigned_ui_tests() {
   return 0
 }
 
+should_use_adhoc_ui_tests() {
+  [[ "${CHAINWORKS_USE_ADHOC_UI_TESTS:-0}" == "1" ]]
+}
+
 append_xcodebuild_signing_args() {
   local gate_name="${1:-}"
   local includes_ui="${2:-0}"
+
+  if [[ "$includes_ui" == "1" ]] && should_use_adhoc_ui_tests; then
+    printf '%s\0' \
+      CODE_SIGNING_ALLOWED=YES \
+      CODE_SIGNING_REQUIRED=NO \
+      CODE_SIGN_IDENTITY=- \
+      CODE_SIGN_STYLE=Manual \
+      DEVELOPMENT_TEAM=
+    return 0
+  fi
 
   if [[ "$includes_ui" == "1" ]] && ! should_use_unsigned_ui_tests; then
     return 0
@@ -1161,7 +1194,7 @@ approved_remote_ui_hosts() {
 
 gate_requires_remote_ui_host() {
   case "${1:-}" in
-    ui-smoke|proposal-006|p006|proposal-012|p012|proposal-013|p013|proposal-014|p014|proposal-015|p015|proposal-022|p022|proposal-024|p024|proposal-036|p036|proposal-077-ui|p077-ui|full)
+    ui-smoke|proposal-006|p006|proposal-012|p012|proposal-013|p013|proposal-014|p014|proposal-015|p015|proposal-022|p022|proposal-024|p024|proposal-036|p036|proposal-077-ui|p077-ui|proposal-093|p093|full)
       return 0
       ;;
     *)
@@ -1184,6 +1217,7 @@ emit_forwarded_chainworks_env() {
   local -a allowed_chainworks_env=(
     CHAINWORKS_REMOTE_UI_TEST_HOSTS
 	    CHAINWORKS_USE_UNSIGNED_UI_TESTS
+    CHAINWORKS_USE_ADHOC_UI_TESTS
 	    CHAINWORKS_GUI_GATE_TIMEOUT_SECONDS
     CHAINWORKS_CODESIGN_KEYCHAIN
     CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON
@@ -1293,7 +1327,7 @@ default_codesign_keychain() {
 }
 
 prepare_codesign_keychain() {
-  if should_use_unsigned_ui_tests; then
+  if should_use_unsigned_ui_tests || should_use_adhoc_ui_tests; then
     return 0
   fi
 
@@ -1965,19 +1999,48 @@ run_test_plan() {
   log "Result bundle: $result_bundle"
 }
 
+prepare_test_source_snapshot() {
+  local gate_name="$1"
+  local stamp="$2"
+  local snapshot="$TMP_BASE/source-snapshot"
+  local -a source_files=(
+    "Chainworks Forge/Views/RunsHomeView.swift"
+    "Chainworks Forge/Models/RunsWorkbenchPresentationModel.swift"
+    "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift"
+    "docs/evidence/macos-operator-navigation/dogfood-validation-2026-05-21.json"
+    "docs/evidence/macos-operator-navigation/remote-ui-accessibility-proof-2026-05-21.json"
+    "docs/evidence/macos-operator-navigation/rollout-readback-live-2026-05-21.json"
+  )
+
+  rm -rf "$snapshot"
+  mkdir -p "$snapshot"
+
+  local rel_path dest_dir
+  for rel_path in "${source_files[@]}"; do
+    dest_dir="$snapshot/$(dirname "$rel_path")"
+    mkdir -p "$dest_dir"
+    cp "$ROOT_DIR/$rel_path" "$snapshot/$rel_path"
+  done
+
+  printf '%s\n' "$snapshot"
+}
+
 run_targeted_tests() {
   local gate_name="$1"
   shift
 
-  local stamp derived_data result_bundle log_path automation_log_path previous_automation_log_path
+  local stamp derived_data result_bundle log_path source_snapshot automation_log_path previous_automation_log_path
   local -a signing_args=()
   stamp="$(make_stamp)"
   derived_data="$TMP_BASE/${gate_name}-${stamp}-DerivedData"
   result_bundle="$TMP_BASE/${gate_name}-${stamp}.xcresult"
   log_path="$TMP_BASE/${gate_name}-${stamp}.log"
   mkdir -p "$TMP_BASE"
+  source_snapshot="$(prepare_test_source_snapshot "$gate_name" "$stamp")"
 
   local cmd=(
+    env
+    "CHAINWORKS_TEST_SOURCE_ROOT=$source_snapshot"
     xcodebuild
     test
     -project "$PROJECT_PATH"
@@ -2276,6 +2339,7 @@ Available gates:
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
   proposal-031,p031  Thin GraphQL-only UI inventory/static guard/write-path guide gate
   proposal-036,p036  UX Consolidation and Navigation Simplification gate
+  proposal-093,p093  Live Agent Timeline UX and readability gate
   proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
   proposal-077,p077  Proposal 077 closeout readiness gates (Rust domain/db/engine plus GraphQL/MCP readback parity; UI remote evidence separate)
   proposal-077-ui,p077-ui  Proposal 077 remote macOS compact/focus/backlink/accessibility runtime proof
@@ -2914,6 +2978,19 @@ PY
       run_non_ui_targeted_gate "proposal-036" "${PROPOSAL_036_TESTS[@]}"
       log "proposal-036 UI smoke is remote-only; run the same gate on test@SMacBook.local for UI proof"
     fi
+    ;;
+  proposal-093|p093)
+    check_idle_environment allow_app
+    guard_direct_run_insertion
+    run_build "proposal-093"
+    if is_approved_remote_ui_host; then
+      prepare_codesign_keychain
+      run_targeted_tests "proposal-093" "${PROPOSAL_093_TESTS[@]}"
+    else
+      run_non_ui_targeted_gate "proposal-093" "${PROPOSAL_093_TESTS[@]}"
+      log "proposal-093 UI smoke is remote-only; run the same gate on test@SMacBook.local for UI proof"
+    fi
+    (cd "$ROOT_DIR/control-plane" && cargo test -p graphql-server runtime_timeline_p093 --quiet)
     ;;
   proposal-037|p037)
     check_idle_environment allow_app

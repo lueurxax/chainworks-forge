@@ -819,4 +819,37 @@ mod tests {
             "advance_run_payload_target_required"
         );
     }
+
+    #[test]
+    fn retry_payload_recovery_readback_marks_unknown_reason_codes() {
+        let now = Utc::now();
+        let event = RetryPayloadRecoveryEvent {
+            idempotency_key: "run-1:invoke-1".into(),
+            run_id: RunId::new(),
+            invoke_work_item_id: "invoke-1".into(),
+            retry_authority_id: Some("authority-1".into()),
+            target_stage_execution_id: Some(StageExecutionId::new()),
+            completed_agent_execution_id: Some("agent-1".into()),
+            reason_code: "unexpected_new_reason".into(),
+            mode: "diagnostic".into(),
+            repaired: false,
+            current_json: json!({"retry_authority_id": "authority-1"}),
+            provenance_json: None,
+            repaired_fields_json: None,
+            diagnostic_json: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let readback = event.readback_json();
+        assert_eq!(
+            readback.pointer("/schema_version"),
+            Some(&json!("retry_payload_recovery_v1"))
+        );
+        assert_eq!(readback.pointer("/unknown_reason_code"), Some(&json!(true)));
+        assert_eq!(
+            readback.pointer("/current/retry_authority_id"),
+            Some(&json!("authority-1"))
+        );
+    }
 }

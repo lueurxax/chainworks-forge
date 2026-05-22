@@ -964,6 +964,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
       approvalInbox: P031GraphQLDocuments.approvalInbox,
       artifacts: P031GraphQLDocuments.artifacts,
       artifactPayload: P031GraphQLDocuments.artifactPayload,
+      timelineRawDetail: P031GraphQLDocuments.timelineRawDetail,
       reportMetadata: P031GraphQLDocuments.reportMetadata,
       daemonStatus: P031GraphQLDocuments.daemonStatus,
       ideaTitle: P031GraphQLDocuments.ideaTitle,
@@ -2676,12 +2677,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
 
   @Test("P031 artifact viewer keeps artifact list and preview in independent scroll panes")
   func artifactViewerUsesIndependentScrollPanes() throws {
-    let repoRoot = URL(fileURLWithPath: #filePath)
-      .deletingLastPathComponent()
-      .deletingLastPathComponent()
-    let sourceURL = repoRoot
-      .appendingPathComponent("Chainworks Forge/Views/RunsHomeView.swift", isDirectory: false)
-    let source = try String(contentsOf: sourceURL, encoding: .utf8)
+    let source = try p031SourceFile("Chainworks Forge/Views/RunsHomeView.swift")
 
     #expect(source.contains(#".accessibilityIdentifier("p031-artifact-list-scroll")"#))
     #expect(source.contains(#".accessibilityIdentifier("p031-artifact-preview-scroll")"#))
@@ -2690,12 +2686,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
 
   @Test("P031 artifact viewer restores grouping and filtering controls")
   func artifactViewerRestoresGroupingAndFilteringControls() throws {
-    let repoRoot = URL(fileURLWithPath: #filePath)
-      .deletingLastPathComponent()
-      .deletingLastPathComponent()
-    let sourceURL = repoRoot
-      .appendingPathComponent("Chainworks Forge/Views/RunsHomeView.swift", isDirectory: false)
-    let source = try String(contentsOf: sourceURL, encoding: .utf8)
+    let source = try p031SourceFile("Chainworks Forge/Views/RunsHomeView.swift")
 
     #expect(source.contains(#".accessibilityIdentifier("p031-artifact-filter-search")"#))
     #expect(source.contains(#".accessibilityIdentifier("p031-artifact-stage-filter")"#))
@@ -3417,6 +3408,10 @@ private struct FailingP031WorkflowReadStore: P031WorkflowReadStore {
     throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
   }
 
+  func fetchTimelineRawDetail(handle: String) async throws -> P031TimelineRawDetailReadModel {
+    throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
+  }
+
   func fetchReportMetadata(runID: String) async throws -> [P031ReportMetadataReadModel] {
     throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
   }
@@ -3454,4 +3449,27 @@ private func firstValue<Element>(
 private func jsonObject(from text: String) throws -> [String: Any] {
   let data = Data(text.utf8)
   return try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+}
+
+private func p031SourceFile(_ path: String) throws -> String {
+  let snapshotRoots = [
+    ProcessInfo.processInfo.environment["CHAINWORKS_TEST_SOURCE_ROOT"],
+    URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("chainworks-test-gates/source-snapshot", isDirectory: true)
+      .path
+  ].compactMap { root -> String? in
+    guard let root, !root.isEmpty else { return nil }
+    return root
+  }
+
+  for snapshotRoot in snapshotRoots {
+    let sourceURL = URL(fileURLWithPath: snapshotRoot, isDirectory: true)
+      .appendingPathComponent(path, isDirectory: false)
+    guard FileManager.default.fileExists(atPath: sourceURL.path) else { continue }
+    return try String(contentsOf: sourceURL, encoding: .utf8)
+  }
+
+  throw P031GraphQLReadBoundaryError.transportFailed(
+    "Source-scan tests require a test-gate source snapshot; run through scripts/test-gate.sh"
+  )
 }

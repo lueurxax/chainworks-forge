@@ -3103,6 +3103,157 @@ final class Chainworks_ForgeUITests: XCTestCase {
         screenshot(app, name: "P036_RunsApprovalTimelineSettingsFlow")
     }
 
+    func testProposal093TimelineCardExpansionRemoteProof() throws {
+        let app = makeApp(
+            directSurface: "p093_timeline_proof",
+            uiTestWindowSize: "wide"
+        )
+        defer { terminateIfRunning(app) }
+        launchClean(app)
+
+        XCTAssertTrue(
+            anyElement(app, identifier: "ui-test-direct-surface-ready-p093_timeline_proof").waitForExistence(timeout: 20),
+            "P093: direct timeline proof surface must finish bootstrap"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p036-timeline-workbench-card").waitForExistence(timeout: 10),
+            "P093: timeline workbench card must render"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-active-agent-selector").waitForExistence(timeout: 10),
+            "P093: multi-agent selector must be present when multiple active agents are running"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-active-agent-option-code_writer").waitForExistence(timeout: 10),
+            "P093: selector must expose the default code_writer agent option"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-active-agent-option-reviewer").waitForExistence(timeout: 10),
+            "P093: selector must expose the parallel reviewer agent option"
+        )
+
+        let firstTimelineEntry = anyElement(app, identifier: "p093-timeline-entry")
+        XCTAssertTrue(firstTimelineEntry.waitForExistence(timeout: 10), "P093: timeline entry must render")
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-order-0-rte_p093_response").waitForExistence(timeout: 5),
+            "P093: selected-agent events must render newest first"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-order-1-rte_p093_tool").waitForExistence(timeout: 5),
+            "P093: provider action must follow the newest response card"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-order-2-rte_p093_prompt").waitForExistence(timeout: 5),
+            "P093: prompt card must remain below newer selected-agent events"
+        )
+        XCTAssertFalse(
+            anyElement(app, identifier: "p093-timeline-entry-id-rte_p093_reviewer").waitForExistence(timeout: 1),
+            "P093: default selected-agent view must not interleave reviewer events"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-collapsed-terminal-summary-rte_p093_response").waitForExistence(timeout: 5),
+            "P093: collapsed completed responses must show summary-level information"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-status-badge").waitForExistence(timeout: 5),
+            "P093: status badge must be readable without color"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-provider-badge").waitForExistence(timeout: 5),
+            "P093: provider badge must be readable without color"
+        )
+
+        let toggles = app.buttons.matching(NSPredicate(format: "identifier == %@", "p093-timeline-toggle"))
+        XCTAssertGreaterThanOrEqual(toggles.count, 3, "P093: proof fixture must expose at least three selected-agent cards")
+        let visibleToggle = toggles.element(boundBy: 0)
+        XCTAssertTrue(visibleToggle.waitForExistence(timeout: 10), "P093: timeline entry must expose a stable expansion toggle")
+
+        visibleToggle.click()
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-expanded-controls").waitForExistence(timeout: 5),
+            "P093: expanded timeline entry must expose expansion controls"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-formatted-detail").waitForExistence(timeout: 5),
+            "P093: expanded timeline entry must expose formatted detail"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-detail-non-empty").waitForExistence(timeout: 5),
+            "P093: expanded timeline entry must expose non-empty formatted detail"
+        )
+        XCTAssertNotNil(
+            waitForLabelContaining(["System Instructions", "Input Artifacts", "proposal_review_v1", "Streaming response body", "first", "second"], in: app, timeout: 10),
+            "P093: expanded timeline entry must render formatted detail instead of an empty body"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-copy-id").waitForExistence(timeout: 5),
+            "P093: expanded timeline entry must expose an accessible copyable event ID control"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-metadata").waitForExistence(timeout: 5),
+            "P093: hover/focus inspection must expose state, time, agent, and provider metadata"
+        )
+
+        app.typeKey(.space, modifierFlags: [])
+        XCTAssertFalse(
+            anyElement(app, identifier: "p093-timeline-expanded-controls").waitForExistence(timeout: 2),
+            "P093: keyboard activation must collapse the focused expanded card"
+        )
+        app.typeKey(.space, modifierFlags: [])
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-expanded-rte_p093_response").waitForExistence(timeout: 5),
+            "P093: keyboard activation must expand the focused collapsed card"
+        )
+
+        toggles.element(boundBy: 1).click()
+        XCTAssertFalse(
+            anyElement(app, identifier: "p093-timeline-expanded-rte_p093_response").waitForExistence(timeout: 2),
+            "P093: expanding another card must collapse the previous card"
+        )
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-expanded-rte_p093_tool").waitForExistence(timeout: 5),
+            "P093: second card must expand after replacing the first expanded card"
+        )
+        XCTAssertFalse(
+            anyElement(app, identifier: "p093-timeline-expanded-rte_p093_prompt").waitForExistence(timeout: 1),
+            "P093: only the selected replacement card may be expanded"
+        )
+
+        anyElement(app, identifier: "p093-active-agent-option-reviewer").click()
+        XCTAssertTrue(
+            anyElement(app, identifier: "p093-timeline-entry-id-rte_p093_reviewer").waitForExistence(timeout: 5),
+            "P093: selector must switch to the chosen active agent"
+        )
+        XCTAssertFalse(
+            anyElement(app, identifier: "p093-timeline-expanded-controls").waitForExistence(timeout: 2),
+            "P093: changing the selected agent must clear the expanded card"
+        )
+
+        screenshot(app, name: "P093_TimelineCardExpansionRemoteProof")
+
+        terminateIfRunning(app)
+
+        let singleAgentApp = makeApp(
+            directSurface: "p093_timeline_single_agent_proof",
+            uiTestWindowSize: "wide"
+        )
+        defer { terminateIfRunning(singleAgentApp) }
+        launchClean(singleAgentApp)
+
+        XCTAssertTrue(
+            anyElement(singleAgentApp, identifier: "ui-test-direct-surface-ready-p093_timeline_proof").waitForExistence(timeout: 20),
+            "P093: single-agent proof surface must finish bootstrap"
+        )
+        XCTAssertFalse(
+            anyElement(singleAgentApp, identifier: "p093-active-agent-selector").waitForExistence(timeout: 2),
+            "P093: single active agent should auto-select without showing a multi-agent selector"
+        )
+        XCTAssertTrue(
+            anyElement(singleAgentApp, identifier: "p093-timeline-entry-id-rte_p093_response").waitForExistence(timeout: 10),
+            "P093: single active agent must auto-select and show its timeline"
+        )
+    }
+
     func testProposal036IdeasDeepLinkToRunsFlow() throws {
         let app = makeApp(initialTab: "Ideas")
         defer { terminateIfRunning(app) }

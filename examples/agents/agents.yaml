@@ -1199,7 +1199,7 @@ agents:
     title: Lead / Orchestrator
     mode: orchestration
     system_role: lead
-    backend_profile: codex_orchestrator_high
+    backend_profile: gemini_reasoning_pro_high
     permission_profile: ORCH
     lead_resolution_contract: LeadResolutionContract
     skill_ref: orchestrator_core

@@ -15,6 +15,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
     @Published private(set) var recoveryEvidence: [RecoveryEvidenceRow] = []
     @Published private(set) var freshnessAndHealth: FreshnessHealth?
     @Published private(set) var timelineEntries: [TimelineEntry] = []
+    @Published private(set) var activeTimelineAgents: [ActiveTimelineAgent] = []
     @Published private(set) var selectedActiveTimelineAgentID: String?
     @Published private(set) var approvalInbox: P031ApprovalInboxPresentation?
     @Published private(set) var deferredStates: [DeferredStateRow] = []
@@ -283,39 +284,23 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         closeoutReadiness = detail.closeoutReadiness
         implementationCompletion = detail.implementationCompletion
         sideEffectReadback = detail.sideEffectReadback
-        timelineEntries = Self.entriesForFocusedActiveAgent(
-            detail.activeAgentTimelineEntries.map { entry in
-                FocusedTimelineSpineEntry(
-                    id: entry.id,
-                    kind: .sessionEvent,
-                    title: entry.title,
-                    detail: entry.detail,
-                    timestamp: entry.timestamp,
-                    stageID: entry.stageID ?? "active_agent_execution",
-                    surfaceLabel: "active_agent_execution",
-                    sessionID: entry.sessionID,
-                    agentID: entry.agentID,
-                    isCollapsed: false,
-                    liveEvent: nil
-                )
-            },
-            selectedAgentID: selectedActiveTimelineAgentID
-        )
-        .map { entry in
-            TimelineEntry(
-                id: entry.id,
-                kind: TimelineEntryKind(rawValue: entry.kind.rawValue) ?? .sessionEvent,
+        activeTimelineAgents = detail.activeAgentTimelineEntries.map { entry in
+            ActiveTimelineAgent(
+                id: entry.agentID,
                 title: entry.title,
-                detail: entry.detail,
-                timestamp: entry.timestamp,
-                displayTime: entry.timestamp.formatted(date: .omitted, time: .standard),
+                providerID: entry.providerID,
                 stageID: entry.stageID,
-                surfaceLabel: entry.surfaceLabel,
-                agentID: entry.agentID,
+                stageLabel: entry.stageLabel,
+                taskLabel: entry.taskLabel,
+                status: entry.status,
                 sessionID: entry.sessionID,
-                isCollapsed: entry.isCollapsed
+                latestAt: entry.timestamp,
+                eventCount: entry.eventCount ?? 0,
+                selectionOrder: entry.selectionOrder,
+                selectionUnavailableReason: entry.selectionUnavailableReason
             )
         }
+        timelineEntries = []
 
         if let error = detail.errorDescription {
             deferredStates = [
@@ -544,6 +529,21 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         let isReadinessDeferred: Bool
     }
 
+    struct ActiveTimelineAgent: Identifiable, Equatable, Sendable {
+        let id: String
+        let title: String
+        let providerID: String?
+        let stageID: String?
+        let stageLabel: String?
+        let taskLabel: String?
+        let status: String
+        let sessionID: String?
+        let latestAt: Date
+        let eventCount: Int
+        let selectionOrder: Int?
+        let selectionUnavailableReason: String?
+    }
+
     struct TimelineEntry: Identifiable, Equatable {
         let id: String
         let kind: TimelineEntryKind
@@ -556,6 +556,71 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         let agentID: String?
         let sessionID: String?
         let isCollapsed: Bool
+        let rawDetail: String?
+        let rawDetailBytes: Int?
+        let rawDetailTruncated: Bool
+        let rawDetailHandle: String?
+        let rawDetailDigest: String?
+        let fullRawAvailable: Bool
+        let detailDigest: String?
+        let detailCharCount: Int?
+        let chunkCount: Int?
+        let isStreaming: Bool
+        let isTerminal: Bool
+        let stateLabel: String?
+        let providerID: String?
+
+        init(
+            id: String,
+            kind: TimelineEntryKind,
+            title: String,
+            detail: String,
+            timestamp: Date,
+            displayTime: String?,
+            stageID: String?,
+            surfaceLabel: String,
+            agentID: String?,
+            sessionID: String?,
+            isCollapsed: Bool,
+            rawDetail: String? = nil,
+            rawDetailBytes: Int? = nil,
+            rawDetailTruncated: Bool = false,
+            rawDetailHandle: String? = nil,
+            rawDetailDigest: String? = nil,
+            fullRawAvailable: Bool = true,
+            detailDigest: String? = nil,
+            detailCharCount: Int? = nil,
+            chunkCount: Int? = nil,
+            isStreaming: Bool = false,
+            isTerminal: Bool = false,
+            stateLabel: String? = nil,
+            providerID: String? = nil
+        ) {
+            self.id = id
+            self.kind = kind
+            self.title = title
+            self.detail = detail
+            self.timestamp = timestamp
+            self.displayTime = displayTime
+            self.stageID = stageID
+            self.surfaceLabel = surfaceLabel
+            self.agentID = agentID
+            self.sessionID = sessionID
+            self.isCollapsed = isCollapsed
+            self.rawDetail = rawDetail
+            self.rawDetailBytes = rawDetailBytes
+            self.rawDetailTruncated = rawDetailTruncated
+            self.rawDetailHandle = rawDetailHandle
+            self.rawDetailDigest = rawDetailDigest
+            self.fullRawAvailable = fullRawAvailable
+            self.detailDigest = detailDigest
+            self.detailCharCount = detailCharCount
+            self.chunkCount = chunkCount
+            self.isStreaming = isStreaming
+            self.isTerminal = isTerminal
+            self.stateLabel = stateLabel
+            self.providerID = providerID
+        }
     }
 
     enum TimelineEntryKind: String, Codable, CaseIterable {

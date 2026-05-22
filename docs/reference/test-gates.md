@@ -557,6 +557,40 @@ Important:
 - this gate is the repo-owned proof lane for the consolidated macOS operator shell
 - inline approval rendering follows the [thin-client read-model affordance contract](thin-client-read-model-affordance-contract.md); legacy Approvals routes redirect into Runs with waiting-approval focus after the Phase 2c top-level tab removal
 
+### Retained historical alias: `proposal-093|p093`
+
+Retained historical alias for the live agent Timeline UX and readability gate. The stable behavior is documented in [macOS Operator Navigation and Read-Model UX](macos-operator-navigation.md#timeline); this section owns only the proof lane.
+
+Scope:
+
+- focused `Proposal036UXConsolidationTests` slices for chunk accumulation, terminal response summaries, truthful raw-detail availability, newest-first ordering, agent selector presence, formatting, and expandable card behavior
+- `Proposal031ThinGraphQLReadBoundaryTests` for thin read-model compatibility
+- `graphql-server` runtime timeline tests for additive daemon-owned timeline fields and the raw-detail resolver surface
+
+Use when:
+
+- changing live Timeline cards, response chunk coalescing, newest-first ordering, active-agent selection, raw-detail copy labeling, or formatted expanded details
+- changing `runtimeStatusChanged` fields or the `timelineRawDetail(handle:)` resolver contract
+
+Host policy:
+
+- on local hosts, the retained historical alias runs the build plus non-UI focused tests and skips remote UI proof
+- on approved remote UI hosts, the same gate may include UI smoke coverage
+- UI smoke tests remain remote-only per repository policy
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-093 # retained historical alias
+ssh test@SMacBook.local "cd '/Users/test/chainworks-remote' && ./scripts/test-gate.sh proposal-093" # retained historical alias
+```
+
+Important:
+
+- Timeline remains a control-plane readback surface; this gate must not be satisfied by Swift-local orchestration history or artifact scans
+- raw-detail handles are opaque daemon tokens and must be resolved only through the control-plane read API
+- the latest retained historical alias live-agent Timeline remote UI proof is recorded at `docs/evidence/macos-operator-navigation/p093-remote-ui-proof-2026-05-22.json`
+
 ### `proposal-037`
 
 ACP execution supervision and idle-watchdog gate.

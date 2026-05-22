@@ -65,10 +65,39 @@ struct FocusedTimelineSpineEntry: Identifiable, Sendable {
     let timestamp: Date
     let stageID: String
     let surfaceLabel: String
+    let providerID: String?
     let sessionID: String?
     let agentID: String?
     let isCollapsed: Bool
     let liveEvent: ExecutionEvent?
+
+    init(
+        id: String,
+        kind: EntryKind,
+        title: String,
+        detail: String,
+        timestamp: Date,
+        stageID: String,
+        surfaceLabel: String,
+        providerID: String? = nil,
+        sessionID: String?,
+        agentID: String?,
+        isCollapsed: Bool,
+        liveEvent: ExecutionEvent?
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.detail = detail
+        self.timestamp = timestamp
+        self.stageID = stageID
+        self.surfaceLabel = surfaceLabel
+        self.providerID = providerID
+        self.sessionID = sessionID
+        self.agentID = agentID
+        self.isCollapsed = isCollapsed
+        self.liveEvent = liveEvent
+    }
     
     enum EntryKind: String, Sendable {
         case text

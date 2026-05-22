@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use async_graphql::futures_util::StreamExt;
 use async_graphql::*;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, info, warn};
@@ -430,6 +431,145 @@ fn p036_topology_nodes(
         .collect()
 }
 
+async fn p093_active_agent_executions(
+    pool: &SqlitePool,
+    run_id: RunId,
+    items: Vec<domain::agent::AgentExecution>,
+) -> Result<Vec<GqlAgentExecution>> {
+    let runtime_evidence = p093_runtime_evidence_by_agent(
+        pool,
+        items.iter().map(|item| item.id.to_string()).collect(),
+    )
+    .await?;
+
+    let plan = match runs::find_by_id(pool, run_id).await? {
+        Some(run) => {
+            let workflow = run.workflow_snapshot_json.as_deref().unwrap_or_default();
+            let catalog = run.catalog_snapshot_json.as_deref().unwrap_or_default();
+            if workflow.trim().is_empty() || catalog.trim().is_empty() {
+                None
+            } else {
+                let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or(".");
+                workflow::compiler::compile_from_snapshot_json(workflow, catalog, catalog_path).ok()
+            }
+        }
+        None => None,
+    };
+
+    let stage_rows = projections::list_stages_projection(pool, &run_id.to_string()).await?;
+    let stage_by_execution_id: HashMap<String, projections::StageSummaryRow> = stage_rows
+        .into_iter()
+        .map(|row| (row.id.clone(), row))
+        .collect();
+
+    let mut stage_order_by_id: HashMap<String, i64> = HashMap::new();
+    let mut task_label_by_stage_agent: HashMap<(String, String), String> = HashMap::new();
+    if let Some(plan) = plan.as_ref() {
+        for (index, stage_id) in p036_stage_topology_order(plan).into_iter().enumerate() {
+            stage_order_by_id.insert(stage_id.clone(), index as i64);
+            if let Some(state) = plan.states.get(&stage_id) {
+                for task in state.tasks.iter().chain(state.post_approval_tasks.iter()) {
+                    task_label_by_stage_agent
+                        .entry((stage_id.clone(), task.agent.agent_id.clone()))
+                        .or_insert_with(|| task.task_name.clone());
+                }
+            }
+        }
+    }
+
+    let mut gql_items: Vec<GqlAgentExecution> = items
+        .into_iter()
+        .map(|execution| {
+            let started_at = execution.started_at;
+            let execution_id = execution.id.to_string();
+            let stage_execution_id = execution
+                .stage_execution_id
+                .map(|id| id.to_string())
+                .unwrap_or_default();
+            let stage_row = stage_by_execution_id.get(&stage_execution_id);
+            let stage_id = stage_row.map(|row| row.stage_id.clone());
+            let selection_order = stage_id
+                .as_ref()
+                .and_then(|stage_id| stage_order_by_id.get(stage_id).copied());
+            let task_label = stage_id
+                .as_ref()
+                .and_then(|stage_id| {
+                    task_label_by_stage_agent.get(&(stage_id.clone(), execution.agent_id.clone()))
+                })
+                .cloned();
+            let mut gql = GqlAgentExecution::from(execution);
+            gql.agent_title = Some(p036_agent_title(&gql.agent_id));
+            gql.stage_label = stage_row.map(|row| row.label.clone());
+            gql.task_label = task_label;
+            if let Some((event_count, last_event_at)) = runtime_evidence.get(&execution_id) {
+                gql.event_count = Some(*event_count);
+                gql.last_event_at = last_event_at
+                    .clone()
+                    .or_else(|| Some(started_at.to_rfc3339()));
+            } else {
+                gql.event_count = Some(0);
+                gql.last_event_at = Some(started_at.to_rfc3339());
+            }
+            gql.selection_order = selection_order;
+            gql.selection_unavailable_reason = if selection_order.is_some() {
+                None
+            } else {
+                Some("snapshot_unavailable".into())
+            };
+            gql
+        })
+        .collect();
+
+    gql_items.sort_by(
+        |lhs, rhs| match (lhs.selection_order, rhs.selection_order) {
+            (Some(left), Some(right)) if left != right => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            _ => lhs
+                .started_at
+                .cmp(&rhs.started_at)
+                .then_with(|| lhs.agent_id.cmp(&rhs.agent_id)),
+        },
+    );
+
+    for (index, item) in gql_items.iter_mut().enumerate() {
+        if item.selection_order.is_some() {
+            item.selection_order = Some(index as i64);
+        }
+    }
+
+    Ok(gql_items)
+}
+
+async fn p093_runtime_evidence_by_agent(
+    pool: &SqlitePool,
+    agent_execution_ids: Vec<String>,
+) -> Result<HashMap<String, (i64, Option<String>)>> {
+    let mut evidence = HashMap::new();
+    for agent_execution_id in agent_execution_ids {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COALESCE(SUM(event_count), 0) AS event_count,
+                MAX(last_event_at_ms) AS last_event_at_ms
+            FROM agent_execution_runtime_receipts
+            WHERE agent_execution_id = ?1
+            "#,
+        )
+        .bind(&agent_execution_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| Error::new(e.to_string()))?;
+        let event_count: i64 = row.get("event_count");
+        let last_event_at_ms: Option<i64> = row.get("last_event_at_ms");
+        let last_event_at = last_event_at_ms.and_then(|ms| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|ts| ts.to_rfc3339())
+        });
+        evidence.insert(agent_execution_id, (event_count, last_event_at));
+    }
+    Ok(evidence)
+}
+
 #[Object]
 impl QueryRoot {
     async fn ideas(
@@ -647,7 +787,22 @@ impl QueryRoot {
             .parse()
             .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
         let items = db::repos::agent_executions::list_running_by_run(pool, run_id).await?;
-        Ok(items.into_iter().map(GqlAgentExecution::from).collect())
+        p093_active_agent_executions(pool, run_id, items).await
+    }
+
+    async fn timeline_raw_detail(
+        &self,
+        ctx: &Context<'_>,
+        handle: ID,
+    ) -> Result<GqlTimelineRawDetailResult> {
+        require_operator_read(ctx)?;
+        let handle = handle.to_string();
+        if handle.trim().is_empty() {
+            return Ok(GqlTimelineRawDetailResult::missing(
+                TimelineRawDetailErrorReason::HandleNotFound,
+            ));
+        }
+        p093_resolve_timeline_raw_detail(ctx.data::<SqlitePool>()?, &handle).await
     }
 
     /// Work-queue counts for all items associated with a run.
@@ -2304,11 +2459,13 @@ impl SubscriptionRoot {
     {
         require_operator_read(ctx)?;
 
+        let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
         let filter_run_id: Option<RunId> = run_id.and_then(|id| id.parse().ok());
 
         let rx = events.subscribe();
         Ok(BroadcastStream::new(rx).filter_map(move |msg| {
+            let pool = pool.clone();
             let fut = async move {
                 let event = msg.ok()?;
                 match event {
@@ -2324,18 +2481,18 @@ impl SubscriptionRoot {
                                 return None;
                             }
                         }
-                        Some(Ok(Some(GqlRuntimeEvent {
-                            run_id: ID(run_id.to_string()),
+                        Some(Ok(Some(GqlRuntimeEvent::from_parts(
+                            ID(run_id.to_string()),
                             stage_id,
                             agent_id,
                             provider,
                             event_kind,
-                            title: None,
-                            detail: None,
-                            surface_label: None,
-                            session_generation_id: None,
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                        })))
+                            None,
+                            None,
+                            None,
+                            None,
+                            chrono::Utc::now().to_rfc3339(),
+                        ))))
                     }
                     DomainEvent::RuntimeTimelineEvent {
                         run_id,
@@ -2353,18 +2510,22 @@ impl SubscriptionRoot {
                                 return None;
                             }
                         }
-                        Some(Ok(Some(GqlRuntimeEvent {
-                            run_id: ID(run_id.to_string()),
-                            stage_id,
-                            agent_id,
-                            provider,
-                            event_kind,
-                            title: Some(title),
-                            detail,
-                            surface_label: Some(surface_label),
-                            session_generation_id,
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                        })))
+                        Some(Ok(Some(
+                            GqlRuntimeEvent::from_live_timeline_parts(
+                                &pool,
+                                run_id,
+                                stage_id,
+                                agent_id,
+                                provider,
+                                event_kind,
+                                Some(title),
+                                detail,
+                                Some(surface_label),
+                                session_generation_id,
+                                chrono::Utc::now().to_rfc3339(),
+                            )
+                            .await,
+                        )))
                     }
                     _ => None,
                 }
@@ -2416,9 +2577,246 @@ impl SubscriptionRoot {
     }
 }
 
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(rename_items = "snake_case")]
+pub enum TimelineRawDetailStatus {
+    Available,
+    Missing,
+    Stale,
+    Unauthorized,
+    Unavailable,
+    DigestMismatch,
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(rename_items = "snake_case")]
+pub enum TimelineRawDetailErrorReason {
+    HandleNotFound,
+    HandleExpired,
+    RunNotAuthorized,
+    EventNotAuthorized,
+    StorageUnavailable,
+    DigestValidationFailed,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlTimelineRawDetailResult {
+    pub status: TimelineRawDetailStatus,
+    pub raw_detail: Option<String>,
+    pub raw_detail_bytes: Option<i32>,
+    pub raw_detail_digest: Option<String>,
+    pub error_reason: Option<TimelineRawDetailErrorReason>,
+}
+
+impl GqlTimelineRawDetailResult {
+    fn available(raw_detail: String, raw_detail_digest: String) -> Self {
+        let raw_detail_bytes = raw_detail.len() as i32;
+        Self {
+            status: TimelineRawDetailStatus::Available,
+            raw_detail: Some(raw_detail),
+            raw_detail_bytes: Some(raw_detail_bytes),
+            raw_detail_digest: Some(raw_detail_digest),
+            error_reason: None,
+        }
+    }
+
+    fn missing(error_reason: TimelineRawDetailErrorReason) -> Self {
+        Self {
+            status: TimelineRawDetailStatus::Missing,
+            raw_detail: None,
+            raw_detail_bytes: None,
+            raw_detail_digest: None,
+            error_reason: Some(error_reason),
+        }
+    }
+
+    fn failed(status: TimelineRawDetailStatus, error_reason: TimelineRawDetailErrorReason) -> Self {
+        Self {
+            status,
+            raw_detail: None,
+            raw_detail_bytes: None,
+            raw_detail_digest: None,
+            error_reason: Some(error_reason),
+        }
+    }
+}
+
+async fn p093_resolve_timeline_raw_detail(
+    pool: &SqlitePool,
+    handle: &str,
+) -> Result<GqlTimelineRawDetailResult> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            trd.run_id,
+            trd.agent_execution_id,
+            trd.session_generation_id,
+            trd.timeline_event_id,
+            trd.raw_detail,
+            trd.raw_detail_bytes,
+            trd.raw_detail_digest,
+            trd.status,
+            trd.expires_at,
+            r.id AS existing_run_id,
+            ae.id AS existing_agent_execution_id,
+            ae.session_generation_id AS execution_session_generation_id,
+            se.run_id AS execution_run_id
+        FROM timeline_raw_details trd
+        LEFT JOIN runs r ON r.id = trd.run_id
+        LEFT JOIN agent_executions ae ON ae.id = trd.agent_execution_id
+        LEFT JOIN stage_executions se ON se.id = ae.stage_execution_id
+        WHERE trd.handle = ?1
+        "#,
+    )
+    .bind(handle)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| Error::new(e.to_string()))?;
+
+    let Some(row) = row else {
+        return Ok(GqlTimelineRawDetailResult::missing(
+            TimelineRawDetailErrorReason::HandleNotFound,
+        ));
+    };
+
+    let status: String = row.get("status");
+    match status.as_str() {
+        "available" => {}
+        "stale" => {
+            return Ok(GqlTimelineRawDetailResult::failed(
+                TimelineRawDetailStatus::Stale,
+                TimelineRawDetailErrorReason::HandleExpired,
+            ));
+        }
+        "unauthorized" => {
+            return Ok(GqlTimelineRawDetailResult::failed(
+                TimelineRawDetailStatus::Unauthorized,
+                TimelineRawDetailErrorReason::EventNotAuthorized,
+            ));
+        }
+        "unavailable" => {
+            return Ok(GqlTimelineRawDetailResult::failed(
+                TimelineRawDetailStatus::Unavailable,
+                TimelineRawDetailErrorReason::StorageUnavailable,
+            ));
+        }
+        "digest_mismatch" => {
+            return Ok(GqlTimelineRawDetailResult::failed(
+                TimelineRawDetailStatus::DigestMismatch,
+                TimelineRawDetailErrorReason::DigestValidationFailed,
+            ));
+        }
+        _ => {
+            return Ok(GqlTimelineRawDetailResult::failed(
+                TimelineRawDetailStatus::Unavailable,
+                TimelineRawDetailErrorReason::StorageUnavailable,
+            ));
+        }
+    }
+
+    let expires_at: Option<String> = row.get("expires_at");
+    if let Some(expires_at) = expires_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
+            .map(|value| value.with_timezone(&chrono::Utc))
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%dT%H:%M:%S%.fZ")
+                    .map(|value| value.and_utc())
+            });
+        match parsed {
+            Ok(expires_at) if expires_at <= chrono::Utc::now() => {
+                return Ok(GqlTimelineRawDetailResult::failed(
+                    TimelineRawDetailStatus::Stale,
+                    TimelineRawDetailErrorReason::HandleExpired,
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => {
+                return Ok(GqlTimelineRawDetailResult::failed(
+                    TimelineRawDetailStatus::Stale,
+                    TimelineRawDetailErrorReason::HandleExpired,
+                ));
+            }
+        }
+    }
+
+    let existing_run_id: Option<String> = row.get("existing_run_id");
+    if existing_run_id.is_none() {
+        return Ok(GqlTimelineRawDetailResult::failed(
+            TimelineRawDetailStatus::Unauthorized,
+            TimelineRawDetailErrorReason::RunNotAuthorized,
+        ));
+    }
+
+    let agent_execution_id: Option<String> = row.get("agent_execution_id");
+    let existing_agent_execution_id: Option<String> = row.get("existing_agent_execution_id");
+    if agent_execution_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+        || existing_agent_execution_id.is_none()
+    {
+        return Ok(GqlTimelineRawDetailResult::failed(
+            TimelineRawDetailStatus::Unauthorized,
+            TimelineRawDetailErrorReason::EventNotAuthorized,
+        ));
+    }
+
+    let run_id: String = row.get("run_id");
+    let execution_run_id: Option<String> = row.get("execution_run_id");
+    if execution_run_id.as_deref() != Some(run_id.as_str()) {
+        return Ok(GqlTimelineRawDetailResult::failed(
+            TimelineRawDetailStatus::Unauthorized,
+            TimelineRawDetailErrorReason::RunNotAuthorized,
+        ));
+    }
+
+    let timeline_event_id: String = row.get("timeline_event_id");
+    if timeline_event_id.trim().is_empty() {
+        return Ok(GqlTimelineRawDetailResult::failed(
+            TimelineRawDetailStatus::Unauthorized,
+            TimelineRawDetailErrorReason::EventNotAuthorized,
+        ));
+    }
+
+    let scoped_session_generation_id: Option<String> = row.get("session_generation_id");
+    if let Some(scoped_session_generation_id) = scoped_session_generation_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let execution_session_generation_id: Option<String> =
+            row.get("execution_session_generation_id");
+        if execution_session_generation_id.as_deref() != Some(scoped_session_generation_id) {
+            return Ok(GqlTimelineRawDetailResult::failed(
+                TimelineRawDetailStatus::Unauthorized,
+                TimelineRawDetailErrorReason::EventNotAuthorized,
+            ));
+        }
+    }
+
+    let raw_detail: String = row.get("raw_detail");
+    let raw_detail_digest: String = row.get("raw_detail_digest");
+    let computed = sha256_digest(&raw_detail);
+    if raw_detail_digest != computed {
+        return Ok(GqlTimelineRawDetailResult::failed(
+            TimelineRawDetailStatus::DigestMismatch,
+            TimelineRawDetailErrorReason::DigestValidationFailed,
+        ));
+    }
+
+    Ok(GqlTimelineRawDetailResult::available(
+        raw_detail,
+        raw_detail_digest,
+    ))
+}
+
 /// Runtime lifecycle event surfaced to GraphQL subscribers.
 #[derive(SimpleObject, Clone, Debug)]
 pub struct GqlRuntimeEvent {
+    pub id: ID,
     pub run_id: ID,
     pub stage_id: String,
     pub agent_id: String,
@@ -2430,6 +2828,353 @@ pub struct GqlRuntimeEvent {
     pub surface_label: Option<String>,
     pub session_generation_id: Option<String>,
     pub timestamp: String,
+    pub raw_detail: Option<String>,
+    pub raw_detail_bytes: Option<i32>,
+    pub raw_detail_truncated: bool,
+    pub raw_detail_handle: Option<ID>,
+    pub raw_detail_digest: Option<String>,
+    pub full_raw_available: bool,
+    pub detail_digest: Option<String>,
+    pub detail_char_count: Option<i32>,
+    pub chunk_count: Option<i32>,
+    pub is_streaming: bool,
+    pub is_terminal: bool,
+    pub state_label: Option<String>,
+}
+
+struct P093RuntimeRawDetailReadback {
+    detail: Option<String>,
+    raw_detail: Option<String>,
+    raw_detail_bytes: Option<i32>,
+    raw_detail_truncated: bool,
+    raw_detail_handle: Option<ID>,
+    raw_detail_digest: Option<String>,
+    full_raw_available: bool,
+    detail_digest: Option<String>,
+    detail_char_count: Option<i32>,
+}
+
+impl GqlRuntimeEvent {
+    const RETAINED_INLINE_RAW_DETAIL_LIMIT: usize = 512 * 1024;
+
+    fn from_parts(
+        run_id: ID,
+        stage_id: String,
+        agent_id: String,
+        provider: String,
+        event_kind: String,
+        title: Option<String>,
+        detail: Option<String>,
+        surface_label: Option<String>,
+        session_generation_id: Option<String>,
+        timestamp: String,
+    ) -> Self {
+        let raw = Self::inline_raw_detail_readback(detail, None);
+        Self::from_readback_parts(
+            run_id,
+            stage_id,
+            agent_id,
+            provider,
+            event_kind,
+            title,
+            surface_label,
+            session_generation_id,
+            timestamp,
+            raw,
+        )
+    }
+
+    async fn from_live_timeline_parts(
+        pool: &SqlitePool,
+        run_id: RunId,
+        stage_id: String,
+        agent_id: String,
+        provider: String,
+        event_kind: String,
+        title: Option<String>,
+        detail: Option<String>,
+        surface_label: Option<String>,
+        session_generation_id: Option<String>,
+        timestamp: String,
+    ) -> Self {
+        let full_detail = detail.clone();
+        let mut raw = Self::inline_raw_detail_readback(detail, None);
+        if raw.raw_detail_truncated {
+            let event_id = runtime_event_id(
+                &run_id.to_string(),
+                &stage_id,
+                &agent_id,
+                &event_kind,
+                surface_label.as_deref(),
+                session_generation_id.as_deref(),
+                &timestamp,
+                raw.detail_digest.as_deref(),
+            );
+            if let Some(full_detail) = full_detail {
+                match p093_persist_live_timeline_raw_detail(
+                    pool,
+                    run_id,
+                    &stage_id,
+                    &agent_id,
+                    &provider,
+                    session_generation_id.as_deref(),
+                    &event_id,
+                    &full_detail,
+                    raw.raw_detail_digest.as_deref().unwrap_or_default(),
+                )
+                .await
+                {
+                    Ok(Some(handle)) => {
+                        raw.raw_detail_handle = Some(ID(handle));
+                        raw.full_raw_available = true;
+                    }
+                    Ok(None) => {
+                        raw.full_raw_available = false;
+                    }
+                    Err(error) => {
+                        warn!(
+                            run_id = %run_id,
+                            stage_id = %stage_id,
+                            agent_id = %agent_id,
+                            error = ?error,
+                            "P093 live timeline raw detail retention failed closed"
+                        );
+                        raw.full_raw_available = false;
+                    }
+                }
+            }
+        }
+        Self::from_readback_parts(
+            ID(run_id.to_string()),
+            stage_id,
+            agent_id,
+            provider,
+            event_kind,
+            title,
+            surface_label,
+            session_generation_id,
+            timestamp,
+            raw,
+        )
+    }
+
+    fn from_readback_parts(
+        run_id: ID,
+        stage_id: String,
+        agent_id: String,
+        provider: String,
+        event_kind: String,
+        title: Option<String>,
+        surface_label: Option<String>,
+        session_generation_id: Option<String>,
+        timestamp: String,
+        raw: P093RuntimeRawDetailReadback,
+    ) -> Self {
+        let is_terminal = matches!(
+            event_kind.as_str(),
+            "session_completed" | "session_failed" | "agent_summary"
+        ) || matches!(surface_label.as_deref(), Some("agent_summary"));
+        let is_streaming = !is_terminal
+            && matches!(
+                surface_label.as_deref(),
+                Some("text_chunk") | Some("agent_message_chunk")
+            );
+        let id = runtime_event_id(
+            run_id.as_str(),
+            &stage_id,
+            &agent_id,
+            &event_kind,
+            surface_label.as_deref(),
+            session_generation_id.as_deref(),
+            &timestamp,
+            raw.detail_digest.as_deref(),
+        );
+        Self {
+            id: ID(id),
+            run_id,
+            stage_id: stage_id.clone(),
+            agent_id,
+            provider,
+            event_kind,
+            title,
+            detail: raw.detail,
+            surface_label,
+            session_generation_id,
+            timestamp,
+            raw_detail: raw.raw_detail,
+            raw_detail_bytes: raw.raw_detail_bytes,
+            raw_detail_truncated: raw.raw_detail_truncated,
+            raw_detail_handle: raw.raw_detail_handle,
+            raw_detail_digest: raw.raw_detail_digest,
+            full_raw_available: raw.full_raw_available,
+            detail_digest: raw.detail_digest,
+            detail_char_count: raw.detail_char_count,
+            chunk_count: Some(1),
+            is_streaming,
+            is_terminal,
+            state_label: Some(stage_id),
+        }
+    }
+
+    fn inline_raw_detail_readback(
+        detail: Option<String>,
+        raw_detail_handle: Option<ID>,
+    ) -> P093RuntimeRawDetailReadback {
+        let Some(full_detail) = detail else {
+            return P093RuntimeRawDetailReadback {
+                detail: None,
+                raw_detail: None,
+                raw_detail_bytes: None,
+                raw_detail_truncated: false,
+                raw_detail_handle,
+                raw_detail_digest: None,
+                full_raw_available: true,
+                detail_digest: None,
+                detail_char_count: None,
+            };
+        };
+
+        let raw_detail_digest = sha256_digest(&full_detail);
+        let capped = cap_utf8_suffix(&full_detail, Self::RETAINED_INLINE_RAW_DETAIL_LIMIT);
+        let detail_digest = sha256_digest(&capped.text);
+        let raw_detail_bytes = Some(i32::try_from(capped.text.len()).unwrap_or(i32::MAX));
+        let detail_char_count =
+            Some(i32::try_from(capped.text.chars().count()).unwrap_or(i32::MAX));
+        P093RuntimeRawDetailReadback {
+            detail: Some(capped.text.clone()),
+            raw_detail: Some(capped.text),
+            raw_detail_bytes,
+            raw_detail_truncated: capped.truncated,
+            raw_detail_handle,
+            raw_detail_digest: Some(raw_detail_digest),
+            full_raw_available: !capped.truncated,
+            detail_digest: Some(detail_digest),
+            detail_char_count,
+        }
+    }
+}
+
+async fn p093_persist_live_timeline_raw_detail(
+    pool: &SqlitePool,
+    run_id: RunId,
+    stage_id: &str,
+    agent_id: &str,
+    provider: &str,
+    session_generation_id: Option<&str>,
+    timeline_event_id: &str,
+    raw_detail: &str,
+    raw_detail_digest: &str,
+) -> Result<Option<String>> {
+    let mut query = String::from(
+        r#"
+        SELECT ae.id
+        FROM agent_executions ae
+        INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
+        WHERE se.run_id = ?1
+          AND se.stage_id = ?2
+          AND ae.agent_id = ?3
+          AND ae.provider = ?4
+        "#,
+    );
+    if session_generation_id.is_some() {
+        query.push_str(" AND ae.session_generation_id = ?5");
+    }
+    query.push_str(" ORDER BY ae.started_at DESC LIMIT 1");
+
+    let mut sql = sqlx::query(&query)
+        .bind(run_id.to_string())
+        .bind(stage_id)
+        .bind(agent_id)
+        .bind(provider);
+    if let Some(session_generation_id) = session_generation_id {
+        sql = sql.bind(session_generation_id);
+    }
+    let row = sql
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| Error::new(e.to_string()))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let agent_execution_id: String = row.get("id");
+    let handle = format!("trd_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        r#"
+        INSERT INTO timeline_raw_details
+            (handle, run_id, agent_execution_id, session_generation_id, timeline_event_id,
+             raw_detail, raw_detail_bytes, raw_detail_digest, status)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available')
+        "#,
+    )
+    .bind(&handle)
+    .bind(run_id.to_string())
+    .bind(agent_execution_id)
+    .bind(session_generation_id)
+    .bind(timeline_event_id)
+    .bind(raw_detail)
+    .bind(i64::try_from(raw_detail.len()).unwrap_or(i64::MAX))
+    .bind(raw_detail_digest)
+    .execute(pool)
+    .await
+    .map_err(|e| Error::new(e.to_string()))?;
+
+    Ok(Some(handle))
+}
+
+fn cap_utf8_suffix(text: &str, utf8_limit: usize) -> P093CappedText {
+    if text.len() <= utf8_limit {
+        return P093CappedText {
+            text: text.to_string(),
+            truncated: false,
+        };
+    }
+    let mut start = text.len().saturating_sub(utf8_limit);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    P093CappedText {
+        text: text[start..].to_string(),
+        truncated: true,
+    }
+}
+
+struct P093CappedText {
+    text: String,
+    truncated: bool,
+}
+
+fn sha256_digest(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn runtime_event_id(
+    run_id: &str,
+    stage_id: &str,
+    agent_id: &str,
+    event_kind: &str,
+    surface_label: Option<&str>,
+    session_generation_id: Option<&str>,
+    timestamp: &str,
+    detail_digest: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        run_id,
+        stage_id,
+        agent_id,
+        event_kind,
+        surface_label.unwrap_or(""),
+        session_generation_id.unwrap_or(""),
+        timestamp,
+        detail_digest.unwrap_or(""),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("rte_{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -2547,6 +3292,702 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn runtime_timeline_p093_readback_fields_are_in_schema() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let sdl = schema.sdl();
+
+        for field in [
+            "timelineRawDetail(",
+            "rawDetail",
+            "rawDetailBytes",
+            "rawDetailTruncated",
+            "rawDetailHandle",
+            "rawDetailDigest",
+            "fullRawAvailable",
+            "detailDigest",
+            "detailCharCount",
+            "chunkCount",
+            "isStreaming",
+            "isTerminal",
+            "stateLabel",
+        ] {
+            assert!(sdl.contains(field), "schema should expose {field}");
+        }
+    }
+
+    #[test]
+    fn runtime_timeline_p093_event_synthesizes_metadata_without_swift_inference() {
+        let event = GqlRuntimeEvent::from_parts(
+            ID("run-1".into()),
+            "state_10".into(),
+            "code_writer".into(),
+            "claude".into(),
+            "meaningful_progress".into(),
+            Some("Agent response".into()),
+            Some("chunk".into()),
+            Some("text_chunk".into()),
+            Some("session-1".into()),
+            "2026-05-21T08:44:47Z".into(),
+        );
+
+        assert!(event.id.as_str().starts_with("rte_"));
+        assert_eq!(event.raw_detail.as_deref(), Some("chunk"));
+        assert_eq!(event.raw_detail_bytes, Some(5));
+        assert_eq!(event.detail_char_count, Some(5));
+        assert_eq!(event.chunk_count, Some(1));
+        assert!(event.is_streaming);
+        assert!(!event.is_terminal);
+        assert_eq!(event.state_label.as_deref(), Some("state_10"));
+        assert!(event.full_raw_available);
+        assert!(!event.raw_detail_truncated);
+        assert!(event
+            .raw_detail_digest
+            .as_deref()
+            .unwrap()
+            .starts_with("sha256:"));
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_p093_live_over_budget_event_persists_resolvable_raw_detail() {
+        use async_graphql::futures_util::StreamExt;
+
+        let pool = test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        runs::insert(&pool, &run).await.unwrap();
+        let stage = make_stage_execution(run_id, "state_10", "Implementation", Utc::now());
+        let stage_execution_id = stage.id;
+        stages::insert(&pool, &stage).await.unwrap();
+        let execution =
+            make_agent_execution(stage_execution_id, "code_writer", "claude", Utc::now());
+        db::repos::agent_executions::insert(&pool, &execution)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            bus.clone(),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let raw = format!("{}{}", "a".repeat(530_000), "tail-marker");
+        let expected_digest = sha256_digest(&raw);
+        let mut stream = schema.execute_stream(
+            Request::new(
+                r#"
+                subscription($runId: ID!) {
+                  runtimeStatusChanged(runId: $runId) {
+                    rawDetail
+                    rawDetailBytes
+                    rawDetailTruncated
+                    rawDetailHandle
+                    rawDetailDigest
+                    fullRawAvailable
+                  }
+                }
+                "#,
+            )
+            .variables(Variables::from_json(
+                serde_json::json!({ "runId": run_id.to_string() }),
+            ))
+            .data(test_principal()),
+        );
+        let bus_for_event = bus.clone();
+        let raw_for_event = raw.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = bus_for_event.send(DomainEvent::RuntimeTimelineEvent {
+                run_id,
+                stage_id: "state_10".into(),
+                agent_id: "code_writer".into(),
+                provider: "claude".into(),
+                event_kind: "meaningful_progress".into(),
+                title: "Agent response".into(),
+                detail: Some(raw_for_event),
+                surface_label: "text_chunk".into(),
+                session_generation_id: Some("session-code_writer".into()),
+            });
+        });
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("runtime timeline subscription frame timed out")
+            .expect("runtime timeline subscription ended");
+        assert!(
+            frame.errors.is_empty(),
+            "runtime timeline over-budget event should stream without errors: {frame:?}"
+        );
+        let json = frame.data.into_json().unwrap();
+        let event = &json["runtimeStatusChanged"];
+        assert_eq!(event["rawDetailTruncated"], serde_json::json!(true));
+        assert_eq!(event["rawDetailBytes"], serde_json::json!(524_288));
+        assert_eq!(event["rawDetailDigest"], serde_json::json!(expected_digest));
+        assert_eq!(event["fullRawAvailable"], serde_json::json!(true));
+        let retained = event["rawDetail"].as_str().unwrap();
+        assert_eq!(retained.len(), 524_288);
+        assert!(retained.ends_with("tail-marker"));
+        let handle = event["rawDetailHandle"]
+            .as_str()
+            .expect("over-budget live event should expose daemon raw-detail handle");
+
+        let resolver_response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query {{
+                      timelineRawDetail(handle: "{handle}") {{
+                        status rawDetail rawDetailBytes rawDetailDigest errorReason
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+        assert!(
+            resolver_response.errors.is_empty(),
+            "stored live raw detail handle should resolve: {resolver_response:?}"
+        );
+        let resolver_json = resolver_response.data.into_json().unwrap();
+        let resolved = &resolver_json["timelineRawDetail"];
+        assert_eq!(resolved["status"], serde_json::json!("available"));
+        assert_eq!(resolved["rawDetailBytes"], serde_json::json!(raw.len()));
+        assert_eq!(
+            resolved["rawDetailDigest"],
+            serde_json::json!(expected_digest)
+        );
+        assert_eq!(resolved["rawDetail"], serde_json::json!(raw));
+        assert!(resolved["errorReason"].is_null());
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_p093_raw_detail_resolver_covers_status_matrix() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let raw = "full retained raw response";
+        let digest = sha256_digest(raw);
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        runs::insert(&pool, &run).await.unwrap();
+        let stage = make_stage_execution(run_id, "state_10", "Implementation", Utc::now());
+        let stage_id = stage.id;
+        stages::insert(&pool, &stage).await.unwrap();
+        let execution = make_agent_execution(stage_id, "code_writer", "claude", Utc::now());
+        let agent_execution_id = execution.id.to_string();
+        db::repos::agent_executions::insert(&pool, &execution)
+            .await
+            .unwrap();
+        for (handle, status, detail, digest_override) in [
+            ("trd_available", "available", raw, digest.as_str()),
+            ("trd_stale", "stale", "", "sha256:empty"),
+            ("trd_unauthorized", "unauthorized", "", "sha256:empty"),
+            ("trd_unavailable", "unavailable", "", "sha256:empty"),
+            (
+                "trd_status_mismatch",
+                "digest_mismatch",
+                raw,
+                digest.as_str(),
+            ),
+            (
+                "trd_digest_mismatch",
+                "available",
+                raw,
+                "sha256:not-the-content",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO timeline_raw_details
+                    (handle, run_id, agent_execution_id, session_generation_id, timeline_event_id,
+                     raw_detail, raw_detail_bytes, raw_detail_digest, status)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+            )
+            .bind(handle)
+            .bind(run_id.to_string())
+            .bind(&agent_execution_id)
+            .bind("session-code_writer")
+            .bind(format!("rte_{handle}"))
+            .bind(detail)
+            .bind(detail.len() as i64)
+            .bind(digest_override)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query {
+                      available: timelineRawDetail(handle: "trd_available") {
+                        status rawDetail rawDetailBytes rawDetailDigest errorReason
+                      }
+                      missing: timelineRawDetail(handle: "trd_missing") {
+                        status errorReason
+                      }
+                      stale: timelineRawDetail(handle: "trd_stale") {
+                        status errorReason
+                      }
+                      unauthorized: timelineRawDetail(handle: "trd_unauthorized") {
+                        status errorReason
+                      }
+                      unavailable: timelineRawDetail(handle: "trd_unavailable") {
+                        status errorReason
+                      }
+                      statusMismatch: timelineRawDetail(handle: "trd_status_mismatch") {
+                        status errorReason
+                      }
+                      digestMismatch: timelineRawDetail(handle: "trd_digest_mismatch") {
+                        status errorReason
+                      }
+                    }
+                    "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "raw detail resolver should fail closed through result statuses: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["available"]["status"], serde_json::json!("available"));
+        assert_eq!(json["available"]["rawDetail"], serde_json::json!(raw));
+        assert_eq!(
+            json["available"]["rawDetailDigest"],
+            serde_json::json!(digest)
+        );
+        assert_eq!(
+            json["missing"]["errorReason"],
+            serde_json::json!("handle_not_found")
+        );
+        assert_eq!(json["stale"]["status"], serde_json::json!("stale"));
+        assert_eq!(
+            json["stale"]["errorReason"],
+            serde_json::json!("handle_expired")
+        );
+        assert_eq!(
+            json["unauthorized"]["status"],
+            serde_json::json!("unauthorized")
+        );
+        assert_eq!(
+            json["unauthorized"]["errorReason"],
+            serde_json::json!("event_not_authorized")
+        );
+        assert_eq!(
+            json["unavailable"]["status"],
+            serde_json::json!("unavailable")
+        );
+        assert_eq!(
+            json["unavailable"]["errorReason"],
+            serde_json::json!("storage_unavailable")
+        );
+        assert_eq!(
+            json["statusMismatch"]["status"],
+            serde_json::json!("digest_mismatch")
+        );
+        assert_eq!(
+            json["digestMismatch"]["errorReason"],
+            serde_json::json!("digest_validation_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_p093_raw_detail_resolver_enforces_expiry_and_scope() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        runs::insert(&pool, &run).await.unwrap();
+        let stage = make_stage_execution(run_id, "state_10", "Implementation", Utc::now());
+        let stage_id = stage.id;
+        stages::insert(&pool, &stage).await.unwrap();
+        let execution = make_agent_execution(stage_id, "code_writer", "claude", Utc::now());
+        let agent_execution_id = execution.id.to_string();
+        db::repos::agent_executions::insert(&pool, &execution)
+            .await
+            .unwrap();
+
+        let raw = "full scoped raw detail";
+        let digest = sha256_digest(raw);
+        sqlx::query(
+            r#"
+            INSERT INTO timeline_raw_details
+                (handle, run_id, agent_execution_id, session_generation_id, timeline_event_id,
+                 raw_detail, raw_detail_bytes, raw_detail_digest, status, expires_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available', ?9)
+            "#,
+        )
+        .bind("trd_scoped")
+        .bind(run_id.to_string())
+        .bind(&agent_execution_id)
+        .bind("session-code_writer")
+        .bind("rte_scoped")
+        .bind(raw)
+        .bind(raw.len() as i64)
+        .bind(&digest)
+        .bind((Utc::now() + chrono::Duration::minutes(5)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO timeline_raw_details
+                (handle, run_id, agent_execution_id, session_generation_id, timeline_event_id,
+                 raw_detail, raw_detail_bytes, raw_detail_digest, status, expires_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available', ?9)
+            "#,
+        )
+        .bind("trd_expired")
+        .bind(run_id.to_string())
+        .bind(&agent_execution_id)
+        .bind("session-code_writer")
+        .bind("rte_expired")
+        .bind(raw)
+        .bind(raw.len() as i64)
+        .bind(&digest)
+        .bind((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO timeline_raw_details
+                (handle, run_id, agent_execution_id, session_generation_id, timeline_event_id,
+                 raw_detail, raw_detail_bytes, raw_detail_digest, status)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available')
+            "#,
+        )
+        .bind("trd_wrong_session")
+        .bind(run_id.to_string())
+        .bind(&agent_execution_id)
+        .bind("session-other")
+        .bind("rte_wrong_session")
+        .bind(raw)
+        .bind(raw.len() as i64)
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO timeline_raw_details
+                (handle, run_id, agent_execution_id, session_generation_id, timeline_event_id,
+                 raw_detail, raw_detail_bytes, raw_detail_digest, status)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available')
+            "#,
+        )
+        .bind("trd_wrong_run")
+        .bind(RunId::new().to_string())
+        .bind(&agent_execution_id)
+        .bind("session-code_writer")
+        .bind("rte_wrong_run")
+        .bind(raw)
+        .bind(raw.len() as i64)
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query {
+                      scoped: timelineRawDetail(handle: "trd_scoped") { status rawDetail errorReason }
+                      expired: timelineRawDetail(handle: "trd_expired") { status rawDetail errorReason }
+                      wrongSession: timelineRawDetail(handle: "trd_wrong_session") { status rawDetail errorReason }
+                      wrongRun: timelineRawDetail(handle: "trd_wrong_run") { status rawDetail errorReason }
+                    }
+                    "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "raw detail scope checks should fail closed through result statuses: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["scoped"]["status"], serde_json::json!("available"));
+        assert_eq!(json["scoped"]["rawDetail"], serde_json::json!(raw));
+        assert_eq!(json["expired"]["status"], serde_json::json!("stale"));
+        assert_eq!(
+            json["expired"]["errorReason"],
+            serde_json::json!("handle_expired")
+        );
+        assert_eq!(
+            json["wrongSession"]["status"],
+            serde_json::json!("unauthorized")
+        );
+        assert_eq!(
+            json["wrongSession"]["errorReason"],
+            serde_json::json!("event_not_authorized")
+        );
+        assert_eq!(
+            json["wrongRun"]["status"],
+            serde_json::json!("unauthorized")
+        );
+        assert_eq!(
+            json["wrongRun"]["errorReason"],
+            serde_json::json!("run_not_authorized")
+        );
+        assert!(json["wrongRun"]["rawDetail"].is_null());
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_p093_active_agent_selector_uses_backend_stage_order() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
+        let catalog_path = "../../../examples/agents/agents.yaml";
+        let workflow_snapshot = workflow::definition::load(workflow_path).unwrap();
+        let catalog_snapshot = workflow::catalog::load(catalog_path).unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        run.workflow_yaml_path = Some(workflow_path.into());
+        run.agent_catalog_yaml_path = Some(catalog_path.into());
+        run.workflow_snapshot_json = Some(serde_json::to_string(&workflow_snapshot).unwrap());
+        run.catalog_snapshot_json = Some(serde_json::to_string(&catalog_snapshot).unwrap());
+        runs::insert(&pool, &run).await.unwrap();
+
+        let later = Utc::now() + chrono::Duration::seconds(30);
+        let earlier = Utc::now();
+        let proposal_stage = make_stage_execution(
+            run_id,
+            "state_2_proposal_drafted",
+            "Proposal drafted",
+            later,
+        );
+        let implementation_stage = make_stage_execution(
+            run_id,
+            "state_10_implementation_refined",
+            "Implementation refined",
+            earlier,
+        );
+        let proposal_stage_id = proposal_stage.id;
+        let implementation_stage_id = implementation_stage.id;
+        stages::insert(&pool, &proposal_stage).await.unwrap();
+        stages::insert(&pool, &implementation_stage).await.unwrap();
+        db::repos::agent_executions::insert(
+            &pool,
+            &make_agent_execution(proposal_stage_id, "proposal_writer", "codex", later),
+        )
+        .await
+        .unwrap();
+        db::repos::agent_executions::insert(
+            &pool,
+            &make_agent_execution(implementation_stage_id, "code_writer", "claude", earlier),
+        )
+        .await
+        .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query {{
+                      activeAgentExecutions(runId: "{run_id}") {{
+                        agentId
+                        agentTitle
+                        stageLabel
+                        taskLabel
+                        selectionOrder
+                        selectionUnavailableReason
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "active agent selector order should be daemon-owned: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let agents = json["activeAgentExecutions"].as_array().unwrap();
+        assert_eq!(agents[0]["agentId"], serde_json::json!("proposal_writer"));
+        assert_eq!(
+            agents[0]["agentTitle"],
+            serde_json::json!("Proposal Writer")
+        );
+        assert_eq!(
+            agents[0]["stageLabel"],
+            serde_json::json!("Proposal drafted")
+        );
+        assert_eq!(agents[0]["selectionOrder"], serde_json::json!(0));
+        assert_eq!(
+            agents[0]["selectionUnavailableReason"],
+            serde_json::Value::Null
+        );
+        assert_eq!(agents[1]["agentId"], serde_json::json!("code_writer"));
+        assert_eq!(agents[1]["selectionOrder"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_p093_active_agent_selector_uses_receipts_start_time_and_agent_id_tiebreak(
+    ) {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
+        let catalog_path = "../../../examples/agents/agents.yaml";
+        let workflow_snapshot = workflow::definition::load(workflow_path).unwrap();
+        let catalog_snapshot = workflow::catalog::load(catalog_path).unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        run.workflow_yaml_path = Some(workflow_path.into());
+        run.agent_catalog_yaml_path = Some(catalog_path.into());
+        run.workflow_snapshot_json = Some(serde_json::to_string(&workflow_snapshot).unwrap());
+        run.catalog_snapshot_json = Some(serde_json::to_string(&catalog_snapshot).unwrap());
+        runs::insert(&pool, &run).await.unwrap();
+
+        let started = Utc::now();
+        let stage = make_stage_execution(
+            run_id,
+            "state_10_implementation_refined",
+            "Implementation refined",
+            started,
+        );
+        let stage_id = stage.id;
+        stages::insert(&pool, &stage).await.unwrap();
+        let earlier_started = started - chrono::Duration::seconds(30);
+        let zeta = make_agent_execution(stage_id, "zeta_writer", "claude", started);
+        let alpha = make_agent_execution(stage_id, "alpha_writer", "codex", started);
+        let beta = make_agent_execution(stage_id, "beta_writer", "gemini", earlier_started);
+        db::repos::agent_executions::insert(&pool, &zeta)
+            .await
+            .unwrap();
+        db::repos::agent_executions::insert(&pool, &alpha)
+            .await
+            .unwrap();
+        db::repos::agent_executions::insert(&pool, &beta)
+            .await
+            .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let last_event_at_ms = 1_777_000_123_000_i64;
+        insert_runtime_receipt(
+            &pool,
+            zeta.id.to_string(),
+            "claude",
+            2,
+            last_event_at_ms - 5_000,
+        )
+        .await;
+        insert_runtime_receipt(&pool, alpha.id.to_string(), "codex", 7, last_event_at_ms).await;
+        insert_runtime_receipt(
+            &pool,
+            beta.id.to_string(),
+            "gemini",
+            3,
+            last_event_at_ms - 10_000,
+        )
+        .await;
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query {{
+                      activeAgentExecutions(runId: "{run_id}") {{
+                        agentId
+                        eventCount
+                        lastEventAt
+                        selectionOrder
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "active agent selector should use daemon runtime evidence: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let agents = json["activeAgentExecutions"].as_array().unwrap();
+        assert_eq!(agents[0]["agentId"], serde_json::json!("beta_writer"));
+        assert_eq!(agents[0]["eventCount"], serde_json::json!(3));
+        assert_eq!(agents[1]["agentId"], serde_json::json!("alpha_writer"));
+        assert_eq!(agents[1]["eventCount"], serde_json::json!(7));
+        assert_eq!(
+            agents[1]["lastEventAt"],
+            serde_json::json!(
+                chrono::DateTime::<Utc>::from_timestamp_millis(last_event_at_ms)
+                    .unwrap()
+                    .to_rfc3339()
+            )
+        );
+        assert_eq!(agents[2]["agentId"], serde_json::json!("zeta_writer"));
+        assert_eq!(agents[2]["eventCount"], serde_json::json!(2));
+    }
+
     fn test_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
     }
@@ -2604,6 +4045,111 @@ mod tests {
             review_routing_json: None,
             closeout_readiness_mode: None,
         }
+    }
+
+    fn make_stage_execution(
+        run_id: RunId,
+        stage_id: &str,
+        label: &str,
+        started_at: chrono::DateTime<Utc>,
+    ) -> domain::stage::StageExecution {
+        domain::stage::StageExecution {
+            id: domain::ids::StageExecutionId::new(),
+            run_id,
+            stage_id: stage_id.into(),
+            label: label.into(),
+            status: domain::stage::StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at,
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        }
+    }
+
+    fn make_agent_execution(
+        stage_execution_id: domain::ids::StageExecutionId,
+        agent_id: &str,
+        provider: &str,
+        started_at: chrono::DateTime<Utc>,
+    ) -> domain::agent::AgentExecution {
+        domain::agent::AgentExecution {
+            id: domain::ids::AgentExecutionId::new(),
+            stage_execution_id: Some(stage_execution_id),
+            agent_id: agent_id.into(),
+            provider: provider.into(),
+            model: Some("test-model".into()),
+            started_at,
+            completed_at: None,
+            status: domain::agent::AgentStatus::Running,
+            owner_execution_lineage_id: None,
+            session_lineage_id: None,
+            session_generation_id: Some(format!("session-{agent_id}")),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: None,
+            session_reuse_scope: None,
+            session_family_id: None,
+            session_reuse_disposition: None,
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+        }
+    }
+
+    async fn insert_runtime_receipt(
+        pool: &SqlitePool,
+        agent_execution_id: String,
+        provider: &str,
+        event_count: i64,
+        last_event_at_ms: i64,
+    ) {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO agent_execution_runtime_receipts
+                (runtime_receipt_id, agent_execution_id, prompt_kind, turn_index,
+                 provider, transport_family, status, event_count, last_event_kind,
+                 last_event_at_ms, receipt_json, created_at, updated_at)
+            VALUES (?1, ?2, 'original', 0, ?3, 'acp', 'running', ?4, 'text_chunk', ?5, '{}', ?6, ?7)
+            "#,
+        )
+        .bind(format!("{agent_execution_id}:original:0"))
+        .bind(agent_execution_id)
+        .bind(provider)
+        .bind(event_count)
+        .bind(last_event_at_ms)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn persist_rollout_contract_readback(pool: &SqlitePool, run_id: RunId) {

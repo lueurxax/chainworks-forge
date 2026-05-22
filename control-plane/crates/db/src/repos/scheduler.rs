@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
+use crate::repos::agent_retry_budget_ledger;
 use crate::writer::{
     begin_registered_immediate_transaction, execute_repository_transaction_operation,
     repository_transaction_operation,
@@ -1044,11 +1045,14 @@ struct ActiveCounts {
     xcode_mcp: i64,
     by_run: BTreeMap<String, i64>,
     by_provider: BTreeMap<String, i64>,
+    provider_quota_wait_families: BTreeSet<String>,
 }
 
 impl ActiveCounts {
     async fn load(pool: &SqlitePool) -> Result<Self> {
         let mut counts = Self::default();
+        let now = Utc::now();
+        agent_retry_budget_ledger::mark_elapsed_provider_quota_waits(pool, now).await?;
 
         let global_agent_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM agent_executions WHERE status = 'running'")
@@ -1114,12 +1118,15 @@ impl ActiveCounts {
             let entry = counts.by_provider.entry(provider_family).or_insert(0);
             *entry = (*entry).max(count);
         }
+        counts.provider_quota_wait_families = load_provider_quota_wait_families(pool, now).await?;
 
         Ok(counts)
     }
 
     async fn load_tx(tx: &mut Transaction<'_, Sqlite>) -> Result<Self> {
         let mut counts = Self::default();
+        let now = Utc::now();
+        agent_retry_budget_ledger::mark_elapsed_provider_quota_waits_tx(tx, now).await?;
 
         let global_agent_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM agent_executions WHERE status = 'running'")
@@ -1185,9 +1192,64 @@ impl ActiveCounts {
             let entry = counts.by_provider.entry(provider_family).or_insert(0);
             *entry = (*entry).max(count);
         }
+        counts.provider_quota_wait_families = load_provider_quota_wait_families_tx(tx, now).await?;
 
         Ok(counts)
     }
+}
+
+async fn load_provider_quota_wait_families(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> Result<BTreeSet<String>> {
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT COALESCE(ae.provider_family, ae.provider) AS provider_family
+           FROM agent_retry_budget_ledger ledger
+           INNER JOIN agent_executions ae ON ae.id = ledger.agent_execution_id
+           WHERE ledger.failure_kind = 'provider_quota'
+             AND ledger.normal_budget_consumed = 0
+             AND ledger.state = 'waiting_for_reset'
+             AND ledger.retry_after IS NOT NULL
+             AND ledger.retry_after > ?1"#,
+    )
+    .bind(now.to_rfc3339())
+    .fetch_all(pool)
+    .await
+    .context("load provider quota wait families")?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let provider_family: String = row.get("provider_family");
+            (!provider_family.is_empty()).then_some(provider_family)
+        })
+        .collect())
+}
+
+async fn load_provider_quota_wait_families_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    now: DateTime<Utc>,
+) -> Result<BTreeSet<String>> {
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT COALESCE(ae.provider_family, ae.provider) AS provider_family
+           FROM agent_retry_budget_ledger ledger
+           INNER JOIN agent_executions ae ON ae.id = ledger.agent_execution_id
+           WHERE ledger.failure_kind = 'provider_quota'
+             AND ledger.normal_budget_consumed = 0
+             AND ledger.state = 'waiting_for_reset'
+             AND ledger.retry_after IS NOT NULL
+             AND ledger.retry_after > ?1"#,
+    )
+    .bind(now.to_rfc3339())
+    .fetch_all(&mut **tx)
+    .await
+    .context("load provider quota wait families")?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let provider_family: String = row.get("provider_family");
+            (!provider_family.is_empty()).then_some(provider_family)
+        })
+        .collect())
 }
 
 fn top_reason_for_item(
@@ -1212,6 +1274,12 @@ fn top_reason_for_item(
     }
 
     if let Some(provider_family) = item.provider_family.as_deref() {
+        if active
+            .provider_quota_wait_families
+            .contains(provider_family)
+        {
+            return "provider_quota_wait".to_string();
+        }
         if let Ok(family) = provider_family.parse::<ProviderFamily>() {
             if active
                 .by_provider
@@ -1325,6 +1393,7 @@ fn select_notification_summary(
 
 fn reason_priority(reason: &str) -> i64 {
     match reason {
+        "provider_quota_wait" => 7,
         "xcode_mcp_capacity" => 6,
         "run_capacity" => 5,
         "provider_capacity" => 4,

@@ -6,9 +6,10 @@ use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
 
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
-    closeout, ideas, lead_conflict_mediations, projections, retry_stage_execution_authorities,
-    runs, stages, work_items, workflow_conflicts,
+    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
+    artifact_contracts, artifacts, closeout, code_writer_completion_receipts, ideas,
+    lead_conflict_mediations, projections, retry_stage_execution_authorities, runs, stages,
+    work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
@@ -45,8 +46,8 @@ use crate::closeout_loop_budget::{
 use crate::domain_engine::{DomainEngine, RunEvaluation};
 use crate::event_bus::EventSender;
 use crate::synthesizers::closeout_readiness::{
-    synthesize_implementation_closeout_readiness_for_state9,
-    SynthesizerInputs as CloseoutSynthesizerInputs,
+    synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards, NoDiffConvergence,
+    SynthesizerInputs as CloseoutSynthesizerInputs, NO_DIFF_CONVERGENCE_THRESHOLD,
 };
 use crate::work_queue::WorkQueue;
 use db::write_class::WriteLane;
@@ -1931,6 +1932,19 @@ impl Orchestrator {
                 }
                 _ => None,
             };
+        let consecutive_no_diff_code_writer_attempts =
+            code_writer_completion_receipts::consecutive_completed_no_diff_count_by_run(
+                &self.pool, run_id,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                warn!(
+                    run_id = %run_id,
+                    error = %error,
+                    "P077: failed to resolve no-diff code_writer convergence; continuing without runtime guard"
+                );
+                0
+            });
 
         let inputs = CloseoutSynthesizerInputs {
             run_id: &run_id_str,
@@ -1950,7 +1964,14 @@ impl Orchestrator {
             previous_blocker_digest: prior_blocker_digest.as_deref(),
         };
 
-        let synth_result = synthesize_implementation_closeout_readiness_for_state9(inputs);
+        let synth_result =
+            synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards(
+                inputs,
+                Some(NoDiffConvergence {
+                    consecutive_attempts: consecutive_no_diff_code_writer_attempts,
+                    threshold: NO_DIFF_CONVERGENCE_THRESHOLD,
+                }),
+            );
 
         let tx_inputs = closeout::CloseoutTransactionInputs {
             gate_result: &gate_result,
@@ -2780,6 +2801,17 @@ impl Orchestrator {
             if same_provider_family_for_health_fallback(&source_provider, provider) {
                 return Ok(None);
             }
+            if provider_family_quota_wait_active(&self.pool, provider).await? {
+                warn!(
+                    run_id = %run_id,
+                    agent_id = %agent.agent_id,
+                    from_provider = %source_provider,
+                    candidate_provider = %provider,
+                    candidate_backend_profile_id = "claude_builder_high",
+                    "Skipping forced provider health fallback because candidate provider family has active quota wait"
+                );
+                return Ok(None);
+            }
 
             let from_provider = agent.provider.clone();
             let from_backend_profile_id = agent.backend_profile_id.clone();
@@ -2846,27 +2878,43 @@ impl Orchestrator {
         else {
             return Ok(None);
         };
-        let Some((fallback_profile_id, profile)) = run_local_health_fallback_profile_candidates(
+        let mut selected_fallback = None;
+        for candidate in run_local_health_fallback_profile_candidates(
             &agent.agent_id,
             task_outputs,
             output_contract,
             &source_provider,
-        )
-        .into_iter()
-        .find_map(|candidate| {
-            profiles
+        ) {
+            let Some(profile) = profiles
                 .get(candidate)
                 .and_then(serde_json::Value::as_object)
-                .map(|profile| (candidate, profile))
-        }) else {
-            return Ok(None);
-        };
-        let Some(provider) = profile.get("provider").and_then(serde_json::Value::as_str) else {
-            return Ok(None);
-        };
-        if provider == agent.provider {
-            return Ok(None);
+            else {
+                continue;
+            };
+            let Some(provider) = profile.get("provider").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if provider == agent.provider {
+                continue;
+            }
+            if provider_family_quota_wait_active(&self.pool, provider).await? {
+                warn!(
+                    run_id = %run_id,
+                    agent_id = %agent.agent_id,
+                    failed_agent_execution_id = %source.id,
+                    from_provider = %source_provider,
+                    candidate_provider = %provider,
+                    candidate_backend_profile_id = %candidate,
+                    "Skipping provider health fallback candidate because provider family has active quota wait"
+                );
+                continue;
+            }
+            selected_fallback = Some((candidate, profile, provider));
+            break;
         }
+        let Some((fallback_profile_id, profile, provider)) = selected_fallback else {
+            return Ok(None);
+        };
 
         let from_provider = agent.provider.clone();
         let from_backend_profile_id = agent.backend_profile_id.clone();
@@ -3020,31 +3068,46 @@ impl Orchestrator {
             else {
                 continue;
             };
-            let Some((fallback_profile_id, profile)) =
-                run_local_health_fallback_profile_candidates(
-                    &execution.agent_id,
-                    &task_outputs,
-                    output_contract.as_deref(),
-                    &source_provider,
-                )
-                .into_iter()
-                .find_map(|candidate| {
-                    profiles
-                        .get(candidate)
-                        .and_then(serde_json::Value::as_object)
-                        .map(|profile| (candidate, profile))
-                })
-            else {
-                continue;
-            };
-            let Some(fallback_provider) =
-                profile.get("provider").and_then(serde_json::Value::as_str)
-            else {
-                continue;
-            };
-            if same_provider_family_for_health_fallback(&source_provider, fallback_provider) {
-                continue;
+            let mut selected_fallback = None;
+            for candidate in run_local_health_fallback_profile_candidates(
+                &execution.agent_id,
+                &task_outputs,
+                output_contract.as_deref(),
+                &source_provider,
+            ) {
+                let Some(profile) = profiles
+                    .get(candidate)
+                    .and_then(serde_json::Value::as_object)
+                else {
+                    continue;
+                };
+                let Some(fallback_provider) =
+                    profile.get("provider").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                if same_provider_family_for_health_fallback(&source_provider, fallback_provider) {
+                    continue;
+                }
+                if provider_family_quota_wait_active(&self.pool, fallback_provider).await? {
+                    warn!(
+                        run_id = %run_id,
+                        stage_id = %stage.stage_id,
+                        source_stage_execution_id = %stage.id,
+                        agent_id = %execution.agent_id,
+                        from_provider = %source_provider,
+                        candidate_provider = %fallback_provider,
+                        candidate_backend_profile_id = %candidate,
+                        "Skipping auto contract output retry fallback candidate because provider family has active quota wait"
+                    );
+                    continue;
+                }
+                selected_fallback = Some((candidate, profile, fallback_provider));
+                break;
             }
+            let Some((fallback_profile_id, profile, fallback_provider)) = selected_fallback else {
+                continue;
+            };
 
             let next_attempt_number = matching_stages
                 .iter()
@@ -6553,6 +6616,29 @@ fn same_provider_family_for_health_fallback(left: &str, right: &str) -> bool {
     )
 }
 
+fn provider_family_for_health_fallback(provider: &str) -> &str {
+    match provider {
+        "claude" | "claude_acp" => "claude",
+        "gemini" | "gemini_acp" => "gemini",
+        "codex" | "codex_acp" => "codex",
+        "junie" | "junie_acp" => "junie",
+        other => other,
+    }
+}
+
+async fn provider_family_quota_wait_active(pool: &SqlitePool, provider: &str) -> Result<bool> {
+    let provider_family = provider_family_for_health_fallback(provider);
+    Ok(
+        agent_retry_budget_ledger::active_provider_family_quota_wait(
+            pool,
+            provider_family,
+            Utc::now(),
+        )
+        .await?
+        .is_some(),
+    )
+}
+
 fn is_code_writer_implementation_output_task(
     agent_id: &str,
     task_outputs: &[String],
@@ -7701,7 +7787,9 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use db::pool::create_pool;
-    use db::repos::{agent_execution_runtime_facts, ideas, runs, stages};
+    use db::repos::{
+        agent_execution_runtime_facts, agent_retry_budget_ledger, ideas, runs, stages,
+    };
     use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
@@ -8628,6 +8716,196 @@ mod tests {
         assert_eq!(
             advance_payload["retry_authority_id"],
             serde_json::json!(authority.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_contract_output_retry_skips_fallback_provider_with_active_quota_wait() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(64);
+        let orchestrator =
+            Orchestrator::new(pool.clone(), events.clone(), WorkQueue::new(pool.clone()));
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.catalog_snapshot_json = Some(
+            serde_json::json!({
+                "backend_profiles": {
+                    "claude_design_medium": {
+                        "provider": "claude_acp",
+                        "model": "opus",
+                        "effort": "medium",
+                        "max_turns": 12
+                    },
+                    "codex_architect_high": {
+                        "provider": "codex_acp",
+                        "model": "gpt-5.5",
+                        "effort": "xhigh",
+                        "max_turns": 16
+                    }
+                }
+            })
+            .to_string(),
+        );
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage_id = StageExecutionId::new();
+        let stage = StageExecution {
+            id: stage_id,
+            run_id,
+            stage_id: "review".into(),
+            label: "review".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let blocking_stage_id = StageExecutionId::new();
+        let blocking_stage = StageExecution {
+            id: blocking_stage_id,
+            run_id,
+            stage_id: "other".into(),
+            label: "other".into(),
+            status: StageStatus::Failed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &blocking_stage).await.unwrap();
+
+        let failed_exec_id = AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+                started_at, completed_at, owner_kind, owner_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'failed', ?7, ?8, 'stage_execution', ?2)"#,
+        )
+        .bind(failed_exec_id.to_string())
+        .bind(stage_id.to_string())
+        .bind("proposal_reviewer_ui")
+        .bind("gemini_acp")
+        .bind("gemini")
+        .bind("gemini-3.1-pro-preview")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(failed_exec_id, Utc::now());
+        facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+        facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+        agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .unwrap();
+
+        let blocking_claude_exec_id = AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+                started_at, completed_at, owner_kind, owner_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'failed', ?7, ?8, 'stage_execution', ?2)"#,
+        )
+        .bind(blocking_claude_exec_id.to_string())
+        .bind(blocking_stage_id.to_string())
+        .bind("code_writer")
+        .bind("claude")
+        .bind("claude")
+        .bind("sonnet")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        agent_retry_budget_ledger::upsert_quota_failure(
+            &pool,
+            run_id,
+            blocking_stage_id,
+            blocking_claude_exec_id,
+            Some(Utc::now() + chrono::Duration::hours(1)),
+        )
+        .await
+        .unwrap();
+
+        db::repos::work_items::enqueue(
+            &pool,
+            &db::work_item::WorkItem {
+                id: format!("p060-dynamic:{stage_id}:ui"),
+                kind: db::work_item::WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "review",
+                    "stage_execution_id": stage_id.to_string(),
+                    "agent_id": "proposal_reviewer_ui",
+                    "provider": "gemini_acp",
+                    "backend_profile_id": "gemini_review_pro",
+                    "model": "gemini-3.1-pro-preview",
+                    "output_contract": "proposal_review_v1",
+                    "task_outputs": ["proposal_review_ui"],
+                    "p058_claimed": {
+                        "agent_execution_id": failed_exec_id.to_string()
+                    }
+                })
+                .to_string(),
+                status: db::work_item::WorkItemStatus::Failed,
+                run_id: Some(run_id),
+                stage_id: Some("review".into()),
+                created_at: Utc::now(),
+                scheduled_at: Utc::now(),
+                attempt_count: 1,
+                last_error: Some("provider_quota".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let scheduled = orchestrator
+            .schedule_auto_contract_output_retry_for_stage(run_id, &run, &stage)
+            .await
+            .unwrap();
+
+        assert!(scheduled);
+        let retry_invokes: Vec<_> = db::repos::work_items::list_by_run(&pool, run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| {
+                item.kind == db::work_item::WorkItemKind::InvokeAgent
+                    && item.status == db::work_item::WorkItemStatus::Pending
+            })
+            .collect();
+        assert_eq!(retry_invokes.len(), 1);
+        let payload: serde_json::Value =
+            serde_json::from_str(&retry_invokes[0].payload_json).unwrap();
+        assert_eq!(payload["provider"], serde_json::json!("codex_acp"));
+        assert_eq!(
+            payload["backend_profile_id"],
+            serde_json::json!("codex_architect_high")
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/provider_fallback/to_provider"),
+            Some(&serde_json::json!("codex_acp"))
         );
     }
 

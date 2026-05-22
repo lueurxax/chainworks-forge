@@ -1,0 +1,63 @@
+{
+  "schema_version": "p093_remote_ui_proof_v1",
+  "proposal_id": "093",
+  "captured_at": "2026-05-22T13:00:54+03:00",
+  "local_worktree": "/Users/user/Documents/Chainworks Forge",
+  "local_branch": "main",
+  "local_head": "e1d07a5e3be409499ead8cdcf448d6be4443b0d4",
+  "remote_host": "test@SMacBook.local",
+  "remote_worktree": "/Users/test/chainworks-remote",
+  "remote_branch": "main",
+  "remote_head": "c81bf184747de6e8395935aa097fd24fd77d859f",
+  "remote_note": "Remote workspace was synchronized with the current P093 proof surface before running the gate; the remote git HEAD is older than the copied proof files.",
+  "commands": {
+    "local": "./scripts/test-gate.sh proposal-093",
+    "remote": "ssh -o HostKeyAlias=SMacBook.local test@192.168.0.67 \"cd '/Users/test/chainworks-remote' && CHAINWORKS_USE_ADHOC_UI_TESTS=1 ./scripts/test-gate.sh proposal-093\""
+  },
+  "results": {
+    "local_gate": "passed",
+    "remote_gate": "passed",
+    "remote_result_bundle": "/var/folders/hh/ztmrr5z96xnbxvlcxyf1vxsc0000gp/T/chainworks-test-gates/proposal-093-20260522-125804.xcresult",
+    "remote_signing_mode": "ad_hoc_sign_to_run_locally",
+    "keychain_dependency": "not_required"
+  },
+  "remote_ui_test": {
+    "name": "Chainworks_ForgeUITests/testProposal093TimelineCardExpansionRemoteProof",
+    "status": "passed",
+    "screenshot_name": "P093_TimelineCardExpansionRemoteProof"
+  },
+  "focused_test_counts": {
+    "swift_timeline_tests": "14/14",
+    "p031_read_boundary_tests": "84/84",
+    "rust_runtime_timeline_p093_tests": "7/7"
+  },
+  "remote_proof_matrix": {
+    "direct_timeline_surface_bootstraps": "passed",
+    "multi_agent_selector_present": "passed",
+    "single_agent_auto_selects_without_selector": "passed",
+    "default_agent_is_first_backend_ordered_option": "passed",
+    "selected_agent_events_are_newest_first": "passed",
+    "parallel_agent_events_do_not_interleave": "passed",
+    "mouse_click_expands_card": "passed",
+    "keyboard_space_collapses_and_expands_focused_card": "passed",
+    "second_card_replaces_first_expanded_card": "passed",
+    "agent_switch_clears_expanded_card": "passed",
+    "completed_response_collapses_to_summary": "passed",
+    "expanded_detail_is_non_empty_and_formatted": "passed",
+    "copy_event_id_control_has_accessible_label": "passed",
+    "provider_agent_status_badges_are_text_readable": "passed"
+  },
+  "proof_points": [
+    "P093 direct debug surface bootstrapped on the remote UI host.",
+    "Active-agent selector was present for multiple active agents and absent for a single active agent.",
+    "Default selected-agent timeline rendered newest-first and did not interleave parallel reviewer events.",
+    "Timeline card expansion worked with mouse click and keyboard Space.",
+    "Expanding another card collapsed the previous expanded entry.",
+    "Switching selected active agent cleared expanded state.",
+    "Collapsed completed responses exposed summary-level information.",
+    "Expanded detail exposed non-empty formatted content.",
+    "Copyable event ID, provider, agent, and status badge labels were present for accessibility.",
+    "Remote gate used ad-hoc Sign to Run Locally code signing to avoid keychain prompts while still launching the XCTest UI runner.",
+    "Local non-UI and Rust P093 gates passed on the current worktree."
+  ]
+}

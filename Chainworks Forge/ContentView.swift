@@ -52,6 +52,8 @@ struct ContentView: View {
     enum UISurface: String {
         case completedExportHub = "completed_export_hub"
         case p077CloseoutReadiness = "p077_closeout_readiness"
+        case p093TimelineProof = "p093_timeline_proof"
+        case p093TimelineSingleAgentProof = "p093_timeline_single_agent_proof"
     }
 
 
@@ -301,6 +303,18 @@ struct ContentView: View {
                     .frame(width: 1, height: 1)
                     .opacity(0.01)
             }
+#else
+            RunsHomeView(workbench: workbench)
+#endif
+        case .p093TimelineProof:
+#if DEBUG
+            P093TimelineProofSurface()
+#else
+            RunsHomeView(workbench: workbench)
+#endif
+        case .p093TimelineSingleAgentProof:
+#if DEBUG
+            P093TimelineProofSurface(singleAgentOnly: true)
 #else
             RunsHomeView(workbench: workbench)
 #endif

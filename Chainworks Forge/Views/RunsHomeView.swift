@@ -327,7 +327,13 @@ struct RunsHomeView: View {
                             resolvingIDs: model.resolvingApprovalIDs
                         )
                     case .timeline:
-                        P036TimelineWorkbenchCard(entries: timelineEntriesForSelectedRun())
+                        P036TimelineWorkbenchCard(
+                            entries: timelineEntriesForSelectedRun(),
+                            activeAgents: workbench.activeTimelineAgents,
+                            resolveTimelineRawDetail: { handle in
+                                await model.resolveTimelineRawDetail(handle: handle)
+                            }
+                        )
                     case .reports:
                         P031ReportMetadataCard(rows: workbench.reportRows)
                     case .system:
@@ -376,7 +382,20 @@ struct RunsHomeView: View {
                 surfaceLabel: event.surfaceLabel,
                 agentID: event.agentID,
                 sessionID: event.sessionGenerationID,
-                isCollapsed: false
+                isCollapsed: false,
+                rawDetail: event.rawDetail,
+                rawDetailBytes: event.rawDetailBytes,
+                rawDetailTruncated: event.rawDetailTruncated,
+                rawDetailHandle: event.rawDetailHandle,
+                rawDetailDigest: event.rawDetailDigest,
+                fullRawAvailable: event.fullRawAvailable,
+                detailDigest: event.detailDigest,
+                detailCharCount: event.detailCharCount,
+                chunkCount: event.chunkCount,
+                isStreaming: event.isStreaming,
+                isTerminal: event.isTerminal,
+                stateLabel: event.stateLabel,
+                providerID: event.provider
             )
         }
         return liveEntries.isEmpty ? workbench.timelineEntries : liveEntries
@@ -395,7 +414,7 @@ struct RunsHomeView: View {
 
 struct P036RuntimeTimelineBuffer {
     private static let liveResponseDetailLimit = 64_000
-    private static let completedResponseDetailLimit = 48_000
+    private static let retainedRawResponseDetailLimitBytes = 512 * 1024
 
     private(set) var events: [P031RuntimeTimelineEventPresentation] = []
 
@@ -432,6 +451,11 @@ struct P036RuntimeTimelineBuffer {
             return
         }
 
+        if Self.isProviderActionCompletion(event) {
+            collapseProviderActionCompletion(event)
+            return
+        }
+
         append(event)
     }
 
@@ -457,11 +481,20 @@ struct P036RuntimeTimelineBuffer {
                 && Self.matchesAgentSession(existing, terminalEvent: event)
         })
         else {
-            append(event)
+            append(Self.normalizedResponseChunk(event))
             return
         }
 
         let previous = events.remove(at: existingIndex)
+        let previousRawDetail = previous.rawDetail ?? previous.detail
+        let incomingRawDetail = event.rawDetail ?? event.detail
+        let combinedRawDetail = previousRawDetail + incomingRawDetail
+        let rawDetailWasTruncated = previous.rawDetailTruncated
+            || event.rawDetailTruncated
+            || combinedRawDetail.utf8.count > Self.retainedRawResponseDetailLimitBytes
+        let rawDetail = Self.boundedRawResponseDetail(combinedRawDetail)
+        let rawDetailBytes = Self.combinedRawDetailBytes(previous.rawDetailBytes, event.rawDetailBytes)
+        let rawDetailHandle = event.rawDetailHandle ?? previous.rawDetailHandle
         append(P031RuntimeTimelineEventPresentation(
             id: previous.id,
             runID: event.runID,
@@ -470,10 +503,64 @@ struct P036RuntimeTimelineBuffer {
             provider: event.provider,
             eventKind: event.eventKind,
             title: event.title,
-            detail: Self.boundedLiveResponseDetail(previous.detail + event.detail),
+            detail: Self.boundedLiveResponseDetail(rawDetail),
             surfaceLabel: event.surfaceLabel,
             sessionGenerationID: previous.sessionGenerationID ?? event.sessionGenerationID,
-            timestamp: event.timestamp
+            timestamp: event.timestamp,
+            rawDetail: rawDetail,
+            rawDetailBytes: rawDetailBytes,
+            rawDetailTruncated: rawDetailWasTruncated,
+            rawDetailHandle: rawDetailHandle,
+            rawDetailDigest: event.rawDetailDigest ?? previous.rawDetailDigest,
+            fullRawAvailable: !rawDetailWasTruncated
+                || (rawDetailHandle != nil && event.fullRawAvailable && previous.fullRawAvailable),
+            detailDigest: event.detailDigest ?? previous.detailDigest,
+            detailCharCount: rawDetail.count,
+            chunkCount: (previous.chunkCount ?? 1) + (event.chunkCount ?? 1),
+            isStreaming: true,
+            isTerminal: false,
+            stateLabel: event.stateLabel ?? previous.stateLabel
+        ))
+    }
+
+    private mutating func collapseProviderActionCompletion(_ event: P031RuntimeTimelineEventPresentation) {
+        guard let incomingIdentity = Self.providerActionIdentity(for: event),
+              let existingIndex = events.indices.reversed().first(where: { index in
+                  let existing = events[index]
+                  return Self.isProviderActionInProgress(existing)
+                      && Self.matchesAgentSession(existing, terminalEvent: event)
+                      && Self.providerActionIdentity(for: existing) == incomingIdentity
+              })
+        else {
+            append(event)
+            return
+        }
+
+        let previous = events.remove(at: existingIndex)
+        append(P031RuntimeTimelineEventPresentation(
+            id: event.id,
+            runID: event.runID,
+            stageID: event.stageID ?? previous.stageID,
+            agentID: event.agentID,
+            provider: event.provider,
+            eventKind: event.eventKind,
+            title: event.title,
+            detail: event.detail,
+            surfaceLabel: event.surfaceLabel,
+            sessionGenerationID: event.sessionGenerationID ?? previous.sessionGenerationID,
+            timestamp: event.timestamp,
+            rawDetail: event.rawDetail ?? event.detail,
+            rawDetailBytes: event.rawDetailBytes,
+            rawDetailTruncated: event.rawDetailTruncated,
+            rawDetailHandle: event.rawDetailHandle,
+            rawDetailDigest: event.rawDetailDigest,
+            fullRawAvailable: event.fullRawAvailable,
+            detailDigest: event.detailDigest,
+            detailCharCount: event.detailCharCount,
+            chunkCount: event.chunkCount,
+            isStreaming: false,
+            isTerminal: true,
+            stateLabel: event.stateLabel ?? previous.stateLabel
         ))
     }
 
@@ -486,11 +573,21 @@ struct P036RuntimeTimelineBuffer {
             Self.isResponseChunk(existing)
                 && Self.matchesAgentSession(existing, terminalEvent: terminalEvent)
         }
-        let summaryDetail = Self.summaryDetail(
+        let rawDetail = Self.accumulatedResponseDetail(
             for: matchingChunks,
             override: terminalDetailOverride
         )
-        guard !summaryDetail.isEmpty else { return }
+        guard !rawDetail.isEmpty else { return }
+        let summaryDetail = Self.summaryDetail(
+            for: matchingChunks,
+            rawDetail: rawDetail
+        )
+        let rawDetailWasTruncated = matchingChunks.contains(where: \.rawDetailTruncated)
+            || rawDetail.utf8.count >= Self.retainedRawResponseDetailLimitBytes
+        let rawDetailBytes = Self.accumulatedRawDetailBytes(
+            for: matchingChunks,
+            fallback: fallbackTerminalEvent
+        )
 
         events.removeAll { existing in
             Self.isResponseChunk(existing)
@@ -512,13 +609,125 @@ struct P036RuntimeTimelineBuffer {
                 detail: summaryDetail,
                 surfaceLabel: "agent_summary",
                 sessionGenerationID: lastChunk.sessionGenerationID,
-                timestamp: fallbackTerminalEvent.timestamp
+                timestamp: fallbackTerminalEvent.timestamp,
+                rawDetail: rawDetail,
+                rawDetailBytes: rawDetailBytes,
+                rawDetailTruncated: rawDetailWasTruncated,
+                rawDetailHandle: lastChunk.rawDetailHandle ?? fallbackTerminalEvent.rawDetailHandle,
+                rawDetailDigest: lastChunk.rawDetailDigest ?? fallbackTerminalEvent.rawDetailDigest,
+                fullRawAvailable: !rawDetailWasTruncated
+                    || ((lastChunk.rawDetailHandle ?? fallbackTerminalEvent.rawDetailHandle) != nil
+                        && lastChunk.fullRawAvailable
+                        && fallbackTerminalEvent.fullRawAvailable),
+                detailDigest: fallbackTerminalEvent.detailDigest,
+                detailCharCount: rawDetail.count,
+                chunkCount: matchingChunks.reduce(0) { total, chunk in
+                    total + (chunk.chunkCount ?? 1)
+                },
+                isStreaming: false,
+                isTerminal: true,
+                stateLabel: fallbackTerminalEvent.stateLabel ?? lastChunk.stateLabel
             )
         )
     }
 
     private static func isResponseChunk(_ event: P031RuntimeTimelineEventPresentation) -> Bool {
         event.surfaceLabel == "agent_message_chunk" || event.surfaceLabel == "text_chunk"
+    }
+
+    private static func isProviderAction(_ event: P031RuntimeTimelineEventPresentation) -> Bool {
+        event.surfaceLabel == "provider_activity"
+            || event.surfaceLabel == "tool_call"
+            || event.surfaceLabel == "tool_call_update"
+    }
+
+    private static func isProviderActionInProgress(_ event: P031RuntimeTimelineEventPresentation) -> Bool {
+        isProviderAction(event) && event.detail.localizedCaseInsensitiveContains("in_progress")
+    }
+
+    private static func isProviderActionCompletion(_ event: P031RuntimeTimelineEventPresentation) -> Bool {
+        isProviderAction(event) && event.detail.localizedCaseInsensitiveContains("completed")
+    }
+
+    private static func providerActionIdentity(for event: P031RuntimeTimelineEventPresentation) -> String? {
+        let tokens = event.detail.components(separatedBy: CharacterSet.whitespacesAndNewlines.union(
+            CharacterSet(charactersIn: "·'\"`()[]{}")
+        ))
+        let pathTokens = tokens.compactMap { rawToken -> String? in
+            let token = rawToken.trimmingCharacters(in: CharacterSet(charactersIn: ",;:"))
+            guard token.contains("/") || token.contains(".") else { return nil }
+            return token.split(separator: "/").last.map(String.init)
+        }
+        if let lastPath = pathTokens.last, !lastPath.isEmpty {
+            return lastPath
+        }
+
+        let normalized = event.detail
+            .replacingOccurrences(of: "in_progress", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: "completed", with: "", options: .caseInsensitive)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func combinedRawDetailBytes(_ lhs: Int?, _ rhs: Int?) -> Int? {
+        guard let lhs, let rhs else { return nil }
+        return boundedRawDetailBytes(lhs + rhs)
+    }
+
+    private static func accumulatedRawDetailBytes(
+        for chunks: [P031RuntimeTimelineEventPresentation],
+        fallback: P031RuntimeTimelineEventPresentation
+    ) -> Int? {
+        guard !chunks.isEmpty else {
+            return boundedRawDetailBytes(fallback.rawDetailBytes)
+        }
+        var total = 0
+        for chunk in chunks {
+            guard let rawDetailBytes = chunk.rawDetailBytes else {
+                return nil
+            }
+            total += rawDetailBytes
+        }
+        return boundedRawDetailBytes(total)
+    }
+
+    private static func boundedRawDetailBytes(_ bytes: Int?) -> Int? {
+        bytes.map { min($0, retainedRawResponseDetailLimitBytes) }
+    }
+
+    private static func normalizedResponseChunk(
+        _ event: P031RuntimeTimelineEventPresentation
+    ) -> P031RuntimeTimelineEventPresentation {
+        let incomingRawDetail = event.rawDetail ?? event.detail
+        let rawDetailWasTruncated = event.rawDetailTruncated
+            || incomingRawDetail.utf8.count > Self.retainedRawResponseDetailLimitBytes
+        let rawDetail = Self.boundedRawResponseDetail(incomingRawDetail)
+        return P031RuntimeTimelineEventPresentation(
+            id: event.id,
+            runID: event.runID,
+            stageID: event.stageID,
+            agentID: event.agentID,
+            provider: event.provider,
+            eventKind: event.eventKind,
+            title: event.title,
+            detail: Self.boundedLiveResponseDetail(rawDetail),
+            surfaceLabel: event.surfaceLabel,
+            sessionGenerationID: event.sessionGenerationID,
+            timestamp: event.timestamp,
+            rawDetail: rawDetail,
+            rawDetailBytes: Self.boundedRawDetailBytes(event.rawDetailBytes),
+            rawDetailTruncated: rawDetailWasTruncated,
+            rawDetailHandle: event.rawDetailHandle,
+            rawDetailDigest: event.rawDetailDigest,
+            fullRawAvailable: !rawDetailWasTruncated
+                || (event.rawDetailHandle != nil && event.fullRawAvailable),
+            detailDigest: event.detailDigest,
+            detailCharCount: rawDetail.count,
+            chunkCount: event.chunkCount ?? 1,
+            isStreaming: true,
+            isTerminal: false,
+            stateLabel: event.stateLabel
+        )
     }
 
     private static func matchesAgentSession(
@@ -538,22 +747,45 @@ struct P036RuntimeTimelineBuffer {
         return String(detail.suffix(liveResponseDetailLimit))
     }
 
-    private static func summaryDetail(
+    private static func boundedRawResponseDetail(_ detail: String) -> String {
+        guard detail.utf8.count > retainedRawResponseDetailLimitBytes else { return detail }
+
+        var retained = ""
+        retained.reserveCapacity(min(detail.count, retainedRawResponseDetailLimitBytes))
+        for character in detail.reversed() {
+            let next = String(character)
+            if retained.utf8.count + next.utf8.count > retainedRawResponseDetailLimitBytes {
+                break
+            }
+            retained.insert(character, at: retained.startIndex)
+        }
+        return retained
+    }
+
+    private static func accumulatedResponseDetail(
         for chunks: [P031RuntimeTimelineEventPresentation],
         override: String?
     ) -> String {
         var detail = chunks
-            .map(\.detail)
+            .map { $0.rawDetail ?? $0.detail }
             .filter { !$0.isEmpty }
             .joined()
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if detail.isEmpty {
             detail = override?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
-        if detail.count > completedResponseDetailLimit {
-            detail = String(detail.suffix(completedResponseDetailLimit))
+        return boundedRawResponseDetail(detail)
+    }
+
+    private static func summaryDetail(
+        for chunks: [P031RuntimeTimelineEventPresentation],
+        rawDetail: String
+    ) -> String {
+        let chunkCount = chunks.reduce(0) { total, chunk in
+            total + (chunk.chunkCount ?? 1)
         }
-        return detail
+        let byteCount = rawDetail.utf8.count
+        return "Response complete · \(chunkCount) chunk\(chunkCount == 1 ? "" : "s") · \(byteCount) byte\(byteCount == 1 ? "" : "s") retained"
     }
 }
 
@@ -628,6 +860,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private let loadRunsHomeAction: @Sendable (P031FreshnessSnapshot, Bool) async -> P031RunsHomePresentation
     private let loadRunDetailAction: @Sendable (String, P031FreshnessSnapshot) async -> P031RunDetailPresentation
     private let loadArtifactPreviewAction: (String) async -> P031ArtifactViewerPresentation?
+    private let resolveTimelineRawDetailAction: @Sendable (String) async -> P031TimelineRawDetailReadModel
     private let loadApprovalInboxAction: @Sendable (P031FreshnessSnapshot) async -> P031ApprovalInboxPresentation
     private let loadDaemonLifecycleAction: @Sendable (P031FreshnessSnapshot) async -> P031DaemonLifecyclePresentation
     private let loadSchedulerHealthAction: @Sendable () async -> SchedulerHealthReadback?
@@ -704,6 +937,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
         }
         loadArtifactPreviewAction = { artifactID in
             await coordinator.loadArtifactPreview(artifactID: artifactID)
+        }
+        resolveTimelineRawDetailAction = { handle in
+            await coordinator.resolveTimelineRawDetail(handle: handle)
         }
         loadApprovalInboxAction = { currentFreshness in
             await coordinator.loadApprovalInbox(currentFreshness: currentFreshness)
@@ -867,6 +1103,15 @@ final class P031ThinReadDashboardModel: ObservableObject {
         loadRunDetailAction = { _, _ in runDetail }
         loadArtifactPreviewAction = { artifactID in
             runDetail.artifactViewerRows.first { $0.artifactID == artifactID }
+        }
+        resolveTimelineRawDetailAction = { _ in
+            P031TimelineRawDetailReadModel(
+                status: .missing,
+                rawDetail: nil,
+                rawDetailBytes: nil,
+                rawDetailDigest: nil,
+                errorReason: .handleNotFound
+            )
         }
         loadApprovalInboxAction = { _ in approvalInbox }
         loadDaemonLifecycleAction = { _ in daemonLifecycle }
@@ -1193,6 +1438,10 @@ final class P031ThinReadDashboardModel: ObservableObject {
             blockedReason: preview == nil ? "payload_unavailable" : nil
         )
         return preview
+    }
+
+    func resolveTimelineRawDetail(handle: String) async -> P031TimelineRawDetailReadModel {
+        await resolveTimelineRawDetailAction(handle)
     }
 
     func isResolvingApproval(_ approvalID: String) -> Bool {
@@ -1639,22 +1888,61 @@ private struct TimelineEntryRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let entry: RunsWorkbenchPresentationModel.TimelineEntry
+    let displayOrder: Int
+    let isExpanded: Bool
+    let resolveTimelineRawDetail: (String) async -> P031TimelineRawDetailReadModel
+    let formatterCache: P093TimelineFormatterCache
+    let onToggleExpanded: () -> Void
+
+    @State private var isHovering = false
+    @State private var resolvedFullRawDetail: String?
+    @State private var rawDetailResolutionStatus: P031TimelineRawDetailStatus?
+    @State private var rawDetailResolutionErrorReason: P031TimelineRawDetailErrorReason?
+    @State private var isResolvingRawDetail = false
+    @FocusState private var isFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Button {
+                    isFocused = true
+                    onToggleExpanded()
+                } label: {
+                    Image(systemName: isExpanded ? "chevron.down.circle.fill" : "chevron.right.circle")
+                        .imageScale(.small)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(tint)
+                .accessibilityLabel(isExpanded ? "Collapse Timeline event" : "Expand Timeline event")
+                .accessibilityIdentifier("p093-timeline-toggle")
+
+                Image(systemName: iconName)
+                    .foregroundStyle(tint)
+                    .accessibilityHidden(true)
+
                 Text(entry.title)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(ForgeColor.Text.primary)
                     .lineLimit(1)
 
-                if entry.isCollapsed {
+                if entry.isStreaming {
                     StatusCapsule(
-                        text: "Collapsed",
-                        color: ForgeStatusColor.neutral,
-                        icon: "rectangle.compress.vertical",
+                        text: "Streaming",
+                        color: ForgeStatusColor.running,
+                        icon: "waveform",
                         size: .small
                     )
+                    .accessibilityLabel("Timeline status Streaming")
+                    .accessibilityIdentifier("p093-timeline-status-badge")
+                } else if entry.isTerminal {
+                    StatusCapsule(
+                        text: "Complete",
+                        color: ForgeStatusColor.neutral,
+                        icon: "checkmark.circle",
+                        size: .small
+                    )
+                    .accessibilityLabel("Timeline status Complete")
+                    .accessibilityIdentifier("p093-timeline-status-badge")
                 }
 
                 Spacer(minLength: 8)
@@ -1665,26 +1953,61 @@ private struct TimelineEntryRow: View {
                     .lineLimit(1)
             }
 
-            if !entry.detail.isEmpty {
-                Text(previewDetail)
+            if isExpanded {
+                expandedControls
+                P093FormattedTimelineDetail(
+                    result: formatterCache.render(
+                        event: entry,
+                        detail: expandedDetail,
+                        detailDigest: entry.detailDigest,
+                        detailCharCount: entry.detailCharCount,
+                        chunkCount: entry.chunkCount
+                    )
+                )
+                    .frame(
+                        minHeight: P093TimelineFormattedResult.expandedMinimumHeight(for: expandedDetail),
+                        maxHeight: 420,
+                        alignment: .top
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .transaction { transaction in
+                        transaction.animation = nil
+                    }
+                    .accessibilityIdentifier("p093-timeline-formatted-detail")
+            } else if !entry.detail.isEmpty {
+                Text(collapsedDetail)
                     .font(.caption)
                     .foregroundStyle(ForgeColor.Text.secondary)
-                    .lineLimit(previewLineLimit)
+                    .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: false)
-                    .frame(maxHeight: previewMaxHeight, alignment: .top)
+                    .frame(maxHeight: 64, alignment: .top)
                     .clipped()
             }
 
             HStack(spacing: 8) {
-                if let stageID = entry.stageID, !stageID.isEmpty {
-                    Text(stageID)
+                if let providerID = entry.providerID, !providerID.isEmpty {
+                    Text(providerID)
+                        .accessibilityLabel("Provider \(providerID)")
+                        .accessibilityIdentifier("p093-timeline-provider-badge")
                 }
-                if let sessionID = entry.sessionID, !sessionID.isEmpty {
-                    Text(sessionID)
+                if let agentID = entry.agentID, !agentID.isEmpty {
+                    Text(agentID)
+                        .accessibilityLabel("Agent \(agentID)")
+                        .accessibilityIdentifier("p093-timeline-agent-badge")
                 }
-                if let displayTime = entry.displayTime {
-                    Text(displayTime)
-                        .monospacedDigit()
+                Button {
+                    copyToPasteboard(entry.id)
+                } label: {
+                    Label(shortID(entry.id), systemImage: "doc.on.doc")
+                        .labelStyle(.titleAndIcon)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Copy Timeline event ID")
+                .accessibilityIdentifier("p093-timeline-copy-id")
+                .help("Copy Timeline event ID")
+
+                if isHovering || isFocused {
+                    metadataText
                 }
             }
             .font(.caption2)
@@ -1693,15 +2016,95 @@ private struct TimelineEntryRow: View {
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .onTapGesture {
+            onToggleExpanded()
+        }
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(tint.opacity(entry.isCollapsed ? 0.10 : 0.20), lineWidth: 1)
+                .strokeBorder(tint.opacity(isExpanded ? 0.46 : 0.20), lineWidth: isExpanded ? 1.5 : 1)
         )
+        .focusable(true)
+        .focused($isFocused)
+        .onKeyPress(.space) {
+            onToggleExpanded()
+            return .handled
+        }
+        .onKeyPress(.return) {
+            onToggleExpanded()
+            return .handled
+        }
+        .onHover { isHovering = $0 }
+        .help(metadataHelp)
+        .contextMenu {
+            Button("Copy event ID") {
+                copyToPasteboard(entry.id)
+            }
+            Button(rawCopyLabel) {
+                Task { await copyRawDetail() }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("p093-timeline-entry")
+        .overlay(alignment: .topLeading) {
+            VStack {
+                P031AccessibilityMarker(identifier: "p093-timeline-entry-id-\(entry.id)")
+                P031AccessibilityMarker(identifier: "p093-timeline-order-\(displayOrder)-\(entry.id)")
+                if !isExpanded && entry.isTerminal && isResponseEntry {
+                    P031AccessibilityMarker(identifier: "p093-timeline-collapsed-terminal-summary-\(entry.id)")
+                }
+                if isExpanded {
+                    P031AccessibilityMarker(identifier: "p093-timeline-expanded-\(entry.id)")
+                }
+                if isExpanded && !expandedDetail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    P031AccessibilityMarker(identifier: "p093-timeline-detail-non-empty")
+                }
+            }
+        }
+        .task(id: isExpanded) {
+            if isExpanded {
+                await resolveRawDetailIfNeeded()
+            }
+        }
+        .id(entry.id)
         .transition(reduceMotion ? .opacity : .asymmetric(
             insertion: .push(from: .bottom).combined(with: .opacity),
             removal: .opacity
         ))
+    }
+
+    private var expandedControls: some View {
+        HStack(spacing: 8) {
+            Button {
+                copyToPasteboard(entry.id)
+            } label: {
+                Label("Copy ID", systemImage: "doc.on.doc")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityLabel("Copy Timeline event ID")
+            .accessibilityIdentifier("p093-timeline-copy-id")
+
+            Button {
+                Task { await copyRawDetail() }
+            } label: {
+                Label(rawCopyLabel, systemImage: "doc.text")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityLabel(rawCopyLabel)
+            .disabled(isResolvingRawDetail)
+
+            if let rawDetailStatusLabel {
+                Text(rawDetailStatusLabel)
+                    .font(.caption2)
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .accessibilityIdentifier("p093-timeline-expanded-controls")
     }
 
     private var iconName: String {
@@ -1735,18 +2138,716 @@ private struct TimelineEntryRow: View {
         return "...\n" + String(entry.detail.suffix(limit))
     }
 
-    private var previewLineLimit: Int {
-        isResponseEntry ? 40 : 3
+    private var collapsedDetail: String {
+        guard isResponseEntry else { return previewDetail }
+        if entry.isTerminal {
+            return entry.detail
+        }
+        if entry.isStreaming {
+            return streamingResponseSummary
+        }
+        return previewDetail
     }
 
-    private var previewMaxHeight: CGFloat {
-        isResponseEntry ? 560 : 54
+    private var streamingResponseSummary: String {
+        let chunks = entry.chunkCount ?? 1
+        let chunkText = "\(chunks) chunk\(chunks == 1 ? "" : "s")"
+        guard let bytes = entry.rawDetailBytes else {
+            return "Response streaming · \(chunkText)"
+        }
+        return "Response streaming · \(chunkText) · \(bytes) byte\(bytes == 1 ? "" : "s") retained"
+    }
+
+    private var expandedDetail: String {
+        resolvedFullRawDetail ?? retainedRawDetail
+    }
+
+    private var retainedRawDetail: String {
+        entry.rawDetail?.isEmpty == false ? entry.rawDetail! : entry.detail
+    }
+
+    private var rawCopyLabel: String {
+        resolvedFullRawDetail != nil || (entry.fullRawAvailable && !entry.rawDetailTruncated)
+            ? "Copy full raw content"
+            : "Copy retained raw content"
+    }
+
+    private var rawDetailStatusLabel: String? {
+        if isResolvingRawDetail {
+            return "Resolving full raw content"
+        }
+        if let rawDetailResolutionStatus, rawDetailResolutionStatus != .available {
+            let reason = rawDetailResolutionErrorReason.map(rawDetailErrorLabel(for:))
+                ?? rawDetailResolutionStatus.rawValue
+            return "Full raw content unavailable: \(reason)"
+        }
+        if entry.rawDetailTruncated && resolvedFullRawDetail == nil {
+            return "Full raw content unavailable"
+        }
+        if let rawDetailResolutionStatus {
+            return "Raw detail: \(rawDetailResolutionStatus.rawValue)"
+        }
+        return nil
+    }
+
+    private func rawDetailErrorLabel(for reason: P031TimelineRawDetailErrorReason) -> String {
+        switch reason {
+        case .handleNotFound:
+            return "handle_not_found"
+        case .handleExpired:
+            return "handle_expired"
+        case .runNotAuthorized:
+            return "run_not_authorized"
+        case .eventNotAuthorized:
+            return "event_not_authorized"
+        case .storageUnavailable:
+            return "storage_unavailable"
+        case .digestValidationFailed:
+            return "digest_mismatch"
+        }
+    }
+
+    private var metadataText: some View {
+        HStack(spacing: 8) {
+            if let stageID = entry.stageID, !stageID.isEmpty {
+                Text(stageID)
+            }
+            if let stateLabel = entry.stateLabel, !stateLabel.isEmpty {
+                Text(stateLabel)
+            }
+            if let displayTime = entry.displayTime {
+                Text(displayTime).monospacedDigit()
+            }
+            if let rawDetailBytes = entry.rawDetailBytes {
+                Text("\(rawDetailBytes) bytes")
+            }
+            if entry.rawDetailTruncated {
+                Text("truncated")
+            }
+            if let rawDetailResolutionStatus {
+                Text(rawDetailResolutionStatus.rawValue)
+            }
+        }
+        .accessibilityLabel(metadataHelp)
+        .accessibilityIdentifier("p093-timeline-metadata")
+    }
+
+    private var metadataHelp: String {
+        [
+            entry.stageID.map { "State: \($0)" },
+            entry.agentID.map { "Agent: \($0)" },
+            entry.providerID.map { "Provider: \($0)" },
+            entry.displayTime.map { "Time: \($0)" },
+        ]
+            .compactMap { $0 }
+            .joined(separator: "\n")
+    }
+
+    private func shortID(_ id: String) -> String {
+        guard id.count > 12 else { return id }
+        return String(id.prefix(8)) + "..."
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    @MainActor
+    private func copyRawDetail() async {
+        await resolveRawDetailIfNeeded()
+        copyToPasteboard(expandedDetail)
+    }
+
+    @MainActor
+    private func resolveRawDetailIfNeeded() async {
+        guard resolvedFullRawDetail == nil,
+              rawDetailResolutionStatus == nil,
+              let handle = entry.rawDetailHandle?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !handle.isEmpty,
+              entry.fullRawAvailable
+        else {
+            return
+        }
+        isResolvingRawDetail = true
+        let result = await resolveTimelineRawDetail(handle)
+        isResolvingRawDetail = false
+        rawDetailResolutionStatus = result.status
+        rawDetailResolutionErrorReason = result.errorReason
+        guard result.status == .available,
+              let rawDetail = result.rawDetail,
+              result.rawDetailBytes == rawDetail.utf8.count,
+              resolverDigestMatches(result.rawDetailDigest)
+        else {
+            if result.status == .available {
+                rawDetailResolutionStatus = .digestMismatch
+                rawDetailResolutionErrorReason = .digestValidationFailed
+            }
+            return
+        }
+        resolvedFullRawDetail = rawDetail
+    }
+
+    private func resolverDigestMatches(_ resolverDigest: String?) -> Bool {
+        guard let expectedDigest = entry.rawDetailDigest?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !expectedDigest.isEmpty
+        else {
+            return true
+        }
+        return resolverDigest == expectedDigest
     }
 
     private var isResponseEntry: Bool {
         entry.surfaceLabel == "text_chunk"
             || entry.surfaceLabel == "agent_message_chunk"
             || entry.surfaceLabel == "agent_summary"
+    }
+}
+
+@MainActor
+private final class P093TimelineFormatterCache {
+    private let maxCacheEntries = 32
+    private var entries: [String: P093TimelineFormattedResult] = [:]
+    private var accessOrder: [String] = []
+
+    func render(
+        event: RunsWorkbenchPresentationModel.TimelineEntry,
+        detail: String,
+        detailDigest: String?,
+        detailCharCount: Int?,
+        chunkCount: Int?
+    ) -> P093TimelineFormattedResult {
+        let key = cacheKey(
+            event: event,
+            detailDigest: detailDigest,
+            detailCharCount: detailCharCount,
+            chunkCount: chunkCount
+        )
+        if let cached = entries[key] {
+            markRecentlyUsed(key)
+            return cached
+        }
+        let rendered = P093TimelineFormattedResult.render(detail: detail, now: Date.init)
+        entries[key] = rendered
+        markRecentlyUsed(key)
+        evictLeastRecentlyUsedEntry()
+        return rendered
+    }
+
+    private func cacheKey(
+        event: RunsWorkbenchPresentationModel.TimelineEntry,
+        detailDigest: String?,
+        detailCharCount: Int?,
+        chunkCount: Int?
+    ) -> String {
+        let formatterVersion = P093TimelineFormattedResult.formatterVersion
+        if let detailDigest, !detailDigest.isEmpty {
+            return "\(event.id):\(detailDigest):\(formatterVersion)"
+        }
+        return "\(event.id):\(detailCharCount ?? 0):\(chunkCount ?? 0):\(formatterVersion)"
+    }
+
+    private func markRecentlyUsed(_ key: String) {
+        accessOrder.removeAll { $0 == key }
+        accessOrder.append(key)
+    }
+
+    private func evictLeastRecentlyUsedEntry() {
+        while accessOrder.count > maxCacheEntries, let evicted = accessOrder.first {
+            accessOrder.removeFirst()
+            entries.removeValue(forKey: evicted)
+        }
+    }
+}
+
+struct P093TimelineFormattedResult: Equatable {
+    static let formatterVersion = "p093-markdown-document-v1"
+    static let formattedPreviewInputLimit = 96 * 1024
+    static let jsonPrettyPrintInputLimit = 64 * 1024
+    static let codeBlockPreviewLimit = 32 * 1024
+    static let parseTimeFallbackLimitSeconds = 0.050
+
+    let content: String
+    let blocks: [Block]
+    let previewTruncated: Bool
+    let fallbackReason: FallbackReason?
+
+    enum Block: Equatable {
+        case text(String)
+        case code(String)
+    }
+
+    enum FallbackReason: Equatable {
+        case parseBudgetExceeded
+    }
+
+    static func expandedMinimumHeight(for detail: String) -> CGFloat {
+        let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return 0 }
+        let lineCount = max(1, min(trimmed.split(separator: "\n", omittingEmptySubsequences: false).count, 8))
+        return min(max(CGFloat(lineCount * 22 + 36), 72), 220)
+    }
+
+    static func render(detail: String) -> P093TimelineFormattedResult {
+        render(detail: detail, now: Date.init)
+    }
+
+    static func render(detail: String, now: () -> Date) -> P093TimelineFormattedResult {
+        let startedAt = now()
+        let budgeted = capped(detail, utf8Limit: formattedPreviewInputLimit)
+        let normalizedContent = P093FormattedTimelineDetail.normalizedMarkdownContent(from: budgeted.text)
+        let blocks = P093FormattedTimelineDetail.blocks(from: normalizedContent)
+        if now().timeIntervalSince(startedAt) > parseTimeFallbackLimitSeconds {
+            return P093TimelineFormattedResult(
+                content: normalizedContent,
+                blocks: [.text(normalizedContent)],
+                previewTruncated: true,
+                fallbackReason: .parseBudgetExceeded
+            )
+        }
+        return P093TimelineFormattedResult(
+            content: normalizedContent,
+            blocks: blocks.isEmpty ? [.text(normalizedContent)] : blocks,
+            previewTruncated: budgeted.truncated,
+            fallbackReason: nil
+        )
+    }
+
+    static func capped(_ text: String, utf8Limit: Int) -> (text: String, truncated: Bool) {
+        guard text.utf8.count > utf8Limit else {
+            return (text, false)
+        }
+        var capped = ""
+        capped.reserveCapacity(utf8Limit)
+        for character in text {
+            if (capped.utf8.count + String(character).utf8.count) > utf8Limit {
+                break
+            }
+            capped.append(character)
+        }
+        return (capped, true)
+    }
+}
+
+private struct P093FormattedTimelineDetail: View {
+    fileprivate let result: P093TimelineFormattedResult
+
+    fileprivate init(result: P093TimelineFormattedResult) {
+        self.result = result
+    }
+
+    var body: some View {
+        stableScrollContainer
+        .background(ForgeColor.Surface.muted.opacity(0.6), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(alignment: .topLeading) {
+            if hasAccessibleContent {
+                P031AccessibilityMarker(identifier: "p093-timeline-detail-non-empty")
+                    .accessibilityLabel(accessibilitySummary)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilitySummary)
+    }
+
+    @ViewBuilder
+    private var stableScrollContainer: some View {
+        ScrollView {
+            formattedContent
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var formattedContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if result.previewTruncated {
+                Label("Preview truncated", systemImage: "scissors")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+            }
+            if result.fallbackReason == .parseBudgetExceeded {
+                Label("Formatter budget fallback", systemImage: "timer")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+            }
+
+            ForEach(Array(result.blocks.enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .text(let text):
+                    P093TimelineMarkdownTextBlock(text: text)
+                case .code(let code):
+                    P093TimelineCodeBlock(code: code)
+                }
+            }
+        }
+        .padding(8)
+    }
+
+    private var accessibilitySummary: String {
+        let text = result.blocks
+            .map { block -> String in
+                switch block {
+                case .text(let text), .code(let text):
+                    return text
+                }
+            }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return "Timeline detail preview is empty" }
+        return String(text.prefix(1_000))
+    }
+
+    private var hasAccessibleContent: Bool {
+        accessibilitySummary != "Timeline detail preview is empty"
+    }
+
+    fileprivate static func normalizedMarkdownContent(from detail: String) -> String {
+        let normalizedNewlines = detail.replacingOccurrences(of: "\r\n", with: "\n")
+        let lines = normalizedNewlines.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var output: [String] = []
+        var inCodeFence = false
+
+        func appendLine(_ line: String) {
+            output.append(line)
+        }
+
+        func processTextLine(_ line: String) {
+            guard let markerRange = line.range(of: "```") else {
+                appendLine(line)
+                return
+            }
+
+            let prefix = String(line[..<markerRange.lowerBound])
+            if !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                appendLine(prefix)
+            }
+
+            let afterMarker = String(line[markerRange.upperBound...])
+            let parsed = parseOpeningFenceRemainder(afterMarker, forceSplitPayload: !prefix.isEmpty)
+            appendLine("```" + parsed.info)
+            inCodeFence = true
+            if let payload = parsed.payload, !payload.isEmpty {
+                appendLine(payload)
+            }
+        }
+
+        func processCodeLine(_ line: String) {
+            guard let markerRange = line.range(of: "```") else {
+                appendLine(line)
+                return
+            }
+
+            let codePrefix = String(line[..<markerRange.lowerBound])
+            if !codePrefix.isEmpty {
+                appendLine(codePrefix)
+            }
+            appendLine("```")
+            inCodeFence = false
+
+            let trailing = String(line[markerRange.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trailing.isEmpty {
+                processTextLine(trailing)
+            }
+        }
+
+        for line in lines {
+            if inCodeFence {
+                processCodeLine(line)
+            } else {
+                processTextLine(line)
+            }
+        }
+
+        return output.joined(separator: "\n")
+    }
+
+    private static func parseOpeningFenceRemainder(
+        _ remainder: String,
+        forceSplitPayload: Bool
+    ) -> (info: String, payload: String?) {
+        let trimmedLeading = remainder.trimmingCharacters(in: .whitespaces)
+        guard !trimmedLeading.isEmpty else {
+            return ("", nil)
+        }
+
+        guard forceSplitPayload else {
+            return (trimmedLeading, nil)
+        }
+
+        let pieces = trimmedLeading.split(maxSplits: 1, whereSeparator: { $0 == " " || $0 == "\t" })
+        guard let first = pieces.first else {
+            return ("", nil)
+        }
+
+        let language = String(first)
+        guard isLikelyFenceLanguage(language) else {
+            return ("", trimmedLeading)
+        }
+
+        let payload = pieces.count > 1
+            ? String(pieces[1]).trimmingCharacters(in: .whitespaces)
+            : nil
+        return (language, payload?.isEmpty == true ? nil : payload)
+    }
+
+    private static func isLikelyFenceLanguage(_ value: String) -> Bool {
+        guard !value.isEmpty, value.count <= 32 else { return false }
+        return value.allSatisfy { character in
+            character.isLetter
+                || character.isNumber
+                || character == "_"
+                || character == "-"
+                || character == "+"
+                || character == "#"
+                || character == "."
+        }
+    }
+
+    fileprivate static func blocks(from detail: String) -> [P093TimelineFormattedResult.Block] {
+        let lines = detail.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var blocks: [P093TimelineFormattedResult.Block] = []
+        var current: [String] = []
+        var code: [String] = []
+        var inCode = false
+
+        func flushText() {
+            let text = current.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                blocks.append(contentsOf: plainTextBlocks(from: text))
+            }
+            current.removeAll()
+        }
+
+        func flushCode() {
+            let text = code.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                let capped = P093TimelineFormattedResult.capped(
+                    text,
+                    utf8Limit: P093TimelineFormattedResult.codeBlockPreviewLimit
+                )
+                blocks.append(.code(capped.truncated ? capped.text + "\nPreview truncated" : capped.text))
+            }
+            code.removeAll()
+        }
+
+        for line in lines {
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                if inCode {
+                    flushCode()
+                } else {
+                    flushText()
+                }
+                inCode.toggle()
+                continue
+            }
+            if inCode {
+                code.append(line)
+            } else {
+                current.append(line)
+            }
+        }
+
+        if inCode {
+            flushCode()
+        } else {
+            flushText()
+        }
+        return blocks.isEmpty ? [.text(detail)] : blocks
+    }
+
+    private static func plainTextBlocks(from text: String) -> [P093TimelineFormattedResult.Block] {
+        if let prettyJSON = prettyPrintedJSON(text) {
+            return [.code(prettyJSON)]
+        }
+
+        if looksLikeChainworksOutputJSON(text) {
+            let capped = P093TimelineFormattedResult.capped(
+                text.trimmingCharacters(in: .whitespacesAndNewlines),
+                utf8Limit: P093TimelineFormattedResult.codeBlockPreviewLimit
+            )
+            return [.code(capped.truncated ? capped.text + "\nPreview truncated" : capped.text)]
+        }
+
+        if let markerBlocks = chainworksOutputBlocks(from: text) {
+            return markerBlocks
+        }
+
+        return [.text(text)]
+    }
+
+    private static func chainworksOutputBlocks(from text: String) -> [P093TimelineFormattedResult.Block]? {
+        guard let markerRange = chainworksOutputMarkerRange(in: text) else {
+            return nil
+        }
+
+        var blocks: [P093TimelineFormattedResult.Block] = []
+        let preface = String(text[..<markerRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !preface.isEmpty {
+            blocks.append(.text(preface))
+        }
+        blocks.append(.text("CHAINWORKS_OUTPUT"))
+
+        let payload = String(text[markerRange.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !payload.isEmpty else {
+            return blocks
+        }
+
+        if let prettyJSON = prettyPrintedJSON(payload) {
+            blocks.append(.code(prettyJSON))
+        } else if let extracted = firstPrettyPrintedJSONFragment(in: payload) {
+            let prefix = String(payload[..<extracted.range.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !prefix.isEmpty {
+                blocks.append(.text(prefix))
+            }
+            blocks.append(.code(extracted.prettyJSON))
+            let suffix = String(payload[extracted.range.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !suffix.isEmpty {
+                blocks.append(.text(suffix))
+            }
+        } else {
+            let capped = P093TimelineFormattedResult.capped(
+                payload,
+                utf8Limit: P093TimelineFormattedResult.codeBlockPreviewLimit
+            )
+            blocks.append(.code(capped.truncated ? capped.text + "\nPreview truncated" : capped.text))
+        }
+        return blocks
+    }
+
+    private static func looksLikeChainworksOutputJSON(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix(#"{"CHAINWORKS_OUTPUT""#)
+            || trimmed.hasPrefix(#"{ "CHAINWORKS_OUTPUT""#)
+    }
+
+    private static func chainworksOutputMarkerRange(in text: String) -> Range<String.Index>? {
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            let lineEnd = text[cursor...].firstIndex(of: "\n") ?? text.endIndex
+            let lineRange = cursor..<lineEnd
+            let trimmed = text[lineRange].trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed == "CHAINWORKS_OUTPUT" || trimmed == "CHAINWORKS_OUTPUT:" {
+                return lineRange
+            }
+            cursor = lineEnd == text.endIndex ? text.endIndex : text.index(after: lineEnd)
+        }
+        return nil
+    }
+
+    private static func firstPrettyPrintedJSONFragment(
+        in text: String
+    ) -> (range: Range<String.Index>, prettyJSON: String)? {
+        for start in text.indices where text[start] == "{" || text[start] == "[" {
+            guard let end = matchingJSONEnd(in: text, startingAt: start) else {
+                continue
+            }
+            let candidateRange = start..<text.index(after: end)
+            let candidate = String(text[candidateRange])
+            if let prettyJSON = prettyPrintedJSON(candidate) {
+                return (candidateRange, prettyJSON)
+            }
+        }
+        return nil
+    }
+
+    private static func matchingJSONEnd(in text: String, startingAt start: String.Index) -> String.Index? {
+        var stack: [Character] = []
+        var isInString = false
+        var isEscaped = false
+        var index = start
+        while index < text.endIndex {
+            let character = text[index]
+            if isInString {
+                if isEscaped {
+                    isEscaped = false
+                } else if character == "\\" {
+                    isEscaped = true
+                } else if character == "\"" {
+                    isInString = false
+                }
+            } else {
+                switch character {
+                case "\"":
+                    isInString = true
+                case "{":
+                    stack.append("}")
+                case "[":
+                    stack.append("]")
+                case "}", "]":
+                    guard stack.last == character else {
+                        return nil
+                    }
+                    stack.removeLast()
+                    if stack.isEmpty {
+                        return index
+                    }
+                default:
+                    break
+                }
+            }
+            index = text.index(after: index)
+        }
+        return nil
+    }
+
+    private static func prettyPrintedJSON(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("{") || trimmed.hasPrefix("["),
+              trimmed.utf8.count <= P093TimelineFormattedResult.jsonPrettyPrintInputLimit,
+              let data = trimmed.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              JSONSerialization.isValidJSONObject(object),
+              let pretty = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]),
+              let rendered = String(data: pretty, encoding: .utf8)
+        else {
+            return nil
+        }
+        return rendered
+    }
+}
+
+private struct P093TimelineMarkdownTextBlock: View {
+    let text: String
+
+    var body: some View {
+        Text(renderedText)
+            .font(.system(size: 13))
+            .foregroundStyle(ForgeColor.Text.secondary)
+            .lineSpacing(3)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityLabel(text)
+    }
+
+    private var renderedText: AttributedString {
+        if let attributed = try? AttributedString(
+            markdown: text,
+            options: .init(interpretedSyntax: .full)
+        ) {
+            return attributed
+        }
+        return AttributedString(text)
+    }
+}
+
+private struct P093TimelineCodeBlock: View {
+    let code: String
+
+    var body: some View {
+        Text(code)
+            .font(.system(size: 12, design: .monospaced))
+            .foregroundStyle(ForgeColor.Text.secondary)
+            .textSelection(.enabled)
+            .lineSpacing(2)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            .background(Color(nsColor: .textBackgroundColor).opacity(0.72), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -3773,10 +4874,237 @@ private struct P036RunsHomePreviewHost: View {
             sessionID: "session-complete",
             isCollapsed: true
         )
-    ])
+    ], activeAgents: [], resolveTimelineRawDetail: { _ in
+        P031TimelineRawDetailReadModel(
+            status: .missing,
+            rawDetail: nil,
+            rawDetailBytes: nil,
+            rawDetailDigest: nil,
+            errorReason: .handleNotFound
+        )
+    })
     .frame(width: 760)
     .padding()
 }
+
+private let p093TimelinePromptPreviewDetail = """
+## System Instructions
+Review the proposal as a macOS specialist. Focus on native macOS interaction patterns, SwiftUI/AppKit fit, accessibility, windowing, menus, keyboard workflows, and platform-specific UX risk. Output only the proposal_review_v1 contract.
+---
+## Task: dynamic_review_proposal_reviewer_macos
+Run meta-root (absolute): /Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218
+Workspace root: /Users/user/Documents/Chainworks Forge
+
+### Input Artifacts
+- `idea_brief` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218/context/idea.md`
+- `proposal_current` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218/proposals/current/proposal.md`
+- `proposal_feedback_coverage` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218/reviews/proposal/feedback-coverage.json`
+- `reviewer_scope_plan` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218/reviews/proposal/reviewer-scope-plan.json`
+- `score_lift_backlog` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218/reviews/proposal/score-lift-backlog.json`
+
+### Required Outputs
+Return each required output through the final `CHAINWORKS_OUTPUT` object using the canonical path keys below; the engine will materialize canonical files after contract validation.
+Tool stdout is not an output channel. Only the final assistant message is settled for `CHAINWORKS_OUTPUT`. Do not call shell `echo`, `printf`, or file-writing commands to return `CHAINWORKS_OUTPUT`.
+- `proposal_review_macos` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218/reviews/proposal/macos.json`
+
+### Structured Output Requirements
+CRITICAL: Each required output file must contain exactly one top-level JSON object and nothing else.
+- Do NOT wrap the JSON in code fences.
+- Do NOT emit markdown, prose, or companion files unless they are explicitly listed as required outputs.
+- Every listed field below MUST be present in the JSON, with its correct type.
+"""
+
+#Preview("Timeline Prompt Detail") {
+    P093FormattedTimelineDetail(
+        result: P093TimelineFormattedResult.render(detail: p093TimelinePromptPreviewDetail)
+    )
+    .frame(width: 1200, height: 420)
+    .padding()
+}
+
+#if DEBUG
+struct P093TimelineProofSurface: View {
+    var singleAgentOnly = false
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            ScrollView {
+                P036TimelineWorkbenchCard(
+                    entries: proofEntries,
+                    activeAgents: proofAgents,
+                    resolveTimelineRawDetail: { _ in
+                        P031TimelineRawDetailReadModel(
+                            status: .available,
+                            rawDetail: p093TimelinePromptPreviewDetail,
+                            rawDetailBytes: p093TimelinePromptPreviewDetail.utf8.count,
+                            rawDetailDigest: "p093-proof-detail",
+                            errorReason: nil
+                        )
+                    }
+                )
+                .padding(24)
+            }
+            .frame(minWidth: 920, minHeight: 620)
+
+            Color.clear
+                .frame(width: 1, height: 1)
+                .accessibilityIdentifier("ui-test-direct-surface-ready-p093_timeline_proof")
+        }
+    }
+
+    private var proofAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent] {
+        let agents = [
+            RunsWorkbenchPresentationModel.ActiveTimelineAgent(
+                id: "code_writer",
+                title: "Code Writer",
+                providerID: "codex",
+                stageID: "state_10_implementation_refined",
+                stageLabel: "Implementation refined",
+                taskLabel: "refine_implementation",
+                status: "running",
+                sessionID: "session-p093-code-writer",
+                latestAt: Date(timeIntervalSince1970: 1_778_000_000),
+                eventCount: 2,
+                selectionOrder: 0,
+                selectionUnavailableReason: nil
+            ),
+            RunsWorkbenchPresentationModel.ActiveTimelineAgent(
+                id: "reviewer",
+                title: "Reviewer",
+                providerID: "claude",
+                stageID: "state_9_implementation_reviewed",
+                stageLabel: "Implementation reviewed",
+                taskLabel: "review_implementation",
+                status: "running",
+                sessionID: "session-p093-reviewer",
+                latestAt: Date(timeIntervalSince1970: 1_777_999_900),
+                eventCount: 1,
+                selectionOrder: 1,
+                selectionUnavailableReason: nil
+            ),
+        ]
+        return singleAgentOnly ? Array(agents.prefix(1)) : agents
+    }
+
+    private var proofEntries: [RunsWorkbenchPresentationModel.TimelineEntry] {
+        let codeWriterEntries = [
+            RunsWorkbenchPresentationModel.TimelineEntry(
+                id: "rte_p093_prompt",
+                kind: .text,
+                title: "Prompt sent",
+                detail: p093TimelinePromptPreviewDetail,
+                timestamp: Date(timeIntervalSince1970: 1_778_000_010),
+                displayTime: "10:00:10",
+                stageID: "state_10_implementation_refined",
+                surfaceLabel: "operator_prompt",
+                agentID: "code_writer",
+                sessionID: "session-p093-code-writer",
+                isCollapsed: false,
+                rawDetail: p093TimelinePromptPreviewDetail,
+                rawDetailBytes: p093TimelinePromptPreviewDetail.utf8.count,
+                rawDetailTruncated: false,
+                rawDetailHandle: nil,
+                rawDetailDigest: "p093-proof-detail",
+                fullRawAvailable: true,
+                detailDigest: "p093-proof-detail",
+                detailCharCount: p093TimelinePromptPreviewDetail.count,
+                chunkCount: 1,
+                isStreaming: false,
+                isTerminal: true,
+                stateLabel: "state_10_implementation_refined",
+                providerID: "codex"
+            ),
+            RunsWorkbenchPresentationModel.TimelineEntry(
+                id: "rte_p093_tool",
+                kind: .mergedTool,
+                title: "Provider activity",
+                detail: "completed · rg -n \"TimelineEntryRow\" \"Chainworks Forge/Views/RunsHomeView.swift\"",
+                timestamp: Date(timeIntervalSince1970: 1_778_000_015),
+                displayTime: "10:00:15",
+                stageID: "state_10_implementation_refined",
+                surfaceLabel: "provider_activity",
+                agentID: "code_writer",
+                sessionID: "session-p093-code-writer",
+                isCollapsed: false,
+                isStreaming: false,
+                isTerminal: true,
+                stateLabel: "state_10_implementation_refined",
+                providerID: "codex"
+            ),
+            RunsWorkbenchPresentationModel.TimelineEntry(
+                id: "rte_p093_response",
+                kind: .text,
+                title: "Agent response complete",
+                detail: "Completed response summary: proposal review output ready.",
+                timestamp: Date(timeIntervalSince1970: 1_778_000_020),
+                displayTime: "10:00:20",
+                stageID: "state_10_implementation_refined",
+                surfaceLabel: "agent_summary",
+                agentID: "code_writer",
+                sessionID: "session-p093-code-writer",
+                isCollapsed: false,
+                rawDetail: """
+                Streaming response body with `inline code` and a short list.
+
+                - first
+                - second
+
+                ```json
+                {
+                  "contract": "proposal_review_v1",
+                  "verdict": "ready"
+                }
+                ```
+                """,
+                rawDetailBytes: """
+                Streaming response body with `inline code` and a short list.
+
+                - first
+                - second
+
+                ```json
+                {
+                  "contract": "proposal_review_v1",
+                  "verdict": "ready"
+                }
+                ```
+                """.utf8.count,
+                rawDetailTruncated: false,
+                rawDetailHandle: nil,
+                rawDetailDigest: "p093-proof-response-detail",
+                fullRawAvailable: true,
+                detailDigest: "p093-proof-response-detail",
+                detailCharCount: 164,
+                chunkCount: 4,
+                isStreaming: false,
+                isTerminal: true,
+                stateLabel: "state_10_implementation_refined",
+                providerID: "codex"
+            ),
+        ]
+        guard !singleAgentOnly else { return codeWriterEntries }
+        return codeWriterEntries + [
+            RunsWorkbenchPresentationModel.TimelineEntry(
+                id: "rte_p093_reviewer",
+                kind: .text,
+                title: "Reviewer note",
+                detail: "Reviewer-only timeline entry.",
+                timestamp: Date(timeIntervalSince1970: 1_778_000_030),
+                displayTime: "10:00:30",
+                stageID: "state_9_implementation_reviewed",
+                surfaceLabel: "text_chunk",
+                agentID: "reviewer",
+                sessionID: "session-p093-reviewer",
+                isCollapsed: false,
+                isStreaming: true,
+                isTerminal: false,
+                stateLabel: "state_9_implementation_reviewed",
+                providerID: "claude"
+            ),
+        ]
+    }
+}
+#endif
 
 private struct P036SystemReadinessCard: View {
     let health: RunsWorkbenchPresentationModel.FreshnessHealth
@@ -4089,13 +5417,130 @@ private struct P036RunningPulse: ViewModifier {
     }
 }
 
+#if os(macOS)
+private struct P093StableTimelineScrollView<Content: View>: NSViewRepresentable {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.contentView.postsBoundsChangedNotifications = true
+
+        let hostingView = NSHostingView(rootView: rootView(width: 1))
+        hostingView.autoresizingMask = [.width]
+        hostingView.translatesAutoresizingMaskIntoConstraints = true
+        scrollView.documentView = hostingView
+        context.coordinator.hostingView = hostingView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let hostingView = context.coordinator.hostingView else { return }
+
+        let clipView = scrollView.contentView
+        let previousOrigin = clipView.bounds.origin
+        let previousDocumentHeight = scrollView.documentView?.bounds.height ?? 0
+        let previousMaxY = max(0, previousDocumentHeight - clipView.bounds.height)
+        let wasNearBottom = previousMaxY - previousOrigin.y <= 20
+        let viewportWidth = max(clipView.bounds.width, 1)
+
+        NSAnimationContext.runAnimationGroup { animationContext in
+            animationContext.duration = 0
+            animationContext.allowsImplicitAnimation = false
+
+            hostingView.rootView = rootView(width: viewportWidth)
+            hostingView.layoutSubtreeIfNeeded()
+
+            let fittingHeight = hostingView.fittingSize.height
+            let documentHeight = max(fittingHeight, clipView.bounds.height)
+            hostingView.frame = NSRect(x: 0, y: 0, width: viewportWidth, height: documentHeight)
+            scrollView.documentView = hostingView
+
+            let nextMaxY = max(0, documentHeight - clipView.bounds.height)
+            let targetY = wasNearBottom ? nextMaxY : min(previousOrigin.y, nextMaxY)
+            clipView.scroll(to: NSPoint(x: 0, y: max(0, targetY)))
+            scrollView.reflectScrolledClipView(clipView)
+        }
+    }
+
+    private func rootView(width: CGFloat) -> AnyView {
+        AnyView(
+            content
+                .frame(width: width, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+        )
+    }
+
+    final class Coordinator {
+        var hostingView: NSHostingView<AnyView>?
+    }
+}
+#endif
+
 private struct P036TimelineWorkbenchCard: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let entries: [RunsWorkbenchPresentationModel.TimelineEntry]
+    let activeAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent]
+    let resolveTimelineRawDetail: (String) async -> P031TimelineRawDetailReadModel
+
+    @State private var expandedEntryID: String?
+    @State private var selectedAgentID: String?
+    @State private var formatterCache = P093TimelineFormatterCache()
+
+    private var allVisibleEntries: [RunsWorkbenchPresentationModel.TimelineEntry] {
+        entries.filter { !$0.isCollapsed }.sorted { lhs, rhs in
+            if lhs.timestamp == rhs.timestamp { return lhs.id > rhs.id }
+            return lhs.timestamp > rhs.timestamp
+        }
+    }
+
+    private var agentOptions: [TimelineAgentOption] {
+        activeAgents.map { agent in
+            TimelineAgentOption(
+                id: agent.id,
+                title: agent.title,
+                providerID: agent.providerID,
+                stageID: agent.stageID,
+                stageLabel: agent.stageLabel,
+                taskLabel: agent.taskLabel,
+                status: agent.status,
+                sessionID: agent.sessionID,
+                latestAt: agent.latestAt,
+                eventCount: agent.eventCount,
+                selectionOrder: agent.selectionOrder,
+                selectionUnavailableReason: agent.selectionUnavailableReason
+            )
+        }
+    }
+
+    private var resolvedSelectedAgentID: String? {
+        if let selectedAgentID,
+           agentOptions.contains(where: { $0.id == selectedAgentID }) {
+            return selectedAgentID
+        }
+        return agentOptions.first?.id
+    }
 
     private var visibleEntries: [RunsWorkbenchPresentationModel.TimelineEntry] {
-        entries.filter { !$0.isCollapsed }
+        guard let agentID = resolvedSelectedAgentID else { return [] }
+        return allVisibleEntries.filter { $0.agentID == agentID }
+    }
+
+    private var activeAgentReadbackUnavailable: Bool {
+        activeAgents.isEmpty && !allVisibleEntries.isEmpty
     }
 
     var body: some View {
@@ -4109,7 +5554,14 @@ private struct P036TimelineWorkbenchCard: View {
                         .foregroundStyle(ForgeColor.Text.secondary)
                 }
 
-                if visibleEntries.isEmpty {
+                if activeAgentReadbackUnavailable {
+                    ContentUnavailableView(
+                        "Active-agent selector unavailable",
+                        systemImage: "person.crop.circle.badge.exclamationmark",
+                        description: Text("Control-plane active-agent readback is unavailable; Timeline will resume when daemon selector data is present.")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 160)
+                } else if visibleEntries.isEmpty {
                     ContentUnavailableView(
                         "No Timeline Data",
                         systemImage: "waveform.path.ecg",
@@ -4119,8 +5571,28 @@ private struct P036TimelineWorkbenchCard: View {
                 } else {
                     GroupBox("Timeline") {
                         VStack(alignment: .leading, spacing: 10) {
-                            ForEach(visibleEntries) { entry in
-                                TimelineEntryRow(entry: entry)
+                            if agentOptions.count > 1 {
+                                TimelineAgentSelector(
+                                    options: agentOptions,
+                                    selectedAgentID: resolvedSelectedAgentID,
+                                    onSelect: { agentID in
+                                        selectedAgentID = agentID
+                                        expandedEntryID = nil
+                                    }
+                                )
+                            }
+
+                            ForEach(Array(visibleEntries.enumerated()), id: \.element.id) { index, entry in
+                                TimelineEntryRow(
+                                    entry: entry,
+                                    displayOrder: index,
+                                    isExpanded: expandedEntryID == entry.id,
+                                    resolveTimelineRawDetail: resolveTimelineRawDetail,
+                                    formatterCache: formatterCache,
+                                    onToggleExpanded: {
+                                        expandedEntryID = expandedEntryID == entry.id ? nil : entry.id
+                                    }
+                                )
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -4133,14 +5605,10 @@ private struct P036TimelineWorkbenchCard: View {
                     .id("live-timeline-bottom")
             }
             .onChange(of: visibleEntries.count) {
-                withAnimation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82)) {
-                    proxy.scrollTo("live-timeline-bottom", anchor: .bottom)
-                }
+                scrollToNewestIfNotInspecting(proxy)
             }
-            .onChange(of: visibleEntries.last?.id) {
-                withAnimation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82)) {
-                    proxy.scrollTo("live-timeline-bottom", anchor: .bottom)
-                }
+            .onChange(of: visibleEntries.first?.id) {
+                scrollToNewestIfNotInspecting(proxy)
             }
         }
         .forgePanel()
@@ -4152,6 +5620,134 @@ private struct P036TimelineWorkbenchCard: View {
             return "Focused run-detail timeline from control-plane active-agent readback."
         }
         return "\(visibleEntries.count) focused event\(visibleEntries.count == 1 ? "" : "s") from the selected active agent."
+    }
+
+    private func scrollToNewestIfNotInspecting(_ proxy: ScrollViewProxy) {
+        guard expandedEntryID == nil else { return }
+        withAnimation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82)) {
+            proxy.scrollTo(visibleEntries.first?.id ?? "live-timeline-bottom", anchor: .top)
+        }
+    }
+}
+
+private struct TimelineAgentOption: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let providerID: String?
+    let stageID: String?
+    let stageLabel: String?
+    let taskLabel: String?
+    let status: String
+    let sessionID: String?
+    let latestAt: Date
+    let eventCount: Int
+    let selectionOrder: Int?
+    let selectionUnavailableReason: String?
+}
+
+private struct TimelineAgentSelector: View {
+    let options: [TimelineAgentOption]
+    let selectedAgentID: String?
+    let onSelect: (String) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(options) { option in
+                    Button {
+                        onSelect(option.id)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Text(option.title.isEmpty ? option.id.replacingOccurrences(of: "_", with: " ").capitalized : option.title)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(ForgeColor.Text.primary)
+                                if let providerID = option.providerID, !providerID.isEmpty {
+                                    Text(providerID)
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundStyle(ForgeColor.Text.secondary)
+                                }
+                            }
+                            Text(selectorDetailLabel(for: option))
+                                .font(.caption2)
+                                .foregroundStyle(ForgeColor.Text.tertiary)
+                                .lineLimit(1)
+                            HStack(spacing: 6) {
+                                Text(selectionStatusLabel(for: option))
+                                Text(latestActivityLabel(for: option))
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(ForgeColor.Text.tertiary)
+                            .lineLimit(1)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(
+                            ForgeColor.Surface.muted,
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .strokeBorder(
+                                    option.id == selectedAgentID ? ForgeColor.Brand.accent : Color.clear,
+                                    lineWidth: 1
+                                )
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(
+                        "Timeline agent \(option.id), provider \(option.providerID ?? "unknown"), \(selectorDetailLabel(for: option)), \(selectionStatusLabel(for: option)), \(latestActivityLabel(for: option))"
+                    )
+                    .accessibilityIdentifier("p093-active-agent-option-\(option.id)")
+                }
+            }
+        }
+        .accessibilityIdentifier("p093-active-agent-selector")
+    }
+
+    private func selectorDetailLabel(for option: TimelineAgentOption) -> String {
+        if let taskLabel = option.taskLabel?.trimmingCharacters(in: .whitespacesAndNewlines), !taskLabel.isEmpty {
+            return taskLabel
+        }
+        if let stageLabel = option.stageLabel?.trimmingCharacters(in: .whitespacesAndNewlines), !stageLabel.isEmpty {
+            return stageLabel
+        }
+        if let sessionSummary = sessionSummaryLabel(for: option) {
+            return sessionSummary
+        }
+        return "\(option.eventCount) event\(option.eventCount == 1 ? "" : "s")"
+    }
+
+    private func sessionSummaryLabel(for option: TimelineAgentOption) -> String? {
+        guard let sessionID = option.sessionID?.trimmingCharacters(in: .whitespacesAndNewlines), !sessionID.isEmpty else {
+            return nil
+        }
+        return "Session \(shortSessionID(sessionID))"
+    }
+
+    private func selectionStatusLabel(for option: TimelineAgentOption) -> String {
+        if let reason = option.selectionUnavailableReason?.trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty {
+            return "Selector unavailable: \(reason)"
+        }
+        let status = option.status.trimmingCharacters(in: .whitespacesAndNewlines)
+        return status.isEmpty ? "Status unavailable" : status.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    private func latestActivityLabel(for option: TimelineAgentOption) -> String {
+        let age = max(0, Int(Date().timeIntervalSince(option.latestAt)))
+        if age < 60 {
+            return "Latest \(age)s ago"
+        }
+        let minutes = age / 60
+        if minutes < 60 {
+            return "Latest \(minutes)m ago"
+        }
+        return "Latest \(minutes / 60)h ago"
+    }
+
+    private func shortSessionID(_ id: String) -> String {
+        guard id.count > 8 else { return id }
+        return String(id.prefix(8))
     }
 }
 

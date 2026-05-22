@@ -19,7 +19,7 @@ This reference owns the durable navigation and read-model UX behavior. Adjacent 
 - [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) for GraphQL projection and subscription shape.
 - [thin-client-read-model-affordance-contract.md](thin-client-read-model-affordance-contract.md) for approval/actionability and payload/freshness affordances.
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) for run detail panes, timeline placement, and artifact hierarchy.
-- [test-gates.md](test-gates.md) for the retained `proposal-036` / `p036` proof aliases.
+- [test-gates.md](test-gates.md) for the retained historical alias names `proposal-036` / `p036` and `proposal-093` / `p093`.
 
 ## Navigation Shell
 
@@ -84,13 +84,35 @@ Artifact and report rendering follows server payload availability and authorized
 
 The Runs workbench Timeline is populated from control-plane active-agent readback. It does not synthesize timeline rows from stage transitions, approval rows, artifacts, reports, or completed-agent noise.
 
+Timeline is scoped to the selected active agent. When one active agent is
+running, the app selects it automatically. When multiple active agents are
+running, the selector uses control-plane ordering and keeps the event stream
+focused on one agent instead of interleaving every active execution.
+
 Runtime events pass through `P036RuntimeTimelineBuffer`:
 
 - response text chunks append into one live response row;
 - terminal response/session events collapse accumulated chunks into a summary;
+- provider/tool action starts collapse with matching completion events into one
+  terminal action card instead of leaving adjacent `in_progress` and
+  `completed` rows;
 - events are applied on the main actor through a bounded publish path, at most once every two seconds unless a terminal event forces publication;
 - the visible cap is 40 rows after preserving response/session attention;
 - out-of-order tool finishes reconcile with matching starts when possible and otherwise render as diagnostic session events.
+
+Timeline cards are newest-first. Each card is collapsed by default and expands
+on click, keyboard action, or accessibility action. Only one card is expanded at
+a time; expanding another card collapses the previous one. Expanded cards render
+a bounded formatted preview for readable markdown/code/JSON-like content and
+keep the full or retained raw detail available through explicit copy actions.
+State, time, provider, agent, and event identity remain available as metadata
+without turning the collapsed card into a dense log row.
+
+Raw detail retention is byte-budgeted. Inline retained raw detail is capped at
+512 KiB by UTF-8 byte count, with truncation/readback fields indicating whether
+the full raw content is available through the daemon-owned raw-detail resolver.
+Swift treats raw-detail handles as opaque control-plane tokens and does not
+probe local filesystem paths or artifact directories to recover raw content.
 
 When macOS Reduce Motion is enabled, timeline transitions use opacity or no animation rather than spatial movement.
 
@@ -109,11 +131,12 @@ The retained metric names use the historical `p036` prefix:
 
 UI counters mirror to `UserDefaults` so `MetricsCollector` can read UI event totals and operator task-attempt label buckets even when the thin GraphQL UI cannot mutate a SwiftData `Run`.
 
-Release evidence for this shell is retained under:
+Release and focused Timeline evidence for this shell is retained under:
 
 - `docs/evidence/macos-operator-navigation/dogfood-validation-2026-05-21.json`
 - `docs/evidence/macos-operator-navigation/remote-ui-accessibility-proof-2026-05-21.json`
 - `docs/evidence/macos-operator-navigation/rollout-readback-live-2026-05-21.json`
+- `docs/evidence/macos-operator-navigation/p093-remote-ui-proof-2026-05-22.json` for retained historical alias evidence
 
 The rollout operator-readback fixture remains at `docs/evidence/rollout-contract/operator-readback/p036-full-surface.fixture.json` because rollout fixtures and gate aliases retain historical proof names.
 
@@ -124,8 +147,10 @@ The canonical proof aliases remain:
 ```bash
 ./scripts/test-gate.sh proposal-036
 ./scripts/test-gate.sh p036
+./scripts/test-gate.sh proposal-093 # retained historical alias
+./scripts/test-gate.sh p093 # retained historical alias
 ```
 
-On local hosts, the gate runs build plus non-UI P036/P031/timeline slices. On the approved remote UI host, the same gate also runs the UI smoke/accessibility flow for navigation, Runs inspection, approval context, Ideas-to-Runs handoff, Definitions segments, Settings readiness, and heavy Timeline behavior.
+On local hosts, the retained gates run the build plus focused non-UI P036/P031/timeline slices. On the approved remote UI host, the same proof lanes also run the UI smoke/accessibility flow for navigation, Runs inspection, approval context, Ideas-to-Runs handoff, Definitions segments, Settings readiness, and heavy Timeline behavior.
 
-Retained historical names such as `proposal-036`, `p036`, `P036DeferredState`, and `P036RuntimeTimelineBuffer` are implementation and proof identifiers. The stable behavioral source of truth is this reference document, not the retired proposal file.
+Retained historical alias names such as `proposal-036`, `p036`, `proposal-093`, `p093`, `P036DeferredState`, and `P036RuntimeTimelineBuffer` are implementation and proof identifiers. The stable behavioral source of truth is this reference document, not retired proposal files.

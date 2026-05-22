@@ -61,7 +61,8 @@ use crate::preflight::{
 };
 use crate::side_effects::{retry_preflight_within_tx, run_cancel_preflight_within_tx};
 use crate::synthesizers::closeout_readiness::{
-    synthesize_implementation_closeout_readiness_for_state9, SynthesizerInputs,
+    synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards, NoDiffConvergence,
+    SynthesizerInputs, NO_DIFF_CONVERGENCE_THRESHOLD,
 };
 use crate::work_queue::WorkQueue;
 
@@ -4306,23 +4307,42 @@ impl CommandHandler {
                         }
                         _ => None,
                     };
+                let consecutive_no_diff_code_writer_attempts =
+                    code_writer_completion_receipts::consecutive_completed_no_diff_count_by_run(
+                        &self.pool, run.id,
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        warn!(
+                            run_id = %run_id_str,
+                            error = %error,
+                            "failed to resolve no-diff code_writer convergence; continuing without runtime guard"
+                        );
+                        0
+                    });
 
                 // Synthesize closeout readiness.
                 let synth_result =
-                    synthesize_implementation_closeout_readiness_for_state9(SynthesizerInputs {
-                        run_id: &run_id_str,
-                        stage_id: &c.stage_id,
-                        gate_result: &gate_result,
-                        mode_result: &mode_result,
-                        implementation_review_status: implementation_review_status.as_deref(),
-                        self_assessment: self_assessment_ref,
-                        accepted_risks: &c.accepted_risks,
-                        loop_budget_remaining,
-                        fingerprint: Some(closeout_fingerprint),
-                        fingerprint_latency_exceeded,
-                        controlled_reports_green,
-                        previous_blocker_digest: prior_blocker_digest.as_deref(),
-                    });
+                    synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards(
+                        SynthesizerInputs {
+                            run_id: &run_id_str,
+                            stage_id: &c.stage_id,
+                            gate_result: &gate_result,
+                            mode_result: &mode_result,
+                            implementation_review_status: implementation_review_status.as_deref(),
+                            self_assessment: self_assessment_ref,
+                            accepted_risks: &c.accepted_risks,
+                            loop_budget_remaining,
+                            fingerprint: Some(closeout_fingerprint),
+                            fingerprint_latency_exceeded,
+                            controlled_reports_green,
+                            previous_blocker_digest: prior_blocker_digest.as_deref(),
+                        },
+                        Some(NoDiffConvergence {
+                            consecutive_attempts: consecutive_no_diff_code_writer_attempts,
+                            threshold: NO_DIFF_CONVERGENCE_THRESHOLD,
+                        }),
+                    );
 
                 // Atomically activate gate + readiness generations, then rebuild projections.
                 let closeout_tx_result =

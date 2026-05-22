@@ -6195,6 +6195,12 @@ async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     manager.set_prompt_progress_sink(Arc::new(RecordingPromptProgressSink { tx }));
 
+    let long_prompt_tail = "final prompt instruction should remain visible after expansion";
+    let long_prompt = format!(
+        "{}\n{}",
+        "stream progress before terminal response ".repeat(80),
+        long_prompt_tail
+    );
     let req = ExecutionRequest {
         run_id: RunId::new(),
         stage_execution_id: None,
@@ -6206,7 +6212,7 @@ async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
         model: None,
         effort: None,
         workspace_root: tmp.path().to_string_lossy().into_owned(),
-        prompt: "stream progress before terminal response".into(),
+        prompt: long_prompt.clone(),
         worktree_root: None,
         worktree_write_enabled: false,
         worktree_strategy: None,
@@ -6232,10 +6238,16 @@ async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
 
     let manager_for_task = Arc::clone(&manager);
     let task = tokio::spawn(async move { manager_for_task.start_session(req).await });
-    let update = timeout(Duration::from_secs(5), rx.recv())
+    let mut update = timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("prompt progress should be reported before terminal response")
         .expect("progress sink should receive an update");
+    while !matches!(update.kind, AcpPromptProgressKind::PromptSent) {
+        update = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("prompt progress should include prompt_sent before terminal response")
+            .expect("progress sink should receive an update");
+    }
     assert!(
         !task.is_finished(),
         "progress must be observable while session/prompt is still running"
@@ -6246,13 +6258,18 @@ async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
         update.session_generation_id.as_deref(),
         Some("generation-progress")
     );
-    assert!(matches!(
-        update.kind,
-        AcpPromptProgressKind::PromptSent
-            | AcpPromptProgressKind::MessageReceived
-            | AcpPromptProgressKind::MeaningfulProgress
-            | AcpPromptProgressKind::ProviderLocalActivity
-    ));
+    assert!(matches!(update.kind, AcpPromptProgressKind::PromptSent));
+    assert_eq!(update.surface_label.as_deref(), Some("operator_prompt"));
+    let detail = update
+        .detail
+        .as_deref()
+        .expect("prompt_sent detail should retain the normalized full prompt");
+    assert!(detail.contains(long_prompt_tail));
+    assert!(!detail.ends_with('…'));
+    assert!(
+        detail.len() > 1400,
+        "prompt_sent detail should not use the short live-preview cap"
+    );
 
     let result = task
         .await

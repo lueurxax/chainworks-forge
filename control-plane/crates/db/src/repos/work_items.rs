@@ -70,6 +70,48 @@ pub async fn claim_next_non_invoke(pool: &SqlitePool) -> Result<Option<WorkItem>
     claim_next_where(pool, "kind != 'invoke_agent'").await
 }
 
+pub async fn record_pending_invoke_agent_wait_reason(
+    pool: &SqlitePool,
+    work_item_id: &str,
+    reason: &str,
+) -> Result<bool> {
+    let tx_started = Instant::now();
+    let mut tx = begin_registered_immediate_transaction(
+        pool,
+        crate::writer::class_a_operation(
+            "work_items.record_pending_invoke_agent_wait_reason",
+            crate::write_class::WriteLane::CriticalBarrier,
+            "work_items.record_pending_invoke_agent_wait_reason",
+        ),
+        "work_items.record_pending_invoke_agent_wait_reason",
+    )
+    .await?;
+    let updated = sqlx::query(
+        r#"UPDATE work_items
+           SET last_error = ?1
+           WHERE id = ?2
+             AND kind = ?3
+             AND status = ?4
+             AND COALESCE(last_error, '') != ?1"#,
+    )
+    .bind(reason)
+    .bind(work_item_id)
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Pending.to_string())
+    .execute(&mut **tx)
+    .await
+    .context("record pending InvokeAgent wait reason")?
+    .rows_affected();
+    tx.commit()
+        .await
+        .context("commit pending InvokeAgent wait reason")?;
+    log_write_transaction(
+        "work_items.record_pending_invoke_agent_wait_reason",
+        tx_started,
+    );
+    Ok(updated > 0)
+}
+
 async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Option<WorkItem>> {
     // Use a transaction to atomically select and update the next pending item.
     let tx_started = Instant::now();

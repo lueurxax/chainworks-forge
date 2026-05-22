@@ -472,8 +472,40 @@ async fn invoke_item_has_start_capacity(
     }
     let provider_family =
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
-    if provider_quota_retry_wait_active(pool, &provider_family, chrono::Utc::now()).await? {
-        return Ok(false);
+    if let Some(wait) =
+        provider_quota_retry_wait_active(pool, &provider_family, chrono::Utc::now()).await?
+    {
+        let stage_execution_id = payload
+            .get("stage_execution_id")
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse().ok());
+        if let Some(stage_execution_id) = stage_execution_id {
+            if let Some(consumed) =
+                agent_retry_budget_ledger::consume_active_provider_family_quota_for_retry_target(
+                    pool,
+                    stage_execution_id,
+                    &provider_family,
+                    chrono::Utc::now(),
+                )
+                .await?
+            {
+                info!(
+                    work_item_id = %item.id,
+                    provider_family = %provider_family,
+                    target_stage_execution_id = %stage_execution_id,
+                    source_command_journal_id = %consumed.source_command_journal_id,
+                    consumed_count = consumed.consumed_count,
+                    "Operator retry consumed active provider-family quota wait"
+                );
+            } else {
+                record_provider_quota_wait_on_pending_item(pool, item, &provider_family, &wait)
+                    .await?;
+                return Ok(false);
+            }
+        } else {
+            record_provider_quota_wait_on_pending_item(pool, item, &provider_family, &wait).await?;
+            return Ok(false);
+        }
     }
 
     let running_status = AgentStatus::Running.to_string();
@@ -545,24 +577,29 @@ async fn provider_quota_retry_wait_active(
     pool: &SqlitePool,
     provider_family: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<bool> {
-    let count: i64 = sqlx::query_scalar(
-        r#"SELECT COUNT(*)
-           FROM agent_retry_budget_ledger ledger
-           INNER JOIN agent_executions ae ON ae.id = ledger.agent_execution_id
-           WHERE ledger.failure_kind = ?1
-             AND ledger.normal_budget_consumed = 0
-             AND ledger.state = 'waiting_for_reset'
-             AND ledger.retry_after IS NOT NULL
-             AND ledger.retry_after > ?2
-             AND COALESCE(ae.provider_family, ae.provider) = ?3"#,
-    )
-    .bind(AgentFailureKind::ProviderQuota.to_string())
-    .bind(now.to_rfc3339())
-    .bind(provider_family)
-    .fetch_one(pool)
-    .await?;
-    Ok(count > 0)
+) -> Result<Option<agent_retry_budget_ledger::ProviderFamilyQuotaWait>> {
+    agent_retry_budget_ledger::active_provider_family_quota_wait(pool, provider_family, now).await
+}
+
+async fn record_provider_quota_wait_on_pending_item(
+    pool: &SqlitePool,
+    item: &WorkItem,
+    provider_family: &str,
+    wait: &agent_retry_budget_ledger::ProviderFamilyQuotaWait,
+) -> Result<()> {
+    let reason = format!(
+        "provider_quota_wait: provider_family={}; retry_after={}; blocking_ledger_id={}; blocking_run_id={}; blocking_agent_execution_id={}",
+        provider_family,
+        wait.retry_after.to_rfc3339(),
+        wait.ledger_id,
+        wait.run_id,
+        wait.agent_execution_id
+    );
+    if item.last_error.as_deref() == Some(reason.as_str()) {
+        return Ok(());
+    }
+    work_items::record_pending_invoke_agent_wait_reason(pool, &item.id, &reason).await?;
+    Ok(())
 }
 
 fn invoke_payload_requires_xcode_mcp(payload: &serde_json::Value) -> bool {
