@@ -5,7 +5,7 @@
 | Date | 2026-05-01 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), [065-operator-retry-instruction-contract.md](065-operator-retry-instruction-contract.md), [076-auto-retry-observation-ledger-and-recovery-policy.md](076-auto-retry-observation-ledger-and-recovery-policy.md), [080-continuous-stale-execution-reconciliation.md](080-continuous-stale-execution-reconciliation.md) |
+| Depends on | [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), [065-operator-retry-instruction-contract.md](065-operator-retry-instruction-contract.md), [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md), [080-continuous-stale-execution-reconciliation.md](080-continuous-stale-execution-reconciliation.md) |
 | Related | P037, P064, [durable side-effect reconciliation](../reference/execution-truth-and-recovery.md#durable-side-effect-ledger-and-reconciliation), April 30 2026 orchestration recovery and ACP startup fixes |
 | Scope | Create a reusable failure matrix and required DB/engine tests for restart, retry, stale execution, duplicate mediation, late output, and ACP startup recovery. |
 | Goal | Turn recurring recovery fixes into one state-machine proof suite instead of one-off incident patches. |
@@ -23,7 +23,7 @@ Recent recovery work repeatedly touched the same fault zone:
 - late output after a stage has been superseded;
 - ACP startup rows marked running without useful provider/session truth.
 
-P045, P065, P076, and P080 define pieces of the recovery model, but implementation still needs a shared failure matrix that every recovery change extends.
+P045, P065, the implemented auto-retry observation ledger, and P080 define pieces of the recovery model, but implementation still needs a shared failure matrix that every recovery change extends.
 
 ## 2. Decision
 
@@ -103,7 +103,7 @@ Required tests:
 - Do not add blind automatic retry.
 - Do not auto-resolve human approvals.
 - Do not retry release side effects while the durable side-effect ledger reports unresolved effects.
-- Do not replace P045/P065/P076/P080; this proposal supplies their shared proof matrix.
+- Do not replace P045, P065, the auto-retry observation ledger, or P080; this proposal supplies their shared proof matrix.
 
 ## 7. Acceptance Criteria
 

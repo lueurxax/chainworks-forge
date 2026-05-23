@@ -55,7 +55,7 @@ After the write-budget and durable side-effect safety rails are in place:
 
 - **P081** boundary-first API/auth contract matrix.
 - **P082** recovery/retry state-machine test matrix.
-- **P076/P080** effect-aware recovery and stale execution reconciliation.
+- **Auto-retry observation ledger / P080** effect-aware recovery and stale execution reconciliation.
 - **P079** contract-aware output repair and provider fallback.
 - **P031** corrected GraphQL thin UI closeout, if not already closed by the UI recovery lane.
 - **P046** session read/subscription-only behavior.
@@ -87,7 +87,7 @@ P073 freeze mode
 → implemented SQLite write discipline
 → durable side-effect ledger
 → P082 recovery/retry matrix
-→ P076/P080 effect-aware recovery
+→ auto-retry ledger / P080 effect-aware recovery
 → P079 output repair/fallback
 → P038 compaction
 → P083 ownership invariants

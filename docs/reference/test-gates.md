@@ -2244,28 +2244,28 @@ Important:
 - this is a fail-closed persistence contract gate, not an inventory-only check
 - startup orphan reconciliation is available through the storage MCP diagnostic tool; daemon startup scheduling and telemetry producer extensions must keep this gate green
 
-### `proposal-076|p076`
+### `proposal-076|p076` retained historical alias
 
-Auto-retry observation ledger contract, fixture, readback, and rollup proof gate. This gate validates the P076 observe-only invariant and now exercises the MCP `automation.auto_retry.latest` readback source plus rollup tooling against a temporary JSONL ledger.
+Auto-retry observation ledger contract, fixture, readback, and rollup proof gate. These retained historical aliases validate the observe-only invariant and exercise the MCP `automation.auto_retry.latest` readback source plus rollup tooling against a temporary JSONL ledger.
 
 Scope:
 
 - `auto_retry_observation_v1` strict-mode validation: required top-level fields, `observation_id` format `ar_obs_<UTC basic timestamp>_<12 lowercase hex>`, RFC3339 `observed_at`, closed `blocker_class` / `policy_decision` / `retry_action` / `retry_result` / `known_issue_status` / `budget_status` / `diagnostic_severity` / `readback_policy_status` enum domains, `additionalProperties=false` rejection of unknown fields, nested `budget_ref_v1` and `observation_summary_v1` shapes (required fields, nullable fields, scalar types)
-- observe-only policy enforcement: P076-created observations must have `retry_action` in `{none, recommend_retry}` and `retry_result` in `{not_attempted, not_allowed}`; any side-effecting retry dispatch in a P076 ledger record is a gate failure
+- observe-only policy enforcement: ledger-created observations must have `retry_action` in `{none, recommend_retry}` and `retry_result` in `{not_attempted, not_allowed}`; any side-effecting retry dispatch in an auto-retry ledger record is a gate failure
 - `auto_retry_readback_v1` six top-level required path fields: `ledger_path`, `budget_state_path`, `known_issue_catalog_path`, `generated_markdown_catalog_path`, `lock_path`, `rollup_report_path`
 - `version_negotiation` object shape and JSON-RPC `unsupported_version` application error (`code: -32076`, populated `error.data` with `code`, `supported_versions`, `unsupported_versions`, `requested_versions`, no partial success payload)
 - degraded-success readback (artifact-read degradation returns successful response with diagnostics + empty arrays, not a transport error) and `no_observation_history` null-readback path
 - rollup grouping by `blocker_signature_id` from valid fixture records and from `scripts/chainworks/auto_retry_rollup.py`
 - focused Rust test proving `automation.auto_retry.latest` reads a real JSONL ledger from the resolved meta-root and returns latest-by-run readback
-- negative fixture inventory under `docs/evidence/rollout-contract/negative/` — twenty `p076-*` fixtures covering side-effect retry presence, human-gate retry, missing schema field, invalid enum, ledger-append missing newline / not fsynced, missing `budget_ref_v1` / `observation_summary_v1` / readback `lock_path` / `rollup_report_path`, budget failure retried, backpressure exceeded, human-gate starvation, orphaned planned attempt not escalated, PID-reuse lock liveness gap, poll timeout without observation, retry timeout duplicate not suppressed, markdown catalog as authority, unsafe stale-lock recovery, and unknown-field-strict rejection
-- operator-readback fixture at `docs/evidence/rollout-contract/operator-readback/p076-full-surface.fixture.json` covering all required `operator_readback_v1` decision fields plus the P076 readback projection
+- retained historical alias negative fixture inventory under `docs/evidence/rollout-contract/negative/` — twenty `p076-*` fixtures covering side-effect retry presence, human-gate retry, missing schema field, invalid enum, ledger-append missing newline / not fsynced, missing `budget_ref_v1` / `observation_summary_v1` / readback `lock_path` / `rollup_report_path`, budget failure retried, backpressure exceeded, human-gate starvation, orphaned planned attempt not escalated, PID-reuse lock liveness gap, poll timeout without observation, retry timeout duplicate not suppressed, markdown catalog as authority, unsafe stale-lock recovery, and unknown-field-strict rejection
+- retained historical alias operator-readback fixture at `docs/evidence/rollout-contract/operator-readback/p076-full-surface.fixture.json` covering all required `operator_readback_v1` decision fields plus the auto-retry readback projection
 
 Use when:
 
-- changing P076 normative schemas (`auto_retry_observation_v1`, `auto_retry_readback_v1`, `auto_retry_budget_v1`, `auto_retry_known_issues_v1`, `budget_ref_v1`, `observation_summary_v1`, `common_diagnostic_v1`) or their enum domains
-- adding, renaming, or removing P076 negative fixtures or the operator-readback fixture
-- implementing later P076 runtime phases (observe-only monitor, JSONL ledger, budget store, MCP readback, rollup tool) — those changes must keep this gate green and may extend the gate
-- referencing P076 from dependent proposals (P079 contract-aware repair, P080 stale execution reconciliation, P082 retry test matrix, P089 temporary artifact lifecycle, P092 retry authority)
+- changing auto-retry normative schemas (`auto_retry_observation_v1`, `auto_retry_readback_v1`, `auto_retry_budget_v1`, `auto_retry_known_issues_v1`, `budget_ref_v1`, `observation_summary_v1`, `common_diagnostic_v1`) or their enum domains
+- adding, renaming, or removing retained historical alias negative fixtures or the operator-readback fixture
+- changing the observe-only monitor, JSONL ledger, budget store, MCP readback, or rollup tool
+- referencing the auto-retry observation ledger from dependent proposals (contract-aware repair, stale execution reconciliation, retry test matrix, temporary artifact lifecycle, retry authority)
 
 Host policy:
 
@@ -2274,16 +2274,16 @@ Host policy:
 Command:
 
 ```bash
-./scripts/test-gate.sh proposal-076
-./scripts/test-gate.sh p076
+./scripts/test-gate.sh proposal-076  # retained historical alias
+./scripts/test-gate.sh p076          # retained historical alias
 ```
 
 Important:
 
-- `p076` is accepted as an alias
+- `p076` is accepted as a retained historical alias
 - this is an observe-only proof gate; landing side-effecting retry remains out of scope and requires a later proposal
-- P076 is observe-only by design — the gate enforces that ledger records do not record side-effecting retry dispatch and that human-gate retries are absent
-- canonical JSON known-issue catalog is authoritative; markdown is generated-only and the negative fixture `p076-markdown-catalog-as-authority.json` proves this boundary
+- the auto-retry ledger is observe-only by design — the gate enforces that ledger records do not record side-effecting retry dispatch and that human-gate retries are absent
+- canonical JSON known-issue catalog is authoritative; markdown is generated-only and the retained historical alias negative fixture `p076-markdown-catalog-as-authority.json` proves this boundary
 - implemented readback and rollup behavior is documented in `docs/reference/auto-retry-observation-ledger.md`
 
 ### `proposal-084|p084` retained historical alias

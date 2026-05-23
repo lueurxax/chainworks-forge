@@ -1,8 +1,10 @@
 # Auto-Retry Observation Ledger
 
-P076 turns the auto-retry monitor from a free-form retry loop into an observe-only evidence surface.
+This document is the stable contract for the auto-retry observation ledger.
 
-The implemented contract is intentionally side-effect free: P076 records blocked-run observations, deduplicates blocker signatures, exposes latest readback, and produces rollup evidence. It does not call retry, recovery, cancellation, archive, continuation, or approval tools.
+The auto-retry monitor is an observe-only evidence surface. It records blocked-run observations, deduplicates blocker signatures, exposes latest readback, and produces rollup evidence. It does not call retry, recovery, cancellation, archive, continuation, approval, or provider-dispatch tools.
+
+Retained historical aliases: `proposal-076` and `p076` remain the proof-gate names for this implemented contract.
 
 ## Files
 
@@ -21,9 +23,9 @@ The JSON catalog is canonical. Markdown is generated from JSON only and must not
 
 Each completed poll appends one `auto-retry-observation.v1` JSON object to the ledger. Readers tolerate one partial trailing line and emit a `partial_trailing_record` diagnostic. Any earlier parse failure produces degraded readback instead of fabricated state.
 
-`scripts/chainworks/auto_retry_observe.py` is the P076 observe-only writer. It accepts a normalized blocked-run input snapshot, acquires `.chainworks/automation/auto-retry.lock`, validates that every row remains side-effect free, appends exactly one newline-terminated JSONL observation, fsyncs the ledger, ensures the budget-state file exists, and refreshes the JSON catalog, markdown view, and rollup report. The writer intentionally contains no retry, recovery, approval, archive, cancellation, continuation, or provider dispatch hook.
+`scripts/chainworks/auto_retry_observe.py` is the observe-only writer. It accepts a normalized blocked-run input snapshot, acquires `.chainworks/automation/auto-retry.lock`, validates that every row remains side-effect free, appends exactly one newline-terminated JSONL observation, fsyncs the ledger, ensures the budget-state file exists, and refreshes the JSON catalog, markdown view, and rollup report. The writer intentionally contains no retry, recovery, approval, archive, cancellation, continuation, or provider dispatch hook.
 
-P076-created observations remain observe-only:
+Ledger-created observations remain observe-only:
 
 - `retry_action` is `none` or `recommend_retry`
 - `retry_result` is `not_attempted` or `not_allowed`
@@ -59,7 +61,7 @@ Rows are grouped by `blocker_signature_id`, preserving first/last seen time, occ
 
 ## Gate
 
-`./scripts/test-gate.sh proposal-076` and alias `p076` validate:
+`./scripts/test-gate.sh proposal-076` and alias `p076` are retained historical aliases that validate:
 
 - normative fixture and negative-fixture schema coverage
 - observe-only retry invariants

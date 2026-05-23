@@ -32,6 +32,7 @@ At the current baseline, the product includes:
 - ACP-only runtime transport with adapter-specific subprocess execution,
 - Junie `code_writer` runtime hardening with strict completion-boundary subtypes, engine-synthesized failure envelopes, staged per-output repair settlement, runtime preflight/remediation, and post-preflight provider launch capacity leasing,
 - targeted retry authority with exact stage-execution retry settlement, authority-history readback, startup orphan retry repair, and retry payload recovery diagnostics,
+- observe-only auto-retry observation ledger with JSONL observations, canonical known-issue catalog, MCP readback, and rollup tooling,
 - bounded artifact discovery and engine-owned settlement pipeline,
 - provider toolchain cache mapping for isolated Xcode and Go build roots,
 - per-agent MCP policy resolution with persisted requested/predicted/actual/denied truth,
@@ -70,6 +71,7 @@ Use these reference docs as the current source of truth:
 | ACP runtime transport | [acp-runtime-transport.md](acp-runtime-transport.md) |
 | Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
 | Rust control plane, scheduler, targeted retry authority, and retry payload recovery | [rust-control-plane.md](rust-control-plane.md) |
+| Auto-retry observation ledger | [auto-retry-observation-ledger.md](auto-retry-observation-ledger.md) |
 | Proposal-loop feedback fidelity | [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) |
 | Live provider-backed proposal loop | [live-provider-execution-slice.md](live-provider-execution-slice.md) |
 | Operator shell | [operator-experience.md](operator-experience.md) |

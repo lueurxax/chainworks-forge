@@ -5,7 +5,7 @@
 | Date | 2026-04-30 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | P037 ACP supervision, P058 claim/start ownership, P061 scheduler/write coordination, P065 retry instructions, P076 auto-retry observation ledger |
+| Depends on | P037 ACP supervision, P058 claim/start ownership, P061 scheduler/write coordination, P065 retry instructions, [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md) |
 | Related | P051 Xcode MCP bridge pool, [local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), [durable side-effect reconciliation](../reference/execution-truth-and-recovery.md#durable-side-effect-ledger-and-reconciliation), `docs/reference/rust-control-plane.md`, `docs/reference/session-lineage-reuse-and-operator-reset.md` |
 | Scope | Add a continuous reconciliation subsystem for stale running execution truth, provider/session ownership, and helper-process lifecycle. |
 | Non-goal | No automatic human approval, no blind retry of release side effects, and no replacement for existing startup repair or provider idle supervision. |
@@ -32,7 +32,7 @@ Implemented pieces today:
 - P061/P058 repair can requeue abandoned running `InvokeAgent` work at startup.
 - P037 supervises idle ACP prompt activity once a prompt is active.
 - P051 keeps Xcode MCP broker warm and classifies modal stalls.
-- P076 observes repeated blocked/retry signatures.
+- The auto-retry ledger observes repeated blocked/retry signatures.
 - A narrow local hotfix repairs stale ACP startup rows where:
   - `InvokeAgent` is `running`;
   - the linked `session_generation` is `active`;
@@ -54,7 +54,7 @@ Missing pieces:
 - Repair stale scheduler capacity without killing long active prompts.
 - Make helper processes and provider sessions owned by durable lease/session records.
 - Surface clear operator readback: `useful_work_active`, `startup_stalled`, `prompt_stalled`, `helper_orphaned`, `needs_operator`, `needs_effect_reconciliation`.
-- Feed P076 with typed stale signatures so auto-retry can avoid noisy blind retries.
+- Feed the auto-retry ledger with typed stale signatures so automation can avoid noisy blind retries.
 - Keep release side-effect stages fail-closed and route them to durable side-effect reconciliation.
 
 ## 4. Non-Goals
@@ -78,7 +78,7 @@ A running `InvokeAgent` is stale when all are true:
 - startup age exceeds configured grace;
 - no in-memory executor ownership confirms a live startup future.
 
-Action: invalidate session generation, cancel/supersede the preclaimed agent execution, requeue the work item with `startup_repair_stale_acp_startup`, refresh scheduler projections, and emit P076 observation.
+Action: invalidate session generation, cancel/supersede the preclaimed agent execution, requeue the work item with `startup_repair_stale_acp_startup`, refresh scheduler projections, and emit an auto-retry ledger observation.
 
 ### 5.2 ACP Prompt Stale
 
@@ -144,7 +144,7 @@ Run a low-frequency reconciliation loop while the executor is idle or on a bound
 3. classify each running row;
 4. apply only the smallest safe repair action;
 5. refresh scheduler health/projections;
-6. emit typed P076 observations.
+6. emit typed auto-retry ledger observations.
 
 The loop must be write-budget aware and compatible with the implemented spooling contract.
 
@@ -226,7 +226,7 @@ Add or extend `proposal-080` gate with deterministic fixtures:
 2. Enable repair for ACP startup stale class.
 3. Enable scheduler ownership drift repair for non-release work.
 4. Enable owned helper process reaping.
-5. Wire P076 auto-retry decisions to stale class observations.
+5. Wire auto-retry ledger decisions to stale class observations.
 6. Keep release reconciliation behind the implemented durable side-effect contract.
 
 ## 11. Acceptance Criteria
