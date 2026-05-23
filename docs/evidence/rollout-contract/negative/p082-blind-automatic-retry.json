@@ -1,0 +1,7 @@
+{
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082-neg-004",
+  "expected_failure_code": "p082_blind_automatic_retry",
+  "mutated_contract_or_matrix": "Recovery path schedules a new stage execution without validating eligibility or writing idempotency key",
+  "assertion": "Gate must fail because blind automatic retry (retry without eligibility check and idempotency) was introduced"
+}

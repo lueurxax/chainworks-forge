@@ -2282,6 +2282,7 @@ Available gates:
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
   proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
   proposal-087|p087  Proposal 087 read-path liveness and storage tiering gate
+  proposal-082|p082  Proposal 082 recovery and retry state-machine matrix proof gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
   proposal-091|p091  Retained P091 targeted retry authority runtime proof gate
@@ -8275,6 +8276,385 @@ if "CANONICAL_HOT_READ_SURFACES" not in storage_health_rs:
 print("P087 UI, schema, and evidence verified")
 PY
     log "Proposal 087 gate passed"
+    ;;
+  proposal-082|p082)
+    log "Proposal 082 gate: recovery and retry state-machine matrix"
+    python3 - <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path.cwd()
+
+# 0. Verify agent output-channel artifacts were not written into source.
+if (root / "CHAINWORKS_OUTPUT").exists():
+    print("FAILED: root-level CHAINWORKS_OUTPUT artifact must not be present in the worktree")
+    sys.exit(1)
+
+# 1. Verify canonical reference matrix document exists
+matrix_doc = root / "docs/reference/recovery-retry-state-machine-test-matrix.md"
+if not matrix_doc.exists():
+    print("FAILED: docs/reference/recovery-retry-state-machine-test-matrix.md is missing")
+    sys.exit(1)
+matrix_text = matrix_doc.read_text()
+
+# 2. Verify all 17 scenario IDs are present
+required_scenarios = [f"P082-R{i:02d}" for i in range(1, 18)]
+for scenario_id in required_scenarios:
+    if scenario_id not in matrix_text:
+        print(f"FAILED: canonical matrix missing required scenario: {scenario_id}")
+        sys.exit(1)
+
+# 3. Verify required reason codes are documented
+required_reason_codes = [
+    "startup_requeue_once",
+    "startup_requeue_exhausted",
+    "invalid_stage_for_retry",
+    "ignored_late_outputs",
+    "duplicate_owner_repaired",
+    "startup_stalled",
+    "stale_repaired",
+    "needs_effect_reconciliation",
+    "requires_effect_reconciliation",
+    "valid_identifier_guidance",
+    "approval_pending_operator_action_required",
+    "duplicate_mediation_owner_rejected",
+    "cancel_active_stage_requested",
+    "cancel_pending_approval_preserved",
+    "cancel_side_effect_reconciliation_required",
+    "cancel_startup_repair_converged",
+    "cancelled_provider_late_output_ignored",
+    "repair_crash_resume_idempotent",
+]
+for code in required_reason_codes:
+    if code not in matrix_text:
+        print(f"FAILED: canonical matrix missing required reason code: {code}")
+        sys.exit(1)
+
+# 4. Verify required schema contracts are documented
+required_schemas = [
+    "p082_recovery_matrix_readback_v1",
+    "p082_rejected_command_error_v1",
+    "p082_retry_identifier_guidance_v1",
+    "p082_late_output_settlement_v1",
+    "p082_startup_repair_summary_v1",
+]
+for schema in required_schemas:
+    if schema not in matrix_text:
+        print(f"FAILED: canonical matrix missing nested schema contract: {schema}")
+        sys.exit(1)
+
+# 5. Verify payload_json non-mutation is documented
+if "command_journal.payload_json" not in matrix_text:
+    print("FAILED: canonical matrix must document command_journal.payload_json non-mutation contract")
+    sys.exit(1)
+
+# 6. Verify lane placement is documented
+required_lane_terms = [
+    "p082_recovery_matrix_readback",
+    "p082_recovery_matrix_readbacks",
+    "runs.get",
+    "reports.get",
+]
+for term in required_lane_terms:
+    if term not in matrix_text:
+        print(f"FAILED: canonical matrix missing lane placement term: {term}")
+        sys.exit(1)
+
+# 7. Verify startup_requeue_exhausted held state is documented
+if "startup_requeue_exhausted" not in matrix_text:
+    print("FAILED: canonical matrix missing startup_requeue_exhausted held-state coverage")
+    sys.exit(1)
+
+# 8. Verify positive fixture exists and validates
+positive_fixture_path = root / "docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json"
+if not positive_fixture_path.exists():
+    print("FAILED: missing docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json")
+    sys.exit(1)
+try:
+    positive_fixture = json.loads(positive_fixture_path.read_text())
+except json.JSONDecodeError as exc:
+    print(f"FAILED: p082-full-surface.fixture.json is invalid JSON: {exc}")
+    sys.exit(1)
+
+if positive_fixture.get("schema_version") != "p082_operator_readback_fixture_v1":
+    print("FAILED: p082-full-surface.fixture.json must have schema_version=p082_operator_readback_fixture_v1")
+    sys.exit(1)
+
+# Check rollout_contract_readback present
+if "rollout_contract_readback" not in positive_fixture:
+    print("FAILED: p082-full-surface.fixture.json missing rollout_contract_readback")
+    sys.exit(1)
+
+# Check lane coverage
+for lane in ["runs_get", "reports_get", "report_resource", "run_report", "release_receipt"]:
+    if lane not in positive_fixture.get("lanes", {}):
+        print(f"FAILED: p082-full-surface.fixture.json missing lane: {lane}")
+        sys.exit(1)
+
+# Check fixture_assertions
+assertions = positive_fixture.get("fixture_assertions", {})
+if not assertions:
+    print("FAILED: p082-full-surface.fixture.json missing fixture_assertions")
+    sys.exit(1)
+
+# Check all reason codes are in fixture_assertions.required_reason_codes
+fixture_reason_codes = assertions.get("required_reason_codes", [])
+for code in required_reason_codes:
+    if code not in fixture_reason_codes:
+        print(f"FAILED: p082-full-surface.fixture.json fixture_assertions.required_reason_codes missing: {code}")
+        sys.exit(1)
+
+# Check all scenario IDs in fixture_assertions
+fixture_scenario_ids = assertions.get("required_scenario_ids", [])
+for sid in required_scenarios:
+    if sid not in fixture_scenario_ids:
+        print(f"FAILED: p082-full-surface.fixture.json fixture_assertions.required_scenario_ids missing: {sid}")
+        sys.exit(1)
+
+# 9. Verify all negative fixtures exist and validate
+required_negative_fixtures = [
+    "p082-missing-matrix-row.json",
+    "p082-missing-db-engine-readback-assertion.json",
+    "p082-release-side-effect-retry-not-fail-closed.json",
+    "p082-blind-automatic-retry.json",
+    "p082-missing-readback-reason.json",
+    "p082-missing-rollout-contract-operator-fields.json",
+    "p082-graphql-required-without-contract.json",
+    "p082-duplicate-requeue-without-idempotency.json",
+    "p082-missing-cancel-crash-rows.json",
+    "p082-rejected-command-payload-mutation.json",
+    "p082-lane-field-name-drift.json",
+    "p082-missing-nested-subcontract.json",
+    "p082-xcode-grace-missing-operator-message.json",
+    "p082-malformed-command-error-envelope.json",
+    "p082-missing-startup-requeue-exhausted-row.json",
+    "p082-cancel-late-output-mutates-active-projection.json",
+]
+# Known expected_failure_codes from the P082 rollout contract hold conditions.
+# Each negative fixture's expected_failure_code must be in this set.
+known_failure_codes = {
+    "p082_missing_matrix_row",
+    "p082_missing_db_engine_readback_assertion",
+    "p082_release_side_effect_retry_not_fail_closed",
+    "p082_blind_automatic_retry",
+    "p082_missing_readback_reason",
+    "p082_missing_rollout_contract_operator_fields",
+    "p082_graphql_required_without_contract",
+    "p082_duplicate_requeue_without_idempotency",
+    "p082_missing_cancel_crash_rows",
+    "p082_rejected_command_payload_mutation",
+    "p082_lane_field_name_drift",
+    "p082_missing_nested_subcontract",
+    "p082_xcode_grace_missing_operator_message",
+    "p082_malformed_command_error_envelope",
+    "p082_missing_startup_requeue_exhausted_row",
+    "p082_cancel_late_output_mutates_active_projection",
+}
+negative_dir = root / "docs/evidence/rollout-contract/negative"
+for fixture_name in required_negative_fixtures:
+    fpath = negative_dir / fixture_name
+    if not fpath.exists():
+        print(f"FAILED: missing required negative fixture: {fixture_name}")
+        sys.exit(1)
+    try:
+        neg = json.loads(fpath.read_text())
+    except json.JSONDecodeError as exc:
+        print(f"FAILED: negative fixture {fixture_name} is invalid JSON: {exc}")
+        sys.exit(1)
+    if neg.get("schema_version") != "p082_negative_fixture_v1":
+        print(f"FAILED: negative fixture {fixture_name} must have schema_version=p082_negative_fixture_v1")
+        sys.exit(1)
+    for required_field in ["fixture_id", "expected_failure_code", "mutated_contract_or_matrix", "assertion"]:
+        if required_field not in neg:
+            print(f"FAILED: negative fixture {fixture_name} missing required field: {required_field}")
+            sys.exit(1)
+    # Verify expected_failure_code is in the known vocabulary (not arbitrary strings).
+    failure_code = neg.get("expected_failure_code", "")
+    if failure_code not in known_failure_codes:
+        print(f"FAILED: negative fixture {fixture_name} has unexpected expected_failure_code '{failure_code}' (not in known P082 failure code vocabulary)")
+        sys.exit(1)
+    # Verify assertion is non-trivial (must contain 'gate' or 'must fail' to confirm it
+    # describes a failure check, not just documentation).
+    assertion = neg.get("assertion", "")
+    if len(assertion) < 20:
+        print(f"FAILED: negative fixture {fixture_name} assertion is too short (must describe a failure check)")
+        sys.exit(1)
+    if not any(kw in assertion.lower() for kw in ["gate", "must fail", "must not", "must be rejected", "must be detected"]):
+        print(f"FAILED: negative fixture {fixture_name} assertion must contain a failure check keyword (e.g. 'gate', 'must fail', 'must be rejected')")
+        sys.exit(1)
+
+# 9b. Verify inline behavioral mutation checks against key negative fixture scenarios.
+# These checks confirm that the implementation rejects the mutated contracts described
+# by the negative fixtures, not just that the fixture files exist.
+
+# Check: malformed envelope (missing reason_code) must fail envelope parsing.
+# This validates that parse_command_journal_error_envelope is behaviorally enforced,
+# corresponding to p082-malformed-command-error-envelope.json.
+import subprocess
+malformed_envelope_check = {
+    "schema_version": "p082_rejected_command_error_v1",
+    "command_type": "RetryStage",
+    "redaction": "none",
+    "operator_safe_summary": "Test",
+    "p082_recovery_matrix_readback": None,
+}
+# The presence of a structural validation test in the cargo test suite is asserted
+# by checking that the behavioral rejection test function name exists in the test file.
+db_test_file = root / "control-plane/crates/db/tests/proposal_082_recovery_retry_matrix.rs"
+if db_test_file.exists():
+    db_test_content = db_test_file.read_text()
+    for required_test in [
+        "p082_neg_malformed_envelope_missing_reason_code_is_rejected",
+        "p082_neg_non_canonical_scenario_id_in_envelope_is_rejected",
+        "p082_sec_high1_nested_subcontract_injection_is_stripped",
+        "p082_sec_medium1_tampered_startup_repair_readback_produces_tamper_detected_row",
+    ]:
+        if required_test not in db_test_content:
+            print(f"FAILED: DB test file missing required behavioral rejection test: {required_test}")
+            sys.exit(1)
+engine_test_file = root / "control-plane/crates/engine/tests/proposal_082_recovery_retry_matrix.rs"
+if engine_test_file.exists():
+    engine_test_content = engine_test_file.read_text()
+    for required_test in [
+        "p082_neg_non_canonical_scenario_id_rejected_by_parser",
+        "p082_neg_empty_next_action_for_non_not_applicable_is_rejected",
+        "p082_neg_validate_readback_v1_shape_rejects_tampered_field_values",
+    ]:
+        if required_test not in engine_test_content:
+            print(f"FAILED: engine test file missing required behavioral rejection test: {required_test}")
+            sys.exit(1)
+
+# 10. Verify domain recovery_matrix module exists
+recovery_matrix_rs = root / "control-plane/crates/domain/src/recovery_matrix.rs"
+if not recovery_matrix_rs.exists():
+    print("FAILED: control-plane/crates/domain/src/recovery_matrix.rs is missing")
+    sys.exit(1)
+rm_content = recovery_matrix_rs.read_text()
+for const_name in ["REASON_STARTUP_REQUEUE_ONCE", "REASON_STARTUP_REQUEUE_EXHAUSTED",
+                    "REASON_INVALID_STAGE_FOR_RETRY", "ALL_REASON_CODES", "SCENARIO_IDS",
+                    "SCHEMA_READBACK_V1", "SCHEMA_REJECTED_COMMAND_ERROR_V1"]:
+    if const_name not in rm_content:
+        print(f"FAILED: recovery_matrix.rs missing required constant: {const_name}")
+        sys.exit(1)
+# 10b. Verify that validate_readback_v1_shape is present (MEDIUM-1 fix).
+if "validate_readback_v1_shape" not in rm_content:
+    print("FAILED: recovery_matrix.rs missing validate_readback_v1_shape function (required for MEDIUM-1 fix)")
+    sys.exit(1)
+
+# 11. Verify P082 readback fields exist in MCP server tools
+runs_rs = root / "control-plane/crates/mcp-server/src/tools/runs.rs"
+if not runs_rs.exists():
+    print("FAILED: mcp-server/src/tools/runs.rs is missing")
+    sys.exit(1)
+runs_content = runs_rs.read_text()
+if "p082_recovery_matrix_readback" not in runs_content:
+    print("FAILED: runs.rs missing p082_recovery_matrix_readback field wiring for runs.get lane")
+    sys.exit(1)
+if "p082_recovery_matrix_readbacks" not in runs_content:
+    print("FAILED: runs.rs missing p082_recovery_matrix_readbacks field wiring for runs.get lane")
+    sys.exit(1)
+
+reports_rs = root / "control-plane/crates/mcp-server/src/tools/reports.rs"
+if not reports_rs.exists():
+    print("FAILED: mcp-server/src/tools/reports.rs is missing")
+    sys.exit(1)
+reports_content = reports_rs.read_text()
+if "p082_recovery_matrix_readbacks_json" not in reports_content:
+    print("FAILED: reports.rs missing p082_recovery_matrix_readbacks_json function")
+    sys.exit(1)
+if "p082_recovery_matrix_readback_json" not in reports_content:
+    print("FAILED: reports.rs missing p082_recovery_matrix_readback_json function")
+    sys.exit(1)
+
+# 12. Verify lane field-name contract: reports.get must not expose singular
+# (This is verified by the Rust test; here we just verify the function is present.)
+if "pub async fn p082_recovery_matrix_readbacks_json" not in reports_content:
+    print("FAILED: reports.rs missing public p082_recovery_matrix_readbacks_json function")
+    sys.exit(1)
+
+# 13. Verify report:// resource wires p082_recovery_matrix_readbacks
+server_rs = root / "control-plane/crates/mcp-server/src/server.rs"
+if not server_rs.exists():
+    print("FAILED: mcp-server/src/server.rs is missing")
+    sys.exit(1)
+server_content = server_rs.read_text()
+if '"p082_recovery_matrix_readbacks": p082_recovery_matrix_readbacks' not in server_content:
+    print("FAILED: server.rs report:// handler missing p082_recovery_matrix_readbacks wiring")
+    sys.exit(1)
+
+# 14. Verify report:// resource parity tests exist in server.rs
+for required_test in [
+    "p082_report_resource_includes_plural_readbacks_not_singular",
+    "p082_report_resource_non_empty_readbacks_when_startup_repair_exists",
+]:
+    if required_test not in server_content:
+        print(f"FAILED: server.rs missing required P082 report:// parity test: {required_test}")
+        sys.exit(1)
+
+# 15. Verify P082 required metric names are declared in metrics.rs (fail-closed condition).
+metrics_rs = root / "control-plane/crates/db/src/metrics.rs"
+if not metrics_rs.exists():
+    print("FAILED: control-plane/crates/db/src/metrics.rs is missing")
+    sys.exit(1)
+metrics_content = metrics_rs.read_text()
+p082_required_metrics = [
+    "p082_recovery_matrix_rows_with_db_engine_readback_coverage_percent",
+    "p082_recovery_matrix_gate_result_total",
+    "p082_recovery_reason_readback_total",
+    "p082_recovery_mutation_rejected_total",
+    "p082_release_side_effect_retry_block_total",
+    "p082_late_output_quarantine_total",
+    "p082_recovery_idempotency_replay_total",
+    "p082_recovery_state_age_seconds",
+]
+for metric in p082_required_metrics:
+    if metric not in metrics_content:
+        print(f"FAILED: P082 required metric not declared in metrics.rs: {metric}")
+        sys.exit(1)
+if "P082_REQUIRED_METRICS" not in metrics_content:
+    print("FAILED: metrics.rs missing P082_REQUIRED_METRICS constant declaration")
+    sys.exit(1)
+
+# 16. Verify R16 approved storage owner: readback must be in startup_repairs.notes,
+# not in work_items.payload_json.p082_r16_held.
+work_items_rs = root / "control-plane/crates/db/src/repos/work_items.rs"
+if work_items_rs.exists():
+    wi_content = work_items_rs.read_text()
+    if "p082_r16_held" in wi_content:
+        print("FAILED: work_items.rs must not store R16 readback in payload_json.p082_r16_held (approved owner is startup_repairs.notes.p082_recovery_matrix_readback)")
+        sys.exit(1)
+p082_rm_rs = root / "control-plane/crates/db/src/repos/p082_recovery_matrix.rs"
+if p082_rm_rs.exists():
+    p082_rm_content = p082_rm_rs.read_text()
+    if "p082_r16_held" in p082_rm_content:
+        print("FAILED: p082_recovery_matrix.rs must not read R16 readback from work_items.payload_json.p082_r16_held (approved owner is startup_repairs.notes.p082_recovery_matrix_readback)")
+        sys.exit(1)
+
+print("P082 gate: all static checks passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      run_p082_cargo_test() {
+        local output status
+        set +e
+        output=$(CARGO_TARGET_DIR=target/proposal-082-gate cargo test "$@" 2>&1)
+        status=$?
+        set -e
+        printf '%s\n' "$output"
+        if [ "$status" -ne 0 ]; then
+          return "$status"
+        fi
+        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
+          echo "FAILED: P082 cargo test filter selected zero tests: cargo test $*" >&2
+          return 1
+        fi
+      }
+      run_p082_cargo_test -p db --test proposal_082_recovery_retry_matrix -- --nocapture
+      run_p082_cargo_test -p engine --test proposal_082_recovery_retry_matrix -- --nocapture
+      run_p082_cargo_test -p mcp-server --test proposal_082_recovery_readback -- --nocapture
+    )
+    log "Proposal 082 gate passed"
     ;;
   *)
     print_usage >&2

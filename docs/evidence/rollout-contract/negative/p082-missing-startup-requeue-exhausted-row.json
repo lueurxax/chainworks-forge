@@ -1,0 +1,7 @@
+{
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082-neg-015",
+  "expected_failure_code": "p082_missing_startup_requeue_exhausted_row",
+  "mutated_contract_or_matrix": "Matrix row P082-R16 (startup_requeue_exhausted held state) removed from canonical matrix",
+  "assertion": "Gate must fail because startup_requeue_exhausted held-state coverage (P082-R16) is a required matrix row"
+}

@@ -9077,6 +9077,8 @@ impl BackgroundExecutor {
                 runtime_facts.valid_required_outputs = false;
             }
         }
+        // Track whether any late output was ignored for post-commit P082-R03/R17 recovery snapshot.
+        let has_ignored_late_output = runtime_facts.ignored_late_output_count > 0;
         if let Some(discovery_diagnostics) = discovery_diagnostics {
             agent_execution_discovery_diagnostics::upsert_tx(&mut tx, discovery_diagnostics)
                 .await?;
@@ -9123,6 +9125,60 @@ impl BackgroundExecutor {
         artifact_contracts::close_source_generation_claim_tx(&mut tx, artifact_claim_key).await?;
         tx.commit().await?;
         db::pool::log_write_transaction("executor.import_declared_outputs", tx_started);
+        // P082-R03/R17: after commit, persist late output settlement readback to
+        // stage_executions.recovery_snapshot_json so the accessor can surface it.
+        if has_ignored_late_output {
+            let cancelled_provider = result_status == AgentStatus::Cancelled;
+            let scenario_id = if cancelled_provider {
+                "P082-R17"
+            } else {
+                "P082-R03"
+            };
+            let reason_code = if cancelled_provider {
+                domain::recovery_matrix::REASON_CANCELLED_PROVIDER_LATE_OUTPUT_IGNORED
+            } else {
+                domain::recovery_matrix::REASON_IGNORED_LATE_OUTPUTS
+            };
+            let now_ts = chrono::Utc::now().to_rfc3339();
+            let settlement = domain::recovery_matrix::build_late_output_settlement(
+                &agent_exec_id.to_string(),
+                work_item_id,
+                source_session_generation_id,
+                session_generation_id.unwrap_or(""),
+                "superseded",
+                "ignored",
+                runtime_facts.ignored_late_output_count,
+                "completed",
+                cancelled_provider,
+            );
+            let readback = domain::recovery_matrix::set_readback_late_output_settlement(
+                domain::recovery_matrix::build_readback_v1(
+                    scenario_id,
+                    "repaired",
+                    "no_mutation",
+                    reason_code,
+                    "Late output from superseded or cancelled source was ignored; active projection unchanged.",
+                    "agent_execution_runtime_facts, artifact_source_generation_claims, work_items",
+                    "agent_execution_runtime_facts, artifact_contracts, work_items",
+                    &stage_execution_id.to_string(),
+                    Some("stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback"),
+                    "valid",
+                    &now_ts,
+                ),
+                settlement,
+            );
+            let snapshot = serde_json::json!({ "p082_recovery_matrix_readback": readback });
+            let _ = db::repos::stages::update_recovery_snapshot_json(
+                &self.pool,
+                stage_execution_id,
+                &snapshot.to_string(),
+            )
+            .await;
+            db::metrics::increment_counter_with_label(
+                "p082_late_output_quarantine_total",
+                &format!("ignored:{source_session_generation_id}"),
+            );
+        }
         if invalidated_session_after_missing_outputs {
             if let Some(session_generation_id) = session_generation_id {
                 let _ = self.acp.close_session(session_generation_id).await;
@@ -10350,11 +10406,16 @@ impl BackgroundExecutor {
                 None => None,
             }
         };
+        let p082_readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&self.pool, run.id)
+            .await
+            .unwrap_or_default();
+        db::repos::p082_recovery_matrix::emit_readback_lane_metrics(&p082_readbacks, "release_receipt");
         let receipt = match DeliveryReceiptBuilder::build_receipt(
             run,
             delivery_config,
             Some(release_result),
             rollout_contract_readback,
+            p082_readbacks,
             idea_title,
             review_status,
         ) {

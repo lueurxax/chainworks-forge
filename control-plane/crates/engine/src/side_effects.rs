@@ -922,6 +922,7 @@ pub async fn run_unresolved_effects_preflight(
 
     let effect_ids: Vec<String> = unresolved.iter().map(|e| e.id.to_string()).collect();
     let reason = classify_unresolved_reason(&unresolved);
+    let reason_label = reason.to_string();
     // Use the stage_execution_id from the first unresolved effect as the envelope anchor.
     let stage_execution_id = &unresolved[0].stage_execution_id;
 
@@ -934,6 +935,10 @@ pub async fn run_unresolved_effects_preflight(
     );
 
     emit_p078_metric("side_effect_retry_block_total", None, None);
+    db::metrics::increment_counter_with_label(
+        "p082_release_side_effect_retry_block_total",
+        &format!("{reason_label}:{operation_label}"),
+    );
     warn!(
         run_id = %run_id,
         operation = operation_label,
@@ -988,6 +993,7 @@ pub async fn run_cancel_preflight_within_tx(
 
     let effect_ids: Vec<String> = unresolved.iter().map(|e| e.id.to_string()).collect();
     let reason = classify_unresolved_reason(&unresolved);
+    let reason_label = reason.to_string();
     let stage_execution_id = &unresolved[0].stage_execution_id;
     let envelope = RequiresEffectReconciliationEnvelope::new(
         run_id,
@@ -998,6 +1004,10 @@ pub async fn run_cancel_preflight_within_tx(
     );
 
     emit_p078_metric("side_effect_retry_block_total", None, None);
+    db::metrics::increment_counter_with_label(
+        "p082_release_side_effect_retry_block_total",
+        &format!("{reason_label}:cancel"),
+    );
     warn!(
         run_id = %run_id,
         "requires_effect_reconciliation_denied: unresolved effects block run cancel"

@@ -1,0 +1,7 @@
+{
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082-neg-008",
+  "expected_failure_code": "p082_duplicate_requeue_without_idempotency",
+  "mutated_contract_or_matrix": "Startup requeue creates second work item for same source without checking existing generation",
+  "assertion": "Gate must fail because startup requeue must be idempotent per idempotency key; second requeue without checking existing generation creates duplicate work"
+}

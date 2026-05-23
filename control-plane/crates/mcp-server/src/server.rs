@@ -709,6 +709,14 @@ impl McpServer {
                 tools::reports::retry_authority_current_json(&self.pool, run_id_parsed).await?;
             let p091_orphan_repair_readback =
                 tools::reports::p091_orphan_repair_readback_json(&self.pool, run_id_parsed).await?;
+            let p082_recovery_matrix_readbacks =
+                tools::reports::p082_recovery_matrix_readbacks_json(
+                    &self.pool,
+                    run_id_parsed,
+                    &principal.class,
+                    "report_resource",
+                )
+                .await?;
 
             return Ok(serde_json::json!({
                 "run_id": run_id,
@@ -730,6 +738,7 @@ impl McpServer {
                 "retryAuthority": retry_authority,
                 "retryAuthorityHistory": retry_authority_history,
                 "p091OrphanRepairReadback": p091_orphan_repair_readback,
+                "p082_recovery_matrix_readbacks": p082_recovery_matrix_readbacks,
                 "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
                 "rollout_contract_readback": mcp_rollout_readback,
                 "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
@@ -3450,5 +3459,142 @@ mod tests {
                 "journal_id must be set on the audit row for the failed run"
             );
         }
+    }
+
+    // ── P082: report:// resource parity tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn p082_report_resource_includes_plural_readbacks_not_singular() {
+        // P082 lane contract: report://{run_id} exposes p082_recovery_matrix_readbacks
+        // (plural array) only. The singular p082_recovery_matrix_readback must NOT be
+        // present in the report resource payload.
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let value = server
+            .read_resource(&format!("report://{run_id}"))
+            .await
+            .unwrap();
+
+        // Plural must be present and must be an array (empty when no recovery rows).
+        assert!(
+            value.get("p082_recovery_matrix_readbacks").is_some(),
+            "P082: report:// resource must include p082_recovery_matrix_readbacks (plural)"
+        );
+        assert!(
+            value["p082_recovery_matrix_readbacks"].is_array(),
+            "P082: report:// p082_recovery_matrix_readbacks must be an array"
+        );
+
+        // Singular must NOT be present per the lane contract.
+        assert!(
+            value.get("p082_recovery_matrix_readback").is_none(),
+            "P082: report:// resource must NOT include singular p082_recovery_matrix_readback (lane contract)"
+        );
+    }
+
+    #[tokio::test]
+    async fn p082_report_resource_non_empty_readbacks_when_startup_repair_exists() {
+        // When a startup_repair row carries a valid P082 readback in its notes,
+        // report://{run_id} must return a non-empty p082_recovery_matrix_readbacks array
+        // with content byte-equivalent to reports.get mcp_execution_truth lane.
+        use db::repos::startup_repairs;
+        use domain::recovery_matrix;
+
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        // Seed a startup_repair with a valid P082 readback in notes.
+        let readback = recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled; requeue_generation=1.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &format!("p082-requeue:cj-server-test:{run_id}:1"),
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-22T00:00:00Z",
+        );
+        let notes = serde_json::json!({
+            "requeue_generation": 1,
+            "max_requeue_generation": 1,
+            "p082_recovery_matrix_readback": readback,
+        })
+        .to_string();
+
+        startup_repairs::record(
+            &pool,
+            &format!("p082-requeue:cj-server-test:{run_id}:1"),
+            &run_id.to_string(),
+            "requeue_once",
+            Utc::now(),
+            Some(&notes),
+        )
+        .await
+        .unwrap();
+
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let value = server
+            .read_resource(&format!("report://{run_id}"))
+            .await
+            .unwrap();
+
+        let readbacks = value["p082_recovery_matrix_readbacks"]
+            .as_array()
+            .expect("P082: p082_recovery_matrix_readbacks must be an array");
+
+        assert_eq!(
+            readbacks.len(),
+            1,
+            "P082: report:// must return exactly one readback row when one startup_repair row exists"
+        );
+        assert_eq!(
+            readbacks[0]["scenario_id"].as_str(),
+            Some("P082-R01"),
+            "P082: report:// readback must have scenario_id=P082-R01"
+        );
+        assert_eq!(
+            readbacks[0]["scenario_status"].as_str(),
+            Some("repaired"),
+            "P082: report:// readback must use approved vocabulary (repaired)"
+        );
+        assert_eq!(
+            readbacks[0]["recovery_reason_code"].as_str(),
+            Some("startup_requeue_once"),
+            "P082: report:// readback must have correct reason_code"
+        );
+        // Singular must not be present in report:// resource.
+        assert!(
+            value.get("p082_recovery_matrix_readback").is_none(),
+            "P082: report:// resource must NOT expose singular p082_recovery_matrix_readback"
+        );
     }
 }

@@ -1,0 +1,7 @@
+{
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082-neg-010",
+  "expected_failure_code": "p082_rejected_command_payload_mutation",
+  "mutated_contract_or_matrix": "Post-validation rejected-command readback written to command_journal.payload_json instead of command_journal.error",
+  "assertion": "Gate must fail because command_journal.payload_json is the write-once inserted command input; P082 readback must use command_journal.error typed envelope only"
+}

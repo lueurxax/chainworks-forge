@@ -1,0 +1,7 @@
+{
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082-neg-016",
+  "expected_failure_code": "p082_cancel_late_output_mutates_active_projection",
+  "mutated_contract_or_matrix": "Cancelled provider late output updates active artifact_contract_generations or stage_executions projection",
+  "assertion": "Gate must fail because cancelled provider late output (P082-R17) must set active_projection_changed=false; any active projection mutation from a cancelled/superseded source generation is a contract violation"
+}

@@ -1,0 +1,7 @@
+{
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082-neg-003",
+  "expected_failure_code": "p082_release_side_effect_retry_not_fail_closed",
+  "mutated_contract_or_matrix": "Engine schedules release side-effect retry while unresolved side-effect ledger rows exist",
+  "assertion": "Gate must fail because release side-effect retry is not fail-closed while unresolved prepared/executing/externally_observed/needs_reconciliation ledger entries exist"
+}

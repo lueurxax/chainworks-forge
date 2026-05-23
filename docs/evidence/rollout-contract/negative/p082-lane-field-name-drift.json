@@ -1,0 +1,7 @@
+{
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082-neg-011",
+  "expected_failure_code": "p082_lane_field_name_drift",
+  "mutated_contract_or_matrix": "reports.get response contains singular p082_recovery_matrix_readback field (should be plural-only)",
+  "assertion": "Gate must fail because reports.get must expose only p082_recovery_matrix_readbacks (plural); singular field is reserved for runs.get only"
+}

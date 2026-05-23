@@ -15,6 +15,9 @@ pub struct DeliveryReceipt {
     pub release_result: Option<ReleaseResultSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollout_contract_readback: Option<serde_json::Value>,
+    /// P082 recovery matrix readback rows for release receipt diagnostics.
+    /// Serialized as an empty array when no recovery events occurred (P082 lane contract).
+    pub p082_recovery_matrix_readbacks: Vec<serde_json::Value>,
     pub implementation_review_status: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
@@ -38,6 +41,7 @@ impl DeliveryReceiptBuilder {
         delivery_config: &DeliveryConfiguration,
         release_result: Option<&ReleaseResult>,
         rollout_contract_readback: Option<serde_json::Value>,
+        p082_recovery_matrix_readbacks: Vec<serde_json::Value>,
         idea_title: &str,
         review_status: Option<&str>,
     ) -> Option<DeliveryReceipt> {
@@ -75,6 +79,7 @@ impl DeliveryReceiptBuilder {
             base_revision: run.base_revision.clone(),
             release_result: release_summary,
             rollout_contract_readback,
+            p082_recovery_matrix_readbacks,
             implementation_review_status: review_status.map(String::from),
             timestamp: Utc::now(),
         })

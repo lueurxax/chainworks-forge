@@ -989,6 +989,44 @@ pub async fn requeue_running_invoke_agent_on_startup(
     Ok(requeued)
 }
 
+fn p082_source_command_journal_id_from_payload(payload: &serde_json::Value) -> Option<String> {
+    [
+        "/targeted_retry/journal_id",
+        "/operator_retry_instruction/journal_id",
+        "/source_command_journal_id",
+        "/journal_id",
+    ]
+    .iter()
+    .find_map(|pointer| {
+        payload
+            .pointer(pointer)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+async fn p082_latest_command_journal_id_for_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+) -> Result<Option<String>> {
+    if run_id.trim().is_empty() {
+        return Ok(None);
+    }
+    sqlx::query_scalar::<_, String>(
+        r#"SELECT id
+           FROM command_journal
+           WHERE run_id = ?1
+           ORDER BY created_at DESC, id DESC
+           LIMIT 1"#,
+    )
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("load latest command journal id for P082 startup repair")
+}
+
 pub async fn requeue_running_invoke_agent_on_startup_tx(
     tx: &mut Transaction<'_, Sqlite>,
     scheduled_at: DateTime<Utc>,
@@ -1016,6 +1054,127 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
         let mut payload = serde_json::from_str::<serde_json::Value>(&payload_json)
             .unwrap_or_else(|_| serde_json::json!({}));
         supersede_abandoned_preclaim_for_retry_tx(tx, &item_id, &payload, scheduled_at).await?;
+        let run_id_for_repair = payload
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let source_command_journal_id = match p082_source_command_journal_id_from_payload(&payload)
+        {
+            Some(journal_id) => journal_id,
+            None => p082_latest_command_journal_id_for_run_tx(tx, &run_id_for_repair)
+                .await?
+                .unwrap_or_else(|| "unavailable".to_string()),
+        };
+        // P082-R01: build the startup repair idempotency key and summary.
+        // Key format: p082-requeue:{command_journal.id}:{source_work_item_id}:1.
+        let repair_id = format!("p082-requeue:{source_command_journal_id}:{item_id}:1");
+        let p082_summary = domain::recovery_matrix::build_startup_repair_summary(
+            &repair_id,
+            &item_id,
+            &source_command_journal_id,
+            1,
+            1,
+            false,
+            60_000,
+            &scheduled_at_rfc3339,
+            false,
+            None,
+            "global",
+        );
+        let p082_readback = domain::recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            domain::recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup recovery requeued abandoned InvokeAgent work item.",
+            "startup_repairs, work_items, command_journal",
+            "startup_repairs, work_items",
+            &repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            &scheduled_at_rfc3339,
+        );
+        let p082_readback_with_summary =
+            domain::recovery_matrix::set_readback_startup_repair(p082_readback, p082_summary, None);
+        let notes_json = serde_json::json!({
+            "p082_recovery_matrix_readback": p082_readback_with_summary,
+        });
+        let record_result = super::startup_repairs::record_tx(
+            &mut **tx,
+            &repair_id,
+            &run_id_for_repair,
+            "p082_requeue_once",
+            scheduled_at,
+            Some(&notes_json.to_string()),
+        )
+        .await;
+        if record_result.is_err() {
+            // P082-R16: idempotency key already exists — generation 1 was already consumed.
+            // Do NOT write a second startup_repairs row (one-idempotency-row invariant).
+            // UPDATE startup_repairs.notes with the R16 readback so Source 1 of the
+            // readbacks_for_run accessor surfaces it from the approved storage owner
+            // (startup_repairs.notes.p082_recovery_matrix_readback).
+            let held_summary = domain::recovery_matrix::build_startup_repair_summary(
+                &repair_id,
+                &item_id,
+                &source_command_journal_id,
+                1,
+                1,
+                true,
+                60_000,
+                &scheduled_at_rfc3339,
+                false,
+                None,
+                "global",
+            );
+            let held_readback = domain::recovery_matrix::set_readback_startup_repair(
+                domain::recovery_matrix::build_readback_v1(
+                    "P082-R16",
+                    "held",
+                    "wait",
+                    domain::recovery_matrix::REASON_STARTUP_REQUEUE_EXHAUSTED,
+                    "Startup requeue generation 1 was already consumed; no duplicate work was enqueued.",
+                    "startup_repairs, work_items",
+                    "startup_repairs, work_items",
+                    &repair_id,
+                    Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+                    "valid",
+                    &scheduled_at_rfc3339,
+                ),
+                held_summary,
+                Some("Startup requeue exhausted: generation 1 was already consumed. Use existing recovery inspection or cancellation paths to clear the hold."),
+            );
+            let r16_notes = serde_json::json!({
+                "p082_recovery_matrix_readback": held_readback,
+            });
+            sqlx::query(
+                "UPDATE startup_repairs SET notes = ?1 WHERE id = ?2",
+            )
+            .bind(r16_notes.to_string())
+            .bind(&repair_id)
+            .execute(&mut **tx)
+            .await
+            .context("update startup_repairs notes for P082-R16 held state")?;
+            crate::metrics::increment_counter_with_label(
+                "p082_recovery_idempotency_replay_total",
+                "P082-R16:startup_requeue_exhausted",
+            );
+            sqlx::query(
+                r#"UPDATE work_items
+                   SET status = ?1, failed_at = ?2, last_error = ?3
+                   WHERE id = ?4 AND status = ?5"#,
+            )
+            .bind(WorkItemStatus::Failed.to_string())
+            .bind(scheduled_at.to_rfc3339())
+            .bind("startup_requeue_exhausted: generation 1 already consumed")
+            .bind(&item_id)
+            .bind(WorkItemStatus::Running.to_string())
+            .execute(&mut **tx)
+            .await
+            .context("fail running InvokeAgent work item on startup requeue exhaustion")?;
+            continue;
+        }
         if let Some(object) = payload.as_object_mut() {
             object.remove("p058_claimed");
             object.insert(
@@ -1023,6 +1182,11 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
                 serde_json::json!({
                     "requeued_at": scheduled_at_rfc3339.clone(),
                     "reason": reason,
+                    "startup_repair_id": repair_id,
+                    "source_command_journal_id": source_command_journal_id,
+                    "source_work_item_id": item_id,
+                    "requeue_generation": 1,
+                    "max_requeue_generation": 1,
                 }),
             );
         }
@@ -1045,6 +1209,12 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
         .await
         .context("requeue running InvokeAgent work item on startup")?
         .rows_affected();
+        if updated > 0 {
+            crate::metrics::increment_counter_with_label(
+                "p082_recovery_idempotency_replay_total",
+                "P082-R01:startup_requeue_once",
+            );
+        }
         requeued += updated;
     }
     Ok(requeued)

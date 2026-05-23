@@ -1,0 +1,7 @@
+{
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082-neg-005",
+  "expected_failure_code": "p082_missing_readback_reason",
+  "mutated_contract_or_matrix": "p082_recovery_matrix_readback_v1 object returned with reason_code field missing",
+  "assertion": "Gate must fail because recovery_reason_code is never-null in p082_recovery_matrix_readback_v1 but is absent"
+}

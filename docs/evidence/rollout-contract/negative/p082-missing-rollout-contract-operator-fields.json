@@ -1,0 +1,7 @@
+{
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082-neg-006",
+  "expected_failure_code": "p082_missing_rollout_contract_operator_fields",
+  "mutated_contract_or_matrix": "Release receipt returned without rollout_contract_* operator fields",
+  "assertion": "Gate must fail because rollout_contract_* fields (rollout_contract_status, rollout_contract_decision, etc.) are required in release receipts"
+}

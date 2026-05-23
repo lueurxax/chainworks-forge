@@ -459,4 +459,5 @@ Use:
 - [workflow-execution-engine.md](workflow-execution-engine.md) for orchestrator topology,
 - [run-control.md](run-control.md) for cancellation settlement and operator-visible cancel truth,
 - [provider-binding-truth.md](provider-binding-truth.md) for historical binding provenance,
-- [operator-experience.md](operator-experience.md) for shell/report/recovery presentation contracts.
+- [operator-experience.md](operator-experience.md) for shell/report/recovery presentation contracts,
+- [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md) for the canonical P082 scenario matrix, reason-code vocabulary, readback schemas, and proof gate that recovery behavior changes must extend.

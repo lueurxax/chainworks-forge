@@ -2199,3 +2199,44 @@ Important:
 - documentation-only self-contract fixtures are validated for JSON well-formedness only; linter-testable scheduler and cutover fixtures are linter inputs
 - the gate validates parity-lane fixture shape (run_report, mcp, release_receipt, graphql), Rust rollout-contract preflight/storage regressions, clean migration install, and the Swift read-only presentation slice
 - the gate fails closed if the template is missing a required term, any negative fixture is absent or malformed, the retained historical alias `p084-full-surface` fixture omits a required readback field or parity-lane payload, or the `Proposal084Tests` Swift slice fails
+
+### `proposal-082|p082` recovery and retry state-machine matrix gate
+
+Canonical recovery/retry state-machine matrix and proof gate covering restart, retry, cancellation, stale startup, late output, side-effect, approval, session, and mediation recovery boundaries.
+
+Scope:
+
+- `docs/reference/recovery-retry-state-machine-test-matrix.md` exists and contains all 17 required scenario rows (P082-R01 through P082-R17) with setup, expected repair or reject, DB assertion, engine assertion, readback requirement, durable storage owner, projection path, crash/replay proof, and observability threshold
+- All canonical reason codes are documented and defined in `control-plane/crates/domain/src/recovery_matrix.rs`
+- `p082_rejected_command_error_v1` typed envelope contract and backward-compatible legacy plain-text fallback rules are documented and implemented
+- Exact readback lane placement is enforced: `runs.get` exposes both singular `p082_recovery_matrix_readback` and plural `p082_recovery_matrix_readbacks`; `reports.get` exposes plural only; singular must be absent from reports.get
+- Rollout fixture `docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json` exists with schema_version `p082_operator_readback_fixture_v1`, all five readback lanes, nested subcontracts, Xcode startup grace row, startup_requeue_exhausted row, cancel-then-late-output row, and fixture assertions naming all reason codes and scenario IDs
+- All 16 negative fixtures in `docs/evidence/rollout-contract/negative/p082-*.json` exist with `schema_version=p082_negative_fixture_v1` and required fields
+- DB, engine, and MCP readback tests compile and pass under CARGO_TARGET_DIR=target/proposal-082-gate
+
+Use when:
+
+- Adding or modifying recovery/retry behavior in the control-plane engine, DB repos, MCP server, or release paths
+- Verifying that all P082 matrix rows have DB, engine, and readback coverage
+- Proving that rejected-command readback uses command_journal.error typed envelopes and not command_journal.payload_json
+
+Host policy:
+
+- Local Rust toolchain required; no UI target or network required
+- Python 3 required for the static check phase
+- No daemon process required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-082
+./scripts/test-gate.sh p082
+```
+
+Important:
+
+- `p082` is accepted as an alias
+- Gate fails if any required matrix row, durable owner, readback assertion, crash/replay proof, or observability threshold is missing
+- Gate fails if GraphQL is treated as a required readback lane without a contract amendment
+- Gate fails if Swift app-facing P082 consumption paths exist without tolerant decode and MainActor tests
+- No schema migration is permitted; if required readback cannot be stored in existing owners, P082 must be amended first
