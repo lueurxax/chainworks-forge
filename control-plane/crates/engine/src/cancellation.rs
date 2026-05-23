@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use db::repos::{
     agent_executions, agent_work_continuations, approvals, lead_conflict_mediations, projections,
-    runs, scheduler, sessions, stages, work_items,
+    runs, scheduler, sessions, side_effects, stages, work_items,
 };
 use db::write_class::WriteLane;
 use db::writer::class_a_operation;
@@ -34,11 +34,151 @@ pub struct CancellationSettlementEntry {
     pub session_close_attempted: bool,
     pub session_close_succeeded: Option<bool>,
     pub settled_at: DateTime<Utc>,
+    /// P082-R11/R12/R13/R14: typed readback for this cancellation settlement entry.
+    /// Written when the cancellation interacts with retry work, approvals, side effects,
+    /// or startup repairs. Null for simple running-execution cancellations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p082_recovery_matrix_readback: Option<serde_json::Value>,
 }
 
 pub struct BeginSettlementResult {
     pub settlement_log: String,
     pub scheduler_refresh: scheduler::RefreshQueueSummariesResult,
+}
+
+fn p082_cancellation_entry_from_readback(
+    run_id: RunId,
+    requested_at: DateTime<Utc>,
+    readback: serde_json::Value,
+) -> CancellationSettlementEntry {
+    CancellationSettlementEntry {
+        agent_execution_id: format!("p082-cancellation-readback:{run_id}"),
+        agent_id: "p082-cancellation".to_string(),
+        prior_status: "not_applicable".to_string(),
+        terminal_status: readback
+            .get("scenario_status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("held")
+            .to_string(),
+        session_close_attempted: false,
+        session_close_succeeded: None,
+        settled_at: requested_at,
+        p082_recovery_matrix_readback: Some(readback),
+    }
+}
+
+pub fn p082_cancel_side_effect_reconciliation_readback(
+    run_id: RunId,
+    requested_at: DateTime<Utc>,
+) -> serde_json::Value {
+    domain::recovery_matrix::set_readback_side_effect_hold(
+        domain::recovery_matrix::build_readback_v1(
+            "P082-R13",
+            "held",
+            "reconcile_side_effects",
+            domain::recovery_matrix::REASON_CANCEL_SIDE_EFFECT_RECONCILIATION_REQUIRED,
+            "Cancellation held: unresolved side effects must be reconciled before final settlement.",
+            "runs, side_effects, side_effect_attempts, side_effect_settlements",
+            "runs, side_effects",
+            &run_id.to_string(),
+            Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
+            "valid",
+            &requested_at.to_rfc3339(),
+        ),
+        "unresolved_side_effect_entries",
+        "Cancellation held: unresolved side-effect ledger entries exist. Reconcile side effects before final settlement.",
+    )
+}
+
+pub fn p082_cancellation_settlement_log_for_readback(
+    run_id: RunId,
+    requested_at: DateTime<Utc>,
+    readback: serde_json::Value,
+) -> Result<String> {
+    serde_json::to_string(&vec![p082_cancellation_entry_from_readback(
+        run_id,
+        requested_at,
+        readback,
+    )])
+    .context("serialize P082 cancellation settlement readback")
+}
+
+async fn p082_cancellation_readback_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    requested_at: DateTime<Utc>,
+) -> Result<serde_json::Value> {
+    let run_id_string = run_id.to_string();
+    if !side_effects::list_unresolved_for_run_tx(tx, &run_id_string)
+        .await?
+        .is_empty()
+    {
+        return Ok(p082_cancel_side_effect_reconciliation_readback(
+            run_id,
+            requested_at,
+        ));
+    }
+
+    let approvals = approvals::list_by_run_tx(tx, run_id).await?;
+    if approvals.iter().any(|approval| {
+        matches!(
+            approval.decision.to_string().as_str(),
+            "pending" | "requested"
+        )
+    }) {
+        return Ok(domain::recovery_matrix::build_readback_v1(
+            "P082-R12",
+            "cancelled",
+            "cancel",
+            domain::recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_PRESERVED,
+            "Run cancellation settled without modifying pending approval decision.",
+            "runs, approvals, approval_inbox",
+            "runs, approvals",
+            &run_id_string,
+            Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
+            "valid",
+            &requested_at.to_rfc3339(),
+        ));
+    }
+
+    let startup_repair_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM startup_repairs
+           WHERE run_id = ?1"#,
+    )
+    .bind(&run_id_string)
+    .fetch_one(&mut **tx)
+    .await
+    .context("count startup repairs for P082 cancellation readback")?;
+    if startup_repair_count > 0 {
+        return Ok(domain::recovery_matrix::build_readback_v1(
+            "P082-R14",
+            "cancelled",
+            "cancel",
+            domain::recovery_matrix::REASON_CANCEL_STARTUP_REPAIR_CONVERGED,
+            "Cancellation settled; startup repair converged idempotently with cancellation.",
+            "runs, startup_repairs, work_items, session_generations",
+            "runs, startup_repairs, work_items, sessions",
+            &run_id_string,
+            Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
+            "valid",
+            &requested_at.to_rfc3339(),
+        ));
+    }
+
+    Ok(domain::recovery_matrix::build_readback_v1(
+        "P082-R11",
+        "cancelled",
+        "cancel",
+        domain::recovery_matrix::REASON_CANCEL_ACTIVE_STAGE_REQUESTED,
+        "Run cancellation settled active stage execution. Provider session terminalization evidence in session_generations/session_events.",
+        "runs, work_items, retry_stage_execution_authorities, session_generations, session_events",
+        "runs, work_items, sessions",
+        &run_id_string,
+        Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
+        "valid",
+        &requested_at.to_rfc3339(),
+    ))
 }
 
 pub async fn begin_settlement(
@@ -94,6 +234,7 @@ pub async fn begin_settlement_tx(
     refresh_context: &'static str,
 ) -> Result<BeginSettlementResult> {
     let executions_before = agent_executions::list_by_run_tx(tx, run_id).await?;
+    let p082_readback = p082_cancellation_readback_tx(tx, run_id, requested_at).await?;
 
     let entries: Vec<CancellationSettlementEntry> = executions_before
         .iter()
@@ -106,8 +247,23 @@ pub async fn begin_settlement_tx(
             session_close_attempted: false,
             session_close_succeeded: None,
             settled_at: requested_at,
+            p082_recovery_matrix_readback: Some(p082_readback.clone()),
         })
         .collect();
+    let entries = if entries.is_empty()
+        && p082_readback
+            .get("scenario_id")
+            .and_then(|value| value.as_str())
+            != Some("P082-R11")
+    {
+        vec![p082_cancellation_entry_from_readback(
+            run_id,
+            requested_at,
+            p082_readback,
+        )]
+    } else {
+        entries
+    };
 
     agent_executions::cancel_running_by_run_tx(tx, run_id, requested_at).await?;
     work_items::cancel_running_by_run_tx(tx, run_id, requested_at).await?;

@@ -436,6 +436,25 @@ pub async fn execute(
                                 )
                                 .await?,
                             );
+                        obj.insert(
+                            "p082_recovery_matrix_readback".into(),
+                            crate::tools::reports::p082_recovery_matrix_readback_json(
+                                pool,
+                                run_id,
+                                &principal.class,
+                            )
+                            .await?,
+                        );
+                        obj.insert(
+                            "p082_recovery_matrix_readbacks".into(),
+                            crate::tools::reports::p082_recovery_matrix_readbacks_json(
+                                pool,
+                                run_id,
+                                &principal.class,
+                                "mcp",
+                            )
+                            .await?,
+                        );
                         }
                     }
                     let value =

@@ -65,7 +65,7 @@ use crate::event_bus::EventSender;
 use crate::preflight::{
     missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
 };
-use crate::side_effects::{retry_preflight_within_tx, run_cancel_preflight_within_tx};
+use crate::side_effects::retry_preflight_within_tx;
 use crate::synthesizers::closeout_readiness::{
     synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards, NoDiffConvergence,
     SynthesizerInputs, NO_DIFF_CONVERGENCE_THRESHOLD,
@@ -3086,15 +3086,45 @@ impl CommandHandler {
                         c.stage_id,
                         old_stage.status
                     );
+                    let now_ts = Utc::now();
+                    let p082_envelope =
+                        domain::recovery_matrix::build_rejected_command_error_envelope(
+                            domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
+                            "RetryStage",
+                            &format!(
+                                "Stage {} latest attempt is {} and cannot be retried yet. No mutation was performed.",
+                                c.stage_id, old_stage.status
+                            ),
+                            domain::recovery_matrix::build_readback_v1(
+                                "P082-R02",
+                                "rejected",
+                                "no_mutation",
+                                domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
+                                "Stage is not in a retryable status. No mutation was performed.",
+                                "command_journal, stage_executions",
+                                "command_journal, stages",
+                                &journal.id,
+                                Some("command_journal.error.p082_recovery_matrix_readback"),
+                                "valid",
+                                &now_ts.to_rfc3339(),
+                            ),
+                        );
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
                         &journal.id,
-                        Utc::now(),
-                        &error.to_string(),
+                        now_ts,
+                        &p082_envelope,
                     )
                     .await?;
                     retry_tx.commit().await?;
                     db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    db::metrics::increment_counter_with_label(
+                        "p082_recovery_mutation_rejected_total",
+                        &format!(
+                            "{}:RetryStage",
+                            domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY
+                        ),
+                    );
                     return Err(error);
                 }
 
@@ -3118,15 +3148,46 @@ impl CommandHandler {
                 if let Err(ledger_err) =
                     retry_preflight_within_tx(&mut retry_tx, &c.run_id, &old_stage.id, None).await
                 {
+                    let now_ts = Utc::now();
+                    let p082_envelope =
+                        domain::recovery_matrix::build_rejected_command_error_envelope(
+                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                            "RetryStage",
+                            "Retry blocked: unresolved side-effect ledger entries exist. No mutation was performed.",
+                            domain::recovery_matrix::set_readback_side_effect_hold(
+                                domain::recovery_matrix::build_readback_v1(
+                                    "P082-R07",
+                                    "held",
+                                    "reconcile_side_effects",
+                                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                                    "Reconcile unresolved side effects before retrying this stage.",
+                                    "side_effects, command_journal",
+                                    "side_effects, command_journal",
+                                    &journal.id,
+                                    Some("command_journal.error.p082_recovery_matrix_readback"),
+                                    "valid",
+                                    &now_ts.to_rfc3339(),
+                                ),
+                                "unresolved_side_effect_entries",
+                                "Retry blocked: unresolved side-effect ledger entries exist. Reconcile side effects before retrying.",
+                            ),
+                        );
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
                         &journal.id,
-                        Utc::now(),
-                        &ledger_err.to_string(),
+                        now_ts,
+                        &p082_envelope,
                     )
                     .await?;
                     retry_tx.commit().await?;
                     db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    db::metrics::increment_counter_with_label(
+                        "p082_recovery_mutation_rejected_total",
+                        &format!(
+                            "{}:RetryStage",
+                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
+                        ),
+                    );
                     return Err(ledger_err);
                 }
 
@@ -3137,15 +3198,46 @@ impl CommandHandler {
                     has_release_post_approval_tasks,
                 ) {
                     let error = requires_effect_reconciliation_error(old_stage);
+                    let now_ts = Utc::now();
+                    let p082_envelope =
+                        domain::recovery_matrix::build_rejected_command_error_envelope(
+                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                            "RetryStage",
+                            "Retry blocked: release stage has unresolved side effects requiring reconciliation. No mutation was performed.",
+                            domain::recovery_matrix::set_readback_side_effect_hold(
+                                domain::recovery_matrix::build_readback_v1(
+                                    "P082-R07",
+                                    "held",
+                                    "reconcile_side_effects",
+                                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                                    "Reconcile unresolved side effects before retrying this stage.",
+                                    "side_effects, command_journal",
+                                    "side_effects, command_journal",
+                                    &journal.id,
+                                    Some("command_journal.error.p082_recovery_matrix_readback"),
+                                    "valid",
+                                    &now_ts.to_rfc3339(),
+                                ),
+                                "unresolved_side_effect_entries",
+                                "Retry blocked: release stage has unresolved side effects requiring reconciliation. Reconcile side effects before retrying.",
+                            ),
+                        );
                     command_journal::fail_entry_tx(
                         &mut retry_tx,
                         &journal.id,
-                        Utc::now(),
-                        &error.to_string(),
+                        now_ts,
+                        &p082_envelope,
                     )
                     .await?;
                     retry_tx.commit().await?;
                     db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    db::metrics::increment_counter_with_label(
+                        "p082_recovery_mutation_rejected_total",
+                        &format!(
+                            "{}:RetryStage",
+                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
+                        ),
+                    );
                     return Err(error);
                 }
 
@@ -4026,22 +4118,10 @@ impl CommandHandler {
                     return Err(error);
                 }
 
-                // Ledger-backed preflight: block cancel when any unresolved side effects exist
-                // for this run, regardless of CHAINWORKS_RELEASE_SIDE_EFFECTS_ENABLED.
-                // Use the tx-scoped variant to avoid deadlocking on single-connection pools.
-                if let Err(ledger_err) = run_cancel_preflight_within_tx(&mut tx, &c.run_id).await {
-                    command_journal::fail_entry_tx(
-                        &mut tx,
-                        &journal.id,
-                        Utc::now(),
-                        &ledger_err.to_string(),
-                    )
-                    .await?;
-                    tx.commit().await?;
-                    db::pool::log_write_transaction("command.CancelRun", tx_started);
-                    return Err(ledger_err);
-                }
-
+                // P082-R13: Cancel proceeds even when unresolved side effects exist.
+                // begin_settlement_tx detects side effects via p082_cancellation_readback_tx
+                // and records R13 held-state in the settlement log. Side effects are NOT
+                // touched by cancellation — they require explicit operator reconciliation.
                 let settlement = cancellation::begin_settlement_tx(
                     &mut tx,
                     c.run_id,
@@ -5779,14 +5859,53 @@ impl CommandHandler {
                 )
             })?;
         if old_stage.run_id != run_id || old_stage.stage_id != stage_id {
-            return Err(anyhow!(
-                "Agent execution {} belongs to run {} stage {}, not run {} stage {}",
-                agent_execution_id,
-                old_stage.run_id,
-                old_stage.stage_id,
-                run_id,
-                stage_id
-            ));
+            let err_msg = format!(
+                "Targeted retry rejected: agent execution {} belongs to run {} stage {}, not run {} stage {}. No mutation was performed.",
+                agent_execution_id, old_stage.run_id, old_stage.stage_id, run_id, stage_id
+            );
+            let now_ts = Utc::now();
+            let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
+                "RetryAgentExecution",
+                &agent_execution_id.to_string(),
+                "stage_execution_uuid",
+                "stage_execution_uuid",
+                &[],
+            );
+            let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
+                domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+                "RetryAgentExecution",
+                "Targeted retry rejected: provided agent_execution_id belongs to a different run or stage. No mutation was performed.",
+                domain::recovery_matrix::set_readback_identifier_guidance(
+                    domain::recovery_matrix::build_readback_v1(
+                        "P082-R08",
+                        "rejected",
+                        "no_mutation",
+                        domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+                        "Provide an agent_execution_id that belongs to the targeted run and stage.",
+                        "command_journal",
+                        "command_journal, agent_executions, stage_executions",
+                        &journal.id,
+                        Some("command_journal.error.p082_recovery_matrix_readback"),
+                        "valid",
+                        &now_ts.to_rfc3339(),
+                    ),
+                    guidance,
+                ),
+            );
+            self.record_failed_command_transaction(
+                journal,
+                "command.RetryAgentExecution",
+                &p082_envelope,
+            )
+            .await?;
+            db::metrics::increment_counter_with_label(
+                "p082_recovery_mutation_rejected_total",
+                &format!(
+                    "{}:RetryAgentExecution",
+                    domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE
+                ),
+            );
+            return Err(anyhow!("{err_msg}"));
         }
 
         let run_stages = stages::list_by_run(&self.pool, run_id).await?;
@@ -5800,13 +5919,53 @@ impl CommandHandler {
             .max_by_key(|s| s.started_at)
             .ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
         if latest_stage.id != old_stage.id {
-            return Err(anyhow!(
-                "Agent execution {} is on stale stage execution {}; latest for {} is {}",
-                agent_execution_id,
-                old_stage.id,
-                stage_id,
-                latest_stage.id
-            ));
+            let err_msg = format!(
+                "Targeted retry rejected: agent execution {} is on stale stage execution {}; latest for {} is {}. No mutation was performed.",
+                agent_execution_id, old_stage.id, stage_id, latest_stage.id
+            );
+            let now_ts = Utc::now();
+            let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
+                "RetryAgentExecution",
+                &old_stage.id.to_string(),
+                "stage_execution_uuid",
+                "stage_execution_uuid",
+                &[&latest_stage.id.to_string()],
+            );
+            let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
+                domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+                "RetryAgentExecution",
+                "Targeted retry rejected: provided agent_execution_id references a stale (superseded) stage execution. Use the latest stage execution. No mutation was performed.",
+                domain::recovery_matrix::set_readback_identifier_guidance(
+                    domain::recovery_matrix::build_readback_v1(
+                        "P082-R08",
+                        "rejected",
+                        "no_mutation",
+                        domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+                        "Provide an agent_execution_id from the latest stage execution attempt.",
+                        "command_journal",
+                        "command_journal, agent_executions, stage_executions",
+                        &journal.id,
+                        Some("command_journal.error.p082_recovery_matrix_readback"),
+                        "valid",
+                        &now_ts.to_rfc3339(),
+                    ),
+                    guidance,
+                ),
+            );
+            self.record_failed_command_transaction(
+                journal,
+                "command.RetryAgentExecution",
+                &p082_envelope,
+            )
+            .await?;
+            db::metrics::increment_counter_with_label(
+                "p082_recovery_mutation_rejected_total",
+                &format!(
+                    "{}:RetryAgentExecution",
+                    domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE
+                ),
+            );
+            return Err(anyhow!("{err_msg}"));
         }
 
         let completed_current_stage_on_blocked_run = old_stage.status == StageStatus::Completed
@@ -5815,12 +5974,98 @@ impl CommandHandler {
         if !matches!(old_stage.status, StageStatus::Failed | StageStatus::Blocked)
             && !completed_current_stage_on_blocked_run
         {
-            return Err(anyhow!(
+            let error = anyhow!(
                 "Stage {} latest attempt is {} and cannot be targeted-retried yet",
                 stage_id,
                 old_stage.status
-            ));
+            );
+            let now_ts = Utc::now();
+            let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
+                domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
+                "RetryAgentExecution",
+                &format!(
+                    "Targeted retry rejected: stage {} latest attempt is {} and is not in a retryable status. No mutation was performed.",
+                    stage_id, old_stage.status
+                ),
+                domain::recovery_matrix::build_readback_v1(
+                    "P082-R02",
+                    "rejected",
+                    "no_mutation",
+                    domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
+                    "Stage is not in a targeted-retryable status. No mutation was performed.",
+                    "command_journal, stage_executions",
+                    "command_journal, stages",
+                    &journal.id,
+                    Some("command_journal.error.p082_recovery_matrix_readback"),
+                    "valid",
+                    &now_ts.to_rfc3339(),
+                ),
+            );
+            self.record_failed_command_transaction(
+                journal,
+                "command.RetryAgentExecution",
+                &p082_envelope,
+            )
+            .await?;
+            db::metrics::increment_counter_with_label(
+                "p082_recovery_mutation_rejected_total",
+                &format!(
+                    "{}:RetryAgentExecution",
+                    domain::recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY
+                ),
+            );
+            return Err(error);
         }
+
+        // Ledger-backed preflight: check actual unresolved side effects for this stage.
+        // SEC-P082-02: RetryAgentExecution now fails closed on unresolved side effects,
+        // matching the RetryStage ledger preflight. Uses a short-lived transaction so we
+        // fail closed without starting the main mutation transaction.
+        {
+            let mut preflight_tx = self.pool.begin().await?;
+            if let Err(ledger_err) = retry_preflight_within_tx(
+                &mut preflight_tx,
+                &run_id,
+                &old_stage.id,
+                Some(&agent_execution_id),
+            )
+            .await
+            {
+                let _ = preflight_tx.rollback().await;
+                let now_ts = Utc::now();
+                let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
+                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                    "RetryAgentExecution",
+                    "Retry blocked: unresolved side-effect ledger entries exist. No mutation was performed.",
+                    domain::recovery_matrix::set_readback_side_effect_hold(
+                        domain::recovery_matrix::build_readback_v1(
+                            "P082-R07",
+                            "held",
+                            "reconcile_side_effects",
+                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                            "Reconcile unresolved side effects before retrying this agent execution.",
+                            "side_effects, command_journal",
+                            "side_effects, command_journal",
+                            &journal.id,
+                            Some("command_journal.error.p082_recovery_matrix_readback"),
+                            "valid",
+                            &now_ts.to_rfc3339(),
+                        ),
+                        "unresolved_side_effect_entries",
+                        "Retry blocked: unresolved side-effect ledger entries exist. Reconcile side effects before retrying.",
+                    ),
+                );
+                self.record_failed_command_transaction(
+                    journal,
+                    "command.RetryAgentExecution",
+                    &p082_envelope,
+                )
+                .await?;
+                return Err(ledger_err);
+            }
+            let _ = preflight_tx.rollback().await;
+        }
+
         let has_release_post_approval_tasks = match retry_state_has_release_post_approval_tasks(
             &run,
             &old_stage.stage_id,
@@ -5842,10 +6087,34 @@ impl CommandHandler {
             has_release_post_approval_tasks,
         ) {
             let error = requires_effect_reconciliation_error(&old_stage);
+            let now_ts = Utc::now();
+            let p082_envelope =
+                domain::recovery_matrix::build_rejected_command_error_envelope(
+                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                    "RetryAgentExecution",
+                    "Retry blocked: release stage has unresolved side effects requiring reconciliation. No mutation was performed.",
+                    domain::recovery_matrix::set_readback_side_effect_hold(
+                        domain::recovery_matrix::build_readback_v1(
+                            "P082-R07",
+                            "held",
+                            "reconcile_side_effects",
+                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                            "Reconcile unresolved side effects before retrying this agent execution.",
+                            "side_effects, command_journal",
+                            "side_effects, command_journal",
+                            &journal.id,
+                            Some("command_journal.error.p082_recovery_matrix_readback"),
+                            "valid",
+                            &now_ts.to_rfc3339(),
+                        ),
+                        "unresolved_side_effect_entries",
+                        "Retry blocked: release stage has unresolved side effects requiring reconciliation. Reconcile side effects before retrying.",
+                    ),
+                );
             self.record_failed_command_transaction(
                 journal,
                 "command.RetryAgentExecution",
-                &error.to_string(),
+                &p082_envelope,
             )
             .await?;
             return Err(error);

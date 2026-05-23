@@ -75,6 +75,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [test-gates.md](test-gates.md) — Layered local and CI execution gates, gate ownership, crash-aware runner behavior
 - [p041-generated-artifact-schemas.md](p041-generated-artifact-schemas.md) — Versioned schemas for server parity runtime artifacts, publication rows, and work products
 - [p031-p041-parity-evidence.json](p031-p041-parity-evidence.json) — Promoted reference snapshot for server parity evidence
+- [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md) — Canonical P082 recovery/retry scenarios, reason-code vocabulary, nested readback schemas, lane placement, fail-closed side-effect behavior, late-output quarantine, startup-requeue exhausted held state, cancel-then-late-output, observability thresholds, and `proposal-082|p082` gate ownership
 - [agent-ui-test-execution.md](agent-ui-test-execution.md) — How agents should run preview review, focused XCUITest, and app-launched UI proof flows
 
 ## System Health

@@ -111,6 +111,7 @@ pub async fn execute(
                 "retryAuthority": retry_authority_current_json(pool, run_id).await?,
                 "retryAuthorityHistory": retry_authority_history_json(pool, run_id).await?,
                 "p091OrphanRepairReadback": p091_orphan_repair_readback_json(pool, run_id).await?,
+                "p082_recovery_matrix_readbacks": p082_recovery_matrix_readbacks_json(pool, run_id, &principal.class, "reports.get").await?,
                 "implementation_handoff_status": implementation_handoff_status_json(pool, run_id).await?,
                 "implementation_self_assessment_summary": implementation_self_assessment_summary_json(pool, run_id).await?,
                 "rollout_contract_readback": rollout_contract_readback,
@@ -213,6 +214,42 @@ pub(crate) async fn retry_authority_current_json(
         value["retry_payload_recovery"] = readback;
     }
     Ok(value)
+}
+
+/// P082: singular latest p082_recovery_matrix_readback for runs.get (null when none applies).
+///
+/// Returns null for non-Operator principals — recovery readbacks contain session/work-item
+/// identifiers and operator messages that must not be exposed to Agent or Observer principals
+/// (SEC-P082-HIGH-1 fix).
+pub async fn p082_recovery_matrix_readback_json(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+    principal_class: &auth::PrincipalClass,
+) -> anyhow::Result<serde_json::Value> {
+    if *principal_class != auth::PrincipalClass::Operator {
+        return Ok(serde_json::Value::Null);
+    }
+    db::repos::p082_recovery_matrix::latest_readback_for_run(pool, run_id).await
+}
+
+/// P082: plural p082_recovery_matrix_readbacks for runs.get, reports.get, report resource,
+/// run report, and release receipt diagnostic context.
+///
+/// Returns an empty array for non-Operator principals (SEC-P082-HIGH-1 fix).
+/// `lane` is the readback lane label for the `p082_recovery_reason_readback_total` metric
+/// (e.g. `"mcp"`, `"reports.get"`, `"report_resource"`, `"release_receipt"`).
+pub async fn p082_recovery_matrix_readbacks_json(
+    pool: &SqlitePool,
+    run_id: domain::ids::RunId,
+    principal_class: &auth::PrincipalClass,
+    lane: &str,
+) -> anyhow::Result<serde_json::Value> {
+    if *principal_class != auth::PrincipalClass::Operator {
+        return Ok(serde_json::Value::Array(vec![]));
+    }
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(pool, run_id).await?;
+    db::repos::p082_recovery_matrix::emit_readback_lane_metrics(&readbacks, lane);
+    Ok(serde_json::Value::Array(readbacks))
 }
 
 pub(crate) async fn p091_orphan_repair_readback_json(

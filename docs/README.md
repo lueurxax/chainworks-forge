@@ -102,6 +102,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 - [reference/test-suite-architecture.md](reference/test-suite-architecture.md) — Swift Testing suite structure
 - [reference/test-gates.md](reference/test-gates.md) — Layered fast/UI/focused/full gates
 - [reference/p041-generated-artifact-schemas.md](reference/p041-generated-artifact-schemas.md) — Versioned schemas for server parity runtime artifacts, publication rows, and work products
+- [reference/recovery-retry-state-machine-test-matrix.md](reference/recovery-retry-state-machine-test-matrix.md) — Canonical P082 recovery/retry state-machine matrix, reason-code vocabulary, readback schemas, lane placement, and `proposal-082|p082` proof gate ownership
 - [reference/agent-ui-test-execution.md](reference/agent-ui-test-execution.md) — Agent-facing UI execution rules
 
 ### Risk analysis

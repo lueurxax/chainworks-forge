@@ -404,6 +404,7 @@ async fn delivery_receipt_builder_rejects_metadata_only_backfill_without_release
         &delivery_config,
         None,
         None,
+        vec![],
         "Release idea",
         None,
     );
@@ -1337,6 +1338,7 @@ async fn background_executor_preserves_existing_delivery_receipt_without_overwri
             failure_reason: Some("keep me".into()),
         }),
         rollout_contract_readback: None,
+        p082_recovery_matrix_readbacks: vec![],
         implementation_review_status: Some("sentinel".into()),
         timestamp: Utc::now(),
     };

@@ -155,6 +155,20 @@ pub const P058_REQUIRED_METRICS: &[&str] = &[
     "escalation_provider_late_frame_after_detach_total",
 ];
 
+/// P082: Required metric names for the recovery/retry state-machine matrix proof gate.
+/// These names are checked by the test gate to confirm all required metrics are declared
+/// before emission wiring is added at the approved sites.
+pub const P082_REQUIRED_METRICS: &[&str] = &[
+    "p082_recovery_matrix_rows_with_db_engine_readback_coverage_percent",
+    "p082_recovery_matrix_gate_result_total",
+    "p082_recovery_reason_readback_total",
+    "p082_recovery_mutation_rejected_total",
+    "p082_release_side_effect_retry_block_total",
+    "p082_late_output_quarantine_total",
+    "p082_recovery_idempotency_replay_total",
+    "p082_recovery_state_age_seconds",
+];
+
 fn metrics() -> &'static Mutex<SystemMetrics> {
     METRICS.get_or_init(|| Mutex::new(SystemMetrics::default()))
 }
@@ -630,6 +644,12 @@ pub fn get_p046_emit_lag_p99() -> Option<u64> {
     sorted.get(idx).copied()
 }
 
+pub fn get_counter_with_label(name: &str, label: &str) -> u64 {
+    let m = metrics().lock().unwrap();
+    let key = format!("{}:{}", name, label);
+    m.counters.get(&key).copied().unwrap_or(0)
+}
+
 pub fn record_hot_read_latency(tool: &str, duration: Duration) {
     let mut m = metrics().lock().unwrap();
     let ms = duration.as_millis() as u64;
@@ -1041,5 +1061,24 @@ mod tests {
                 "operator_alert_native_delivery_total:severity=critical,surface=macos,result=delivered"
             ) > 0
         );
+    }
+
+    #[test]
+    fn proposal_082_required_metric_names_are_declared() {
+        for metric in [
+            "p082_recovery_matrix_rows_with_db_engine_readback_coverage_percent",
+            "p082_recovery_matrix_gate_result_total",
+            "p082_recovery_reason_readback_total",
+            "p082_recovery_mutation_rejected_total",
+            "p082_release_side_effect_retry_block_total",
+            "p082_late_output_quarantine_total",
+            "p082_recovery_idempotency_replay_total",
+            "p082_recovery_state_age_seconds",
+        ] {
+            assert!(
+                P082_REQUIRED_METRICS.contains(&metric),
+                "missing required P082 metric declaration: {metric}"
+            );
+        }
     }
 }
