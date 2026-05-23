@@ -516,7 +516,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 38] {
+fn all_tool_capabilities() -> [CapabilityToolId; 39] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -556,6 +556,7 @@ fn all_tool_capabilities() -> [CapabilityToolId; 38] {
         CapabilityToolId::StorageMaintenanceRepairSlot,
         CapabilityToolId::StorageProjectionsClearBacklog,
         CapabilityToolId::StorageProjectionsClearPoison,
+        CapabilityToolId::AutomationAutoRetryLatest,
     ]
 }
 
@@ -634,6 +635,10 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::StorageProjectionsClearPoison => {
             matches!(class, PrincipalClass::Operator)
         }
+        CapabilityToolId::AutomationAutoRetryLatest => matches!(
+            class,
+            PrincipalClass::Operator | PrincipalClass::Observer
+        ),
     }
 }
 
@@ -748,6 +753,7 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
             Some(CapabilityToolId::StorageProjectionsClearBacklog)
         }
         "storage.projections.clear_poison" => Some(CapabilityToolId::StorageProjectionsClearPoison),
+        "automation.auto_retry.latest" => Some(CapabilityToolId::AutomationAutoRetryLatest),
         _ => None,
     }
 }

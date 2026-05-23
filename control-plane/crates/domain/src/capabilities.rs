@@ -50,6 +50,8 @@ pub enum CapabilityToolId {
     StorageProjectionsClearBacklog,
     /// P087: clear projection poison flag.
     StorageProjectionsClearPoison,
+    /// P076: read latest observe-only auto-retry ledger/catalog state.
+    AutomationAutoRetryLatest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]

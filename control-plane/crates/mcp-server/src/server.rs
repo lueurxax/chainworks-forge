@@ -439,6 +439,35 @@ impl McpServer {
                 }
 
                 let tool_params = params["arguments"].clone();
+                if canonical_tool_name == "automation.auto_retry.latest" {
+                    let requested_versions = tool_params
+                        .get("client_supported_versions")
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str().map(str::to_owned))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|| vec!["auto_retry_readback.v1".to_string()]);
+                    if !requested_versions
+                        .iter()
+                        .any(|version| version == "auto_retry_readback.v1")
+                    {
+                        return JsonRpcResponse::error_with_data(
+                            id,
+                            -32076,
+                            "unsupported_version".to_string(),
+                            serde_json::json!({
+                                "code": "unsupported_version",
+                                "supported_versions": ["auto_retry_readback.v1"],
+                                "unsupported_versions": requested_versions,
+                                "requested_versions": requested_versions
+                            }),
+                        )
+                        .with_error_request_id(Some(&request_id));
+                    }
+                }
 
                 match self
                     .dispatch_tool(canonical_tool_name, tool_params, principal, &request_id)
@@ -1059,6 +1088,8 @@ impl McpServer {
                 Some(request_id),
             )
             .await
+        } else if tool_name.starts_with("automation.") {
+            tools::automation::execute(tool_name, params).await
         } else {
             Err(anyhow::anyhow!("Unknown tool namespace: {tool_name}"))
         }

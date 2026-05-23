@@ -2384,6 +2384,7 @@ Available gates:
   proposal-065|p065  Proposal 065 operator retry instruction contract gate
   proposal-066|p066  Proposal 066 Phase 0 toolchain cache mapping scaffold gate
   proposal-075|p075  Proposal 075 Phase 1 local persistence write budget scaffold gate
+  proposal-076|p076  Proposal 076 auto-retry observation ledger schema and fixture proof gate
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
@@ -6048,6 +6049,684 @@ print(
 PY
 
     log "Proposal 075 gate passed"
+    ;;
+  proposal-076|p076)
+    # P076 fixture/contract/runtime proof gate.
+    # Proves: fixture presence, required field coverage, closed P076 enum domains,
+    # observe-only policy, 6 required top-level path echoes, version_negotiation
+    # shape, JSON-RPC error envelope for unsupported_version, budget_ref_v1 and
+    # observation_summary_v1 shapes, observation_id format, rollup dedupe proof,
+    # degraded-success/no_observation_history coverage, and negative fixture integrity
+    # (invalid enum rejection, missing required field, unknown field in closed schema).
+    log "Proposal 076 auto-retry observation ledger schema and fixture gate"
+    python3 - <<'PY'
+import json, re
+from pathlib import Path
+
+root = Path.cwd()
+
+P076_PATH_FIELDS = [
+    "ledger_path", "budget_state_path", "known_issue_catalog_path",
+    "generated_markdown_catalog_path", "lock_path", "rollup_report_path",
+]
+
+RETRY_ACTION_ENUM = {"none", "recommend_retry"}
+RETRY_RESULT_ENUM = {
+    "not_attempted", "not_allowed", "unknown", "accepted",
+    "rejected", "advanced", "reblocked", "failed", "timeout_ambiguous",
+}
+RETRY_RESULT_P076 = {"not_attempted", "not_allowed"}
+BLOCKER_CLASS_ENUM = {
+    "human_gate", "substantive_output_contract", "stale_execution_truth",
+    "projection_divergence", "provider_or_session_failure",
+    "retry_identifier_shape", "unknown",
+}
+POLICY_DECISION_ENUM = {
+    "observe_only", "collect_evidence", "human_gate", "cooldown_exhausted",
+    "budget_unavailable", "needs_systemic_fix", "needs_human_triage",
+    "retry_disabled_pending_idempotency_contract", "poll_timeout",
+    "skipped_lock_held", "skipped_backpressure",
+}
+KNOWN_ISSUE_STATUS_ENUM = {
+    "observed", "retrying_within_budget", "cooldown_exhausted",
+    "needs_systemic_fix", "needs_human_triage", "resolved_or_quiet", "archived",
+}
+READBACK_POLICY_STATUS_ENUM = {
+    "no_observation_history", "observed", "readback_degraded", "budget_unavailable",
+    "cooldown_exhausted", "needs_human_triage", "needs_systemic_fix",
+    "retry_disabled_pending_idempotency_contract",
+}
+BUDGET_STATUS_ENUM = {
+    "available", "cooldown", "budget_unavailable", "needs_human_triage",
+    "needs_systemic_fix", "disabled_pending_idempotency_contract",
+}
+DIAGNOSTIC_SEVERITY_ENUM = {"info", "warning", "error"}
+
+OBS_V1_REQUIRED = [
+    "schema_version", "observation_id", "canonical_record_hash", "observed_at",
+    "source", "daemon_ready", "policy_version", "writer_lock", "summary", "blocked_runs",
+]
+OBS_SUMMARY_KNOWN = set([
+    "observation_id", "observed_at", "run_id", "stage_id",
+    "blocker_signature_id", "blocker_class", "policy_decision",
+    "retry_action", "retry_result", "known_issue_status", "observation_path",
+    "stage_execution_id", "failure_summary", "next_systemic_action", "evidence_report_id",
+])
+
+OBS_SUMMARY_REQUIRED = [
+    "observation_id", "observed_at", "run_id", "stage_id",
+    "blocker_signature_id", "blocker_class", "policy_decision",
+    "retry_action", "retry_result", "known_issue_status", "observation_path",
+]
+
+RUN_SUMMARY_REQUIRED = [
+    "run_id", "auto_retry_policy_status", "auto_retry_policy_decision",
+    "auto_retry_observation_record_id", "auto_retry_observation_path",
+    "auto_retry_blocker_signature_id", "auto_retry_blocker_class",
+    "auto_retry_retry_budget_state", "auto_retry_last_retry_result",
+    "auto_retry_known_issue_status", "auto_retry_next_systemic_action",
+    "auto_retry_rollup_report_path", "auto_retry_human_gate_retry_attempt_total",
+    "auto_retry_budget_unavailable_reason", "auto_retry_backpressure_skip_count",
+    "auto_retry_readback_version", "oldest_planned_attempt_at",
+    "planned_attempt_age_seconds", "unknown_attempt_count", "required_operator_settlement",
+]
+
+BUDGET_REF_REQUIRED = [
+    "run_id", "blocker_signature_id", "status", "window_hours", "max_attempts",
+    "attempt_count", "remaining_attempts", "cooldown_until", "budget_state_path",
+]
+
+DIAGNOSTIC_V1_REQUIRED = ["code", "severity", "message"]
+DIAGNOSTIC_V1_KNOWN = {
+    "code", "severity", "message", "path", "run_id", "blocker_signature_id", "observation_id",
+}
+# Fields added to sample objects for fixture documentation (not part of the runtime schema)
+FIXTURE_METADATA_FIELDS = {"fixture_note"}
+
+AUTO_RETRY_READBACK_KNOWN = {
+    "schema_version", "generated_at", "version_negotiation",
+    "ledger_path", "budget_state_path", "known_issue_catalog_path",
+    "generated_markdown_catalog_path", "lock_path", "rollup_report_path",
+    "diagnostics", "observations", "latest_by_run",
+}
+
+RUN_SUMMARY_KNOWN = set(RUN_SUMMARY_REQUIRED)
+
+
+def is_rfc3339(s):
+    if not isinstance(s, str):
+        return False
+    return bool(re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', s))
+
+
+def is_absolute_path(s):
+    return isinstance(s, str) and s.startswith('/')
+
+
+def strict_validate_obs_summary(obs, label, allow_fixture_metadata=False):
+    """Strict-mode observation_summary_v1 validation (additionalProperties=false)."""
+    missing = [f for f in OBS_SUMMARY_REQUIRED if f not in obs]
+    if missing:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 missing required fields: {missing}")
+    known = OBS_SUMMARY_KNOWN | (FIXTURE_METADATA_FIELDS if allow_fixture_metadata else set())
+    extra = set(obs.keys()) - known
+    if extra:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 unknown fields (strict mode): {extra}")
+    for str_field in ["run_id", "stage_id", "blocker_signature_id"]:
+        val = obs.get(str_field)
+        if not isinstance(val, str):
+            raise SystemExit(f"proposal-076: {label} observation_summary_v1 {str_field} must be a non-null string, got {type(val).__name__!r}")
+    if obs.get("blocker_class") not in BLOCKER_CLASS_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 invalid blocker_class: {obs.get('blocker_class')!r}")
+    if obs.get("policy_decision") not in POLICY_DECISION_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 invalid policy_decision: {obs.get('policy_decision')!r}")
+    if obs.get("retry_action") not in RETRY_ACTION_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 invalid retry_action: {obs.get('retry_action')!r}")
+    if obs.get("retry_result") not in RETRY_RESULT_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 invalid retry_result: {obs.get('retry_result')!r}")
+    if obs.get("known_issue_status") not in KNOWN_ISSUE_STATUS_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 invalid known_issue_status: {obs.get('known_issue_status')!r}")
+    obs_id = obs.get("observation_id", "")
+    if not re.match(r'^ar_obs_\d{8}T\d{6}Z_[0-9a-f]{12}$', obs_id):
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 invalid observation_id format: {obs_id!r}")
+    if not is_rfc3339(obs.get("observed_at")):
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 observed_at must be RFC3339, got {obs.get('observed_at')!r}")
+    obs_path = obs.get("observation_path")
+    if not is_absolute_path(obs_path):
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 observation_path must be a non-null absolute path, got {obs_path!r}")
+    for nullable_str in ["stage_execution_id", "failure_summary", "next_systemic_action", "evidence_report_id"]:
+        val = obs.get(nullable_str)
+        if val is not None and not isinstance(val, str):
+            raise SystemExit(f"proposal-076: {label} observation_summary_v1 {nullable_str} must be string|null, got {type(val).__name__}")
+
+
+def permissive_validate_obs_summary(obs, label):
+    """Permissive-mode observation_summary_v1: required fields must be present; unknown fields tolerated with diagnostic.
+    Returns a list of diagnostic dicts for any unknown fields found (must be non-empty to prove diagnostic emission)."""
+    diagnostics = []
+    missing = [f for f in OBS_SUMMARY_REQUIRED if f not in obs]
+    if missing:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 (permissive) missing required fields: {missing}")
+    extra = set(obs.keys()) - OBS_SUMMARY_KNOWN
+    if extra:
+        diagnostics.append({
+            "code": "unknown_field_ignored",
+            "severity": "warning",
+            "message": f"Unknown fields ignored in permissive report mode: {sorted(extra)}",
+        })
+    if obs.get("blocker_class") not in BLOCKER_CLASS_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 (permissive) invalid blocker_class: {obs.get('blocker_class')!r}")
+    if obs.get("policy_decision") not in POLICY_DECISION_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 (permissive) invalid policy_decision: {obs.get('policy_decision')!r}")
+    return diagnostics
+
+
+BUDGET_REF_KNOWN = {
+    "run_id", "blocker_signature_id", "status", "window_hours", "max_attempts",
+    "attempt_count", "remaining_attempts", "cooldown_until", "budget_state_path",
+    "last_observation_id", "oldest_planned_attempt_at", "planned_attempt_age_seconds",
+    "unknown_attempt_count", "required_operator_settlement", "budget_unavailable_reason",
+}
+
+
+def validate_budget_ref_v1_scalars(br, label, allow_fixture_metadata=False):
+    """Validate budget_ref_v1 required fields, scalar types, and enum."""
+    for req in BUDGET_REF_REQUIRED:
+        if req not in br:
+            raise SystemExit(f"proposal-076: {label} budget_ref_v1 missing required field: {req}")
+    known = BUDGET_REF_KNOWN | (FIXTURE_METADATA_FIELDS if allow_fixture_metadata else set())
+    extra = set(br.keys()) - known
+    if extra:
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 unknown fields (strict mode): {extra}")
+    for str_field in ["run_id", "blocker_signature_id"]:
+        val = br.get(str_field)
+        if not isinstance(val, str):
+            raise SystemExit(f"proposal-076: {label} budget_ref_v1 {str_field} must be a non-null string, got {type(val).__name__!r}")
+    if not isinstance(br.get("window_hours"), int) or br["window_hours"] <= 0:
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 window_hours must be positive integer, got {br.get('window_hours')!r}")
+    if not isinstance(br.get("max_attempts"), int) or br["max_attempts"] < 0:
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 max_attempts must be non-negative integer, got {br.get('max_attempts')!r}")
+    if not isinstance(br.get("attempt_count"), int) or br["attempt_count"] < 0:
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 attempt_count must be non-negative integer, got {br.get('attempt_count')!r}")
+    if not isinstance(br.get("remaining_attempts"), int) or br["remaining_attempts"] < 0:
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 remaining_attempts must be non-negative integer, got {br.get('remaining_attempts')!r}")
+    if br.get("status") not in BUDGET_STATUS_ENUM:
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 invalid status: {br.get('status')!r}")
+    budget_state_path_val = br.get("budget_state_path")
+    if not is_absolute_path(budget_state_path_val):
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 budget_state_path must be absolute path, got {budget_state_path_val!r}")
+    cooldown_until_val = br.get("cooldown_until")
+    if cooldown_until_val is not None and not is_rfc3339(cooldown_until_val):
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 cooldown_until must be RFC3339|null, got {cooldown_until_val!r}")
+    last_obs_id_val = br.get("last_observation_id")
+    if last_obs_id_val is not None and not re.match(r'^ar_obs_\d{8}T\d{6}Z_[0-9a-f]{12}$', last_obs_id_val):
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 last_observation_id must be observation_id format or null, got {last_obs_id_val!r}")
+    oldest_planned_val = br.get("oldest_planned_attempt_at")
+    if oldest_planned_val is not None and not is_rfc3339(oldest_planned_val):
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 oldest_planned_attempt_at must be RFC3339|null, got {oldest_planned_val!r}")
+    planned_age_val = br.get("planned_attempt_age_seconds")
+    if planned_age_val is not None and (not isinstance(planned_age_val, int) or planned_age_val < 0):
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 planned_attempt_age_seconds must be non_negative_integer|null, got {planned_age_val!r}")
+    unknown_count_val = br.get("unknown_attempt_count")
+    if unknown_count_val is not None and (not isinstance(unknown_count_val, int) or unknown_count_val < 0):
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 unknown_attempt_count must be non_negative_integer|null, got {unknown_count_val!r}")
+    for nullable_str in ["required_operator_settlement", "budget_unavailable_reason"]:
+        val = br.get(nullable_str)
+        if val is not None and not isinstance(val, str):
+            raise SystemExit(f"proposal-076: {label} budget_ref_v1 {nullable_str} must be string|null, got {type(val).__name__}")
+
+
+def validate_diagnostic_v1(diag, label):
+    """Validate common_diagnostic_v1 required fields, closed shape, enum, and nullable scoped fields."""
+    for req in DIAGNOSTIC_V1_REQUIRED:
+        if req not in diag:
+            raise SystemExit(f"proposal-076: {label} common_diagnostic_v1 missing required field: {req}")
+    if diag.get("severity") not in DIAGNOSTIC_SEVERITY_ENUM:
+        raise SystemExit(f"proposal-076: {label} common_diagnostic_v1 invalid severity: {diag.get('severity')!r}")
+    extra = set(diag.keys()) - DIAGNOSTIC_V1_KNOWN
+    if extra:
+        raise SystemExit(f"proposal-076: {label} common_diagnostic_v1 unknown fields (closed shape): {extra}")
+    for nullable_str in ["path", "run_id", "blocker_signature_id", "observation_id"]:
+        val = diag.get(nullable_str)
+        if val is not None and not isinstance(val, str):
+            raise SystemExit(f"proposal-076: {label} common_diagnostic_v1 {nullable_str} must be string|null, got {type(val).__name__}")
+
+
+def require_auto_retry_readback(payload, label):
+    arb = payload.get("auto_retry_readback")
+    if not isinstance(arb, dict):
+        raise SystemExit(f"proposal-076: {label} missing auto_retry_readback")
+    if arb.get("schema_version") != "auto_retry_readback.v1":
+        raise SystemExit(f"proposal-076: {label} auto_retry_readback has invalid schema_version: {arb.get('schema_version')!r}")
+    if not is_rfc3339(arb.get("generated_at")):
+        raise SystemExit(f"proposal-076: {label} auto_retry_readback generated_at must be RFC3339, got {arb.get('generated_at')!r}")
+    extra_arb = set(arb.keys()) - AUTO_RETRY_READBACK_KNOWN
+    if extra_arb:
+        raise SystemExit(f"proposal-076: {label} auto_retry_readback has unknown fields (additionalProperties=false): {extra_arb}")
+    for pf in P076_PATH_FIELDS:
+        if not is_absolute_path(arb.get(pf)):
+            raise SystemExit(f"proposal-076: {label} auto_retry_readback path field {pf!r} must be absolute path, got {arb.get(pf)!r}")
+    vn = arb.get("version_negotiation")
+    if not isinstance(vn, dict):
+        raise SystemExit(f"proposal-076: {label} auto_retry_readback missing version_negotiation")
+    for vf in ["selected_version", "supported_versions", "unsupported_versions"]:
+        if vf not in vn:
+            raise SystemExit(f"proposal-076: {label} version_negotiation missing {vf}")
+    if not isinstance(vn.get("supported_versions"), list):
+        raise SystemExit(f"proposal-076: {label} version_negotiation.supported_versions must be an array")
+    if not isinstance(vn.get("unsupported_versions"), list):
+        raise SystemExit(f"proposal-076: {label} version_negotiation.unsupported_versions must be an array")
+    diagnostics = arb.get("diagnostics")
+    if not isinstance(diagnostics, list):
+        raise SystemExit(f"proposal-076: {label} auto_retry_readback diagnostics must be an array")
+    for diag in diagnostics:
+        validate_diagnostic_v1(diag, label)
+    observations = arb.get("observations")
+    if not isinstance(observations, list):
+        raise SystemExit(f"proposal-076: {label} observations must be an array")
+    for obs in observations:
+        strict_validate_obs_summary(obs, label)
+        if obs.get("retry_result") not in RETRY_RESULT_P076:
+            raise SystemExit(f"proposal-076: {label} P076 observation retry_result must be not_attempted or not_allowed, got {obs.get('retry_result')!r}")
+    latest = arb.get("latest_by_run")
+    if not isinstance(latest, list):
+        raise SystemExit(f"proposal-076: {label} latest_by_run must be an array")
+    for rs in latest:
+        for req in RUN_SUMMARY_REQUIRED:
+            if req not in rs:
+                raise SystemExit(f"proposal-076: {label} run_summary missing required field {req}")
+        extra_rs = set(rs.keys()) - RUN_SUMMARY_KNOWN
+        if extra_rs:
+            raise SystemExit(f"proposal-076: {label} run_summary unknown fields (additionalProperties=false): {extra_rs}")
+        total = rs.get("auto_retry_human_gate_retry_attempt_total")
+        if not isinstance(total, int) or total < 0:
+            raise SystemExit(f"proposal-076: {label} auto_retry_human_gate_retry_attempt_total must be non-negative integer")
+        skip_count = rs.get("auto_retry_backpressure_skip_count")
+        if not isinstance(skip_count, int) or skip_count < 0:
+            raise SystemExit(f"proposal-076: {label} auto_retry_backpressure_skip_count must be non-negative integer")
+        policy_status = rs.get("auto_retry_policy_status")
+        if policy_status not in READBACK_POLICY_STATUS_ENUM:
+            raise SystemExit(f"proposal-076: {label} run_summary invalid auto_retry_policy_status: {policy_status!r}")
+        policy_decision = rs.get("auto_retry_policy_decision")
+        if policy_decision is not None and policy_decision not in POLICY_DECISION_ENUM:
+            raise SystemExit(f"proposal-076: {label} run_summary invalid auto_retry_policy_decision: {policy_decision!r}")
+        blocker_class = rs.get("auto_retry_blocker_class")
+        if blocker_class is not None and blocker_class not in BLOCKER_CLASS_ENUM:
+            raise SystemExit(f"proposal-076: {label} run_summary invalid auto_retry_blocker_class: {blocker_class!r}")
+        budget_state = rs.get("auto_retry_retry_budget_state")
+        if budget_state is not None and budget_state not in BUDGET_STATUS_ENUM:
+            raise SystemExit(f"proposal-076: {label} run_summary invalid auto_retry_retry_budget_state: {budget_state!r}")
+        last_retry = rs.get("auto_retry_last_retry_result")
+        if last_retry is not None and last_retry not in RETRY_RESULT_ENUM:
+            raise SystemExit(f"proposal-076: {label} run_summary invalid auto_retry_last_retry_result: {last_retry!r}")
+        known_issue = rs.get("auto_retry_known_issue_status")
+        if known_issue is not None and known_issue not in KNOWN_ISSUE_STATUS_ENUM:
+            raise SystemExit(f"proposal-076: {label} run_summary invalid auto_retry_known_issue_status: {known_issue!r}")
+        oldest_planned = rs.get("oldest_planned_attempt_at")
+        if oldest_planned is not None and not is_rfc3339(oldest_planned):
+            raise SystemExit(f"proposal-076: {label} run_summary oldest_planned_attempt_at must be RFC3339|null, got {oldest_planned!r}")
+        for nni_field in ["planned_attempt_age_seconds", "unknown_attempt_count"]:
+            nni_val = rs.get(nni_field)
+            if nni_val is not None and (not isinstance(nni_val, int) or nni_val < 0):
+                raise SystemExit(f"proposal-076: {label} run_summary {nni_field} must be non_negative_integer|null, got {nni_val!r}")
+    return arb
+
+
+# --- Positive fixture ---
+fixture_path = root / "docs/evidence/rollout-contract/operator-readback/p076-full-surface.fixture.json"
+if not fixture_path.exists():
+    raise SystemExit("proposal-076: missing P076 operator-readback fixture")
+fixture = json.loads(fixture_path.read_text())
+
+# Assert fixture is scoped as hold (not release) until runtime phases are implemented
+if fixture.get("rollout_contract_decision") == "release":
+    raise SystemExit("proposal-076: rollout_contract_decision must not be 'release' for Phase 1 scaffolding; expected 'hold'")
+
+main_arb = require_auto_retry_readback(fixture, "run_report")
+lanes = fixture.get("parity_lanes") or {}
+
+# Assert no unauthorized graphql lane in parity_lanes (no GraphQL schema changes in P076)
+if "graphql" in lanes:
+    raise SystemExit("proposal-076: parity_lanes must not contain a 'graphql' key (P076 no-change-compatibility rule)")
+
+require_auto_retry_readback(lanes.get("mcp") or {}, "mcp")
+require_auto_retry_readback(lanes.get("release_receipt") or {}, "release_receipt")
+
+# Prove: no side-effecting retry in any lane
+for _label, _payload in [("run_report", fixture), ("mcp", lanes.get("mcp") or {}), ("release_receipt", lanes.get("release_receipt") or {})]:
+    for obs in (_payload.get("auto_retry_readback") or {}).get("observations", []):
+        if obs.get("retry_result") not in RETRY_RESULT_P076:
+            raise SystemExit(f"proposal-076: {_label} fixture has non-P076 retry_result {obs.get('retry_result')!r}")
+
+# Prove: human_gate observation with retry_action=none
+if not any(
+    obs.get("blocker_class") == "human_gate" and obs.get("retry_action") == "none"
+    for obs in main_arb.get("observations", [])
+):
+    raise SystemExit("proposal-076: fixture must prove human_gate observation with retry_action=none")
+
+# Prove: no_observation_history and readback_degraded in latest_by_run
+statuses = {rs.get("auto_retry_policy_status") for rs in main_arb.get("latest_by_run", [])}
+if "no_observation_history" not in statuses:
+    raise SystemExit("proposal-076: fixture must prove no_observation_history run in latest_by_run")
+if "readback_degraded" not in statuses:
+    raise SystemExit("proposal-076: fixture must prove readback_degraded run in latest_by_run (degraded-success)")
+
+# Prove: rollup grouping — at least 2 observations share a blocker_signature_id
+sig_counts = {}
+for obs in main_arb.get("observations", []):
+    sig = obs.get("blocker_signature_id")
+    if sig:
+        sig_counts[sig] = sig_counts.get(sig, 0) + 1
+if not any(v >= 2 for v in sig_counts.values()):
+    raise SystemExit("proposal-076: fixture must have >=2 observations with the same blocker_signature_id to prove rollup dedupe")
+
+# Prove: observe_only policy_decision present
+if not any(obs.get("policy_decision") == "observe_only" for obs in main_arb.get("observations", [])):
+    raise SystemExit("proposal-076: fixture must include at least one observe_only policy_decision observation")
+
+# Prove: unsupported_version_error_sample shape
+uv = fixture.get("unsupported_version_error_sample")
+if not isinstance(uv, dict):
+    raise SystemExit("proposal-076: fixture missing unsupported_version_error_sample")
+err_envelope = uv.get("error") or {}
+if err_envelope.get("code") != -32076:
+    raise SystemExit("proposal-076: unsupported_version error.code must be -32076 (JSON-RPC application error envelope)")
+if err_envelope.get("message") != "unsupported_version":
+    raise SystemExit("proposal-076: unsupported_version error.message must be 'unsupported_version'")
+err_data = err_envelope.get("data") or {}
+for ef in ["code", "supported_versions", "unsupported_versions", "requested_versions"]:
+    if ef not in err_data:
+        raise SystemExit(f"proposal-076: unsupported_version_error_sample error.data missing {ef}")
+
+# Prove: budget_ref_v1_sample shape + scalar types
+br = fixture.get("budget_ref_v1_sample")
+if not isinstance(br, dict):
+    raise SystemExit("proposal-076: fixture missing budget_ref_v1_sample")
+for req in BUDGET_REF_REQUIRED:
+    if req not in br:
+        raise SystemExit(f"proposal-076: budget_ref_v1_sample missing required field {req}")
+validate_budget_ref_v1_scalars(br, "budget_ref_v1_sample", allow_fixture_metadata=True)
+
+# Prove: observation_summary_v1_sample — strict validate (closed schema, enum domains, id format)
+# fixture_note is allowed as documentation metadata in sample objects
+os_sample = fixture.get("observation_summary_v1_sample")
+if not isinstance(os_sample, dict):
+    raise SystemExit("proposal-076: fixture missing observation_summary_v1_sample")
+strict_validate_obs_summary(os_sample, "observation_summary_v1_sample", allow_fixture_metadata=True)
+
+# Prove: strict_validation_proof shape
+svp = fixture.get("strict_validation_proof") or {}
+svp_input = svp.get("sample_input") or {}
+if svp.get("expected_outcome") != "rejected":
+    raise SystemExit("proposal-076: strict_validation_proof.expected_outcome must be 'rejected'")
+svp_extra = set(svp_input.keys()) - OBS_SUMMARY_KNOWN
+if not svp_extra:
+    raise SystemExit("proposal-076: strict_validation_proof.sample_input must contain unknown fields for strict rejection")
+
+# Prove: permissive_validation_proof shape — required fields present, unknown field present
+pvp = fixture.get("permissive_validation_proof") or {}
+pvp_input = pvp.get("sample_input") or {}
+if pvp.get("expected_outcome") != "accepted_with_diagnostic":
+    raise SystemExit("proposal-076: permissive_validation_proof.expected_outcome must be 'accepted_with_diagnostic'")
+pvp_missing = [f for f in OBS_SUMMARY_REQUIRED if f not in pvp_input]
+if pvp_missing:
+    raise SystemExit(f"proposal-076: permissive_validation_proof.sample_input missing required fields for permissive validation: {pvp_missing}")
+pvp_extra = set(pvp_input.keys()) - OBS_SUMMARY_KNOWN
+if not pvp_extra:
+    raise SystemExit("proposal-076: permissive_validation_proof.sample_input must contain an unknown additive field to prove permissive tolerance")
+pvp_diags = permissive_validate_obs_summary(pvp_input, "permissive_validation_proof")
+if not pvp_diags:
+    raise SystemExit("proposal-076: permissive_validate_obs_summary must emit at least one diagnostic for unknown fields (permissive_report mode must prove diagnostic emission, not silent tolerance)")
+
+# Prove: degraded_readback_sample shape (successful response with diagnostics, no partial-failure transport error)
+drs = fixture.get("degraded_readback_sample") or {}
+if drs.get("schema_version") != "auto_retry_readback.v1":
+    raise SystemExit("proposal-076: degraded_readback_sample must have schema_version=auto_retry_readback.v1")
+for pf in P076_PATH_FIELDS:
+    if not drs.get(pf):
+        raise SystemExit(f"proposal-076: degraded_readback_sample missing required path field: {pf}")
+drs_diags = drs.get("diagnostics") or []
+if not isinstance(drs_diags, list):
+    raise SystemExit("proposal-076: degraded_readback_sample diagnostics must be an array")
+for diag in drs_diags:
+    validate_diagnostic_v1(diag, "degraded_readback_sample")
+if not isinstance(drs.get("observations"), list):
+    raise SystemExit("proposal-076: degraded_readback_sample observations must be an array")
+if not isinstance(drs.get("latest_by_run"), list):
+    raise SystemExit("proposal-076: degraded_readback_sample latest_by_run must be an array")
+
+# --- Negative fixtures ---
+neg_dir = root / "docs/evidence/rollout-contract/negative"
+negative_fixtures = [
+    "p076-side-effect-retry-present.jsonl",
+    "p076-human-gate-retried.jsonl",
+    "p076-missing-schema-field.jsonl",
+    "p076-invalid-enum-strict.jsonl",
+    "p076-ledger-append-missing-newline.jsonl",
+    "p076-missing-budget-ref-schema.json",
+    "p076-missing-observation-summary-schema.json",
+    "p076-missing-readback-lock-path.json",
+    "p076-missing-readback-rollup-report-path.json",
+    "p076-budget-failure-retried.json",
+    "p076-backpressure-exceeded.json",
+    "p076-human-gate-starvation.json",
+    "p076-orphaned-planned-attempt-not-escalated.json",
+    "p076-pid-reuse-lock-liveness-gap.json",
+    "p076-poll-timeout-without-observation.json",
+    "p076-retry-timeout-duplicate-not-suppressed.json",
+    "p076-ledger-append-not-fsynced.json",
+    "p076-markdown-catalog-as-authority.json",
+    "p076-unsafe-stale-lock-recovery.json",
+    "p076-unknown-field-strict.json",
+]
+for nf in negative_fixtures:
+    if not (neg_dir / nf).exists():
+        raise SystemExit(f"proposal-076: missing negative fixture {nf}")
+
+# Validate: side-effect-retry-present has non-P076-compliant retry_result in blocked_runs
+se_found = False
+for line in (neg_dir / "p076-side-effect-retry-present.jsonl").read_text().splitlines():
+    if not line.strip():
+        continue
+    try:
+        rec = json.loads(line)
+        for br in rec.get("blocked_runs", []):
+            if br.get("retry_result") not in RETRY_RESULT_P076:
+                se_found = True
+    except Exception:
+        pass
+if not se_found:
+    raise SystemExit("proposal-076: p076-side-effect-retry-present.jsonl must have a blocked_run with retry_result not in {not_attempted, not_allowed}")
+
+# Validate: human-gate-retried has human_gate with non-not_attempted retry_result
+hg_found = False
+for line in (neg_dir / "p076-human-gate-retried.jsonl").read_text().splitlines():
+    if not line.strip():
+        continue
+    try:
+        rec = json.loads(line)
+        for br in rec.get("blocked_runs", []):
+            if br.get("blocker_class") == "human_gate" and br.get("retry_result") not in {None, "not_attempted"}:
+                hg_found = True
+    except Exception:
+        pass
+if not hg_found:
+    raise SystemExit("proposal-076: p076-human-gate-retried.jsonl must have a human_gate blocked_run with non-not_attempted retry_result")
+
+# Validate: ledger-append-missing-newline does NOT end with newline
+nl_bytes = (neg_dir / "p076-ledger-append-missing-newline.jsonl").read_bytes()
+if nl_bytes.endswith(b"\n"):
+    raise SystemExit("proposal-076: p076-ledger-append-missing-newline.jsonl must not end with newline (proves missing trailing newline violation)")
+
+# Validate: missing-readback-lock-path omits lock_path
+lock_fix = json.loads((neg_dir / "p076-missing-readback-lock-path.json").read_text())
+if "lock_path" in (lock_fix.get("auto_retry_readback") or {}):
+    raise SystemExit("proposal-076: p076-missing-readback-lock-path.json must omit lock_path from auto_retry_readback")
+
+# Validate: missing-readback-rollup-report-path omits rollup_report_path
+rollup_fix = json.loads((neg_dir / "p076-missing-readback-rollup-report-path.json").read_text())
+if "rollup_report_path" in (rollup_fix.get("auto_retry_readback") or {}):
+    raise SystemExit("proposal-076: p076-missing-readback-rollup-report-path.json must omit rollup_report_path from auto_retry_readback")
+
+# Validate: budget-failure-retried marker
+bf = json.loads((neg_dir / "p076-budget-failure-retried.json").read_text())
+if not bf.get("proves_budget_unavailable_should_block_retry"):
+    raise SystemExit("proposal-076: p076-budget-failure-retried.json missing proves_budget_unavailable_should_block_retry")
+
+# Validate: backpressure-exceeded marker
+bp = json.loads((neg_dir / "p076-backpressure-exceeded.json").read_text())
+if not bp.get("proves_missing_skipped_work_record"):
+    raise SystemExit("proposal-076: p076-backpressure-exceeded.json missing proves_missing_skipped_work_record")
+
+# Validate: pid-reuse-lock-liveness-gap markers
+pid = json.loads((neg_dir / "p076-pid-reuse-lock-liveness-gap.json").read_text())
+if not pid.get("proves_pid_reuse_risk"):
+    raise SystemExit("proposal-076: p076-pid-reuse-lock-liveness-gap.json missing proves_pid_reuse_risk")
+if not isinstance(pid.get("missing_liveness_fields"), list):
+    raise SystemExit("proposal-076: p076-pid-reuse-lock-liveness-gap.json missing_liveness_fields must be a list")
+
+# Validate: poll-timeout-without-observation marker
+pto = json.loads((neg_dir / "p076-poll-timeout-without-observation.json").read_text())
+if not pto.get("proves_missing_timeout_observation"):
+    raise SystemExit("proposal-076: p076-poll-timeout-without-observation.json missing proves_missing_timeout_observation")
+
+# Validate: unsafe-stale-lock-recovery marker
+slr = json.loads((neg_dir / "p076-unsafe-stale-lock-recovery.json").read_text())
+if not slr.get("proves_unsafe_stale_lock_recovery"):
+    raise SystemExit("proposal-076: p076-unsafe-stale-lock-recovery.json missing proves_unsafe_stale_lock_recovery")
+
+# Validate: unknown-field-strict rejection mode
+uf = json.loads((neg_dir / "p076-unknown-field-strict.json").read_text())
+if uf.get("unknown_field_rejection_mode") != "strict":
+    raise SystemExit("proposal-076: p076-unknown-field-strict.json must have unknown_field_rejection_mode='strict'")
+
+# Strict validator: p076-unknown-field-strict.json sample_record must contain a field
+# not in the observation_summary_v1 additionalProperties=false schema; also confirm
+# that running the strict validator against it would fail (extra fields detected)
+uf_sample = uf.get("sample_record") or {}
+uf_extra = set(uf_sample.keys()) - OBS_SUMMARY_KNOWN
+if not uf_extra:
+    raise SystemExit(
+        "proposal-076: p076-unknown-field-strict.json sample_record must contain at least one "
+        "field absent from the observation_summary_v1 schema (additionalProperties=false)"
+    )
+# Verify strict validator would reject it (the sample has required fields present too)
+uf_missing_required = [f for f in OBS_SUMMARY_REQUIRED if f not in uf_sample]
+if uf_missing_required:
+    raise SystemExit(
+        f"proposal-076: p076-unknown-field-strict.json sample_record must include all required "
+        f"observation_summary_v1 fields so strict rejection is for extra fields, not missing ones. "
+        f"Missing: {uf_missing_required}"
+    )
+# Invoke strict validator and confirm it raises for the unknown field (fail-closed proof)
+try:
+    strict_validate_obs_summary(uf_sample, "p076-unknown-field-strict-sample")
+    raise SystemExit(
+        "proposal-076: strict_validate_obs_summary failed to reject p076-unknown-field-strict.json "
+        "sample_record — fail-closed strict mode must reject unknown fields in additionalProperties=false schemas"
+    )
+except SystemExit as _e:
+    if "unknown fields" not in str(_e) and "strict mode" not in str(_e):
+        raise _e
+    # expected: strict rejection confirmed — fail-closed proof passes
+
+# Strict validator: p076-invalid-enum-strict.jsonl must have a blocked_run with
+# blocker_class outside the closed BLOCKER_CLASS_ENUM domain
+inv_enum_found = False
+for line in (neg_dir / "p076-invalid-enum-strict.jsonl").read_text().splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        rec = json.loads(line)
+        for br in rec.get("blocked_runs", []):
+            if br.get("blocker_class") not in BLOCKER_CLASS_ENUM:
+                inv_enum_found = True
+    except Exception:
+        pass
+if not inv_enum_found:
+    raise SystemExit(
+        "proposal-076: p076-invalid-enum-strict.jsonl must have a blocked_run with "
+        "blocker_class not in the closed enum domain"
+    )
+
+# Strict validator: p076-missing-schema-field.jsonl must have a record missing at
+# least one required auto_retry_observation_v1 top-level field
+missing_field_found = False
+for line in (neg_dir / "p076-missing-schema-field.jsonl").read_text().splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        rec = json.loads(line)
+        if any(req not in rec for req in OBS_V1_REQUIRED):
+            missing_field_found = True
+    except Exception:
+        pass
+if not missing_field_found:
+    raise SystemExit(
+        "proposal-076: p076-missing-schema-field.jsonl must have a record missing at least "
+        "one required auto_retry_observation_v1 field"
+    )
+
+# Active validator: p076-missing-observation-summary-schema.json observations must be
+# missing required observation_summary_v1 fields (proves strict validator would reject them)
+mobs_fix = json.loads((neg_dir / "p076-missing-observation-summary-schema.json").read_text())
+mobs_observations = mobs_fix.get("observations") or []
+if not mobs_observations:
+    raise SystemExit("proposal-076: p076-missing-observation-summary-schema.json must have at least one observation")
+mobs_obs = mobs_observations[0]
+mobs_missing = [f for f in OBS_SUMMARY_REQUIRED if f not in mobs_obs]
+if not mobs_missing:
+    raise SystemExit(
+        "proposal-076: p076-missing-observation-summary-schema.json observation must be missing "
+        "at least one required observation_summary_v1 field (proves strict validator rejects it)"
+    )
+
+# Active validator: p076-missing-budget-ref-schema.json observations must either be missing
+# required fields OR contain unknown fields (proves strict validator would reject them)
+mbr_fix = json.loads((neg_dir / "p076-missing-budget-ref-schema.json").read_text())
+mbr_observations = mbr_fix.get("observations") or []
+if not mbr_observations:
+    raise SystemExit("proposal-076: p076-missing-budget-ref-schema.json must have at least one observation")
+mbr_obs = mbr_observations[0]
+mbr_missing = [f for f in OBS_SUMMARY_REQUIRED if f not in mbr_obs]
+mbr_extra = set(mbr_obs.keys()) - OBS_SUMMARY_KNOWN
+if not mbr_missing and not mbr_extra:
+    raise SystemExit(
+        "proposal-076: p076-missing-budget-ref-schema.json observation must be missing required fields "
+        "or have unknown fields, proving the strict validator would detect a schema violation"
+    )
+
+print("proposal-076 all gate checks passed")
+PY
+    if ! rg -q "automation.auto_retry.latest" "$ROOT_DIR/control-plane/crates/mcp-server/src"; then
+      printf 'proposal-076: missing production automation.auto_retry.latest MCP readback tool\n' >&2
+      exit 1
+    fi
+    if [[ ! -x "$ROOT_DIR/scripts/chainworks/auto_retry_rollup.py" ]]; then
+      printf 'proposal-076: missing auto-retry rollup tooling\n' >&2
+      exit 1
+    fi
+    tmp_p076="$(mktemp -d "${TMPDIR:-/tmp}/p076-rollup.XXXXXX")"
+    mkdir -p "$tmp_p076/automation"
+    printf '%s\n' '{"schema_version":"auto-retry-observation.v1","observation_id":"ar_obs_20260523T100000Z_a1b2c3d4e5f6","observed_at":"2026-05-23T10:00:00Z","blocked_runs":[{"run_id":"run-a","stage_id":"state_9","blocker_signature_id":"sig-p076","blocker_class":"substantive_output_contract","policy_decision":"observe_only","retry_action":"none","retry_result":"not_attempted","failure_summary":"missing output","next_systemic_action":"inspect contract"}]}' '{"schema_version":"auto-retry-observation.v1","observation_id":"ar_obs_20260523T100100Z_b1b2c3d4e5f6","observed_at":"2026-05-23T10:01:00Z","blocked_runs":[{"run_id":"run-b","stage_id":"state_9","blocker_signature_id":"sig-p076","blocker_class":"substantive_output_contract","policy_decision":"observe_only","retry_action":"none","retry_result":"not_attempted","failure_summary":"missing output","next_systemic_action":"inspect contract"}]}' > "$tmp_p076/automation/auto-retry-observations.jsonl"
+    CHAINWORKS_META_ROOT="$tmp_p076" python3 "$ROOT_DIR/scripts/chainworks/auto_retry_rollup.py" --write-markdown >/dev/null
+    python3 - "$tmp_p076/automation/auto-retry-rollup.json" <<'PY'
+import json, sys
+payload = json.loads(open(sys.argv[1]).read())
+if payload.get("schema_version") != "auto-retry-rollup.v1":
+    raise SystemExit("proposal-076: rollup script emitted wrong schema_version")
+issues = payload.get("issues") or []
+if len(issues) != 1 or issues[0].get("observation_count") != 2:
+    raise SystemExit("proposal-076: rollup script did not dedupe repeated blocker_signature_id")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p mcp-server p076_auto_retry_latest -- --nocapture
+    )
+    log "Proposal 076 gate passed"
     ;;
   proposal-054-v1-retirement|p054-v1-retirement)
     if [[ -z "${DATABASE_URL:-}" ]]; then

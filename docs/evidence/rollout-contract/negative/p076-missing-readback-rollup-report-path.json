@@ -1,0 +1,22 @@
+{
+  "fixture_description": "P076 auto_retry_readback envelope that omits rollup_report_path. Proves the rollup_report_path top-level required field is enforced.",
+  "proves_missing_rollup_report_path": true,
+  "auto_retry_readback": {
+    "schema_version": "auto_retry_readback.v1",
+    "generated_at": "2026-05-23T09:00:08Z",
+    "version_negotiation": {
+      "selected_version": "auto_retry_readback.v1",
+      "supported_versions": ["auto_retry_readback.v1"],
+      "unsupported_versions": []
+    },
+    "ledger_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-observations.jsonl",
+    "budget_state_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-budget.json",
+    "known_issue_catalog_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-known-issues.json",
+    "generated_markdown_catalog_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-known-issues.md",
+    "lock_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry.lock",
+    "MISSING_FIELD_NOTE": "rollup_report_path is intentionally absent here to prove it is a required top-level field",
+    "diagnostics": [],
+    "observations": [],
+    "latest_by_run": []
+  }
+}

@@ -1,5 +1,6 @@
 pub mod approvals;
 pub mod artifacts;
+pub mod automation;
 pub mod effects;
 pub mod ideas;
 pub mod reports;
@@ -12,7 +13,7 @@ pub mod storage;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 38] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 39] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -52,6 +53,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 38] {
         CapabilityToolId::StorageMaintenanceRepairSlot,
         CapabilityToolId::StorageProjectionsClearBacklog,
         CapabilityToolId::StorageProjectionsClearPoison,
+        CapabilityToolId::AutomationAutoRetryLatest,
     ]
 }
 
@@ -116,6 +118,7 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
             Some(CapabilityToolId::StorageProjectionsClearBacklog)
         }
         "storage.projections.clear_poison" => Some(CapabilityToolId::StorageProjectionsClearPoison),
+        "automation.auto_retry.latest" => Some(CapabilityToolId::AutomationAutoRetryLatest),
         _ => None,
     }
 }
@@ -158,6 +161,7 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "storage_maintenance_repair_slot" => "storage.maintenance.repair_slot",
         "storage_projections_clear_backlog" => "storage.projections.clear_backlog",
         "storage_projections_clear_poison" => "storage.projections.clear_poison",
+        "automation_auto_retry_latest" => "automation.auto_retry.latest",
         _ => tool_name,
     }
 }
@@ -267,6 +271,9 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::StorageProjectionsClearPoison => {
             tool_spec_by_name(storage::tool_specs(), "storage.projections.clear_poison")
         }
+        CapabilityToolId::AutomationAutoRetryLatest => {
+            tool_spec_by_name(automation::tool_specs(), "automation.auto_retry.latest")
+        }
     }
 }
 
@@ -282,6 +289,7 @@ pub fn all_tool_specs() -> Vec<McpTool> {
     specs.extend(runtime::tool_specs());
     specs.extend(effects::tool_specs());
     specs.extend(storage::tool_specs());
+    specs.extend(automation::tool_specs());
     specs
 }
 
