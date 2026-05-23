@@ -1074,6 +1074,18 @@ pub(crate) async fn artifact_report_json(
             map.insert("rollout_contract_readback".to_string(), readback);
         }
     }
+    if artifact.name == "run_report" {
+        let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(pool, artifact.run_id)
+            .await
+            .unwrap_or_default();
+        db::repos::p082_recovery_matrix::emit_readback_lane_metrics(&readbacks, "run_report");
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert(
+                "p082_recovery_matrix_readbacks".to_string(),
+                serde_json::Value::Array(readbacks),
+            );
+        }
+    }
 
     if artifact.report_kind.as_deref() == Some("validation_failure") {
         if let Some(record) = validation::find_by_artifact_id(pool, artifact.id).await? {

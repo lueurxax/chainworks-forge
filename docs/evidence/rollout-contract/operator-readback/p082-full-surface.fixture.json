@@ -764,6 +764,7 @@
   },
   "fixture_assertions": {
     "required_reason_codes": [
+      "resume_claim_status",
       "startup_requeue_once",
       "startup_requeue_exhausted",
       "invalid_stage_for_retry",

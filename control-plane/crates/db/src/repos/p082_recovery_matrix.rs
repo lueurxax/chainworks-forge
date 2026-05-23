@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
+use std::collections::HashSet;
 use sqlx::{Row, SqlitePool};
 
 /// Maximum byte size per readback row to guard against unbounded JSON parsing
@@ -768,8 +769,8 @@ pub async fn readbacks_for_run(
             "P082-R06",
             "held",
             "wait",
-            recovery_matrix::REASON_STALE_REPAIRED,
-            "Running InvokeAgent work item has no durable executor owner; repair must use an explicit recorded transition.",
+            recovery_matrix::REASON_NEEDS_EFFECT_RECONCILIATION,
+            "Running InvokeAgent work item has no durable executor owner; hold until an explicit recorded transition or reconciliation repairs it.",
             "work_items, startup_repairs, side_effects",
             "work_items, startup_repairs, side_effects",
             &work_item_id,
@@ -848,6 +849,27 @@ pub async fn readbacks_for_run(
         let id_b = b.get("scenario_id").and_then(|v| v.as_str()).unwrap_or("");
         at_a.cmp(at_b).then(id_a.cmp(id_b))
     });
+    let covered_scenarios: HashSet<&str> = readbacks
+        .iter()
+        .filter_map(|row| row.get("scenario_id").and_then(|value| value.as_str()))
+        .collect();
+    crate::metrics::record_p082_recovery_matrix_coverage_percent(
+        covered_scenarios.len(),
+        domain::recovery_matrix::SCENARIO_IDS.len(),
+    );
+    let metric_now = Utc::now();
+    for row in &readbacks {
+        if let Some(updated_at) = row.get("updated_at").and_then(|value| value.as_str()) {
+            if let Some(updated_at_dt) = parse_utc_rfc3339(updated_at) {
+                let age = metric_now
+                    .signed_duration_since(updated_at_dt)
+                    .num_seconds()
+                    .max(0) as u64;
+                crate::metrics::record_p082_recovery_state_age_seconds(age);
+            }
+        }
+    }
+    crate::metrics::record_p082_recovery_matrix_gate_result("readbacks_for_run:passed");
 
     Ok(readbacks)
 }

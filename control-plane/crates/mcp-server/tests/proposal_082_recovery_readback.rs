@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use db::pool::create_pool;
-use db::repos::{ideas, runs};
+use db::repos::{artifacts, ideas, runs};
+use domain::artifact::{Artifact, ArtifactFormat};
 use domain::idea::{Idea, IdeaStatus};
-use domain::ids::{IdeaId, RunId};
+use domain::ids::{ArtifactId, IdeaId, RunId};
 use domain::run::{Run, RunStatus};
 use engine::command_handler::CommandHandler;
 use engine::event_bus;
@@ -963,5 +964,98 @@ async fn p082_reports_get_agent_principal_receives_empty_readbacks() {
     assert!(
         readbacks.is_empty(),
         "P082 SEC-HIGH-1: Agent principal must receive empty p082_recovery_matrix_readbacks in reports.get"
+    );
+}
+
+#[tokio::test]
+async fn p082_reports_get_run_report_artifact_includes_plural_readbacks() {
+    use db::repos::startup_repairs;
+    use domain::recovery_matrix;
+
+    let pool = test_pool().await;
+    let run_id = seed_run(&pool).await;
+    let handler = command_handler(pool.clone());
+    let now = chrono::Utc::now();
+    let repair_id = format!("p082-requeue:cj-run-report:{run_id}:1");
+    let readback = recovery_matrix::build_readback_v1(
+        "P082-R01",
+        "repaired",
+        "retry",
+        recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+        "Startup requeue scheduled.",
+        "startup_repairs",
+        "startup_repairs, work_items",
+        &repair_id,
+        Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+        "valid",
+        &now.to_rfc3339(),
+    );
+    let notes = serde_json::json!({
+        "p082_recovery_matrix_readback": readback,
+    })
+    .to_string();
+    startup_repairs::record(
+        &pool,
+        &repair_id,
+        &run_id.to_string(),
+        "p082_requeue_once",
+        now,
+        Some(&notes),
+    )
+    .await
+    .expect("seed startup repair");
+
+    artifacts::insert(
+        &pool,
+        &Artifact {
+            id: ArtifactId::new(),
+            run_id,
+            stage_id: "state_12_workflow_complete".to_string(),
+            agent_id: "lead_orchestrator".to_string(),
+            name: "run_report".to_string(),
+            contract_id: "run_report_v1".to_string(),
+            format: ArtifactFormat::Json,
+            file_path: "/tmp/p082-run-report.json".to_string(),
+            checksum_sha256: None,
+            size_bytes: Some(2),
+            provider: "system".to_string(),
+            model: None,
+            created_at: now,
+            is_pinned: false,
+            report_kind: Some("run_report".to_string()),
+            report_version: Some(1),
+            agent_execution_id: None,
+        },
+    )
+    .await
+    .expect("insert run_report artifact");
+
+    let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+    let result = reports::execute(
+        "reports.get",
+        serde_json::json!({ "run_id": run_id.to_string() }),
+        &pool,
+        &handler,
+        &principal,
+    )
+    .await
+    .expect("reports.get must succeed");
+    let reports_array = result.as_array().expect("reports.get returns array");
+    let run_report = reports_array
+        .iter()
+        .find(|report| report["name"] == serde_json::json!("run_report"))
+        .expect("reports.get must include the generated run_report artifact");
+    let readbacks = run_report
+        .get("p082_recovery_matrix_readbacks")
+        .and_then(|value| value.as_array())
+        .expect("run_report artifact must include p082_recovery_matrix_readbacks");
+    assert_eq!(
+        readbacks.len(),
+        1,
+        "P082: run_report artifact lane must expose the same plural readback contract"
+    );
+    assert_eq!(
+        readbacks[0].get("scenario_id").and_then(|value| value.as_str()),
+        Some("P082-R01")
     );
 }

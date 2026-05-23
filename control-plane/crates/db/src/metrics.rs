@@ -52,6 +52,8 @@ struct SystemMetrics {
     projection_backlog_rows: HashMap<String, u64>,
     projection_backlog_bytes: HashMap<String, u64>,
     counters: HashMap<String, u64>,
+    gauges: HashMap<String, u64>,
+    p082_recovery_state_age_seconds: Histogram,
     mcp_liveness_gate_last_recorded_at_ms: Option<i64>,
     mcp_hot_read_error_total_by_code: HashMap<String, u64>,
 }
@@ -147,6 +149,42 @@ pub fn get_counter_with_label(name: &str, label: &str) -> u64 {
     let m = metrics().lock().unwrap();
     let key = format!("{}:{}", name, label);
     m.counters.get(&key).copied().unwrap_or(0)
+}
+
+pub fn set_gauge(name: &str, value: u64) {
+    let mut m = metrics().lock().unwrap();
+    m.gauges.insert(name.to_string(), value);
+}
+
+pub fn get_gauge(name: &str) -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    m.gauges.get(name).copied()
+}
+
+pub fn record_p082_recovery_matrix_coverage_percent(rows_with_readback: usize, total_rows: usize) {
+    let percent = if total_rows == 0 {
+        0
+    } else {
+        ((rows_with_readback as u64) * 100) / (total_rows as u64)
+    };
+    set_gauge(
+        "p082_recovery_matrix_rows_with_db_engine_readback_coverage_percent",
+        percent,
+    );
+}
+
+pub fn record_p082_recovery_matrix_gate_result(result: &str) {
+    increment_counter_with_label("p082_recovery_matrix_gate_result_total", result);
+}
+
+pub fn record_p082_recovery_state_age_seconds(age_seconds: u64) {
+    let mut m = metrics().lock().unwrap();
+    m.p082_recovery_state_age_seconds.record(age_seconds);
+}
+
+pub fn get_p082_recovery_state_age_seconds_latest() -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    m.p082_recovery_state_age_seconds.latest()
 }
 
 pub fn record_hot_read_latency(tool: &str, duration: Duration) {

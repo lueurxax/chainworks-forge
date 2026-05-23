@@ -9123,6 +9123,50 @@ impl BackgroundExecutor {
             )
             .await?;
         artifact_contracts::close_source_generation_claim_tx(&mut tx, artifact_claim_key).await?;
+        let mut p082_late_claim_state: Option<String> = None;
+        let mut p082_late_work_item_status: Option<String> = None;
+        if has_ignored_late_output {
+            let now_for_terminalization = completed_at.to_rfc3339();
+            sqlx::query(
+                r#"UPDATE work_items
+                   SET status = ?1,
+                       failed_at = COALESCE(failed_at, ?2),
+                       completed_at = NULL,
+                       last_error = COALESCE(last_error, ?3)
+                   WHERE id = ?4
+                     AND status IN ('pending', 'running')"#,
+            )
+            .bind(WorkItemStatus::Failed.to_string())
+            .bind(&now_for_terminalization)
+            .bind("ignored_late_output: superseded provider output was quarantined")
+            .bind(work_item_id)
+            .execute(&mut **tx)
+            .await?;
+
+            p082_late_claim_state = sqlx::query_scalar::<_, String>(
+                r#"SELECT claim_state
+                   FROM artifact_source_generation_claims
+                   WHERE run_id = ?1
+                     AND owner_kind = ?2
+                     AND owner_id = ?3
+                     AND agent_execution_id = ?4
+                     AND source_work_item_id = ?5
+                   LIMIT 1"#,
+            )
+            .bind(artifact_claim_key.run_id.to_string())
+            .bind(artifact_claim_key.owner_kind.to_string())
+            .bind(&artifact_claim_key.owner_id)
+            .bind(agent_exec_id.to_string())
+            .bind(work_item_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+
+            p082_late_work_item_status =
+                sqlx::query_scalar::<_, String>("SELECT status FROM work_items WHERE id = ?1")
+                    .bind(work_item_id)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+        }
         tx.commit().await?;
         db::pool::log_write_transaction("executor.import_declared_outputs", tx_started);
         // P082-R03/R17: after commit, persist late output settlement readback to
@@ -9145,10 +9189,10 @@ impl BackgroundExecutor {
                 work_item_id,
                 source_session_generation_id,
                 session_generation_id.unwrap_or(""),
-                "superseded",
+                p082_late_claim_state.as_deref().unwrap_or("superseded"),
                 "ignored",
                 runtime_facts.ignored_late_output_count,
-                "completed",
+                p082_late_work_item_status.as_deref().unwrap_or("failed"),
                 cancelled_provider,
             );
             let readback = domain::recovery_matrix::set_readback_late_output_settlement(
