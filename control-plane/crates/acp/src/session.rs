@@ -830,6 +830,11 @@ impl AcpSessionHandle {
         session.transport.session_id().to_string()
     }
 
+    pub async fn child_pid(&self) -> Option<u32> {
+        let session = self.inner.lock().await;
+        session.transport.child_pid()
+    }
+
     pub async fn is_live(&self) -> bool {
         let mut session = self.inner.lock().await;
         session.is_live()

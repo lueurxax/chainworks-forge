@@ -855,9 +855,8 @@ pub async fn rebuild_runtime_health_summary(pool: &SqlitePool) -> Result<()> {
 
     let continuation_active_count = sqlx::query_scalar::<_, i64>(
         r#"SELECT COUNT(*)
-           FROM work_items
-           WHERE status IN ('pending','running')
-             AND kind IN ('advance_run','invoke_agent')"#,
+           FROM agent_work_continuations
+           WHERE status NOT IN ('succeeded', 'no_progress', 'failed', 'cancelled')"#,
     )
     .fetch_one(pool)
     .await?;

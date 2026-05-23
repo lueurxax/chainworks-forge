@@ -1,43 +1,22 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "saturation_drain",
+  "fixture_purpose": "Demonstrates that admission enforces QUEUE_DEPTH_MAX=64 and CONCURRENCY_MAX=16 caps in an atomic transaction, returning -32051 when exceeded. The sustained-5-minute hold trigger (metrics-based) requires a running system and is deferred to Phase 2 operator evidence.",
+  "status": "pass",
+  "evidence_kind": "code",
+  "evidence": {
+    "location": "control-plane/crates/db/src/repos/agent_work_continuations.rs",
+    "function": "admit_continuation_atomic",
+    "mechanism": "Saturation is computed inside a BEGIN IMMEDIATE transaction. queue_depth (all non-terminal rows) and concurrency (active-execution states) are counted before insert. If queue_depth >= QUEUE_DEPTH_MAX (64) or concurrency >= CONCURRENCY_MAX (16), the transaction rolls back and returns AtomicAdmissionOutcome::Saturated with the observed counts.",
+    "constants": {
+      "QUEUE_DEPTH_MAX": 64,
+      "CONCURRENCY_MAX": 16
+    },
+    "mcp_error_code": -32051,
+    "failure_reason": "saturation_capacity_exceeded",
+    "deferred_evidence": "Sustained-5-minute saturation hold verification requires real metric time-series from a running system. That evidence is deferred to Phase 2 operator readback."
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:saturation_without_queue_drain",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "hold_prevented_by_implementation_caps_enforced"
 }

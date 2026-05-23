@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents.continuation_status.response.schema.json",
+  "title": "agents.continuation_status response",
+  "description": "P086: MCP response schema for agents.continuation_status (read-only).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["agent_execution_id", "history"],
+  "properties": {
+    "agent_execution_id": {
+      "type": "string"
+    },
+    "active": {
+      "description": "The active (non-terminal) continuation row, if any.",
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/continuation_history_item_v1"}
+      ]
+    },
+    "history": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["items"],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/continuation_history_item_v1"}
+        }
+      }
+    },
+    "response_schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Self-describing schema reference embedded in the response per proposal contract."
+    }
+  },
+  "$defs": {
+    "continuation_history_item_v1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "run_id", "stage_execution_id", "agent_execution_id",
+        "mode", "trigger_kind", "status",
+        "request_fingerprint_sha256",
+        "conflict_count", "created_at", "updated_at"
+      ],
+      "properties": {
+        "id": {"type": "string"},
+        "run_id": {"type": "string"},
+        "stage_execution_id": {"type": "string"},
+        "agent_execution_id": {"type": "string"},
+        "mode": {"type": "string", "enum": ["live_handle_continuation", "provider_session_resurrection"]},
+        "trigger_kind": {"type": "string", "enum": ["operator_mcp", "lead_auto"]},
+        "status": {"type": "string"},
+        "failure_reason": {"type": ["string", "null"]},
+        "reconciliation_status": {"type": ["string", "null"]},
+        "idempotency_scope": {"type": "string"},
+        "idempotency_key": {"type": "string"},
+        "request_fingerprint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "canonical_request_artifact_id": {"type": ["string", "null"]},
+        "attach_receipt_artifact_id": {"type": ["string", "null"]},
+        "evidence_bundle_artifact_id": {"type": ["string", "null"]},
+        "worktree_readback_artifact_id": {"type": ["string", "null"]},
+        "continuation_report_artifact_id": {"type": ["string", "null"]},
+        "response_fingerprint_sha256": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          ]
+        },
+        "response_artifact_id": {"type": ["string", "null"]},
+        "result_or_no_progress_artifact_id": {"type": ["string", "null"]},
+        "conflict_count": {"type": "integer", "minimum": 0},
+        "lead_decision_artifact_id": {"type": ["string", "null"]},
+        "lead_decision_artifact_sha256": {"type": ["string", "null"]},
+        "continuation_instruction_sha256": {"type": ["string", "null"]},
+        "budget_json": {"type": ["string", "null"]},
+        "created_at": {"type": "string"},
+        "updated_at": {"type": "string"}
+      }
+    }
+  }
+}

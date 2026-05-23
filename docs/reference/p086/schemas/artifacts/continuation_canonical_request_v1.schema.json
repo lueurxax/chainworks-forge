@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "continuation_canonical_request_v1.schema.json",
+  "title": "continuation_canonical_request_v1",
+  "description": "P086: Canonical request artifact written at agents.continue_work acceptance. Used for fingerprint derivation and audit.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_kind",
+    "run_id", "stage_execution_id", "agent_execution_id", "continuation_id",
+    "created_at", "redaction_tier", "retention_policy", "payload"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "continuation_canonical_request_v1"},
+    "artifact_kind": {"type": "string", "const": "continuation_canonical_request"},
+    "run_id": {"type": "string"},
+    "stage_execution_id": {"type": "string"},
+    "agent_execution_id": {"type": "string"},
+    "continuation_id": {"type": "string"},
+    "created_at": {"type": "string"},
+    "redaction_tier": {"type": "string", "enum": ["none", "partial", "full"]},
+    "retention_policy": {"type": "string"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command", "idempotency_scope", "idempotency_key",
+        "request_fingerprint_sha256", "canonical_json_sha256",
+        "run_id", "stage_execution_id", "agent_execution_id",
+        "session_generation_id", "trigger_kind", "caller_principal_id",
+        "prompt_template_version", "max_turns", "max_wall_clock_seconds",
+        "worktree_root", "runtime_profile_id", "continuation_policy_version"
+      ],
+      "properties": {
+        "command": {"type": "string", "const": "agents.continue_work"},
+        "idempotency_scope": {"type": "string"},
+        "idempotency_key": {"type": "string"},
+        "request_fingerprint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "canonical_json_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "run_id": {"type": "string"},
+        "stage_execution_id": {"type": "string"},
+        "agent_execution_id": {"type": "string"},
+        "session_generation_id": {"type": "string"},
+        "trigger_kind": {"type": "string", "enum": ["operator_mcp", "lead_auto"]},
+        "caller_principal_id": {"type": "string"},
+        "prompt_template_version": {"type": "string"},
+        "max_turns": {"type": "integer", "minimum": 1},
+        "max_wall_clock_seconds": {"type": "integer", "minimum": 1},
+        "worktree_root": {"type": "string"},
+        "runtime_profile_id": {"type": "string"},
+        "continuation_policy_version": {"type": "string"}
+      }
+    }
+  }
+}

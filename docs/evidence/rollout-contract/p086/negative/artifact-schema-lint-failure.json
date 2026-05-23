@@ -1,43 +1,30 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "schema_lint",
+  "fixture_purpose": "Demonstrates the artifact schema lint hold predicate: an artifact schema without 'additionalProperties: false' would fail the p086-continuation-preflight gate. All five current artifact schemas pass this gate.",
+  "status": "pass",
+  "evidence_kind": "code_and_gate",
+  "evidence": {
+    "gate": "p086-continuation-preflight (scripts/test-gate.sh)",
+    "gate_checks": [
+      "Each artifact schema file exists under docs/reference/p086/schemas/artifacts/",
+      "Each file is valid JSON",
+      "Each file has 'additionalProperties': false at top level"
+    ],
+    "non_conforming_example": {
+      "description": "An artifact schema that would fail: missing additionalProperties=false",
+      "example": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object"},
+      "failure_mode": "gate raises SystemExit: proposal-086: artifact schema must have additionalProperties=false"
+    },
+    "current_artifact_schema_paths_passing": [
+      "docs/reference/p086/schemas/artifacts/continuation_canonical_request_v1.schema.json",
+      "docs/reference/p086/schemas/artifacts/lead_continuation_decision_v1.schema.json",
+      "docs/reference/p086/schemas/artifacts/continuation_response_snapshot_v1.schema.json",
+      "docs/reference/p086/schemas/artifacts/continuation_result_v1.schema.json",
+      "docs/reference/p086/schemas/artifacts/continuation_no_progress_report_v1.schema.json"
+    ]
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:artifact_schema_lint_failure",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "hold_prevented_by_gate"
 }

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chainworks.local/schemas/p086/provider_session_attach_receipt_v1.schema.json",
+  "title": "provider_session_attach_receipt_v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "run_id",
+    "stage_execution_id",
+    "agent_execution_id",
+    "continuation_id",
+    "created_at",
+    "redaction_tier",
+    "retention_policy",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": { "const": "provider_session_attach_receipt_v1" },
+    "artifact_kind": { "const": "provider_session_attach_receipt" },
+    "run_id": { "type": "string" },
+    "stage_execution_id": { "type": "string" },
+    "agent_execution_id": { "type": "string" },
+    "continuation_id": { "type": "string" },
+    "created_at": { "type": "string" },
+    "redaction_tier": { "type": "string" },
+    "retention_policy": { "type": "string" },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["mode", "attach_kind", "orphan_reap_verified"],
+      "properties": {
+        "mode": { "enum": ["live_handle_continuation", "provider_session_resurrection"] },
+        "attach_kind": { "type": "string" },
+        "session_generation_id": { "type": "string" },
+        "provider_session_id": { "type": ["string", "null"] },
+        "runtime_profile_id": { "type": "string" },
+        "orphan_reap_required": { "type": "boolean" },
+        "orphan_reap_verified": { "type": "boolean" },
+        "managed_process_reused": { "type": "boolean" }
+      }
+    }
+  }
+}

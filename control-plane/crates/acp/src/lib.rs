@@ -8,7 +8,10 @@ pub mod xcode_broker;
 pub mod xcode_shim;
 pub mod xcode_target;
 
-pub use manager::{AcpRuntimeManager, BrokeredXcodeLeaseAttachment, XcodeBrokerLeaseAttacher};
+pub use manager::{
+    AcpLiveSessionProcessBinding, AcpRuntimeManager, BrokeredXcodeLeaseAttachment,
+    XcodeBrokerLeaseAttacher,
+};
 pub use session::{AcpSession, AcpSessionHandle};
 pub use xcode_broker::{
     BrokerMcpPolicy, BrokerMcpPolicyDecision, XcodeBrokerHealthSnapshot, XcodeBrokerHealthState,

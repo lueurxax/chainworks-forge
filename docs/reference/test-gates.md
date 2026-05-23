@@ -2288,3 +2288,100 @@ Important:
 - documentation-only self-contract fixtures are validated for JSON well-formedness only; linter-testable scheduler and cutover fixtures are linter inputs
 - the gate validates parity-lane fixture shape (run_report, mcp, release_receipt, graphql), Rust rollout-contract preflight/storage regressions, clean migration install, and the Swift read-only presentation slice
 - the gate fails closed if the template is missing a required term, any negative fixture is absent or malformed, the retained historical alias `p084-full-surface` fixture omits a required readback field or parity-lane payload, or the `Proposal084Tests` Swift slice fails
+
+### `proposal-086|p086|p086-continuation-preflight`
+
+Retained historical gate alias for agent work continuation: migration shape, MCP/artifact JSON Schemas, Rust domain/DB/MCP unit tests for `agents.continue_work`, `agents.continuation_status`, and `agents.continuation_candidates`, the async MCP admission plus terminal-readback contract, GraphQL continuation readback tests, passive SwiftUI readback source guards plus the dedicated P031 Swift readback test slice, durable metrics checks, orphan ACP reap checks, duplicate prompt reconciliation guards, plus a daemon-level MCP -> worker -> live ACP reuse regression. The stable contract lives in [`agent-work-continuation.md`](agent-work-continuation.md); `proposal-086`, `p086`, and `p086-continuation-*` remain gate names only.
+
+Scope:
+
+- `control-plane/crates/db/migrations/065_p086_agent_work_continuations.sql` exists and declares the tables `agent_work_continuations`, `agent_external_side_effect_ledger`, and `supervised_workers_continuation`, the required indexes (`idx_awc_agent_created_at`, `idx_awc_run_status`, `idx_awc_stage`, `idx_awc_recon`, `idx_awc_admission`, `idx_awc_recovery`, `idx_ledger_cont_seq`, `idx_ledger_unresolved`, `idx_swc_heartbeat`, `idx_swc_generation`, `uniq_swc_active_continuation`), and SHA-256 `NOT GLOB` check constraints
+- `control-plane/crates/db/migrations/066_p086_supervised_worker_provider_process.sql` declares the durable provider pid/process-group/uid binding used by restart recovery, and `067_p086_continuation_metric_events.sql` declares bounded metric events plus the `idx_p086_metric_run_time` index
+- `control-plane/crates/db/migrations/066_p086_supervised_worker_provider_process.sql` exists and declares durable provider process binding fields (`provider_child_pid`, `provider_process_group_id`, `provider_process_uid`) used by restart orphan-reap recovery
+- All six MCP schemas under `docs/reference/p086/schemas/mcp/` parse as Draft 2020-12 JSON Schema; `agents.continue_work.request.schema.json` exposes the full continuation context (`run_id`, `stage_execution_id`, `session_generation_id`, `provider_session_id`, `operator_instruction`, `max_turns`, `max_wall_clock_seconds`, `blockers`), and `agents.continue_work.response.schema.json` requires the `outcome` field
+- `agents.continue_work.response.schema.json` remains a bounded async admission response (`accepted` / `replay` / `rejected`) and does not reintroduce terminal artifact fields that belong to `agents.continuation_status`, `continuations(runId:)`, and `continuationStatus(agentExecutionId:)`
+- `control-plane/crates/engine/src/executor.rs` routes live-handle continuation through ACP `execute(... reuse_existing_session=true ...)`, does not call ACP `start_session` for that path, persists the ACP provider process binding, reconciles duplicate post-`prompt_sent` work only from post-continuation worktree evidence paired with a committed `provider_send` row, records durable continuation metric events for raw counters and KPI rollups (useful progress, validation success, time saved, provider/session budget), and contains the canonical P086 mode-reset prompt guardrails retained by the implementation
+- Admission is catalog-gated and side-effect-safe: `examples/agents/agents.yaml` declares `code_writer.continuation_capability`, the workflow catalog model preserves it in frozen snapshots, MCP admission rejects forbidden release/publish/git-push/upload/distribution lanes, engine-owned lead-auto orchestration validates `lead_continuation_decision_v1` and enqueues `ProcessContinuation`, and admission queries unresolved P078 `side_effects` before accepting a continuation
+- `lead_auto` may enter through Agent principals only for `trigger_kind=lead_auto`; the handler still requires server-side lead decision artifact identity/hash/target/safety validation before admission
+- Startup recovery contains the durable provider process-group reap path and records `orphan_reap_attempted` / `orphan_reap_verified` evidence, signal counts, and TERM/KILL deadlines before releasing stale supervised-worker rows
+- GraphQL exposes `continuationStatus`, `continuationCandidates`, `continuations(runId:)`, and `continuationMetricsSummary(runId:)`; the Swift P031 read model and Runs Overview card consume the history/metrics fields, including P086 rates/time-saved/budget rollups, as passive readback only, and `Proposal031ThinGraphQLReadBoundaryTests` runs inside the P086 gate to prove the Swift decode/presentation path
+- All nine artifact schemas under `docs/reference/p086/schemas/artifacts/` parse as JSON Schema with `additionalProperties=false`
+- Rust tests covering `domain::continuation`, the `agent_work_continuations` repo including metric summaries, the `agents.*` MCP tool surface, auth lead-auto capability, GraphQL continuation history/metrics readback, orphan provider process-group reap, and the daemon-level MCP → continuation worker → live ACP reuse path run green under `cargo test`
+
+Use when:
+
+- Landing or revising the continuation migration, schema artifacts, or Rust admission/repo/MCP/runtime worker surface
+- Verifying that the canonical continuation path still reuses a live ACP session instead of falling back to a fresh-session path
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-086
+./scripts/test-gate.sh p086
+./scripts/test-gate.sh p086-continuation-preflight
+```
+
+Important:
+
+- `p086` and `p086-continuation-preflight` are accepted as aliases for the Phase 0 preflight
+- the gate fails closed when any required migration element, SHA-256 constraint, MCP/artifact schema, Rust unit test, passive SwiftUI readback hook, duplicate-send reconciliation guard, or daemon-level live ACP reuse regression is missing or invalid
+
+### `p086-continuation-readback`
+
+Retained Phase 1 readback gate for agent work continuation. Verifies the operator readback fixture `docs/evidence/rollout-contract/operator-readback/p086-continuation-full-surface.fixture.json` carries all `operator_readback_v1` decision fields plus the continuation surface (request/response fingerprints, lifecycle status, projection lag, reconciliation status, cancel termination proof, orphan reap outcome, attach receipt, kill-switch last change). The gate rejects placeholder-looking ids/hashes and requires an `evidence_provenance` block tying the fixture to the same-tree daemon/MCP proof instead of accepting synthetic rollout placeholders.
+
+Use when:
+
+- Producing or refreshing operator readback evidence for an internal Phase 1 run
+- Verifying readback parity across the `mcp`, `release_receipt`, and `graphql` lanes for an eligible `code_writer` continuation
+
+Command:
+
+```bash
+./scripts/test-gate.sh p086-continuation-readback
+```
+
+Important:
+
+- fails closed while the fixture is a Phase 0 placeholder; only fixtures with `rollout_contract_status="pass"` and the full operator readback surface satisfy this gate
+- distinct from `p086-continuation-preflight` — the two gates address different `rollout_contract_v1` decision surfaces
+
+### `p086-continuation-negative-fixtures`
+
+Retained Phase 2 hold-condition gate for agent work continuation. Verifies that every negative fixture under `docs/evidence/rollout-contract/p086/negative/` exists, is valid JSON, and is no longer a Phase 0 placeholder. Each fixture corresponds to a `rollout_contract_v1` hold condition (admission timeout sweeper, duplicate prompt prevention after `prompt_sent`, idempotency fingerprint conflict, lead decision freshness, malformed hashes, schema lint failures, missing log correlation keys, pre-prompt crash recovery, provider session resurrection ordering, saturation drain, terminal artifact presence, worker panic recovery).
+
+Use when:
+
+- Materializing real SQL/readback/runtime evidence as Phase 2 worker behavior lands
+- Proving hold-condition coverage before broader continuation rollout
+
+Command:
+
+```bash
+./scripts/test-gate.sh p086-continuation-negative-fixtures
+```
+
+Important:
+
+- fails closed if any fixture is missing or still carries `status="placeholder"`
+- coupled to continuation worker behavior (provider prompt send, side-effect ledger commit, reconciliation, cancellation lifecycle); fixture evidence requirements are encoded in the fixture set and the stable continuation contract
+
+### `p086-continuation-operator-report`
+
+Retained Phase 1 operator-report gate for agent work continuation. Verifies that the operator readback fixture exposes the subset of operator report fields required by the rollout contract (rollout status/decision/hold conditions/enforcement mode, continuation/run/stage/agent identifiers, mode, trigger kind, lifecycle status, request fingerprint, eligibility, lead decision, confirmation required) and is not a placeholder.
+
+Use when:
+
+- Publishing the operator report after a Phase 1 enablement run
+- Verifying the operator-facing surface before expanding continuation enablement
+
+Command:
+
+```bash
+./scripts/test-gate.sh p086-continuation-operator-report
+```
+
+Important:
+
+- fails closed while the fixture contains a `placeholder` key, has `rollout_contract_status` other than `pass`, or omits any required operator field
+- distinct from `p086-continuation-preflight` and `p086-continuation-readback` — operator-report coverage is its own `rollout_contract_v1` decision surface

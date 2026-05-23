@@ -516,7 +516,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 38] {
+fn all_tool_capabilities() -> [CapabilityToolId; 41] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -556,6 +556,9 @@ fn all_tool_capabilities() -> [CapabilityToolId; 38] {
         CapabilityToolId::StorageMaintenanceRepairSlot,
         CapabilityToolId::StorageProjectionsClearBacklog,
         CapabilityToolId::StorageProjectionsClearPoison,
+        CapabilityToolId::AgentsContinuationStatus,
+        CapabilityToolId::AgentsContinuationCandidates,
+        CapabilityToolId::AgentsContinueWork,
     ]
 }
 
@@ -633,6 +636,18 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         }
         CapabilityToolId::StorageProjectionsClearPoison => {
             matches!(class, PrincipalClass::Operator)
+        }
+        // P086: read-only continuation queries are Operator+Observer.
+        // continue_work is Operator for manual requests and Agent only for
+        // lead_auto requests; the handler enforces trigger-specific authority.
+        CapabilityToolId::AgentsContinuationStatus => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        CapabilityToolId::AgentsContinuationCandidates => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
+        CapabilityToolId::AgentsContinueWork => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Agent)
         }
     }
 }
@@ -748,6 +763,9 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
             Some(CapabilityToolId::StorageProjectionsClearBacklog)
         }
         "storage.projections.clear_poison" => Some(CapabilityToolId::StorageProjectionsClearPoison),
+        "agents.continuation_status" => Some(CapabilityToolId::AgentsContinuationStatus),
+        "agents.continuation_candidates" => Some(CapabilityToolId::AgentsContinuationCandidates),
+        "agents.continue_work" => Some(CapabilityToolId::AgentsContinueWork),
         _ => None,
     }
 }
@@ -927,6 +945,14 @@ mod tests {
         assert!(!is_tool_allowed(&ag, "steward.run_analysis"));
         assert!(!is_tool_allowed(&ag, "steward.list_analyses"));
         assert!(!is_tool_allowed(&ag, "steward.get_analysis"));
+    }
+
+    #[test]
+    fn p086_agents_can_reach_continue_work_handler_for_lead_auto_validation() {
+        let agent = Principal::new("agent-p086", PrincipalClass::Agent);
+        let observer = Principal::new("observer-p086", PrincipalClass::Observer);
+        assert!(is_tool_allowed(&agent, "agents.continue_work"));
+        assert!(!is_tool_allowed(&observer, "agents.continue_work"));
     }
 
     #[test]

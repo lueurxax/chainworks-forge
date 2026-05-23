@@ -72,8 +72,7 @@ After the safety and UI recovery lanes stabilize:
 
 ## Backlog
 
-- Future **P086** agent limit observatory / runtime budget dashboard.
-
+- Agent work continuation and lead-directed same-session resumption — live-handle continuation admission, MCP/GraphQL read surfaces, schemas, migrations, background worker settlement, lead-auto decision-artifact validation, duplicate-send reconciliation, cancellation handling, and restart orphan-reap proof are implemented under [`docs/reference/agent-work-continuation.md`](reference/agent-work-continuation.md). Per-adapter `provider_session_resurrection` remains explicit fail-closed until an adapter declares attach/resume support. Expansion/soak is tracked separately under [P093](proposals/093-agent-work-continuation-expansion-soak.md). The retained `P086` names are gate/schema/evidence aliases only; the earlier "agent limit observatory / runtime budget dashboard" idea suggested under this slot is retired and needs a new proposal number if revived.
 - Additional ACP runtime/provider expansion only after the stabilization window.
 - Additional UI polish builds on the implemented macOS operator navigation baseline and the P032 productization lane.
 

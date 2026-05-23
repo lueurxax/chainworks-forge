@@ -108,6 +108,7 @@ The repository is past the scaffold stage. The implemented system now includes:
 - proof artifacts under [`docs/evidence`](docs/evidence)
 - stable proposal-loop feedback-fidelity documentation and proof under [`docs/reference`](docs/reference) and [`docs/evidence`](docs/evidence)
 - Local Persistence Write Budget and Evidence Spooling — DbWriter lanes/coalescing/shutdown primitives, evidence_spool_refs and storage_write_pressure_snapshots schemas, failed-stage evidence spooling, transcript spooling, storageHealth/MCP diagnostics with live heartbeat/drain/lock/WAL readback, diagnostics-bundle storage snapshots, and fail-closed write-bypass/raw-evidence gate coverage are implemented. Temporary rollout bypasses are retired; the remaining allowlist is limited to migrations, tests, startup repair, and evidence-spool orphan repair.
+- Agent work continuation and lead-directed same-session resumption — `agents.continue_work`, `agents.continuation_status`, and `agents.continuation_candidates` MCP commands for eligible stage-owned `code_writer` agent executions, with persisted continuation/side-effect ledger/supervised-worker/provider-process tables, durable metric events, materialized Draft 2020-12 JSON Schemas, and guarded admission for `live_handle_continuation`. `lead_auto` may be requested by Agent principals only with a validated lead decision artifact; `operator_mcp` remains Operator-only. Per-adapter `provider_session_resurrection` remains explicit and fail-closed for adapters that do not declare attach/resume support. The worker drives the `accepted → … → succeeded | no_progress | failed | cancelled` state machine with durable runtime/worktree/provider-send ledger rows, a live-handle attach receipt, heartbeat-backed supervised-worker ownership, cancellation cascade handling, duplicate-send reconciliation that requires provider-send evidence, worktree readback, evidence bundle, response snapshot, result/no-progress, operator report artifacts, passive GraphQL history/metrics readback, and a read-only macOS Overview card. `P086` names remain only as retained gate/schema/evidence aliases.
 
 Active proposal work is currently concentrated in:
 
@@ -270,6 +271,7 @@ Implemented-system references:
 - [`docs/reference/full-mvp-delivery.md`](docs/reference/full-mvp-delivery.md)
 - [`docs/reference/mvp-sign-off.md`](docs/reference/mvp-sign-off.md)
 - [`docs/reference/test-gates.md`](docs/reference/test-gates.md)
+- [`docs/reference/agent-work-continuation.md`](docs/reference/agent-work-continuation.md)
 
 Examples:
 

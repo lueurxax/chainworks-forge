@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "continuation_no_progress_report_v1.schema.json",
+  "title": "continuation_no_progress_report_v1",
+  "description": "P086: No-progress report artifact written on no_progress terminal status.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_kind",
+    "run_id", "stage_execution_id", "agent_execution_id", "continuation_id",
+    "created_at", "redaction_tier", "retention_policy", "payload"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "continuation_no_progress_report_v1"},
+    "artifact_kind": {"type": "string", "const": "continuation_no_progress_report"},
+    "run_id": {"type": "string"},
+    "stage_execution_id": {"type": "string"},
+    "agent_execution_id": {"type": "string"},
+    "continuation_id": {"type": "string"},
+    "created_at": {"type": "string"},
+    "redaction_tier": {"type": "string", "enum": ["none", "partial", "full"]},
+    "retention_policy": {"type": "string"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["no_progress_reason", "evidence", "budget_spent"],
+      "properties": {
+        "no_progress_reason": {
+          "type": "string",
+          "enum": [
+            "reconciliation_evidence_unavailable",
+            "provider_no_output",
+            "worktree_unchanged",
+            "budget_exhausted",
+            "cancelled_before_provider_send",
+            "other"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "budget_spent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["wall_clock_seconds"],
+          "properties": {
+            "wall_clock_seconds": {"type": "number", "minimum": 0},
+            "turns": {"type": "integer", "minimum": 0},
+            "input_tokens": {"type": "integer", "minimum": 0},
+            "output_tokens": {"type": "integer", "minimum": 0}
+          }
+        },
+        "response_fingerprint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provider_transcript_artifact_ids": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    }
+  }
+}

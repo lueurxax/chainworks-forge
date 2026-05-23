@@ -3,6 +3,7 @@ pub mod agent_execution_runtime_facts;
 pub mod agent_execution_runtime_receipts;
 pub mod agent_executions;
 pub mod agent_retry_budget_ledger;
+pub mod agent_work_continuations;
 pub mod approvals;
 pub mod artifact_contracts;
 pub mod artifacts;

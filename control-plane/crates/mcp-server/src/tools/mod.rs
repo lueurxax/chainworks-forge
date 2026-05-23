@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod approvals;
 pub mod artifacts;
 pub mod effects;
@@ -12,7 +13,7 @@ pub mod storage;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 38] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 41] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -52,6 +53,9 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 38] {
         CapabilityToolId::StorageMaintenanceRepairSlot,
         CapabilityToolId::StorageProjectionsClearBacklog,
         CapabilityToolId::StorageProjectionsClearPoison,
+        CapabilityToolId::AgentsContinuationStatus,
+        CapabilityToolId::AgentsContinuationCandidates,
+        CapabilityToolId::AgentsContinueWork,
     ]
 }
 
@@ -116,6 +120,9 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
             Some(CapabilityToolId::StorageProjectionsClearBacklog)
         }
         "storage.projections.clear_poison" => Some(CapabilityToolId::StorageProjectionsClearPoison),
+        "agents.continuation_status" => Some(CapabilityToolId::AgentsContinuationStatus),
+        "agents.continuation_candidates" => Some(CapabilityToolId::AgentsContinuationCandidates),
+        "agents.continue_work" => Some(CapabilityToolId::AgentsContinueWork),
         _ => None,
     }
 }
@@ -158,6 +165,9 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "storage_maintenance_repair_slot" => "storage.maintenance.repair_slot",
         "storage_projections_clear_backlog" => "storage.projections.clear_backlog",
         "storage_projections_clear_poison" => "storage.projections.clear_poison",
+        "agents_continuation_status" => "agents.continuation_status",
+        "agents_continuation_candidates" => "agents.continuation_candidates",
+        "agents_continue_work" => "agents.continue_work",
         _ => tool_name,
     }
 }
@@ -267,6 +277,15 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::StorageProjectionsClearPoison => {
             tool_spec_by_name(storage::tool_specs(), "storage.projections.clear_poison")
         }
+        CapabilityToolId::AgentsContinuationStatus => {
+            tool_spec_by_name(agents::tool_specs(), "agents.continuation_status")
+        }
+        CapabilityToolId::AgentsContinuationCandidates => {
+            tool_spec_by_name(agents::tool_specs(), "agents.continuation_candidates")
+        }
+        CapabilityToolId::AgentsContinueWork => {
+            tool_spec_by_name(agents::tool_specs(), "agents.continue_work")
+        }
     }
 }
 
@@ -282,6 +301,7 @@ pub fn all_tool_specs() -> Vec<McpTool> {
     specs.extend(runtime::tool_specs());
     specs.extend(effects::tool_specs());
     specs.extend(storage::tool_specs());
+    specs.extend(agents::tool_specs());
     specs
 }
 

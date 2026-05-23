@@ -99,8 +99,13 @@ Implementation: `control-plane/crates/domain/src/commands.rs` (`PrincipalClass`,
 | `EffectsReconcile` | `effects.reconcile` | no (direct) |
 | `EffectsMarkUnrecoverable` | `effects.mark_unrecoverable` | no (direct) |
 | `EffectsClearAfterManualVerification` | `effects.clear_after_manual_verification` | no (direct) |
+| `AgentsContinuationStatus` | `agents.continuation_status` | no (direct) |
+| `AgentsContinuationCandidates` | `agents.continuation_candidates` | no (direct) |
+| `AgentsContinueWork` | `agents.continue_work` | no (direct) |
 
 Command tools build a typed `Command` enum value and call `CommandHandler::handle`; they emit a `command_journal` row and return `journal_id`. Direct tools call repo functions directly and do not produce journal rows or `journal_id`.
+
+The Proposal 086 continuation tools (`agents.continue_work`, `agents.continuation_status`, `agents.continuation_candidates`) have typed `CapabilityToolId` variants (`AgentsContinueWork`, `AgentsContinuationStatus`, `AgentsContinuationCandidates`) so they participate in standard `tools/list` capability filtering. The read tools are exposed to `Operator` and `Observer` principals; `agents.continue_work` is exposed only to `Operator`. They are dispatched by prefix into a separate `tools::agents` namespace in `control-plane/crates/mcp-server/src/server.rs` rather than through `CommandHandler::handle`: `agents.continue_work` runs its own atomic admission transaction that persists a `command_journal_id` on the `agent_work_continuations` row alongside the canonical request fingerprint, while the read tools omit unauthorized rows without leaking existence. See [`proposal-086-api-contracts.md`](proposal-086-api-contracts.md) for the request/response schemas and admission semantics.
 
 ### MCP tool payloads
 
@@ -295,6 +300,9 @@ Both checks are required, so a future change that wants to narrow a specific pri
 | `effects.reconcile` | yes | no | no |
 | `effects.mark_unrecoverable` | yes | no | no |
 | `effects.clear_after_manual_verification` | yes | no | no |
+| `agents.continuation_status` | yes | no | yes |
+| `agents.continuation_candidates` | yes | no | yes |
+| `agents.continue_work` | yes | no | no |
 
 Rationale for the Steward trio: `run_analysis` queues compute work and drives the quality-gate pipeline, so only operators can trigger it. `list_analyses` and `get_analysis` are read-only over persisted analysis records and are visible to the operational/audit (observer) class. Agents are scoped to executing their own run and have no legitimate cross-cohort read surface, so they see none of the three.
 

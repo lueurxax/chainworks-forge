@@ -6,8 +6,9 @@
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
 | Depends on | [Local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), [durable side-effect ledger](../reference/rust-control-plane.md#durable-side-effect-ledger) for side-effect lanes, P081 Boundary Matrix / UI Action Boundary |
-| Related | P079 Contract-Aware Output Repair, P080 Continuous Stale Execution Reconciliation, Session Lineage Reference, ACP Runtime Transport |
+| Related | P079 Contract-Aware Output Repair, P080 Continuous Stale Execution Reconciliation, P093 Phase 5 Expansion Soak, Session Lineage Reference, ACP Runtime Transport |
 | Scope | Add an in-band way to continue useful agent work through server-owned provider session continuity instead of forcing a fresh retry that re-discovers the proposal, repository, blockers, and current diff. Support live-handle continuation first, define provider-session resurrection by known provider `session_id` for adapters that can attach/resume that provider session, fail closed for adapters that cannot, and allow both operator-triggered continuation through MCP and lead-directed automatic continuation under strict eligibility and safety rules. |
+| Out of scope | Phase 5 expansion/soak is split into Proposal 093. Current P086 closeout must finish implementation and evidence for phases 1-4 only. |
 | Goal | Reduce wasted time and model/runtime burn on implementation work by preserving useful provider-session continuity while still recording Chainworks truth, evidence, provenance, and safety boundaries. |
 
 ---
@@ -128,6 +129,11 @@ GraphQL may show continuation state and evidence, but there is no GraphQL mutati
 ---
 
 ## 4. Initial scope
+
+Phase 5 expansion is no longer part of this implementation run. The 14-day
+no-hold soak window, SLO-budget expansion, and 100-continuation/30-run
+graduation evidence are owned by Proposal 093 after P086 phases 1-4 are
+implemented and validated.
 
 ## 4.1 First supported agent class
 
@@ -628,25 +634,49 @@ Input:
 
 If `provider_session_resurrection` is requested and unsupported, the output status must be `provider_session_resurrection_unsupported`.
 
-Output:
+Output is an admission response, not a terminal execution response. The
+command validates eligibility, records or replays the canonical request, and
+queues/returns the continuation row. It must not block the MCP request until the
+provider turn completes.
 
 ```json
 {
+  "outcome": "accepted",
   "continuation_id": "...",
-  "status": "completed",
-  "continuation_mode": "live_handle_continuation",
   "request_fingerprint_sha256": "...",
-  "response_fingerprint_sha256": "...",
-  "session_generation_id": "...",
-  "provider_session_id": "...",
-  "canonical_request_artifact_id": "...",
-  "response_artifact_id": "...",
-  "attach_receipt_artifact_id": "...",
-  "evidence_bundle_artifact_id": "...",
-  "worktree_readback_artifact_id": "...",
-  "continuation_report_artifact_id": "..."
+  "status": "accepted"
 }
 ```
+
+`outcome` is one of:
+
+- `accepted` — a new continuation was admitted and queued;
+- `replay` — the same idempotency key and canonical request already exist, so
+  the command returns the existing continuation id/status without another
+  provider send;
+- `rejected` — admission failed before a row was queued, with a bounded machine
+  error object.
+
+Terminal fields are readback, not command output. After `accepted` or `replay`,
+clients must read `agents.continuation_status`, `continuations(runId:)`, or
+`continuationStatus(agentExecutionId:)` to obtain:
+
+- `continuation_mode`;
+- terminal `status`;
+- `response_fingerprint_sha256`;
+- `session_generation_id`;
+- `provider_session_id`;
+- `canonical_request_artifact_id`;
+- `response_artifact_id`;
+- `attach_receipt_artifact_id`;
+- `evidence_bundle_artifact_id`;
+- `worktree_readback_artifact_id`;
+- `continuation_report_artifact_id`;
+- `result_or_no_progress_artifact_id`.
+
+This split is intentional: admission is transactional and bounded, while the
+provider turn is asynchronous and may complete, fail, be cancelled, or reconcile
+after daemon restart.
 
 ## 12.2 `agents.continuation_status`
 
@@ -715,6 +745,13 @@ fact and result of a continuation already performed by MCP/lead orchestration.
 ## 14. Lead continuation decision contract
 
 The lead must emit a structured decision when requesting automatic continuation.
+When a stage-owned lead agent completes, the control plane inspects its newly
+materialized artifacts for `lead_continuation_decision_v1`. A valid decision is
+not advisory-only: after server-side target, hash, safety, capability, side
+effect, and approval checks pass, the engine admits the continuation through the
+same durable `agent_work_continuations` admission transaction and enqueues
+`ProcessContinuation`. Invalid, stale, or unsafe lead decisions fail closed and
+do not require an operator to call MCP manually.
 
 ## 14.1 `lead_continuation_decision_v1`
 
@@ -1163,8 +1200,9 @@ Required tests:
     orphan OS process.
 21. Provider-session resurrection fails closed when orphan ACP subprocess reap
     is unverified or fails.
-22. Same idempotency key plus same canonical request and completed continuation
-    returns the previous response.
+22. Same idempotency key plus same canonical request returns the previous
+    continuation id/status without another provider send; terminal output fields
+    remain available through continuation readback.
 23. Same idempotency key plus different canonical request returns
     `idempotency_conflict`.
 24. Same idempotency key plus same request at `prompt_sent` does not send
@@ -1200,6 +1238,9 @@ P086 is complete when:
     uniqueness alone;
 14. duplicate requests after `prompt_sent` never resend the provider prompt and
     use continuation reconciliation instead.
+15. `agents.continue_work` returns a bounded admission response; terminal
+    response/session/provider/artifact fields are exposed through MCP/GraphQL
+    continuation readback, not by blocking the initial command.
 
 ---
 

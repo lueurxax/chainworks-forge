@@ -617,6 +617,43 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     #expect(!P031GraphQLDocuments.runDetail.contains("implementation-closeout-readiness.json"))
   }
 
+  @Test("P086 continuation readback is decoded and presented without write mutations")
+  func p086ContinuationReadbackDecodedAndPresented() async throws {
+    let readTransport = CapturingP031ReadTransport(
+      responses: [
+        "P031RunDetail": Data(
+          """
+          {"data":{"run":{"id":"run-p086","status":"running","workflowTitle":"Full MVP","freshnessState":"live","totalStages":2,"completedStages":1,"failedStages":0,"pendingApprovals":0},"stages":[],"artifacts":[],"approvalInbox":[],"activeAgentExecutions":[],"runStageTopology":[],"continuations":[{"id":"cont-1","runId":"run-p086","stageExecutionId":"stage-exec-1","agentExecutionId":"agent-exec-1","modeRaw":"live_handle_continuation","modeDisplay":"Live Handle Continuation","triggerKindRaw":"lead_auto","triggerKindDisplay":"Lead Auto","statusRaw":"succeeded","statusDisplay":"Succeeded","isTerminal":true,"failureReason":null,"reconciliationStatus":"not_required","requestFingerprintSha256":"8d81a3d14a823cbc708e60633d920600ae6d23007355dada6e1c788a79df27c5","canonicalRequestArtifactId":"artifact-request","attachReceiptArtifactId":"artifact-attach","evidenceBundleArtifactId":"artifact-evidence","worktreeReadbackArtifactId":"artifact-worktree","continuationReportArtifactId":"artifact-report","responseFingerprintSha256":"022868142b0ef3057180d20b067e0871c85b04de16ae1b0152c4223f82d3a5f4","responseArtifactId":"artifact-response","resultOrNoProgressArtifactId":"artifact-result","conflictCount":0,"createdAt":"2026-05-23T00:00:00Z","updatedAt":"2026-05-23T00:00:02Z","freshnessState":"live","projectionLagMs":12}],"continuationMetricsSummary":{"runId":"run-p086","admissionTotal":1,"acceptedTotal":1,"rejectedTotal":0,"replayTotal":0,"successTotal":1,"noProgressTotal":0,"failedTotal":0,"cancelledTotal":0,"freshSessionAvoidedTotal":1,"leadAutoTotal":1,"operatorMcpTotal":0,"changedFilesTotal":2,"testsOrGatesTotal":1,"terminalTotal":1,"usefulProgressTotal":1,"usefulProgressRate":1.0,"noProgressRate":0.0,"testsPassedAfterContinuationTotal":1,"followupValidationTotal":1,"followupValidationSuccessTotal":1,"followupValidationSuccessRate":1.0,"leadAutoSuccessTotal":1,"leadAutoSuccessRate":1.0,"operatorMcpSuccessTotal":0,"operatorMcpSuccessRate":0.0,"timeSavedSecondsTotal":120,"timeSavedSampleCount":1,"averageTimeSavedSeconds":120.0,"providerSessionBudgetInputTokensTotal":100,"providerSessionBudgetOutputTokensTotal":40,"providerSessionBudgetCachedInputTokensTotal":20,"providerSessionBudgetCostCentsTotal":7,"providerSessionResurrectionAttachSuccessTotal":0,"providerSessionResurrectionAttachFailureTotal":1,"orphanReapAttemptedTotal":0,"orphanReapVerifiedTotal":0,"resurrectionUnsupportedTotal":1}}}
+          """.utf8)
+      ])
+    let store = P031GraphQLWorkflowReadStore(
+      readTransport: readTransport,
+      subscriptionTransport: CapturingP031SubscriptionTransport()
+    )
+
+    let detail = try await store.fetchRunDetail(runID: "run-p086")
+    let presentation = P031RunDetailPresenter.presentation(
+      for: detail,
+      currentFreshness: P031FreshnessSnapshot(state: .live),
+      checkedAt: Date(timeIntervalSince1970: 0)
+    )
+
+    #expect(detail.continuations.map(\.id) == ["cont-1"])
+    #expect(detail.continuationMetricsSummary?.leadAutoTotal == 1)
+    #expect(detail.continuationMetricsSummary?.usefulProgressRate == 1.0)
+    #expect(detail.continuationMetricsSummary?.followupValidationSuccessRate == 1.0)
+    #expect(detail.continuationMetricsSummary?.averageTimeSavedSeconds == 120.0)
+    #expect(detail.continuationMetricsSummary?.providerSessionBudgetInputTokensTotal == 100)
+    #expect(detail.continuationMetricsSummary?.providerSessionResurrectionAttachFailureTotal == 1)
+    #expect(presentation.continuationReadback?.latestStatus == "Succeeded")
+    #expect(presentation.continuationReadback?.latestTrigger == "Lead Auto")
+    #expect(presentation.continuationReadback?.artifactSummary == "7 evidence artifacts")
+    #expect(P031GraphQLDocuments.runDetail.contains("continuations(runId: $runId)"))
+    #expect(P031GraphQLDocuments.runDetail.contains("continuationMetricsSummary(runId: $runId)"))
+    #expect(!P031GraphQLDocuments.runDetail.contains("continueWork("))
+    #expect(!P031GraphQLDocuments.runDetail.contains("agentsContinueWork("))
+  }
+
   @Test("Workflow read store decodes P077 closeout readiness from documented and alias fields")
   func workflowReadStoreDecodesP077CloseoutReadinessFields() async throws {
     let readTransport = CapturingP031ReadTransport(

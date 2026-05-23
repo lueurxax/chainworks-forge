@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
+use acp::AcpRuntimeManager;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts,
     code_writer_completion_receipts, projections, retry_payload_recovery_events,
@@ -40,6 +41,7 @@ pub struct RecoveryService {
     #[allow(dead_code)]
     events: EventSender,
     db_writer: Arc<DbWriter>,
+    acp: Option<Arc<AcpRuntimeManager>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +75,166 @@ struct P092RecoverySummary {
     repaired: usize,
     mode: &'static str,
     disabled: bool,
+}
+
+#[derive(Clone, Debug)]
+struct P086OrphanReapOutcome {
+    attempted: bool,
+    verified: bool,
+    error: Option<String>,
+    policy: &'static str,
+    signals_sent: Vec<&'static str>,
+    term_deadline_ms: u64,
+    kill_deadline_ms: u64,
+    started_at: String,
+    completed_at: String,
+}
+
+fn p086_process_exists(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let mut status: libc::c_int = 0;
+    let waited = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) };
+    if waited == pid {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPERM)
+    )
+}
+
+fn p086_process_group_id(pid: libc::pid_t) -> Option<libc::pid_t> {
+    if pid <= 0 {
+        return None;
+    }
+    let pgid = unsafe { libc::getpgid(pid) };
+    (pgid > 0).then_some(pgid)
+}
+
+async fn p086_reap_registered_provider_process_group(
+    child_pid: Option<i64>,
+    process_group_id: Option<i64>,
+    process_uid: Option<i64>,
+) -> P086OrphanReapOutcome {
+    let started_at = Utc::now().to_rfc3339();
+    let Some(child_pid) = child_pid.and_then(|pid| (pid > 0).then_some(pid as libc::pid_t)) else {
+        let completed_at = Utc::now().to_rfc3339();
+        return P086OrphanReapOutcome {
+            attempted: false,
+            verified: false,
+            error: Some("missing_provider_process_binding".to_string()),
+            policy: "missing_durable_provider_process_binding",
+            signals_sent: Vec::new(),
+            term_deadline_ms: 0,
+            kill_deadline_ms: 0,
+            started_at,
+            completed_at,
+        };
+    };
+    let pgid = process_group_id
+        .and_then(|pid| (pid > 0).then_some(pid as libc::pid_t))
+        .unwrap_or(child_pid);
+    let current_uid = unsafe { libc::getuid() } as i64;
+    if let Some(expected_uid) = process_uid {
+        if expected_uid != current_uid {
+            let completed_at = Utc::now().to_rfc3339();
+            return P086OrphanReapOutcome {
+                attempted: true,
+                verified: false,
+                error: Some(format!(
+                    "provider_process_uid_mismatch: expected {expected_uid}, current {current_uid}"
+                )),
+                policy: "registered_process_group_uid_guard",
+                signals_sent: Vec::new(),
+                term_deadline_ms: 0,
+                kill_deadline_ms: 0,
+                started_at,
+                completed_at,
+            };
+        }
+    }
+    if !p086_process_exists(child_pid) {
+        let completed_at = Utc::now().to_rfc3339();
+        return P086OrphanReapOutcome {
+            attempted: true,
+            verified: true,
+            error: None,
+            policy: "registered_process_group_already_exited",
+            signals_sent: Vec::new(),
+            term_deadline_ms: 0,
+            kill_deadline_ms: 0,
+            started_at,
+            completed_at,
+        };
+    }
+    match p086_process_group_id(child_pid) {
+        Some(actual_pgid) if actual_pgid == pgid => {}
+        Some(actual_pgid) => {
+            let completed_at = Utc::now().to_rfc3339();
+            return P086OrphanReapOutcome {
+                attempted: true,
+                verified: false,
+                error: Some(format!(
+                    "provider_process_group_mismatch: expected {pgid}, actual {actual_pgid}"
+                )),
+                policy: "registered_process_group_pgid_guard",
+                signals_sent: Vec::new(),
+                term_deadline_ms: 0,
+                kill_deadline_ms: 0,
+                started_at,
+                completed_at,
+            };
+        }
+        None => {
+            let completed_at = Utc::now().to_rfc3339();
+            return P086OrphanReapOutcome {
+                attempted: true,
+                verified: true,
+                error: None,
+                policy: "registered_process_group_gone_before_signal",
+                signals_sent: Vec::new(),
+                term_deadline_ms: 0,
+                kill_deadline_ms: 0,
+                started_at,
+                completed_at,
+            };
+        }
+    }
+
+    let target = -pgid;
+    let mut signals_sent = vec!["SIGTERM"];
+    let term_deadline_ms = 200;
+    let kill_deadline_ms = 200;
+    unsafe {
+        libc::kill(target, libc::SIGTERM);
+    }
+    tokio::time::sleep(Duration::from_millis(term_deadline_ms)).await;
+    if p086_process_exists(child_pid) {
+        signals_sent.push("SIGKILL");
+        unsafe {
+            libc::kill(target, libc::SIGKILL);
+        }
+        tokio::time::sleep(Duration::from_millis(kill_deadline_ms)).await;
+    }
+    let verified = !p086_process_exists(child_pid);
+    let completed_at = Utc::now().to_rfc3339();
+    P086OrphanReapOutcome {
+        attempted: true,
+        verified,
+        error: (!verified).then(|| "provider_process_still_live_after_signal".to_string()),
+        policy: "registered_provider_process_group_signal",
+        signals_sent,
+        term_deadline_ms,
+        kill_deadline_ms,
+        started_at,
+        completed_at,
+    }
 }
 
 fn p092_recovery_disabled() -> bool {
@@ -131,6 +293,7 @@ fn p092_recovery_reason_code(stale_fields: &[&'static str]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
 
     #[test]
     fn proposal_058_recovery_action_uses_failure_kind_and_output_settlement() {
@@ -155,6 +318,58 @@ mod tests {
                 "valid_outputs_from_failed_execution"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn p086_reap_registered_provider_process_group_kills_test_process_group() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn test sleep process");
+        let pid = child.id() as libc::pid_t;
+        let pgid = p086_process_group_id(pid).expect("test child must have process group");
+
+        let outcome = p086_reap_registered_provider_process_group(
+            Some(pid as i64),
+            Some(pgid as i64),
+            Some(unsafe { libc::getuid() } as i64),
+        )
+        .await;
+
+        assert!(outcome.attempted);
+        assert!(outcome.verified, "unexpected reap outcome: {outcome:?}");
+        assert_eq!(outcome.policy, "registered_provider_process_group_signal");
+        assert!(outcome.signals_sent.contains(&"SIGTERM"));
+        assert!(outcome.term_deadline_ms > 0);
+        assert!(outcome.kill_deadline_ms > 0);
+        let _ = child.kill();
+    }
+
+    #[tokio::test]
+    async fn p086_reap_registered_provider_process_group_fails_closed_on_uid_mismatch() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn test sleep process");
+        let pid = child.id() as libc::pid_t;
+        let pgid = p086_process_group_id(pid).expect("test child must have process group");
+        let current_uid = unsafe { libc::getuid() } as i64;
+
+        let outcome = p086_reap_registered_provider_process_group(
+            Some(pid as i64),
+            Some(pgid as i64),
+            Some(current_uid + 1),
+        )
+        .await;
+
+        assert!(outcome.attempted);
+        assert!(!outcome.verified);
+        assert_eq!(outcome.policy, "registered_process_group_uid_guard");
+        assert!(p086_process_exists(pid));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -435,6 +650,7 @@ impl RecoveryService {
             work_queue,
             events,
             db_writer: Arc::new(db_writer),
+            acp: None,
         }
     }
 
@@ -449,6 +665,23 @@ impl RecoveryService {
             work_queue,
             events,
             db_writer,
+            acp: None,
+        }
+    }
+
+    pub fn new_with_db_writer_and_acp(
+        pool: SqlitePool,
+        work_queue: WorkQueue,
+        events: EventSender,
+        db_writer: Arc<DbWriter>,
+        acp: Arc<AcpRuntimeManager>,
+    ) -> Self {
+        Self {
+            pool,
+            work_queue,
+            events,
+            db_writer,
+            acp: Some(acp),
         }
     }
 
@@ -469,6 +702,7 @@ impl RecoveryService {
             work_queue,
             events,
             db_writer,
+            acp: None,
         }
     }
 
@@ -499,6 +733,13 @@ impl RecoveryService {
             warn!(
                 settled = agent_executions_settled,
                 "Startup recovery settled terminal preclaimed InvokeAgent executions"
+            );
+        }
+        let p086_recovered = self.repair_p086_stale_continuation_workers().await?;
+        if p086_recovered > 0 {
+            warn!(
+                repaired = p086_recovered,
+                "Startup recovery released stale P086 continuation workers"
             );
         }
         let mut p092_recovered = 0usize;
@@ -824,6 +1065,144 @@ impl RecoveryService {
                 .as_ref()
                 .and_then(|readback| readback.next_retry_or_backoff_time),
         })
+    }
+
+    async fn repair_p086_stale_continuation_workers(&self) -> Result<usize> {
+        let current_generation = format!("daemon-{}", std::process::id());
+        let stale_before = (Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        let stale = db::repos::agent_work_continuations::list_stale_supervised_workers(
+            &self.pool,
+            &current_generation,
+            &stale_before,
+            100,
+        )
+        .await?;
+        let mut repaired = 0usize;
+        for worker in stale {
+            let close_outcome = if let Some(acp) = &self.acp {
+                match acp.close_session(&worker.session_generation_id).await {
+                    Ok(()) => P086OrphanReapOutcome {
+                        attempted: true,
+                        verified: true,
+                        error: None,
+                        policy: "close_registered_acp_session_before_release",
+                        signals_sent: Vec::new(),
+                        term_deadline_ms: 0,
+                        kill_deadline_ms: 0,
+                        started_at: Utc::now().to_rfc3339(),
+                        completed_at: Utc::now().to_rfc3339(),
+                    },
+                    Err(error) => {
+                        let mut outcome = p086_reap_registered_provider_process_group(
+                            worker.provider_child_pid,
+                            worker.provider_process_group_id,
+                            worker.provider_process_uid,
+                        )
+                        .await;
+                        if let Some(reap_error) = outcome.error.take() {
+                            outcome.error = Some(format!("{error}; {reap_error}"));
+                        } else if !outcome.verified {
+                            outcome.error = Some(error.to_string());
+                        }
+                        outcome
+                    }
+                }
+            } else {
+                let mut outcome = p086_reap_registered_provider_process_group(
+                    worker.provider_child_pid,
+                    worker.provider_process_group_id,
+                    worker.provider_process_uid,
+                )
+                .await;
+                if outcome.error.is_none() && !outcome.verified {
+                    outcome.error = Some("acp_runtime_unavailable".to_string());
+                }
+                outcome
+            };
+            let evidence = serde_json::json!({
+                "schema_version": "p086_stale_worker_recovery_v1",
+                "continuation_id": worker.continuation_id,
+                "old_worker_pid": worker.worker_pid,
+                "provider_child_pid": worker.provider_child_pid,
+                "provider_process_group_id": worker.provider_process_group_id,
+                "provider_process_uid": worker.provider_process_uid,
+                "old_daemon_generation_id": worker.daemon_generation_id,
+                "current_daemon_generation_id": current_generation,
+                "session_generation_id": worker.session_generation_id,
+                "provider_session_id": worker.provider_session_id,
+                "prior_status": worker.status,
+                "last_heartbeat_at": worker.last_heartbeat_at,
+                "observed_at": Utc::now().to_rfc3339(),
+                "orphan_reap_policy": close_outcome.policy,
+                "orphan_reap_attempted": close_outcome.attempted,
+                "orphan_reap_verified": close_outcome.verified,
+                "orphan_reap_error": close_outcome.error,
+                "orphan_reap_signals_sent": close_outcome.signals_sent,
+                "orphan_reap_term_deadline_ms": close_outcome.term_deadline_ms,
+                "orphan_reap_kill_deadline_ms": close_outcome.kill_deadline_ms,
+                "orphan_reap_started_at": close_outcome.started_at,
+                "orphan_reap_completed_at": close_outcome.completed_at,
+                "outcome": if close_outcome.verified {
+                    "verified_reap_then_released"
+                } else {
+                    "fail_closed_without_verified_reap"
+                }
+            });
+            db::repos::agent_work_continuations::release_supervised_worker(
+                &self.pool,
+                &worker.continuation_id,
+                if close_outcome.verified {
+                    "stale_generation_reaped"
+                } else {
+                    "stale_generation_reap_unverified"
+                },
+                Some(&evidence.to_string()),
+            )
+            .await?;
+            db::repos::agent_work_continuations::update_continuation_status(
+                &self.pool,
+                &worker.continuation_id,
+                "needs_continuation_reconciliation",
+                if close_outcome.verified {
+                    Some("stale_worker_reaped")
+                } else {
+                    Some("stale_worker_reap_unverified")
+                },
+            )
+            .await?;
+            db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                &self.pool,
+                None,
+                None,
+                None,
+                Some(&worker.continuation_id),
+                "continuation_orphan_reap_attempted_total",
+                serde_json::json!({
+                    "orphan_reap_policy": close_outcome.policy,
+                    "outcome": if close_outcome.verified { "verified" } else { "unverified" }
+                }),
+                if close_outcome.attempted { 1 } else { 0 },
+            )
+            .await?;
+            if close_outcome.verified {
+                db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                    &self.pool,
+                    None,
+                    None,
+                    None,
+                    Some(&worker.continuation_id),
+                    "continuation_orphan_reap_verified_total",
+                    serde_json::json!({
+                        "orphan_reap_policy": close_outcome.policy,
+                        "outcome": "verified"
+                    }),
+                    1,
+                )
+                .await?;
+            }
+            repaired += 1;
+        }
+        Ok(repaired)
     }
 
     pub async fn run_p092_retry_payload_recovery_for_active_runs(&self) -> Result<usize> {

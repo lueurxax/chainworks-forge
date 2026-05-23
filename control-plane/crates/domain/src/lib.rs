@@ -8,6 +8,7 @@ pub mod closeout_readiness_mode;
 pub mod closeout_readiness_summary_accessor;
 pub mod code_writer_completion;
 pub mod commands;
+pub mod continuation;
 pub mod discovery;
 pub mod error_sanitizer;
 pub mod events;
