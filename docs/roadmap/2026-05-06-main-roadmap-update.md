@@ -139,12 +139,12 @@ The durable side-effect ledger identifies and guards the risk that retry of rele
 
 Retry automation must fail closed around release/publish/git stages while unresolved side effects exist.
 
-P076/P080 should not perform active repair/retry for side-effect lanes unless the durable ledger readback clears them.
+The auto-retry observation ledger and P080 should not perform active repair/retry for side-effect lanes unless the durable ledger readback clears them.
 
 Related docs:
 
 - [Durable side-effect ledger](../reference/rust-control-plane.md#durable-side-effect-ledger)
-- [P076 auto-retry observation ledger](../proposals/076-auto-retry-observation-ledger-and-recovery-policy.md)
+- [Auto-retry observation ledger](../reference/auto-retry-observation-ledger.md)
 - [P080 continuous stale execution reconciliation](../proposals/080-continuous-stale-execution-reconciliation.md)
 - [Execution truth and recovery](../reference/execution-truth-and-recovery.md)
 
@@ -314,7 +314,7 @@ Minimum rows:
 - late output after supersede,
 - duplicate startup/session.
 
-#### Step 8 - P076 / P080 recovery automation
+#### Step 8 - Auto-retry ledger / P080 recovery automation
 
 Only after the durable side-effect guard exists.
 
@@ -448,7 +448,7 @@ P073
 -> write-budget contract
 -> durable side-effect ledger
 -> P082
--> P076/P080
+-> auto-retry ledger / P080
 -> P079
 -> P031 closeout
 -> P038/P046

@@ -1,39 +1,26 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "fixture_description": "P076 readback that omits required observation_summary_v1 fields. Proves the observation_summary_v1 schema shape is required in strict mode.",
+  "proves_missing_observation_summary_schema": true,
+  "schema_version": "auto_retry_readback.v1",
+  "generated_at": "2026-05-23T09:00:06Z",
+  "version_negotiation": {
+    "selected_version": "auto_retry_readback.v1",
+    "supported_versions": ["auto_retry_readback.v1"],
+    "unsupported_versions": []
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
+  "ledger_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-observations.jsonl",
+  "budget_state_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-budget.json",
+  "known_issue_catalog_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-known-issues.json",
+  "generated_markdown_catalog_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-known-issues.md",
+  "lock_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry.lock",
+  "rollup_report_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-rollup.json",
+  "diagnostics": [],
+  "observations": [
+    {
+      "observation_id": "ar_obs_20260523T090006Z_bad6bad6bad6",
+      "observed_at": "2026-05-23T09:00:06Z",
+      "MISSING_REQUIRED_FIELDS_NOTE": "run_id, stage_id, blocker_signature_id, blocker_class, policy_decision, retry_action, retry_result, known_issue_status, observation_path are all absent here — proves observation_summary_v1 required fields"
+    }
   ],
-  "gate_aliases": [
-    "proposal-076",
-    "p076"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:missing_observation_summary_schema",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "latest_by_run": []
 }

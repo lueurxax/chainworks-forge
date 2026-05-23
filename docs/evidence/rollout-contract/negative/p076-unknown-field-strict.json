@@ -1,39 +1,25 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "fixture_description": "P076 observation_summary_v1 record with an unknown field that is not in the schema. In strict_gate_mode with additionalProperties=false, this must be rejected.",
+  "proves_unknown_field_rejection_in_strict_mode": true,
+  "unknown_field_rejection_mode": "strict",
+  "violation_type": "unknown_field_in_closed_object_schema",
+  "affected_schema": "observation_summary_v1",
+  "unknown_field_name": "future_extension_field_not_in_schema",
+  "required_behavior": "In strict_gate_mode, unknown fields in additionalProperties=false schemas are rejected. In permissive_report_mode, they are tolerated with a diagnostic.",
+  "sample_record": {
+    "observation_id": "ar_obs_20260523T090020Z_badebadebade",
+    "observed_at": "2026-05-23T09:00:20Z",
+    "run_id": "run-unknown-field-001",
+    "stage_id": "state_3_implementation_started",
+    "blocker_signature_id": "sig-unknown-field-001",
+    "blocker_class": "substantive_output_contract",
+    "policy_decision": "observe_only",
+    "retry_action": "none",
+    "retry_result": "not_attempted",
+    "known_issue_status": "observed",
+    "observation_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-observations.jsonl",
+    "future_extension_field_not_in_schema": "this field is not defined in observation_summary_v1 additionalProperties=false"
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-076",
-    "p076"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:unknown_field_strict",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_strict_outcome": "rejected",
+  "expected_permissive_outcome": "accepted_with_diagnostic"
 }

@@ -64,6 +64,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 
 - [reference/run-control.md](reference/run-control.md) — Stop/cancel, two-phase cancellation settlement, terminal-history rules
 - [reference/release-gate.md](reference/release-gate.md) — Manual release gate: post-approval execution, native git/publish, delivery receipts
+- [reference/auto-retry-observation-ledger.md](reference/auto-retry-observation-ledger.md) — Observe-only auto-retry ledger, known-issue catalog, MCP readback, and rollup tooling
 - [reference/executable-rollout-gate-template.md](reference/executable-rollout-gate-template.md) — `rollout_contract_v1` / `rollout_contract_check_v1` / `operator_readback_v1` schemas, run-start preflight contract, and retained historical alias self-contract
 - [reference/full-mvp-delivery.md](reference/full-mvp-delivery.md) — Repo-backed delivery slice: worktrees, implementation loop, manual release, assessment and handoff
 - [proposals/064-run-worktree-main-sync-and-cross-run-knowledge-transfer.md](proposals/064-run-worktree-main-sync-and-cross-run-knowledge-transfer.md) — Run worktree main sync and cross-run knowledge transfer (Phase 0 contract freeze)

@@ -1,39 +1,19 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-076",
-    "p076"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:poll_timeout_without_observation",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "fixture_description": "P076 poll that exceeded poll_deadline_seconds=300 but did not write a timeout observation record with policy_decision=poll_timeout. Proves deadline behavior requires a partial observation.",
+  "proves_missing_timeout_observation": true,
+  "violation": "poll_timeout_without_partial_observation_record",
+  "poll_deadline_seconds": 300,
+  "actual_poll_elapsed_ms": 301500,
+  "observation_record_written": false,
+  "hold_condition_triggered": "MCP readback exceeds configured deadline without timeout observation",
+  "required_behavior": "A deadline produces one partial observation with policy_decision=poll_timeout for unfinished items. The observation must be written even when the poll times out.",
+  "evidence": {
+    "poll_started_at": "2026-05-23T09:00:00Z",
+    "poll_elapsed_ms": 301500,
+    "timeout_observation_expected": {
+      "policy_decision": "poll_timeout",
+      "summary": {"partial": true}
+    },
+    "timeout_observation_found": false
+  }
 }

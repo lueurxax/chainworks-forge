@@ -516,7 +516,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 41] {
+fn all_tool_capabilities() -> [CapabilityToolId; 42] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -559,6 +559,7 @@ fn all_tool_capabilities() -> [CapabilityToolId; 41] {
         CapabilityToolId::AgentsContinuationStatus,
         CapabilityToolId::AgentsContinuationCandidates,
         CapabilityToolId::AgentsContinueWork,
+        CapabilityToolId::AutomationAutoRetryLatest,
     ]
 }
 
@@ -649,6 +650,10 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::AgentsContinueWork => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Agent)
         }
+        CapabilityToolId::AutomationAutoRetryLatest => matches!(
+            class,
+            PrincipalClass::Operator | PrincipalClass::Observer
+        ),
     }
 }
 
@@ -766,6 +771,7 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "agents.continuation_status" => Some(CapabilityToolId::AgentsContinuationStatus),
         "agents.continuation_candidates" => Some(CapabilityToolId::AgentsContinuationCandidates),
         "agents.continue_work" => Some(CapabilityToolId::AgentsContinueWork),
+        "automation.auto_retry.latest" => Some(CapabilityToolId::AutomationAutoRetryLatest),
         _ => None,
     }
 }

@@ -1,39 +1,22 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-076",
-    "p076"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:missing_readback_lock_path",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "fixture_description": "P076 auto_retry_readback envelope that omits lock_path. Proves the lock_path top-level required field is enforced.",
+  "proves_missing_lock_path": true,
+  "auto_retry_readback": {
+    "schema_version": "auto_retry_readback.v1",
+    "generated_at": "2026-05-23T09:00:07Z",
+    "version_negotiation": {
+      "selected_version": "auto_retry_readback.v1",
+      "supported_versions": ["auto_retry_readback.v1"],
+      "unsupported_versions": []
+    },
+    "ledger_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-observations.jsonl",
+    "budget_state_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-budget.json",
+    "known_issue_catalog_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-known-issues.json",
+    "generated_markdown_catalog_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-known-issues.md",
+    "MISSING_FIELD_NOTE": "lock_path is intentionally absent here to prove it is a required top-level field",
+    "rollup_report_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-rollup.json",
+    "diagnostics": [],
+    "observations": [],
+    "latest_by_run": []
+  }
 }

@@ -41,6 +41,24 @@ impl JsonRpcResponse {
         }
     }
 
+    pub fn error_with_data(
+        id: Option<serde_json::Value>,
+        code: i32,
+        message: String,
+        data: serde_json::Value,
+    ) -> Self {
+        JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message,
+                data: Some(data),
+            }),
+        }
+    }
+
     /// R12 API-001: ensure every outbound error response carries the
     /// ambient request id so an operator can pivot from a failed MCP
     /// call to logs and `command_journal` rows. No-op when the

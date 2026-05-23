@@ -56,6 +56,8 @@ pub enum CapabilityToolId {
     AgentsContinuationCandidates,
     /// P086: issue a continuation command for an eligible code_writer AgentExecution.
     AgentsContinueWork,
+    /// P076: read latest observe-only auto-retry ledger/catalog state.
+    AutomationAutoRetryLatest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]

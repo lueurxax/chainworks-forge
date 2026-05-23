@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod approvals;
 pub mod artifacts;
+pub mod automation;
 pub mod effects;
 pub mod ideas;
 pub mod reports;
@@ -13,7 +14,7 @@ pub mod storage;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 41] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 42] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -56,6 +57,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 41] {
         CapabilityToolId::AgentsContinuationStatus,
         CapabilityToolId::AgentsContinuationCandidates,
         CapabilityToolId::AgentsContinueWork,
+        CapabilityToolId::AutomationAutoRetryLatest,
     ]
 }
 
@@ -123,6 +125,7 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "agents.continuation_status" => Some(CapabilityToolId::AgentsContinuationStatus),
         "agents.continuation_candidates" => Some(CapabilityToolId::AgentsContinuationCandidates),
         "agents.continue_work" => Some(CapabilityToolId::AgentsContinueWork),
+        "automation.auto_retry.latest" => Some(CapabilityToolId::AutomationAutoRetryLatest),
         _ => None,
     }
 }
@@ -168,6 +171,7 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "agents_continuation_status" => "agents.continuation_status",
         "agents_continuation_candidates" => "agents.continuation_candidates",
         "agents_continue_work" => "agents.continue_work",
+        "automation_auto_retry_latest" => "automation.auto_retry.latest",
         _ => tool_name,
     }
 }
@@ -286,6 +290,9 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::AgentsContinueWork => {
             tool_spec_by_name(agents::tool_specs(), "agents.continue_work")
         }
+        CapabilityToolId::AutomationAutoRetryLatest => {
+            tool_spec_by_name(automation::tool_specs(), "automation.auto_retry.latest")
+        }
     }
 }
 
@@ -301,6 +308,7 @@ pub fn all_tool_specs() -> Vec<McpTool> {
     specs.extend(runtime::tool_specs());
     specs.extend(effects::tool_specs());
     specs.extend(storage::tool_specs());
+    specs.extend(automation::tool_specs());
     specs.extend(agents::tool_specs());
     specs
 }
