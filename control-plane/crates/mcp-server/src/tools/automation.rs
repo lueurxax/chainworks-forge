@@ -43,6 +43,10 @@ pub async fn execute(tool_name: &str, params: Value) -> Result<Value> {
 
 fn auto_retry_latest(params: Value) -> Value {
     let paths = P076Paths::resolve();
+    auto_retry_latest_with_paths(params, paths)
+}
+
+fn auto_retry_latest_with_paths(params: Value, paths: P076Paths) -> Value {
     let run_filter = params.get("run_id").and_then(Value::as_str);
     let signature_filter = params.get("blocker_signature_id").and_then(Value::as_str);
 
@@ -51,7 +55,20 @@ fn auto_retry_latest(params: Value) -> Value {
 
     match std::fs::read_to_string(&paths.ledger_path) {
         Ok(text) => {
-            for (idx, raw_line) in text.lines().enumerate() {
+            let mut lines: Vec<&str> = text.lines().collect();
+            if !text.is_empty() && !text.as_bytes().ends_with(b"\n") {
+                diagnostics.push(diagnostic(
+                    "partial_trailing_record",
+                    "warning",
+                    format!(
+                        "Ignored partial trailing auto-retry observation at line {}: ledger does not end with newline",
+                        lines.len()
+                    ),
+                    Some(paths.ledger_path.to_string_lossy().as_ref()),
+                ));
+                lines.pop();
+            }
+            for (idx, raw_line) in lines.iter().enumerate() {
                 let line = raw_line.trim();
                 if line.is_empty() {
                     continue;
@@ -63,17 +80,6 @@ fn auto_retry_latest(params: Value) -> Value {
                             &paths.ledger_path,
                             run_filter,
                             signature_filter,
-                        ));
-                    }
-                    Err(error) if idx + 1 == text.lines().count() => {
-                        diagnostics.push(diagnostic(
-                            "partial_trailing_record",
-                            "warning",
-                            format!(
-                                "Ignored partial trailing auto-retry observation at line {}: {error}",
-                                idx + 1
-                            ),
-                            Some(paths.ledger_path.to_string_lossy().as_ref()),
                         ));
                     }
                     Err(error) => {
@@ -334,14 +340,18 @@ mod tests {
         std::fs::create_dir_all(&automation).unwrap();
         std::fs::write(
             automation.join("auto-retry-observations.jsonl"),
-            r#"{"schema_version":"auto-retry-observation.v1","observation_id":"ar_obs_20260523T100000Z_a1b2c3d4e5f6","observed_at":"2026-05-23T10:00:00Z","blocked_runs":[{"run_id":"run-1","stage_id":"state_9","blocker_signature_id":"sig-1","blocker_class":"substantive_output_contract","policy_decision":"observe_only","retry_action":"none","retry_result":"not_attempted","stage_execution_id":null,"failure_summary":"missing output","next_systemic_action":"fix contract","evidence_report_id":null}]}"#,
+            concat!(
+                r#"{"schema_version":"auto-retry-observation.v1","observation_id":"ar_obs_20260523T100000Z_a1b2c3d4e5f6","observed_at":"2026-05-23T10:00:00Z","blocked_runs":[{"run_id":"run-1","stage_id":"state_9","blocker_signature_id":"sig-1","blocker_class":"substantive_output_contract","policy_decision":"observe_only","retry_action":"none","retry_result":"not_attempted","stage_execution_id":null,"failure_summary":"missing output","next_systemic_action":"fix contract","evidence_report_id":null}]}"#,
+                "\n"
+            ),
         )
         .unwrap();
-        std::env::set_var("CHAINWORKS_META_ROOT", &meta);
 
-        let payload = auto_retry_latest(json!({"run_id": "run-1"}));
+        let payload = auto_retry_latest_with_paths(
+            json!({"run_id": "run-1"}),
+            test_paths(automation.clone()),
+        );
 
-        std::env::remove_var("CHAINWORKS_META_ROOT");
         assert_eq!(payload["schema_version"], READBACK_VERSION);
         assert_eq!(payload["observations"][0]["run_id"], "run-1");
         assert_eq!(
@@ -355,5 +365,73 @@ mod tests {
                 .to_string_lossy()
                 .as_ref()
         );
+    }
+
+    #[test]
+    fn p076_auto_retry_latest_ignores_only_unterminated_trailing_fragment() {
+        let temp = tempfile::tempdir().unwrap();
+        let meta = temp.path().join(".chainworks");
+        let automation = meta.join("automation");
+        std::fs::create_dir_all(&automation).unwrap();
+        std::fs::write(
+            automation.join("auto-retry-observations.jsonl"),
+            concat!(
+                r#"{"schema_version":"auto-retry-observation.v1","observation_id":"ar_obs_20260523T100000Z_a1b2c3d4e5f6","observed_at":"2026-05-23T10:00:00Z","blocked_runs":[{"run_id":"run-1","stage_id":"state_9","blocker_signature_id":"sig-1","blocker_class":"substantive_output_contract","policy_decision":"observe_only","retry_action":"none","retry_result":"not_attempted","stage_execution_id":null,"failure_summary":"missing output","next_systemic_action":"fix contract","evidence_report_id":null}]}"#,
+                "\n",
+                r#"{"schema_version":"#
+            ),
+        )
+        .unwrap();
+
+        let payload = auto_retry_latest_with_paths(
+            json!({"run_id": "run-1"}),
+            test_paths(automation),
+        );
+
+        assert_eq!(payload["observations"][0]["run_id"], "run-1");
+        assert_eq!(
+            payload["diagnostics"][0]["code"],
+            "partial_trailing_record"
+        );
+        assert_eq!(payload["diagnostics"][0]["severity"], "warning");
+    }
+
+    #[test]
+    fn p076_auto_retry_latest_degrades_on_malformed_complete_final_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let meta = temp.path().join(".chainworks");
+        let automation = meta.join("automation");
+        std::fs::create_dir_all(&automation).unwrap();
+        std::fs::write(
+            automation.join("auto-retry-observations.jsonl"),
+            concat!(
+                r#"{"schema_version":"auto-retry-observation.v1","observation_id":"ar_obs_20260523T100000Z_a1b2c3d4e5f6","observed_at":"2026-05-23T10:00:00Z","blocked_runs":[{"run_id":"run-1","stage_id":"state_9","blocker_signature_id":"sig-1","blocker_class":"substantive_output_contract","policy_decision":"observe_only","retry_action":"none","retry_result":"not_attempted","stage_execution_id":null,"failure_summary":"missing output","next_systemic_action":"fix contract","evidence_report_id":null}]}"#,
+                "\n",
+                r#"{"schema_version":"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let payload = auto_retry_latest_with_paths(
+            json!({"run_id": "run-1"}),
+            test_paths(automation),
+        );
+
+        assert_eq!(payload["diagnostics"][0]["code"], "artifact_read_degraded");
+        assert_eq!(payload["diagnostics"][0]["severity"], "error");
+        assert_eq!(payload["observations"].as_array().unwrap().len(), 0);
+        assert_eq!(payload["latest_by_run"].as_array().unwrap().len(), 0);
+    }
+
+    fn test_paths(automation: PathBuf) -> P076Paths {
+        P076Paths {
+            ledger_path: automation.join("auto-retry-observations.jsonl"),
+            budget_state_path: automation.join("auto-retry-budget.json"),
+            known_issue_catalog_path: automation.join("auto-retry-known-issues.json"),
+            generated_markdown_catalog_path: automation.join("auto-retry-known-issues.md"),
+            lock_path: automation.join("auto-retry.lock"),
+            rollup_report_path: automation.join("auto-retry-rollup.json"),
+        }
     }
 }
