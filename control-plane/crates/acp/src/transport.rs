@@ -3121,6 +3121,10 @@ impl AcpTransportSession {
         &self.session_id
     }
 
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed
     }

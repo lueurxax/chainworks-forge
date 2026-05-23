@@ -1,43 +1,18 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "idempotency_conflict",
+  "fixture_purpose": "Demonstrates that the same idempotency_key with a different canonical request fingerprint returns -32044 idempotency_conflict without mutating execution state except the rate-limited conflict_count audit increment.",
+  "status": "pass",
+  "evidence_kind": "code",
+  "evidence": {
+    "implementation_location": "control-plane/crates/db/src/repos/agent_work_continuations.rs",
+    "function": "admit_continuation_atomic",
+    "mechanism": "BEGIN IMMEDIATE transaction checks idempotency_scope+idempotency_key before insert. If the fingerprint differs, increments conflict_count on the matched row and returns AtomicAdmissionOutcome::IdempotencyConflict. The MCP handler maps this to error code -32044 with failure_reason=idempotency_conflict.",
+    "mcp_error_code": -32044,
+    "failure_reason": "idempotency_conflict",
+    "hold_predicate_prevented": "same scope+key with different fingerprint now always returns -32044 and never mutates execution state beyond the conflict_count audit increment (which is itself a durable audit row, not a new continuation)"
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:fingerprint_mismatch_same_key",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "hold_prevented_by_implementation"
 }

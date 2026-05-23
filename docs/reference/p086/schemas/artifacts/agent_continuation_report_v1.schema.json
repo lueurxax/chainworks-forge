@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chainworks.local/schemas/p086/agent_continuation_report_v1.schema.json",
+  "title": "agent_continuation_report_v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact_kind", "run_id", "stage_execution_id", "agent_execution_id", "continuation_id", "created_at", "redaction_tier", "retention_policy", "payload"],
+  "properties": {
+    "schema_version": { "const": "agent_continuation_report_v1" },
+    "artifact_kind": { "const": "agent_continuation_report" },
+    "run_id": { "type": "string" },
+    "stage_execution_id": { "type": "string" },
+    "agent_execution_id": { "type": "string" },
+    "continuation_id": { "type": "string" },
+    "created_at": { "type": "string" },
+    "redaction_tier": { "type": "string" },
+    "retention_policy": { "type": "string" },
+    "payload": { "type": "object", "additionalProperties": true }
+  }
+}

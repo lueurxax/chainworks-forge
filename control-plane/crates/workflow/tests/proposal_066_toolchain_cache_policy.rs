@@ -33,6 +33,7 @@ fn minimal_agent_entry(id: &str) -> AgentEntry {
         prompt: None,
         notes: None,
         worktree_policy: None,
+        continuation_capability: None,
         required_tools: None,
         xcode_broker_required: None,
         xcode_shim_injection_signal: None,

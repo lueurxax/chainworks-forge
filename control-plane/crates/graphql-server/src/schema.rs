@@ -11,8 +11,9 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, info, warn};
 
 use db::repos::{
-    approvals, artifact_contracts, artifacts, closeout, code_writer_completion_receipts, ideas,
-    projections, rollout_contract_checks, runs, steward as steward_repo, workflow_conflicts,
+    agent_work_continuations, approvals, artifact_contracts, artifacts, closeout,
+    code_writer_completion_receipts, ideas, projections, rollout_contract_checks, runs,
+    steward as steward_repo, workflow_conflicts,
 };
 use db::writer::DbWriterHeartbeat;
 use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, ResolveApprovalCmd};
@@ -25,6 +26,10 @@ use engine::lifecycle_reporter::LifecycleReporter;
 
 use crate::types::approval::GqlApproval;
 use crate::types::artifact::{GqlArtifact, P085_NO_DEADLINE_JUSTIFICATION};
+use crate::types::continuation::{
+    GqlContinuationCandidatesResult, GqlContinuationMetricsSummary, GqlContinuationRecord,
+    GqlContinuationStatus,
+};
 use crate::types::idea::GqlIdea;
 use crate::types::p031::{
     GqlMutationConflictResultCode, GqlPayloadAvailabilityState, GqlPayloadUnavailableReasonCode,
@@ -1137,6 +1142,95 @@ impl QueryRoot {
             .into_iter()
             .map(GqlSideEffectSummary::from_domain)
             .collect())
+    }
+
+    /// P086: Read-only continuation history and current status for an agent execution.
+    /// Returns raw + display status, freshness/projection-lag, and UNKNOWN display states
+    /// for unrecognised daemon values. Operator-only; no continuation mutation surface.
+    async fn continuation_status(
+        &self,
+        ctx: &Context<'_>,
+        agent_execution_id: ID,
+    ) -> Result<GqlContinuationStatus> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let ae_id = agent_execution_id.as_str();
+        let records = agent_work_continuations::list_for_agent_execution(pool, ae_id).await?;
+        let active = agent_work_continuations::find_active_for_agent_execution(pool, ae_id).await?;
+        let freshness_state = if records.is_empty() {
+            crate::types::p031::GqlFreshnessState::Unavailable
+        } else {
+            crate::types::p031::GqlFreshnessState::Live
+        };
+        let history: Vec<GqlContinuationRecord> = records
+            .into_iter()
+            .map(GqlContinuationRecord::from)
+            .collect();
+        let active_gql = active.map(GqlContinuationRecord::from);
+        Ok(GqlContinuationStatus {
+            agent_execution_id: agent_execution_id.clone(),
+            active: active_gql,
+            history,
+            freshness_state,
+        })
+    }
+
+    /// P086: Read-only list of eligible continuation candidates for a run.
+    /// Returns eligibility, raw/display status, and disabled reason for each
+    /// code_writer stage-owned AgentExecution. Operator-only.
+    async fn continuation_candidates(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<GqlContinuationCandidatesResult> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let candidates =
+            agent_work_continuations::list_candidates_for_run(pool, run_id.as_str()).await?;
+        let freshness_state = if candidates.is_empty() {
+            crate::types::p031::GqlFreshnessState::Unavailable
+        } else {
+            crate::types::p031::GqlFreshnessState::Live
+        };
+        Ok(GqlContinuationCandidatesResult {
+            run_id: run_id.clone(),
+            candidates: candidates
+                .into_iter()
+                .map(crate::types::continuation::GqlContinuationCandidate::from)
+                .collect(),
+            freshness_state,
+        })
+    }
+
+    /// P086: Read-only run-level continuation history for SwiftUI/operator readback.
+    async fn continuations(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<Vec<GqlContinuationRecord>> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let records = agent_work_continuations::list_for_run(pool, run_id.as_str()).await?;
+        Ok(records
+            .into_iter()
+            .map(GqlContinuationRecord::from)
+            .collect())
+    }
+
+    /// P086: Durable read-only rollout metric summary for continuation behavior.
+    async fn continuation_metrics_summary(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<GqlContinuationMetricsSummary> {
+        require_operator_read(ctx)?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let summary = agent_work_continuations::p086_continuation_metrics_summary_for_run(
+            pool,
+            run_id.as_str(),
+        )
+        .await?;
+        Ok(GqlContinuationMetricsSummary::from(summary))
     }
 }
 

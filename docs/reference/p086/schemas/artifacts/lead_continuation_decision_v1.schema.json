@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "lead_continuation_decision_v1.schema.json",
+  "title": "lead_continuation_decision_v1",
+  "description": "P086: Lead-directed continuation decision artifact. Server verifies artifact identity, hash, and instruction hash before accepting a lead_auto continuation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_kind",
+    "run_id", "stage_execution_id", "agent_execution_id", "continuation_id",
+    "created_at", "redaction_tier", "retention_policy", "payload"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "lead_continuation_decision_v1"},
+    "artifact_kind": {"type": "string", "const": "lead_continuation_decision"},
+    "run_id": {"type": "string"},
+    "stage_execution_id": {"type": "string"},
+    "agent_execution_id": {"type": "string"},
+    "continuation_id": {"type": "string"},
+    "created_at": {"type": "string"},
+    "redaction_tier": {"type": "string", "enum": ["none", "partial", "full"]},
+    "retention_policy": {"type": "string"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "decision_id",
+        "run_id", "stage_execution_id", "agent_execution_id",
+        "agent_id", "session_generation_id",
+        "decision", "reason", "created_at",
+        "continuation_instruction", "continuation_instruction_sha256",
+        "expected_next_work", "known_completed_work", "known_blockers",
+        "safety_checks", "stop_conditions", "max_turns", "max_wall_clock_seconds"
+      ],
+      "properties": {
+        "schema_version": {"type": "string", "const": "lead_continuation_decision_v1"},
+        "decision_id": {"type": "string"},
+        "run_id": {"type": "string"},
+        "stage_execution_id": {"type": "string"},
+        "agent_execution_id": {"type": "string"},
+        "agent_id": {"type": "string", "const": "code_writer"},
+        "session_generation_id": {"type": "string"},
+        "decision": {"type": "string", "enum": ["continue", "reject"]},
+        "reason": {"type": "string"},
+        "created_at": {"type": "string"},
+        "continuation_instruction": {"type": "string", "minLength": 1},
+        "continuation_instruction_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "expected_next_work": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "known_completed_work": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "known_blockers": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "safety_checks": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "no_release_side_effect",
+            "no_unresolved_effect_ledger",
+            "same_worktree_required"
+          ],
+          "properties": {
+            "no_release_side_effect": {"type": "boolean", "const": true},
+            "no_unresolved_effect_ledger": {"type": "boolean", "const": true},
+            "same_worktree_required": {"type": "boolean", "const": true}
+          }
+        },
+        "stop_conditions": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "max_turns": {"type": "integer", "minimum": 1, "maximum": 20},
+        "max_wall_clock_seconds": {"type": "integer", "minimum": 30, "maximum": 7200}
+      }
+    }
+  }
+}

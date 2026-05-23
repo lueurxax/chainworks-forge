@@ -298,6 +298,10 @@ struct RunsHomeView: View {
                             P036StageMapCard(map: stageMap)
                         }
 
+                        if let continuationReadback = runDetail.continuationReadback {
+                            P086ContinuationReadbackCard(presentation: continuationReadback)
+                        }
+
                         if !workbench.artifactsAndReports.isEmpty {
                             P036ArtifactWorkbenchCard(rows: workbench.artifactsAndReports)
                         }
@@ -2896,6 +2900,98 @@ private struct P031RunDetailSummaryCard: View {
         ]
         .compactMap { $0 }
         .joined(separator: " • ")
+    }
+}
+
+private struct P086ContinuationReadbackCard: View {
+    let presentation: P086ContinuationReadbackPresentation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForgeSectionHeader(
+                title: presentation.title,
+                subtitle: presentation.summary,
+                symbol: "arrow.triangle.2.circlepath"
+            )
+
+            HStack(alignment: .top, spacing: 12) {
+                Label(presentation.latestStatus, systemImage: statusSymbolName)
+                    .font(ForgeTypography.supporting.weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(statusColor.opacity(0.15), in: Capsule())
+                    .foregroundStyle(statusColor)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(presentation.latestMode)
+                        .font(ForgeTypography.body.weight(.semibold))
+                        .foregroundStyle(ForgeColor.Text.primary)
+                    Text([
+                        presentation.latestTrigger,
+                        presentation.artifactSummary,
+                        presentation.metricSummary,
+                    ].joined(separator: " · "))
+                    .font(ForgeTypography.supporting)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+            }
+
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 10)], spacing: 8) {
+                if let id = presentation.latestContinuationID {
+                    P086ContinuationMetadataPill(label: "Continuation", value: id)
+                }
+                if let id = presentation.latestAgentExecutionID {
+                    P086ContinuationMetadataPill(label: "Agent execution", value: id)
+                }
+                if let id = presentation.latestStageExecutionID {
+                    P086ContinuationMetadataPill(label: "Stage execution", value: id)
+                }
+            }
+        }
+        .forgePanel()
+        .accessibilityIdentifier("p086-continuation-readback-card")
+        .accessibilityLabel(presentation.accessibilityLabel)
+    }
+
+    private var statusColor: Color {
+        let status = presentation.latestStatus.lowercased()
+        if status.contains("succeeded") { return ForgeColor.Status.success }
+        if status.contains("failed") || status.contains("no progress") { return ForgeColor.Status.error }
+        if status.contains("cancel") { return ForgeColor.Status.warning }
+        return ForgeColor.Status.running
+    }
+
+    private var statusSymbolName: String {
+        let status = presentation.latestStatus.lowercased()
+        if status.contains("succeeded") { return "checkmark.circle.fill" }
+        if status.contains("failed") || status.contains("no progress") { return "exclamationmark.triangle.fill" }
+        if status.contains("cancel") { return "xmark.circle.fill" }
+        return "arrow.triangle.2.circlepath"
+    }
+}
+
+private struct P086ContinuationMetadataPill: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(ForgeTypography.micro.weight(.semibold))
+                .foregroundStyle(ForgeColor.Text.tertiary)
+            Text(value)
+                .font(ForgeTypography.micro.monospaced())
+                .foregroundStyle(ForgeColor.Text.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(ForgeColor.Surface.muted, in: RoundedRectangle(cornerRadius: 8))
     }
 }
 

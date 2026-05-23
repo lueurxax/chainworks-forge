@@ -1,43 +1,21 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "terminal_artifact_required",
+  "fixture_purpose": "Terminal continuation rows must carry response and result/no-progress artifact ids backed by materialized JSON artifacts.",
+  "status": "pass",
+  "evidence_kind": "code_and_regression_test",
+  "evidence": {
+    "implemented": {
+      "settlement_location": "control-plane/crates/engine/src/executor.rs::settle_p086_continuation_with_materialized_artifacts",
+      "repo_location": "control-plane/crates/db/src/repos/agent_work_continuations.rs::settle_with_artifacts",
+      "mechanism": "The worker writes continuation_response_snapshot_v1 and continuation_result_v1 or continuation_no_progress_report_v1 under the run artifact root, inserts both files into the artifacts table, and stores the artifact UUIDs plus response fingerprint on agent_work_continuations before operator readback can pass."
+    },
+    "tests": [
+      "cargo test -p db --test proposal_086_continuation_lifecycle p086_terminal_settlement_persists_artifact_ids_and_response_hash"
+    ],
+    "hold_predicate_sql": "SELECT * FROM agent_work_continuations WHERE status IN ('succeeded','no_progress','failed','cancelled') AND (result_or_no_progress_artifact_id IS NULL OR response_artifact_id IS NULL)"
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:terminal_missing_result_artifact",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "terminal_rows_without_artifacts_fail_closed"
 }

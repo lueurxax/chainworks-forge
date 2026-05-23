@@ -2580,6 +2580,8 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
   let approvalInbox: [P031ApprovalReadModel]
   let activeAgentExecutions: [P031ActiveAgentExecutionReadModel]
   let runStageTopology: [P031RunStageTopologyReadModel]
+  let continuations: [P086ContinuationRecordReadModel]
+  let continuationMetricsSummary: P086ContinuationMetricsSummaryReadModel?
 
   nonisolated init(
     run: P031RunRowReadModel?,
@@ -2588,7 +2590,9 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
     artifacts: [P031ArtifactReadModel],
     approvalInbox: [P031ApprovalReadModel] = [],
     activeAgentExecutions: [P031ActiveAgentExecutionReadModel] = [],
-    runStageTopology: [P031RunStageTopologyReadModel] = []
+    runStageTopology: [P031RunStageTopologyReadModel] = [],
+    continuations: [P086ContinuationRecordReadModel] = [],
+    continuationMetricsSummary: P086ContinuationMetricsSummaryReadModel? = nil
   ) {
     self.run = run
     self.idea = idea
@@ -2597,6 +2601,8 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
     self.approvalInbox = approvalInbox
     self.activeAgentExecutions = activeAgentExecutions
     self.runStageTopology = runStageTopology
+    self.continuations = continuations
+    self.continuationMetricsSummary = continuationMetricsSummary
   }
 
   nonisolated var freshnessStates: [P031FreshnessState] {
@@ -2604,6 +2610,7 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
       + stages.map(\.freshnessState)
       + artifacts.map(\.freshnessState)
       + approvalInbox.map(\.freshnessState)
+      + continuations.map(\.freshnessState)
   }
 
   nonisolated var ordinaryArtifacts: [P031ArtifactReadModel] {
@@ -2629,6 +2636,8 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
     case approvalInbox
     case activeAgentExecutions
     case runStageTopology
+    case continuations
+    case continuationMetricsSummary
   }
 
   init(from decoder: Decoder) throws {
@@ -2651,6 +2660,156 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
         [P031RunStageTopologyReadModel].self,
         forKey: .runStageTopology
       ) ?? []
+    self.continuations =
+      try container.decodeIfPresent([P086ContinuationRecordReadModel].self, forKey: .continuations)
+      ?? []
+    self.continuationMetricsSummary =
+      try container.decodeIfPresent(
+        P086ContinuationMetricsSummaryReadModel.self,
+        forKey: .continuationMetricsSummary
+      )
+  }
+}
+
+struct P086ContinuationRecordReadModel: Decodable, Equatable, Sendable {
+  let id: String
+  let runID: String
+  let stageExecutionID: String
+  let agentExecutionID: String
+  let modeRaw: String
+  let modeDisplay: String
+  let triggerKindRaw: String
+  let triggerKindDisplay: String
+  let statusRaw: String
+  let statusDisplay: String
+  let isTerminal: Bool
+  let failureReason: String?
+  let reconciliationStatus: String?
+  let requestFingerprintSHA256: String
+  let canonicalRequestArtifactID: String?
+  let attachReceiptArtifactID: String?
+  let evidenceBundleArtifactID: String?
+  let worktreeReadbackArtifactID: String?
+  let continuationReportArtifactID: String?
+  let responseFingerprintSHA256: String?
+  let responseArtifactID: String?
+  let resultOrNoProgressArtifactID: String?
+  let conflictCount: Int
+  let createdAt: String
+  let updatedAt: String
+  let freshnessState: P031FreshnessState
+  let projectionLagMS: Int?
+
+  enum CodingKeys: String, CodingKey {
+    case id
+    case runID = "runId"
+    case stageExecutionID = "stageExecutionId"
+    case agentExecutionID = "agentExecutionId"
+    case modeRaw
+    case modeDisplay
+    case triggerKindRaw
+    case triggerKindDisplay
+    case statusRaw
+    case statusDisplay
+    case isTerminal
+    case failureReason
+    case reconciliationStatus
+    case requestFingerprintSHA256 = "requestFingerprintSha256"
+    case canonicalRequestArtifactID = "canonicalRequestArtifactId"
+    case attachReceiptArtifactID = "attachReceiptArtifactId"
+    case evidenceBundleArtifactID = "evidenceBundleArtifactId"
+    case worktreeReadbackArtifactID = "worktreeReadbackArtifactId"
+    case continuationReportArtifactID = "continuationReportArtifactId"
+    case responseFingerprintSHA256 = "responseFingerprintSha256"
+    case responseArtifactID = "responseArtifactId"
+    case resultOrNoProgressArtifactID = "resultOrNoProgressArtifactId"
+    case conflictCount
+    case createdAt
+    case updatedAt
+    case freshnessState
+    case projectionLagMS = "projectionLagMs"
+  }
+}
+
+struct P086ContinuationMetricsSummaryReadModel: Decodable, Equatable, Sendable {
+  let runID: String
+  let admissionTotal: Int
+  let acceptedTotal: Int
+  let rejectedTotal: Int
+  let replayTotal: Int
+  let successTotal: Int
+  let noProgressTotal: Int
+  let failedTotal: Int
+  let cancelledTotal: Int
+  let freshSessionAvoidedTotal: Int
+  let leadAutoTotal: Int
+  let operatorMCPTotal: Int
+  let changedFilesTotal: Int
+  let testsOrGatesTotal: Int
+  let terminalTotal: Int
+  let usefulProgressTotal: Int
+  let usefulProgressRate: Double
+  let noProgressRate: Double
+  let testsPassedAfterContinuationTotal: Int
+  let followupValidationTotal: Int
+  let followupValidationSuccessTotal: Int
+  let followupValidationSuccessRate: Double
+  let leadAutoSuccessTotal: Int
+  let leadAutoSuccessRate: Double
+  let operatorMCPSuccessTotal: Int
+  let operatorMCPSuccessRate: Double
+  let timeSavedSecondsTotal: Int
+  let timeSavedSampleCount: Int
+  let averageTimeSavedSeconds: Double
+  let providerSessionBudgetInputTokensTotal: Int
+  let providerSessionBudgetOutputTokensTotal: Int
+  let providerSessionBudgetCachedInputTokensTotal: Int
+  let providerSessionBudgetCostCentsTotal: Int
+  let providerSessionResurrectionAttachSuccessTotal: Int
+  let providerSessionResurrectionAttachFailureTotal: Int
+  let orphanReapAttemptedTotal: Int
+  let orphanReapVerifiedTotal: Int
+  let resurrectionUnsupportedTotal: Int
+
+  enum CodingKeys: String, CodingKey {
+    case runID = "runId"
+    case admissionTotal
+    case acceptedTotal
+    case rejectedTotal
+    case replayTotal
+    case successTotal
+    case noProgressTotal
+    case failedTotal
+    case cancelledTotal
+    case freshSessionAvoidedTotal
+    case leadAutoTotal
+    case operatorMCPTotal = "operatorMcpTotal"
+    case changedFilesTotal
+    case testsOrGatesTotal
+    case terminalTotal
+    case usefulProgressTotal
+    case usefulProgressRate
+    case noProgressRate
+    case testsPassedAfterContinuationTotal
+    case followupValidationTotal
+    case followupValidationSuccessTotal
+    case followupValidationSuccessRate
+    case leadAutoSuccessTotal
+    case leadAutoSuccessRate
+    case operatorMCPSuccessTotal = "operatorMcpSuccessTotal"
+    case operatorMCPSuccessRate = "operatorMcpSuccessRate"
+    case timeSavedSecondsTotal
+    case timeSavedSampleCount
+    case averageTimeSavedSeconds
+    case providerSessionBudgetInputTokensTotal
+    case providerSessionBudgetOutputTokensTotal
+    case providerSessionBudgetCachedInputTokensTotal
+    case providerSessionBudgetCostCentsTotal
+    case providerSessionResurrectionAttachSuccessTotal
+    case providerSessionResurrectionAttachFailureTotal
+    case orphanReapAttemptedTotal
+    case orphanReapVerifiedTotal
+    case resurrectionUnsupportedTotal
   }
 }
 
@@ -2891,6 +3050,75 @@ enum P031GraphQLDocuments {
         selectionUnavailableReason
         sessionLineageId
         sessionGenerationId
+      }
+      continuations(runId: $runId) {
+        id
+        runId
+        stageExecutionId
+        agentExecutionId
+        modeRaw
+        modeDisplay
+        triggerKindRaw
+        triggerKindDisplay
+        statusRaw
+        statusDisplay
+        isTerminal
+        failureReason
+        reconciliationStatus
+        requestFingerprintSha256
+        canonicalRequestArtifactId
+        attachReceiptArtifactId
+        evidenceBundleArtifactId
+        worktreeReadbackArtifactId
+        continuationReportArtifactId
+        responseFingerprintSha256
+        responseArtifactId
+        resultOrNoProgressArtifactId
+        conflictCount
+        createdAt
+        updatedAt
+        freshnessState
+        projectionLagMs
+      }
+      continuationMetricsSummary(runId: $runId) {
+        runId
+        admissionTotal
+        acceptedTotal
+        rejectedTotal
+        replayTotal
+        successTotal
+        noProgressTotal
+        failedTotal
+        cancelledTotal
+        freshSessionAvoidedTotal
+        leadAutoTotal
+        operatorMcpTotal
+        changedFilesTotal
+        testsOrGatesTotal
+        terminalTotal
+        usefulProgressTotal
+        usefulProgressRate
+        noProgressRate
+        testsPassedAfterContinuationTotal
+        followupValidationTotal
+        followupValidationSuccessTotal
+        followupValidationSuccessRate
+        leadAutoSuccessTotal
+        leadAutoSuccessRate
+        operatorMcpSuccessTotal
+        operatorMcpSuccessRate
+        timeSavedSecondsTotal
+        timeSavedSampleCount
+        averageTimeSavedSeconds
+        providerSessionBudgetInputTokensTotal
+        providerSessionBudgetOutputTokensTotal
+        providerSessionBudgetCachedInputTokensTotal
+        providerSessionBudgetCostCentsTotal
+        providerSessionResurrectionAttachSuccessTotal
+        providerSessionResurrectionAttachFailureTotal
+        orphanReapAttemptedTotal
+        orphanReapVerifiedTotal
+        resurrectionUnsupportedTotal
       }
       artifacts(runId: $runId) {
         id
@@ -3268,7 +3496,9 @@ struct P031GraphQLWorkflowReadStore<
       artifacts: detail.artifacts,
       approvalInbox: detail.approvalInbox,
       activeAgentExecutions: detail.activeAgentExecutions,
-      runStageTopology: detail.runStageTopology
+      runStageTopology: detail.runStageTopology,
+      continuations: detail.continuations,
+      continuationMetricsSummary: detail.continuationMetricsSummary
     )
   }
 
@@ -5066,6 +5296,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let closeoutReadiness: P077CloseoutReadinessPresentation?
   let implementationCompletion: P088ImplementationCompletionPresentation?
   let sideEffectReadback: P078SideEffectReadbackPresentation?
+  let continuationReadback: P086ContinuationReadbackPresentation?
   let freshness: P031FreshnessSnapshot
   let refreshFeedbackText: String
   let emptyStateTitle: String?
@@ -5093,6 +5324,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     closeoutReadiness: P077CloseoutReadinessPresentation? = nil,
     implementationCompletion: P088ImplementationCompletionPresentation? = nil,
     sideEffectReadback: P078SideEffectReadbackPresentation? = nil,
+    continuationReadback: P086ContinuationReadbackPresentation? = nil,
     freshness: P031FreshnessSnapshot,
     refreshFeedbackText: String,
     emptyStateTitle: String?,
@@ -5118,12 +5350,107 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.closeoutReadiness = closeoutReadiness
     self.implementationCompletion = implementationCompletion
     self.sideEffectReadback = sideEffectReadback
+    self.continuationReadback = continuationReadback
     self.freshness = freshness
     self.refreshFeedbackText = refreshFeedbackText
     self.emptyStateTitle = emptyStateTitle
     self.errorDescription = errorDescription
     self.rawStatus = rawStatus
     self.failedStages = failedStages
+  }
+}
+
+struct P086ContinuationReadbackPresentation: Equatable, Sendable {
+  let title: String
+  let summary: String
+  let latestStatus: String
+  let latestMode: String
+  let latestTrigger: String
+  let latestContinuationID: String?
+  let latestAgentExecutionID: String?
+  let latestStageExecutionID: String?
+  let artifactSummary: String
+  let metricSummary: String
+  let accessibilityLabel: String
+}
+
+enum P086ContinuationReadbackPresenter {
+  nonisolated static func presentationIfPresent(
+    records: [P086ContinuationRecordReadModel],
+    metrics: P086ContinuationMetricsSummaryReadModel?
+  ) -> P086ContinuationReadbackPresentation? {
+    guard !records.isEmpty || metrics.map({ $0.admissionTotal > 0 }) == true else {
+      return nil
+    }
+
+    let latest = records.sorted { lhs, rhs in
+      lhs.updatedAt.localizedStandardCompare(rhs.updatedAt) == .orderedDescending
+    }.first
+    let artifactCount = latest.map { record in
+      [
+        record.canonicalRequestArtifactID,
+        record.attachReceiptArtifactID,
+        record.evidenceBundleArtifactID,
+        record.worktreeReadbackArtifactID,
+        record.continuationReportArtifactID,
+        record.responseArtifactID,
+        record.resultOrNoProgressArtifactID,
+      ].compactMap { $0 }.count
+    } ?? 0
+
+    let total = metrics?.admissionTotal ?? records.count
+    let succeeded = metrics?.successTotal ?? records.filter { $0.statusRaw == "succeeded" }.count
+    let noProgress = metrics?.noProgressTotal ?? records.filter { $0.statusRaw == "no_progress" }.count
+    let failed = metrics?.failedTotal ?? records.filter { $0.statusRaw == "failed" }.count
+    let cancelled = metrics?.cancelledTotal ?? records.filter { $0.statusRaw == "cancelled" }.count
+    let freshAvoided = metrics?.freshSessionAvoidedTotal ?? 0
+    let orphanReaped = metrics?.orphanReapVerifiedTotal ?? 0
+    let leadAuto = metrics?.leadAutoTotal ?? records.filter { $0.triggerKindRaw == "lead_auto" }.count
+    let usefulProgressPercent = metrics.map { Int(($0.usefulProgressRate * 100).rounded()) }
+    let followupValidationPercent = metrics.map {
+      Int(($0.followupValidationSuccessRate * 100).rounded())
+    }
+    let averageTimeSavedSeconds = metrics?.averageTimeSavedSeconds ?? 0
+    let providerBudgetTokens =
+      (metrics?.providerSessionBudgetInputTokensTotal ?? 0)
+      + (metrics?.providerSessionBudgetOutputTokensTotal ?? 0)
+    let resurrectionFailures = metrics?.providerSessionResurrectionAttachFailureTotal ?? 0
+
+    let status = latest?.statusDisplay ?? "No continuation history"
+    let mode = latest?.modeDisplay ?? "Unavailable"
+    let trigger = latest?.triggerKindDisplay ?? "Unavailable"
+    let summary = [
+      "\(total) admission\(total == 1 ? "" : "s")",
+      "\(succeeded) succeeded",
+      noProgress > 0 ? "\(noProgress) no progress" : nil,
+      failed > 0 ? "\(failed) failed" : nil,
+      cancelled > 0 ? "\(cancelled) cancelled" : nil,
+    ].compactMap { $0 }.joined(separator: " · ")
+    let metricSummary = [
+      freshAvoided > 0 ? "\(freshAvoided) fresh session avoided" : nil,
+      leadAuto > 0 ? "\(leadAuto) lead-auto" : nil,
+      usefulProgressPercent.map { "useful progress \($0)%" },
+      followupValidationPercent.map { "follow-up validation \($0)%" },
+      averageTimeSavedSeconds > 0
+        ? "avg \(Int(averageTimeSavedSeconds.rounded()))s saved" : nil,
+      providerBudgetTokens > 0 ? "\(providerBudgetTokens) provider tokens" : nil,
+      resurrectionFailures > 0 ? "\(resurrectionFailures) resurrection failed" : nil,
+      orphanReaped > 0 ? "\(orphanReaped) orphan reaped" : nil,
+    ].compactMap { $0 }.joined(separator: " · ")
+    let artifacts = artifactCount > 0 ? "\(artifactCount) evidence artifact\(artifactCount == 1 ? "" : "s")" : "No terminal evidence artifacts"
+    return P086ContinuationReadbackPresentation(
+      title: "Agent Continuation",
+      summary: summary.isEmpty ? status : summary,
+      latestStatus: status,
+      latestMode: mode,
+      latestTrigger: trigger,
+      latestContinuationID: latest?.id,
+      latestAgentExecutionID: latest?.agentExecutionID,
+      latestStageExecutionID: latest?.stageExecutionID,
+      artifactSummary: artifacts,
+      metricSummary: metricSummary.isEmpty ? "No rollout metrics yet" : metricSummary,
+      accessibilityLabel: "P086 continuation readback, latest status \(status), \(summary)"
+    )
   }
 }
 
@@ -5928,6 +6255,10 @@ enum P031RunDetailPresenter {
     let sideEffectReadback = P078SideEffectReadbackPresenter.presentationIfPresent(
       for: run?.sideEffectReadback
     )
+    let continuationReadback = P086ContinuationReadbackPresenter.presentationIfPresent(
+      records: detail.continuations,
+      metrics: detail.continuationMetricsSummary
+    )
     let emptyStateTitle: String?
     switch run {
     case .some:
@@ -5955,6 +6286,7 @@ enum P031RunDetailPresenter {
       closeoutReadiness: closeoutReadiness,
       implementationCompletion: implementationCompletion,
       sideEffectReadback: sideEffectReadback,
+      continuationReadback: continuationReadback,
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
         currentFreshness: currentFreshness,
         checkedAt: checkedAt,
@@ -6044,6 +6376,7 @@ enum P031RunDetailPresenter {
       closeoutReadiness: nil,
       implementationCompletion: nil,
       sideEffectReadback: nil,
+      continuationReadback: nil,
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
         event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))

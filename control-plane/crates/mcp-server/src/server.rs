@@ -327,7 +327,10 @@ impl McpServer {
         principal: &auth::Principal,
     ) -> JsonRpcResponse {
         let started = std::time::Instant::now();
-        let response = self.handle_request_inner(req, principal).await;
+        // Box::pin keeps the large handle_request_inner future off the caller's state machine.
+        // This prevents the complex MCP dispatch tree from inflating state machines of
+        // test functions that call handle_request multiple times sequentially.
+        let response = Box::pin(self.handle_request_inner(req, principal)).await;
         db::metrics::record_mcp_liveness_gate_duration(started.elapsed());
         response
     }
@@ -1059,6 +1062,11 @@ impl McpServer {
                 Some(request_id),
             )
             .await
+        } else if tool_name.starts_with("agents.") {
+            // Box::pin isolates the agents future from dispatch_tool_internal's state machine,
+            // preventing the large agents executor from inflating the state machine of all
+            // non-agents paths (storage, runs, runtime, etc.) in debug builds.
+            Box::pin(tools::agents::execute(tool_name, params, pool, principal)).await
         } else {
             Err(anyhow::anyhow!("Unknown tool namespace: {tool_name}"))
         }

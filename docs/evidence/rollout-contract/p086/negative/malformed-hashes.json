@@ -1,43 +1,22 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "malformed_hash_rejection",
+  "fixture_purpose": "Demonstrates that malformed SHA-256 values are rejected before any DB write. Two-layer defense: MCP input validation then SQLite CHECK constraints.",
+  "status": "pass",
+  "evidence_kind": "code",
+  "evidence": {
+    "layer_1_mcp_validation": {
+      "location": "control-plane/crates/mcp-server/src/tools/agents.rs",
+      "function": "validate_sha256_hex",
+      "rule": "length must equal 64 and every character must be in [0-9a-f]. Returns false for short, long, uppercase, or non-hex inputs. MCP handler maps false to -32023 (malformed_lead_decision_sha256 or malformed_continuation_instruction_sha256) before any DB interaction."
+    },
+    "layer_2_sqlite_check": {
+      "location": "control-plane/crates/db/migrations/065_p086_agent_work_continuations.sql",
+      "rule": "SHA-256 columns use: CHECK (length(c) = 64 AND c NOT GLOB '*[^0-9a-f]*'). Nullable columns add: c IS NULL OR (...). SQLite rejects any INSERT/UPDATE where a non-null SHA-256 column fails this predicate."
+    },
+    "hold_predicate_prevented": "No malformed hash can enter the system. MCP validation rejects before DB write; SQLite CHECK provides defense-in-depth for any future code path that bypasses the MCP layer."
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:malformed_hashes",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "hold_prevented_by_implementation"
 }

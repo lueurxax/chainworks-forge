@@ -189,6 +189,10 @@ PROPOSAL_093_TESTS=(
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal093TimelineCardExpansionRemoteProof"
 )
 
+PROPOSAL_086_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
+)
+
 PROPOSAL_037_TESTS=(
   "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorFailClosesACPProposalReviewReadLoopStallsBeforeWatchdogAndEmitsDurableFailureEvidence()"
   "Chainworks ForgeTests/RuntimeAgentExecutorTests/acpProposalReviewerReadLoopStallFailsEarlyWithDurableFailureEvidence()"
@@ -2389,6 +2393,14 @@ Available gates:
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
   proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
+  proposal-086|p086|p086-continuation-preflight
+                  Proposal 086 Phase 0 preflight: migration shape, MCP/artifact schemas, and Rust unit tests
+  p086-continuation-readback
+                  Proposal 086 Phase 1 readback gate: operator readback fixture field coverage
+  p086-continuation-negative-fixtures
+                  Proposal 086 Phase 2 hold-condition gate: all negative fixtures present and not placeholder
+  p086-continuation-operator-report
+                  Proposal 086 Phase 1 operator-report gate: operator report field coverage
   proposal-087|p087  Proposal 087 read-path liveness and storage tiering gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
@@ -7767,6 +7779,566 @@ PY
       CARGO_TARGET_DIR=target/proposal-092-gate cargo check -p daemon
     )
     log "Proposal 092 retained gate passed"
+    ;;
+  proposal-086|p086|p086-continuation-preflight)
+    log "Proposal 086 Phase 0 preflight: migration shape, MCP/artifact schemas, and Rust unit tests"
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def fail(msg):
+    raise SystemExit(f"proposal-086: {msg}")
+
+def load_json(path):
+    if not path.exists():
+        fail(f"missing {path.relative_to(root)}")
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {path.relative_to(root)}: {exc}")
+
+# 1. Migration file exists and contains required tables, indexes, and SHA-256 CHECK constraints
+migration = root / "control-plane/crates/db/migrations/065_p086_agent_work_continuations.sql"
+if not migration.exists():
+    fail("missing control-plane/crates/db/migrations/065_p086_agent_work_continuations.sql")
+sql = migration.read_text()
+
+required_tables = [
+    "agent_work_continuations",
+    "agent_external_side_effect_ledger",
+    "supervised_workers_continuation",
+]
+for table in required_tables:
+    if f"CREATE TABLE IF NOT EXISTS {table}" not in sql:
+        fail(f"migration missing CREATE TABLE IF NOT EXISTS {table}")
+
+required_indexes = [
+    "idx_awc_agent_created_at",
+    "idx_awc_run_status",
+    "idx_awc_stage",
+    "idx_awc_recon",
+    "idx_awc_admission",
+    "idx_awc_recovery",
+    "idx_ledger_cont_seq",
+    "idx_ledger_unresolved",
+    "idx_swc_heartbeat",
+    "idx_swc_generation",
+    "uniq_swc_active_continuation",
+]
+for idx in required_indexes:
+    if idx not in sql:
+        fail(f"migration missing required index: {idx}")
+
+if "NOT GLOB '*[^0-9a-f]*'" not in sql:
+    fail("migration missing SHA-256 NOT GLOB check constraints")
+for field in [
+    "attach_receipt_artifact_id",
+    "evidence_bundle_artifact_id",
+    "worktree_readback_artifact_id",
+    "continuation_report_artifact_id",
+]:
+    if field not in sql:
+        fail(f"migration missing P086 evidence readback column: {field}")
+
+provider_process_migration = root / "control-plane/crates/db/migrations/066_p086_supervised_worker_provider_process.sql"
+if not provider_process_migration.exists():
+    fail("missing control-plane/crates/db/migrations/066_p086_supervised_worker_provider_process.sql")
+provider_process_sql = provider_process_migration.read_text()
+for field in [
+    "provider_child_pid",
+    "provider_process_group_id",
+    "provider_process_uid",
+]:
+    if field not in provider_process_sql:
+        fail(f"migration 066 missing durable provider process field: {field}")
+
+metrics_migration = root / "control-plane/crates/db/migrations/067_p086_continuation_metric_events.sql"
+if not metrics_migration.exists():
+    fail("missing control-plane/crates/db/migrations/067_p086_continuation_metric_events.sql")
+metrics_sql = metrics_migration.read_text()
+for field in [
+    "p086_continuation_metric_events",
+    "metric_name",
+    "labels_json",
+    "continuation_id",
+    "idx_p086_metric_run_time",
+]:
+    if field not in metrics_sql:
+        fail(f"migration 067 missing durable P086 metric element: {field}")
+
+# 2. All six MCP schemas parse as valid JSON Schema; continue_work.response requires 'outcome'
+mcp_dir = root / "docs/reference/p086/schemas/mcp"
+required_mcp = [
+    "agents.continue_work.request.schema.json",
+    "agents.continue_work.response.schema.json",
+    "agents.continuation_status.request.schema.json",
+    "agents.continuation_status.response.schema.json",
+    "agents.continuation_candidates.request.schema.json",
+    "agents.continuation_candidates.response.schema.json",
+]
+for name in required_mcp:
+    schema = load_json(mcp_dir / name)
+    if name == "agents.continue_work.request.schema.json":
+        props = schema.get("properties") or {}
+        for field in [
+            "run_id",
+            "stage_execution_id",
+            "session_generation_id",
+            "provider_session_id",
+            "continuation_mode",
+            "operator_instruction",
+            "max_turns",
+            "max_wall_clock_seconds",
+            "blockers",
+        ]:
+            if field not in props:
+                fail(f"agents.continue_work.request.schema.json missing {field}")
+        schema_text = (mcp_dir / name).read_text()
+        if '"continuation_mode"' not in schema_text:
+            fail("agents.continue_work.request.schema.json must expose canonical continuation_mode")
+    if name == "agents.continue_work.response.schema.json":
+        required_props = schema.get("properties") or schema.get("oneOf") or {}
+        # Check 'outcome' appears anywhere in the schema text
+        schema_text = (mcp_dir / name).read_text()
+        if '"outcome"' not in schema_text:
+            fail(f"agents.continue_work.response.schema.json must require the 'outcome' field")
+        if "asynchronous admission response" not in schema_text:
+            fail("agents.continue_work.response.schema.json must document async admission/readback split")
+        forbidden_terminal_fields = [
+            "response_artifact_id",
+            "attach_receipt_artifact_id",
+            "evidence_bundle_artifact_id",
+            "worktree_readback_artifact_id",
+            "continuation_report_artifact_id",
+            "result_or_no_progress_artifact_id",
+        ]
+        for field in forbidden_terminal_fields:
+            if f'"{field}"' in schema_text:
+                fail(
+                    "agents.continue_work.response.schema.json must remain bounded admission output; "
+                    f"terminal field {field} belongs to continuation readback"
+                )
+        for field in ["failure_reason", "agent_execution_id", "queue_depth", "limit_scope"]:
+            if f'"{field}"' not in schema_text:
+                fail(f"agents.continue_work.response.schema.json must declare rejected error.data.{field}")
+
+reference_text = (root / "docs/reference/agent-work-continuation.md").read_text()
+for needle in [
+    "Output is an admission response, not a terminal execution response",
+    "Terminal fields are readback, not command output",
+    "agents.continue_work` returns a bounded admission response",
+]:
+    if needle not in reference_text:
+        fail(f"agent-work-continuation reference missing async MCP/readback contract clarification: {needle!r}")
+
+# 2b. Worker must route continuation through the ACP live-session reuse path and
+# must retain the canonical P086 mode-reset prompt contract.
+executor_rs = root / "control-plane/crates/engine/src/executor.rs"
+executor_text = executor_rs.read_text()
+if ".start_session(acp::ExecutionRequest" in executor_text:
+    fail("P086 worker must not call ACP start_session for live-handle continuation")
+if ".execute(acp::ExecutionRequest" not in executor_text:
+    fail("P086 worker must call ACP execute with reuse_existing_session=true")
+for needle in [
+    "# P086 Continuation Mode Reset",
+    "This is not a retry",
+    "Do not commit, push, release, publish, upload",
+    "provider_session_attach_receipt_v1",
+    "worktree_continuation_readback_v1",
+    "agent_continuation_evidence_bundle_v1",
+    "agent_continuation_report_v1",
+    "refresh_supervised_worker_heartbeat",
+    "reconcile_p086_continuation_from_evidence",
+    "p086_worktree_has_post_continuation_change",
+    "has_side_effect_ledger_row",
+    '"provider_send"',
+    "reconciled_from_post_continuation_worktree_evidence",
+    "post_continuation_change_without_provider_send_evidence",
+    "settle_p086_cancelled_after_provider_return",
+    "cancelled_after_provider_send",
+    "maybe_admit_p086_lead_auto_continuation",
+    "lead_continuation_decision_v1",
+    "lead_auto_orchestration",
+    "continuation_instruction",
+    "p086_reconciliation_transcript_evidence",
+    "continuation_reconciliation_transcript_evidence_total",
+    "explicit_transcript_absence",
+]:
+    if needle not in executor_text:
+        fail(f"P086 canonical prompt missing {needle!r}")
+
+# 2c. Admission must be catalog-gated and side-effect-safe, not just role-gated.
+agents_yaml = (root / "examples/agents/agents.yaml").read_text()
+for needle in [
+    "continuation_capability:",
+    "allowed_triggers:",
+    "live_handle_continuation:",
+    "require_no_unresolved_side_effects: true",
+]:
+    if needle not in agents_yaml:
+        fail(f"code_writer catalog missing P086 continuation capability needle {needle!r}")
+
+workflow_catalog = (root / "control-plane/crates/workflow/src/catalog.rs").read_text()
+if "pub struct ContinuationCapabilityYaml" not in workflow_catalog:
+    fail("workflow catalog must model continuation_capability in frozen snapshots")
+
+db_repo = (root / "control-plane/crates/db/src/repos/agent_work_continuations.rs").read_text()
+if "has_unresolved_side_effects_for_stage" not in db_repo or "FROM side_effects" not in db_repo:
+    fail("P086 admission must query unresolved P078 side_effects before accepting continuation")
+for needle in [
+    "list_stale_supervised_workers",
+    "mark_active_for_run_cancelling_tx",
+    "set_evidence_artifact_ids",
+    "list_needing_continuation_reconciliation",
+    "update_continuation_status_unless_cancelling",
+    "settle_with_artifacts_unless_cancelling",
+    "record_p086_continuation_metric_event",
+    "p086_continuation_metrics_summary_for_run",
+    "useful_progress_rate",
+    "average_time_saved_seconds",
+    "followup_validation_success_rate",
+    "provider_session_budget_input_tokens_total",
+    "provider_session_resurrection_attach_failure_total",
+    "rejected_lead_auto_agent_limit",
+    "rejected_lead_auto_stage_limit",
+]:
+    if needle not in db_repo:
+        fail(f"P086 DB repo missing recovery/readback helper {needle!r}")
+
+mcp_agents = (root / "control-plane/crates/mcp-server/src/tools/agents.rs").read_text()
+for needle in [
+    "continuation_capability_rejection",
+    "forbidden_stage_kind",
+    "unresolved_side_effects",
+    "live_session_required",
+    'PrincipalClass::Agent) && trigger_kind == "lead_auto"',
+    "validate_lead_auto_decision_payload",
+    "lead_auto_artifact_target_mismatch",
+    "lead_auto_safety_check_failed",
+    "lead_auto_instruction_hash_mismatch",
+    "continuation_mode",
+    "LeadAutoLimitExceeded",
+]:
+    if needle not in mcp_agents:
+        fail(f"P086 MCP admission missing fail-closed guard {needle!r}")
+
+recovery_text = (root / "control-plane/crates/engine/src/recovery.rs").read_text()
+for needle in [
+    "close_session(&worker.session_generation_id)",
+    "p086_reap_registered_provider_process_group",
+    "provider_process_group_id",
+    "provider_process_uid",
+    "registered_provider_process_group_signal",
+    "orphan_reap_attempted",
+    "orphan_reap_verified",
+    "stale_generation_reaped",
+    "stale_generation_reap_unverified",
+    "orphan_reap_signals_sent",
+    "orphan_reap_term_deadline_ms",
+    "orphan_reap_kill_deadline_ms",
+]:
+    if needle not in recovery_text:
+        fail(f"P086 startup recovery missing stale ACP reap proof field {needle!r}")
+
+graphql_schema = (root / "control-plane/crates/graphql-server/src/schema.rs").read_text()
+graphql_types = (root / "control-plane/crates/graphql-server/src/types/continuation.rs").read_text()
+graphql_test = root / "control-plane/crates/graphql-server/tests/proposal_086_continuation_readback.rs"
+if not graphql_test.exists():
+    fail("missing GraphQL P086 continuation readback test")
+for needle in [
+    "continuations(",
+    "continuation_metrics_summary",
+    "continuation_status",
+    "continuation_candidates",
+]:
+    if needle not in graphql_schema:
+        fail(f"GraphQL schema missing P086 readback field/helper {needle!r}")
+if "GqlContinuationMetricsSummary" not in graphql_types:
+    fail("GraphQL continuation types missing durable P086 metrics summary")
+for needle in [
+    "useful_progress_rate",
+    "average_time_saved_seconds",
+    "followup_validation_success_rate",
+    "provider_session_budget_input_tokens_total",
+    "provider_session_resurrection_attach_failure_total",
+]:
+    if needle not in graphql_types:
+        fail(f"GraphQL continuation metrics summary missing P086 KPI field {needle!r}")
+
+swift_read_boundary = (root / "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift").read_text()
+swift_runs_home = (root / "Chainworks Forge/Views/RunsHomeView.swift").read_text()
+for needle in [
+    "continuations(runId: $runId)",
+    "continuationMetricsSummary(runId: $runId)",
+    "P086ContinuationReadbackPresentation",
+    "P086ContinuationReadbackPresenter",
+    "usefulProgressRate",
+    "averageTimeSavedSeconds",
+    "followupValidationSuccessRate",
+    "providerSessionBudgetInputTokensTotal",
+    "providerSessionResurrectionAttachFailureTotal",
+]:
+    if needle not in swift_read_boundary:
+        fail(f"Swift P031 read boundary missing passive P086 readback needle {needle!r}")
+for needle in [
+    "P086ContinuationReadbackCard",
+    "p086-continuation-readback-card",
+]:
+    if needle not in swift_runs_home:
+        fail(f"Runs UI missing passive P086 continuation readback needle {needle!r}")
+
+# 3. All five artifact schemas parse as valid JSON Schema with additionalProperties=false
+artifact_dir = root / "docs/reference/p086/schemas/artifacts"
+required_artifacts = [
+    "agent_continuation_evidence_bundle_v1.schema.json",
+    "agent_continuation_report_v1.schema.json",
+    "continuation_canonical_request_v1.schema.json",
+    "continuation_no_progress_report_v1.schema.json",
+    "continuation_response_snapshot_v1.schema.json",
+    "continuation_result_v1.schema.json",
+    "lead_continuation_decision_v1.schema.json",
+    "provider_session_attach_receipt_v1.schema.json",
+    "worktree_continuation_readback_v1.schema.json",
+]
+for name in required_artifacts:
+    schema = load_json(artifact_dir / name)
+    if schema.get("additionalProperties") is not False:
+        fail(f"artifact schema {name} must have additionalProperties=false at top level")
+
+response_schema = load_json(artifact_dir / "continuation_response_snapshot_v1.schema.json")
+response_required = set(response_schema["properties"]["payload"].get("required", []))
+if "response_artifact_id" not in response_required:
+    fail("continuation_response_snapshot_v1 must require payload.response_artifact_id")
+
+result_schema = load_json(artifact_dir / "continuation_result_v1.schema.json")
+tests_or_gates = result_schema["properties"]["payload"]["properties"]["tests_or_gates"]["items"]
+if tests_or_gates.get("type") != "object":
+    fail("continuation_result_v1 tests_or_gates items must be objects, not strings")
+if set(tests_or_gates.get("required", [])) != {"name", "status"}:
+    fail("continuation_result_v1 tests_or_gates rows must require name and status")
+
+no_progress_schema = load_json(artifact_dir / "continuation_no_progress_report_v1.schema.json")
+no_progress_payload_props = no_progress_schema["properties"]["payload"]["properties"]
+for field in ["response_fingerprint_sha256", "provider_transcript_artifact_ids"]:
+    if field not in no_progress_payload_props:
+        fail(f"continuation_no_progress_report_v1 payload missing emitted field {field}")
+
+if '"response_artifact_id": response_artifact_id' not in executor_text:
+    fail("P086 response snapshot must emit payload.response_artifact_id")
+if "serde_json::json!({" not in executor_text or '"name": name' not in executor_text or '"status": status' not in executor_text:
+    fail("P086 tests_or_gates extraction must emit schema-compatible object rows")
+
+print("proposal-086 Phase 0 preflight checks passed (migration, schemas)")
+PY
+    log "Proposal 086 Rust unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p domain "continuation"
+      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p db --test proposal_086_continuation_lifecycle
+      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p engine --lib p086
+      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p mcp-server "tools::agents"
+      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p graphql-server --test proposal_086_continuation_readback
+      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p daemon --test proposal_086_mcp_continuation_live_reuse
+    )
+    log "Proposal 086 Swift readback tests"
+    run_targeted_tests "proposal-086-swift-readback" "${PROPOSAL_086_SWIFT_TESTS[@]}"
+    log "Proposal 086 Phase 0 preflight gate passed"
+    ;;
+  p086-continuation-readback)
+    log "Proposal 086 Phase 1 readback gate: operator readback fixture field coverage"
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def fail(msg):
+    raise SystemExit(f"p086-continuation-readback: {msg}")
+
+fixture_path = root / "docs/evidence/rollout-contract/operator-readback/p086-continuation-full-surface.fixture.json"
+if not fixture_path.exists():
+    fail("missing docs/evidence/rollout-contract/operator-readback/p086-continuation-full-surface.fixture.json")
+
+try:
+    fixture = json.loads(fixture_path.read_text())
+except json.JSONDecodeError as exc:
+    fail(f"invalid JSON in p086-continuation-full-surface.fixture.json: {exc}")
+
+# Fails closed while the fixture contains a placeholder key or rollout_contract_status != "pass"
+if "placeholder" in fixture:
+    fail(
+        "fixture contains 'placeholder' key; p086-continuation-readback requires real Phase 1 "
+        "runtime evidence (50+ AgentExecutions across 10+ runs with MCP/GraphQL/run_report/release_receipt parity)"
+    )
+raw_fixture = json.dumps(fixture, sort_keys=True)
+for forbidden in [
+    "p086-fixture",
+    "11111111-1111",
+    "22222222-2222",
+    "33333333-3333",
+    "44444444-4444",
+    "55555555-5555",
+    "66666666-6666",
+    "77777777-7777",
+    "aaaaaaaaaaaaaaaa",
+    "bbbbbbbbbbbbbbbb",
+]:
+    if forbidden in raw_fixture:
+        fail(f"fixture still contains synthetic placeholder token: {forbidden}")
+provenance = fixture.get("evidence_provenance")
+if not isinstance(provenance, dict):
+    fail("fixture missing evidence_provenance object")
+for field in ["source_test", "source_gate", "generated_from", "generated_at"]:
+    if not provenance.get(field):
+        fail(f"fixture evidence_provenance missing {field}")
+
+required_fields = [
+    "evidence_provenance",
+    "rollout_contract_status", "rollout_contract_decision", "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state", "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode", "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions", "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane", "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code", "rollout_contract_action_id",
+    "rollout_contract_operator_message", "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision", "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps",
+    "continuation_id", "run_id", "stage_execution_id", "agent_execution_id",
+    "mode", "mode_raw", "trigger_kind", "trigger_kind_raw",
+    "lifecycle_status", "lifecycle_status_raw", "status_raw",
+    "failure_reason", "failure_reason_raw", "runtime_disabled_reason_code",
+    "request_fingerprint_sha256", "canonical_request_artifact_id",
+    "response_fingerprint_sha256", "response_artifact_id",
+    "conflict_count", "reconciliation_status",
+    "projection_lag_ms", "projection_lag_budget_ms", "projection_degraded",
+    "restart_recovery_stale_non_terminal_count",
+    "cancel_termination_proof_state", "orphan_acp_reap_outcome",
+    "provider_session_attach_receipt_id", "kill_switch_last_change",
+]
+for field in required_fields:
+    if field not in fixture:
+        fail(f"fixture missing required field: {field}")
+
+if fixture.get("rollout_contract_status") != "pass":
+    fail(
+        f"rollout_contract_status={fixture.get('rollout_contract_status')!r}; "
+        "p086-continuation-readback requires rollout_contract_status='pass' (Phase 1 evidence not yet materialized)"
+    )
+
+print("p086-continuation-readback passed")
+PY
+    log "Proposal 086 Phase 1 readback gate passed"
+    ;;
+  p086-continuation-negative-fixtures)
+    log "Proposal 086 Phase 2 hold-condition gate: all negative fixtures present and not placeholder"
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def fail(msg):
+    raise SystemExit(f"p086-continuation-negative-fixtures: {msg}")
+
+neg_dir = root / "docs/evidence/rollout-contract/p086/negative"
+required_fixtures = [
+    "admission-timeout-sweeper.json",
+    "artifact-schema-lint-failure.json",
+    "cancel-timeout-termination-unverified.json",
+    "duplicate-after-prompt-sent-no-resend.json",
+    "fingerprint-mismatch-same-key.json",
+    "lead-decision-missing-or-changed.json",
+    "malformed-hashes.json",
+    "mcp-schema-lint-failure.json",
+    "missing-log-correlation-key.json",
+    "pre-prompt-crash-after-lease.json",
+    "resurrection-before-attach-receipt.json",
+    "resurrection-before-orphan-reap.json",
+    "resurrection-unsupported-adapter.json",
+    "saturation-without-queue-drain.json",
+    "terminal-missing-result-artifact.json",
+    "worker-panic-recovery.json",
+]
+for name in required_fixtures:
+    path = neg_dir / name
+    if not path.exists():
+        fail(f"missing negative fixture: {name}")
+    try:
+        fixture = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {name}: {exc}")
+    status = fixture.get("status")
+    if status == "placeholder":
+        fail(
+            f"{name} still has status='placeholder'; "
+            "replace with real evidence (pass/fail/deferred_pending_phase2_worker)"
+        )
+    if status is None:
+        fail(f"{name} missing 'status' field")
+
+print(f"p086-continuation-negative-fixtures: all {len(required_fixtures)} fixtures present and valid")
+PY
+    log "Proposal 086 Phase 2 negative fixtures gate passed"
+    ;;
+  p086-continuation-operator-report)
+    log "Proposal 086 Phase 1 operator-report gate: operator report field coverage"
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def fail(msg):
+    raise SystemExit(f"p086-continuation-operator-report: {msg}")
+
+fixture_path = root / "docs/evidence/rollout-contract/operator-readback/p086-continuation-full-surface.fixture.json"
+if not fixture_path.exists():
+    fail("missing docs/evidence/rollout-contract/operator-readback/p086-continuation-full-surface.fixture.json")
+
+try:
+    fixture = json.loads(fixture_path.read_text())
+except json.JSONDecodeError as exc:
+    fail(f"invalid JSON in p086-continuation-full-surface.fixture.json: {exc}")
+
+# Fails closed while the fixture contains a placeholder key
+if "placeholder" in fixture:
+    fail(
+        "fixture contains 'placeholder' key; p086-continuation-operator-report requires real Phase 1 "
+        "operator run evidence (rollout_contract_status='pass', no placeholder key)"
+    )
+raw_fixture = json.dumps(fixture, sort_keys=True)
+for forbidden in ["p086-fixture", "11111111-1111", "aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"]:
+    if forbidden in raw_fixture:
+        fail(f"fixture still contains synthetic placeholder token: {forbidden}")
+if not isinstance(fixture.get("evidence_provenance"), dict):
+    fail("fixture missing evidence_provenance object")
+
+if fixture.get("rollout_contract_status") != "pass":
+    fail(
+        f"rollout_contract_status={fixture.get('rollout_contract_status')!r}; "
+        "operator report requires rollout_contract_status='pass'"
+    )
+
+required_operator_fields = [
+    "rollout_contract_status", "rollout_contract_decision",
+    "rollout_contract_hold_conditions", "rollout_contract_enforcement_mode",
+    "continuation_id", "run_id", "stage_execution_id", "agent_execution_id",
+    "mode", "trigger_kind", "lifecycle_status", "request_fingerprint_sha256",
+    "eligible", "lead_decision", "confirmation_required",
+]
+for field in required_operator_fields:
+    if field not in fixture:
+        fail(f"fixture missing required operator report field: {field}")
+
+print("p086-continuation-operator-report passed")
+PY
+    log "Proposal 086 Phase 1 operator report gate passed"
     ;;
   proposal-085|p085)
     log "Proposal 085 gate: thin-client read-model parity and affordance contract"

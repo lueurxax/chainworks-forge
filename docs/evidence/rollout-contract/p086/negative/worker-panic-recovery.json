@@ -1,43 +1,21 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "worker_supervision",
+  "fixture_purpose": "Worker supervision no longer relies on in-memory state only: claims create supervised_workers_continuation rows with heartbeat data, and terminal settlement releases them with a reason.",
+  "status": "pass",
+  "evidence_kind": "code_and_regression_test",
+  "evidence": {
+    "supervised_worker_table": "supervised_workers_continuation",
+    "implemented": {
+      "claim_location": "control-plane/crates/db/src/repos/agent_work_continuations.rs::claim_for_continuation_worker",
+      "release_location": "control-plane/crates/db/src/repos/agent_work_continuations.rs::release_supervised_worker",
+      "mechanism": "A worker row is durably registered at claim and released after terminal settlement. Startup/recovery can distinguish an active worker from a completed/cancelled one using released_at and release_reason."
+    },
+    "tests": [
+      "cargo test -p db --test proposal_086_continuation_lifecycle p086_side_effect_lookup_and_worker_release_are_durable"
+    ]
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:worker_panic_recovery",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "panic_recovery_has_durable_worker_truth"
 }
