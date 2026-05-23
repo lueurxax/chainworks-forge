@@ -408,14 +408,34 @@ async fn run_daemon() -> Result<()> {
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");
 
-            let schema = graphql_server::schema::build_schema_with_storage_writer(
-                pool.clone(),
-                cmd_handler.clone(),
-                events.clone(),
-                principal_table.clone(),
-                reporter.clone(),
-                db_writer.heartbeat.clone(),
-            );
+            let (schema, p046_live_handle) =
+                graphql_server::schema::build_schema_with_storage_writer_and_handle(
+                    pool.clone(),
+                    cmd_handler.clone(),
+                    events.clone(),
+                    principal_table.clone(),
+                    reporter.clone(),
+                    db_writer.heartbeat.clone(),
+                );
+            // P046: periodically reload principals.json so subscription auth rechecks
+            // observe revocation within ~30s, without requiring a daemon restart.
+            let principals_path_for_reload = paths.principals_path.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
+                        Ok(new_table) => {
+                            p046_live_handle.update(new_table).await;
+                            tracing::debug!("P046 principal table reloaded for live revocation");
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "P046 principal reload failed (keeping current table): {e:#}"
+                            );
+                        }
+                    }
+                }
+            });
 
             // §7.3 port fallback: bind the listener here so the
             // 4000→ephemeral fallback + `daemon.port` write runs before the

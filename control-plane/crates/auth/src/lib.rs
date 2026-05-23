@@ -139,6 +139,28 @@ impl PrincipalTable {
         }
     }
 
+    /// Test variant: single operator with a caller-supplied id and token.
+    /// Use when tests need to control which principal id appears in the table —
+    /// for example, to simulate revocation by swapping to a table that lacks a
+    /// previously-known principal id.
+    pub fn test_fixture_with_id(id: &str) -> Self {
+        PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: format!("{id}-token"),
+                id: id.to_string(),
+                class: PrincipalClass::Operator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: Some(GraphqlPolicy {
+                        allow_queries: true,
+                        allow_subscriptions: true,
+                        allowed_mutations: approval_mutations(),
+                    }),
+                    mcp: None,
+                }),
+            }],
+        }
+    }
+
     /// Load from a JSON file. If the file does not exist, bootstrap a default
     /// operator-class principal, write it to disk, and return the table.
     pub fn load_or_bootstrap(path: &Path) -> Result<Self, AuthError> {

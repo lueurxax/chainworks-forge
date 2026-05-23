@@ -3201,6 +3201,116 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
   }
 }
 
+// MARK: - P046 session observability store conformance
+
+// Placed in this file so the private readClient/subscriptionClient members are accessible.
+
+extension P031GraphQLWorkflowReadStore: P046SessionStore {
+  private nonisolated struct P046CapabilityPayload: Decodable, Sendable {
+    let sessionObservabilityAvailable: Bool
+  }
+  private nonisolated struct P046LineagesPayload: Decodable, Sendable {
+    let sessionLineages: P046SessionLineageConnectionReadModel
+  }
+  private nonisolated struct P046KpiPayload: Decodable, Sendable {
+    let sessionKpiSummary: P046SessionKpiSummaryReadModel
+  }
+  private nonisolated struct P046HealthPayload: Decodable, Sendable {
+    let sessionHealth: P046SessionHealthReadModel
+  }
+  private nonisolated struct P046StatusChangedPayload: Decodable, Sendable {
+    let sessionStatusChanged: P046SessionStatusChangedReadModel
+  }
+
+  func checkP046SchemaAvailability() async throws -> Bool {
+    let payload = try await readClient.execute(
+      P046CapabilityPayload.self,
+      operationName: "P046CapabilityCheck",
+      document: P046GraphQLDocuments.capabilityCheck,
+      variables: [:]
+    )
+    return payload.sessionObservabilityAvailable
+  }
+
+  func fetchP046SessionLineages(runID: String) async throws -> P046SessionLineageConnectionReadModel {
+    let payload = try await readClient.execute(
+      P046LineagesPayload.self,
+      operationName: "P046SessionLineages",
+      document: P046GraphQLDocuments.sessionLineages,
+      variables: ["runId": .string(runID), "first": .int(100)]
+    )
+    return payload.sessionLineages
+  }
+
+  func fetchP046SessionKpiSummary(runID: String) async throws -> P046SessionKpiSummaryReadModel {
+    let payload = try await readClient.execute(
+      P046KpiPayload.self,
+      operationName: "P046SessionKpiSummary",
+      document: P046GraphQLDocuments.sessionKpiSummary,
+      variables: ["runId": .string(runID)]
+    )
+    return payload.sessionKpiSummary
+  }
+
+  func fetchP046SessionHealth(runID: String) async throws -> P046SessionHealthReadModel {
+    let payload = try await readClient.execute(
+      P046HealthPayload.self,
+      operationName: "P046SessionHealth",
+      document: P046GraphQLDocuments.sessionHealth,
+      variables: ["runId": .string(runID)]
+    )
+    return payload.sessionHealth
+  }
+
+  nonisolated func subscribeP046SessionStatusChanged(
+    runID: String
+  ) throws -> AsyncThrowingStream<P046SessionStatusChangedReadModel, Error> {
+    return try subscriptionClient.subscribe(
+      P046StatusChangedPayload.self,
+      operationName: "P046SessionStatusChanged",
+      document: P046GraphQLDocuments.sessionStatusChanged,
+      variables: ["runId": .string(runID)]
+    )
+    .map { payload in payload.sessionStatusChanged }
+  }
+}
+
+// P031InMemoryWorkflowReadStore stub: returns disabled-schema error so
+// tests that inject the in-memory store confirm P046 documents are not issued.
+extension P031InMemoryWorkflowReadStore: P046SessionStore {
+  func checkP046SchemaAvailability() async throws -> Bool {
+    throw P031GraphQLReadBoundaryError.graphqlErrors(
+      ["Cannot query field 'sessionObservabilityAvailable' on type 'QueryRoot'. (p046 schema disabled in fixture)"]
+    )
+  }
+
+  func fetchP046SessionLineages(runID: String) async throws -> P046SessionLineageConnectionReadModel {
+    throw P031GraphQLReadBoundaryError.graphqlErrors(
+      ["Cannot query field 'sessionLineages' on type 'QueryRoot'. (p046 schema disabled in fixture)"]
+    )
+  }
+
+  func fetchP046SessionKpiSummary(runID: String) async throws -> P046SessionKpiSummaryReadModel {
+    throw P031GraphQLReadBoundaryError.graphqlErrors(
+      ["Cannot query field 'sessionKpiSummary' on type 'QueryRoot'. (p046 schema disabled in fixture)"]
+    )
+  }
+
+  func fetchP046SessionHealth(runID: String) async throws -> P046SessionHealthReadModel {
+    throw P031GraphQLReadBoundaryError.graphqlErrors(
+      ["Cannot query field 'sessionHealth' on type 'QueryRoot'. (p046 schema disabled in fixture)"]
+    )
+  }
+
+  nonisolated func subscribeP046SessionStatusChanged(
+    runID: String
+  ) throws -> AsyncThrowingStream<P046SessionStatusChangedReadModel, Error> {
+    throw P031GraphQLReadBoundaryError.graphqlErrors(
+      ["Cannot query field 'sessionStatusChanged' on type 'SubscriptionRoot'. (p046 schema disabled in fixture)"]
+    )
+  }
+}
+
 extension AsyncThrowingStream {
   nonisolated fileprivate func map<Mapped>(
     _ transform: @escaping @Sendable (Element) throws -> Mapped

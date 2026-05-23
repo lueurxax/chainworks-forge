@@ -560,6 +560,7 @@ name = "db"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "domain",
  "rand 0.8.5",
@@ -1001,6 +1002,7 @@ dependencies = [
  "engine",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "tokio",

@@ -3601,6 +3601,8 @@ impl BackgroundExecutor {
                 error = %error,
                 "Failed to persist output contract repair session event"
             );
+        } else {
+            let _ = self.events.send(domain::events::DomainEvent::SessionEventRecorded { run_id });
         }
     }
 
@@ -4711,7 +4713,11 @@ impl BackgroundExecutor {
                     session_reuse_scope.is_some() || !declared_outputs.is_empty();
                 let mut policy_decision: Option<SessionPolicyDecision> =
                     if invocation_generation_required {
-                        Some(ensure_policy(&self.pool, policy_input.clone()).await?)
+                        let d = ensure_policy(&self.pool, policy_input.clone()).await?;
+                        let _ = self.events.send(
+                            domain::events::DomainEvent::SessionEventRecorded { run_id },
+                        );
+                        Some(d)
                     } else {
                         None
                     };
@@ -4748,7 +4754,11 @@ impl BackgroundExecutor {
                             },
                         )
                         .await?;
-                        policy_decision = Some(ensure_policy(&self.pool, policy_input).await?);
+                        let d = ensure_policy(&self.pool, policy_input).await?;
+                        let _ = self.events.send(
+                            domain::events::DomainEvent::SessionEventRecorded { run_id },
+                        );
+                        policy_decision = Some(d);
                     }
                 }
                 if let Some(decision) = policy_decision.as_ref() {

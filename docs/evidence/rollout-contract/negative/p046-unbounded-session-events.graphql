@@ -1,0 +1,8 @@
+# P046 negative fixture: sessionEvents query with no first/limit parameter enforced.
+# Expected: gate fails with hold condition "sessionEvents or sessionLineages can return unbounded results."
+# The resolver MUST enforce a default limit and maximum limit.
+query UnboundedSessionEvents {
+  sessionEvents(lineageId: "some-lineage", first: 999999) {
+    nodes { id }
+  }
+}

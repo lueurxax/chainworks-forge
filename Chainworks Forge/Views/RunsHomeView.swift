@@ -6,6 +6,9 @@ import AppKit
 
 struct RunsHomeView: View {
     @StateObject private var model: P031ThinReadDashboardModel
+    // P046: transient MainActor session observability state; never persisted to SwiftData.
+    // Owned here as the selected-run detail coordinator per Phase 3 requirement.
+    @StateObject private var p046Model: P046SessionObservabilityModel
     @ObservedObject var workbench: RunsWorkbenchPresentationModel
     @State private var selectedRunDetailTab: P031RunDetailTab = .overview
     @State private var focusedArtifactStageID: String?
@@ -18,17 +21,27 @@ struct RunsHomeView: View {
     @MainActor
     init(workbench: RunsWorkbenchPresentationModel) {
         let model = P031ThinReadDashboardModel.bootstrap()
+        // Share the same endpoint for P046 session observability reads.
+        let endpoint = DaemonClientEndpoint.operatorDefault()
+        let p046Store = P031GraphQLWorkflowReadStore(
+            readTransport: P031URLSessionGraphQLReadTransport(endpoint: endpoint),
+            subscriptionTransport: P031URLSessionGraphQLSubscriptionTransport(endpoint: endpoint)
+        )
         _model = StateObject(wrappedValue: model)
+        _p046Model = StateObject(wrappedValue: P046SessionObservabilityModel.make(store: p046Store))
         self.workbench = workbench
         _selectedRunDetailTab = State(initialValue: .overview)
     }
 
+    @MainActor
     init(
         model: P031ThinReadDashboardModel,
         workbench: RunsWorkbenchPresentationModel,
-        initialTab: P031RunDetailTab
+        initialTab: P031RunDetailTab,
+        p046Model: P046SessionObservabilityModel? = nil
     ) {
         _model = StateObject(wrappedValue: model)
+        _p046Model = StateObject(wrappedValue: p046Model ?? P046SessionObservabilityModel.noOp())
         self.workbench = workbench
         _selectedRunDetailTab = State(initialValue: initialTab)
     }
@@ -43,6 +56,13 @@ struct RunsHomeView: View {
         .accessibilityIdentifier("runs-home-owner-view")
         .task {
             await model.loadIfNeeded()
+        }
+        // P046: drive session observability for the currently selected run.
+        // Capability discovery and gating happen inside the model before any P046
+        // documents are issued. On run change the prior task is cancelled automatically
+        // by SwiftUI's .task(id:) semantics; here we use onChange for the same effect.
+        .onChange(of: model.selectedRunID) { _, newRunID in
+            p046Model.updateSelectedRun(newRunID)
         }
         .toolbar {
             Button {
@@ -313,6 +333,9 @@ struct RunsHomeView: View {
                         if let health = workbench.freshnessAndHealth {
                             P036SystemReadinessCard(health: health)
                         }
+
+                        P046SessionObservabilityCard(model: p046Model)
+
                     case .stages:
                         if let stageMap = workbench.stageMap {
                             P036StageMapCard(map: stageMap)
@@ -3637,6 +3660,230 @@ private struct P036RecoveryEvidenceCard: View {
         .padding(20)
         .background(Color.primary.opacity(0.03))
         .cornerRadius(12)
+    }
+}
+
+// MARK: - P046 Session Observability Card
+
+// Renders P046 session observability readback in the selected-run overview tab.
+// Shows lineage list, KPI summary, health warnings, and generic MCP reset guidance.
+// Hides itself when P046 is unavailable (feature flag off or schema absent).
+private struct P046SessionObservabilityCard: View {
+    @ObservedObject var model: P046SessionObservabilityModel
+
+    var body: some View {
+        switch model.availability {
+        case .unavailable:
+            EmptyView()
+        case .unknown:
+            if model.isLoading {
+                loadingShell
+            } else {
+                EmptyView()
+            }
+        case .available:
+            contentCard
+        }
+    }
+
+    private var loadingShell: some View {
+        HStack(spacing: 10) {
+            ProgressView().controlSize(.small)
+            Text("Loading session observability…")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.03))
+        .cornerRadius(12)
+        .accessibilityIdentifier("p046-session-observability-loading")
+    }
+
+    private var contentCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            headerRow
+            if let health = model.health {
+                healthSection(health)
+            }
+            if !model.lineages.isEmpty {
+                lineagesSection
+            }
+            if let kpi = model.kpiSummary {
+                kpiRow(kpi)
+            }
+            if shouldShowResetGuidance {
+                Text("Suggested MCP action: use the MCP session reset capability.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("p046-mcp-reset-guidance")
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.03))
+        .cornerRadius(12)
+        .accessibilityIdentifier("p046-session-observability-card")
+    }
+
+    private var shouldShowResetGuidance: Bool {
+        guard let state = model.health?.state else { return false }
+        return state == "WARNING" || state == "CRITICAL"
+    }
+
+    private var headerRow: some View {
+        HStack {
+            Text("Session Observability")
+                .font(.headline)
+            if model.isStale {
+                Label("Stale", systemImage: "arrow.clockwise")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            Spacer()
+            if let kpi = model.kpiSummary {
+                Text("\(kpi.lineageCount) lineage\(kpi.lineageCount == 1 ? "" : "s")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func healthSection(_ health: P046SessionHealthReadModel) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(healthLabel(health.state), systemImage: healthIcon(health.state))
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(healthColor(health.state))
+            if !health.warnings.isEmpty {
+                ForEach(health.warnings, id: \.reasonCode) { warning in
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(severityColor(warning.severity))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(warning.reasonCode.replacingOccurrences(of: "_", with: " ").capitalized)
+                                .font(.caption.weight(.medium))
+                            if let message = warning.message {
+                                Text(message)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var lineagesSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Agent Sessions")
+                .font(.subheadline.weight(.medium))
+            ForEach(model.lineages) { lineage in
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(lineageColor(lineage.healthState))
+                        .frame(width: 7, height: 7)
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 4) {
+                            Text(lineage.agentId)
+                                .font(.caption.weight(.medium))
+                            if let scope = lineage.sessionReuseScope {
+                                Text("·")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                                Text(scope)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        if let count = lineage.generationCount {
+                            Text("\(count) generation\(count == 1 ? "" : "s")")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    if lineage.activeGenerationId != nil {
+                        Text("active")
+                            .font(.caption2)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 2)
+                            .background(Color.green.opacity(0.12))
+                            .foregroundStyle(.green)
+                            .cornerRadius(4)
+                    }
+                }
+                .padding(.vertical, 1)
+            }
+        }
+    }
+
+    private func kpiRow(_ kpi: P046SessionKpiSummaryReadModel) -> some View {
+        HStack(spacing: 20) {
+            kpiChip("Active", value: "\(kpi.activeGenerationCount)")
+            if let closed = kpi.closedGenerationCount {
+                kpiChip("Closed", value: "\(closed)")
+            }
+            if let turns = kpi.totalTurnCount {
+                kpiChip("Turns", value: "\(turns)")
+            }
+            Spacer()
+        }
+    }
+
+    private func kpiChip(_ label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(value).font(.subheadline.weight(.semibold))
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+
+    private func healthLabel(_ state: String) -> String {
+        switch state {
+        case "HEALTHY": return "Healthy"
+        case "WARNING": return "Warning"
+        case "CRITICAL": return "Critical"
+        default: return "Unknown"
+        }
+    }
+
+    private func healthIcon(_ state: String) -> String {
+        switch state {
+        case "HEALTHY": return "checkmark.circle.fill"
+        case "WARNING": return "exclamationmark.triangle"
+        case "CRITICAL": return "xmark.circle.fill"
+        default: return "questionmark.circle"
+        }
+    }
+
+    private func healthColor(_ state: String) -> Color {
+        switch state {
+        case "HEALTHY": return .green
+        case "WARNING": return .orange
+        case "CRITICAL": return .red
+        default: return .secondary
+        }
+    }
+
+    private func severityColor(_ severity: String) -> Color {
+        switch severity {
+        case "INFO": return .blue
+        case "WARNING": return .orange
+        case "CRITICAL": return .red
+        default: return .secondary
+        }
+    }
+
+    private func lineageColor(_ healthState: String?) -> Color {
+        switch healthState {
+        case "HEALTHY": return .green
+        case "WARNING": return .orange
+        case "CRITICAL": return .red
+        default: return Color(nsColor: .secondaryLabelColor)
+        }
     }
 }
 

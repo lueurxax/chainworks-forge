@@ -54,9 +54,28 @@ struct SystemMetrics {
     counters: HashMap<String, u64>,
     mcp_liveness_gate_last_recorded_at_ms: Option<i64>,
     mcp_hot_read_error_total_by_code: HashMap<String, u64>,
+    p046_query_duration_ms: HashMap<String, Histogram>,
+    p046_emit_lag_ms: Histogram,
 }
 
 static METRICS: OnceLock<Mutex<SystemMetrics>> = OnceLock::new();
+
+/// P046 bounded-label metric names required by rollout_contract_v1.
+/// Used by gate inventory checks to verify metric emissions are present.
+pub const P046_REQUIRED_METRICS: &[&str] = &[
+    "session_graphql_query_total",
+    "session_graphql_query_duration_seconds",
+    "session_graphql_sqlite_retry_total",
+    "session_graphql_sqlite_retry_exhausted_total",
+    "session_status_subscription_event_total",
+    "session_status_subscription_emit_lag_seconds",
+    "session_status_subscription_slow_consumer_disconnect_total",
+    "session_health_warning_total",
+    "session_event_redaction_total",
+    "session_graphql_disabled_schema_guard_total",
+    "session_graphql_reset_mutation_guard_total",
+    "session_graphql_observability_query_success_rate",
+];
 
 pub const P087_REQUIRED_METRICS: &[&str] = &[
     "db_writer_alive",
@@ -127,6 +146,62 @@ pub fn increment_counter_with_label(name: &str, label: &str) {
 pub fn get_counter(name: &str) -> u64 {
     let m = metrics().lock().unwrap();
     m.counters.get(name).copied().unwrap_or(0)
+}
+
+/// Returns the sum of all counters whose key starts with `prefix:`.
+/// Used in tests to verify that a labelled counter family was incremented
+/// without enumerating every possible label combination.
+pub fn get_counter_prefix_sum(prefix: &str) -> u64 {
+    let m = metrics().lock().unwrap();
+    let prefix_colon = format!("{prefix}:");
+    m.counters
+        .iter()
+        .filter(|(k, _)| k.starts_with(&prefix_colon))
+        .map(|(_, v)| v)
+        .sum()
+}
+
+/// Record P046 query resolver duration (session_graphql_query_duration_seconds).
+/// Stored as milliseconds internally; the metric name uses _seconds per the proposal vocabulary.
+pub fn record_p046_query_duration(field: &str, millis: u64) {
+    let mut m = metrics().lock().unwrap();
+    let key = if m.p046_query_duration_ms.len() >= 32 && !m.p046_query_duration_ms.contains_key(field) {
+        "unbounded_overflow"
+    } else {
+        field
+    };
+    m.p046_query_duration_ms.entry(key.to_string()).or_default().record(millis);
+    // Also increment success-rate adoption counter (session_graphql_observability_query_success_rate).
+    *m.counters.entry("session_graphql_observability_query_success_rate".to_string()).or_default() += 1;
+}
+
+pub fn get_p046_query_duration_p95(field: &str) -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    m.p046_query_duration_ms.get(field).and_then(|h| h.p95())
+}
+
+/// Record P046 subscription emit lag (session_status_subscription_emit_lag_seconds).
+/// Stored as milliseconds internally.
+pub fn record_p046_emit_lag(millis: u64) {
+    let mut m = metrics().lock().unwrap();
+    m.p046_emit_lag_ms.record(millis);
+}
+
+pub fn get_p046_emit_lag_p95() -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    m.p046_emit_lag_ms.p95()
+}
+
+pub fn get_p046_emit_lag_p99() -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    // Approximate p99 from the sorted sample.
+    if m.p046_emit_lag_ms.samples.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<u64> = m.p046_emit_lag_ms.samples.iter().copied().collect();
+    sorted.sort_unstable();
+    let idx = ((sorted.len() - 1) * 99).div_ceil(100);
+    sorted.get(idx).copied()
 }
 
 pub fn record_hot_read_latency(tool: &str, duration: Duration) {

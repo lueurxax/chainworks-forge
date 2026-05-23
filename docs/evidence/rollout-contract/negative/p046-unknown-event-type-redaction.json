@@ -1,0 +1,14 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "unknown_event_type_redaction",
+  "description": "Unknown event_type, unknown schema_version, or unknown details_json shape is passed through to GraphQL rather than failing closed to detailsJsonRedacted=null plus bounded warning.",
+  "hold_condition": "Unknown event_type, schema_version, or details_json shape does not fail closed to detailsJsonRedacted=null plus bounded warning.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_unknown_shape_not_fail_closed",
+  "fixture_input": {
+    "event_type": "unknown_future_event_type",
+    "event_details_json": "{\"schemaVersion\":\"future_unknown_schema\",\"someKey\":\"someValue\"}",
+    "expected_result": "details_json_redacted_null_with_redaction_unknown_event_type_or_unknown_schema_version_warning"
+  }
+}

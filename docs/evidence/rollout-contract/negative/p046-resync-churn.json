@@ -1,0 +1,13 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "resync_churn",
+  "description": "Subscription emits multiple resyncRequired=true payloads in a row without a successful non-resync payload between them.",
+  "hold_condition": "sessionStatusChanged lacks a 64 payload per-subscriber buffer cap, at-most-once resyncRequired behavior, or slow-consumer disconnect criteria.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_resync_churn",
+  "fixture_input": {
+    "lag_events": 3,
+    "expected_result": "at_most_one_resync_required_between_successful_payloads"
+  }
+}

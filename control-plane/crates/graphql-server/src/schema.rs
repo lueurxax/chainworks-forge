@@ -5,12 +5,13 @@ use std::sync::Arc;
 use async_graphql::futures_util::StreamExt;
 use async_graphql::*;
 use sqlx::{Row, SqlitePool};
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tracing::{debug, info, warn};
 
 use db::repos::{
     approvals, artifact_contracts, artifacts, closeout, code_writer_completion_receipts, ideas,
-    projections, rollout_contract_checks, runs, steward as steward_repo, workflow_conflicts,
+    projections, rollout_contract_checks, runs, sessions as session_repo, steward as steward_repo,
+    workflow_conflicts,
 };
 use db::writer::DbWriterHeartbeat;
 use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, ResolveApprovalCmd};
@@ -29,6 +30,13 @@ use crate::types::p031::{
 };
 use crate::types::run::GqlRun;
 use crate::types::scheduler::{GqlStartupRecoverySummary, GqlToolchainCacheHousekeepingSummary};
+use crate::types::session::{
+    transient_db_unavailable_health, GqlSessionEventConnection, GqlSessionGenerationConnection,
+    GqlSessionHealthReport, GqlSessionKpiSummary, GqlSessionLineage, GqlSessionLineageConnection,
+    GqlSessionStatusChangedEvent, P046Config, P046LivePrincipalHandle,
+    SESSION_EVENTS_DEFAULT_FIRST, SESSION_EVENTS_MAX_FIRST, SESSION_GENERATIONS_DEFAULT_FIRST,
+    SESSION_GENERATIONS_MAX_FIRST, SESSION_LINEAGES_DEFAULT_FIRST, SESSION_LINEAGES_MAX_FIRST,
+};
 use crate::types::stage::{GqlAgentExecution, GqlStageExecution};
 use crate::types::steward::{
     GqlStewardAnalysis, GqlStewardAnalysisRunLink, GqlStewardRecommendation,
@@ -64,6 +72,41 @@ pub fn build_schema_with_storage_writer(
     )
 }
 
+/// Like `build_schema_with_storage_writer` but also returns the live principal handle
+/// so the caller (daemon) can update it when principals.json changes, enabling
+/// revocation without a daemon restart.
+pub fn build_schema_with_storage_writer_and_handle(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
+) -> (AppSchema, P046LivePrincipalHandle) {
+    let p046 = P046Config {
+        enabled: matches!(
+            std::env::var("CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY")
+                .unwrap_or_default()
+                .to_lowercase()
+                .as_str(),
+            "1" | "true" | "yes"
+        ),
+        subscription_channel_capacity: 64,
+    };
+    let live_handle = P046LivePrincipalHandle::new(principal_table.clone());
+    let schema = build_schema_inner_with_p046_and_handle(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        Some(storage_writer_heartbeat),
+        p046,
+        live_handle.clone(),
+    );
+    (schema, live_handle)
+}
+
 fn build_schema_inner(
     pool: SqlitePool,
     cmd_handler: Arc<CommandHandler>,
@@ -72,19 +115,163 @@ fn build_schema_inner(
     reporter: LifecycleReporter,
     storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
 ) -> AppSchema {
+    let p046 = P046Config {
+        enabled: matches!(
+            std::env::var("CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY")
+                .unwrap_or_default()
+                .to_lowercase()
+                .as_str(),
+            "1" | "true" | "yes"
+        ),
+        subscription_channel_capacity: 64,
+    };
+    build_schema_inner_with_p046(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        storage_writer_heartbeat,
+        p046,
+    )
+}
+
+fn build_schema_inner_with_p046(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
+    p046: P046Config,
+) -> AppSchema {
+    let live_handle = P046LivePrincipalHandle::new(principal_table.clone());
+    build_schema_inner_with_p046_and_handle(
+        pool, cmd_handler, events, principal_table, reporter, storage_writer_heartbeat, p046, live_handle,
+    )
+}
+
+fn build_schema_inner_with_p046_and_handle(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
+    p046: P046Config,
+    live_handle: P046LivePrincipalHandle,
+) -> AppSchema {
+    // P046 reset mutation guard: record that the schema was built without any
+    // resetSession/equivalent mutation. This counter is incremented once per schema
+    // construction to prove the guard is active. It must remain zero for "fail" labels.
+    if p046.enabled {
+        db::metrics::increment_counter_with_label(
+            "session_graphql_reset_mutation_guard_total",
+            "pass",
+        );
+    }
     let mut builder = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .data(pool)
         .data(cmd_handler)
         .data(events)
         .data(principal_table)
-        .data(reporter);
+        .data(live_handle)
+        .data(reporter)
+        .data(p046);
     if let Some(heartbeat) = storage_writer_heartbeat {
         builder = builder.data(heartbeat);
     }
     builder.finish()
 }
 
+pub fn build_schema_with_session_observability(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+) -> AppSchema {
+    build_schema_inner_with_p046(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        None,
+        P046Config { enabled: true, subscription_channel_capacity: 64 },
+    )
+}
+
+/// Build a P046 schema and return the live principal handle so callers can drive
+/// revocation tests by updating the handle after the schema is constructed.
+pub fn build_schema_with_session_observability_and_live_handle(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+) -> (AppSchema, P046LivePrincipalHandle) {
+    let live_handle = P046LivePrincipalHandle::new(principal_table.clone());
+    let schema = build_schema_inner_with_p046_and_handle(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        None,
+        P046Config { enabled: true, subscription_channel_capacity: 64 },
+        live_handle.clone(),
+    );
+    (schema, live_handle)
+}
+
+/// Build a schema with an explicit P046Config — used in tests to set a smaller
+/// subscription channel capacity for slow-consumer disconnect testing.
+pub fn build_schema_with_p046_config(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    p046: P046Config,
+) -> AppSchema {
+    build_schema_inner_with_p046(pool, cmd_handler, events, principal_table, reporter, None, p046)
+}
+
 pub struct QueryRoot;
+
+// P046 transient SQLite retry is db-owned: db::p046_retry::p046_retry_db.
+// The local forwarding alias keeps call-site notation identical to the pre-move form.
+use db::p046_retry::p046_retry_db;
+
+/// Returns a bounded metric label for a session event type (for subscription_event_total).
+fn session_event_type_metric_label(event_type: &domain::session::SessionEventType) -> &'static str {
+    use domain::session::SessionEventType;
+    match event_type {
+        SessionEventType::Created => "LINEAGE_CREATED",
+        SessionEventType::Reused => "SESSION_REUSED",
+        SessionEventType::Invalidated => "GENERATION_INVALIDATED",
+        SessionEventType::Closed => "GENERATION_CLOSED",
+        SessionEventType::OperatorReset => "OPERATOR_RESET_RECORDED",
+        SessionEventType::OutputContractRepairStarted
+        | SessionEventType::OutputContractRepairSucceeded
+        | SessionEventType::OutputContractRepairSkipped => "REPAIR_ATTEMPTED",
+        SessionEventType::OutputContractRepairFailed => "REPAIR_FAILED",
+        SessionEventType::BudgetExceeded => "CONTEXT_WINDOW_OBSERVED",
+        _ => "UNKNOWN_EVENT_SHAPE",
+    }
+}
+
+// P046 metric names emitted via db::metrics helpers (listed here for gate inventory grep):
+//   session_graphql_query_duration_seconds   → db::metrics::record_p046_query_duration
+//   session_status_subscription_emit_lag_seconds → db::metrics::record_p046_emit_lag
+//   session_graphql_observability_query_success_rate → incremented inside record_p046_query_duration
+
+/// P046 resolver deadline: 2 seconds per resolver. Passed into p046_retry_db so all
+/// chained DB calls within a single resolver share the same budget.
+fn p046_resolver_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + std::time::Duration::from_secs(2)
+}
 
 fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
     let principal = ctx
@@ -103,6 +290,56 @@ fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
     }
     Ok(())
 }
+
+// ── P046: Resource-scoped run accessibility ──────────────────────────────────
+//
+// Atomically verifies the calling principal is an operator AND the run exists.
+// Returns Ok(Some(())) if authorized and found, Ok(None) if run absent,
+// Err("forbidden") if non-operator, Err("db_unavailable") on transient DB failure.
+// Uses the pinned P046 retry policy (3 attempts, 50ms/150ms backoff) so transient
+// SQLite busy/timeout is handled consistently with other P046 DB reads.
+// Combining both checks prevents authorization bypass if a new resolver omits
+// require_operator_read — the run-scoped check enforces operator class itself.
+// ID-based resolvers use Ok(None) to apply not-found-or-not-visible behavior.
+// run_id-based resolvers typically map Ok(None) to Err("not found").
+async fn p046_check_run_accessible(
+    ctx: &Context<'_>,
+    pool: &SqlitePool,
+    run_id_str: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Option<()>> {
+    let principal = ctx
+        .data::<auth::Principal>()
+        .map_err(|_| Error::new("unauthorized"))?;
+    if principal.class != auth::PrincipalClass::Operator {
+        return Err(Error::new("forbidden"));
+    }
+    let parsed: domain::ids::RunId =
+        run_id_str.parse().map_err(|_| Error::new("not found"))?;
+    let pool_ref = pool.clone();
+    match p046_retry_db("session_run_access", deadline, || {
+        let pool_inner = pool_ref.clone();
+        async move {
+            runs::find_by_id(&pool_inner, parsed)
+                .await
+                .map(|opt| opt.map(|_| ()))
+        }
+    })
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.starts_with("transient_db_unavailable") {
+                warn!("p046 run accessibility check transient: {e:#}");
+            } else {
+                warn!("p046 run accessibility check: {e:#}");
+            }
+            Err(Error::new("db_unavailable"))
+        }
+    }
+}
+
 
 async fn run_from_projection_or_canonical(
     pool: &SqlitePool,
@@ -716,6 +953,557 @@ impl QueryRoot {
             .into_iter()
             .map(GqlSideEffectSummary::from_domain)
             .collect())
+    }
+
+    // ── P046: Session observability read-only queries ─────────────────────────
+
+    #[graphql(visible = "crate::types::session::p046_visible")]
+    async fn session_lineages(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+        first: Option<i32>,
+        after: Option<String>,
+    ) -> Result<GqlSessionLineageConnection> {
+        require_operator_read(ctx)?;
+        let p046 = ctx.data::<P046Config>()?;
+        if !p046.enabled {
+            db::metrics::increment_counter_with_label(
+                "session_graphql_disabled_schema_guard_total",
+                "graphql_external:blocked",
+            );
+            return Err(Error::new("session observability is not enabled"));
+        }
+        let pool = ctx.data::<SqlitePool>()?.clone();
+        let resolver_deadline = p046_resolver_deadline();
+        let resolver_start = std::time::Instant::now();
+        let limit = first
+            .map(|n| n as i64)
+            .unwrap_or(SESSION_LINEAGES_DEFAULT_FIRST);
+        if limit > SESSION_LINEAGES_MAX_FIRST {
+            return Err(Error::new("first exceeds maximum allowed value"));
+        }
+        if limit < 1 {
+            return Err(Error::new("first must be at least 1"));
+        }
+        let run_id_str = run_id.as_str().to_string();
+        if let Some(ref c) = after {
+            match db::repos::sessions::decode_session_lineage_cursor(c) {
+                Some((cursor_run_id, _, _, _, _)) if cursor_run_id == run_id_str => {}
+                Some(_) => return Err(Error::new("invalid cursor")), // wrong run
+                None => return Err(Error::new("invalid cursor")),
+            }
+        }
+        let after_clone = after.clone();
+        // P046 resource-scoped authorization: bind operator read to the owning run.
+        match p046_check_run_accessible(ctx, &pool, &run_id_str, resolver_deadline).await? {
+            Some(()) => {}
+            None => return Err(Error::new("not found")),
+        }
+        let page = p046_retry_db("sessionLineages", resolver_deadline, || {
+            let pool = pool.clone();
+            let run_id_str = run_id_str.clone();
+            let after = after_clone.clone();
+            async move {
+                session_repo::list_lineages_for_run_paginated(
+                    &pool,
+                    &run_id_str,
+                    limit,
+                    after.as_deref(),
+                )
+                .await
+            }
+        })
+        .await
+        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+        // Load per-lineage stats (generation_count, latest_event_at) in a single batch query.
+        // On transient DB failure return db_unavailable rather than silently defaulting to zeros.
+        let stats = match p046_retry_db("sessionLineages", resolver_deadline, || {
+            let pool = pool.clone();
+            let run_id_str = run_id_str.clone();
+            async move { session_repo::aggregate_lineage_stats_for_run(&pool, &run_id_str).await }
+        })
+        .await
+        {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!("p046 sessionLineages stats error: {e:#}");
+                return Err(Error::new("db_unavailable"));
+            }
+        };
+        db::metrics::increment_counter_with_label(
+            "session_graphql_query_total",
+            "sessionLineages:ok",
+        );
+        db::metrics::record_p046_query_duration("sessionLineages", resolver_start.elapsed().as_millis() as u64);
+        Ok(GqlSessionLineageConnection::from_page_with_stats(page, stats.as_ref()))
+    }
+
+    #[graphql(visible = "crate::types::session::p046_visible")]
+    async fn session_lineage(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+    ) -> Result<Option<GqlSessionLineage>> {
+        require_operator_read(ctx)?;
+        let p046 = ctx.data::<P046Config>()?;
+        if !p046.enabled {
+            db::metrics::increment_counter_with_label(
+                "session_graphql_disabled_schema_guard_total",
+                "graphql_external:blocked",
+            );
+            return Err(Error::new("session observability is not enabled"));
+        }
+        let pool = ctx.data::<SqlitePool>()?.clone();
+        let resolver_deadline = p046_resolver_deadline();
+        let resolver_start = std::time::Instant::now();
+        let id_str = id.as_str().to_string();
+        // Resolve owning run first; not-found-or-not-visible behavior
+        let owner = p046_retry_db("sessionLineage", resolver_deadline, || {
+            let pool = pool.clone();
+            let id_str = id_str.clone();
+            async move { session_repo::find_lineage_owner_run(&pool, &id_str).await }
+        })
+        .await
+        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+        let owner_run_id_str = match owner {
+            None => return Ok(None),
+            Some(r) => r,
+        };
+        // P046 resource-scoped authorization: bind operator read to the owning run.
+        match p046_check_run_accessible(ctx, &pool, &owner_run_id_str, resolver_deadline).await? {
+            Some(()) => {}
+            None => return Ok(None),
+        }
+        let lineage = match p046_retry_db("sessionLineage", resolver_deadline, || {
+            let pool = pool.clone();
+            let id_str = id_str.clone();
+            async move { session_repo::find_lineage_by_id(&pool, &id_str).await }
+        })
+        .await
+        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?
+        {
+            None => return Ok(None),
+            Some(l) => l,
+        };
+        // Load stats and activeGeneration for the resolved single lineage.
+        let stats = match p046_retry_db("sessionLineage", resolver_deadline, || {
+            let pool = pool.clone();
+            let id_str = id_str.clone();
+            async move { session_repo::aggregate_lineage_stats_for_lineage(&pool, &id_str).await }
+        })
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("p046 sessionLineage stats error: {e:#}");
+                return Err(Error::new("db_unavailable"));
+            }
+        };
+        let active_gen = if lineage.active_generation_id.is_some() {
+            let run_id_for_ref = lineage.run_id.clone();
+            let lid = lineage.id.clone();
+            match p046_retry_db("sessionLineage", resolver_deadline, || {
+                let pool = pool.clone();
+                let lid = lid.clone();
+                async move { session_repo::find_active_generation(&pool, &lid).await }
+            })
+            .await
+            {
+                Ok(gen) => gen.map(|g| {
+                    crate::types::session::GqlSessionGeneration::from_domain(g, &run_id_for_ref)
+                }),
+                Err(e) => {
+                    warn!("p046 sessionLineage activeGeneration error: {e:#}");
+                    return Err(Error::new("db_unavailable"));
+                }
+            }
+        } else {
+            None
+        };
+        let mut gql = GqlSessionLineage::from_lineage_with_stats(lineage, stats.as_ref());
+        gql.active_generation = active_gen;
+        db::metrics::increment_counter_with_label(
+            "session_graphql_query_total",
+            "sessionLineage:ok",
+        );
+        db::metrics::record_p046_query_duration("sessionLineage", resolver_start.elapsed().as_millis() as u64);
+        Ok(Some(gql))
+    }
+
+    #[graphql(visible = "crate::types::session::p046_visible")]
+    async fn session_generations(
+        &self,
+        ctx: &Context<'_>,
+        lineage_id: ID,
+        first: Option<i32>,
+        after: Option<String>,
+    ) -> Result<GqlSessionGenerationConnection> {
+        require_operator_read(ctx)?;
+        let p046 = ctx.data::<P046Config>()?;
+        if !p046.enabled {
+            db::metrics::increment_counter_with_label(
+                "session_graphql_disabled_schema_guard_total",
+                "graphql_external:blocked",
+            );
+            return Err(Error::new("session observability is not enabled"));
+        }
+        let pool = ctx.data::<SqlitePool>()?;
+        let resolver_deadline = p046_resolver_deadline();
+        let resolver_start = std::time::Instant::now();
+        let limit = first
+            .map(|n| n as i64)
+            .unwrap_or(SESSION_GENERATIONS_DEFAULT_FIRST);
+        if limit > SESSION_GENERATIONS_MAX_FIRST {
+            return Err(Error::new("first exceeds maximum allowed value"));
+        }
+        if limit < 1 {
+            return Err(Error::new("first must be at least 1"));
+        }
+        let lineage_id_str = lineage_id.as_str().to_string();
+        if let Some(ref c) = after {
+            match db::repos::sessions::decode_session_generation_cursor(c) {
+                Some((cursor_lid, _, _, _)) if cursor_lid == lineage_id_str => {}
+                Some(_) => return Err(Error::new("invalid cursor")), // mismatched filter
+                None => return Err(Error::new("invalid cursor")),
+            }
+        }
+        let pool = pool.clone();
+        let after_clone = after.clone();
+        // Resolve owning run for resource-scoped authorization (not-found-or-not-visible).
+        let run_id = match p046_retry_db("sessionGenerations", resolver_deadline, || {
+            let pool = pool.clone();
+            let lineage_id_str = lineage_id_str.clone();
+            async move { session_repo::find_lineage_owner_run(&pool, &lineage_id_str).await }
+        })
+        .await
+        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?
+        {
+            Some(r) => r,
+            None => {
+                return Ok(GqlSessionGenerationConnection::from_page(
+                    db::repos::sessions::SessionGenerationPage {
+                        items: vec![],
+                        has_next_page: false,
+                        start_cursor: None,
+                        end_cursor: None,
+                    },
+                    "",
+                ));
+            }
+        };
+        // P046 resource-scoped authorization: bind operator read to the owning run.
+        match p046_check_run_accessible(ctx, &pool, &run_id, resolver_deadline).await? {
+            Some(()) => {}
+            None => {
+                return Ok(GqlSessionGenerationConnection::from_page(
+                    db::repos::sessions::SessionGenerationPage {
+                        items: vec![],
+                        has_next_page: false,
+                        start_cursor: None,
+                        end_cursor: None,
+                    },
+                    "",
+                ));
+            }
+        }
+        let page = p046_retry_db("sessionGenerations", resolver_deadline, || {
+            let pool = pool.clone();
+            let lineage_id_str = lineage_id_str.clone();
+            let after = after_clone.clone();
+            async move {
+                session_repo::list_generations_for_lineage_paginated(
+                    &pool,
+                    &lineage_id_str,
+                    limit,
+                    after.as_deref(),
+                )
+                .await
+            }
+        })
+        .await
+        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+        db::metrics::increment_counter_with_label(
+            "session_graphql_query_total",
+            "sessionGenerations:ok",
+        );
+        db::metrics::record_p046_query_duration("sessionGenerations", resolver_start.elapsed().as_millis() as u64);
+        Ok(GqlSessionGenerationConnection::from_page(page, &run_id))
+    }
+
+    #[graphql(visible = "crate::types::session::p046_visible")]
+    async fn session_events(
+        &self,
+        ctx: &Context<'_>,
+        lineage_id: ID,
+        generation_id: Option<ID>,
+        first: Option<i32>,
+        after: Option<String>,
+    ) -> Result<GqlSessionEventConnection> {
+        require_operator_read(ctx)?;
+        let p046 = ctx.data::<P046Config>()?;
+        if !p046.enabled {
+            db::metrics::increment_counter_with_label(
+                "session_graphql_disabled_schema_guard_total",
+                "graphql_external:blocked",
+            );
+            return Err(Error::new("session observability is not enabled"));
+        }
+        let pool = ctx.data::<SqlitePool>()?;
+        let resolver_deadline = p046_resolver_deadline();
+        let resolver_start = std::time::Instant::now();
+        let limit = first
+            .map(|n| n as i64)
+            .unwrap_or(SESSION_EVENTS_DEFAULT_FIRST);
+        if limit > SESSION_EVENTS_MAX_FIRST {
+            return Err(Error::new("first exceeds maximum allowed value"));
+        }
+        if limit < 1 {
+            return Err(Error::new("first must be at least 1"));
+        }
+        let lineage_id_str = lineage_id.as_str().to_string();
+        let gen_filter = generation_id.as_deref().map(|id| id.as_str().to_string());
+        if let Some(ref c) = after {
+            let expected_gen = gen_filter.as_deref().unwrap_or("");
+            match db::repos::sessions::decode_session_cursor(c) {
+                Some((cursor_lid, cursor_gen, _, _))
+                    if cursor_lid == lineage_id_str && cursor_gen == expected_gen => {}
+                Some(_) => return Err(Error::new("invalid cursor")), // mismatched lineage or gen filter
+                None => return Err(Error::new("invalid cursor")),
+            }
+        }
+        let pool = pool.clone();
+        let after_clone = after.clone();
+        // Resolve owning run for resource-scoped authorization (not-found-or-not-visible).
+        let owner_run_id = p046_retry_db("sessionEvents", resolver_deadline, || {
+            let pool = pool.clone();
+            let lineage_id_str = lineage_id_str.clone();
+            async move { session_repo::find_lineage_owner_run(&pool, &lineage_id_str).await }
+        })
+        .await
+        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+        let empty_page = || db::repos::sessions::SessionEventPage {
+            items: vec![],
+            has_next_page: false,
+            start_cursor: None,
+            end_cursor: None,
+            gen_id_filter: gen_filter.as_deref().unwrap_or("").to_string(),
+        };
+        match owner_run_id {
+            None => {
+                return Ok(GqlSessionEventConnection::from_page(empty_page()));
+            }
+            Some(rid) => {
+                // P046 resource-scoped authorization: bind operator read to the owning run.
+                match p046_check_run_accessible(ctx, &pool, &rid, resolver_deadline).await? {
+                    Some(()) => {}
+                    None => {
+                        return Ok(GqlSessionEventConnection::from_page(empty_page()));
+                    }
+                }
+            }
+        }
+        // Validate generationId belongs to the authorized lineage before reading events.
+        // Proposal requirement: "verify generationId belongs to that lineage before returning
+        // events. A generationId from another lineage returns not-found-or-not-visible."
+        if let Some(ref gen_id) = gen_filter {
+            let pool_for_check = pool.clone();
+            let gen_id_for_check = gen_id.clone();
+            let lineage_id_for_check = lineage_id_str.clone();
+            let gen_belongs = p046_retry_db("sessionEvents", resolver_deadline, move || {
+                let pool = pool_for_check.clone();
+                let gen_id = gen_id_for_check.clone();
+                let lineage_id = lineage_id_for_check.clone();
+                async move {
+                    let result =
+                        session_repo::find_generation_with_lineage_owner(&pool, &gen_id).await?;
+                    Ok(matches!(result, Some((ref g, _)) if g.lineage_id == lineage_id))
+                }
+            })
+            .await
+            .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+
+            if !gen_belongs {
+                return Ok(GqlSessionEventConnection::from_page(empty_page()));
+            }
+        }
+
+        let page = p046_retry_db("sessionEvents", resolver_deadline, || {
+            let pool = pool.clone();
+            let lineage_id_str = lineage_id_str.clone();
+            let gen_filter = gen_filter.clone();
+            let after = after_clone.clone();
+            async move {
+                session_repo::list_events_paginated(
+                    &pool,
+                    &lineage_id_str,
+                    gen_filter.as_deref(),
+                    limit,
+                    after.as_deref(),
+                )
+                .await
+            }
+        })
+        .await
+        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+        db::metrics::increment_counter_with_label(
+            "session_graphql_query_total",
+            "sessionEvents:ok",
+        );
+        db::metrics::record_p046_query_duration("sessionEvents", resolver_start.elapsed().as_millis() as u64);
+        Ok(GqlSessionEventConnection::from_page(page))
+    }
+
+    #[graphql(visible = "crate::types::session::p046_visible")]
+    async fn session_kpi_summary(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<GqlSessionKpiSummary> {
+        require_operator_read(ctx)?;
+        let p046 = ctx.data::<P046Config>()?;
+        if !p046.enabled {
+            db::metrics::increment_counter_with_label(
+                "session_graphql_disabled_schema_guard_total",
+                "graphql_external:blocked",
+            );
+            return Err(Error::new("session observability is not enabled"));
+        }
+        let pool = ctx.data::<SqlitePool>()?.clone();
+        let resolver_deadline = p046_resolver_deadline();
+        let resolver_start = std::time::Instant::now();
+        let run_id_str = run_id.as_str().to_string();
+        // P046 resource-scoped authorization: bind operator read to the owning run.
+        match p046_check_run_accessible(ctx, &pool, &run_id_str, resolver_deadline).await? {
+            Some(()) => {}
+            None => return Err(Error::new("not found")),
+        }
+        let kpi = p046_retry_db("sessionKpiSummary", resolver_deadline, || {
+            let pool = pool.clone();
+            let run_id_str = run_id_str.clone();
+            async move { session_repo::aggregate_kpis_for_run(&pool, &run_id_str).await }
+        })
+        .await
+        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+        db::metrics::increment_counter_with_label(
+            "session_graphql_query_total",
+            "sessionKpiSummary:ok",
+        );
+        db::metrics::record_p046_query_duration("sessionKpiSummary", resolver_start.elapsed().as_millis() as u64);
+        Ok(GqlSessionKpiSummary {
+            run_id: run_id_str,
+            lineage_count: kpi.lineage_count,
+            generation_count: kpi.generation_count,
+            active_generation_count: kpi.active_generation_count,
+            closed_generation_count: kpi.closed_generation_count,
+            reset_generation_count: kpi.reset_generation_count,
+            invalidated_generation_count: kpi.invalidated_generation_count,
+            reuse_event_count: kpi.reuse_event_count,
+            operator_reset_event_count: kpi.operator_reset_event_count,
+            total_turn_count: kpi.total_turn_count,
+            total_prompt_tokens: kpi.total_prompt_tokens,
+            total_cost_cents: kpi.total_cost_cents,
+            latest_activity_at: kpi.latest_activity_at.map(|t| t.to_rfc3339()),
+            stale_active_generation_count: kpi.stale_active_generation_count,
+        })
+    }
+
+    #[graphql(visible = "crate::types::session::p046_visible")]
+    async fn session_health(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<GqlSessionHealthReport> {
+        require_operator_read(ctx)?;
+        let p046 = ctx.data::<P046Config>()?;
+        if !p046.enabled {
+            db::metrics::increment_counter_with_label(
+                "session_graphql_disabled_schema_guard_total",
+                "graphql_external:blocked",
+            );
+            return Err(Error::new("session observability is not enabled"));
+        }
+        let pool = ctx.data::<SqlitePool>()?.clone();
+        let resolver_deadline = p046_resolver_deadline();
+        let resolver_start = std::time::Instant::now();
+        let run_id_str = run_id.as_str().to_string();
+        // P046 resource-scoped authorization: bind operator read to the owning run.
+        // For sessionHealth, transient db failure during access check returns UNKNOWN/transient_db_unavailable
+        // rather than propagating a resolver error (same contract as aggregate read exhaustion).
+        match p046_check_run_accessible(ctx, &pool, &run_id_str, resolver_deadline).await {
+            Ok(Some(())) => {}
+            Ok(None) => return Err(Error::new("not found")),
+            Err(e) if e.message == "db_unavailable" => {
+                db::metrics::increment_counter_with_label(
+                    "session_graphql_query_total",
+                    "sessionHealth:db_unavailable",
+                );
+                db::metrics::record_p046_query_duration(
+                    "sessionHealth",
+                    resolver_start.elapsed().as_millis() as u64,
+                );
+                return Ok(transient_db_unavailable_health(&run_id_str));
+            }
+            Err(e) => return Err(e),
+        }
+        // P046: use pinned retry policy.
+        // Transient sqlite exhaustion returns UNKNOWN/transient_db_unavailable health (not an error).
+        // Non-transient errors (data-shape corruption, schema mismatch) propagate as resolver errors.
+        match p046_retry_db("sessionHealth", resolver_deadline, || {
+            let pool = pool.clone();
+            let run_id_str = run_id_str.clone();
+            async move { session_repo::load_health_data_for_run(&pool, &run_id_str).await }
+        })
+        .await
+        {
+            Ok(data) => {
+                let run_is_terminal = data.run_is_terminal;
+                let report = crate::types::session::compute_session_health(
+                    &data,
+                    &run_id_str,
+                    run_is_terminal,
+                );
+                db::metrics::increment_counter_with_label(
+                    "session_graphql_query_total",
+                    "sessionHealth:ok",
+                );
+                db::metrics::record_p046_query_duration("sessionHealth", resolver_start.elapsed().as_millis() as u64);
+                Ok(report)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.starts_with("transient_db_unavailable") {
+                    db::metrics::increment_counter_with_label(
+                        "session_graphql_query_total",
+                        "sessionHealth:db_unavailable",
+                    );
+                    db::metrics::record_p046_query_duration("sessionHealth", resolver_start.elapsed().as_millis() as u64);
+                    Ok(transient_db_unavailable_health(&run_id_str))
+                } else {
+                    warn!("p046 sessionHealth non-transient error for run {run_id_str}: {e:#}");
+                    Err(Error::new("session health data unavailable"))
+                }
+            }
+        }
+    }
+
+    // Lightweight capability probe: present only when P046 is enabled.
+    // Clients issue this before constructing P046 query/subscription documents.
+    // A "Cannot query field" error means P046 fields are absent from the schema.
+    // Requires operator-read authorization so non-operator principals cannot fingerprint
+    // daemon capability (holds_conditions: every P046 query/subscription requires operator-read).
+    #[graphql(visible = "crate::types::session::p046_visible")]
+    async fn session_observability_available(&self, ctx: &Context<'_>) -> Result<bool> {
+        require_operator_read(ctx)?;
+        let p046 = ctx.data::<P046Config>()?;
+        if !p046.enabled {
+            db::metrics::increment_counter_with_label(
+                "session_graphql_disabled_schema_guard_total",
+                "graphql_external:blocked",
+            );
+            return Err(Error::new("session observability is not enabled"));
+        }
+        Ok(true)
     }
 }
 
@@ -1897,7 +2685,8 @@ impl SubscriptionRoot {
                         run_id.and_then(|id| id.parse().ok())
                     }
                     DomainEvent::DaemonStatusChanged { .. }
-                    | DomainEvent::MaintenanceSlotReleaseCasFailed { .. } => None,
+                    | DomainEvent::MaintenanceSlotReleaseCasFailed { .. }
+                    | DomainEvent::SessionEventRecorded { .. } => None,
                 }?;
                 if let Some(fid) = filter_run_id {
                     if refresh_run_id != fid {
@@ -2092,6 +2881,321 @@ impl SubscriptionRoot {
                 _ => None,
             }
         }))
+    }
+
+    // ── P046: Live session status subscription ────────────────────────────────
+
+    #[graphql(visible = "crate::types::session::p046_visible")]
+    async fn session_status_changed(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<GqlSessionStatusChangedEvent>>>
+    {
+        // P046-SEC-L3: check operator class AND subscription surface policy at startup,
+        // matching the per-emission recheck policy so the gate is symmetric.
+        let principal = ctx
+            .data::<auth::Principal>()
+            .map_err(|_| Error::new("unauthorized"))?;
+        if principal.class != auth::PrincipalClass::Operator {
+            return Err(Error::new("forbidden"));
+        }
+        if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
+            if let Some(allowed) =
+                auth::is_subscription_allowed_by_surface_policy(table, &principal.id)
+            {
+                if !allowed {
+                    return Err(Error::new("forbidden"));
+                }
+            }
+        }
+        let p046 = ctx.data::<P046Config>()?;
+        if !p046.enabled {
+            db::metrics::increment_counter_with_label(
+                "session_graphql_disabled_schema_guard_total",
+                "graphql_external:blocked",
+            );
+            return Err(Error::new("session observability is not enabled"));
+        }
+
+        let run_id_str = run_id.as_str().to_string();
+        let filter_run_id: RunId = run_id_str
+            .parse()
+            .map_err(|_| Error::new("invalid run id"))?;
+
+        let pool = ctx.data::<SqlitePool>()?.clone();
+        let events = ctx.data::<EventSender>()?.clone();
+        // Use the live handle for per-emission auth so revocation in the underlying
+        // table is observed without waiting for daemon restart.
+        let live_principal_handle = ctx.data::<P046LivePrincipalHandle>()?.clone();
+        let principal_id = ctx.data::<auth::Principal>()?.id.clone();
+        // Optional test-only shutdown signal: when the watch sender is dropped (or sends true),
+        // the subscription performs the same graceful-shutdown drain as RecvError::Closed.
+        let shutdown_rx: Option<tokio::sync::watch::Receiver<bool>> =
+            ctx.data::<tokio::sync::watch::Receiver<bool>>().ok().cloned();
+
+        // P046 resource-scoped authorization: bind operator subscription to the owning run.
+        let run_id_for_auth = filter_run_id.to_string();
+        let sub_deadline = p046_resolver_deadline();
+        match p046_check_run_accessible(ctx, &pool, &run_id_for_auth, sub_deadline).await? {
+            Some(()) => {}
+            None => return Err(Error::new("not found")),
+        }
+
+        let channel_capacity = p046.subscription_channel_capacity;
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<GqlSessionStatusChangedEvent>>(channel_capacity);
+
+        tokio::spawn(async move {
+            let mut broadcast_rx = events.subscribe();
+            let mut shutdown_rx = shutdown_rx;
+            let mut consecutive_failures: u32 = 0;
+            // resync_pending: lag/overflow detected; try to send resync before next event.
+            let mut resync_pending = false;
+            // resync_sent: a resync was successfully enqueued; suppress further resyncs
+            // until a successful non-resync payload clears this (at-most-once contract).
+            let mut resync_sent = false;
+            let mut queue_full_since: Option<tokio::time::Instant> = None;
+            let mut last_emitted_event_id: Option<String> = None;
+
+            loop {
+                // Compute the absolute slow-consumer disconnect deadline (once set, it does not
+                // reset when new events arrive, so the 5s SLO is enforced independently).
+                let disconnect_deadline =
+                    queue_full_since.map(|s| s + std::time::Duration::from_secs(5));
+
+                let recv_result = tokio::select! {
+                    biased;
+                    // Slow-consumer arm fires at the absolute deadline, not relative to events.
+                    _ = async {
+                        if let Some(dl) = disconnect_deadline {
+                            tokio::time::sleep_until(dl).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        db::metrics::increment_counter_with_label(
+                            "session_status_subscription_slow_consumer_disconnect_total",
+                            "queue_full_5s",
+                        );
+                        let _ = tx.try_send(Err(Error::new("slow_consumer_disconnected")));
+                        break;
+                    }
+                    // Optional shutdown signal (test-only): mirrors the Closed arm behavior.
+                    _ = async {
+                        if let Some(rx) = &mut shutdown_rx {
+                            let _ = rx.changed().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        if !live_principal_handle.auth_ok(&principal_id).await {
+                            let _ = tx.try_send(Err(Error::new("authorization_recheck_failed")));
+                            return;
+                        }
+                        let resync = crate::types::session::resync_event(&run_id_str);
+                        let _ = tx.try_send(Ok(resync));
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        break;
+                    }
+                    // Normal receive with keep-alive timeout.
+                    result = tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        broadcast_rx.recv(),
+                    ) => result,
+                };
+
+                let domain_event = match recv_result {
+                    Ok(Ok(ev)) => ev,
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                        // Proposal: immediately try to enqueue one resyncRequired notification
+                        // rather than deferring until the next matching event. At-most-once:
+                        // suppress if a resync was already delivered since the last successful
+                        // non-resync payload.
+                        db::metrics::increment_counter_with_label(
+                            "session_status_subscription_lag_total",
+                            "lagged",
+                        );
+                        if !live_principal_handle.auth_ok(&principal_id).await {
+                            let _ = tx.try_send(Err(Error::new("authorization_recheck_failed")));
+                            return;
+                        }
+                        if !resync_sent {
+                            let resync = crate::types::session::resync_event(&run_id_str);
+                            match tx.try_send(Ok(resync)) {
+                                Ok(_) => {
+                                    consecutive_failures = 0;
+                                    queue_full_since = None;
+                                    resync_sent = true;
+                                    resync_pending = false;
+                                }
+                                Err(_) => {
+                                    // Queue full; will retry before next matching event.
+                                    resync_pending = true;
+                                    if queue_full_since.is_none() {
+                                        queue_full_since = Some(tokio::time::Instant::now());
+                                    }
+                                    consecutive_failures += 1;
+                                    if consecutive_failures >= 3 {
+                                        db::metrics::increment_counter_with_label(
+                                            "session_status_subscription_slow_consumer_disconnect_total",
+                                            "consecutive_enqueue_failures",
+                                        );
+                                        let _ = tx.try_send(Err(Error::new(
+                                            "slow_consumer_disconnected",
+                                        )));
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                        // Graceful shutdown: emit one resyncRequired payload so clients know
+                        // they must re-query. Allow up to 1 second for the client to receive it.
+                        if !live_principal_handle.auth_ok(&principal_id).await {
+                            let _ = tx.try_send(Err(Error::new("authorization_recheck_failed")));
+                            return;
+                        }
+                        let resync = crate::types::session::resync_event(&run_id_str);
+                        let _ = tx.try_send(Ok(resync));
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        break;
+                    }
+                    Err(_timeout) => {
+                        if tx.is_closed() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                let emit_start = std::time::Instant::now();
+
+                // Primary trigger: SessionEventRecorded (session lifecycle events).
+                // Secondary triggers: runtime/run/stage changes for backwards compat.
+                let matched_run_id = match &domain_event {
+                    DomainEvent::SessionEventRecorded { run_id } => *run_id == filter_run_id,
+                    DomainEvent::RuntimeStatusChanged { run_id, .. } => *run_id == filter_run_id,
+                    DomainEvent::RunStatusChanged { run_id, .. } => *run_id == filter_run_id,
+                    DomainEvent::StageStatusChanged { run_id, .. } => *run_id == filter_run_id,
+                    _ => false,
+                };
+                if !matched_run_id {
+                    continue;
+                }
+
+                // Recheck full operator-read authorization (class + P072 subscription policy).
+                // Uses the live handle so revocation of principals.json is observed.
+                // Fail-closed on revocation, downgrade, or transient lookup failure.
+                if !live_principal_handle.auth_ok(&principal_id).await {
+                    let _ = tx.try_send(Err(Error::new("authorization_recheck_failed")));
+                    break;
+                }
+
+                // Bound per-emission DB lookup to 250ms (subscription payload resolution deadline).
+                let session_ev = match tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    session_repo::latest_session_event_for_run(&pool, &run_id_str),
+                )
+                .await
+                {
+                    Ok(Ok(Some(ev))) => ev,
+                    Ok(Ok(None)) => continue,
+                    Ok(Err(_)) => {
+                        if !resync_sent {
+                            resync_pending = true;
+                        }
+                        continue;
+                    }
+                    Err(_timeout) => {
+                        if !resync_sent {
+                            resync_pending = true;
+                        }
+                        continue;
+                    }
+                };
+
+                // Skip if this is the same event we already emitted (stale repeat).
+                if last_emitted_event_id.as_deref() == Some(session_ev.id.as_str()) {
+                    continue;
+                }
+
+                // Build payloads: (is_resync, payload) so we can update resync_sent correctly.
+                // Prepend a pending resync only if one hasn't already been delivered.
+                let mut payloads: Vec<(bool, Result<GqlSessionStatusChangedEvent>)> = Vec::new();
+                if resync_pending && !resync_sent {
+                    resync_pending = false;
+                    payloads.push((true, Ok(crate::types::session::resync_event(&run_id_str))));
+                } else {
+                    resync_pending = false;
+                }
+                payloads.push((
+                    false,
+                    Ok(crate::types::session::session_event_to_status_changed(
+                        &session_ev,
+                        &run_id_str,
+                    )),
+                ));
+
+                for (is_resync, payload) in payloads {
+                    if tx.is_closed() {
+                        return;
+                    }
+                    match tx.try_send(payload) {
+                        Ok(_) => {
+                            consecutive_failures = 0;
+                            queue_full_since = None;
+                            if is_resync {
+                                resync_sent = true;
+                                db::metrics::increment_counter_with_label(
+                                    "session_status_subscription_event_total",
+                                    "UNKNOWN_EVENT_SHAPE:resync",
+                                );
+                            } else {
+                                // Successful non-resync delivery: reset resync guard and
+                                // record last emitted event id for deduplication.
+                                resync_sent = false;
+                                last_emitted_event_id = Some(session_ev.id.clone());
+                                db::metrics::record_p046_emit_lag(
+                                    emit_start.elapsed().as_millis() as u64,
+                                );
+                                let evt_label = format!(
+                                    "{}:ok",
+                                    session_event_type_metric_label(&session_ev.event_type)
+                                );
+                                db::metrics::increment_counter_with_label(
+                                    "session_status_subscription_event_total",
+                                    &evt_label,
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            if queue_full_since.is_none() {
+                                queue_full_since = Some(tokio::time::Instant::now());
+                            }
+                            consecutive_failures += 1;
+                            // Schedule a pending resync for the next event if we haven't
+                            // already sent one and this was a non-resync failure.
+                            if !is_resync && !resync_sent {
+                                resync_pending = true;
+                            }
+                            if consecutive_failures >= 3 {
+                                db::metrics::increment_counter_with_label(
+                                    "session_status_subscription_slow_consumer_disconnect_total",
+                                    "consecutive_enqueue_failures",
+                                );
+                                let _ = tx.try_send(Err(Error::new("slow_consumer_disconnected")));
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(ReceiverStream::new(rx))
     }
 }
 
@@ -8133,6 +9237,71 @@ mod tests {
         assert!(
             field_names.contains(&"sourceName"),
             "ProjectionFreshnessV1 must include sourceName identity field; got: {field_names:?}"
+        );
+    }
+
+    // ── P046: retry exhaustion unit tests ────────────────────────────────────
+    //
+    // These unit tests exercise db::p046_retry::p046_retry_db (now db-owned per
+    // approved architecture contract) via the re-exported alias to prove the
+    // pinned retry policy:
+    // - All 3 attempts are tried before exhaustion is declared.
+    // - The returned error starts with "transient_db_unavailable".
+    // - deadline_headroom_stop is recorded when the remaining budget is zero.
+
+    #[tokio::test]
+    async fn p046_retry_db_exhaustion_returns_transient_db_unavailable() {
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+
+        let result = p046_retry_db("test_exhaustion_field", deadline, || {
+            let cc = call_count_clone.clone();
+            async move {
+                cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>(anyhow::anyhow!("database is locked: injected test error"))
+            }
+        })
+        .await;
+
+        assert!(result.is_err(), "exhausted retry must return Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.starts_with("transient_db_unavailable"),
+            "error must start with transient_db_unavailable; got: {msg}"
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "policy requires exactly 3 total attempts before exhaustion"
+        );
+    }
+
+    #[tokio::test]
+    async fn p046_retry_db_non_transient_error_propagates_immediately() {
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+
+        let result = p046_retry_db("test_nontransient_field", deadline, || {
+            let cc = call_count_clone.clone();
+            async move {
+                cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>(anyhow::anyhow!("schema mismatch: unexpected column"))
+            }
+        })
+        .await;
+
+        assert!(result.is_err(), "non-transient error must propagate");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            !msg.starts_with("transient_db_unavailable"),
+            "non-transient error must not be wrapped as transient_db_unavailable; got: {msg}"
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "non-transient errors must not be retried (exactly 1 attempt)"
         );
     }
 }

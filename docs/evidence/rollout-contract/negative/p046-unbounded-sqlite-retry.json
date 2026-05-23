@@ -1,0 +1,15 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "unbounded_sqlite_retry",
+  "description": "P046 DB resolver retries more than 3 total attempts or exceeds 50ms/150ms backoff schedule, 250ms retry sleep budget, or 2s resolver deadline.",
+  "hold_condition": "Transient sqlite busy/timeout retry can exceed 3 total attempts, the 50ms/150ms backoff schedule, 250ms retry sleep budget, or the 2 second resolver deadline.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_sqlite_retry_exceeds_budget",
+  "fixture_input": {
+    "injected_busy_responses": 4,
+    "expected_max_attempts": 3,
+    "expected_max_sleep_ms": 250,
+    "expected_result": "deterministic_db_unavailable_or_transient_db_unavailable_after_exhaustion"
+  }
+}

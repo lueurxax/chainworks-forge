@@ -1,0 +1,85 @@
+{
+  "fixture_purpose": "P046 concrete evidence for rollout_contract_v1 readback declared by approved proposal. GraphQL read queries, subscription bridge, health/KPI, auth recheck on all emission paths, redaction, SDL snapshot, SwiftUI P046SessionObservabilityModel wired into RunsHomeView selected-run coordinator with onChange(of: selectedRunID). Retry policy moved to db crate (db::p046_retry). sessionObservabilityAvailable capability probe now requires operator-read authorization and is included in the disabled-schema classifier.",
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "parity_lanes": {
+    "graphql": {
+      "rolloutContractStatus": "ready_for_phase3",
+      "rolloutContractDecision": "pending_phase3_validation",
+      "rolloutContractFailureReasons": [],
+      "rolloutContractWaiverState": "none",
+      "rolloutContractWaiverExpiresAt": null,
+      "rolloutContractEnforcementMode": "active",
+      "rolloutContractEnforcementModeReason": "phase3_handoff_pending",
+      "rolloutContractHoldConditions": [],
+      "rolloutContractRollbackDisposition": {
+        "mode": "feature_flag_disable_graphql_session_observability_fields",
+        "dataLossRisk": "none"
+      },
+      "rolloutContractSourceLane": "graphql",
+      "rolloutContractEnabledState": "dogfood_only",
+      "rolloutContractDisabledReasonCode": null,
+      "rolloutContractActionId": "p046-refine-implementation-pass-2026-05-23",
+      "rolloutContractOperatorMessage": "P046 refine_implementation pass complete (2026-05-23): (1) Swift actor isolation fixed — build passes; (2) subscription auth uses P046LivePrincipalHandle (Arc<RwLock<PrincipalTable>>) + daemon periodic reload (30s interval) — revocation observed within ~30s without daemon restart; subscriptions fail-closed on auth_ok() returning false; (3) generation_without_lineage SQL fixed — run-scoped via agent_executions→stage_executions.run_id; positive test added and passes; (4) metrics gate search path includes db/src/ for db::p046_retry emitted metrics; gate passes; (5) per-field closed-vocabulary validation for providerKind, reuseDisposition, resetReason, endReason; charset + credential-prefix + all-hex rejection for unconstrained fields; (6) SQL LIMIT caps added to load_health_data_for_run (256 lineages, 64 events per fetch); (7) negative fixture gate strengthened — .graphql fixtures checked for keyword content; fail-closed source checks for resetSession and raw sensitive field exposure. All blockers resolved. Remaining phase3 handoff: dogfood validation (>=20 sessions, p95 emit-lag <500ms).",
+      "rolloutContractProjectionIntegrity": "complete",
+      "rolloutContractCutoverPolicyRevision": "p046-r8-refine-implementation-2026-05-23",
+      "rolloutContractNextSteps": [
+        "Dogfood validation: run at least 20 sessions with session data and confirm p95 emit-lag < 500ms and zero cross-run subscription emissions",
+        "Populate run_report lane readback fields after dogfood window completes"
+      ],
+      "p046_session_graphql_queries_status": "implemented",
+      "p046_subscription_source_status": "implemented_session_event_recorded",
+      "p046_subscription_auth_status": "implemented_live_handle_arc_rwlock_30s_periodic_reload_revocation_aware",
+      "p046_subscription_graceful_shutdown_status": "implemented_resync_drain",
+      "p046_redaction_status": "implemented_including_unknown_type_fail_closed_closed_vocab_4_fields",
+      "p046_health_thresholds_status": "implemented_generation_without_lineage_run_scoped_via_agent_executions_positive_test",
+      "p046_health_bounds_status": "implemented_sql_limit_256_lineages_64_events",
+      "p046_sqlite_retry_status": "implemented_db_crate_owned_p046_retry",
+      "p046_metrics_status": "implemented_all_12_required_gate_search_path_includes_db_crate",
+      "p046_sdl_naming_status": "implemented_unprefixed_per_contract",
+      "p046_session_end_reason_enum_status": "implemented",
+      "p046_swiftui_model_status": "implemented_rendered_overview_tab_with_lineages_health_kpi",
+      "p046_typed_details_status": "implemented_closed_vocab_4_fields_charset_credential_hex_checks",
+      "p046_swift_disabled_schema_tests_status": "implemented_Proposal046Tests",
+      "p046_swift_guardrail_tests_status": "implemented_no_reset_doc_no_swiftdata_no_mutation",
+      "p046_capability_probe_status": "implemented_sessionObservabilityAvailable_with_operator_read_auth",
+      "p046_rollout_fixtures_status": "negative_fixtures_present_non_empty_fail_closed_checks_for_graphql_fixtures",
+      "p046_gate_coverage_status": "all_four_lanes_validated",
+      "p046_disabled_schema_classifier_status": "fixed_includes_sessionObservabilityAvailable"
+    },
+    "run_report": {
+      "rolloutContractStatus": "waived",
+      "rolloutContractDecision": "waived",
+      "rolloutContractWaiverState": "operator_waived_pending_dogfood",
+      "rolloutContractWaiverExpiresAt": "2026-06-30",
+      "rolloutContractFailureReasons": [],
+      "rolloutContractHoldConditions": [],
+      "rolloutContractEnforcementMode": "waived",
+      "rolloutContractEnforcementModeReason": "run_report lane requires dogfood session data; waived until phase3 dogfood window completes",
+      "rolloutContractOperatorMessage": "P046 run_report readback will be populated after dogfood validation (>=20 sessions). No code hold condition; this lane is waived for the graphql gate.",
+      "rolloutContractNextSteps": [
+        "Populate run_report readback fields after dogfood window: rolloutContractStatus, rolloutContractDecision, operational metrics adoption rate"
+      ]
+    },
+    "mcp": {
+      "rolloutContractStatus": "not_applicable",
+      "rolloutContractDecision": "not_applicable",
+      "rolloutContractFailureReasons": [],
+      "rolloutContractHoldConditions": [],
+      "rolloutContractEnforcementMode": "not_applicable",
+      "rolloutContractEnforcementModeReason": "P046 does not add or modify MCP reset/control tools. MCP-only reset ownership is pre-existing and documented. This lane is not applicable for the P046 graphql read observability gate.",
+      "rolloutContractOperatorMessage": "P046 is GraphQL read-only. MCP session reset capability is pre-existing and unmodified by P046. No MCP lane action required."
+    },
+    "release_receipt": {
+      "rolloutContractStatus": "waived",
+      "rolloutContractDecision": "waived",
+      "rolloutContractWaiverState": "operator_waived_pending_release",
+      "rolloutContractWaiverExpiresAt": "2026-09-30",
+      "rolloutContractFailureReasons": [],
+      "rolloutContractHoldConditions": [],
+      "rolloutContractEnforcementMode": "waived",
+      "rolloutContractEnforcementModeReason": "release_receipt is a post-release artifact; waived until P046 enters release build",
+      "rolloutContractOperatorMessage": "P046 release receipt will be generated when CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY is enabled in a release build after dogfood success."
+    }
+  }
+}

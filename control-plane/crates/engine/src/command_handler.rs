@@ -3901,6 +3901,9 @@ impl CommandHandler {
                 self.work_queue
                     .publish_scheduler_notification(scheduler_refresh);
 
+                // Notify session subscribers that a session event was persisted.
+                let _ = self.events.send(DomainEvent::SessionEventRecorded { run_id: c.run_id });
+
                 if let Some(acp) = &self.acp {
                     for generation_id in generation_ids_to_close {
                         let _ = acp.close_session(&generation_id).await;

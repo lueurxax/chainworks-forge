@@ -1,0 +1,9 @@
+# P046 negative fixture: schema exposes raw sensitive generation fields.
+# Expected: gate fails with hold condition about raw providerSessionId/bindingFingerprint/invocationOwnerKey/absolute workingDirectory.
+# These raw fields are FORBIDDEN by P046; derived references must be used instead.
+type SessionGeneration {
+  providerSessionId: String
+  bindingFingerprint: String
+  invocationOwnerKey: String
+  workingDirectory: String
+}
