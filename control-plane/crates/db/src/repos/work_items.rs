@@ -1390,6 +1390,93 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
         )
         .await;
         if record_result.is_err() {
+            let stamped_replay = payload
+                .pointer("/p061_startup_recovery/startup_repair_id")
+                .and_then(|value| value.as_str())
+                == Some(repair_id.as_str())
+                && payload
+                    .pointer("/p061_startup_recovery/requeue_generation")
+                    .and_then(|value| value.as_i64())
+                    == Some(1)
+                && payload
+                    .pointer("/p061_startup_recovery/source_work_item_id")
+                    .and_then(|value| value.as_str())
+                    == Some(item_id.as_str());
+            if stamped_replay {
+                let existing_notes: Option<String> =
+                    sqlx::query_scalar("SELECT notes FROM startup_repairs WHERE id = ?1")
+                        .bind(&repair_id)
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .context("load startup repair notes for P082 crash replay")?;
+                if let Some(existing_notes) = existing_notes {
+                    if let Ok(mut notes_json) =
+                        serde_json::from_str::<serde_json::Value>(&existing_notes)
+                    {
+                        if let Some(summary) = notes_json
+                            .get_mut("p082_recovery_matrix_readback")
+                            .and_then(|rb| rb.get_mut("recovery_startup_repair_summary"))
+                            .and_then(|summary| summary.as_object_mut())
+                        {
+                            summary.insert("replayed".to_string(), serde_json::Value::Bool(true));
+                            summary.insert(
+                                "next_retry_or_backoff_time".to_string(),
+                                serde_json::Value::String(scheduled_at_rfc3339.clone()),
+                            );
+                            let _ = sqlx::query(
+                                "UPDATE startup_repairs SET notes = ?1 WHERE id = ?2",
+                            )
+                            .bind(notes_json.to_string())
+                            .bind(&repair_id)
+                            .execute(&mut **tx)
+                            .await;
+                        }
+                    }
+                }
+                if let Some(object) = payload.as_object_mut() {
+                    object.remove("p058_claimed");
+                    object.insert(
+                        "p061_startup_recovery".to_string(),
+                        serde_json::json!({
+                            "requeued_at": scheduled_at_rfc3339.clone(),
+                            "reason": reason,
+                            "startup_repair_id": repair_id,
+                            "source_command_journal_id": source_command_journal_id,
+                            "source_work_item_id": item_id,
+                            "requeue_generation": 1,
+                            "max_requeue_generation": 1,
+                            "replayed": true,
+                        }),
+                    );
+                }
+                let updated = sqlx::query(
+                    r#"UPDATE work_items
+                       SET status = ?1,
+                           payload_json = ?2,
+                           started_at = NULL,
+                           completed_at = NULL,
+                           failed_at = NULL,
+                           last_error = ?3
+                       WHERE id = ?4 AND status = ?5"#,
+                )
+                .bind(&pending)
+                .bind(serde_json::to_string(&payload)?)
+                .bind(reason)
+                .bind(&item_id)
+                .bind(&running)
+                .execute(&mut **tx)
+                .await
+                .context("replay startup requeue for InvokeAgent work item")?
+                .rows_affected();
+                if updated > 0 {
+                    crate::metrics::increment_counter_with_label(
+                        "p082_recovery_idempotency_replay_total",
+                        "P082-R15:repair_crash_resume_idempotent",
+                    );
+                    requeued += updated;
+                }
+                continue;
+            }
             // P082-R16: idempotency key already exists — generation 1 was already consumed.
             // Do NOT write a second startup_repairs row (one-idempotency-row invariant).
             // UPDATE startup_repairs.notes with the R16 readback so Source 1 of the

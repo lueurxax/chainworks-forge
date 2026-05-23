@@ -1431,8 +1431,8 @@ async fn p082_r06_stale_scheduler_owner_accessor_derives_held_readback() {
     assert_eq!(
         row.get("recovery_reason_code")
             .and_then(|value| value.as_str()),
-        Some(recovery_matrix::REASON_STALE_REPAIRED),
-        "P082-R06: reason code must match stale scheduler repair vocabulary"
+        Some(recovery_matrix::REASON_NEEDS_EFFECT_RECONCILIATION),
+        "P082-R06: held stale scheduler ownership must use needs_effect_reconciliation until an explicit transition repairs it"
     );
     assert_eq!(
         row.get("scenario_status").and_then(|value| value.as_str()),
@@ -3168,14 +3168,15 @@ async fn p082_r01_startup_requeue_integration_creates_idempotency_row() {
     );
 }
 
-// ── P082-R01/R16: Integration: second startup requeue triggers R16 held state ─
+// ── P082-R01/R15/R16: Integration startup replay and exhaustion ──────────────
 
 /// Integration test: calls the production `requeue_running_invoke_agent_on_startup`
-/// twice for the same work item (simulating crash-after-first-requeue then restart).
-/// Second call must produce the R16 held state (startup_requeue_exhausted) instead
-/// of creating duplicate work.
+/// twice for the same work item after the first pass already stamped
+/// `p061_startup_recovery` into the payload. This is the crash-replay case: the
+/// same generation may be requeued idempotently and must not be misclassified as
+/// startup_requeue_exhausted.
 #[tokio::test]
-async fn p082_r16_startup_requeue_exhausted_second_call_holds_without_duplicating_work() {
+async fn p082_r01_startup_requeue_crash_replay_requeues_same_generation() {
     let pool = setup_db().await;
     let now = Utc::now();
     let run_id = RunId::new();
@@ -3223,7 +3224,9 @@ async fn p082_r16_startup_requeue_exhausted_second_call_holds_without_duplicatin
     .expect("first requeue must not fail");
     assert_eq!(first_requeued, 1, "P082-R01: first requeue must process one item");
 
-    // Re-insert the work item as running (simulating crash before completion).
+    // Re-insert the work item as running while preserving the stamped
+    // p061_startup_recovery payload (simulating crash after payload write and
+    // before the replayed work completes).
     sqlx::query(
         "UPDATE work_items SET status = 'running', started_at = ?1, completed_at = NULL, failed_at = NULL WHERE id = ?2",
     )
@@ -3233,7 +3236,8 @@ async fn p082_r16_startup_requeue_exhausted_second_call_holds_without_duplicatin
     .await
     .expect("reset work item to running for second requeue attempt");
 
-    // Second requeue: should trigger R16 held state (startup_requeue_exhausted).
+    // Second requeue is a crash replay of the same generation. It must requeue
+    // idempotently instead of overwriting R01 with R16.
     let second_requeued = work_items::requeue_running_invoke_agent_on_startup(
         &pool,
         now,
@@ -3241,7 +3245,20 @@ async fn p082_r16_startup_requeue_exhausted_second_call_holds_without_duplicatin
     )
     .await
     .expect("second requeue must not fail");
-    assert_eq!(second_requeued, 0, "P082-R16: second requeue must not create new work (held)");
+    assert_eq!(
+        second_requeued, 1,
+        "P082-R01/R15: crash replay of the same stamped generation must requeue idempotently"
+    );
+
+    let work_status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = ?1")
+        .bind(&work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch work item status");
+    assert_eq!(
+        work_status, "pending",
+        "P082-R01/R15: replayed startup repair should return the work item to pending"
+    );
 
     // Verify only one startup_repairs row exists (idempotency invariant).
     let repair_count: i64 = sqlx::query_scalar(
@@ -3251,24 +3268,113 @@ async fn p082_r16_startup_requeue_exhausted_second_call_holds_without_duplicatin
     .fetch_one(&pool)
     .await
     .expect("count startup_repairs");
-    assert_eq!(repair_count, 1, "P082-R16: exactly one startup_repairs row must exist (no duplicate)");
+    assert_eq!(repair_count, 1, "P082-R01/R15: exactly one startup_repairs row must exist (no duplicate)");
 
-    // Verify the readback accessor surfaces the R16 held row.
+    // Verify the readback accessor still surfaces the R01 repaired row, not R16.
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run must not fail");
+    let r01_row = readbacks
+        .iter()
+        .find(|row| row.get("recovery_reason_code").and_then(|v| v.as_str()) == Some(recovery_matrix::REASON_STARTUP_REQUEUE_ONCE))
+        .expect("P082-R01/R15: accessor must keep returning startup_requeue_once for replay");
+    assert_eq!(
+        r01_row.get("scenario_status").and_then(|v| v.as_str()),
+        Some("repaired"),
+        "P082-R01/R15: scenario_status must remain repaired for replay"
+    );
+    assert!(
+        !readbacks.iter().any(|row| row.get("recovery_reason_code").and_then(|v| v.as_str()) == Some(recovery_matrix::REASON_STARTUP_REQUEUE_EXHAUSTED)),
+        "P082-R01/R15: crash replay must not emit startup_requeue_exhausted"
+    );
+}
+
+/// A duplicate startup repair key without the stamped p061_startup_recovery
+/// payload is not a crash replay. That is the actual R16 exhausted-generation
+/// case and must hold without enqueuing duplicate work.
+#[tokio::test]
+async fn p082_r16_startup_requeue_exhausted_non_replay_holds_without_duplicating_work() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    let journal_id = format!("cj-r16-non-replay-{run_id_str}");
+
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+    command_journal::record(
+        &pool,
+        &journal_id,
+        "InvokeAgent",
+        &serde_json::json!({"run_id": run_id_str}).to_string(),
+        Some(&run_id_str),
+        now,
+        Some("engine"),
+        None,
+        Some("operator"),
+        Some("engine.invoke"),
+        None,
+    )
+    .await
+    .expect("record command journal");
+
+    let work_item_id = format!("wi-r16-non-replay-{run_id_str}");
+    let repair_id = format!("p082-requeue:{journal_id}:{work_item_id}:1");
+    startup_repairs::record(
+        &pool,
+        &repair_id,
+        &run_id_str,
+        "p082_requeue_once",
+        now,
+        Some(r#"{"preexisting":true}"#),
+    )
+    .await
+    .expect("seed preexisting startup repair");
+
+    sqlx::query(
+        r#"INSERT INTO work_items (id, run_id, kind, payload_json, status, created_at, scheduled_at, attempt_count)
+           VALUES (?1, ?2, 'invoke_agent', ?3, 'running', ?4, ?4, 1)"#,
+    )
+    .bind(&work_item_id)
+    .bind(&run_id_str)
+    .bind(serde_json::json!({"run_id": run_id_str, "journal_id": journal_id}).to_string())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert non-replay running InvokeAgent work item");
+
+    let requeued = work_items::requeue_running_invoke_agent_on_startup(
+        &pool,
+        now,
+        "startup_requeue_non_replay_duplicate",
+    )
+    .await
+    .expect("non-replay duplicate must not fail");
+    assert_eq!(
+        requeued, 0,
+        "P082-R16: duplicate key without stamped replay payload must not create new work"
+    );
+
+    let work_status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = ?1")
+        .bind(&work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch exhausted work item status");
+    assert_eq!(
+        work_status, "failed",
+        "P082-R16: exhausted non-replay work item must be terminalized"
+    );
+
     let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
         .await
         .expect("readbacks_for_run must not fail");
     let r16_row = readbacks
         .iter()
         .find(|row| row.get("recovery_reason_code").and_then(|v| v.as_str()) == Some(recovery_matrix::REASON_STARTUP_REQUEUE_EXHAUSTED))
-        .expect("P082-R16: accessor must return a startup_requeue_exhausted row");
+        .expect("P082-R16: accessor must return startup_requeue_exhausted for non-replay duplicate");
     assert_eq!(
         r16_row.get("scenario_status").and_then(|v| v.as_str()),
         Some("held"),
         "P082-R16: scenario_status must be held"
-    );
-    assert!(
-        r16_row.get("recovery_operator_message").map_or(false, |v| !v.is_null()),
-        "P082-R16: recovery_operator_message must be non-null for held state"
     );
 }
 
@@ -3333,8 +3439,11 @@ async fn p082_r16_metric_emitted_on_startup_requeue_exhausted() {
         "P082-R01: p082_recovery_idempotency_replay_total must be incremented on first requeue"
     );
 
-    // Reset to running for the second call.
-    sqlx::query("UPDATE work_items SET status = 'running' WHERE id = ?1")
+    // Reset to running without the stamped p061_startup_recovery marker. This
+    // is the non-replay duplicate-key case that must hold as R16; preserving the
+    // marker would be a valid crash replay and would emit R15 instead.
+    sqlx::query("UPDATE work_items SET status = 'running', payload_json = ?1 WHERE id = ?2")
+        .bind(serde_json::json!({"run_id": run_id_str, "journal_id": journal_id}).to_string())
         .bind(&work_item_id)
         .execute(&pool)
         .await
@@ -3356,5 +3465,81 @@ async fn p082_r16_metric_emitted_on_startup_requeue_exhausted() {
     assert_eq!(
         after_r16 - before_r16, 1,
         "P082-R16: p082_recovery_idempotency_replay_total must be incremented on exhausted requeue"
+    );
+}
+
+#[tokio::test]
+async fn p082_required_matrix_metrics_are_emitted_from_readback_accessor() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+
+    let readback = recovery_matrix::build_readback_v1(
+        "P082-R02",
+        "rejected",
+        "no_mutation",
+        recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
+        "Rejected before mutation.",
+        "command_journal",
+        "command_journal",
+        "p082-metric-journal",
+        Some("command_journal.error.p082_recovery_matrix_readback"),
+        "valid",
+        &now.to_rfc3339(),
+    );
+    let envelope = recovery_matrix::build_rejected_command_error_envelope(
+        recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
+        "RetryStage",
+        "Rejected before mutation.",
+        readback,
+    );
+    command_journal::record(
+        &pool,
+        "p082-metric-journal",
+        "RetryStage",
+        r#"{"run_id":"metric-run"}"#,
+        Some(&run_id_str),
+        now,
+        Some("mcp"),
+        Some("operator"),
+        Some("operator"),
+        Some("runs.retry"),
+        None,
+    )
+    .await
+    .expect("record metric journal");
+    command_journal::fail_entry(&pool, "p082-metric-journal", now, &envelope)
+        .await
+        .expect("fail metric journal");
+
+    let before_gate = db::metrics::get_counter_with_label(
+        "p082_recovery_matrix_gate_result_total",
+        "readbacks_for_run:passed",
+    );
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run");
+    assert_eq!(readbacks.len(), 1);
+    assert!(
+        db::metrics::get_gauge(
+            "p082_recovery_matrix_rows_with_db_engine_readback_coverage_percent"
+        )
+        .unwrap_or(0)
+            > 0,
+        "P082: coverage percent gauge must be emitted when readbacks are built"
+    );
+    assert!(
+        db::metrics::get_p082_recovery_state_age_seconds_latest().is_some(),
+        "P082: state age seconds metric must be emitted when readbacks are built"
+    );
+    let after_gate = db::metrics::get_counter_with_label(
+        "p082_recovery_matrix_gate_result_total",
+        "readbacks_for_run:passed",
+    );
+    assert!(
+        after_gate > before_gate,
+        "P082: gate result counter must be emitted for readback construction"
     );
 }

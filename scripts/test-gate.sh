@@ -10762,7 +10762,83 @@ for path in [
     if path.exists() and "known proof gap" in path.read_text().lower():
         fail(f"{path.relative_to(root)} still contains known proof gap language")
 
-print("P082 positive fixture, lane contract, nested subcontracts, and negative fixtures verified")
+# 15. Verify P082 required metric names are declared in metrics.rs (fail-closed condition).
+metrics_rs = root / "control-plane/crates/db/src/metrics.rs"
+if not metrics_rs.exists():
+    print("FAILED: control-plane/crates/db/src/metrics.rs is missing")
+    sys.exit(1)
+metrics_content = metrics_rs.read_text()
+p082_required_metrics = [
+    "p082_recovery_matrix_rows_with_db_engine_readback_coverage_percent",
+    "p082_recovery_matrix_gate_result_total",
+    "p082_recovery_reason_readback_total",
+    "p082_recovery_mutation_rejected_total",
+    "p082_release_side_effect_retry_block_total",
+    "p082_late_output_quarantine_total",
+    "p082_recovery_idempotency_replay_total",
+    "p082_recovery_state_age_seconds",
+]
+for metric in p082_required_metrics:
+    if metric not in metrics_content:
+        print(f"FAILED: P082 required metric not declared in metrics.rs: {metric}")
+        sys.exit(1)
+if "P082_REQUIRED_METRICS" not in metrics_content:
+    print("FAILED: metrics.rs missing P082_REQUIRED_METRICS constant declaration")
+    sys.exit(1)
+p082_rm_rs = root / "control-plane/crates/db/src/repos/p082_recovery_matrix.rs"
+p082_rm_content = p082_rm_rs.read_text() if p082_rm_rs.exists() else ""
+for required_emitter in [
+    "record_p082_recovery_matrix_coverage_percent",
+    "record_p082_recovery_matrix_gate_result",
+    "record_p082_recovery_state_age_seconds",
+]:
+    if required_emitter not in metrics_content:
+        print(f"FAILED: metrics.rs missing P082 metric emitter: {required_emitter}")
+        sys.exit(1)
+if "record_p082_recovery_matrix_coverage_percent" not in p082_rm_content:
+    print("FAILED: p082_recovery_matrix.rs must emit coverage percent from readbacks_for_run")
+    sys.exit(1)
+if "record_p082_recovery_state_age_seconds" not in p082_rm_content:
+    print("FAILED: p082_recovery_matrix.rs must emit recovery state age seconds")
+    sys.exit(1)
+if "record_p082_recovery_matrix_gate_result" not in p082_rm_content:
+    print("FAILED: p082_recovery_matrix.rs must emit gate/result counter for readback construction")
+    sys.exit(1)
+if '"run_report"' not in reports_content or '"p082_recovery_matrix_readbacks".to_string()' not in reports_content:
+    print("FAILED: reports.rs must wire p082_recovery_matrix_readbacks into generated run_report artifact lane")
+    sys.exit(1)
+
+for required_test in [
+    "p082_r01_startup_requeue_crash_replay_requeues_same_generation",
+    "p082_r16_startup_requeue_exhausted_non_replay_holds_without_duplicating_work",
+    "p082_required_matrix_metrics_are_emitted_from_readback_accessor",
+]:
+    if required_test not in db_test_content:
+        print(f"FAILED: DB test file missing P082 production proof test: {required_test}")
+        sys.exit(1)
+for required_test in [
+    "p082_reports_get_run_report_artifact_includes_plural_readbacks",
+]:
+    mcp_test_file = root / "control-plane/crates/mcp-server/tests/proposal_082_recovery_readback.rs"
+    mcp_test_content = mcp_test_file.read_text() if mcp_test_file.exists() else ""
+    if required_test not in mcp_test_content:
+        print(f"FAILED: MCP test file missing P082 run_report lane proof: {required_test}")
+        sys.exit(1)
+
+# 16. Verify R16 approved storage owner: readback must be in startup_repairs.notes,
+# not in work_items.payload_json.p082_r16_held.
+work_items_rs = root / "control-plane/crates/db/src/repos/work_items.rs"
+if work_items_rs.exists():
+    wi_content = work_items_rs.read_text()
+    if "p082_r16_held" in wi_content:
+        print("FAILED: work_items.rs must not store R16 readback in payload_json.p082_r16_held (approved owner is startup_repairs.notes.p082_recovery_matrix_readback)")
+        sys.exit(1)
+if p082_rm_rs.exists():
+    if "p082_r16_held" in p082_rm_content:
+        print("FAILED: p082_recovery_matrix.rs must not read R16 readback from work_items.payload_json.p082_r16_held (approved owner is startup_repairs.notes.p082_recovery_matrix_readback)")
+        sys.exit(1)
+
+print("P082 gate: all static checks passed")
 PY
     (
       cd "$ROOT_DIR/control-plane"
