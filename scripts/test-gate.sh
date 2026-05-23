@@ -6709,6 +6709,14 @@ PY
       printf 'proposal-076: missing auto-retry rollup tooling\n' >&2
       exit 1
     fi
+    if [[ ! -x "$ROOT_DIR/scripts/chainworks/auto_retry_observe.py" ]]; then
+      printf 'proposal-076: missing observe-only auto-retry poll writer\n' >&2
+      exit 1
+    fi
+    if rg -q "stages_retry|stages\\.retry|runs_retry|tools/call|stages\\.approve|approvals\\.approve" "$ROOT_DIR/scripts/chainworks/auto_retry_observe.py"; then
+      printf 'proposal-076: observe-only poll writer must not contain retry/recovery/approval dispatch hooks\n' >&2
+      exit 1
+    fi
     tmp_p076="$(mktemp -d "${TMPDIR:-/tmp}/p076-rollup.XXXXXX")"
     mkdir -p "$tmp_p076/automation"
     printf '%s\n' '{"schema_version":"auto-retry-observation.v1","observation_id":"ar_obs_20260523T100000Z_a1b2c3d4e5f6","observed_at":"2026-05-23T10:00:00Z","blocked_runs":[{"run_id":"run-a","stage_id":"state_9","blocker_signature_id":"sig-p076","blocker_class":"substantive_output_contract","policy_decision":"observe_only","retry_action":"none","retry_result":"not_attempted","failure_summary":"missing output","next_systemic_action":"inspect contract"}]}' '{"schema_version":"auto-retry-observation.v1","observation_id":"ar_obs_20260523T100100Z_b1b2c3d4e5f6","observed_at":"2026-05-23T10:01:00Z","blocked_runs":[{"run_id":"run-b","stage_id":"state_9","blocker_signature_id":"sig-p076","blocker_class":"substantive_output_contract","policy_decision":"observe_only","retry_action":"none","retry_result":"not_attempted","failure_summary":"missing output","next_systemic_action":"inspect contract"}]}' > "$tmp_p076/automation/auto-retry-observations.jsonl"
@@ -6721,6 +6729,72 @@ if payload.get("schema_version") != "auto-retry-rollup.v1":
 issues = payload.get("issues") or []
 if len(issues) != 1 or issues[0].get("observation_count") != 2:
     raise SystemExit("proposal-076: rollup script did not dedupe repeated blocker_signature_id")
+PY
+    tmp_p076_observe="$(mktemp -d "${TMPDIR:-/tmp}/p076-observe.XXXXXX")"
+    cat > "$tmp_p076_observe/blocked-runs.json" <<'JSON'
+[
+  {
+    "run_id": "run-p076-writer-001",
+    "stage_id": "state_9_implementation_reviewed",
+    "blocker_class": "substantive_output_contract",
+    "blocker_signature_id": "sig-p076-writer",
+    "failure_class": "missing_required_output",
+    "failure_summary": "required output missing",
+    "safe_retry": true,
+    "retry_action": "recommend_retry",
+    "retry_result": "not_attempted",
+    "policy_decision": "observe_only",
+    "next_systemic_action": "inspect contract"
+  },
+  {
+    "run_id": "run-p076-human-gate-001",
+    "stage_id": "state_5_approval",
+    "blocker_class": "human_gate",
+    "blocker_signature_id": "sig-p076-human-gate",
+    "status_before": "waiting_approval",
+    "safe_retry": false,
+    "retry_action": "none",
+    "retry_result": "not_allowed",
+    "policy_decision": "human_gate",
+    "next_systemic_action": "wait for human approval"
+  }
+]
+JSON
+    CHAINWORKS_META_ROOT="$tmp_p076_observe" python3 "$ROOT_DIR/scripts/chainworks/auto_retry_observe.py" --blocked-runs-json "$tmp_p076_observe/blocked-runs.json" >/dev/null
+    python3 - "$tmp_p076_observe" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+ledger = root / "automation/auto-retry-observations.jsonl"
+budget = root / "automation/auto-retry-budget.json"
+catalog = root / "automation/auto-retry-known-issues.json"
+markdown = root / "automation/auto-retry-known-issues.md"
+rollup = root / "automation/auto-retry-rollup.json"
+for path in [ledger, budget, catalog, markdown, rollup]:
+    if not path.exists():
+        raise SystemExit(f"proposal-076: observe writer did not create {path.name}")
+raw = ledger.read_bytes()
+if not raw.endswith(b"\n"):
+    raise SystemExit("proposal-076: observe writer did not append newline-terminated JSONL")
+records = [json.loads(line) for line in ledger.read_text().splitlines() if line.strip()]
+if len(records) != 1:
+    raise SystemExit("proposal-076: observe writer must append exactly one observation per poll")
+record = records[0]
+if record.get("schema_version") != "auto-retry-observation.v1":
+    raise SystemExit("proposal-076: observe writer emitted wrong observation schema")
+if not str(record.get("canonical_record_hash", "")).startswith("sha256:"):
+    raise SystemExit("proposal-076: observe writer omitted canonical_record_hash")
+for row in record.get("blocked_runs", []):
+    if row.get("retry_result") not in {"not_attempted", "not_allowed"}:
+        raise SystemExit("proposal-076: observe writer recorded side-effect retry result")
+    if row.get("blocker_class") == "human_gate" and row.get("retry_action") != "none":
+        raise SystemExit("proposal-076: observe writer retried human gate")
+if json.loads(budget.read_text()).get("schema_version") != "auto-retry-budget.v1":
+    raise SystemExit("proposal-076: observe writer emitted wrong budget schema")
+if json.loads(catalog.read_text()).get("schema_version") != "auto-retry-known-issues.v1":
+    raise SystemExit("proposal-076: observe writer emitted wrong catalog schema")
+if json.loads(rollup.read_text()).get("issue_count") != 2:
+    raise SystemExit("proposal-076: observe writer rollup did not include both signatures")
 PY
     (
       cd "$ROOT_DIR/control-plane"

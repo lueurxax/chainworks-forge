@@ -21,6 +21,8 @@ The JSON catalog is canonical. Markdown is generated from JSON only and must not
 
 Each completed poll appends one `auto-retry-observation.v1` JSON object to the ledger. Readers tolerate one partial trailing line and emit a `partial_trailing_record` diagnostic. Any earlier parse failure produces degraded readback instead of fabricated state.
 
+`scripts/chainworks/auto_retry_observe.py` is the P076 observe-only writer. It accepts a normalized blocked-run input snapshot, acquires `.chainworks/automation/auto-retry.lock`, validates that every row remains side-effect free, appends exactly one newline-terminated JSONL observation, fsyncs the ledger, ensures the budget-state file exists, and refreshes the JSON catalog, markdown view, and rollup report. The writer intentionally contains no retry, recovery, approval, archive, cancellation, continuation, or provider dispatch hook.
+
 P076-created observations remain observe-only:
 
 - `retry_action` is `none` or `recommend_retry`
@@ -61,6 +63,7 @@ Rows are grouped by `blocker_signature_id`, preserving first/last seen time, occ
 
 - normative fixture and negative-fixture schema coverage
 - observe-only retry invariants
+- observe-only writer append behavior, newline termination, budget/catalog/rollup refresh, and human-gate no-retry behavior
 - `automation.auto_retry.latest` source and focused Rust test
 - rollup dedupe behavior against a real temporary JSONL ledger
 - top-level readback path echo and degraded/no-history semantics
