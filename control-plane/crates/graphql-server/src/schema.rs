@@ -33,7 +33,7 @@ use crate::types::scheduler::{GqlStartupRecoverySummary, GqlToolchainCacheHousek
 use crate::types::session::{
     transient_db_unavailable_health, GqlSessionEventConnection, GqlSessionGenerationConnection,
     GqlSessionHealthReport, GqlSessionKpiSummary, GqlSessionLineage, GqlSessionLineageConnection,
-    GqlSessionStatusChangedEvent, P046Config, P046LivePrincipalHandle,
+    GqlSessionStatusChangedEvent, P046Config, P046LiveCredential, P046LivePrincipalHandle,
     SESSION_EVENTS_MAX_FIRST, SESSION_GENERATIONS_MAX_FIRST, SESSION_LINEAGES_MAX_FIRST,
 };
 use crate::types::stage::{GqlAgentExecution, GqlStageExecution};
@@ -146,7 +146,14 @@ fn build_schema_inner_with_p046(
 ) -> AppSchema {
     let live_handle = P046LivePrincipalHandle::new(principal_table.clone());
     build_schema_inner_with_p046_and_handle(
-        pool, cmd_handler, events, principal_table, reporter, storage_writer_heartbeat, p046, live_handle,
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        storage_writer_heartbeat,
+        p046,
+        live_handle,
     )
 }
 
@@ -197,7 +204,10 @@ pub fn build_schema_with_session_observability(
         principal_table,
         reporter,
         None,
-        P046Config { enabled: true, subscription_channel_capacity: 64 },
+        P046Config {
+            enabled: true,
+            subscription_channel_capacity: 64,
+        },
     )
 }
 
@@ -218,7 +228,10 @@ pub fn build_schema_with_session_observability_and_live_handle(
         principal_table,
         reporter,
         None,
-        P046Config { enabled: true, subscription_channel_capacity: 64 },
+        P046Config {
+            enabled: true,
+            subscription_channel_capacity: 64,
+        },
         live_handle.clone(),
     );
     (schema, live_handle)
@@ -234,7 +247,15 @@ pub fn build_schema_with_p046_config(
     reporter: LifecycleReporter,
     p046: P046Config,
 ) -> AppSchema {
-    build_schema_inner_with_p046(pool, cmd_handler, events, principal_table, reporter, None, p046)
+    build_schema_inner_with_p046(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        None,
+        p046,
+    )
 }
 
 pub struct QueryRoot;
@@ -315,8 +336,9 @@ async fn p046_check_run_accessible(
     }
     // Return a sanitized parse error (not "not found") so input validation failures
     // are distinguishable from authorization outcomes and do not disclose row existence.
-    let parsed: domain::ids::RunId =
-        run_id_str.parse().map_err(|_| Error::new("invalid_argument"))?;
+    let parsed: domain::ids::RunId = run_id_str
+        .parse()
+        .map_err(|_| Error::new("invalid_argument"))?;
     let pool_ref = pool.clone();
     match p046_retry_db("session_run_access", deadline, || {
         let pool_inner = pool_ref.clone();
@@ -340,7 +362,6 @@ async fn p046_check_run_accessible(
         }
     }
 }
-
 
 async fn run_from_projection_or_canonical(
     pool: &SqlitePool,
@@ -1014,7 +1035,10 @@ impl QueryRoot {
             }
         })
         .await
-        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+        .map_err(|e| {
+            warn!("p046 db error: {e:#}");
+            Error::new("db_unavailable")
+        })?;
         // Load per-lineage stats (generation_count, latest_event_at, active_generation_status)
         // scoped to the returned page's lineage IDs only — this bounds the DB work to the
         // current page rather than scanning all lineages in the run.
@@ -1036,8 +1060,14 @@ impl QueryRoot {
             "session_graphql_query_total",
             "sessionLineages:ok",
         );
-        db::metrics::record_p046_query_duration("sessionLineages", resolver_start.elapsed().as_millis() as u64);
-        Ok(GqlSessionLineageConnection::from_page_with_stats(page, stats.as_ref()))
+        db::metrics::record_p046_query_duration(
+            "sessionLineages",
+            resolver_start.elapsed().as_millis() as u64,
+        );
+        Ok(GqlSessionLineageConnection::from_page_with_stats(
+            page,
+            stats.as_ref(),
+        ))
     }
 
     #[graphql(visible = "crate::types::session::p046_visible")]
@@ -1066,7 +1096,10 @@ impl QueryRoot {
             async move { session_repo::find_lineage_owner_run(&pool, &id_str).await }
         })
         .await
-        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+        .map_err(|e| {
+            warn!("p046 db error: {e:#}");
+            Error::new("db_unavailable")
+        })?;
         let owner_run_id_str = match owner {
             None => return Ok(None),
             Some(r) => r,
@@ -1082,8 +1115,10 @@ impl QueryRoot {
             async move { session_repo::find_lineage_by_id(&pool, &id_str).await }
         })
         .await
-        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?
-        {
+        .map_err(|e| {
+            warn!("p046 db error: {e:#}");
+            Error::new("db_unavailable")
+        })? {
             None => return Ok(None),
             Some(l) => l,
         };
@@ -1128,7 +1163,10 @@ impl QueryRoot {
             "session_graphql_query_total",
             "sessionLineage:ok",
         );
-        db::metrics::record_p046_query_duration("sessionLineage", resolver_start.elapsed().as_millis() as u64);
+        db::metrics::record_p046_query_duration(
+            "sessionLineage",
+            resolver_start.elapsed().as_millis() as u64,
+        );
         Ok(Some(gql))
     }
 
@@ -1176,8 +1214,10 @@ impl QueryRoot {
             async move { session_repo::find_lineage_owner_run(&pool, &lineage_id_str).await }
         })
         .await
-        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?
-        {
+        .map_err(|e| {
+            warn!("p046 db error: {e:#}");
+            Error::new("db_unavailable")
+        })? {
             Some(r) => r,
             None => {
                 return Ok(GqlSessionGenerationConnection::from_page(
@@ -1221,12 +1261,18 @@ impl QueryRoot {
             }
         })
         .await
-        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+        .map_err(|e| {
+            warn!("p046 db error: {e:#}");
+            Error::new("db_unavailable")
+        })?;
         db::metrics::increment_counter_with_label(
             "session_graphql_query_total",
             "sessionGenerations:ok",
         );
-        db::metrics::record_p046_query_duration("sessionGenerations", resolver_start.elapsed().as_millis() as u64);
+        db::metrics::record_p046_query_duration(
+            "sessionGenerations",
+            resolver_start.elapsed().as_millis() as u64,
+        );
         Ok(GqlSessionGenerationConnection::from_page(page, &run_id))
     }
 
@@ -1278,7 +1324,10 @@ impl QueryRoot {
             async move { session_repo::find_lineage_owner_run(&pool, &lineage_id_str).await }
         })
         .await
-        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+        .map_err(|e| {
+            warn!("p046 db error: {e:#}");
+            Error::new("db_unavailable")
+        })?;
         let empty_page = || db::repos::sessions::SessionEventPage {
             items: vec![],
             has_next_page: false,
@@ -1318,7 +1367,10 @@ impl QueryRoot {
                 }
             })
             .await
-            .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+            .map_err(|e| {
+                warn!("p046 db error: {e:#}");
+                Error::new("db_unavailable")
+            })?;
 
             if !gen_belongs {
                 return Ok(GqlSessionEventConnection::from_page(empty_page()));
@@ -1342,12 +1394,18 @@ impl QueryRoot {
             }
         })
         .await
-        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+        .map_err(|e| {
+            warn!("p046 db error: {e:#}");
+            Error::new("db_unavailable")
+        })?;
         db::metrics::increment_counter_with_label(
             "session_graphql_query_total",
             "sessionEvents:ok",
         );
-        db::metrics::record_p046_query_duration("sessionEvents", resolver_start.elapsed().as_millis() as u64);
+        db::metrics::record_p046_query_duration(
+            "sessionEvents",
+            resolver_start.elapsed().as_millis() as u64,
+        );
         Ok(GqlSessionEventConnection::from_page(page))
     }
 
@@ -1381,12 +1439,18 @@ impl QueryRoot {
             async move { session_repo::aggregate_kpis_for_run(&pool, &run_id_str).await }
         })
         .await
-        .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
+        .map_err(|e| {
+            warn!("p046 db error: {e:#}");
+            Error::new("db_unavailable")
+        })?;
         db::metrics::increment_counter_with_label(
             "session_graphql_query_total",
             "sessionKpiSummary:ok",
         );
-        db::metrics::record_p046_query_duration("sessionKpiSummary", resolver_start.elapsed().as_millis() as u64);
+        db::metrics::record_p046_query_duration(
+            "sessionKpiSummary",
+            resolver_start.elapsed().as_millis() as u64,
+        );
         Ok(GqlSessionKpiSummary {
             run_id: run_id_str,
             lineage_count: kpi.lineage_count,
@@ -1464,7 +1528,10 @@ impl QueryRoot {
                     "session_graphql_query_total",
                     "sessionHealth:ok",
                 );
-                db::metrics::record_p046_query_duration("sessionHealth", resolver_start.elapsed().as_millis() as u64);
+                db::metrics::record_p046_query_duration(
+                    "sessionHealth",
+                    resolver_start.elapsed().as_millis() as u64,
+                );
                 Ok(report)
             }
             Err(e) => {
@@ -1474,7 +1541,10 @@ impl QueryRoot {
                         "session_graphql_query_total",
                         "sessionHealth:db_unavailable",
                     );
-                    db::metrics::record_p046_query_duration("sessionHealth", resolver_start.elapsed().as_millis() as u64);
+                    db::metrics::record_p046_query_duration(
+                        "sessionHealth",
+                        resolver_start.elapsed().as_millis() as u64,
+                    );
                     Ok(transient_db_unavailable_health(&run_id_str))
                 } else {
                     warn!("p046 sessionHealth non-transient error for run {run_id_str}: {e:#}");
@@ -2925,11 +2995,28 @@ impl SubscriptionRoot {
         // Use the live handle for per-emission auth so revocation in the underlying
         // table is observed without waiting for daemon restart.
         let live_principal_handle = ctx.data::<P046LivePrincipalHandle>()?.clone();
-        let principal_id = ctx.data::<auth::Principal>()?.id.clone();
+        let principal = ctx.data::<auth::Principal>()?;
+        let principal_id = principal.id.clone();
+        let live_credential = ctx
+            .data_opt::<P046LiveCredential>()
+            .cloned()
+            .or_else(|| {
+                ctx.data::<auth::PrincipalTable>().ok().and_then(|table| {
+                    auth::principal_token_fingerprint_by_id(table, &principal_id).map(
+                        |token_fingerprint| P046LiveCredential {
+                            principal_id: principal_id.clone(),
+                            token_fingerprint,
+                        },
+                    )
+                })
+            })
+            .ok_or_else(|| Error::new("unauthorized"))?;
         // Optional test-only shutdown signal: when the watch sender is dropped (or sends true),
         // the subscription performs the same graceful-shutdown drain as RecvError::Closed.
-        let shutdown_rx: Option<tokio::sync::watch::Receiver<bool>> =
-            ctx.data::<tokio::sync::watch::Receiver<bool>>().ok().cloned();
+        let shutdown_rx: Option<tokio::sync::watch::Receiver<bool>> = ctx
+            .data::<tokio::sync::watch::Receiver<bool>>()
+            .ok()
+            .cloned();
 
         // P046 resource-scoped authorization: bind operator subscription to the owning run.
         let run_id_for_auth = filter_run_id.to_string();
@@ -2986,7 +3073,7 @@ impl SubscriptionRoot {
                             std::future::pending::<()>().await;
                         }
                     } => {
-                        if !live_principal_handle.auth_ok(&principal_id).await {
+                        if !live_principal_handle.auth_ok_for_credential(&live_credential).await {
                             let _ = tx.try_send(Err(Error::new("authorization_recheck_failed")));
                             return;
                         }
@@ -3013,7 +3100,10 @@ impl SubscriptionRoot {
                             "session_status_subscription_lag_total",
                             "lagged",
                         );
-                        if !live_principal_handle.auth_ok(&principal_id).await {
+                        if !live_principal_handle
+                            .auth_ok_for_credential(&live_credential)
+                            .await
+                        {
                             let _ = tx.try_send(Err(Error::new("authorization_recheck_failed")));
                             return;
                         }
@@ -3051,7 +3141,10 @@ impl SubscriptionRoot {
                     Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                         // Graceful shutdown: emit one resyncRequired payload so clients know
                         // they must re-query. Allow up to 1 second for the client to receive it.
-                        if !live_principal_handle.auth_ok(&principal_id).await {
+                        if !live_principal_handle
+                            .auth_ok_for_credential(&live_credential)
+                            .await
+                        {
                             let _ = tx.try_send(Err(Error::new("authorization_recheck_failed")));
                             return;
                         }
@@ -3086,7 +3179,10 @@ impl SubscriptionRoot {
                 // Recheck full operator-read authorization (class + P072 subscription policy).
                 // Uses the live handle so revocation of principals.json is observed.
                 // Fail-closed on revocation, downgrade, or transient lookup failure.
-                if !live_principal_handle.auth_ok(&principal_id).await {
+                if !live_principal_handle
+                    .auth_ok_for_credential(&live_credential)
+                    .await
+                {
                     let _ = tx.try_send(Err(Error::new("authorization_recheck_failed")));
                     break;
                 }
@@ -3156,7 +3252,7 @@ impl SubscriptionRoot {
                                 resync_sent = false;
                                 last_emitted_event_id = Some(session_ev.id.clone());
                                 db::metrics::record_p046_emit_lag(
-                                    emit_start.elapsed().as_millis() as u64,
+                                    emit_start.elapsed().as_millis() as u64
                                 );
                                 let evt_label = format!(
                                     "{}:ok",

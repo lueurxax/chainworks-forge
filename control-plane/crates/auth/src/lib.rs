@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -325,6 +326,19 @@ pub fn resolve_bearer(token: &str, table: &PrincipalTable) -> Result<Principal, 
         .ok_or(AuthError::UnknownToken)
 }
 
+/// Non-secret stable fingerprint for comparing a connection credential against
+/// a later-reloaded principal table without retaining or exposing the bearer.
+pub fn token_fingerprint(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    let mut out = String::with_capacity("sha256:".len() + digest.len() * 2);
+    out.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
 /// Extract bearer token from an Authorization header value.
 /// Expects format: "Bearer <token>"
 pub fn extract_bearer_token(header_value: &str) -> Result<&str, AuthError> {
@@ -463,6 +477,14 @@ pub fn find_principal_by_id(table: &PrincipalTable, id: &str) -> Option<Principa
         .iter()
         .find(|e| e.id == id)
         .map(Principal::from_entry)
+}
+
+pub fn principal_token_fingerprint_by_id(table: &PrincipalTable, id: &str) -> Option<String> {
+    table
+        .entries
+        .iter()
+        .find(|e| e.id == id)
+        .map(|e| token_fingerprint(&e.token))
 }
 
 /// P072: Check if a mutation is allowed for a principal based on v2 surface_policies.

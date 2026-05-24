@@ -33,6 +33,12 @@ pub struct P046Config {
 #[derive(Clone, Debug)]
 pub struct P046LivePrincipalHandle(pub Arc<tokio::sync::RwLock<Option<auth::PrincipalTable>>>);
 
+#[derive(Clone, Debug)]
+pub struct P046LiveCredential {
+    pub principal_id: String,
+    pub token_fingerprint: String,
+}
+
 impl P046LivePrincipalHandle {
     pub fn new(table: auth::PrincipalTable) -> Self {
         Self(Arc::new(tokio::sync::RwLock::new(Some(table))))
@@ -70,6 +76,31 @@ impl P046LivePrincipalHandle {
                     _ => false,
                 }
             }
+            _ => false,
+        }
+    }
+
+    /// Returns true iff the same principal id is still authorized and its bearer
+    /// credential fingerprint still matches the live principal table.
+    pub async fn auth_ok_for_credential(&self, credential: &P046LiveCredential) -> bool {
+        let guard = self.0.read().await;
+        let table = match guard.as_ref() {
+            Some(t) => t,
+            None => return false,
+        };
+        let Some(current_fingerprint) =
+            auth::principal_token_fingerprint_by_id(table, &credential.principal_id)
+        else {
+            return false;
+        };
+        if current_fingerprint != credential.token_fingerprint {
+            return false;
+        }
+        match auth::find_principal_by_id(table, &credential.principal_id) {
+            Some(p) if p.class == auth::PrincipalClass::Operator => matches!(
+                auth::is_subscription_allowed_by_surface_policy(table, &credential.principal_id),
+                Some(true)
+            ),
             _ => false,
         }
     }
@@ -611,14 +642,23 @@ pub fn redact_event_details(
     // Known bearer-like token prefixes. Strings starting with these are rejected even
     // if they pass the alphanumeric charset check — they are structurally credential-shaped.
     const CREDENTIAL_DENY_PREFIXES: &[&str] = &[
-        "ghp_", "ghs_", "gho_", "github_pat_", // GitHub
-        "sk-",                                   // OpenAI / Anthropic / generic secret keys
-        "xoxb-", "xoxp-", "xoxa-", "xoxr-",    // Slack
-        "ya29.",                                 // Google OAuth access tokens
-        "eyJ",                                   // JWT (base64 header prefix)
+        "ghp_",
+        "ghs_",
+        "gho_",
+        "github_pat_", // GitHub
+        "sk-",         // OpenAI / Anthropic / generic secret keys
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxr-", // Slack
+        "ya29.", // Google OAuth access tokens
+        "eyJ",   // JWT (base64 header prefix)
         // AWS IAM access key ID prefixes (access keys, session keys, batch operation,
         // certificate, and credential group prefixes — all structurally credential-shaped).
-        "AKIA", "ASIA", "ABIA", "ACCA",
+        "AKIA",
+        "ASIA",
+        "ABIA",
+        "ACCA",
         // Google API key prefix.
         "AIza",
     ];
@@ -629,30 +669,56 @@ pub fn redact_event_details(
     const PROVIDER_KIND_VOCAB: &[&str] = &[
         "claude", "codex", "gemini", "auggie", "junie", "goose", "unknown",
     ];
-    const REUSE_DISPOSITION_VOCAB: &[&str] = &[
-        "new", "reused", "reset", "invalidated", "unknown",
-    ];
+    const REUSE_DISPOSITION_VOCAB: &[&str] = &["new", "reused", "reset", "invalidated", "unknown"];
     const RESET_REASON_VOCAB: &[&str] = &[
-        "operator_reset", "context_pressure", "transport_error", "timeout", "invalidated",
-        "output_contract_repair", "unknown",
+        "operator_reset",
+        "context_pressure",
+        "transport_error",
+        "timeout",
+        "invalidated",
+        "output_contract_repair",
+        "unknown",
     ];
     const END_REASON_VOCAB: &[&str] = &[
-        "completed", "failed", "operator_reset", "invalidated", "context_pressure",
-        "transport_error", "timeout", "unknown",
+        "completed",
+        "failed",
+        "operator_reset",
+        "invalidated",
+        "context_pressure",
+        "transport_error",
+        "timeout",
+        "unknown",
     ];
     const TOKEN_ESTIMATE_BUCKET_VOCAB: &[&str] = &[
-        "none", "tiny", "small", "medium", "large", "very_large", "unknown",
+        "none",
+        "tiny",
+        "small",
+        "medium",
+        "large",
+        "very_large",
+        "unknown",
     ];
-    const CONTEXT_WINDOW_PRESSURE_BUCKET_VOCAB: &[&str] = &[
-        "none", "low", "medium", "high", "critical", "unknown",
-    ];
+    const CONTEXT_WINDOW_PRESSURE_BUCKET_VOCAB: &[&str] =
+        &["none", "low", "medium", "high", "critical", "unknown"];
     // Closed vocabulary for summaryCode: lifecycle/outcome codes produced by control-plane
     // session management. Secret-shaped tokens (AWS AKIA, Google AIza, high-entropy base64)
     // cannot appear in this set, making the field safe even without prefix checks.
     const SUMMARY_CODE_VOCAB: &[&str] = &[
-        "created", "active", "reused", "closed", "reset", "invalidated", "failed",
-        "completed", "context_pressure", "checkpoint", "repair", "operator_reset",
-        "transport_error", "timeout", "unknown",
+        "created",
+        "active",
+        "reused",
+        "closed",
+        "reset",
+        "invalidated",
+        "failed",
+        "completed",
+        "context_pressure",
+        "checkpoint",
+        "repair",
+        "operator_reset",
+        "transport_error",
+        "timeout",
+        "unknown",
     ];
     // Closed vocabulary for modelFamily: known provider model family identifiers.
     const MODEL_FAMILY_VOCAB: &[&str] = &[
@@ -661,13 +727,24 @@ pub fn redact_event_details(
     // Closed vocabulary for safeDiagnosticCode: bounded reason codes from
     // p046_session_graphql_vocab_v1. Matches the proposal's reason_codes list exactly.
     const SAFE_DIAGNOSTIC_CODE_VOCAB: &[&str] = &[
-        "stale_active_generation", "active_generation_missing", "generation_without_lineage",
-        "repeated_operator_reset", "invalidated_active_generation", "context_window_pressure",
-        "repair_failure_recent", "no_session_data", "transient_db_unavailable",
-        "redaction_unknown_event_type", "redaction_unknown_schema_version",
-        "redaction_unknown_details_shape", "redaction_size_limit_exceeded",
-        "subscription_resync_required", "slow_consumer_disconnected",
-        "authorization_recheck_failed", "sqlite_retry_exhausted", "unknown",
+        "stale_active_generation",
+        "active_generation_missing",
+        "generation_without_lineage",
+        "repeated_operator_reset",
+        "invalidated_active_generation",
+        "context_window_pressure",
+        "repair_failure_recent",
+        "no_session_data",
+        "transient_db_unavailable",
+        "redaction_unknown_event_type",
+        "redaction_unknown_schema_version",
+        "redaction_unknown_details_shape",
+        "redaction_size_limit_exceeded",
+        "subscription_resync_required",
+        "slow_consumer_disconnected",
+        "authorization_recheck_failed",
+        "sqlite_retry_exhausted",
+        "unknown",
     ];
 
     // Value-type safety: all values must be scalars (string, number, bool, null).
@@ -732,7 +809,9 @@ pub fn redact_event_details(
         }
     }
     // Total serialized size guard.
-    let total_len = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(usize::MAX);
+    let total_len = serde_json::to_string(&value)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX);
     if total_len > 4096 {
         return (None, vec!["redaction_size_limit_exceeded".to_string()]);
     }
@@ -786,24 +865,50 @@ pub fn extract_typed_details(details_json: Option<&str>) -> Option<GqlSessionEve
     let json_str = details_json?;
     let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
     let obj = value.as_object()?;
+    if obj.get("schemaVersion").and_then(|v| v.as_str())
+        != Some(P046_EVENT_DETAILS_REDACTION_SCHEMA_VERSION)
+    {
+        return None;
+    }
 
     const CREDENTIAL_DENY_PREFIXES: &[&str] = &[
-        "ghp_", "ghs_", "gho_", "github_pat_",
+        "ghp_",
+        "ghs_",
+        "gho_",
+        "github_pat_",
         "sk-",
-        "xoxb-", "xoxp-", "xoxa-", "xoxr-",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxr-",
         "ya29.",
         "eyJ",
         // AWS IAM access key ID prefixes.
-        "AKIA", "ASIA", "ABIA", "ACCA",
+        "AKIA",
+        "ASIA",
+        "ABIA",
+        "ACCA",
         // Google API key prefix.
         "AIza",
     ];
     // Closed vocabularies for fields that are not already enum-restricted by redact_event_details.
     // Applying them here ensures typedDetails also rejects secret-shaped tokens under these keys.
     const SUMMARY_CODE_VOCAB: &[&str] = &[
-        "created", "active", "reused", "closed", "reset", "invalidated", "failed",
-        "completed", "context_pressure", "checkpoint", "repair", "operator_reset",
-        "transport_error", "timeout", "unknown",
+        "created",
+        "active",
+        "reused",
+        "closed",
+        "reset",
+        "invalidated",
+        "failed",
+        "completed",
+        "context_pressure",
+        "checkpoint",
+        "repair",
+        "operator_reset",
+        "transport_error",
+        "timeout",
+        "unknown",
     ];
     const MODEL_FAMILY_VOCAB: &[&str] = &[
         "claude", "gpt", "gemini", "codex", "llama", "mistral", "palm", "unknown",
@@ -811,31 +916,56 @@ pub fn extract_typed_details(details_json: Option<&str>) -> Option<GqlSessionEve
     const PROVIDER_KIND_VOCAB: &[&str] = &[
         "claude", "codex", "gemini", "auggie", "junie", "goose", "unknown",
     ];
-    const REUSE_DISPOSITION_VOCAB: &[&str] = &[
-        "new", "reused", "reset", "invalidated", "unknown",
-    ];
+    const REUSE_DISPOSITION_VOCAB: &[&str] = &["new", "reused", "reset", "invalidated", "unknown"];
     const RESET_REASON_VOCAB: &[&str] = &[
-        "operator_reset", "context_pressure", "transport_error", "timeout", "invalidated",
-        "output_contract_repair", "unknown",
+        "operator_reset",
+        "context_pressure",
+        "transport_error",
+        "timeout",
+        "invalidated",
+        "output_contract_repair",
+        "unknown",
     ];
     const END_REASON_VOCAB: &[&str] = &[
-        "completed", "failed", "operator_reset", "invalidated", "context_pressure",
-        "transport_error", "timeout", "unknown",
+        "completed",
+        "failed",
+        "operator_reset",
+        "invalidated",
+        "context_pressure",
+        "transport_error",
+        "timeout",
+        "unknown",
     ];
     const TOKEN_ESTIMATE_BUCKET_VOCAB: &[&str] = &[
-        "none", "tiny", "small", "medium", "large", "very_large", "unknown",
+        "none",
+        "tiny",
+        "small",
+        "medium",
+        "large",
+        "very_large",
+        "unknown",
     ];
-    const CONTEXT_WINDOW_PRESSURE_BUCKET_VOCAB: &[&str] = &[
-        "none", "low", "medium", "high", "critical", "unknown",
-    ];
+    const CONTEXT_WINDOW_PRESSURE_BUCKET_VOCAB: &[&str] =
+        &["none", "low", "medium", "high", "critical", "unknown"];
     const SAFE_DIAGNOSTIC_CODE_VOCAB: &[&str] = &[
-        "stale_active_generation", "active_generation_missing", "generation_without_lineage",
-        "repeated_operator_reset", "invalidated_active_generation", "context_window_pressure",
-        "repair_failure_recent", "no_session_data", "transient_db_unavailable",
-        "redaction_unknown_event_type", "redaction_unknown_schema_version",
-        "redaction_unknown_details_shape", "redaction_size_limit_exceeded",
-        "subscription_resync_required", "slow_consumer_disconnected",
-        "authorization_recheck_failed", "sqlite_retry_exhausted", "unknown",
+        "stale_active_generation",
+        "active_generation_missing",
+        "generation_without_lineage",
+        "repeated_operator_reset",
+        "invalidated_active_generation",
+        "context_window_pressure",
+        "repair_failure_recent",
+        "no_session_data",
+        "transient_db_unavailable",
+        "redaction_unknown_event_type",
+        "redaction_unknown_schema_version",
+        "redaction_unknown_details_shape",
+        "redaction_size_limit_exceeded",
+        "subscription_resync_required",
+        "slow_consumer_disconnected",
+        "authorization_recheck_failed",
+        "sqlite_retry_exhausted",
+        "unknown",
     ];
 
     // Helper: check if a string value is operator-safe per the same rules used by
@@ -848,7 +978,10 @@ pub fn extract_typed_details(details_json: Option<&str>) -> Option<GqlSessionEve
         if s.len() > P046_SAFE_STRING_CONTENT_MAX_BYTES {
             return None;
         }
-        if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
             return None;
         }
         if CREDENTIAL_DENY_PREFIXES.iter().any(|p| s.starts_with(p)) {
@@ -863,22 +996,44 @@ pub fn extract_typed_details(details_json: Option<&str>) -> Option<GqlSessionEve
     let safe_vocab = |v: &serde_json::Value, vocab: &[&str]| -> Option<String> {
         let s = safe_str(v)?;
         let s_lower = s.to_lowercase();
-        if vocab.contains(&s_lower.as_str()) { Some(s) } else { None }
+        if vocab.contains(&s_lower.as_str()) {
+            Some(s)
+        } else {
+            None
+        }
     };
 
     let typed = GqlSessionEventTypedDetails {
-        schema_version:                 obj.get("schemaVersion").and_then(safe_str),
-        summary_code:                   obj.get("summaryCode").and_then(|v| safe_vocab(v, SUMMARY_CODE_VOCAB)),
-        provider_kind:                  obj.get("providerKind").and_then(|v| safe_vocab(v, PROVIDER_KIND_VOCAB)),
-        model_family:                   obj.get("modelFamily").and_then(|v| safe_vocab(v, MODEL_FAMILY_VOCAB)),
-        reuse_disposition:              obj.get("reuseDisposition").and_then(|v| safe_vocab(v, REUSE_DISPOSITION_VOCAB)),
-        reset_reason:                   obj.get("resetReason").and_then(|v| safe_vocab(v, RESET_REASON_VOCAB)),
-        end_reason:                     obj.get("endReason").and_then(|v| safe_vocab(v, END_REASON_VOCAB)),
-        token_estimate_bucket:          obj.get("tokenEstimateBucket").and_then(|v| safe_vocab(v, TOKEN_ESTIMATE_BUCKET_VOCAB)),
-        context_window_pressure_bucket: obj.get("contextWindowPressureBucket").and_then(|v| safe_vocab(v, CONTEXT_WINDOW_PRESSURE_BUCKET_VOCAB)),
-        checkpoint_present:             obj.get("checkpointPresent").and_then(|v| v.as_bool()),
-        repair_attempt_count:           obj.get("repairAttemptCount").and_then(|v| v.as_i64()),
-        safe_diagnostic_code:           obj.get("safeDiagnosticCode").and_then(|v| safe_vocab(v, SAFE_DIAGNOSTIC_CODE_VOCAB)),
+        schema_version: obj.get("schemaVersion").and_then(safe_str),
+        summary_code: obj
+            .get("summaryCode")
+            .and_then(|v| safe_vocab(v, SUMMARY_CODE_VOCAB)),
+        provider_kind: obj
+            .get("providerKind")
+            .and_then(|v| safe_vocab(v, PROVIDER_KIND_VOCAB)),
+        model_family: obj
+            .get("modelFamily")
+            .and_then(|v| safe_vocab(v, MODEL_FAMILY_VOCAB)),
+        reuse_disposition: obj
+            .get("reuseDisposition")
+            .and_then(|v| safe_vocab(v, REUSE_DISPOSITION_VOCAB)),
+        reset_reason: obj
+            .get("resetReason")
+            .and_then(|v| safe_vocab(v, RESET_REASON_VOCAB)),
+        end_reason: obj
+            .get("endReason")
+            .and_then(|v| safe_vocab(v, END_REASON_VOCAB)),
+        token_estimate_bucket: obj
+            .get("tokenEstimateBucket")
+            .and_then(|v| safe_vocab(v, TOKEN_ESTIMATE_BUCKET_VOCAB)),
+        context_window_pressure_bucket: obj
+            .get("contextWindowPressureBucket")
+            .and_then(|v| safe_vocab(v, CONTEXT_WINDOW_PRESSURE_BUCKET_VOCAB)),
+        checkpoint_present: obj.get("checkpointPresent").and_then(|v| v.as_bool()),
+        repair_attempt_count: obj.get("repairAttemptCount").and_then(|v| v.as_i64()),
+        safe_diagnostic_code: obj
+            .get("safeDiagnosticCode")
+            .and_then(|v| safe_vocab(v, SAFE_DIAGNOSTIC_CODE_VOCAB)),
     };
 
     // Return None if no safe field was found (fully unknown/unsafe payload).
@@ -895,7 +1050,11 @@ pub fn extract_typed_details(details_json: Option<&str>) -> Option<GqlSessionEve
         || typed.repair_attempt_count.is_some()
         || typed.safe_diagnostic_code.is_some();
 
-    if has_any { Some(typed) } else { None }
+    if has_any {
+        Some(typed)
+    } else {
+        None
+    }
 }
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -916,29 +1075,30 @@ impl From<SessionEvent> for GqlSessionEvent {
     fn from(e: SessionEvent) -> Self {
         let gql_event_type = GqlSessionEventType::from(&e.event_type);
         // Unknown event shapes must fail closed: no details leak regardless of JSON content.
-        let (redacted, warnings) = if matches!(gql_event_type, GqlSessionEventType::UnknownEventShape) {
-            db::metrics::increment_counter_with_label(
-                "session_event_redaction_total",
-                "redaction_unknown_event_type:redacted",
-            );
-            (None, vec!["redaction_unknown_event_type".to_string()])
-        } else {
-            let result = redact_event_details(e.details_json.as_deref());
-            // Emit redaction metrics for any warning codes produced.
-            for w in &result.1 {
+        let (redacted, warnings) =
+            if matches!(gql_event_type, GqlSessionEventType::UnknownEventShape) {
                 db::metrics::increment_counter_with_label(
                     "session_event_redaction_total",
-                    &format!("{w}:redacted"),
+                    "redaction_unknown_event_type:redacted",
                 );
-            }
-            if result.1.is_empty() && result.0.is_some() {
-                db::metrics::increment_counter_with_label(
-                    "session_event_redaction_total",
-                    "none:ok",
-                );
-            }
-            result
-        };
+                (None, vec!["redaction_unknown_event_type".to_string()])
+            } else {
+                let result = redact_event_details(e.details_json.as_deref());
+                // Emit redaction metrics for any warning codes produced.
+                for w in &result.1 {
+                    db::metrics::increment_counter_with_label(
+                        "session_event_redaction_total",
+                        &format!("{w}:redacted"),
+                    );
+                }
+                if result.1.is_empty() && result.0.is_some() {
+                    db::metrics::increment_counter_with_label(
+                        "session_event_redaction_total",
+                        "none:ok",
+                    );
+                }
+                result
+            };
         // Typed details: extract safe fields from source JSON, ignoring unknown keys.
         // For unknown event shapes, fail closed to None (same as detailsJsonRedacted).
         let typed_details = if matches!(gql_event_type, GqlSessionEventType::UnknownEventShape) {
@@ -1247,8 +1407,7 @@ pub fn compute_session_health(
             severity: GqlSessionHealthSeverity::Critical,
             lineage_id: None,
             generation_id: None,
-            message: "One or more session generation rows reference a missing lineage."
-                .to_string(),
+            message: "One or more session generation rows reference a missing lineage.".to_string(),
             suggested_mcp_action: None,
         });
     }
@@ -1326,18 +1485,24 @@ pub struct GqlSessionStatusChangedEvent {
 }
 
 /// Derive the session status from the most recent event type.
-fn status_from_event_type(event_type: &domain::session::SessionEventType) -> GqlSessionStatusChangedStatus {
+fn status_from_event_type(
+    event_type: &domain::session::SessionEventType,
+) -> GqlSessionStatusChangedStatus {
     use domain::session::SessionEventType::*;
     match event_type {
-        Created | OutputContractRepairStarted | OutputContractRepairSucceeded
-        | OutputContractRepairSkipped | CodeWriterCompletionStarted | BudgetExceeded => {
-            GqlSessionStatusChangedStatus::Active
-        }
+        Created
+        | OutputContractRepairStarted
+        | OutputContractRepairSucceeded
+        | OutputContractRepairSkipped
+        | CodeWriterCompletionStarted
+        | BudgetExceeded => GqlSessionStatusChangedStatus::Active,
         Reused => GqlSessionStatusChangedStatus::Active,
         Closed => GqlSessionStatusChangedStatus::Closed,
         Invalidated => GqlSessionStatusChangedStatus::Invalidated,
         OperatorReset => GqlSessionStatusChangedStatus::Reset,
-        OutputContractRepairFailed | CodeWriterCompletionFailed => GqlSessionStatusChangedStatus::Failed,
+        OutputContractRepairFailed | CodeWriterCompletionFailed => {
+            GqlSessionStatusChangedStatus::Failed
+        }
         Compacted | CodeWriterCompletionSucceeded => GqlSessionStatusChangedStatus::Unknown,
     }
 }

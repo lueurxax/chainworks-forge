@@ -19,7 +19,7 @@ use graphql_server::schema::{
     build_schema, build_schema_with_p046_config, build_schema_with_session_observability,
     build_schema_with_session_observability_and_live_handle, AppSchema,
 };
-use graphql_server::types::session::{derive_scoped_ref_with_salt, P046Config};
+use graphql_server::types::session::{derive_scoped_ref_with_salt, P046Config, P046LiveCredential};
 
 async fn test_pool() -> sqlx::SqlitePool {
     let pool = create_pool("sqlite::memory:").await.unwrap();
@@ -88,6 +88,13 @@ fn table_operator_principal() -> auth::Principal {
 
 fn operator_principal() -> auth::Principal {
     auth::Principal::new("operator", auth::PrincipalClass::Operator)
+}
+
+fn operator_missing_from_live_table_credential() -> P046LiveCredential {
+    P046LiveCredential {
+        principal_id: "operator".to_string(),
+        token_fingerprint: auth::token_fingerprint("operator-token"),
+    }
 }
 
 fn observer_principal() -> auth::Principal {
@@ -858,14 +865,33 @@ async fn proposal_046_session_event_details_are_default_deny_redacted() {
     )
     .await
     .unwrap();
+    db::repos::sessions::insert_event(
+        &pool,
+        &event_fixture(
+            "missing-schema-event",
+            &lineage.id,
+            "redaction-generation",
+            6,
+            Some(
+                serde_json::json!({
+                    "summaryCode": "created",
+                    "providerKind": "codex"
+                })
+                .to_string(),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
 
     let schema = make_schema_with_p046(pool);
     // detailsJsonRedacted is a typed object (GqlSessionEventDetailsRedacted), not a scalar.
     let query = r#"{
-      sessionEvents(lineageId: "redaction-lineage", first: 3) {
+      sessionEvents(lineageId: "redaction-lineage", first: 4) {
         nodes {
           eventId
           detailsJsonRedacted { schemaVersion summaryCode providerKind modelFamily reuseDisposition resetReason endReason tokenEstimateBucket contextWindowPressureBucket checkpointPresent repairAttemptCount safeDiagnosticCode }
+          typedDetails { schemaVersion summaryCode providerKind modelFamily reuseDisposition resetReason endReason tokenEstimateBucket contextWindowPressureBucket checkpointPresent repairAttemptCount safeDiagnosticCode }
           redactionWarnings
         }
       }
@@ -888,10 +914,7 @@ async fn proposal_046_session_event_details_are_default_deny_redacted() {
         !safe_details.is_null(),
         "safe event must return non-null detailsJsonRedacted"
     );
-    assert_eq!(
-        safe_details["summaryCode"].as_str().unwrap(),
-        "completed"
-    );
+    assert_eq!(safe_details["summaryCode"].as_str().unwrap(), "completed");
 
     assert_eq!(nodes[1]["eventId"].as_str().unwrap(), "unsafe-event");
     assert!(
@@ -914,12 +937,29 @@ async fn proposal_046_session_event_details_are_default_deny_redacted() {
         nodes[2]["detailsJsonRedacted"].is_null(),
         "unknown schema event must return null detailsJsonRedacted"
     );
+    assert!(
+        nodes[2]["typedDetails"].is_null(),
+        "unknown schema event must also return null typedDetails"
+    );
     let warnings = nodes[2]["redactionWarnings"].as_array().unwrap();
     assert!(
         warnings
             .iter()
             .any(|w| w.as_str() == Some("redaction_unknown_schema_version")),
         "unknown schema version must fail closed with bounded warning, got {warnings:?}"
+    );
+
+    assert_eq!(
+        nodes[3]["eventId"].as_str().unwrap(),
+        "missing-schema-event"
+    );
+    assert!(
+        nodes[3]["detailsJsonRedacted"].is_null(),
+        "missing schema event must return null detailsJsonRedacted"
+    );
+    assert!(
+        nodes[3]["typedDetails"].is_null(),
+        "missing schema event must return null typedDetails"
     );
 }
 
@@ -1408,9 +1448,8 @@ async fn proposal_046_subscription_setup_rejects_unknown_run_id() {
       }
     }"#;
 
-    let mut stream = schema.execute_stream(
-        Request::new(subscription).data(operator_principal()),
-    );
+    let mut stream =
+        schema.execute_stream(Request::new(subscription).data(table_operator_principal()));
 
     let resp = stream.next().await.expect("must get initial response");
     assert!(
@@ -1464,20 +1503,19 @@ async fn proposal_046_subscription_run_id_filter_emits_only_matching_run() {
         // Allow the subscription stream to start polling and subscribe to the broadcast channel.
         // Use a generous delay so this test is robust when run after other heavy tests.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _ = events_clone
-            .send(DomainEvent::SessionEventRecorded { run_id: run_id_b_parsed });
+        let _ = events_clone.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_b_parsed,
+        });
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let _ = events_clone
-            .send(DomainEvent::SessionEventRecorded { run_id: run_id_a_parsed });
+        let _ = events_clone.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_a_parsed,
+        });
     });
 
-    let item = tokio::time::timeout(
-        std::time::Duration::from_millis(1000),
-        stream.next(),
-    )
-    .await
-    .expect("timed out: no event emitted for run_a")
-    .expect("stream ended before emitting");
+    let item = tokio::time::timeout(std::time::Duration::from_millis(1000), stream.next())
+        .await
+        .expect("timed out: no event emitted for run_a")
+        .expect("stream ended before emitting");
 
     publish_task.await.unwrap();
 
@@ -1510,25 +1548,26 @@ async fn proposal_046_subscription_stops_on_authorization_recheck_failure() {
     let subscription = format!(
         r#"subscription {{ sessionStatusChanged(runId: "{run_id}") {{ runId resyncRequired }} }}"#,
     );
-    let mut stream =
-        schema.execute_stream(Request::new(subscription).data(operator_principal()));
+    let mut stream = schema.execute_stream(
+        Request::new(subscription)
+            .data(operator_principal())
+            .data(operator_missing_from_live_table_credential()),
+    );
 
     let run_id_parsed: RunId = run_id.parse().unwrap();
     let events_clone = events.clone();
 
     let publish_task = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        let _ = events_clone
-            .send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
+        let _ = events_clone.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_parsed,
+        });
     });
 
-    let item = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        stream.next(),
-    )
-    .await
-    .expect("timed out: revocation error was not delivered")
-    .expect("stream ended before delivering revocation error");
+    let item = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+        .await
+        .expect("timed out: revocation error was not delivered")
+        .expect("stream ended before delivering revocation error");
 
     publish_task.await.unwrap();
 
@@ -1612,20 +1651,21 @@ async fn proposal_046_subscription_resync_on_broadcast_lag() {
         // subscribed to the broadcast channel before events are published. This is
         // important under load (full suite with --test-threads=1).
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _ = events_clone.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
-        let _ = events_clone.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
-        let _ = events_clone.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
+        let _ = events_clone.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_parsed,
+        });
+        let _ = events_clone.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_parsed,
+        });
+        let _ = events_clone.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_parsed,
+        });
     });
 
     // Collect the first few items. The resync payload must appear before any normal event.
     let mut found_resync = false;
     for _ in 0..8u32 {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(800),
-            stream.next(),
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_millis(800), stream.next()).await {
             Ok(Some(item)) => {
                 let data = item.data.into_json().unwrap_or_default();
                 if data["sessionStatusChanged"]["resyncRequired"].as_bool() == Some(true) {
@@ -1688,15 +1728,14 @@ async fn proposal_046_subscription_eventid_dedup_skips_repeated_event() {
     // subscription resolver (and broadcast::Receiver) starts before the event arrives.
     let first_publish = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        let _ = events_clone.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
+        let _ = events_clone.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_parsed,
+        });
     });
-    let item = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        stream.next(),
-    )
-    .await
-    .expect("first emission timed out")
-    .expect("stream ended unexpectedly");
+    let item = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+        .await
+        .expect("first emission timed out")
+        .expect("stream ended unexpectedly");
     first_publish.await.unwrap();
     assert!(
         item.errors.is_empty(),
@@ -1711,12 +1750,10 @@ async fn proposal_046_subscription_eventid_dedup_skips_repeated_event() {
     );
 
     // Second notification with SAME DB state (dedup-ev-1 still latest) → must be suppressed.
-    let _ = events.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        stream.next(),
-    )
-    .await;
+    let _ = events.send(DomainEvent::SessionEventRecorded {
+        run_id: run_id_parsed,
+    });
+    let result = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await;
     assert!(
         result.is_err(),
         "duplicate notification with same eventId must be suppressed (no payload within 200ms)"
@@ -1729,14 +1766,13 @@ async fn proposal_046_subscription_eventid_dedup_skips_repeated_event() {
     )
     .await
     .unwrap();
-    let _ = events.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
-    let item = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        stream.next(),
-    )
-    .await
-    .expect("third emission timed out")
-    .expect("stream ended unexpectedly");
+    let _ = events.send(DomainEvent::SessionEventRecorded {
+        run_id: run_id_parsed,
+    });
+    let item = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+        .await
+        .expect("third emission timed out")
+        .expect("stream ended unexpectedly");
     assert!(
         item.errors.is_empty(),
         "third emission (after new event) must succeed; errors: {:?}",
@@ -1770,7 +1806,10 @@ fn proposal_046_derived_refs_are_not_raw_and_differ_across_salts() {
         (raw_owner_key, "ior"),
     ] {
         let derived = derive_scoped_ref_with_salt(run_id, raw, tag, &salt_a);
-        assert_ne!(derived, raw, "derived ref must not equal raw value for tag={tag}");
+        assert_ne!(
+            derived, raw,
+            "derived ref must not equal raw value for tag={tag}"
+        );
         assert!(
             !derived.contains(raw),
             "derived ref must not contain raw value for tag={tag}: derived={derived}"
@@ -1780,12 +1819,16 @@ fn proposal_046_derived_refs_are_not_raw_and_differ_across_salts() {
             "derived ref must not contain 'secret' for tag={tag}: derived={derived}"
         );
         // Fixed length (32 hex chars = 16 bytes), not preserving raw length.
-        assert_eq!(derived.len(), 32, "derived ref must be 32 hex chars, got {}", derived.len());
+        assert_eq!(
+            derived.len(),
+            32,
+            "derived ref must be 32 hex chars, got {}",
+            derived.len()
+        );
     }
 
     // Working directory display must not expose raw absolute paths.
-    let display =
-        graphql_server::types::session::redact_working_directory(raw_working_dir);
+    let display = graphql_server::types::session::redact_working_directory(raw_working_dir);
     assert!(
         !display.contains("testuser"),
         "working directory display must not expose username: {display}"
@@ -1832,7 +1875,10 @@ fn make_schema_with_tiny_channel(
         events.clone(),
         auth::PrincipalTable::test_fixture(),
         LifecycleReporter::new(15, "test-build", events.clone()),
-        P046Config { enabled: true, subscription_channel_capacity: 2 },
+        P046Config {
+            enabled: true,
+            subscription_channel_capacity: 2,
+        },
     )
 }
 
@@ -1843,9 +1889,13 @@ async fn proposal_046_subscription_slow_consumer_disconnect_on_3_consecutive_fai
     seed_run(&pool, run_id).await;
 
     let lineage = lineage_fixture("slow-consumer-lineage", run_id, "agent-a", "lineage-sl", 0);
-    db::repos::sessions::insert_lineage(&pool, &lineage).await.unwrap();
+    db::repos::sessions::insert_lineage(&pool, &lineage)
+        .await
+        .unwrap();
     let gen = generation_fixture("slow-consumer-gen", &lineage.id, 1, 0);
-    db::repos::sessions::insert_generation(&pool, &gen).await.unwrap();
+    db::repos::sessions::insert_generation(&pool, &gen)
+        .await
+        .unwrap();
 
     let events_bus = event_bus::new_bus(128);
     let schema = make_schema_with_tiny_channel(pool.clone(), events_bus.clone());
@@ -1867,21 +1917,25 @@ async fn proposal_046_subscription_slow_consumer_disconnect_on_3_consecutive_fai
     let publish_task = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         for i in 0..5u32 {
-            let ev =
-                event_fixture(&format!("slow-ev-{i}"), &lineage_id, &gen_id, i as i64, None);
-            db::repos::sessions::insert_event(&pool_clone, &ev).await.unwrap();
-            let _ =
-                events_clone.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
+            let ev = event_fixture(
+                &format!("slow-ev-{i}"),
+                &lineage_id,
+                &gen_id,
+                i as i64,
+                None,
+            );
+            db::repos::sessions::insert_event(&pool_clone, &ev)
+                .await
+                .unwrap();
+            let _ = events_clone.send(DomainEvent::SessionEventRecorded {
+                run_id: run_id_parsed,
+            });
             tokio::time::sleep(std::time::Duration::from_millis(15)).await;
         }
     });
 
     // Poll once to start the subscription task, then stop consuming (channel fills to capacity).
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(15),
-        stream.next(),
-    )
-    .await;
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(15), stream.next()).await;
 
     // Wait for publish task to complete and the subscription task to hit 3 consecutive failures.
     publish_task.await.unwrap();
@@ -1895,12 +1949,7 @@ async fn proposal_046_subscription_slow_consumer_disconnect_on_3_consecutive_fai
     let mut stream_ended = false;
     let mut items_after_stop = 0u32;
     for _ in 0..20u32 {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            stream.next(),
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_millis(200), stream.next()).await {
             Ok(Some(item)) => {
                 if item
                     .errors
@@ -1953,7 +2002,11 @@ async fn proposal_046_connection_types_have_required_fields() {
     let resp = schema
         .execute(Request::new(query).data(operator_principal()))
         .await;
-    assert!(resp.errors.is_empty(), "introspection failed: {:?}", resp.errors);
+    assert!(
+        resp.errors.is_empty(),
+        "introspection failed: {:?}",
+        resp.errors
+    );
 
     let data = resp.data.into_json().unwrap();
     let type_obj = &data["__type"];
@@ -1961,9 +2014,10 @@ async fn proposal_046_connection_types_have_required_fields() {
         !type_obj.is_null(),
         "SessionLineageConnection type must be present in schema"
     );
-    let fields = type_obj["fields"].as_array().expect("SessionLineageConnection fields array");
-    let field_names: Vec<&str> =
-        fields.iter().filter_map(|f| f["name"].as_str()).collect();
+    let fields = type_obj["fields"]
+        .as_array()
+        .expect("SessionLineageConnection fields array");
+    let field_names: Vec<&str> = fields.iter().filter_map(|f| f["name"].as_str()).collect();
     assert!(
         field_names.contains(&"edges"),
         "SessionLineageConnection must have 'edges' field; got {field_names:?}"
@@ -1989,13 +2043,24 @@ async fn proposal_046_connection_types_have_required_fields() {
     let resp = schema
         .execute(Request::new(query).data(operator_principal()))
         .await;
-    assert!(resp.errors.is_empty(), "PageInfo introspection failed: {:?}", resp.errors);
+    assert!(
+        resp.errors.is_empty(),
+        "PageInfo introspection failed: {:?}",
+        resp.errors
+    );
 
     let data = resp.data.into_json().unwrap();
-    let fields = data["__type"]["fields"].as_array().expect("PageInfo fields");
+    let fields = data["__type"]["fields"]
+        .as_array()
+        .expect("PageInfo fields");
 
-    let has_next_page = fields.iter().find(|f| f["name"].as_str() == Some("hasNextPage"));
-    assert!(has_next_page.is_some(), "PageInfo must have hasNextPage field");
+    let has_next_page = fields
+        .iter()
+        .find(|f| f["name"].as_str() == Some("hasNextPage"));
+    assert!(
+        has_next_page.is_some(),
+        "PageInfo must have hasNextPage field"
+    );
     // hasNextPage must be NON_NULL Boolean.
     let hnp = has_next_page.unwrap();
     assert_eq!(
@@ -2005,8 +2070,13 @@ async fn proposal_046_connection_types_have_required_fields() {
         hnp["type"]
     );
 
-    let start_cursor = fields.iter().find(|f| f["name"].as_str() == Some("startCursor"));
-    assert!(start_cursor.is_some(), "PageInfo must have startCursor field");
+    let start_cursor = fields
+        .iter()
+        .find(|f| f["name"].as_str() == Some("startCursor"));
+    assert!(
+        start_cursor.is_some(),
+        "PageInfo must have startCursor field"
+    );
     // startCursor must be nullable (not NON_NULL).
     let sc = start_cursor.unwrap();
     assert_ne!(
@@ -2016,7 +2086,9 @@ async fn proposal_046_connection_types_have_required_fields() {
         sc["type"]
     );
 
-    let end_cursor = fields.iter().find(|f| f["name"].as_str() == Some("endCursor"));
+    let end_cursor = fields
+        .iter()
+        .find(|f| f["name"].as_str() == Some("endCursor"));
     assert!(end_cursor.is_some(), "PageInfo must have endCursor field");
     let ec = end_cursor.unwrap();
     assert_ne!(
@@ -2045,9 +2117,10 @@ async fn proposal_046_connection_types_have_required_fields() {
     );
 
     let data = resp.data.into_json().unwrap();
-    let fields = data["__type"]["fields"].as_array().expect("SessionLineageEdge fields");
-    let field_names: Vec<&str> =
-        fields.iter().filter_map(|f| f["name"].as_str()).collect();
+    let fields = data["__type"]["fields"]
+        .as_array()
+        .expect("SessionLineageEdge fields");
+    let field_names: Vec<&str> = fields.iter().filter_map(|f| f["name"].as_str()).collect();
     assert!(
         field_names.contains(&"cursor"),
         "SessionLineageEdge must have 'cursor' field; got {field_names:?}"
@@ -2057,8 +2130,10 @@ async fn proposal_046_connection_types_have_required_fields() {
         "SessionLineageEdge must have 'node' field; got {field_names:?}"
     );
     // cursor on Edge must be NON_NULL.
-    let cursor_field =
-        fields.iter().find(|f| f["name"].as_str() == Some("cursor")).unwrap();
+    let cursor_field = fields
+        .iter()
+        .find(|f| f["name"].as_str() == Some("cursor"))
+        .unwrap();
     assert_eq!(
         cursor_field["type"]["kind"].as_str(),
         Some("NON_NULL"),
@@ -2091,15 +2166,21 @@ async fn proposal_046_session_health_returns_unknown_for_run_without_session_dat
     let resp = schema
         .execute(Request::new(query).data(operator_principal()))
         .await;
-    assert!(resp.errors.is_empty(), "sessionHealth must not error: {:?}", resp.errors);
+    assert!(
+        resp.errors.is_empty(),
+        "sessionHealth must not error: {:?}",
+        resp.errors
+    );
 
     let data = resp.data.into_json().unwrap();
     let state = data["sessionHealth"]["state"].as_str().unwrap_or("");
     assert_eq!(state, "UNKNOWN", "empty run must return UNKNOWN");
 
     let warnings = data["sessionHealth"]["warnings"].as_array().unwrap();
-    let reason_codes: Vec<&str> =
-        warnings.iter().filter_map(|w| w["reasonCode"].as_str()).collect();
+    let reason_codes: Vec<&str> = warnings
+        .iter()
+        .filter_map(|w| w["reasonCode"].as_str())
+        .collect();
     assert!(
         reason_codes.contains(&"no_session_data"),
         "empty run must have no_session_data warning; got {reason_codes:?}"
@@ -2135,7 +2216,11 @@ async fn proposal_046_metrics_bounded_labels_incremented_on_query() {
     let resp = schema
         .execute(Request::new(query).data(operator_principal()))
         .await;
-    assert!(resp.errors.is_empty(), "queries must succeed: {:?}", resp.errors);
+    assert!(
+        resp.errors.is_empty(),
+        "queries must succeed: {:?}",
+        resp.errors
+    );
 
     let after = db::metrics::get_counter_prefix_sum("session_graphql_query_total");
     assert!(
@@ -2157,8 +2242,7 @@ async fn proposal_046_metrics_reset_mutation_guard_incremented_on_schema_build()
     // Building a P046-enabled schema increments the guard.
     let _ = make_schema_with_p046(pool);
 
-    let after =
-        db::metrics::get_counter_prefix_sum("session_graphql_reset_mutation_guard_total");
+    let after = db::metrics::get_counter_prefix_sum("session_graphql_reset_mutation_guard_total");
     assert!(
         after > baseline,
         "session_graphql_reset_mutation_guard_total must be incremented when P046 schema is built; \
@@ -2176,13 +2260,16 @@ async fn proposal_046_metrics_health_warning_total_incremented() {
 
     let baseline = db::metrics::get_counter_prefix_sum("session_health_warning_total");
 
-    let query = format!(
-        r#"{{ sessionHealth(runId: "{run_id}") {{ state warnings {{ reasonCode }} }} }}"#
-    );
+    let query =
+        format!(r#"{{ sessionHealth(runId: "{run_id}") {{ state warnings {{ reasonCode }} }} }}"#);
     let resp = schema
         .execute(Request::new(query).data(operator_principal()))
         .await;
-    assert!(resp.errors.is_empty(), "sessionHealth must succeed: {:?}", resp.errors);
+    assert!(
+        resp.errors.is_empty(),
+        "sessionHealth must succeed: {:?}",
+        resp.errors
+    );
 
     let after = db::metrics::get_counter_prefix_sum("session_health_warning_total");
     assert!(
@@ -2209,7 +2296,10 @@ async fn proposal_046_required_metric_names_are_all_present_in_constant() {
             "P046_REQUIRED_METRICS must not contain empty strings"
         );
         assert!(
-            name.starts_with("session_graphql_") || name.starts_with("session_status_") || name.starts_with("session_health_") || name.starts_with("session_event_"),
+            name.starts_with("session_graphql_")
+                || name.starts_with("session_status_")
+                || name.starts_with("session_health_")
+                || name.starts_with("session_event_"),
             "P046 metric name '{name}' must use a p046 metric prefix"
         );
     }
@@ -2228,16 +2318,36 @@ async fn proposal_046_generation_and_event_connection_types_have_required_fields
         fields { name type { kind name ofType { kind name } } }
       }
     }"#;
-    let resp = schema.execute(Request::new(query).data(operator_principal())).await;
-    assert!(resp.errors.is_empty(), "SessionGenerationConnection introspection failed: {:?}", resp.errors);
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(
+        resp.errors.is_empty(),
+        "SessionGenerationConnection introspection failed: {:?}",
+        resp.errors
+    );
     let data = resp.data.into_json().unwrap();
     let type_obj = &data["__type"];
-    assert!(!type_obj.is_null(), "SessionGenerationConnection type must be present");
-    let fields = type_obj["fields"].as_array().expect("SessionGenerationConnection fields");
+    assert!(
+        !type_obj.is_null(),
+        "SessionGenerationConnection type must be present"
+    );
+    let fields = type_obj["fields"]
+        .as_array()
+        .expect("SessionGenerationConnection fields");
     let field_names: Vec<&str> = fields.iter().filter_map(|f| f["name"].as_str()).collect();
-    assert!(field_names.contains(&"edges"), "SessionGenerationConnection must have 'edges'; got {field_names:?}");
-    assert!(field_names.contains(&"nodes"), "SessionGenerationConnection must have 'nodes'; got {field_names:?}");
-    assert!(field_names.contains(&"pageInfo"), "SessionGenerationConnection must have 'pageInfo'; got {field_names:?}");
+    assert!(
+        field_names.contains(&"edges"),
+        "SessionGenerationConnection must have 'edges'; got {field_names:?}"
+    );
+    assert!(
+        field_names.contains(&"nodes"),
+        "SessionGenerationConnection must have 'nodes'; got {field_names:?}"
+    );
+    assert!(
+        field_names.contains(&"pageInfo"),
+        "SessionGenerationConnection must have 'pageInfo'; got {field_names:?}"
+    );
 
     // Check SessionGenerationEdge
     let query = r#"{
@@ -2245,15 +2355,36 @@ async fn proposal_046_generation_and_event_connection_types_have_required_fields
         fields { name type { kind name ofType { kind name } } }
       }
     }"#;
-    let resp = schema.execute(Request::new(query).data(operator_principal())).await;
-    assert!(resp.errors.is_empty(), "SessionGenerationEdge introspection failed: {:?}", resp.errors);
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(
+        resp.errors.is_empty(),
+        "SessionGenerationEdge introspection failed: {:?}",
+        resp.errors
+    );
     let data = resp.data.into_json().unwrap();
-    let fields = data["__type"]["fields"].as_array().expect("SessionGenerationEdge fields");
+    let fields = data["__type"]["fields"]
+        .as_array()
+        .expect("SessionGenerationEdge fields");
     let field_names: Vec<&str> = fields.iter().filter_map(|f| f["name"].as_str()).collect();
-    assert!(field_names.contains(&"cursor"), "SessionGenerationEdge must have 'cursor'; got {field_names:?}");
-    assert!(field_names.contains(&"node"), "SessionGenerationEdge must have 'node'; got {field_names:?}");
-    let cursor_field = fields.iter().find(|f| f["name"].as_str() == Some("cursor")).unwrap();
-    assert_eq!(cursor_field["type"]["kind"].as_str(), Some("NON_NULL"), "cursor must be NON_NULL");
+    assert!(
+        field_names.contains(&"cursor"),
+        "SessionGenerationEdge must have 'cursor'; got {field_names:?}"
+    );
+    assert!(
+        field_names.contains(&"node"),
+        "SessionGenerationEdge must have 'node'; got {field_names:?}"
+    );
+    let cursor_field = fields
+        .iter()
+        .find(|f| f["name"].as_str() == Some("cursor"))
+        .unwrap();
+    assert_eq!(
+        cursor_field["type"]["kind"].as_str(),
+        Some("NON_NULL"),
+        "cursor must be NON_NULL"
+    );
 
     // Check SessionEventConnection
     let query = r#"{
@@ -2261,16 +2392,36 @@ async fn proposal_046_generation_and_event_connection_types_have_required_fields
         fields { name type { kind name ofType { kind name } } }
       }
     }"#;
-    let resp = schema.execute(Request::new(query).data(operator_principal())).await;
-    assert!(resp.errors.is_empty(), "SessionEventConnection introspection failed: {:?}", resp.errors);
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(
+        resp.errors.is_empty(),
+        "SessionEventConnection introspection failed: {:?}",
+        resp.errors
+    );
     let data = resp.data.into_json().unwrap();
     let type_obj = &data["__type"];
-    assert!(!type_obj.is_null(), "SessionEventConnection type must be present");
-    let fields = type_obj["fields"].as_array().expect("SessionEventConnection fields");
+    assert!(
+        !type_obj.is_null(),
+        "SessionEventConnection type must be present"
+    );
+    let fields = type_obj["fields"]
+        .as_array()
+        .expect("SessionEventConnection fields");
     let field_names: Vec<&str> = fields.iter().filter_map(|f| f["name"].as_str()).collect();
-    assert!(field_names.contains(&"edges"), "SessionEventConnection must have 'edges'; got {field_names:?}");
-    assert!(field_names.contains(&"nodes"), "SessionEventConnection must have 'nodes'; got {field_names:?}");
-    assert!(field_names.contains(&"pageInfo"), "SessionEventConnection must have 'pageInfo'; got {field_names:?}");
+    assert!(
+        field_names.contains(&"edges"),
+        "SessionEventConnection must have 'edges'; got {field_names:?}"
+    );
+    assert!(
+        field_names.contains(&"nodes"),
+        "SessionEventConnection must have 'nodes'; got {field_names:?}"
+    );
+    assert!(
+        field_names.contains(&"pageInfo"),
+        "SessionEventConnection must have 'pageInfo'; got {field_names:?}"
+    );
 
     // Check SessionEventEdge
     let query = r#"{
@@ -2278,13 +2429,27 @@ async fn proposal_046_generation_and_event_connection_types_have_required_fields
         fields { name type { kind name ofType { kind name } } }
       }
     }"#;
-    let resp = schema.execute(Request::new(query).data(operator_principal())).await;
-    assert!(resp.errors.is_empty(), "SessionEventEdge introspection failed: {:?}", resp.errors);
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(
+        resp.errors.is_empty(),
+        "SessionEventEdge introspection failed: {:?}",
+        resp.errors
+    );
     let data = resp.data.into_json().unwrap();
-    let fields = data["__type"]["fields"].as_array().expect("SessionEventEdge fields");
+    let fields = data["__type"]["fields"]
+        .as_array()
+        .expect("SessionEventEdge fields");
     let field_names: Vec<&str> = fields.iter().filter_map(|f| f["name"].as_str()).collect();
-    assert!(field_names.contains(&"cursor"), "SessionEventEdge must have 'cursor'; got {field_names:?}");
-    assert!(field_names.contains(&"node"), "SessionEventEdge must have 'node'; got {field_names:?}");
+    assert!(
+        field_names.contains(&"cursor"),
+        "SessionEventEdge must have 'cursor'; got {field_names:?}"
+    );
+    assert!(
+        field_names.contains(&"node"),
+        "SessionEventEdge must have 'node'; got {field_names:?}"
+    );
 }
 
 // ── Redaction edge cases: unknown event type is fail-closed ───────────────────
@@ -2307,12 +2472,9 @@ async fn proposal_046_redaction_unknown_event_type_is_fail_closed() {
 
     // Seed a "Compacted" event type which maps to UNKNOWN_EVENT_SHAPE
     let gen_id = "gen-redact-unk-001";
-    db::repos::sessions::insert_generation(
-        &pool,
-        &generation_fixture(gen_id, lineage_id, 1, 0),
-    )
-    .await
-    .unwrap();
+    db::repos::sessions::insert_generation(&pool, &generation_fixture(gen_id, lineage_id, 1, 0))
+        .await
+        .unwrap();
     db::repos::sessions::insert_event(
         &pool,
         &SessionEvent {
@@ -2346,8 +2508,14 @@ async fn proposal_046_redaction_unknown_event_type_is_fail_closed() {
           }}
         }}"#
     );
-    let resp = schema.execute(Request::new(query).data(operator_principal())).await;
-    assert!(resp.errors.is_empty(), "sessionEvents must not error: {:?}", resp.errors);
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(
+        resp.errors.is_empty(),
+        "sessionEvents must not error: {:?}",
+        resp.errors
+    );
     let data = resp.data.into_json().unwrap();
     let nodes = data["sessionEvents"]["nodes"].as_array().unwrap();
     assert!(!nodes.is_empty(), "must have at least one event");
@@ -2359,7 +2527,9 @@ async fn proposal_046_redaction_unknown_event_type_is_fail_closed() {
         );
         let warnings = node["redactionWarnings"].as_array().unwrap();
         assert!(
-            warnings.iter().any(|w| w.as_str() == Some("redaction_unknown_event_type")),
+            warnings
+                .iter()
+                .any(|w| w.as_str() == Some("redaction_unknown_event_type")),
             "must have redaction_unknown_event_type warning; got {warnings:?}"
         );
     }
@@ -2382,12 +2552,11 @@ async fn proposal_046_subscription_graceful_shutdown_emits_resync() {
     let query = format!(
         r#"subscription {{ sessionStatusChanged(runId: "{run_id}") {{ runId resyncRequired }} }}"#
     );
-    let mut stream = schema
-        .execute_stream(
-            Request::new(query)
-                .data(table_operator_principal())
-                .data(shutdown_rx),
-        );
+    let mut stream = schema.execute_stream(
+        Request::new(query)
+            .data(table_operator_principal())
+            .data(shutdown_rx),
+    );
 
     // Give the subscription task time to start and enter its select loop.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2418,7 +2587,10 @@ async fn proposal_046_subscription_graceful_shutdown_emits_resync() {
             }
         }
     }
-    assert!(found_resync, "graceful shutdown must emit resyncRequired=true payload");
+    assert!(
+        found_resync,
+        "graceful shutdown must emit resyncRequired=true payload"
+    );
 }
 
 // ── Subscription: emit-lag metric is recorded on delivery ────────────────────
@@ -2436,22 +2608,15 @@ async fn proposal_046_emit_lag_metric_is_recorded_on_subscription_delivery() {
     )
     .await
     .unwrap();
-    db::repos::sessions::insert_generation(
-        &pool,
-        &generation_fixture(gen_id, lineage_id, 1, 0),
-    )
-    .await
-    .unwrap();
+    db::repos::sessions::insert_generation(&pool, &generation_fixture(gen_id, lineage_id, 1, 0))
+        .await
+        .unwrap();
 
     let (schema, events) = make_schema_with_p046_and_events(pool.clone());
 
-    let query = format!(
-        r#"subscription {{ sessionStatusChanged(runId: "{run_id}") {{ runId }} }}"#
-    );
-    let mut stream = schema
-        .execute_stream(
-            Request::new(query).data(table_operator_principal()),
-        );
+    let query =
+        format!(r#"subscription {{ sessionStatusChanged(runId: "{run_id}") {{ runId }} }}"#);
+    let mut stream = schema.execute_stream(Request::new(query).data(table_operator_principal()));
 
     // Give subscription task time to start.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2459,7 +2624,7 @@ async fn proposal_046_emit_lag_metric_is_recorded_on_subscription_delivery() {
     // Seed an actual event row so the DB lookup finds something.
     sqlx::query(
         "INSERT INTO session_events (id, lineage_id, generation_id, event_type, recorded_at) \
-         VALUES (?1, ?2, ?3, 'created', datetime('now'))"
+         VALUES (?1, ?2, ?3, 'created', datetime('now'))",
     )
     .bind("evt-lag-001")
     .bind(lineage_id)
@@ -2512,12 +2677,25 @@ async fn proposal_046_session_end_reason_is_graphql_enum() {
         enumValues { name }
       }
     }"#;
-    let resp = schema.execute(Request::new(query).data(operator_principal())).await;
-    assert!(resp.errors.is_empty(), "SessionEndReason introspection failed: {:?}", resp.errors);
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(
+        resp.errors.is_empty(),
+        "SessionEndReason introspection failed: {:?}",
+        resp.errors
+    );
     let data = resp.data.into_json().unwrap();
     let type_obj = &data["__type"];
-    assert!(!type_obj.is_null(), "SessionEndReason enum must be present in schema");
-    assert_eq!(type_obj["kind"].as_str(), Some("ENUM"), "SessionEndReason must be an ENUM");
+    assert!(
+        !type_obj.is_null(),
+        "SessionEndReason enum must be present in schema"
+    );
+    assert_eq!(
+        type_obj["kind"].as_str(),
+        Some("ENUM"),
+        "SessionEndReason must be an ENUM"
+    );
     let empty = vec![];
     let values: Vec<&str> = type_obj["enumValues"]
         .as_array()
@@ -2525,7 +2703,16 @@ async fn proposal_046_session_end_reason_is_graphql_enum() {
         .iter()
         .filter_map(|v| v["name"].as_str())
         .collect();
-    for expected in ["COMPLETED", "FAILED", "OPERATOR_RESET", "INVALIDATED", "CONTEXT_PRESSURE", "TRANSPORT_ERROR", "TIMEOUT", "UNKNOWN"] {
+    for expected in [
+        "COMPLETED",
+        "FAILED",
+        "OPERATOR_RESET",
+        "INVALIDATED",
+        "CONTEXT_PRESSURE",
+        "TRANSPORT_ERROR",
+        "TIMEOUT",
+        "UNKNOWN",
+    ] {
         assert!(
             values.contains(&expected),
             "SessionEndReason must contain {expected}; got {values:?}"
@@ -2541,9 +2728,14 @@ async fn proposal_046_redaction_malformed_json_fails_closed() {
     use graphql_server::types::session::redact_event_details;
 
     let (result, warnings) = redact_event_details(Some("not_valid_json{{{"));
-    assert!(result.is_none(), "malformed JSON must produce null detailsJsonRedacted");
     assert!(
-        warnings.iter().any(|w| w == "redaction_unknown_details_shape"),
+        result.is_none(),
+        "malformed JSON must produce null detailsJsonRedacted"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w == "redaction_unknown_details_shape"),
         "malformed JSON must produce redaction_unknown_details_shape warning; got {warnings:?}"
     );
 }
@@ -2564,7 +2756,10 @@ async fn proposal_046_redaction_oversized_payload_fails_closed() {
     .to_string();
 
     let (result, warnings) = redact_event_details(Some(&json));
-    assert!(result.is_none(), "oversized string value must produce null detailsJsonRedacted");
+    assert!(
+        result.is_none(),
+        "oversized string value must produce null detailsJsonRedacted"
+    );
     assert!(
         warnings.iter().any(|w| w == "redaction_size_limit_exceeded"),
         "oversized string value must produce redaction_size_limit_exceeded warning; got {warnings:?}"
@@ -2602,16 +2797,26 @@ async fn proposal_046_redaction_non_object_json_fails_closed() {
     use graphql_server::types::session::redact_event_details;
 
     let (result, warnings) = redact_event_details(Some(r#"["array_is_not_allowed"]"#));
-    assert!(result.is_none(), "JSON array root must produce null detailsJsonRedacted");
     assert!(
-        warnings.iter().any(|w| w == "redaction_unknown_details_shape"),
+        result.is_none(),
+        "JSON array root must produce null detailsJsonRedacted"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w == "redaction_unknown_details_shape"),
         "JSON array must produce redaction_unknown_details_shape warning; got {warnings:?}"
     );
 
     let (result2, warnings2) = redact_event_details(Some(r#""just_a_string""#));
-    assert!(result2.is_none(), "JSON string root must produce null detailsJsonRedacted");
     assert!(
-        warnings2.iter().any(|w| w == "redaction_unknown_details_shape"),
+        result2.is_none(),
+        "JSON string root must produce null detailsJsonRedacted"
+    );
+    assert!(
+        warnings2
+            .iter()
+            .any(|w| w == "redaction_unknown_details_shape"),
         "JSON string root must produce redaction_unknown_details_shape warning; got {warnings2:?}"
     );
 }
@@ -2634,15 +2839,23 @@ async fn proposal_046_typed_details_partial_safe_returns_allowed_fields() {
 
     // detailsJsonRedacted fails closed because of disallowed key rawPrompt.
     let (redacted, warnings) = redact_event_details(Some(&json));
-    assert!(redacted.is_none(), "partial-safe payload must produce null detailsJsonRedacted");
     assert!(
-        warnings.iter().any(|w| w == "redaction_unknown_details_shape"),
+        redacted.is_none(),
+        "partial-safe payload must produce null detailsJsonRedacted"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w == "redaction_unknown_details_shape"),
         "partial-safe payload must produce redaction_unknown_details_shape; got {warnings:?}"
     );
 
     // typedDetails must extract only the allowed safe fields (silently omits rawPrompt).
     let typed = extract_typed_details(Some(&json));
-    assert!(typed.is_some(), "partial-safe payload must produce non-null typedDetails");
+    assert!(
+        typed.is_some(),
+        "partial-safe payload must produce non-null typedDetails"
+    );
     let td = typed.unwrap();
     assert_eq!(
         td.schema_version.as_deref(),
@@ -2670,11 +2883,20 @@ async fn proposal_046_typed_details_full_safe_returns_all_fields() {
     .to_string();
 
     let (redacted, warnings) = redact_event_details(Some(&json));
-    assert!(redacted.is_some(), "full-safe payload must produce non-null detailsJsonRedacted");
-    assert!(warnings.is_empty(), "full-safe payload must produce no warnings");
+    assert!(
+        redacted.is_some(),
+        "full-safe payload must produce non-null detailsJsonRedacted"
+    );
+    assert!(
+        warnings.is_empty(),
+        "full-safe payload must produce no warnings"
+    );
 
     let typed = extract_typed_details(Some(&json));
-    assert!(typed.is_some(), "full-safe payload must produce non-null typedDetails");
+    assert!(
+        typed.is_some(),
+        "full-safe payload must produce non-null typedDetails"
+    );
     let td = typed.unwrap();
     assert_eq!(td.end_reason.as_deref(), Some("COMPLETED"));
 }
@@ -2713,7 +2935,10 @@ async fn proposal_046_typed_details_credential_value_omitted_silently() {
     let typed = extract_typed_details(Some(&json));
     // schemaVersion is safe, so typedDetails should be Some with schema_version set.
     // summaryCode has a credential prefix so it must be omitted (None).
-    assert!(typed.is_some(), "event with at least one safe field must produce non-null typedDetails");
+    assert!(
+        typed.is_some(),
+        "event with at least one safe field must produce non-null typedDetails"
+    );
     let td = typed.unwrap();
     assert!(
         td.summary_code.is_none(),
@@ -2741,9 +2966,13 @@ async fn proposal_046_subscription_lag_resync_stops_on_auth_revocation() {
 
     // Seed data so the subscription has a valid run to subscribe to.
     let lineage = lineage_fixture("lag-rev-lineage", run_id, "agent-a", "lineage-lag-rev", 0);
-    db::repos::sessions::insert_lineage(&pool, &lineage).await.unwrap();
+    db::repos::sessions::insert_lineage(&pool, &lineage)
+        .await
+        .unwrap();
     let gen = generation_fixture("lag-rev-gen", &lineage.id, 1, 0);
-    db::repos::sessions::insert_generation(&pool, &gen).await.unwrap();
+    db::repos::sessions::insert_generation(&pool, &gen)
+        .await
+        .unwrap();
     db::repos::sessions::insert_event(
         &pool,
         &event_fixture("lag-rev-ev-1", &lineage.id, &gen.id, 0, None),
@@ -2760,29 +2989,37 @@ async fn proposal_046_subscription_lag_resync_stops_on_auth_revocation() {
     let subscription = format!(
         r#"subscription {{ sessionStatusChanged(runId: "{run_id}") {{ runId resyncRequired }} }}"#
     );
-    let mut stream =
-        schema.execute_stream(Request::new(subscription).data(operator_principal()));
+    let mut stream = schema.execute_stream(
+        Request::new(subscription)
+            .data(operator_principal())
+            .data(operator_missing_from_live_table_credential()),
+    );
 
     let run_id_parsed: RunId = run_id.parse().unwrap();
     let publish_task = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        let _ = events.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
-        let _ = events.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
-        let _ = events.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
+        let _ = events.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_parsed,
+        });
+        let _ = events.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_parsed,
+        });
+        let _ = events.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_parsed,
+        });
     });
 
-    let item = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        stream.next(),
-    )
-    .await
-    .expect("timed out: error was not delivered")
-    .expect("stream ended without delivering error");
+    let item = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+        .await
+        .expect("timed out: error was not delivered")
+        .expect("stream ended without delivering error");
 
     publish_task.await.unwrap();
 
     assert!(
-        item.errors.iter().any(|e| e.message == "authorization_recheck_failed"),
+        item.errors
+            .iter()
+            .any(|e| e.message == "authorization_recheck_failed"),
         "lag resync must terminate with authorization_recheck_failed for revoked principal; \
          got {:?}",
         item.errors
@@ -2817,6 +3054,7 @@ async fn proposal_046_subscription_closed_resync_stops_on_auth_revocation() {
     let mut stream = schema.execute_stream(
         Request::new(subscription)
             .data(operator_principal())
+            .data(operator_missing_from_live_table_credential())
             .data(shutdown_rx),
     );
 
@@ -2826,18 +3064,17 @@ async fn proposal_046_subscription_closed_resync_stops_on_auth_revocation() {
         drop(shutdown_tx);
     });
 
-    let item = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        stream.next(),
-    )
-    .await
-    .expect("timed out: error was not delivered on shutdown drain")
-    .expect("stream ended without delivering error");
+    let item = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+        .await
+        .expect("timed out: error was not delivered on shutdown drain")
+        .expect("stream ended without delivering error");
 
     shutdown_task.await.unwrap();
 
     assert!(
-        item.errors.iter().any(|e| e.message == "authorization_recheck_failed"),
+        item.errors
+            .iter()
+            .any(|e| e.message == "authorization_recheck_failed"),
         "shutdown-drain resync must terminate with authorization_recheck_failed for revoked \
          principal; got {:?}",
         item.errors
@@ -2856,7 +3093,11 @@ async fn proposal_046_session_observability_available_returns_true_when_enabled(
         .execute(Request::new(query).data(table_operator_principal()))
         .await;
 
-    assert!(resp.errors.is_empty(), "capability probe must succeed: {:?}", resp.errors);
+    assert!(
+        resp.errors.is_empty(),
+        "capability probe must succeed: {:?}",
+        resp.errors
+    );
     assert_eq!(
         resp.data.into_json().unwrap()["sessionObservabilityAvailable"],
         serde_json::Value::Bool(true),
@@ -2901,7 +3142,8 @@ async fn proposal_046_session_lineages_returns_not_found_for_absent_run() {
     let pool = test_pool().await;
     let schema = make_schema_with_p046(pool);
 
-    let query = r#"{ sessionLineages(runId: "00000000-0000-0000-0000-999999999999") { nodes { id } } }"#;
+    let query =
+        r#"{ sessionLineages(runId: "00000000-0000-0000-0000-999999999999") { nodes { id } } }"#;
     let resp = schema
         .execute(Request::new(query).data(operator_principal()))
         .await;
@@ -2917,7 +3159,8 @@ async fn proposal_046_session_kpi_returns_not_found_for_absent_run() {
     let pool = test_pool().await;
     let schema = make_schema_with_p046(pool);
 
-    let query = r#"{ sessionKpiSummary(runId: "00000000-0000-0000-0000-999999999999") { lineageCount } }"#;
+    let query =
+        r#"{ sessionKpiSummary(runId: "00000000-0000-0000-0000-999999999999") { lineageCount } }"#;
     let resp = schema
         .execute(Request::new(query).data(operator_principal()))
         .await;
@@ -2983,11 +3226,17 @@ async fn proposal_046_session_health_orphan_probe_is_run_scoped() {
 
     // Query run_a health: run_b's data must not produce a generation_without_lineage
     // warning in run_a's health report.
-    let query_a = format!(r#"{{ sessionHealth(runId: "{run_id_a}") {{ state warnings {{ reasonCode }} }} }}"#);
+    let query_a = format!(
+        r#"{{ sessionHealth(runId: "{run_id_a}") {{ state warnings {{ reasonCode }} }} }}"#
+    );
     let resp = schema
         .execute(Request::new(query_a).data(operator_principal()))
         .await;
-    assert!(resp.errors.is_empty(), "sessionHealth must not error: {:?}", resp.errors);
+    assert!(
+        resp.errors.is_empty(),
+        "sessionHealth must not error: {:?}",
+        resp.errors
+    );
     let data = resp.data.into_json().unwrap();
     let warnings = data["sessionHealth"]["warnings"].as_array().unwrap();
     let has_orphan_warning = warnings
@@ -3013,7 +3262,9 @@ async fn proposal_046_redaction_rejects_github_token_in_summary_code() {
         "GitHub token-shaped summaryCode must produce null redacted output"
     );
     assert!(
-        warnings.iter().any(|w| w == "redaction_unknown_details_shape"),
+        warnings
+            .iter()
+            .any(|w| w == "redaction_unknown_details_shape"),
         "must emit bounded warning for credential-shaped value, got {warnings:?}"
     );
 }
@@ -3028,7 +3279,9 @@ async fn proposal_046_redaction_rejects_sk_token_in_diagnostic_code() {
         "sk- prefixed safeDiagnosticCode must produce null redacted output"
     );
     assert!(
-        warnings.iter().any(|w| w == "redaction_unknown_details_shape"),
+        warnings
+            .iter()
+            .any(|w| w == "redaction_unknown_details_shape"),
         "must emit bounded warning for sk- credential-shaped value, got {warnings:?}"
     );
 }
@@ -3043,7 +3296,9 @@ async fn proposal_046_redaction_rejects_jwt_in_reset_reason() {
         "JWT-prefixed resetReason must produce null redacted output"
     );
     assert!(
-        warnings.iter().any(|w| w == "redaction_unknown_details_shape"),
+        warnings
+            .iter()
+            .any(|w| w == "redaction_unknown_details_shape"),
         "must emit bounded warning for JWT-shaped value, got {warnings:?}"
     );
 }
@@ -3082,9 +3337,13 @@ async fn proposal_046_subscription_live_revocation_stops_emissions() {
 
     // Seed session data so latest_session_event_for_run returns Some (required for emission).
     let lineage = lineage_fixture("rev-live-lineage", run_id, "agent-a", "rev-live-family", 0);
-    db::repos::sessions::insert_lineage(&pool, &lineage).await.unwrap();
+    db::repos::sessions::insert_lineage(&pool, &lineage)
+        .await
+        .unwrap();
     let gen = generation_fixture("rev-live-gen", &lineage.id, 1, 0);
-    db::repos::sessions::insert_generation(&pool, &gen).await.unwrap();
+    db::repos::sessions::insert_generation(&pool, &gen)
+        .await
+        .unwrap();
     db::repos::sessions::insert_event(
         &pool,
         &event_fixture("rev-live-ev-1", &lineage.id, &gen.id, 0, None),
@@ -3110,9 +3369,8 @@ async fn proposal_046_subscription_live_revocation_stops_emissions() {
         r#"subscription {{ sessionStatusChanged(runId: "{run_id}") {{ runId resyncRequired }} }}"#
     );
     // table_operator_principal() id="test-operator" IS in the initial test_fixture table.
-    let mut stream = schema.execute_stream(
-        Request::new(subscription).data(table_operator_principal()),
-    );
+    let mut stream =
+        schema.execute_stream(Request::new(subscription).data(table_operator_principal()));
 
     let run_id_parsed: RunId = run_id.parse().unwrap();
 
@@ -3123,15 +3381,14 @@ async fn proposal_046_subscription_live_revocation_stops_emissions() {
     let publish_first = tokio::spawn(async move {
         // 100ms delay (vs 30ms) for robustness under load (full suite with --test-threads=1).
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _ = events_clone.send(DomainEvent::SessionEventRecorded { run_id: run_id_first });
+        let _ = events_clone.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_first,
+        });
     });
-    let first = tokio::time::timeout(
-        std::time::Duration::from_millis(800),
-        stream.next(),
-    )
-    .await
-    .expect("timed out waiting for first event")
-    .expect("stream ended before first event");
+    let first = tokio::time::timeout(std::time::Duration::from_millis(800), stream.next())
+        .await
+        .expect("timed out waiting for first event")
+        .expect("stream ended before first event");
     publish_first.await.unwrap();
     assert!(
         first.errors.is_empty(),
@@ -3140,21 +3397,137 @@ async fn proposal_046_subscription_live_revocation_stops_emissions() {
     );
 
     // Revoke: replace the live table with one that does NOT contain test-operator.
-    live_handle.update(auth::PrincipalTable::test_fixture_with_id("other-operator")).await;
+    live_handle
+        .update(auth::PrincipalTable::test_fixture_with_id("other-operator"))
+        .await;
 
     // Second emission: subscription task is already running so direct send is safe.
-    let _ = events.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        stream.next(),
+    let _ = events.send(DomainEvent::SessionEventRecorded {
+        run_id: run_id_parsed,
+    });
+    let result = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+        .await
+        .expect("timed out waiting for auth_recheck_failed after revocation")
+        .expect("stream ended without delivering error");
+
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| e.message == "authorization_recheck_failed"),
+        "live revocation must terminate subscription with authorization_recheck_failed; \
+         got {:?}",
+        result.errors
+    );
+}
+
+#[tokio::test]
+async fn proposal_046_subscription_same_principal_token_rotation_stops_emissions() {
+    let pool = test_pool().await;
+    let run_id = "00000000-0000-0000-0000-000000000705";
+    seed_run(&pool, run_id).await;
+
+    let lineage = lineage_fixture("rotation-lineage", run_id, "agent-a", "rotation-family", 0);
+    db::repos::sessions::insert_lineage(&pool, &lineage)
+        .await
+        .unwrap();
+    let gen = generation_fixture("rotation-gen", &lineage.id, 1, 0);
+    db::repos::sessions::insert_generation(&pool, &gen)
+        .await
+        .unwrap();
+    db::repos::sessions::insert_event(
+        &pool,
+        &event_fixture("rotation-ev-1", &lineage.id, &gen.id, 0, None),
     )
     .await
-    .expect("timed out waiting for auth_recheck_failed after revocation")
-    .expect("stream ended without delivering error");
+    .unwrap();
+
+    let events = event_bus::new_bus(128);
+    let handler = Arc::new(CommandHandler::new(
+        pool.clone(),
+        events.clone(),
+        WorkQueue::new(pool.clone()),
+    ));
+    let (schema, live_handle) = build_schema_with_session_observability_and_live_handle(
+        pool,
+        handler,
+        events.clone(),
+        auth::PrincipalTable::test_fixture(),
+        LifecycleReporter::new(15, "test-build", events.clone()),
+    );
+
+    let subscription = format!(
+        r#"subscription {{ sessionStatusChanged(runId: "{run_id}") {{ runId resyncRequired }} }}"#
+    );
+    let mut stream =
+        schema.execute_stream(Request::new(subscription).data(table_operator_principal()));
+
+    let run_id_parsed: RunId = run_id.parse().unwrap();
+    let events_clone = events.clone();
+    let publish_first = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = events_clone.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_parsed,
+        });
+    });
+    let first = tokio::time::timeout(std::time::Duration::from_millis(800), stream.next())
+        .await
+        .expect("timed out waiting for first event")
+        .expect("stream ended before first event");
+    publish_first.await.unwrap();
+    assert!(
+        first.errors.is_empty(),
+        "first emission should succeed, got {:?}",
+        first.errors
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let principals_path = dir.path().join("principals.json");
+    let rotated_json = r#"{
+        "schema_version": 2,
+        "principals": [{
+            "token": "rotated-token-same-principal",
+            "id": "test-operator",
+            "class": "operator",
+            "surface_policies": {
+                "graphql": {
+                    "allow_queries": true,
+                    "allow_subscriptions": true,
+                    "allowed_mutations": ["approveApproval", "rejectApproval"]
+                },
+                "mcp": { "allowed_tools": [] }
+            }
+        }]
+    }"#;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&principals_path)
+            .unwrap();
+        f.write_all(rotated_json.as_bytes()).unwrap();
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&principals_path, rotated_json).unwrap();
+
+    let rotated_table = auth::PrincipalTable::load_or_bootstrap(&principals_path).unwrap();
+    live_handle.update(rotated_table).await;
+
+    let _ = events.send(DomainEvent::SessionEventRecorded {
+        run_id: run_id_parsed,
+    });
+    let result = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+        .await
+        .expect("timed out waiting for auth_recheck_failed after token rotation")
+        .expect("stream ended without delivering error");
 
     assert!(
         result.errors.iter().any(|e| e.message == "authorization_recheck_failed"),
-        "live revocation must terminate subscription with authorization_recheck_failed; \
+        "same-principal token rotation must terminate subscription with authorization_recheck_failed; \
          got {:?}",
         result.errors
     );
@@ -3169,7 +3542,7 @@ async fn proposal_046_subscription_live_revocation_stops_emissions() {
 
 #[tokio::test]
 async fn proposal_046_file_backed_principal_revocation_observed_by_live_handle() {
-    use graphql_server::types::session::P046LivePrincipalHandle;
+    use graphql_server::types::session::{P046LiveCredential, P046LivePrincipalHandle};
 
     let dir = tempfile::tempdir().unwrap();
     let principals_path = dir.path().join("principals.json");
@@ -3179,11 +3552,23 @@ async fn proposal_046_file_backed_principal_revocation_observed_by_live_handle()
     let principal_id = "default-operator";
 
     let live_handle = P046LivePrincipalHandle::new(table1);
+    let credential = P046LiveCredential {
+        principal_id: principal_id.to_string(),
+        token_fingerprint: auth::principal_token_fingerprint_by_id(
+            &auth::PrincipalTable::load_or_bootstrap(&principals_path).unwrap(),
+            principal_id,
+        )
+        .unwrap(),
+    };
 
     // Confirm the principal is authorized in the initial table.
     assert!(
         live_handle.auth_ok(principal_id).await,
         "default-operator must be authorized before revocation"
+    );
+    assert!(
+        live_handle.auth_ok_for_credential(&credential).await,
+        "default-operator credential must be authorized before revocation"
     );
 
     // Write a new principals.json that REPLACES default-operator with a different id.
@@ -3229,6 +3614,10 @@ async fn proposal_046_file_backed_principal_revocation_observed_by_live_handle()
     assert!(
         !live_handle.auth_ok(principal_id).await,
         "default-operator must be denied after file-backed revocation"
+    );
+    assert!(
+        !live_handle.auth_ok_for_credential(&credential).await,
+        "default-operator credential must be denied after file-backed revocation"
     );
 
     // The replacement principal must pass auth.
@@ -3283,7 +3672,10 @@ async fn proposal_046_health_generation_without_lineage_detected() {
     // 3. Insert a session_generation referencing the orphan lineage_id.
     //    There is NO session_lineage row for orphan_lineage_id — disable FK enforcement
     //    for this insert to simulate the integrity anomaly the health check must detect.
-    sqlx::query("PRAGMA foreign_keys = OFF").execute(&pool).await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query(
         r#"INSERT INTO session_generations
            (id, lineage_id, generation, invocation_owner_key, provider_session_id,
@@ -3298,7 +3690,10 @@ async fn proposal_046_health_generation_without_lineage_detected() {
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let schema = make_schema_with_p046(pool);
     let query = format!(
@@ -3317,9 +3712,9 @@ async fn proposal_046_health_generation_without_lineage_detected() {
     );
     let data = resp.data.into_json().unwrap();
     let warnings = data["sessionHealth"]["warnings"].as_array().unwrap();
-    let has_orphan_warning = warnings.iter().any(|w| {
-        w["reasonCode"].as_str() == Some("generation_without_lineage")
-    });
+    let has_orphan_warning = warnings
+        .iter()
+        .any(|w| w["reasonCode"].as_str() == Some("generation_without_lineage"));
     assert!(
         has_orphan_warning,
         "expected generation_without_lineage warning in sessionHealth; \
@@ -3341,9 +3736,13 @@ async fn proposal_046_subscription_fails_closed_on_auth_source_unavailable() {
 
     // Seed session data so latest_session_event_for_run returns Some (allowing payload emission).
     let lineage = lineage_fixture("unavail-lineage", run_id, "agent-a", "unavail-key", 0);
-    db::repos::sessions::insert_lineage(&pool, &lineage).await.unwrap();
+    db::repos::sessions::insert_lineage(&pool, &lineage)
+        .await
+        .unwrap();
     let gen = generation_fixture("unavail-gen", &lineage.id, 1, 0);
-    db::repos::sessions::insert_generation(&pool, &gen).await.unwrap();
+    db::repos::sessions::insert_generation(&pool, &gen)
+        .await
+        .unwrap();
     db::repos::sessions::insert_event(
         &pool,
         &event_fixture("unavail-ev-1", &lineage.id, &gen.id, 1, None),
@@ -3368,9 +3767,8 @@ async fn proposal_046_subscription_fails_closed_on_auth_source_unavailable() {
     let subscription = format!(
         r#"subscription {{ sessionStatusChanged(runId: "{run_id}") {{ runId resyncRequired }} }}"#
     );
-    let mut stream = schema.execute_stream(
-        Request::new(subscription).data(table_operator_principal()),
-    );
+    let mut stream =
+        schema.execute_stream(Request::new(subscription).data(table_operator_principal()));
 
     let run_id_parsed: RunId = run_id.parse().unwrap();
 
@@ -3378,32 +3776,37 @@ async fn proposal_046_subscription_fails_closed_on_auth_source_unavailable() {
     let events_clone = events.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _ = events_clone.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
+        let _ = events_clone.send(DomainEvent::SessionEventRecorded {
+            run_id: run_id_parsed,
+        });
     });
-    let first = tokio::time::timeout(
-        std::time::Duration::from_millis(800),
-        stream.next(),
-    )
-    .await
-    .expect("timed out waiting for first event")
-    .expect("stream ended before first event");
-    assert!(first.errors.is_empty(), "first emission should succeed, got {:?}", first.errors);
+    let first = tokio::time::timeout(std::time::Duration::from_millis(800), stream.next())
+        .await
+        .expect("timed out waiting for first event")
+        .expect("stream ended before first event");
+    assert!(
+        first.errors.is_empty(),
+        "first emission should succeed, got {:?}",
+        first.errors
+    );
 
     // Mark auth source unavailable (simulates principals.json reload failure).
     live_handle.mark_unavailable().await;
 
     // Second emission: auth_ok must return false (None table → deny-all).
-    let _ = events.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        stream.next(),
-    )
-    .await
-    .expect("timed out waiting for fail-closed error after mark_unavailable")
-    .expect("stream ended without delivering error");
+    let _ = events.send(DomainEvent::SessionEventRecorded {
+        run_id: run_id_parsed,
+    });
+    let result = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next())
+        .await
+        .expect("timed out waiting for fail-closed error after mark_unavailable")
+        .expect("stream ended without delivering error");
 
     assert!(
-        result.errors.iter().any(|e| e.message == "authorization_recheck_failed"),
+        result
+            .errors
+            .iter()
+            .any(|e| e.message == "authorization_recheck_failed"),
         "auth source unavailable must terminate subscription with authorization_recheck_failed; \
          got {:?}",
         result.errors
@@ -3448,7 +3851,10 @@ fn proposal_046_redaction_google_aiza_key_fails_closed() {
     let json = r#"{"schemaVersion":"p046_event_details_redaction_v1","modelFamily":"AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI"}"#;
     let (result, warnings) = redact_event_details(Some(json));
     assert!(result.is_none(), "Google AIza key must fail closed");
-    assert!(!warnings.is_empty(), "Google AIza key must produce a warning");
+    assert!(
+        !warnings.is_empty(),
+        "Google AIza key must produce a warning"
+    );
 }
 
 #[test]
@@ -3461,7 +3867,10 @@ fn proposal_046_redaction_non_vocab_summary_code_fails_closed() {
         result.is_none(),
         "non-vocabulary summaryCode value must fail closed; got {result:?}"
     );
-    assert!(!warnings.is_empty(), "non-vocabulary summaryCode must produce a warning");
+    assert!(
+        !warnings.is_empty(),
+        "non-vocabulary summaryCode must produce a warning"
+    );
 }
 
 #[test]
@@ -3474,7 +3883,10 @@ fn proposal_046_redaction_non_vocab_model_family_fails_closed() {
         result.is_none(),
         "non-vocabulary modelFamily must fail closed; got {result:?}"
     );
-    assert!(!warnings.is_empty(), "non-vocabulary modelFamily must produce a warning");
+    assert!(
+        !warnings.is_empty(),
+        "non-vocabulary modelFamily must produce a warning"
+    );
 }
 
 #[test]
@@ -3541,12 +3953,16 @@ async fn proposal_046_lineage_health_state_is_warning_for_invalidated_active_gen
     seed_run(&pool, run_id).await;
 
     let lineage = lineage_fixture("lineage-inv-active", run_id, "agent-a", "inv-active-key", 0);
-    db::repos::sessions::insert_lineage(&pool, &lineage).await.unwrap();
+    db::repos::sessions::insert_lineage(&pool, &lineage)
+        .await
+        .unwrap();
 
     // Insert an INVALIDATED generation.
     let mut gen = generation_fixture("gen-inv", &lineage.id, 1, 0);
     gen.status = SessionGenerationStatus::Invalidated;
-    db::repos::sessions::insert_generation(&pool, &gen).await.unwrap();
+    db::repos::sessions::insert_generation(&pool, &gen)
+        .await
+        .unwrap();
 
     // Point lineage to the invalidated generation as active.
     db::repos::sessions::set_active_generation(&pool, &lineage.id, Some(&gen.id))
@@ -3554,9 +3970,8 @@ async fn proposal_046_lineage_health_state_is_warning_for_invalidated_active_gen
         .unwrap();
 
     let schema = make_schema_with_p046(pool);
-    let query = format!(
-        r#"{{ sessionLineages(runId: "{run_id}") {{ nodes {{ id healthState }} }} }}"#
-    );
+    let query =
+        format!(r#"{{ sessionLineages(runId: "{run_id}") {{ nodes {{ id healthState }} }} }}"#);
     let resp = schema
         .execute(Request::new(query).data(operator_principal()))
         .await;
@@ -3578,10 +3993,14 @@ async fn proposal_046_lineage_health_state_is_healthy_for_active_gen() {
     seed_run(&pool, run_id).await;
 
     let lineage = lineage_fixture("lineage-active-ok", run_id, "agent-a", "active-ok-key", 0);
-    db::repos::sessions::insert_lineage(&pool, &lineage).await.unwrap();
+    db::repos::sessions::insert_lineage(&pool, &lineage)
+        .await
+        .unwrap();
 
     let gen = generation_fixture("gen-active-ok", &lineage.id, 1, 0);
-    db::repos::sessions::insert_generation(&pool, &gen).await.unwrap();
+    db::repos::sessions::insert_generation(&pool, &gen)
+        .await
+        .unwrap();
 
     // Point lineage to the ACTIVE generation.
     db::repos::sessions::set_active_generation(&pool, &lineage.id, Some(&gen.id))
@@ -3589,9 +4008,8 @@ async fn proposal_046_lineage_health_state_is_healthy_for_active_gen() {
         .unwrap();
 
     let schema = make_schema_with_p046(pool);
-    let query = format!(
-        r#"{{ sessionLineages(runId: "{run_id}") {{ nodes {{ id healthState }} }} }}"#
-    );
+    let query =
+        format!(r#"{{ sessionLineages(runId: "{run_id}") {{ nodes {{ id healthState }} }} }}"#);
     let resp = schema
         .execute(Request::new(query).data(operator_principal()))
         .await;
@@ -3630,12 +4048,18 @@ async fn proposal_046_sdl_first_argument_has_default_value_in_schema() {
     let resp = schema
         .execute(Request::new(query).data(operator_principal()))
         .await;
-    assert!(resp.errors.is_empty(), "introspection failed: {:?}", resp.errors);
+    assert!(
+        resp.errors.is_empty(),
+        "introspection failed: {:?}",
+        resp.errors
+    );
     let data = resp.data.into_json().unwrap();
     let fields = data["__schema"]["queryType"]["fields"].as_array().unwrap();
 
     // Check sessionLineages.first defaultValue.
-    let sl = fields.iter().find(|f| f["name"].as_str() == Some("sessionLineages"));
+    let sl = fields
+        .iter()
+        .find(|f| f["name"].as_str() == Some("sessionLineages"));
     assert!(sl.is_some(), "sessionLineages must be in schema");
     let sl_args = sl.unwrap()["args"].as_array().unwrap();
     let sl_first = sl_args.iter().find(|a| a["name"].as_str() == Some("first"));
@@ -3647,7 +4071,9 @@ async fn proposal_046_sdl_first_argument_has_default_value_in_schema() {
     );
 
     // Check sessionEvents.first defaultValue.
-    let se = fields.iter().find(|f| f["name"].as_str() == Some("sessionEvents"));
+    let se = fields
+        .iter()
+        .find(|f| f["name"].as_str() == Some("sessionEvents"));
     assert!(se.is_some(), "sessionEvents must be in schema");
     let se_args = se.unwrap()["args"].as_array().unwrap();
     let se_first = se_args.iter().find(|a| a["name"].as_str() == Some("first"));
@@ -3676,7 +4102,11 @@ async fn type_field_names(schema: &AppSchema, type_name: &str) -> Vec<String> {
     let resp = schema
         .execute(Request::new(query).data(operator_principal()))
         .await;
-    assert!(resp.errors.is_empty(), "introspection failed: {:?}", resp.errors);
+    assert!(
+        resp.errors.is_empty(),
+        "introspection failed: {:?}",
+        resp.errors
+    );
     let data = resp.data.into_json().unwrap();
     data["__type"]["fields"]
         .as_array()

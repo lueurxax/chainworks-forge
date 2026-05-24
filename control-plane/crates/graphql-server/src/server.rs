@@ -14,6 +14,7 @@ use engine::lifecycle_reporter::LifecycleReporter;
 use tracing::info;
 
 use crate::schema::AppSchema;
+use crate::types::session::P046LiveCredential;
 
 async fn graphql_playground() -> impl IntoResponse {
     Html(async_graphql::http::playground_source(
@@ -108,6 +109,10 @@ async fn connection_init_data(
         Some(t) => match auth::resolve_bearer(t, &table) {
             Ok(principal) => {
                 let mut data = async_graphql::Data::default();
+                data.insert(P046LiveCredential {
+                    principal_id: principal.id.clone(),
+                    token_fingerprint: auth::token_fingerprint(t),
+                });
                 data.insert(principal);
                 Ok(data)
             }

@@ -2871,6 +2871,13 @@ PY
     ;;
   proposal-046|p046)
     log "Proposal 046 control-plane gate: session GraphQL observability (read-only queries, subscription, authorization, redaction)"
+    log "Proposal 046: verifying no root-level output artifacts are present"
+    for output_artifact in CHAINWORKS_OUTPUT chainworks_output.json tmp_chainworks_output.json; do
+      if [[ -e "$ROOT_DIR/$output_artifact" ]]; then
+        log "ERROR: stale output artifact exists outside the canonical meta-root: $ROOT_DIR/$output_artifact"
+        exit 1
+      fi
+    done
     (
       cd "$ROOT_DIR/control-plane"
       cargo test -p graphql-server --test proposal_046_session_graphql -- --test-threads=1 --nocapture
