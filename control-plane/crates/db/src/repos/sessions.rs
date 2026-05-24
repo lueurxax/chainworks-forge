@@ -742,7 +742,9 @@ fn decode_cursor_parts(cursor: &str, expected_len: usize) -> Option<Vec<String>>
     if cursor.is_empty() {
         return None;
     }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(cursor).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(cursor)
+        .ok()?;
     let raw = String::from_utf8(bytes).ok()?;
     let parts: Vec<String> = raw.split('\x00').map(str::to_string).collect();
     (parts.len() == expected_len).then_some(parts)
@@ -817,7 +819,12 @@ pub fn encode_session_generation_cursor(generation: &SessionGeneration) -> Strin
 /// Returns (lineage_id, generation, created_at, id) or None for invalid cursors.
 pub fn decode_session_generation_cursor(cursor: &str) -> Option<(String, i64, String, String)> {
     let parts = decode_cursor_parts(cursor, 4)?;
-    Some((parts[0].clone(), parts[1].parse().ok()?, parts[2].clone(), parts[3].clone()))
+    Some((
+        parts[0].clone(),
+        parts[1].parse().ok()?,
+        parts[2].clone(),
+        parts[3].clone(),
+    ))
 }
 
 pub async fn list_lineages_for_run_paginated(
@@ -1214,13 +1221,10 @@ pub async fn load_health_data_for_run(
     pool: &SqlitePool,
     run_id: &str,
 ) -> Result<SessionHealthData> {
-    // Cap at 256 lineages for memory safety. ORDER BY created_at, id makes the cap
-    // deterministic: on large runs the same oldest-first set of lineages is always
-    // evaluated rather than an arbitrary subset.
     let lineages = sqlx::query(
         r#"SELECT id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
                   active_generation_id, created_at, closed_at
-           FROM session_lineages WHERE run_id = ?1 ORDER BY created_at, id LIMIT 256"#,
+           FROM session_lineages WHERE run_id = ?1 ORDER BY created_at, id"#,
     )
     .bind(run_id)
     .fetch_all(pool)
@@ -1260,7 +1264,7 @@ pub async fn load_health_data_for_run(
            FROM session_events e
            JOIN session_lineages l ON e.lineage_id = l.id
            WHERE l.run_id = ?1 AND e.event_type = 'operator_reset' AND e.recorded_at >= ?2
-           ORDER BY e.recorded_at, e.id LIMIT 64"#,
+           ORDER BY e.recorded_at, e.id"#,
     )
     .bind(run_id)
     .bind(&threshold_30m_ts)
@@ -1276,7 +1280,7 @@ pub async fn load_health_data_for_run(
            FROM session_events e
            JOIN session_lineages l ON e.lineage_id = l.id
            WHERE l.run_id = ?1 AND e.event_type = 'output_contract_repair_failed' AND e.recorded_at >= ?2
-           ORDER BY e.recorded_at, e.id LIMIT 64"#,
+           ORDER BY e.recorded_at, e.id"#,
     )
     .bind(run_id)
     .bind(&threshold_30m_ts)
@@ -1292,7 +1296,7 @@ pub async fn load_health_data_for_run(
            FROM session_events e
            JOIN session_lineages l ON e.lineage_id = l.id
            WHERE l.run_id = ?1 AND e.event_type = 'operator_reset' AND e.recorded_at >= ?2
-           ORDER BY e.recorded_at, e.id LIMIT 64"#,
+           ORDER BY e.recorded_at, e.id"#,
     )
     .bind(run_id)
     .bind(&threshold_24h_ts)
@@ -1311,7 +1315,10 @@ pub async fn load_health_data_for_run(
         .context("load run status for health")?
         .map(|r| {
             let status: String = r.get("status");
-            matches!(status.as_str(), "completed" | "failed" | "cancelled" | "cancelling")
+            matches!(
+                status.as_str(),
+                "completed" | "failed" | "cancelled" | "cancelling"
+            )
         })
         .unwrap_or(false);
 
@@ -1433,7 +1440,11 @@ pub async fn aggregate_lineage_stats_for_page(
         sep.push_bind(id.as_str());
     }
     qb.push(") GROUP BY l.id, ag.status");
-    let rows = qb.build().fetch_all(pool).await.context("aggregate lineage stats for page")?;
+    let rows = qb
+        .build()
+        .fetch_all(pool)
+        .await
+        .context("aggregate lineage stats for page")?;
     Ok(parse_lineage_stats_rows(rows))
 }
 
@@ -1454,12 +1465,18 @@ fn parse_lineage_stats_rows(
             .map(parse_dt)
             .transpose()
             .unwrap_or(None);
-        let active_gen_status_str: Option<String> =
-            row.try_get("active_gen_status").ok().flatten();
-        let active_generation_status = active_gen_status_str.as_deref().and_then(|s| {
-            serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
-        });
-        map.insert(lid, LineageStats { generation_count, latest_event_at, active_generation_status });
+        let active_gen_status_str: Option<String> = row.try_get("active_gen_status").ok().flatten();
+        let active_generation_status = active_gen_status_str
+            .as_deref()
+            .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok());
+        map.insert(
+            lid,
+            LineageStats {
+                generation_count,
+                latest_event_at,
+                active_generation_status,
+            },
+        );
     }
     map
 }
@@ -1502,7 +1519,11 @@ pub async fn aggregate_lineage_stats_for_lineage(
     let active_generation_status = active_gen_status_str
         .as_deref()
         .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok());
-    Ok(Some(LineageStats { generation_count, latest_event_at, active_generation_status }))
+    Ok(Some(LineageStats {
+        generation_count,
+        latest_event_at,
+        active_generation_status,
+    }))
 }
 
 fn parse_event_row(row: sqlx::sqlite::SqliteRow) -> Result<SessionEvent> {
@@ -1537,7 +1558,9 @@ fn session_event_type_from_str(s: &str) -> Result<SessionEventType> {
         // Unknown event types map to Compacted which renders as UNKNOWN_EVENT_SHAPE in GraphQL.
         // Details are withheld by the GraphQL redaction layer.
         other => {
-            tracing::warn!("p046 unknown session event type in DB: {other:?}; mapping to UNKNOWN_EVENT_SHAPE");
+            tracing::warn!(
+                "p046 unknown session event type in DB: {other:?}; mapping to UNKNOWN_EVENT_SHAPE"
+            );
             Ok(SessionEventType::Compacted)
         }
     }

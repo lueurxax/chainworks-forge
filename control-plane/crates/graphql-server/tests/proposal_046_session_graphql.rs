@@ -970,15 +970,22 @@ async fn proposal_046_invalid_cursor_returns_sanitized_error() {
     let pool = test_pool().await;
     let schema = make_schema_with_p046(pool);
 
-    let query = r#"{ sessionLineages(runId: "00000000-0000-0000-0000-000000000001", after: "NOTACURSOR") { nodes { id } } }"#;
-    let resp = schema
-        .execute(Request::new(query).data(operator_principal()))
-        .await;
-    assert!(
-        resp.errors.iter().any(|e| e.message == "invalid cursor"),
-        "malformed cursor must return 'invalid cursor' error; got: {:?}",
-        resp.errors
-    );
+    let cases = [
+        r#"{ sessionLineages(runId: "00000000-0000-0000-0000-000000000001", after: "NOTACURSOR") { nodes { id } } }"#,
+        r#"{ sessionGenerations(lineageId: "lineage-invalid-cursor", after: "NOTACURSOR") { nodes { id } } }"#,
+        r#"{ sessionEvents(lineageId: "lineage-invalid-cursor", after: "NOTACURSOR") { nodes { id } } }"#,
+    ];
+
+    for query in cases {
+        let resp = schema
+            .execute(Request::new(query).data(operator_principal()))
+            .await;
+        assert!(
+            resp.errors.iter().any(|e| e.message == "invalid cursor"),
+            "malformed cursor must return 'invalid cursor' error for query {query}; got: {:?}",
+            resp.errors
+        );
+    }
 }
 
 // ── Subscription schema presence ─────────────────────────────────────────────
@@ -1051,6 +1058,66 @@ async fn proposal_046_health_stale_active_generation() {
     assert!(
         state == "WARNING" || state == "CRITICAL",
         "state must be WARNING or CRITICAL for stale generation, got: {state}"
+    );
+}
+
+#[tokio::test]
+async fn proposal_046_health_evaluates_beyond_legacy_lineage_cap() {
+    let pool = test_pool().await;
+    let run_id = "00000000-0000-0000-0000-000000000477";
+    seed_run(&pool, run_id).await;
+
+    for idx in 0..257 {
+        let lineage_id = format!("health-cap-lineage-{idx:03}");
+        let lineage = lineage_fixture(
+            &lineage_id,
+            run_id,
+            "agent-a",
+            &format!("lineage-{idx:03}"),
+            idx,
+        );
+        let generation_id = format!("health-cap-gen-{idx:03}");
+        let mut generation = generation_fixture(&generation_id, &lineage.id, 1, idx);
+        if idx == 256 {
+            generation.last_activity_at = Some(fixed_time(-1800));
+        }
+        db::repos::sessions::insert_lineage(&pool, &lineage)
+            .await
+            .unwrap();
+        db::repos::sessions::insert_generation(&pool, &generation)
+            .await
+            .unwrap();
+        db::repos::sessions::set_active_generation(&pool, &lineage.id, Some(&generation.id))
+            .await
+            .unwrap();
+    }
+
+    let schema = make_schema_with_p046(pool);
+    let query = format!(
+        r#"{{
+          sessionHealth(runId: "{run_id}") {{
+            state
+            warnings {{ reasonCode lineageId }}
+          }}
+        }}"#
+    );
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(
+        resp.errors.is_empty(),
+        "health query failed: {:?}",
+        resp.errors
+    );
+
+    let data = resp.data.into_json().unwrap();
+    let warnings = data["sessionHealth"]["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| {
+            w["reasonCode"].as_str() == Some("stale_active_generation")
+                && w["lineageId"].as_str() == Some("health-cap-lineage-256")
+        }),
+        "health must evaluate persisted rows beyond the old 256-lineage cap; warnings={warnings:?}"
     );
 }
 

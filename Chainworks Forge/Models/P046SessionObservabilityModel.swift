@@ -55,6 +55,7 @@ struct P046SessionStatusChangedReadModel: Decodable, Sendable {
     let generationId: String?
     let eventId: String?
     let status: String
+    let recordedAt: String?
     let resyncRequired: Bool
 }
 
@@ -147,6 +148,7 @@ enum P046GraphQLDocuments {
             generationId
             eventId
             status
+            recordedAt
             resyncRequired
           }
         }
@@ -183,6 +185,7 @@ final class P046SessionObservabilityModel: ObservableObject {
 
     private var observationTask: Task<Void, Never>?
     private var observedRunID: String?
+    private var seenSubscriptionEventKeys: Set<String> = []
 
     init(
         checkCapability: @escaping @Sendable () async throws -> Bool,
@@ -251,6 +254,7 @@ final class P046SessionObservabilityModel: ObservableObject {
         observationTask?.cancel()
         observationTask = nil
         observedRunID = runID
+        seenSubscriptionEventKeys.removeAll()
         lineages = []
         kpiSummary = nil
         health = nil
@@ -330,23 +334,31 @@ final class P046SessionObservabilityModel: ObservableObject {
             for try await event in stream {
                 try Task.checkCancellation()
                 guard event.runId == runID else { continue }
+                guard markSubscriptionEventIfNew(event) else { continue }
                 if event.resyncRequired {
                     isStale = true
-                    await requery(runID: runID)
-                    isStale = false
+                    if await requery(runID: runID) {
+                        isStale = false
+                    }
                 } else {
-                    await requery(runID: runID)
+                    _ = await requery(runID: runID)
                 }
+            }
+            isStale = true
+            if await requery(runID: runID) {
+                isStale = false
             }
         } catch is CancellationError {
             return
         } catch {
-            // Subscription closed or error; mark stale so UI shows re-query guidance.
             isStale = true
+            if await requery(runID: runID) {
+                isStale = false
+            }
         }
     }
 
-    private func requery(runID: String) async {
+    private func requery(runID: String) async -> Bool {
         do {
             async let lineagesResult = fetchLineages(runID)
             async let kpiResult = fetchKpi(runID)
@@ -356,11 +368,31 @@ final class P046SessionObservabilityModel: ObservableObject {
             lineages = conn.nodes
             kpiSummary = kpi
             health = hlth
+            loadError = nil
+            return true
         } catch is CancellationError {
-            return
+            return false
         } catch {
-            // Non-fatal on refresh; keep prior state.
+            loadError = Self.describeError(error)
+            return false
         }
+    }
+
+    private func markSubscriptionEventIfNew(_ event: P046SessionStatusChangedReadModel) -> Bool {
+        let key: String
+        if let eventId = event.eventId, !eventId.isEmpty {
+            key = "event:\(eventId)"
+        } else {
+            key = [
+                "fallback",
+                event.lineageId ?? "_",
+                event.generationId ?? "_",
+                event.recordedAt ?? "_",
+                event.status,
+                event.resyncRequired ? "resync" : "status",
+            ].joined(separator: "\u{1f}")
+        }
+        return seenSubscriptionEventKeys.insert(key).inserted
     }
 
     // Returns true when the error indicates P046 fields are absent from the schema.

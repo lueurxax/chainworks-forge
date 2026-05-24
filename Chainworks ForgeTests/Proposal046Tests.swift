@@ -185,4 +185,175 @@ struct Proposal046Tests {
         #expect(model.availability == .unknown)
         #expect(model.lineages.isEmpty)
     }
+
+    @Test("Resync refresh failure keeps P046 session readback stale")
+    func resyncRefreshFailureKeepsSessionReadbackStale() async throws {
+        var fetchCount = 0
+        var continuation: AsyncThrowingStream<P046SessionStatusChangedReadModel, Error>.Continuation?
+        let model = Self.makeModel(
+            fetchLineages: { runID in
+                fetchCount += 1
+                if fetchCount == 1 {
+                    return Self.lineageConnection(runID: runID, marker: "initial")
+                }
+                throw P031GraphQLReadBoundaryError.graphqlErrors(["refresh failed"])
+            },
+            subscribeStatus: { _ in
+                AsyncThrowingStream { streamContinuation in
+                    continuation = streamContinuation
+                }
+            }
+        )
+
+        model.updateSelectedRun("run-1")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        continuation?.yield(Self.statusEvent(runID: "run-1", eventID: nil, status: "RESYNC_REQUIRED", resyncRequired: true))
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        #expect(model.isStale, "stale must remain true until a full fresh readback succeeds")
+        #expect(model.loadError == "refresh failed")
+    }
+
+    @Test("Normal subscription completion refreshes before clearing stale state")
+    func subscriptionCompletionRefreshesBeforeClearingStaleState() async throws {
+        var fetchCount = 0
+        let model = Self.makeModel(
+            fetchLineages: { runID in
+                fetchCount += 1
+                return Self.lineageConnection(runID: runID, marker: "fetch-\(fetchCount)")
+            },
+            subscribeStatus: { _ in
+                AsyncThrowingStream { streamContinuation in
+                    streamContinuation.finish()
+                }
+            }
+        )
+
+        model.updateSelectedRun("run-1")
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        #expect(fetchCount >= 2, "stream completion must trigger a fresh readback")
+        #expect(!model.isStale, "successful completion refresh may clear stale state")
+        #expect(model.lineages.first?.lineageKey == "fetch-2")
+    }
+
+    @Test("Subscription error attempts fresh readback before staying stale")
+    func subscriptionErrorAttemptsFreshReadback() async throws {
+        struct SubscriptionClosed: Error {}
+        var fetchCount = 0
+        let model = Self.makeModel(
+            fetchLineages: { runID in
+                fetchCount += 1
+                return Self.lineageConnection(runID: runID, marker: "fetch-\(fetchCount)")
+            },
+            subscribeStatus: { _ in
+                AsyncThrowingStream { streamContinuation in
+                    streamContinuation.finish(throwing: SubscriptionClosed())
+                }
+            }
+        )
+
+        model.updateSelectedRun("run-1")
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        #expect(fetchCount >= 2, "subscription error must attempt a fresh readback")
+        #expect(!model.isStale, "successful error refresh may clear stale state")
+        #expect(model.lineages.first?.lineageKey == "fetch-2")
+    }
+
+    @Test("Duplicate subscription events are ignored by event id")
+    func duplicateSubscriptionEventsAreIgnored() async throws {
+        var fetchCount = 0
+        var continuation: AsyncThrowingStream<P046SessionStatusChangedReadModel, Error>.Continuation?
+        let model = Self.makeModel(
+            fetchLineages: { runID in
+                fetchCount += 1
+                return Self.lineageConnection(runID: runID, marker: "fetch-\(fetchCount)")
+            },
+            subscribeStatus: { _ in
+                AsyncThrowingStream { streamContinuation in
+                    continuation = streamContinuation
+                }
+            }
+        )
+
+        model.updateSelectedRun("run-1")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        continuation?.yield(Self.statusEvent(runID: "run-1", eventID: "event-1"))
+        continuation?.yield(Self.statusEvent(runID: "run-1", eventID: "event-1"))
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        #expect(fetchCount == 2, "initial read plus one unique event refresh expected; got \(fetchCount)")
+        model.updateSelectedRun(nil)
+    }
+
+    private static func makeModel(
+        fetchLineages: @escaping @Sendable (String) async throws -> P046SessionLineageConnectionReadModel,
+        fetchKpi: @escaping @Sendable (String) async throws -> P046SessionKpiSummaryReadModel = { runID in
+            P046SessionKpiSummaryReadModel(
+                runId: runID,
+                lineageCount: 1,
+                generationCount: 1,
+                activeGenerationCount: 1,
+                closedGenerationCount: 0,
+                totalTurnCount: 0,
+                totalCostCents: 0,
+                latestActivityAt: nil
+            )
+        },
+        fetchHealth: @escaping @Sendable (String) async throws -> P046SessionHealthReadModel = { runID in
+            P046SessionHealthReadModel(
+                runId: runID,
+                state: "HEALTHY",
+                thresholdsVersion: "p046_session_health_thresholds_v1",
+                warnings: [],
+                checkedAt: nil
+            )
+        },
+        subscribeStatus: @escaping @Sendable (String) throws -> AsyncThrowingStream<P046SessionStatusChangedReadModel, Error>
+    ) -> P046SessionObservabilityModel {
+        P046SessionObservabilityModel(
+            checkCapability: { true },
+            fetchLineages: fetchLineages,
+            fetchKpi: fetchKpi,
+            fetchHealth: fetchHealth,
+            subscribeStatus: subscribeStatus
+        )
+    }
+
+    nonisolated private static func lineageConnection(runID: String, marker: String) -> P046SessionLineageConnectionReadModel {
+        P046SessionLineageConnectionReadModel(
+            nodes: [
+                P046SessionLineageReadModel(
+                    id: "\(runID)-lineage",
+                    agentId: "code_writer",
+                    lineageKey: marker,
+                    sessionReuseScope: "run",
+                    activeGenerationId: "generation-1",
+                    generationCount: 1,
+                    latestEventAt: nil,
+                    healthState: "HEALTHY",
+                    createdAt: nil
+                )
+            ],
+            pageInfo: .init(hasNextPage: false, endCursor: nil)
+        )
+    }
+
+    nonisolated private static func statusEvent(
+        runID: String,
+        eventID: String?,
+        status: String = "ACTIVE",
+        resyncRequired: Bool = false
+    ) -> P046SessionStatusChangedReadModel {
+        P046SessionStatusChangedReadModel(
+            runId: runID,
+            lineageId: "lineage-1",
+            generationId: "generation-1",
+            eventId: eventID,
+            status: status,
+            recordedAt: "2026-05-24T00:00:00Z",
+            resyncRequired: resyncRequired
+        )
+    }
 }
