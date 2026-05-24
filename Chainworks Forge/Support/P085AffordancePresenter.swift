@@ -383,6 +383,10 @@ enum P085AffordancePresenter {
       return "Projection lag detected. The action may be available after the projection catches up."
     case .unauthorized: return "You are not authorized to perform this action."
     case .unsupportedAction: return "This action is not supported."
+    case .approvalNotActionable: return "This approval is no longer actionable."
+    case .observerScope: return "Read-only access. Approval actions are not available."
+    case .nonApprovalMutation: return "GraphQL mutations are restricted to approval actions."
+    case .capabilityOutOfScope: return "Action Not Available."
     }
   }
 

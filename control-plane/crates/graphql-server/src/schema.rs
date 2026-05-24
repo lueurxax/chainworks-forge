@@ -1,6 +1,6 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_graphql::futures_util::StreamExt;
 use async_graphql::*;
@@ -9,8 +9,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, info, warn};
 
 use db::repos::{
-    approvals, artifact_contracts, artifacts, closeout, code_writer_completion_receipts, ideas,
-    projections, rollout_contract_checks, runs, steward as steward_repo, workflow_conflicts,
+    approvals, artifact_contracts, artifacts, audit_log, closeout, code_writer_completion_receipts,
+    ideas, projections, rollout_contract_checks, runs, steward as steward_repo, workflow_conflicts,
 };
 use db::writer::DbWriterHeartbeat;
 use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, ResolveApprovalCmd};
@@ -36,6 +36,92 @@ use crate::types::steward::{
 
 pub type AppSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 
+/// P081 server-side field redaction collector.
+///
+/// Resolver code records field-level redactions here without raising GraphQL
+/// errors. The HTTP handler attaches the collected entries to
+/// `extensions.redactions`, preserving the distinction between ordinary nulls
+/// and policy-redacted nulls for Swift clients.
+#[derive(Clone, Default)]
+pub struct P081GraphqlRedactionCollector {
+    redactions: Arc<Mutex<Vec<async_graphql::Value>>>,
+}
+
+impl P081GraphqlRedactionCollector {
+    pub fn push_field_null_redaction(
+        &self,
+        path: Vec<&str>,
+        row_id: Option<&str>,
+        caller_class: &str,
+    ) {
+        let mut object = async_graphql::indexmap::IndexMap::new();
+        object.insert(
+            async_graphql::Name::new("path"),
+            async_graphql::Value::List(
+                path.into_iter()
+                    .map(|segment| async_graphql::Value::String(segment.to_string()))
+                    .collect(),
+            ),
+        );
+        object.insert(
+            async_graphql::Name::new("reasonCode"),
+            async_graphql::Value::String("OBSERVER_SCOPE".to_string()),
+        );
+        if let Some(row_id) = row_id {
+            object.insert(
+                async_graphql::Name::new("rowId"),
+                async_graphql::Value::String(row_id.to_string()),
+            );
+        }
+        object.insert(
+            async_graphql::Name::new("redactionMode"),
+            async_graphql::Value::String("field_null_redacted".to_string()),
+        );
+        object.insert(
+            async_graphql::Name::new("callerClass"),
+            async_graphql::Value::String(caller_class.to_string()),
+        );
+        object.insert(
+            async_graphql::Name::new("redactionId"),
+            async_graphql::Value::String(format!(
+                "p081:{}:{}",
+                caller_class,
+                row_id.unwrap_or("unknown")
+            )),
+        );
+        db::metrics::increment_counter("graphql_redaction_extensions_total");
+        self.redactions
+            .lock()
+            .expect("p081 redaction collector poisoned")
+            .push(async_graphql::Value::Object(object));
+    }
+
+    pub fn snapshot(&self) -> Vec<async_graphql::Value> {
+        self.redactions
+            .lock()
+            .expect("p081 redaction collector poisoned")
+            .clone()
+    }
+}
+
+pub fn attach_p081_collected_redactions(
+    response: &mut async_graphql::Response,
+    collector: &P081GraphqlRedactionCollector,
+) {
+    let collected = collector.snapshot();
+    if collected.is_empty() {
+        return;
+    }
+    match response.extensions.get_mut("redactions") {
+        Some(async_graphql::Value::List(existing)) => existing.extend(collected),
+        _ => {
+            response
+                .extensions
+                .insert("redactions".into(), async_graphql::Value::List(collected));
+        }
+    }
+}
+
 pub fn build_schema(
     pool: SqlitePool,
     cmd_handler: Arc<CommandHandler>,
@@ -43,7 +129,15 @@ pub fn build_schema(
     principal_table: auth::PrincipalTable,
     reporter: LifecycleReporter,
 ) -> AppSchema {
-    build_schema_inner(pool, cmd_handler, events, principal_table, reporter, None)
+    build_schema_inner(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        None,
+        None,
+    )
 }
 
 pub fn build_schema_with_storage_writer(
@@ -61,6 +155,29 @@ pub fn build_schema_with_storage_writer(
         principal_table,
         reporter,
         Some(storage_writer_heartbeat),
+        None,
+    )
+}
+
+/// P081 Phase 3: build the schema with a shared BoundaryPolicy service injected so
+/// mutation_allowed and query guards can consult the daemon-level policy decision.
+pub fn build_schema_with_storage_writer_and_boundary_policy(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
+    boundary_policy: Arc<auth::boundary::BoundaryPolicy>,
+) -> AppSchema {
+    build_schema_inner(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        Some(storage_writer_heartbeat),
+        Some(boundary_policy),
     )
 }
 
@@ -71,6 +188,7 @@ fn build_schema_inner(
     principal_table: auth::PrincipalTable,
     reporter: LifecycleReporter,
     storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
+    boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
 ) -> AppSchema {
     let mut builder = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .data(pool)
@@ -81,23 +199,680 @@ fn build_schema_inner(
     if let Some(heartbeat) = storage_writer_heartbeat {
         builder = builder.data(heartbeat);
     }
+    if let Some(policy) = boundary_policy {
+        builder = builder.data(policy);
+    }
     builder.finish()
 }
 
 pub struct QueryRoot;
 
-fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
+fn boundary_denial_error(
+    reason_code: &str,
+    row_id: Option<&str>,
+    caller_class: Option<&str>,
+) -> async_graphql::Error {
+    async_graphql::Error::new("forbidden").extend_with(|_, e| {
+        e.set("code", "FORBIDDEN");
+        e.set("reasonCode", reason_code);
+        if let Some(rid) = row_id {
+            e.set("rowId", rid);
+        }
+        if let Some(cc) = caller_class {
+            e.set("callerClass", cc);
+        }
+    })
+}
+
+/// P081 MEDIUM-001: Write a best-effort audit row for legacy/shadow deny paths.
+/// Unlike write_graphql_deny_audit, audit failure here only produces a warning log
+/// rather than failing the request, because these are legacy guard denials where
+/// the audit path does not yet have full bounded-seam status.
+async fn write_graphql_legacy_deny_audit(
+    ctx: &Context<'_>,
+    principal: &auth::Principal,
+    transport: &str,
+    action_attempted: &str,
+    reason_code: &str,
+    row_id: Option<&str>,
+    caller_class_str: &str,
+    policy: &auth::boundary::BoundaryPolicy,
+) {
+    let Ok(pool) = ctx.data::<SqlitePool>() else {
+        return;
+    };
+    let id = uuid::Uuid::now_v7().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let request_id_buf = ctx
+        .data::<crate::request_id::RequestId>()
+        .ok()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let token_id_buf = ctx
+        .data::<crate::auth_layer::GraphqlTokenId>()
+        .ok()
+        .map(|t| t.0.clone());
+    let principal_id_str = principal.id.to_string();
+    let principal_class_str = principal.class.to_string();
+    let mode_str = policy.mode().as_str().to_string();
+    let raw_payload = serde_json::json!({
+        "event": "boundary_decision_legacy_deny",
+        "decision": "deny",
+        "transport": transport,
+        "action_attempted": action_attempted,
+        "reason_code": reason_code,
+        "row_id": row_id,
+    })
+    .to_string();
+    let (stored_payload, _, truncated) = audit_log::build_envelope(&raw_payload);
+    let entry = audit_log::AuditEntry {
+        id: &id,
+        request_id: &request_id_buf,
+        timestamp_ms: now_ms,
+        event_type: "boundary_decision_deny",
+        principal_id: Some(&principal_id_str),
+        principal_class: Some(&principal_class_str),
+        caller_class: Some(caller_class_str),
+        token_id: token_id_buf.as_deref(),
+        transport,
+        action_attempted,
+        decision: "deny",
+        denial_reason_code: Some(reason_code),
+        row_id,
+        env_gate_state: None,
+        source_ip_hash_or_local_process_id: None,
+        boundary_policy_mode: &mode_str,
+        fixture_version: "p081-boundary-matrix-v1",
+        payload: &stored_payload,
+        original_payload_bytes: if truncated { Some(&raw_payload) } else { None },
+        diagnostic_truncated: truncated,
+        checkpoint_id: None,
+        created_at_ms: now_ms,
+    };
+    if let Err(e) = audit_log::append(pool, &entry).await {
+        tracing::warn!(
+            error = %e,
+            transport,
+            reason_code,
+            "P081: legacy/shadow GraphQL deny audit write failed (best-effort)"
+        );
+    }
+}
+
+/// P081: Write a durable deny audit row to audit_log.
+/// Fail-closed: if the audit write fails, the caller receives E_AUDIT_UNAVAILABLE
+/// rather than the original denial reason. This ensures no boundary denial is
+/// returned without a committed audit row.
+/// Uses a standalone bounded append (not a write-unit transaction) because the
+/// deny path has not opened a command transaction.
+async fn write_graphql_deny_audit(
+    pool: &SqlitePool,
+    ctx: &Context<'_>,
+    principal: &auth::Principal,
+    transport: &str,
+    action_attempted: &str,
+    reason_code: &str,
+    row_id: Option<&str>,
+    caller_class_str: &str,
+    policy: &auth::boundary::BoundaryPolicy,
+) -> async_graphql::Result<()> {
+    let id = uuid::Uuid::now_v7().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let request_id_buf = ctx
+        .data::<crate::request_id::RequestId>()
+        .ok()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // SEC-P081-M002: extract derived token_id for audit correlation. Not the raw token.
+    let token_id_buf = ctx
+        .data::<crate::auth_layer::GraphqlTokenId>()
+        .ok()
+        .map(|t| t.0.clone());
+    let principal_id_str = principal.id.to_string();
+    let principal_class_str = principal.class.to_string();
+    let mode_str = policy.mode().as_str().to_string();
+    let raw_payload = serde_json::json!({
+        "event": "boundary_decision",
+        "decision": "deny",
+        "transport": transport,
+        "action_attempted": action_attempted,
+        "reason_code": reason_code,
+        "row_id": row_id,
+    })
+    .to_string();
+    let (stored_payload, _, truncated) = audit_log::build_envelope(&raw_payload);
+    let entry = audit_log::AuditEntry {
+        id: &id,
+        request_id: &request_id_buf,
+        timestamp_ms: now_ms,
+        event_type: "boundary_decision_deny",
+        principal_id: Some(&principal_id_str),
+        principal_class: Some(&principal_class_str),
+        caller_class: Some(caller_class_str),
+        token_id: token_id_buf.as_deref(),
+        transport,
+        action_attempted,
+        decision: "deny",
+        denial_reason_code: Some(reason_code),
+        row_id,
+        env_gate_state: None,
+        source_ip_hash_or_local_process_id: None,
+        boundary_policy_mode: &mode_str,
+        fixture_version: "p081-boundary-matrix-v1",
+        payload: &stored_payload,
+        original_payload_bytes: if truncated { Some(&raw_payload) } else { None },
+        diagnostic_truncated: truncated,
+        checkpoint_id: None,
+        created_at_ms: now_ms,
+    };
+    audit_log::append(pool, &entry).await.map_err(|e| {
+        tracing::error!(
+            error = %e,
+            transport,
+            reason_code,
+            "P081: GraphQL deny audit write failed; failing closed with E_AUDIT_UNAVAILABLE"
+        );
+        async_graphql::Error::new("audit unavailable").extend_with(|_, ext| {
+            ext.set("code", "E_AUDIT_UNAVAILABLE");
+            ext.set("requestId", request_id_buf.as_str());
+        })
+    })
+}
+
+async fn boundary_runtime_readback_json(
+    pool: &SqlitePool,
+    boundary_policy: Option<&auth::boundary::BoundaryPolicy>,
+) -> Result<serde_json::Value> {
+    let audit_health = audit_log::health_snapshot(pool)
+        .await
+        .map_err(|e| Error::new(e.to_string()))?;
+    let integrity_state = audit_log::verify_latest_checkpoint(pool).await;
+    let safe_mode_active = boundary_policy
+        .map(|policy| matches!(policy.mode(), auth::boundary::PolicyMode::ReadOnlySafeMode))
+        .unwrap_or(false);
+
+    Ok(serde_json::json!({
+        "schemaVersion": "boundary_runtime.v1",
+        "matrixId": boundary_policy.map(|_| "p081-boundary-matrix-v1"),
+        "policyInjected": boundary_policy.is_some(),
+        "policyMode": boundary_policy.map(|policy| policy.mode().as_str()),
+        "safeModeActive": safe_mode_active,
+        "fixtureDigest": boundary_policy.map(|policy| policy.fixture_digest()),
+        "auditLogHealth": {
+            "schemaVersion": "audit_log_health.v1",
+            "rowCount": audit_health.row_count,
+            "latestRowId": audit_health.latest_row_id,
+            "latestCheckpointSeq": audit_health.latest_checkpoint_seq,
+            "latestCheckpointHash": audit_health.latest_checkpoint_hash,
+            "integrityState": integrity_state.as_str(),
+        }
+    }))
+}
+
+async fn p081_operator_alerts_json(
+    pool: &SqlitePool,
+    boundary_policy: Option<&auth::boundary::BoundaryPolicy>,
+) -> Result<serde_json::Value> {
+    let runtime = boundary_runtime_readback_json(pool, boundary_policy).await?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut alerts = Vec::new();
+
+    if runtime["safeModeActive"].as_bool().unwrap_or(false) {
+        alerts.push(serde_json::json!({
+            "schemaVersion": "operator_alert_v1",
+            "id": "p081-safe-mode-active",
+            "dedupeKey": "p081.boundary.safe_mode_active",
+            "severity": "critical",
+            "title": "Boundary policy is in safe mode",
+            "message": "State-changing GraphQL and MCP operations are denied until boundary policy health is restored.",
+            "source": "boundaryRuntime",
+            "active": true,
+            "silenceable": false,
+            "acknowledgedAtMs": null,
+            "silencedUntilMs": null,
+            "nativeDelivery": {
+                "schemaVersion": "operator_alert_native_delivery_v1",
+                "deliveryKey": "p081.boundary.safe_mode_active",
+                "dockBadgeContribution": 1,
+                "requestUserAttention": "critical",
+                "notificationCategory": "BOUNDARY_POLICY_CRITICAL",
+                "dedupePolicy": "dedupe_key_until_clear"
+            },
+            "lifecycle": {
+                "state": "active_unacknowledged",
+                "dedupeKey": "p081.boundary.safe_mode_active",
+                "ackRequired": true,
+                "clearCondition": "boundaryRuntime.safeModeActive=false"
+            },
+            "createdAtMs": now_ms,
+            "clearCondition": "boundaryRuntime.safeModeActive=false",
+            "boundaryRuntime": runtime,
+        }));
+    }
+
+    if runtime["auditLogHealth"]["integrityState"] == "tamper_suspected" {
+        alerts.push(serde_json::json!({
+            "schemaVersion": "operator_alert_v1",
+            "id": "p081-audit-tamper-suspected",
+            "dedupeKey": "p081.audit.integrity.tamper_suspected",
+            "severity": "critical",
+            "title": "Audit log integrity requires operator review",
+            "message": "Boundary audit checkpoint verification reported tamper_suspected. Writes remain fail-closed until repaired.",
+            "source": "auditLogHealth",
+            "active": true,
+            "silenceable": false,
+            "acknowledgedAtMs": null,
+            "silencedUntilMs": null,
+            "nativeDelivery": {
+                "schemaVersion": "operator_alert_native_delivery_v1",
+                "deliveryKey": "p081.audit.integrity.tamper_suspected",
+                "dockBadgeContribution": 1,
+                "requestUserAttention": "critical",
+                "notificationCategory": "BOUNDARY_POLICY_CRITICAL",
+                "dedupePolicy": "dedupe_key_until_clear"
+            },
+            "lifecycle": {
+                "state": "active_unacknowledged",
+                "dedupeKey": "p081.audit.integrity.tamper_suspected",
+                "ackRequired": true,
+                "clearCondition": "auditLogHealth.integrityState=verified"
+            },
+            "createdAtMs": now_ms,
+            "clearCondition": "auditLogHealth.integrityState=verified",
+            "boundaryRuntime": runtime,
+        }));
+    }
+
+    Ok(serde_json::Value::Array(alerts))
+}
+
+fn redact_p081_operator_alerts_for_observer(
+    alerts: &mut serde_json::Value,
+    authorization: &GraphqlReadAuthorization,
+    collector: Option<&P081GraphqlRedactionCollector>,
+) {
+    if authorization.caller_class != "observer" {
+        return;
+    }
+    let Some(alerts_array) = alerts.as_array_mut() else {
+        return;
+    };
+    for (idx, alert) in alerts_array.iter_mut().enumerate() {
+        if let Some(object) = alert.as_object_mut() {
+            if object.contains_key("message") {
+                object.insert("message".to_string(), serde_json::Value::Null);
+                if let Some(collector) = collector {
+                    collector.push_field_null_redaction(
+                        vec!["operatorAlerts", &idx.to_string(), "message"],
+                        authorization.row_id.as_deref(),
+                        authorization.caller_class.as_str(),
+                    );
+                }
+            }
+            if object.contains_key("nativeDelivery") {
+                object.insert("nativeDelivery".to_string(), serde_json::Value::Null);
+                if let Some(collector) = collector {
+                    collector.push_field_null_redaction(
+                        vec!["operatorAlerts", &idx.to_string(), "nativeDelivery"],
+                        authorization.row_id.as_deref(),
+                        authorization.caller_class.as_str(),
+                    );
+                }
+            }
+            if let Some(lifecycle) = object.get_mut("lifecycle").and_then(|v| v.as_object_mut()) {
+                if lifecycle.contains_key("clearCondition") {
+                    lifecycle.insert("clearCondition".to_string(), serde_json::Value::Null);
+                    if let Some(collector) = collector {
+                        collector.push_field_null_redaction(
+                            vec![
+                                "operatorAlerts",
+                                &idx.to_string(),
+                                "lifecycle",
+                                "clearCondition",
+                            ],
+                            authorization.row_id.as_deref(),
+                            authorization.caller_class.as_str(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GraphqlReadAuthorization {
+    caller_class: String,
+    row_id: Option<String>,
+}
+
+async fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
+    require_graphql_read(ctx, None).await.map(|_| ())
+}
+
+async fn require_observer_opt_in_read(ctx: &Context<'_>) -> Result<GraphqlReadAuthorization> {
     let principal = ctx
         .data::<auth::Principal>()
         .map_err(|_| Error::new("unauthorized"))?;
-    if principal.class != auth::PrincipalClass::Operator {
-        return Err(Error::new("forbidden"));
+    let caller_class = auth::derive_caller_class(principal);
+    let action = if caller_class.as_str() == "observer" {
+        Some("graphql.read_only")
+    } else {
+        None
+    };
+    require_graphql_read(ctx, action).await
+}
+
+async fn require_graphql_read(
+    ctx: &Context<'_>,
+    action: Option<&str>,
+) -> Result<GraphqlReadAuthorization> {
+    let principal = ctx
+        .data::<auth::Principal>()
+        .map_err(|_| Error::new("unauthorized"))?;
+    let caller_class = auth::derive_caller_class(principal);
+
+    // P081 Phase 3: evaluate BoundaryPolicy for ALL callers including Operators.
+    // In shadow mode decisions are logged but not enforced; in legacy_compat mode
+    // the legacy P072 guards below remain authoritative.
+    if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+        let started = std::time::Instant::now();
+        let decision = policy.evaluate(caller_class.as_str(), "graphql_query", action);
+        db::metrics::record_p081_boundary_decision_latency(started.elapsed());
+        match decision {
+            auth::boundary::PolicyDecision::Allow { row_id } => {
+                db::metrics::record_p081_boundary_decision(
+                    "graphql_query",
+                    row_id.as_deref(),
+                    caller_class.as_str(),
+                    action.unwrap_or("query"),
+                    "allow",
+                    None,
+                    policy.mode().as_str(),
+                );
+                return Ok(GraphqlReadAuthorization {
+                    caller_class: caller_class.as_str().to_string(),
+                    row_id,
+                });
+            }
+            auth::boundary::PolicyDecision::Deny {
+                reason_code,
+                row_id,
+                ..
+            } => {
+                db::metrics::record_p081_boundary_decision(
+                    "graphql_query",
+                    row_id.as_deref(),
+                    caller_class.as_str(),
+                    action.unwrap_or("query"),
+                    "deny",
+                    Some(reason_code.as_str()),
+                    policy.mode().as_str(),
+                );
+                // P081: write durable deny audit before returning the denial.
+                // Fail-closed: if the audit write fails, return E_AUDIT_UNAVAILABLE.
+                if let Ok(pool) = ctx.data::<SqlitePool>() {
+                    write_graphql_deny_audit(
+                        pool,
+                        ctx,
+                        principal,
+                        "graphql_query",
+                        "query",
+                        &reason_code,
+                        row_id.as_deref(),
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await?;
+                }
+                return Err(boundary_denial_error(
+                    &reason_code,
+                    row_id.as_deref(),
+                    Some(caller_class.as_str()),
+                ));
+            }
+            auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                // Shadow mode: log the matrix decision but retain the pre-P081
+                // legacy Operator-only guard for non-operators so that shadow
+                // mode cannot weaken pre-P081 authorization (P081-SEC-M1).
+                match *matched_decision {
+                    auth::boundary::PolicyDecision::Deny {
+                        reason_code,
+                        row_id,
+                        ..
+                    } => {
+                        db::metrics::record_p081_boundary_decision(
+                            "graphql_query",
+                            row_id.as_deref(),
+                            caller_class.as_str(),
+                            action.unwrap_or("query"),
+                            "shadow_deny",
+                            Some(reason_code.as_str()),
+                            policy.mode().as_str(),
+                        );
+                        tracing::debug!(
+                            caller_class = caller_class.as_str(),
+                            transport = "graphql_query",
+                            reason_code = %reason_code,
+                            row_id = ?row_id,
+                            "BoundaryPolicy shadow: matrix would deny this graphql_query request"
+                        );
+                        // Preserve legacy fail-closed: non-Operator callers that the
+                        // matrix would deny must still be denied in shadow mode.
+                        if principal.class != auth::PrincipalClass::Operator {
+                            // MEDIUM-001: best-effort audit for shadow-mode denials.
+                            write_graphql_legacy_deny_audit(
+                                ctx,
+                                principal,
+                                "graphql_query",
+                                "query",
+                                &reason_code,
+                                row_id.as_deref(),
+                                caller_class.as_str(),
+                                &policy,
+                            )
+                            .await;
+                            return Err(boundary_denial_error(
+                                &reason_code,
+                                row_id.as_deref(),
+                                Some(caller_class.as_str()),
+                            ));
+                        }
+                    }
+                    auth::boundary::PolicyDecision::Allow { row_id } => {
+                        db::metrics::record_p081_boundary_decision(
+                            "graphql_query",
+                            row_id.as_deref(),
+                            caller_class.as_str(),
+                            action.unwrap_or("query"),
+                            "shadow_allow",
+                            None,
+                            policy.mode().as_str(),
+                        );
+                        return Ok(GraphqlReadAuthorization {
+                            caller_class: caller_class.as_str().to_string(),
+                            row_id,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            auth::boundary::PolicyDecision::LegacyPassthrough => {
+                // Legacy compat: operator-only, matching the pre-P081 P072 guard.
+                // Observer and Agent principals are denied; only Operators may pass through
+                // to the P072 surface policy check below. Exempting observer here would allow
+                // observer queries when no surface_policy is configured (fail-open gap).
+                if principal.class != auth::PrincipalClass::Operator {
+                    // MEDIUM-001: best-effort audit for legacy-passthrough denials.
+                    write_graphql_legacy_deny_audit(
+                        ctx,
+                        principal,
+                        "graphql_query",
+                        "query",
+                        "CAPABILITY_OUT_OF_SCOPE",
+                        None,
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await;
+                    return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
+                }
+            }
+        }
+    } else if principal.class != auth::PrincipalClass::Operator {
+        // No BoundaryPolicy available — fall back to operator-only guard.
+        // No audit written here: this seam does not yet have bounded DB access.
+        return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
     }
+
     // P072: enforce allow_queries surface policy when present.
     if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
         if let Some(allowed) = auth::is_query_allowed_by_surface_policy(table, &principal.id) {
             if !allowed {
-                return Err(Error::new("forbidden"));
+                // MEDIUM-001: best-effort audit for P072 surface-policy denials.
+                if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+                    let caller_class = auth::derive_caller_class(principal);
+                    write_graphql_legacy_deny_audit(
+                        ctx,
+                        principal,
+                        "graphql_query",
+                        "query",
+                        "CAPABILITY_OUT_OF_SCOPE",
+                        None,
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await;
+                }
+                return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
+            }
+        }
+    }
+    Ok(GraphqlReadAuthorization {
+        caller_class: caller_class.as_str().to_string(),
+        row_id: None,
+    })
+}
+
+/// P081 Phase 3: Evaluate BoundaryPolicy for graphql_subscription transport.
+/// Subscriptions use a separate transport so the matrix can apply
+/// different allow/deny rows from graphql_query.
+async fn require_subscription_read(ctx: &Context<'_>) -> Result<()> {
+    let principal = ctx
+        .data::<auth::Principal>()
+        .map_err(|_| Error::new("unauthorized"))?;
+
+    if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+        let caller_class = auth::derive_caller_class(principal);
+        match policy.evaluate(caller_class.as_str(), "graphql_subscription", None) {
+            auth::boundary::PolicyDecision::Allow { .. } => {}
+            auth::boundary::PolicyDecision::Deny {
+                reason_code,
+                row_id,
+                ..
+            } => {
+                // P081: write durable deny audit before returning the denial.
+                // Fail-closed: if the audit write fails, return E_AUDIT_UNAVAILABLE.
+                if let Ok(pool) = ctx.data::<SqlitePool>() {
+                    write_graphql_deny_audit(
+                        pool,
+                        ctx,
+                        principal,
+                        "graphql_subscription",
+                        "subscription",
+                        &reason_code,
+                        row_id.as_deref(),
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await?;
+                }
+                return Err(boundary_denial_error(
+                    &reason_code,
+                    row_id.as_deref(),
+                    Some(caller_class.as_str()),
+                ));
+            }
+            auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                if let auth::boundary::PolicyDecision::Deny {
+                    reason_code,
+                    row_id,
+                    ..
+                } = *matched_decision
+                {
+                    tracing::debug!(
+                        caller_class = caller_class.as_str(),
+                        transport = "graphql_subscription",
+                        reason_code = %reason_code,
+                        row_id = ?row_id,
+                        "BoundaryPolicy shadow: matrix would deny this graphql_subscription"
+                    );
+                    if principal.class != auth::PrincipalClass::Operator {
+                        // MEDIUM-001: best-effort audit for shadow-mode subscription denials.
+                        write_graphql_legacy_deny_audit(
+                            ctx,
+                            principal,
+                            "graphql_subscription",
+                            "subscription",
+                            &reason_code,
+                            row_id.as_deref(),
+                            caller_class.as_str(),
+                            &policy,
+                        )
+                        .await;
+                        return Err(boundary_denial_error(
+                            &reason_code,
+                            row_id.as_deref(),
+                            Some(caller_class.as_str()),
+                        ));
+                    }
+                }
+            }
+            auth::boundary::PolicyDecision::LegacyPassthrough => {
+                if principal.class != auth::PrincipalClass::Operator {
+                    // MEDIUM-001: best-effort audit for legacy-passthrough subscription denials.
+                    write_graphql_legacy_deny_audit(
+                        ctx,
+                        principal,
+                        "graphql_subscription",
+                        "subscription",
+                        "CAPABILITY_OUT_OF_SCOPE",
+                        None,
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await;
+                    return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
+                }
+            }
+        }
+    } else if principal.class != auth::PrincipalClass::Operator {
+        // No BoundaryPolicy available — fall back to operator-only guard.
+        // No audit written here: this seam does not yet have bounded DB access.
+        return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
+    }
+
+    // P081 fix: subscriptions must check allow_subscriptions, not allow_queries.
+    if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
+        if let Some(allowed) = auth::is_subscription_allowed_by_surface_policy(table, &principal.id)
+        {
+            if !allowed {
+                // MEDIUM-001: best-effort audit for P072 surface-policy subscription denials.
+                if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+                    let caller_class = auth::derive_caller_class(principal);
+                    write_graphql_legacy_deny_audit(
+                        ctx,
+                        principal,
+                        "graphql_subscription",
+                        "subscription",
+                        "CAPABILITY_OUT_OF_SCOPE",
+                        None,
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await;
+                }
+                return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
             }
         }
     }
@@ -237,7 +1012,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         include_archived: Option<bool>,
     ) -> Result<Vec<GqlIdea>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let include = include_archived.unwrap_or(false);
         let items = ideas::list(pool, include).await?;
@@ -245,7 +1020,7 @@ impl QueryRoot {
     }
 
     async fn idea(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlIdea>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let idea_id: IdeaId = id
             .parse()
@@ -255,19 +1030,31 @@ impl QueryRoot {
     }
 
     async fn runs(&self, ctx: &Context<'_>, idea_id: Option<ID>) -> Result<Vec<GqlRun>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
-        if let Some(id) = idea_id {
+        let mut runs: Vec<GqlRun> = if let Some(id) = idea_id {
             let items = projections::list_by_idea_projection(pool, id.as_str()).await?;
-            Ok(items.into_iter().map(GqlRun::from).collect())
+            items.into_iter().map(GqlRun::from).collect()
         } else {
             let items = projections::list_active_projection(pool).await?;
-            Ok(items.into_iter().map(GqlRun::from).collect())
+            items.into_iter().map(GqlRun::from).collect()
+        };
+        // Batch-fetch blocking workflow conflicts to avoid N+1 per-run lookups.
+        let run_ids: Vec<String> = runs.iter().map(|r| r.id.to_string()).collect();
+        if !run_ids.is_empty() {
+            let conflicts =
+                workflow_conflicts::get_blocking_conflicts_for_runs(pool, &run_ids).await?;
+            for run in &mut runs {
+                if let Some(conflict) = conflicts.get(run.id.as_str()) {
+                    run.workflow_conflict = Some(conflict.clone().into());
+                }
+            }
         }
+        Ok(runs)
     }
 
     async fn run(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlRun>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let run_id: RunId = id
             .parse()
@@ -280,9 +1067,25 @@ impl QueryRoot {
         ctx: &Context<'_>,
         run_id: Option<ID>,
     ) -> Result<Vec<GqlApproval>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = projections::list_pending_inbox_projection(pool).await?;
+
+        // P081 Phase 4: compute BoundaryPolicy actionability for this caller once
+        // and apply it to every approval in the list.
+        let boundary_decision: Option<(auth::CallerClass, auth::boundary::PolicyDecision)> =
+            if let Ok(principal) = ctx.data::<auth::Principal>() {
+                if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+                    let caller_class = auth::derive_caller_class(principal);
+                    let decision = policy.evaluate(caller_class.as_str(), "graphql_mutation", None);
+                    Some((caller_class, decision))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         Ok(items
             .into_iter()
             .filter(|row| {
@@ -290,12 +1093,19 @@ impl QueryRoot {
                     row.run_id == requested_run_id.as_str()
                 })
             })
-            .map(GqlApproval::from)
+            .map(|row| {
+                let approval = GqlApproval::from(row);
+                if let Some((ref caller_class, ref decision)) = boundary_decision {
+                    approval.with_boundary_actionability(caller_class.as_str(), decision)
+                } else {
+                    approval
+                }
+            })
             .collect())
     }
 
     async fn artifacts(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlArtifact>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let parsed_run_id: RunId = run_id
             .as_str()
@@ -336,7 +1146,7 @@ impl QueryRoot {
     }
 
     async fn artifact(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlArtifact>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let artifact_id: ArtifactId = id
             .as_str()
@@ -378,7 +1188,7 @@ impl QueryRoot {
     }
 
     async fn stages(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlStageExecution>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = projections::list_stages_projection(pool, run_id.as_str()).await?;
         Ok(items.into_iter().map(GqlStageExecution::from).collect())
@@ -386,7 +1196,7 @@ impl QueryRoot {
 
     /// Work-queue counts for all items associated with a run.
     async fn run_queue_summary(&self, ctx: &Context<'_>, run_id: ID) -> Result<GqlRunQueueSummary> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let run_id_str = run_id.as_str();
         let rows = sqlx::query(
@@ -430,7 +1240,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         stage_execution_id: ID,
     ) -> Result<GqlStageQueueSummary> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let stage_id_str = stage_execution_id.as_str();
         let rows = sqlx::query(
@@ -469,7 +1279,7 @@ impl QueryRoot {
     }
 
     async fn stage(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlStageExecution>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let stage_execution_id: domain::ids::StageExecutionId = id
             .parse()
@@ -482,7 +1292,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         stage_execution_id: ID,
     ) -> Result<Vec<GqlAgentExecution>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let stage_execution_id: domain::ids::StageExecutionId = stage_execution_id
             .parse()
@@ -497,7 +1307,7 @@ impl QueryRoot {
         limit: Option<i32>,
         status: Option<String>,
     ) -> Result<Vec<GqlStewardAnalysis>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let parsed_status = status
             .as_deref()
@@ -521,7 +1331,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         id: ID,
     ) -> Result<Option<GqlStewardAnalysis>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let item = steward_repo::find_analysis(pool, id.as_str()).await?;
         if let Some(item) = item {
@@ -542,7 +1352,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         analysis_id: ID,
     ) -> Result<Vec<GqlStewardAnalysisRunLink>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = steward_repo::list_run_links(pool, analysis_id.as_str()).await?;
         Ok(items
@@ -556,7 +1366,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         analysis_id: ID,
     ) -> Result<Vec<GqlStewardRecommendation>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = steward_repo::list_recommendations(pool, analysis_id.as_str()).await?;
         Ok(items
@@ -571,9 +1381,36 @@ impl QueryRoot {
     /// split: any authenticated operator can read the full typed status,
     /// unauthenticated loopback probes get the JSON snapshot at `/health`.
     async fn daemon_status(&self, ctx: &Context<'_>) -> Result<GqlDaemonStatus> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let reporter = ctx.data::<LifecycleReporter>()?;
         Ok(GqlDaemonStatus::from(reporter.snapshot()))
+    }
+
+    /// P081: bounded operator diagnostic readback for the active boundary policy
+    /// and audit-log integrity state. This never exposes raw audit rows.
+    async fn boundary_runtime(&self, ctx: &Context<'_>) -> Result<Json<serde_json::Value>> {
+        require_observer_opt_in_read(ctx).await?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let boundary_policy = ctx
+            .data_opt::<Arc<auth::boundary::BoundaryPolicy>>()
+            .map(|policy| policy.as_ref());
+        Ok(Json(
+            boundary_runtime_readback_json(pool, boundary_policy).await?,
+        ))
+    }
+
+    /// P081: bounded operator alert inbox derived from the same BoundaryPolicy
+    /// and audit health readback as `boundaryRuntime`.
+    async fn operator_alerts(&self, ctx: &Context<'_>) -> Result<Json<serde_json::Value>> {
+        let authorization = require_observer_opt_in_read(ctx).await?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let boundary_policy = ctx
+            .data_opt::<Arc<auth::boundary::BoundaryPolicy>>()
+            .map(|policy| policy.as_ref());
+        let mut alerts = p081_operator_alerts_json(pool, boundary_policy).await?;
+        let collector = ctx.data_opt::<P081GraphqlRedactionCollector>();
+        redact_p081_operator_alerts_for_observer(&mut alerts, &authorization, collector);
+        Ok(Json(alerts))
     }
 
     /// P075: Storage health readback for write pressure, evidence spooling,
@@ -582,7 +1419,7 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<crate::types::storage::GqlStorageHealth> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let heartbeat = ctx.data_opt::<Arc<DbWriterHeartbeat>>();
 
@@ -682,7 +1519,7 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<Option<GqlStartupRecoverySummary>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let readback = db::repos::startup_repairs::latest_startup_recovery_readback(pool).await?;
         Ok(readback.map(GqlStartupRecoverySummary::from))
@@ -694,7 +1531,7 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<Option<GqlToolchainCacheHousekeepingSummary>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let readback = db::repos::toolchain_cache_housekeeping::latest(pool).await?;
         Ok(readback.map(GqlToolchainCacheHousekeepingSummary::from))
@@ -708,7 +1545,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         first: Option<i32>,
     ) -> Result<Vec<GqlSideEffectSummary>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let limit = first.unwrap_or(50).clamp(1, 100) as u32;
         let effects = db::repos::side_effects::list_unresolved(pool, limit).await?;
@@ -1641,25 +2478,90 @@ pub fn capability_id_for(mutation: MutationName) -> domain::CapabilityToolId {
     }
 }
 
-fn mutation_allowed(
+async fn mutation_allowed(
     ctx: &Context<'_>,
     principal: &auth::Principal,
     mutation: MutationName,
-) -> bool {
+) -> Result<(), async_graphql::Error> {
+    // P081 Phase 3: consult the shared BoundaryPolicy when it is injected.
+    // ui_operator on graphql_mutation is allowed by the matrix (approval actions).
+    // Any other caller_class that lacks a matching row returns MATRIX_NO_ROW → denied.
+    if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+        let caller_class = auth::derive_caller_class(principal);
+        match policy.evaluate(
+            caller_class.as_str(),
+            "graphql_mutation",
+            Some(mutation.graphql_name()),
+        ) {
+            auth::boundary::PolicyDecision::Deny {
+                reason_code,
+                row_id,
+                ..
+            } => {
+                // P081: write durable deny audit before returning the denial.
+                // Fail-closed: if the audit write fails, return E_AUDIT_UNAVAILABLE.
+                if let Ok(pool) = ctx.data::<SqlitePool>() {
+                    write_graphql_deny_audit(
+                        pool,
+                        ctx,
+                        principal,
+                        "graphql_mutation",
+                        mutation.graphql_name(),
+                        &reason_code,
+                        row_id.as_deref(),
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await?;
+                }
+                return Err(boundary_denial_error(
+                    &reason_code,
+                    row_id.as_deref(),
+                    Some(caller_class.as_str()),
+                ));
+            }
+            auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                if let auth::boundary::PolicyDecision::Deny {
+                    reason_code,
+                    row_id,
+                    ..
+                } = *matched_decision
+                {
+                    tracing::debug!(
+                        caller_class = caller_class.as_str(),
+                        transport = "graphql_mutation",
+                        reason_code = %reason_code,
+                        row_id = ?row_id,
+                        "BoundaryPolicy shadow: matrix would deny this graphql_mutation"
+                    );
+                }
+            }
+            auth::boundary::PolicyDecision::Allow { .. }
+            | auth::boundary::PolicyDecision::LegacyPassthrough => {}
+        }
+    }
+
     if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
         if let Some(allowed) = auth::is_mutation_allowed_by_surface_policy(
             table,
             &principal.id,
             mutation.graphql_name(),
         ) {
-            return allowed && principal.class == auth::PrincipalClass::Operator;
+            if !(allowed && principal.class == auth::PrincipalClass::Operator) {
+                return Err(boundary_denial_error("NON_APPROVAL_MUTATION", None, None));
+            }
+            return Ok(());
         }
         if auth::find_principal_by_id(table, &principal.id).is_some() {
-            return false;
+            return Err(boundary_denial_error("NON_APPROVAL_MUTATION", None, None));
         }
     }
 
-    auth::filter_tools(principal, &[capability_id_for(mutation)]).len() == 1
+    if auth::filter_tools(principal, &[capability_id_for(mutation)]).len() == 1 {
+        Ok(())
+    } else {
+        Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None))
+    }
 }
 
 /// Build the GraphQL caller context for a mutation and attach the
@@ -1671,9 +2573,15 @@ fn graphql_caller_with_request_id(
     principal: &auth::Principal,
     mutation_name: &str,
 ) -> CallerContext {
-    let mut caller = CallerContext::graphql(&principal.id, &principal.class, mutation_name);
+    let caller_class = auth::derive_caller_class(principal);
+    let mut caller = CallerContext::graphql(&principal.id, &principal.class, mutation_name)
+        .with_caller_class(caller_class.as_str());
     if let Ok(rid) = ctx.data::<crate::request_id::RequestId>() {
         caller = caller.with_request_id(&rid.0);
+    }
+    // SEC-P081-M002: propagate derived token_id for audit correlation.
+    if let Ok(tid) = ctx.data::<crate::auth_layer::GraphqlTokenId>() {
+        caller = caller.with_token_id(&tid.0);
     }
     caller
 }
@@ -1698,6 +2606,32 @@ pub struct RejectApprovalPayload {
     pub conflict_result_code: Option<GqlMutationConflictResultCode>,
 }
 
+/// SEC-M-001: Validate that an idempotency key is a well-formed UUIDv7.
+/// UUIDv7 format: 8-4-4-4-12 hex groups where the version nibble (13th char) is '7'
+/// and the variant nibble (17th char) is '8', '9', 'a', or 'b' (RFC 4122 variant).
+/// Returns a typed, non-disclosing error on validation failure.
+fn validate_idempotency_key_uuidv7(key: &str) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(key).map_err(|_| {
+        let mut e = async_graphql::Error::new("INVALID_IDEMPOTENCY_KEY");
+        e = e.extend_with(|_, ext| ext.set("code", "INVALID_IDEMPOTENCY_KEY"));
+        e
+    })?;
+    // Version check: UUIDv7 has version nibble == 7
+    if uuid.get_version_num() != 7 {
+        let mut e = async_graphql::Error::new("INVALID_IDEMPOTENCY_KEY");
+        e = e.extend_with(|_, ext| ext.set("code", "INVALID_IDEMPOTENCY_KEY"));
+        return Err(e.into());
+    }
+    // SEC-M-001b: Variant check — must be RFC 4122 (high bits 10xx).
+    // Rejects malformed UUIDs that parse with version=7 but use a non-standard variant byte.
+    if uuid.get_variant() != uuid::Variant::RFC4122 {
+        let mut e = async_graphql::Error::new("INVALID_IDEMPOTENCY_KEY");
+        e = e.extend_with(|_, ext| ext.set("code", "INVALID_IDEMPOTENCY_KEY"));
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 fn approval_resolution_conflict_code(
     error: &anyhow::Error,
 ) -> Option<(ID, GqlMutationConflictResultCode)> {
@@ -1707,19 +2641,42 @@ fn approval_resolution_conflict_code(
             ID::from(conflict.journal_id().to_owned()),
             GqlMutationConflictResultCode::AlreadyResolved,
         )),
+        // P081: terminal approval retried with a different key → APPROVAL_NOT_ACTIONABLE.
+        // Zero settlement side effects (no command_journal row was written).
+        ApprovalResolutionConflict::ApprovalNotActionable { .. } => Some((
+            ID::from(conflict.journal_id().to_owned()),
+            GqlMutationConflictResultCode::ApprovalNotActionable,
+        )),
     }
+}
+
+/// Build a deterministic IDEMPOTENCY_CONFLICT GraphQL error.
+/// Called when the command handler returns an IDEMPOTENCY_CONFLICT string error
+/// (same key, different canonical request hash) which is not an ApprovalResolutionConflict
+/// typed error and must not fall through to the opaque INTERNAL path.
+fn idempotency_conflict_gql_error(request_id: &Option<String>) -> Error {
+    let mut gql_err = Error::new("IDEMPOTENCY_CONFLICT");
+    gql_err = gql_err.extend_with(|_, ext| ext.set("code", "IDEMPOTENCY_CONFLICT"));
+    gql_err = gql_err.extend_with(|_, ext| ext.set("reasonCode", "IDEMPOTENCY_CONFLICT"));
+    if let Some(ref rid) = request_id {
+        gql_err = gql_err.extend_with(|_, ext| ext.set("requestId", rid.clone()));
+    }
+    gql_err
 }
 
 #[Object]
 impl MutationRoot {
-    /// P072: Approve a stage approval by approval_id. The resolver
+    /// P072/P081: Approve a stage approval by approval_id. The resolver
     /// server-resolves run_id and stage_id from the approval record
     /// before constructing ResolveApprovalCmd.
+    /// P081: idempotency_key is a required UUIDv7 per ApprovalActionAttemptStore attempt.
+    /// SEC-P081-HIGH-001: Required to enforce committed-unack replay contract.
     async fn approve_approval(
         &self,
         ctx: &Context<'_>,
         approval_id: ID,
         comment: Option<String>,
+        idempotency_key: String,
     ) -> Result<ApproveApprovalPayload> {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
@@ -1729,11 +2686,25 @@ impl MutationRoot {
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !mutation_allowed(ctx, &principal, MutationName::ApproveApproval) {
-            return Err(Error::new("forbidden"));
-        }
+        mutation_allowed(ctx, &principal, MutationName::ApproveApproval).await?;
+
+        // SEC-M-001: Validate idempotencyKey as UUIDv7 before command handling or storage.
+        validate_idempotency_key_uuidv7(&idempotency_key)?;
 
         let caller = graphql_caller_with_request_id(ctx, &principal, "approveApproval");
+        // SEC-P081-002: Capture request_id before caller is consumed so internal errors
+        // can include it without disclosing the raw error chain to the client.
+        let request_id = caller.request_id.clone();
+
+        // P081: Log a SHA-256 digest of the key — raw replay handles must not appear in logs.
+        {
+            let key_digest = {
+                use sha2::{Digest, Sha256};
+                let h = Sha256::digest(idempotency_key.as_bytes());
+                format!("{:x}", h)[..16].to_string()
+            };
+            tracing::debug!(idempotency_key_digest = %key_digest, approval_id = %*approval_id, "approveApproval idempotency_key received");
+        }
 
         let aid: domain::ids::ApprovalId = approval_id
             .parse()
@@ -1750,6 +2721,7 @@ impl MutationRoot {
             rationale: comment,
             run_id: approval.run_id,
             stage_id: approval.stage_id.clone(),
+            idempotency_key: Some(idempotency_key),
         });
 
         let result = cmd_handler.handle(cmd, caller).await;
@@ -1778,19 +2750,33 @@ impl MutationRoot {
                         journal_id,
                         conflict_result_code: Some(conflict_result_code),
                     })
+                } else if e.to_string().contains("IDEMPOTENCY_CONFLICT") {
+                    // P081: same idempotency key with a different canonical request hash.
+                    // Return a deterministic IDEMPOTENCY_CONFLICT code, not an opaque INTERNAL.
+                    Err(idempotency_conflict_gql_error(&request_id))
                 } else {
-                    Err(Error::new(e.to_string()))
+                    // SEC-P081-002: Log full error chain server-side; expose only INTERNAL + request_id.
+                    tracing::error!(error = %e, request_id = ?request_id, "approveApproval: internal command error");
+                    let mut gql_err = Error::new("INTERNAL");
+                    gql_err = gql_err.extend_with(|_, ext| ext.set("code", "INTERNAL"));
+                    if let Some(ref rid) = request_id {
+                        gql_err = gql_err.extend_with(|_, ext| ext.set("requestId", rid.clone()));
+                    }
+                    Err(gql_err)
                 }
             }
         }
     }
 
-    /// P072: Reject a stage approval by approval_id with a required reason.
+    /// P072/P081: Reject a stage approval by approval_id with a required reason.
+    /// P081: idempotency_key is a required UUIDv7 per ApprovalActionAttemptStore attempt.
+    /// SEC-P081-HIGH-001: Required to enforce committed-unack replay contract.
     async fn reject_approval(
         &self,
         ctx: &Context<'_>,
         approval_id: ID,
         reason: String,
+        idempotency_key: String,
     ) -> Result<RejectApprovalPayload> {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
@@ -1800,11 +2786,24 @@ impl MutationRoot {
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !mutation_allowed(ctx, &principal, MutationName::RejectApproval) {
-            return Err(Error::new("forbidden"));
+        mutation_allowed(ctx, &principal, MutationName::RejectApproval).await?;
+
+        // SEC-M-001: Validate idempotencyKey as UUIDv7 before command handling or storage.
+        validate_idempotency_key_uuidv7(&idempotency_key)?;
+
+        // P081: Log a SHA-256 digest of the key — raw replay handles must not appear in logs.
+        {
+            let key_digest = {
+                use sha2::{Digest, Sha256};
+                let h = Sha256::digest(idempotency_key.as_bytes());
+                format!("{:x}", h)[..16].to_string()
+            };
+            tracing::debug!(idempotency_key_digest = %key_digest, approval_id = %*approval_id, "rejectApproval idempotency_key received");
         }
 
         let caller = graphql_caller_with_request_id(ctx, &principal, "rejectApproval");
+        // SEC-P081-002: Capture request_id before caller is consumed.
+        let request_id = caller.request_id.clone();
 
         let aid: domain::ids::ApprovalId = approval_id
             .parse()
@@ -1821,6 +2820,7 @@ impl MutationRoot {
             rationale: Some(reason),
             run_id: approval.run_id,
             stage_id: approval.stage_id.clone(),
+            idempotency_key: Some(idempotency_key),
         });
 
         let result = cmd_handler.handle(cmd, caller).await;
@@ -1848,8 +2848,19 @@ impl MutationRoot {
                         journal_id,
                         conflict_result_code: Some(conflict_result_code),
                     })
+                } else if e.to_string().contains("IDEMPOTENCY_CONFLICT") {
+                    // P081: same idempotency key with a different canonical request hash.
+                    // Return a deterministic IDEMPOTENCY_CONFLICT code, not an opaque INTERNAL.
+                    Err(idempotency_conflict_gql_error(&request_id))
                 } else {
-                    Err(Error::new(e.to_string()))
+                    // SEC-P081-002: Log full error chain server-side; expose only INTERNAL + request_id.
+                    tracing::error!(error = %e, request_id = ?request_id, "rejectApproval: internal command error");
+                    let mut gql_err = Error::new("INTERNAL");
+                    gql_err = gql_err.extend_with(|_, ext| ext.set("code", "INTERNAL"));
+                    if let Some(ref rid) = request_id {
+                        gql_err = gql_err.extend_with(|_, ext| ext.set("requestId", rid.clone()));
+                    }
+                    Err(gql_err)
                 }
             }
         }
@@ -1866,7 +2877,8 @@ impl SubscriptionRoot {
         run_id: Option<ID>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRun>>>> {
         // P029 §4.1.c: principal is injected by on_connection_init during WS handshake.
-        require_operator_read(ctx)?;
+        // P081 Phase 3: evaluate graphql_subscription transport (not graphql_query).
+        require_subscription_read(ctx).await?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -1919,7 +2931,7 @@ impl SubscriptionRoot {
         run_id: ID,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlStageExecution>>>>
     {
-        require_operator_read(ctx)?;
+        require_subscription_read(ctx).await?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -1957,7 +2969,7 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlApproval>>>> {
-        require_operator_read(ctx)?;
+        require_subscription_read(ctx).await?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -1983,7 +2995,7 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlApproval>>>> {
-        require_operator_read(ctx)?;
+        require_subscription_read(ctx).await?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -2014,7 +3026,7 @@ impl SubscriptionRoot {
         run_id: Option<ID>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRuntimeEvent>>>>
     {
-        require_operator_read(ctx)?;
+        require_subscription_read(ctx).await?;
 
         let events = ctx.data::<EventSender>()?.clone();
         let filter_run_id: Option<RunId> = run_id.and_then(|id| id.parse().ok());
@@ -2065,22 +3077,8 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<GqlDaemonStatus>>> {
-        let principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
-        if principal.class != auth::PrincipalClass::Operator {
-            return Err(Error::new("forbidden"));
-        }
-        // P072: enforce allow_subscriptions surface policy when present.
-        if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
-            if let Some(allowed) =
-                auth::is_subscription_allowed_by_surface_policy(table, &principal.id)
-            {
-                if !allowed {
-                    return Err(Error::new("forbidden"));
-                }
-            }
-        }
+        // P081 Phase 3: use shared graphql_subscription BoundaryPolicy evaluation.
+        require_subscription_read(ctx).await?;
         let events = ctx.data::<EventSender>()?.clone();
         let rx = events.subscribe();
         Ok(BroadcastStream::new(rx).filter_map(move |msg| async move {
@@ -2415,12 +3413,10 @@ mod tests {
         let pool = create_pool("sqlite::memory:")
             .await
             .expect("in-memory pool failed");
-        db::writer::register_shared_writer(
-            &pool,
-            Arc::new(db::writer::DbWriter::new(pool.clone())),
-        )
-        .await
-        .expect("register shared writer");
+        let writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .expect("register shared DbWriter for test pool");
         pool
     }
 
@@ -2430,12 +3426,10 @@ mod tests {
         let pool = create_pool(&format!("sqlite://{}", path.to_string_lossy()))
             .await
             .expect("P043 file-backed pool failed");
-        db::writer::register_shared_writer(
-            &pool,
-            Arc::new(db::writer::DbWriter::new(pool.clone())),
-        )
-        .await
-        .expect("register shared writer");
+        let writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .expect("P043 register shared DbWriter");
         pool
     }
 
@@ -2732,6 +3726,9 @@ mod tests {
             Some("operator"),
             Some("operator"),
             Some("runs.main_sync.request"),
+            None,
+            None,
+            None,
             None,
         )
         .await
@@ -4371,6 +5368,11 @@ mod tests {
                 "PROJECTION_LAG",
                 "UNAUTHORIZED",
                 "UNSUPPORTED_ACTION",
+                // P081 boundary policy reason codes
+                "APPROVAL_NOT_ACTIONABLE",
+                "OBSERVER_SCOPE",
+                "NON_APPROVAL_MUTATION",
+                "CAPABILITY_OUT_OF_SCOPE",
             ],
         );
         assert_enum_values(
@@ -6596,6 +7598,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_081_boundary_runtime_graphql_readback_is_bounded() {
+        let pool = test_pool().await;
+        let policy = Arc::new(
+            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                auth::boundary::PolicyMode::ReadOnlySafeMode,
+            )
+            .unwrap(),
+        );
+        let schema = build_schema_inner(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+            None,
+            Some(policy),
+        );
+
+        let response = schema
+            .execute(Request::new("{ boundaryRuntime }").data(test_principal()))
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "boundaryRuntime readback must be available to operator reads: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let readback = &json["boundaryRuntime"];
+        assert_eq!(readback["schemaVersion"], "boundary_runtime.v1");
+        assert_eq!(readback["matrixId"], "p081-boundary-matrix-v1");
+        assert_eq!(readback["policyInjected"], true);
+        assert_eq!(readback["policyMode"], "read_only_safe_mode");
+        assert_eq!(readback["safeModeActive"], true);
+        assert_eq!(
+            readback["auditLogHealth"]["schemaVersion"],
+            "audit_log_health.v1"
+        );
+        assert!(readback["auditLogHealth"]["rowCount"].as_i64().is_some());
+        assert!(
+            readback["auditLogHealth"]["integrityState"]
+                .as_str()
+                .is_some(),
+            "auditLogHealth must expose bounded integrity state, not raw rows"
+        );
+        assert!(
+            readback.get("rows").is_none(),
+            "boundaryRuntime must not expose raw audit rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_081_operator_alerts_surface_safe_mode_without_raw_audit_rows() {
+        let pool = test_pool().await;
+        let policy = Arc::new(
+            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                auth::boundary::PolicyMode::ReadOnlySafeMode,
+            )
+            .unwrap(),
+        );
+        let schema = build_schema_inner(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+            None,
+            Some(policy),
+        );
+
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"{ operatorAlerts }"#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "operatorAlerts readback must be available to operator reads: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let alerts = json["operatorAlerts"].as_array().expect("alerts array");
+        let safe_mode = alerts
+            .iter()
+            .find(|alert| alert["dedupeKey"] == "p081.boundary.safe_mode_active")
+            .expect("safe-mode alert must be present");
+        assert_eq!(safe_mode["schemaVersion"], "operator_alert_v1");
+        assert_eq!(safe_mode["severity"], "critical");
+        assert_eq!(safe_mode["active"], true);
+        assert_eq!(safe_mode["silenceable"], false);
+        assert_eq!(safe_mode["lifecycle"]["state"], "active_unacknowledged");
+        assert_eq!(
+            safe_mode["nativeDelivery"]["dedupePolicy"],
+            "dedupe_key_until_clear"
+        );
+        assert_eq!(
+            safe_mode["boundaryRuntime"]["safeModeActive"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(
+            !safe_mode.to_string().contains("\"rows\""),
+            "operatorAlerts must not expose raw audit rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_081_observer_operator_alerts_redact_fields_without_graphql_errors() {
+        let pool = test_pool().await;
+        let policy = Arc::new(
+            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                auth::boundary::PolicyMode::ReadOnlySafeMode,
+            )
+            .unwrap(),
+        );
+        let schema = build_schema_inner(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+            None,
+            Some(policy),
+        );
+        let redactions = P081GraphqlRedactionCollector::default();
+
+        let mut response = schema
+            .execute(
+                Request::new(r#"{ operatorAlerts }"#)
+                    .data(observer_principal())
+                    .data(redactions.clone()),
+            )
+            .await;
+        attach_p081_collected_redactions(&mut response, &redactions);
+
+        assert!(
+            response.errors.is_empty(),
+            "observer opt-in read must redact fields without a response-level GraphQL error: {response:?}"
+        );
+        let data = response.data.into_json().unwrap();
+        let alerts = data["operatorAlerts"].as_array().expect("alerts array");
+        let safe_mode = alerts
+            .iter()
+            .find(|alert| alert["dedupeKey"] == "p081.boundary.safe_mode_active")
+            .expect("safe-mode alert must be present");
+        assert_eq!(
+            safe_mode["message"],
+            serde_json::Value::Null,
+            "observer-sensitive alert message must be field-null redacted"
+        );
+        assert_eq!(
+            safe_mode["nativeDelivery"],
+            serde_json::Value::Null,
+            "observer-sensitive native delivery metadata must be redacted"
+        );
+        let extension_redactions = match response.extensions.get("redactions") {
+            Some(async_graphql::Value::List(redactions)) => redactions,
+            other => panic!("extensions.redactions must be present, got {other:?}"),
+        };
+        assert!(
+            extension_redactions.iter().any(|redaction| {
+                let async_graphql::Value::Object(object) = redaction else {
+                    return false;
+                };
+                matches!(
+                    object.get("redactionMode"),
+                    Some(async_graphql::Value::String(value)) if value == "field_null_redacted"
+                )
+            }),
+            "observer redaction must use camelCase field_null_redacted extension metadata"
+        );
+    }
+
+    #[tokio::test]
     async fn test_graphql_approve_approval_uses_p072_ui_operator_policy() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
@@ -6622,7 +7799,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}") {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8000-000000000001") {{
                         approval {{ id }}
                         journalId
                       }}
@@ -6645,7 +7822,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}") {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8000-000000000002") {{
                         approval {{
                           id
                           decision
@@ -6826,7 +8003,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}") {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8aaa-000000000001") {{
                         approval {{ id }}
                         journalId
                       }}
@@ -6845,7 +8022,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}") {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8aaa-000000000002") {{
                         approval {{ id decision }}
                         journalId
                       }}
@@ -6860,11 +8037,13 @@ mod tests {
             "first approveApproval must succeed: {first:?}"
         );
 
+        // P081: second attempt with a DIFFERENT idempotency key on an already-resolved approval
+        // returns approval_not_actionable (not already_resolved) per P081 conflict contract.
         let second = schema
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}") {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8aaa-000000000003") {{
                         approval {{ id decision }}
                         journalId
                         conflictResultCode
@@ -6877,12 +8056,12 @@ mod tests {
             .await;
         assert!(
             second.errors.is_empty(),
-            "already-resolved approval must return a typed conflict code, not a GraphQL error: {second:?}"
+            "terminal approval with different key must return typed conflict code, not a GraphQL error: {second:?}"
         );
         assert_eq!(
             second.data.into_json().unwrap()["approveApproval"]["conflictResultCode"],
-            serde_json::json!("already_resolved"),
-            "already-resolved approval must return already_resolved conflict code"
+            serde_json::json!("approval_not_actionable"),
+            "terminal approval with different key must return approval_not_actionable"
         );
     }
 
@@ -6909,10 +8088,11 @@ mod tests {
             test_reporter(),
         );
 
-        let approve = |fields: &str| {
+        // P081: each attempt uses a distinct idempotency key.
+        let approve = |fields: &str, key: &str| {
             Request::new(format!(
                 r#"mutation {{
-                  approveApproval(approvalId: "{}") {{
+                  approveApproval(approvalId: "{}", idempotencyKey: "{key}") {{
                     {fields}
                   }}
                 }}"#,
@@ -6924,6 +8104,7 @@ mod tests {
         let first = schema
             .execute(approve(
                 "approval { id decision } journalId conflictResultCode",
+                "01900000-0000-7000-8001-000000000001",
             ))
             .await;
         assert!(
@@ -6936,42 +8117,53 @@ mod tests {
             serde_json::Value::Null
         );
 
+        // P081: second attempt with a DIFFERENT idempotency key returns approval_not_actionable.
+        // (Per P081 contract: terminal approval + different key = APPROVAL_NOT_ACTIONABLE, not AlreadyResolved)
+        // P081 AC17: already-terminal denials produce zero new command_journal rows.
+        let journal_count_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM command_journal")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let second = schema
             .execute(approve(
                 "approval { id decision } journalId conflictResultCode",
+                "01900000-0000-7000-8001-000000000002",
             ))
             .await;
         assert!(
             second.errors.is_empty(),
-            "already-resolved approval must return typed conflict payload: {second:?}"
+            "terminal approval with different key must return typed conflict payload: {second:?}"
         );
         let second_json = second.data.into_json().unwrap();
         let payload = &second_json["approveApproval"];
         assert_eq!(
             payload["conflictResultCode"],
-            serde_json::json!("already_resolved")
+            serde_json::json!("approval_not_actionable"),
+            "different-key terminal retry must return approval_not_actionable (not already_resolved)"
         );
         assert_eq!(
             payload["approval"]["decision"],
             serde_json::json!("granted")
         );
+        // P081 AC17: The returned journalId for a conflict is a valid UUID (non-zero) but
+        // is not persisted to command_journal — it is a correlation handle only.
         let journal_id = payload["journalId"]
             .as_str()
             .expect("conflict payload must include journalId");
         assert_ne!(
             journal_id, "00000000-0000-0000-0000-000000000000",
-            "conflict journalId must be the real failed command journal row"
+            "conflict journalId must be a non-zero UUID correlation handle"
         );
-        uuid::Uuid::parse_str(journal_id).expect("conflict journalId must be a UUID");
-
-        let row: (String, String) =
-            sqlx::query_as("SELECT result_status, command_type FROM command_journal WHERE id = ?1")
-                .bind(journal_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(row.0, "failed");
-        assert_eq!(row.1, "ResolveApproval");
+        uuid::Uuid::parse_str(journal_id).expect("conflict journalId must be a valid UUID");
+        // P081 AC17: zero new command_journal rows for the already-resolved conflict attempt.
+        let journal_count_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM command_journal")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            journal_count_before.0, journal_count_after.0,
+            "P081 AC17: already-resolved conflict must produce zero new command_journal rows"
+        );
     }
 
     #[tokio::test]
@@ -7004,7 +8196,11 @@ mod tests {
             "P085 mutation conflict enum introspection must succeed: {response:?}"
         );
         let json = response.data.into_json().unwrap();
-        assert_enum_values(&json, "conflict", &["already_resolved"]);
+        assert_enum_values(
+            &json,
+            "conflict",
+            &["already_resolved", "approval_not_actionable"],
+        );
     }
 
     #[tokio::test]
@@ -7035,7 +8231,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}") {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8002-000000000001") {{
                         approval {{ id decision }}
                         journalId
                         conflictResultCode
@@ -7051,11 +8247,16 @@ mod tests {
             "initial approveApproval must succeed before reject conflict proof: {approve:?}"
         );
 
+        // P081 AC17: zero new journal rows for the already-resolved reject conflict attempt.
+        let journal_count_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM command_journal")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let reject = schema
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      rejectApproval(approvalId: "{}", reason: "stale reject") {{
+                      rejectApproval(approvalId: "{}", reason: "stale reject", idempotencyKey: "01900000-0000-7000-8002-000000000002") {{
                         approval {{ id decision availableActions disabledReasonCode writePathState }}
                         journalId
                         conflictResultCode
@@ -7072,9 +8273,11 @@ mod tests {
         );
         let json = reject.data.into_json().unwrap();
         let payload = &json["rejectApproval"];
+        // P081: reject with a DIFFERENT key than the approve → approval_not_actionable
         assert_eq!(
             payload["conflictResultCode"],
-            serde_json::json!("already_resolved")
+            serde_json::json!("approval_not_actionable"),
+            "terminal approval retried with different key must return approval_not_actionable"
         );
         assert_eq!(
             payload["approval"]["decision"],
@@ -7092,19 +8295,21 @@ mod tests {
             payload["approval"]["writePathState"],
             serde_json::json!("write_path_not_available")
         );
+        // P081: journalId in the conflict response is a valid non-zero UUID correlation handle.
         let journal_id = payload["journalId"]
             .as_str()
             .expect("reject conflict payload must include journalId");
         assert_ne!(journal_id, "00000000-0000-0000-0000-000000000000");
-
-        let row: (String, String) =
-            sqlx::query_as("SELECT result_status, command_type FROM command_journal WHERE id = ?1")
-                .bind(journal_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(row.0, "failed");
-        assert_eq!(row.1, "ResolveApproval");
+        uuid::Uuid::parse_str(journal_id).expect("reject conflict journalId must be a valid UUID");
+        // P081 AC17: zero new command_journal rows for the already-resolved conflict attempt.
+        let journal_count_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM command_journal")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            journal_count_before.0, journal_count_after.0,
+            "P081 AC17: already-resolved conflict must produce zero new command_journal rows"
+        );
     }
 
     #[tokio::test]
@@ -7488,7 +8693,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      rejectApproval(approvalId: "{}", reason: "needs more work") {{
+                      rejectApproval(approvalId: "{}", reason: "needs more work", idempotencyKey: "01900000-0000-7000-8003-000000000001") {{
                         approval {{ id }}
                         journalId
                       }}
@@ -7510,7 +8715,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      rejectApproval(approvalId: "{}", reason: "needs more work") {{
+                      rejectApproval(approvalId: "{}", reason: "needs more work", idempotencyKey: "01900000-0000-7000-8003-000000000002") {{
                         approval {{ id decision }}
                         journalId
                       }}

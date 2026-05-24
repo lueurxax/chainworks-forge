@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use sqlx::SqlitePool;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use db::repos::runs;
 use db::repos::side_effects::{self, apply_operator_disposition, DispositionOutcome};
@@ -14,7 +14,6 @@ use crate::protocol::McpTool;
 
 const DECISION_JSON_MAX_BYTES: usize = 64 * 1024;
 const LAST_ERROR_MAX_BYTES: usize = 512;
-const RECONCILIATION_REPORT_FILENAME: &str = "mcp-reconcile-report.json";
 const RECONCILIATION_REPORT_SCHEMA_VERSION: &str = "p078_reconciliation_report_v1";
 
 /// Redact a stored last_error before MCP readback. Strips credential-like tokens
@@ -29,7 +28,6 @@ fn redact_last_error(raw: Option<&str>) -> Option<String> {
 
 struct ReconciliationReadback {
     readback_source: String,
-    report_path: String,
     report_details: serde_json::Value,
 }
 
@@ -68,16 +66,6 @@ fn readback_probe_spec(effect_kind: &EffectKind) -> ReadbackProbeSpec {
             matched_evidence_kind: "artifact_publish_receipt",
             relative_paths: &["artifact-publish.json", "release/artifact-publish.json"],
         },
-    }
-}
-
-fn reconciliation_report_dir(effect: &SideEffect, artifact_root: &str) -> PathBuf {
-    match effect.evidence_root.as_deref() {
-        Some(root) if !root.trim().is_empty() => PathBuf::from(root).join("reconciliation"),
-        _ => PathBuf::from(artifact_root)
-            .join("side-effects")
-            .join(effect.id.to_string())
-            .join("reconciliation"),
     }
 }
 
@@ -130,15 +118,6 @@ async fn build_reconciliation_readback(
         })
         .transpose()?;
 
-    let report_path =
-        reconciliation_report_dir(effect, &run.artifact_root).join(RECONCILIATION_REPORT_FILENAME);
-    std::fs::create_dir_all(
-        report_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("invalid reconciliation report path"))?,
-    )
-    .with_context(|| format!("create reconciliation report dir {}", report_path.display()))?;
-
     let report_scope = match effect.evidence_root.as_deref() {
         Some(root) if !root.trim().is_empty() => "evidence_root",
         _ => "effect_scoped_fallback",
@@ -165,30 +144,12 @@ async fn build_reconciliation_readback(
             .as_deref()
             .map(parse_json_or_string),
         "last_error_kind": effect.last_error_kind,
-    });
-
-    let report = serde_json::json!({
         "schema_version": RECONCILIATION_REPORT_SCHEMA_VERSION,
-        "effect_id": effect.id.to_string(),
-        "run_id": effect.run_id.to_string(),
-        "stage_execution_id": effect.stage_execution_id.to_string(),
-        "effect_kind": effect.effect_kind.to_string(),
-        "status": effect.status.to_string(),
-        "readback_source": readback_source,
         "generated_at": Utc::now().to_rfc3339(),
-        "report_path": report_path.to_string_lossy().to_string(),
-        "report_details": report_details,
     });
-
-    std::fs::write(
-        &report_path,
-        serde_json::to_vec_pretty(&report).context("serialize reconciliation report")?,
-    )
-    .with_context(|| format!("write reconciliation report {}", report_path.display()))?;
 
     Ok(ReconciliationReadback {
         readback_source: readback_source.to_string(),
-        report_path: report_path.to_string_lossy().into_owned(),
         report_details,
     })
 }
@@ -473,10 +434,7 @@ pub async fn handle_effects_reconcile(
         "evidence_root": effect.evidence_root,
         "readback_source": readback.readback_source,
         "readback_unavailable": false,
-        "report_path": readback.report_path,
-        "report_details": readback.report_details.clone(),
-        "reconciliation_report_path": readback.report_path,
-        "reconciliation_report_details": readback.report_details,
+        "report_details": readback.report_details,
         "recommended_action": recommended_action,
         "retry_forbidden": true,
         "updated_at": effect.updated_at.to_rfc3339()

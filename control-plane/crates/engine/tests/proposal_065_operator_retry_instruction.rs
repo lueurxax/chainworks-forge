@@ -70,6 +70,10 @@ fn operator_caller() -> CallerContext {
         principal_class: PrincipalClass::Operator,
         caller_tool: "stages.retry".into(),
         request_id: None,
+        caller_class: None,
+        token_id: None,
+        mcp_idempotency_key: None,
+        boundary_row_id: None,
     }
 }
 
@@ -80,6 +84,10 @@ fn agent_caller() -> CallerContext {
         principal_class: PrincipalClass::Agent,
         caller_tool: "stages.retry".into(),
         request_id: None,
+        caller_class: None,
+        token_id: None,
+        mcp_idempotency_key: None,
+        boundary_row_id: None,
     }
 }
 
@@ -667,6 +675,9 @@ async fn p065_repo_helpers_round_trip() {
         Some("operator"),
         Some("stages.retry"),
         None,
+        None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -782,6 +793,9 @@ async fn p065_mark_failed_sets_reason() {
         Some("op-1"),
         Some("operator"),
         Some("stages.retry"),
+        None,
+        None,
+        None,
         None,
     )
     .await

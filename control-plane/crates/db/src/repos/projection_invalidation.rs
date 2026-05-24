@@ -212,6 +212,9 @@ pub async fn clear_backlog(
         caller_principal_class,
         Some("storage.projections.clear_backlog"),
         request_id,
+        None,
+        None,
+        None,
     )
     .await?;
 
@@ -274,6 +277,9 @@ pub async fn clear_poison(
         caller_principal_class,
         Some("storage.projections.clear_poison"),
         request_id,
+        None,
+        None,
+        None,
     )
     .await?;
 

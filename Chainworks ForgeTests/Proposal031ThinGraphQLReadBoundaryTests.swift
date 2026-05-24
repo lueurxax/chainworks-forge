@@ -3,6 +3,246 @@ import Testing
 
 @testable import Chainworks_Forge
 
+@Suite("P081 GraphQL redaction readback", .tags(.fast))
+struct Proposal081GraphQLRedactionTests {
+  @Test("P081 GraphQL response decoder preserves typed redaction extensions")
+  func responseDecoderPreservesRedactionExtensions() throws {
+    let data = Data(
+      """
+      {
+        "data": { "__typename": "Query" },
+        "extensions": {
+          "redactions": [
+            {
+              "path": ["run", "privateNote"],
+              "reasonCode": "observer_field_denied",
+              "rowId": "matrix-row-1",
+              "redactionMode": "redact_field",
+              "callerClass": "observer",
+              "redactionId": "redaction-1"
+            },
+            {
+              "path": ["run", "secretArtifact"],
+              "reasonCode": "drop_resource",
+              "rowId": "matrix-row-2",
+              "redactionMode": "drop_resource",
+              "callerClass": "observer",
+              "redactionId": "redaction-2"
+            }
+          ]
+        }
+      }
+      """.utf8)
+
+    let extensions = try P031GraphQLResponseDecoder.decodeExtensions(from: data)
+
+    #expect(extensions.redactions.count == 2)
+    #expect(extensions.redactions[0].path == ["run", "privateNote"])
+    #expect(extensions.redactions[0].reasonCode == "observer_field_denied")
+    #expect(extensions.redactions[1].redactionMode == "drop_resource")
+  }
+
+  @Test("P081 redaction state exposes distinct accessibility metadata")
+  func redactionStateAccessibilitySeparatesOrdinaryNilRedactedNilAndDropResource() throws {
+    let redaction = P081GraphQLRedaction(
+      path: ["run", "privateNote"],
+      reasonCode: "observer_field_denied",
+      rowId: "matrix-row-1",
+      redactionMode: "redact_field",
+      callerClass: "observer",
+      redactionId: "redaction-1"
+    )
+    let drop = P081GraphQLRedaction(
+      path: ["run", "secretArtifact"],
+      reasonCode: "drop_resource",
+      rowId: "matrix-row-2",
+      redactionMode: "drop_resource",
+      callerClass: "observer",
+      redactionId: "redaction-2"
+    )
+
+    let ordinary = P081RedactionState.ordinaryNil(fieldDisplayName: "Private note")
+    let redacted = P081RedactionState.redacted(fieldDisplayName: "Private note", redaction: redaction)
+    let dropped = P081RedactionState.dropResource(
+      fieldDisplayName: "Secret artifact",
+      denialCopy: "Permission denied",
+      redaction: drop
+    )
+
+    #expect(ordinary.accessibilityLabel == "Private note")
+    #expect(ordinary.accessibilityValue == "No value")
+    #expect(ordinary.accessibilityHint == nil)
+    #expect(redacted.accessibilityLabel == "Private note")
+    #expect(redacted.accessibilityValue == "Restricted value")
+    #expect(redacted.accessibilityHint == "Permissions hide this value. Copy diagnostics for the access rule.")
+    #expect(dropped.accessibilityLabel == "Restricted view")
+    #expect(dropped.accessibilityValue == "Permission denied")
+    #expect(dropped.accessibilityHint == "Permissions hide this resource. Copy diagnostics for the access rule.")
+  }
+
+  @Test("P081 operator alert lifecycle and native delivery are accessible")
+  func operatorAlertLifecycleAndNativeDeliveryAreAccessible() throws {
+    let data = Data(
+      """
+      {
+        "id": "p081-safe-mode-active",
+        "dedupeKey": "p081.boundary.safe_mode_active",
+        "severity": "critical",
+        "title": "Boundary policy is in safe mode",
+        "message": "State-changing operations are denied.",
+        "active": true,
+        "silenceable": false,
+        "acknowledgedAtMs": null,
+        "silencedUntilMs": null,
+        "nativeDelivery": {
+          "deliveryKey": "p081.boundary.safe_mode_active",
+          "dockBadgeContribution": 1,
+          "requestUserAttention": "critical",
+          "notificationCategory": "BOUNDARY_POLICY_CRITICAL",
+          "dedupePolicy": "dedupe_key_until_clear"
+        },
+        "lifecycle": {
+          "state": "active_unacknowledged",
+          "dedupeKey": "p081.boundary.safe_mode_active",
+          "ackRequired": true,
+          "clearCondition": "boundaryRuntime.safeModeActive=false"
+        }
+      }
+      """.utf8)
+
+    let alert = try JSONDecoder().decode(P081OperatorAlert.self, from: data)
+
+    #expect(alert.accessibilityLabel == "Boundary policy is in safe mode, critical")
+    #expect(alert.accessibilityValue == "active_unacknowledged")
+    #expect(alert.accessibilityHint == "Boundary alert. Copy diagnostics for p081.boundary.safe_mode_active.")
+    #expect(alert.nativeDelivery?.dockBadgeContribution == 1)
+    #expect(alert.nativeDelivery?.dedupePolicy == "dedupe_key_until_clear")
+    #expect(alert.lifecycle?.ackRequired == true)
+  }
+
+  @MainActor
+  @Test("P081 operator alerts drive native attention lifecycle without duplicate badge growth")
+  func operatorAlertNativeDeliveryIsDedupedAndClears() throws {
+    let data = Data(
+      """
+      {
+        "id": "p081-safe-mode-active",
+        "dedupeKey": "p081.boundary.safe_mode_active",
+        "severity": "critical",
+        "title": "Boundary policy is in safe mode",
+        "message": "State-changing operations are denied.",
+        "active": true,
+        "silenceable": false,
+        "acknowledgedAtMs": null,
+        "silencedUntilMs": null,
+        "nativeDelivery": {
+          "deliveryKey": "p081.boundary.safe_mode_active",
+          "dockBadgeContribution": 1,
+          "requestUserAttention": "critical",
+          "notificationCategory": "BOUNDARY_POLICY_CRITICAL",
+          "dedupePolicy": "dedupe_key_until_clear"
+        },
+        "lifecycle": {
+          "state": "active_unacknowledged",
+          "dedupeKey": "p081.boundary.safe_mode_active",
+          "ackRequired": true,
+          "clearCondition": "boundaryRuntime.safeModeActive=false"
+        }
+      }
+      """.utf8)
+    let activeAlert = try JSONDecoder().decode(P081OperatorAlert.self, from: data)
+    let inactiveAlert = P081OperatorAlert(
+      id: activeAlert.id,
+      dedupeKey: activeAlert.dedupeKey,
+      severity: activeAlert.severity,
+      title: activeAlert.title,
+      message: activeAlert.message,
+      active: false,
+      silenceable: activeAlert.silenceable,
+      acknowledgedAtMs: activeAlert.acknowledgedAtMs,
+      silencedUntilMs: activeAlert.silencedUntilMs,
+      nativeDelivery: activeAlert.nativeDelivery,
+      lifecycle: activeAlert.lifecycle
+    )
+    let service = NotificationService()
+
+    service.updateDockBadge(waitingApprovalCount: 1, blockedCount: 1)
+    service.applyP081OperatorAlerts([activeAlert])
+    #expect(service.pendingAttentionCount == 3)
+    #expect(service.isMenuBarEnabled == true)
+
+    service.applyP081OperatorAlerts([activeAlert])
+    #expect(service.pendingAttentionCount == 3)
+
+    service.applyP081OperatorAlerts([inactiveAlert])
+    #expect(service.pendingAttentionCount == 2)
+    #expect(service.isMenuBarEnabled == false)
+  }
+
+  @Test("P081 actionability_false keeps keyboard actions disabled with accessible diagnostics")
+  func actionabilityFalseKeepsApprovalControlsDisabled() throws {
+    let model = P031ApprovalReadModel(
+      id: "approval-1",
+      runID: "run-1",
+      stageID: "state_6_manual_gate",
+      decision: "pending",
+      freshnessState: .live,
+      disabledReasonCode: .observerScope,
+      writePathState: .readOnlyDiagnostic,
+      diagnosticID: "approval-1",
+      serverDebugDetail: nil,
+      availableActions: [],
+      disabledReason: "Observer principals cannot approve or reject"
+    )
+
+    #expect(model.canApprove == false)
+    #expect(model.canReject == false)
+    #expect(model.disabledReasonCode == .observerScope)
+    #expect(model.disabledReason == "Observer principals cannot approve or reject")
+  }
+
+  @MainActor
+  @Test("P081 silenced operator alert remains visible but suppresses native escalation window")
+  func silencedOperatorAlertRetainsReadbackAndBadgeState() throws {
+    let futureMs = Int(Date().addingTimeInterval(300).timeIntervalSince1970 * 1_000)
+    let data = Data(
+      """
+      {
+        "id": "p081-safe-mode-active",
+        "dedupeKey": "p081.boundary.safe_mode_active",
+        "severity": "critical",
+        "title": "Boundary policy is in safe mode",
+        "message": "State-changing operations are denied.",
+        "active": true,
+        "silenceable": true,
+        "acknowledgedAtMs": null,
+        "silencedUntilMs": \(futureMs),
+        "nativeDelivery": {
+          "deliveryKey": "p081.boundary.safe_mode_active",
+          "dockBadgeContribution": 1,
+          "requestUserAttention": "critical",
+          "notificationCategory": "BOUNDARY_POLICY_CRITICAL",
+          "dedupePolicy": "dedupe_key_until_clear"
+        },
+        "lifecycle": {
+          "state": "silenced",
+          "dedupeKey": "p081.boundary.safe_mode_active",
+          "ackRequired": true,
+          "clearCondition": "boundaryRuntime.safeModeActive=false"
+        }
+      }
+      """.utf8)
+    let alert = try JSONDecoder().decode(P081OperatorAlert.self, from: data)
+    let service = NotificationService()
+
+    service.applyP081OperatorAlerts([alert], now: Date())
+
+    #expect(alert.accessibilityValue == "silenced")
+    #expect(alert.silencedUntilMs == futureMs)
+    #expect(service.pendingAttentionCount == 1)
+  }
+}
+
 @Suite("P031 thin GraphQL read boundary", .tags(.fast))
 struct Proposal031ThinGraphQLReadBoundaryTests {
   @Test("GraphQL read request accepts queries and rejects mutations before transport")
@@ -26,6 +266,81 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     )
     #expect(transport.requests.map(\.operationName) == ["P031RunList"])
     #expect(transport.requests.first?.operationKind == .query)
+  }
+
+  @Test("P081 GraphQL response decoder preserves typed redaction extensions")
+  func p081ResponseDecoderPreservesRedactionExtensions() throws {
+    let data = Data(
+      """
+      {
+        "data": { "__typename": "Query" },
+        "extensions": {
+          "redactions": [
+            {
+              "path": ["run", "privateNote"],
+              "reasonCode": "observer_field_denied",
+              "rowId": "matrix-row-1",
+              "redactionMode": "redact_field",
+              "callerClass": "observer",
+              "redactionId": "redaction-1"
+            },
+            {
+              "path": ["run", "secretArtifact"],
+              "reasonCode": "drop_resource",
+              "rowId": "matrix-row-2",
+              "redactionMode": "drop_resource",
+              "callerClass": "observer",
+              "redactionId": "redaction-2"
+            }
+          ]
+        }
+      }
+      """.utf8)
+
+    let extensions = try P031GraphQLResponseDecoder.decodeExtensions(from: data)
+
+    #expect(extensions.redactions.count == 2)
+    #expect(extensions.redactions[0].path == ["run", "privateNote"])
+    #expect(extensions.redactions[0].reasonCode == "observer_field_denied")
+    #expect(extensions.redactions[1].redactionMode == "drop_resource")
+  }
+
+  @Test("P081 redaction state exposes distinct accessibility metadata")
+  func p081RedactionStateAccessibilitySeparatesOrdinaryNilRedactedNilAndDropResource() throws {
+    let redaction = P081GraphQLRedaction(
+      path: ["run", "privateNote"],
+      reasonCode: "observer_field_denied",
+      rowId: "matrix-row-1",
+      redactionMode: "redact_field",
+      callerClass: "observer",
+      redactionId: "redaction-1"
+    )
+    let drop = P081GraphQLRedaction(
+      path: ["run", "secretArtifact"],
+      reasonCode: "drop_resource",
+      rowId: "matrix-row-2",
+      redactionMode: "drop_resource",
+      callerClass: "observer",
+      redactionId: "redaction-2"
+    )
+
+    let ordinary = P081RedactionState.ordinaryNil(fieldDisplayName: "Private note")
+    let redacted = P081RedactionState.redacted(fieldDisplayName: "Private note", redaction: redaction)
+    let dropped = P081RedactionState.dropResource(
+      fieldDisplayName: "Secret artifact",
+      denialCopy: "Permission denied",
+      redaction: drop
+    )
+
+    #expect(ordinary.accessibilityLabel == "Private note")
+    #expect(ordinary.accessibilityValue == "No value")
+    #expect(ordinary.accessibilityHint == nil)
+    #expect(redacted.accessibilityLabel == "Private note")
+    #expect(redacted.accessibilityValue == "Restricted value")
+    #expect(redacted.accessibilityHint == "Permissions hide this value. Copy diagnostics for the access rule.")
+    #expect(dropped.accessibilityLabel == "Restricted view")
+    #expect(dropped.accessibilityValue == "Permission denied")
+    #expect(dropped.accessibilityHint == "Permissions hide this resource. Copy diagnostics for the access rule.")
   }
 
   @Test("P072 approval mutation client allows only approval mutations")
@@ -58,7 +373,7 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
     )
     let client = P072ApprovalMutationClient(transport: transport)
 
-    let result = try await client.approve(approvalID: approvalID)
+    let result = try await client.approve(approvalID: approvalID, idempotencyKey: UUID().uuidString)
 
     #expect(result.approval.id == approvalID)
     #expect(result.journalID == "journal-1")
@@ -2732,6 +3047,73 @@ struct Proposal031ThinGraphQLReadBoundaryTests {
   }
 }
 
+@Suite("P081 approval action attempt store", .tags(.fast))
+struct Proposal081ApprovalActionAttemptStoreTests {
+  @Test("Approval action attempts keep one retry key until success")
+  func approvalActionAttemptStorePersistsRetryKeyUntilSuccess() throws {
+    let suiteName = "P081ApprovalActionAttemptStore-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let generator = P081AttemptKeySequence(["key-1", "key-2"])
+    let storageKey = "attempts"
+    let firstStore = P081ApprovalActionAttemptStore(
+      defaults: defaults,
+      storageKey: storageKey,
+      makeID: { generator.next() }
+    )
+
+    let first = firstStore.idempotencyKey(for: "approval:1", action: .approve)
+    let retry = firstStore.idempotencyKey(for: "approval:1", action: .approve)
+
+    #expect(first == "key-1")
+    #expect(retry == "key-1")
+
+    let restartedStore = P081ApprovalActionAttemptStore(
+      defaults: defaults,
+      storageKey: storageKey,
+      makeID: { generator.next() }
+    )
+    #expect(restartedStore.idempotencyKey(for: "approval:1", action: .approve) == "key-1")
+
+    restartedStore.clear(approvalID: "approval:1", action: .approve)
+
+    #expect(restartedStore.idempotencyKey(for: "approval:1", action: .approve) == "key-2")
+  }
+
+  @Test("Approval action attempts are scoped by approval action")
+  func approvalActionAttemptStoreScopesKeysByAction() throws {
+    let suiteName = "P081ApprovalActionAttemptStore-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+
+    let generator = P081AttemptKeySequence(["approve-key", "reject-key", "other-reject-key"])
+    let store = P081ApprovalActionAttemptStore(
+      defaults: defaults,
+      storageKey: "attempts",
+      makeID: { generator.next() }
+    )
+
+    let approve = store.idempotencyKey(for: "approval/1", action: .approve)
+    let reject = store.idempotencyKey(
+      for: "approval/1",
+      action: .reject(reason: "needs:changes")
+    )
+
+    #expect(approve == "approve-key")
+    #expect(reject == "reject-key")
+    #expect(approve != reject)
+    #expect(
+      store.idempotencyKey(for: "approval/1", action: .reject(reason: "needs:changes"))
+        == "reject-key"
+    )
+    #expect(
+      store.idempotencyKey(for: "approval/1", action: .reject(reason: "different reason"))
+        == "other-reject-key"
+    )
+  }
+}
+
 private struct RunsPayload: Decodable {
   let runs: [P031RunRowReadModel]
 }
@@ -3074,6 +3456,24 @@ private final class CapturingP031SubscriptionTransport: P031GraphQLSubscriptionT
       }
       continuation.finish()
     }
+  }
+}
+
+private final class P081AttemptKeySequence: @unchecked Sendable {
+  private let lock = NSLock()
+  private var keys: [String]
+
+  init(_ keys: [String]) {
+    self.keys = keys
+  }
+
+  func next() -> String {
+    lock.lock()
+    defer { lock.unlock() }
+    guard !keys.isEmpty else {
+      return "exhausted-\(UUID().uuidString)"
+    }
+    return keys.removeFirst()
   }
 }
 

@@ -1619,6 +1619,10 @@ async fn rebuild_all_for_run_on_current_thread(pool: &SqlitePool, run_id: RunId)
     rebuild_artifact_noise_summary(pool, run_id).await?;
     rebuild_runtime_health_summary(pool).await?;
 
+    // P088: Bake implementation_completion_json into the run summary so runs.list can
+    // read it without querying the receipts table on every list call.
+    refresh_run_list_readbacks(pool, run_id).await?;
+
     info!(run_id = %run_id, "Full projection rebuild complete");
     Ok(())
 }

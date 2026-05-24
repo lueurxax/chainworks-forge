@@ -219,6 +219,9 @@ async fn repair_slot_once(
         Some(caller_principal_class),
         Some("storage.maintenance.repair_slot"),
         request_id,
+        None,
+        None,
+        None,
     )
     .await?;
 

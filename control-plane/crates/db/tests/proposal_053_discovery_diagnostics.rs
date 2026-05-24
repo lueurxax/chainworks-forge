@@ -559,6 +559,9 @@ async fn proposal_053_discovery_diagnostics_legacy_override_binds_and_consumes_p
         Some("operator"),
         Some("stages.retry"),
         None,
+        None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -702,6 +705,9 @@ async fn proposal_053_discovery_diagnostics_legacy_override_rejects_duplicate_an
         Some("operator"),
         Some("legacy_discovery_override_create"),
         None,
+        None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -717,6 +723,9 @@ async fn proposal_053_discovery_diagnostics_legacy_override_rejects_duplicate_an
         Some("operator-1"),
         Some("operator"),
         Some("legacy_discovery_override_create"),
+        None,
+        None,
+        None,
         None,
     )
     .await

@@ -47,10 +47,12 @@ Cheapest possible structural gate.
 Scope:
 
 - no direct `Run(...)` construction outside `RunRepository`
+- `scripts/check-boundary-coverage.sh` (P081) fails in-scope boundary changes that omit a `matrix_row` citation, `boundary-no-op` label, or matched fixture+doc touch under `docs/reference/boundary-first-api-auth-contract.{json,md}`
 
 Use when:
 
 - editing persistence, repositories, constructors, or test scaffolding
+- editing P081 in-scope crates (`control-plane/crates/auth/`, `graphql-server/`, `mcp-server/`, `engine/`, `db/src/repos/audit_log*`, `db/src/repos/approval_mutation_idempotency.rs`, `db/src/repos/mcp_command_idempotency.rs`, and the `064_p081_*`/`065_p081_*`/`066_p081_*`/`067_p081_*`/`068_p081_*`/`069_p081_*`/`070_p081_*`/`071_p081_*` migrations)
 
 Command:
 
@@ -2165,3 +2167,52 @@ Important:
 - documentation-only self-contract fixtures are validated for JSON well-formedness only; linter-testable scheduler and cutover fixtures are linter inputs
 - the gate validates parity-lane fixture shape (run_report, mcp, release_receipt, graphql), Rust rollout-contract preflight/storage regressions, clean migration install, and the Swift read-only presentation slice
 - the gate fails closed if the template is missing a required term, any negative fixture is absent or malformed, the retained historical alias `p084-full-surface` fixture omits a required readback field or parity-lane payload, or the `Proposal084Tests` Swift slice fails
+
+### `proposal-081|p081`
+
+Boundary-first API and auth contract matrix gate (matrix/fixture validation, shared `BoundaryPolicy`, bounded `boundaryRuntime` and `operatorAlerts` readback, GraphQL WebSocket close-code enforcement, GraphQL `extensions.redactions`, `approval_mutation_idempotency`, Swift approval action attempt persistence, and `mcp_command_idempotency` dispatcher enforcement for state-changing MCP tools).
+
+Operational truth lives in [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md)
+and the executable fixture [boundary-first-api-auth-contract.json](boundary-first-api-auth-contract.json);
+the macOS-side contract lives in [swift-macos-boundary-contract.md](swift-macos-boundary-contract.md).
+
+Scope:
+
+- `scripts/check-boundary-coverage.sh` (also runs from `guardrails`)
+- fixture validity: `boundary-first-api-auth-contract.json` parses, declares `schema_version == 1`, carries a `matrix_id`, and contains all 11 required row ids (`p081.ui_operator.graphql_query.read`, `p081.ui_operator.graphql_subscription.subscribe`, `p081.ui_operator.graphql_mutation.approval_action`, `p081.agent_operator.mcp_initialize.capability`, `p081.agent_operator.mcp_tools_list.discovery`, `p081.agent_operator.mcp_tools_call.command`, `p081.automation.mcp_tools_list.discovery`, `p081.automation.mcp_tools_call.command`, `p081.observer.mcp_tools_call.compact_read`, `p081.observer.graphql_query.read_only_opt_in`, `p081.developer_break_glass.debug_endpoint.disabled`)
+- `boundary-first-api-auth-contract.md` exists
+- `cargo test -p auth boundary::` — fixture loader, validator error codes, embedded last-known-good fallback into `read_only_safe_mode`
+- `cargo test -p auth caller_class` — `CallerClass` enum, `CallerContext.caller_class`, and resolver
+- `cargo test -p auth bootstrap_emits_schema_version_3` and `v3_principal_table_rejects_unknown_schema_version` — principal-table v3 parser
+- `cargo test -p db repos::audit_log::` — `audit_log` repository write/append/checkpoint semantics
+- `cargo test -p graphql-server proposal_081_boundary_runtime_graphql_readback_is_bounded` — bounded GraphQL `boundaryRuntime` operator diagnostic lane for active policy mode, safe-mode state, and audit-log health
+- `cargo test -p graphql-server test_graphql_ws_rejects_missing_connection_init_auth` and `test_graphql_ws_rejects_non_ui_caller_with_forbidden_close` — GraphQL WebSocket pre-auth close-code contract (`4401`, `4403`, `4408`)
+- `RUST_MIN_STACK=8388608 cargo test -p mcp-server proposal_081_runtime_health_includes_boundary_runtime_readback` — bounded MCP `runtime.health.boundaryRuntime` diagnostic lane with the same audit-log health envelope
+- `RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_ideas_create_records_command_journal_and_idempotency_linkage` and `p081_ideas_create_idempotency_replay_does_not_duplicate_command_commit` — MCP state-changing idempotency requires a durable command-journal link and duplicate replays do not duplicate command/domain rows
+- `Chainworks ForgeTests/Proposal081ApprovalActionAttemptStoreTests` — Swift approval action attempt store reuses one idempotency key across retries/restarts, scopes by approval action, and clears after terminal success
+- `Chainworks ForgeTests/Proposal081GraphQLRedactionTests` — Swift decodes typed GraphQL redaction metadata and operator-alert lifecycle/native-delivery fields with accessibility metadata
+- migration presence: `control-plane/crates/db/migrations/064_p081_audit_log.sql`, `065_p081_audit_log_checkpoints.sql`, `066_p081_caller_class.sql`, `067_p081_approval_idempotency.sql`, `068_p081_fix_payload_length_check.sql`, `069_p081_approval_idempotency_request_hash.sql`, `070_p081_mcp_command_idempotency.sql`, `071_p081_command_journal_idempotency.sql`
+
+Use when:
+
+- changing the boundary matrix doc/fixture
+- editing `control-plane/crates/auth/src/boundary/`, the `auth::resolve` caller-class derivation, `db::repos::audit_log`, or the P081 migrations
+- changing Swift approval action idempotency ownership in `RunsHomeView`
+- adding or renaming a matrix row, transport, caller class, denial reason code, or rollout phase
+
+Host policy:
+
+- local Rust toolchain and Python 3 required; no UI host, daemon, or network required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-081
+./scripts/test-gate.sh p081
+```
+
+Important:
+
+- `p081` is accepted as an alias
+- this gate proves the P081 boundary contract as implemented repository truth: daemon-injected policy wiring, GraphQL/MCP bounded readback, WebSocket close-code enforcement, GraphQL redaction envelopes, Swift redaction/accessibility decoding, approval idempotency, and MCP command idempotency linked to `command_journal`
+- the gate fails closed if the fixture is missing any required row, the doc is missing, the auth/db/readback/WebSocket/idempotency/Swift slices fail, or any of the P081 migrations (`064`–`071`) is absent

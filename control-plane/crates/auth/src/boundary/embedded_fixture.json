@@ -139,7 +139,7 @@
       "row_id": "p081.agent_operator.mcp_tools_list.discovery",
       "caller_class": "agent_operator",
       "transports": ["mcp_tools_list"],
-      "actions": ["tools/list"],
+      "actions": ["tools/list", "resources.list", "resources.templates.list"],
       "allow": {
         "enabled": true,
         "wildcard": false,
@@ -170,10 +170,10 @@
       "row_id": "p081.agent_operator.mcp_tools_call.command",
       "caller_class": "agent_operator",
       "transports": ["mcp_tools_call"],
-      "actions": ["operator-class MCP commands scoped by surface_policies.mcp"],
+      "actions": ["runs.*", "ideas.*", "approvals.*", "stages.*", "reports.*", "artifacts.*", "steward.*", "storage.*", "runtime.*", "effects.*", "resources.*"],
       "allow": {
         "enabled": true,
-        "wildcard": false,
+        "wildcard": true,
         "conditions": []
       },
       "deny": {
@@ -204,7 +204,7 @@
       "row_id": "p081.automation.mcp_tools_list.discovery",
       "caller_class": "automation",
       "transports": ["mcp_tools_list"],
-      "actions": ["tools/list"],
+      "actions": ["tools/list", "resources.list", "resources.templates.list"],
       "allow": {
         "enabled": true,
         "wildcard": false,
@@ -235,10 +235,10 @@
       "row_id": "p081.automation.mcp_tools_call.command",
       "caller_class": "automation",
       "transports": ["mcp_tools_call"],
-      "actions": ["intersection of surface_policies.mcp and automation_capabilities"],
+      "actions": ["runs.*", "ideas.*", "approvals.*", "stages.*", "reports.*", "artifacts.*", "steward.*", "storage.*", "runtime.*", "effects.*", "resources.*"],
       "allow": {
         "enabled": true,
-        "wildcard": false,
+        "wildcard": true,
         "conditions": []
       },
       "deny": {
@@ -268,7 +268,16 @@
       "row_id": "p081.observer.mcp_tools_call.compact_read",
       "caller_class": "observer",
       "transports": ["mcp_tools_call"],
-      "actions": ["read-only compact diagnostics"],
+      "actions": [
+        "runtime.health",
+        "runs.list", "runs.get",
+        "approvals.list", "approvals.get",
+        "stages.list", "stages.get",
+        "artifacts.list", "artifacts.get",
+        "reports.list", "reports.get",
+        "steward.status",
+        "resources.list", "resources.read"
+      ],
       "allow": {
         "enabled": true,
         "wildcard": false,
@@ -300,7 +309,7 @@
       "row_id": "p081.observer.graphql_query.read_only_opt_in",
       "caller_class": "observer",
       "transports": ["graphql_query"],
-      "actions": ["explicitly enabled read-only fields only"],
+      "actions": ["graphql.read_only"],
       "allow": {
         "enabled": true,
         "wildcard": false,
@@ -333,7 +342,7 @@
       "row_id": "p081.developer_break_glass.debug_endpoint.disabled",
       "caller_class": "developer_break_glass",
       "transports": ["debug_endpoint"],
-      "actions": ["diagnostic preflight readback only if separately enabled later"],
+      "actions": ["debug.preflight"],
       "allow": {
         "enabled": false,
         "wildcard": false,

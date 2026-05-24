@@ -35,6 +35,32 @@ pub async fn insert(pool: &SqlitePool, idea: &Idea) -> Result<()> {
     Ok(())
 }
 
+pub async fn insert_tx(tx: &mut Transaction<'_, Sqlite>, idea: &Idea) -> Result<()> {
+    let id = idea.id.to_string();
+    let status = idea.status.to_string();
+    let created_at = idea.created_at.to_rfc3339();
+    let archived_at = idea.archived_at.map(|t| t.to_rfc3339());
+
+    sqlx::query(
+        r#"
+        INSERT INTO ideas (id, title, body, workspace_root_path, project_key, status, created_at, archived_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(id)
+    .bind(&idea.title)
+    .bind(&idea.body)
+    .bind(&idea.workspace_root_path)
+    .bind(&idea.project_key)
+    .bind(status)
+    .bind(created_at)
+    .bind(archived_at)
+    .execute(&mut **tx)
+    .await
+    .context("insert idea")?;
+    Ok(())
+}
+
 pub async fn find_by_id(pool: &SqlitePool, id: IdeaId) -> Result<Option<Idea>> {
     let id_str = id.to_string();
     let row = sqlx::query(

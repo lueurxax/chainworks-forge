@@ -206,38 +206,6 @@ pub async fn list_unresolved_for_run(pool: &SqlitePool, run_id: &str) -> Result<
     rows.into_iter().map(parse_side_effect).collect()
 }
 
-pub async fn list_unresolved_for_run_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    run_id: &str,
-) -> Result<Vec<SideEffect>> {
-    let rows = sqlx::query(
-        r#"SELECT id, run_id, stage_execution_id, agent_execution_id,
-                  effect_kind, target_key,
-                  idempotency_key, idempotency_key_version,
-                  request_fingerprint, request_fingerprint_version,
-                  status, owner_instance_id,
-                  lease_acquired_at, lease_renewed_at, lease_expires_at,
-                  deadline_at, external_write_started_at, external_write_attempted,
-                  attempt_budget_remaining, expected_evidence_json,
-                  observed_evidence_summary_json, evidence_root,
-                  last_error_kind, last_error, settlement_txn_id,
-                  created_at, updated_at
-           FROM side_effects
-           WHERE run_id = ?1
-             AND status IN (
-               'prepared','executing','externally_observed',
-               'needs_reconciliation','conflict','unrecoverable'
-             )
-           ORDER BY created_at ASC"#,
-    )
-    .bind(run_id)
-    .fetch_all(&mut **tx)
-    .await
-    .context("list unresolved side_effects for run")?;
-
-    rows.into_iter().map(parse_side_effect).collect()
-}
-
 pub async fn list_unresolved_for_stage(
     pool: &SqlitePool,
     stage_execution_id: &str,
@@ -266,6 +234,41 @@ pub async fn list_unresolved_for_stage(
     .fetch_all(pool)
     .await
     .context("list unresolved side_effects for stage")?;
+
+    rows.into_iter().map(parse_side_effect).collect()
+}
+
+/// Transaction-scoped variant of `list_unresolved_for_run`. Callers that already
+/// hold an open `BEGIN IMMEDIATE` transaction on a single-connection pool (e.g.
+/// command handlers, in-memory test pools) must use this to avoid deadlocking.
+pub async fn list_unresolved_for_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+) -> Result<Vec<SideEffect>> {
+    let rows = sqlx::query(
+        r#"SELECT id, run_id, stage_execution_id, agent_execution_id,
+                  effect_kind, target_key,
+                  idempotency_key, idempotency_key_version,
+                  request_fingerprint, request_fingerprint_version,
+                  status, owner_instance_id,
+                  lease_acquired_at, lease_renewed_at, lease_expires_at,
+                  deadline_at, external_write_started_at, external_write_attempted,
+                  attempt_budget_remaining, expected_evidence_json,
+                  observed_evidence_summary_json, evidence_root,
+                  last_error_kind, last_error, settlement_txn_id,
+                  created_at, updated_at
+           FROM side_effects
+           WHERE run_id = ?1
+             AND status IN (
+               'prepared','executing','externally_observed',
+               'needs_reconciliation','conflict','unrecoverable'
+             )
+           ORDER BY created_at ASC"#,
+    )
+    .bind(run_id)
+    .fetch_all(&mut **tx)
+    .await
+    .context("list unresolved side_effects for run (tx)")?;
 
     rows.into_iter().map(parse_side_effect).collect()
 }

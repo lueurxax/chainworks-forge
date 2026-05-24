@@ -76,6 +76,10 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
     // Exhaustive match — adding a new Command variant fails to compile here
     // until the author records an explicit matrix entry.
     match cmd {
+        Command::CreateIdea(_) => {
+            // Preserve operator-submitted idea title/body in the command journal:
+            // idea creation is itself the durable content being audited.
+        }
         Command::StartRun(_) => {
             if let Some(obj) = inner {
                 redact_field_if_present(obj, "delivery_configuration_json");
@@ -617,6 +621,7 @@ mod tests {
                 rationale: Some("LGTM".into()),
                 run_id: RunId::new(),
                 stage_id: "state_6".into(),
+                idempotency_key: None,
             }),
             Command::ResolveApproval(ResolveApprovalCmd {
                 approval_id: domain::ids::ApprovalId::new(),
@@ -624,6 +629,7 @@ mod tests {
                 rationale: Some("Needs rework".into()),
                 run_id: RunId::new(),
                 stage_id: "state_3".into(),
+                idempotency_key: None,
             }),
         ];
 
@@ -641,6 +647,7 @@ mod tests {
         // discriminant is accounted for in the focused inventory.
         fn _exhaustiveness_reminder(c: &Command) {
             match c {
+                Command::CreateIdea(_) => {}
                 Command::StartRun(_) => {}
                 Command::ApproveStage(_) => {}
                 Command::RejectStage(_) => {}

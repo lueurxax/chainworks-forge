@@ -92,6 +92,20 @@ pub const P087_REQUIRED_METRICS: &[&str] = &[
     "hot_read_circuit_open_total",
 ];
 
+pub const P081_REQUIRED_METRICS: &[&str] = &[
+    "p081_boundary_policy_enforcement_parity_percent",
+    "boundary_policy_decisions_total",
+    "boundary_policy_shadow_disagreement_total",
+    "audit_log_append_failure_total",
+    "operator_alert_native_delivery_total",
+    "mcp_command_idempotency_replay_total",
+    "mcp_command_idempotency_conflict_total",
+    "boundary_policy_evaluation_error_total",
+    "approval_actionability_false_total",
+    "graphql_redaction_extensions_total",
+    "boundary_policy_decision_latency_ms",
+];
+
 fn metrics() -> &'static Mutex<SystemMetrics> {
     METRICS.get_or_init(|| Mutex::new(SystemMetrics::default()))
 }
@@ -122,6 +136,34 @@ pub fn increment_counter_with_label(name: &str, label: &str) {
     let mut m = metrics().lock().unwrap();
     let key = format!("{}:{}", name, label);
     *m.counters.entry(key).or_default() += 1;
+}
+
+pub fn record_p081_boundary_decision(
+    transport: &str,
+    row_id: Option<&str>,
+    caller_class: &str,
+    action_kind: &str,
+    decision: &str,
+    denial_reason_code: Option<&str>,
+    mode: &str,
+) {
+    increment_counter("boundary_policy_decisions_total");
+    increment_counter_with_label(
+        "boundary_policy_decisions_total",
+        &format!(
+            "transport={transport},row_id={},caller_class={caller_class},action_kind={action_kind},decision={decision},denial_reason_code={},shadow_or_enforce={mode}",
+            row_id.unwrap_or("none"),
+            denial_reason_code.unwrap_or("none")
+        ),
+    );
+}
+
+pub fn record_p081_boundary_decision_latency(duration: Duration) {
+    let mut m = metrics().lock().unwrap();
+    m.hot_read_latency
+        .entry("boundary_policy_decision_latency_ms".to_string())
+        .or_default()
+        .record(duration.as_millis() as u64);
 }
 
 pub fn get_counter(name: &str) -> u64 {
@@ -310,5 +352,42 @@ mod tests {
                 "missing required P087 metric declaration: {metric}"
             );
         }
+    }
+
+    #[test]
+    fn proposal_081_required_metric_names_are_declared_and_recordable() {
+        for metric in [
+            "p081_boundary_policy_enforcement_parity_percent",
+            "boundary_policy_decisions_total",
+            "boundary_policy_shadow_disagreement_total",
+            "audit_log_append_failure_total",
+            "operator_alert_native_delivery_total",
+            "mcp_command_idempotency_replay_total",
+            "mcp_command_idempotency_conflict_total",
+            "boundary_policy_evaluation_error_total",
+            "approval_actionability_false_total",
+            "graphql_redaction_extensions_total",
+            "boundary_policy_decision_latency_ms",
+        ] {
+            assert!(
+                P081_REQUIRED_METRICS.contains(&metric),
+                "missing required P081 metric declaration: {metric}"
+            );
+        }
+        record_p081_boundary_decision(
+            "graphql_query",
+            Some("p081.observer.graphql_query.read_only_opt_in"),
+            "observer",
+            "graphql.read_only",
+            "allow_redacted",
+            None,
+            "enforce",
+        );
+        record_p081_boundary_decision_latency(Duration::from_millis(2));
+        assert!(get_counter("boundary_policy_decisions_total") > 0);
+        assert_eq!(
+            get_hot_read_latest("boundary_policy_decision_latency_ms"),
+            Some(2)
+        );
     }
 }

@@ -68,6 +68,10 @@ fn operator_caller() -> CallerContext {
         principal_class: PrincipalClass::Operator,
         caller_tool: "stages.retry".into(),
         request_id: None,
+        caller_class: None,
+        token_id: None,
+        mcp_idempotency_key: None,
+        boundary_row_id: None,
     }
 }
 
