@@ -28,6 +28,13 @@ pub struct McpServer {
     boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
 }
 
+fn embedded_shadow_boundary_policy() -> Arc<auth::boundary::BoundaryPolicy> {
+    Arc::new(
+        auth::boundary::BoundaryPolicy::from_embedded_with_mode(auth::boundary::PolicyMode::Shadow)
+            .expect("embedded P081 boundary fixture must be valid"),
+    )
+}
+
 async fn write_json_line<T: serde::Serialize>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value: &T) {
     if let Ok(json) = serde_json::to_string(value) {
         let mut stdout = stdout.lock().await;
@@ -134,7 +141,7 @@ impl McpServer {
             principal_table,
             events: None,
             storage_writer_heartbeat: None,
-            boundary_policy: None,
+            boundary_policy: Some(embedded_shadow_boundary_policy()),
         }
     }
 
@@ -150,7 +157,7 @@ impl McpServer {
             principal_table,
             events: None,
             storage_writer_heartbeat: Some(storage_writer_heartbeat),
-            boundary_policy: None,
+            boundary_policy: Some(embedded_shadow_boundary_policy()),
         }
     }
 
@@ -183,7 +190,7 @@ impl McpServer {
             principal_table,
             events: Some(events),
             storage_writer_heartbeat: None,
-            boundary_policy: None,
+            boundary_policy: Some(embedded_shadow_boundary_policy()),
         }
     }
 
@@ -401,6 +408,7 @@ impl McpServer {
                             )
                             .await
                             {
+                                db::metrics::increment_counter("audit_log_append_failure_total");
                                 tracing::error!(
                                     error = %e,
                                     "boundary deny audit write failed; failing closed (mcp_initialize)"
@@ -499,6 +507,7 @@ impl McpServer {
                             )
                             .await
                             {
+                                db::metrics::increment_counter("audit_log_append_failure_total");
                                 tracing::error!(
                                     error = %e,
                                     "boundary deny audit write failed; failing closed (mcp_tools_list)"
@@ -608,6 +617,7 @@ impl McpServer {
                             )
                             .await
                             {
+                                db::metrics::increment_counter("audit_log_append_failure_total");
                                 tracing::error!(
                                     error = %e,
                                     "boundary deny audit write failed; failing closed (mcp_tools_call)"
@@ -667,6 +677,7 @@ impl McpServer {
                     )
                     .await
                     {
+                        db::metrics::increment_counter("audit_log_append_failure_total");
                         tracing::warn!(error = %e, tool = %canonical_tool_name, "capability-denial audit write failed; returning fail-closed denial");
                         return JsonRpcResponse::policy_denial(
                             id,
@@ -708,9 +719,9 @@ impl McpServer {
                 let tool_params = params["arguments"].clone();
 
                 // P081 AC-13: MCP command idempotency enforcement.
-                // Pre-claim approach: insert a pending sentinel BEFORE dispatch so concurrent
-                // races are serialized by the UNIQUE constraint and crash-after-dispatch leaves
-                // a durable pending record that prevents silent re-execution on retry.
+                // The transport validates and looks up the key before dispatch; the pending
+                // sentinel is inserted inside the command transaction so the idempotency claim,
+                // command_journal row, and durable domain writes share one write unit.
                 // Logic extracted to module-level helpers to keep this async fn's stack frame small.
                 let (idempotency_claimed_key, idempotency_claimed_hash) =
                     if is_state_changing_call(canonical_tool_name, &tool_params) {
@@ -751,9 +762,12 @@ impl McpServer {
                 // CommandJournalEntry::new() then persists in command_journal.
                 let dispatch_result = crate::request_context::scope_idempotency_key(
                     idempotency_claimed_key.clone(),
-                    crate::request_context::scope_boundary_row_id(
-                        policy_allowed_row_id.clone(),
-                        self.dispatch_tool(canonical_tool_name, tool_params, principal),
+                    crate::request_context::scope_idempotency_request_hash(
+                        idempotency_claimed_hash.clone(),
+                        crate::request_context::scope_boundary_row_id(
+                            policy_allowed_row_id.clone(),
+                            self.dispatch_tool(canonical_tool_name, tool_params, principal),
+                        ),
                     ),
                 )
                 .await;
@@ -797,26 +811,29 @@ impl McpServer {
                         // SEC-P081-002: Log full error chain server-side; expose only INTERNAL
                         // plus the ambient request_id for correlation.
                         let rid = crate::request_context::current_request_id();
+                        let error_text = e.to_string();
+                        if error_text.starts_with("IDEMPOTENCY_IN_FLIGHT") {
+                            return JsonRpcResponse::error_with_data(
+                                id,
+                                -32603,
+                                "idempotency key has an in-flight request; retry after completion",
+                                serde_json::json!({
+                                    "code": "IDEMPOTENCY_IN_FLIGHT",
+                                    "tool_name": canonical_tool_name,
+                                    "request_id": rid,
+                                }),
+                            );
+                        }
                         tracing::error!(
                             error = %e,
                             request_id = ?rid,
                             tool = %canonical_tool_name,
                             "mcp_tools_call: internal dispatch error"
                         );
-                        // Release the pending idempotency claim so the caller can retry.
-                        if let Some(ref key) = idempotency_claimed_key {
-                            if let Err(del_err) =
-                                db::repos::mcp_command_idempotency::delete_pending(&self.pool, key)
-                                    .await
-                            {
-                                tracing::warn!(
-                                    error = %del_err,
-                                    tool = %canonical_tool_name,
-                                    "failed to delete pending idempotency claim after dispatch error; \
-                                     key will expire naturally"
-                                );
-                            }
-                        }
+                        // The pending idempotency claim is owned by the command transaction.
+                        // On rollback it disappears with the command writes; on a committed
+                        // failure it remains as committed-unack evidence and must not be
+                        // deleted by a racing transport retry.
                         let data = serde_json::json!({
                             "code": "INTERNAL",
                             "request_id": rid,
@@ -828,13 +845,16 @@ impl McpServer {
 
             "resources/list" => {
                 // P081: evaluate BoundaryPolicy before exposing resource listing.
-                // Use concrete action "resources.list" so absent matrix rows fail closed (H-002 fix).
+                // Observer compact reads are modeled as mcp_tools_call in the matrix;
+                // operator/automation discovery remains mcp_tools_list.
                 // matrix_row: p081.agent_operator.mcp_tools_list.discovery
+                // matrix_row: p081.observer.mcp_tools_call.compact_read
                 if let Some(policy) = &self.boundary_policy {
                     let caller_class = auth::derive_caller_class_for_mcp(&principal);
+                    let policy_transport = resources_list_policy_transport(caller_class.as_str());
                     match policy.evaluate(
                         caller_class.as_str(),
-                        "mcp_tools_list",
+                        policy_transport,
                         Some("resources.list"),
                     ) {
                         auth::boundary::PolicyDecision::Deny {
@@ -846,7 +866,7 @@ impl McpServer {
                                 &self.pool,
                                 self.boundary_policy.as_deref(),
                                 principal,
-                                "mcp_tools_list",
+                                policy_transport,
                                 "resources/list",
                                 &reason_code,
                                 row_id.as_deref(),
@@ -1684,10 +1704,11 @@ async fn mcp_idempotency_committed_unack_recovery(
     }
 }
 
-/// Execute the P081 pre-claim idempotency precheck for state-changing MCP calls.
+/// Execute the P081 idempotency lookup precheck for state-changing MCP calls.
 ///
 /// `boundary_row_id` is threaded from the BoundaryPolicy Allow decision so it is
-/// included in the canonical_request_hash per P081 mcp_idempotency_contract.
+/// included in the canonical_request_hash per P081 mcp_idempotency_contract. The
+/// first-attempt pending sentinel is claimed later inside the command transaction.
 ///
 /// Extracted into a module-level async fn to keep the async state machine of the
 /// outer request handler small enough to avoid stack overflows.
@@ -1738,100 +1759,58 @@ async fn mcp_idempotency_precheck(
         boundary_row_id,
     );
 
-    match db::repos::mcp_command_idempotency::insert_pending(
-        pool,
-        &key_str,
-        canonical_tool_name,
-        &principal.id,
-        &canonical_hash,
-        boundary_row_id,
-    )
-    .await
-    {
-        Ok(true) => IdempotencyOutcome::Proceed {
+    match db::repos::mcp_command_idempotency::find_by_key(pool, &key_str).await {
+        Ok(None) => IdempotencyOutcome::Proceed {
             key: key_str,
             hash: canonical_hash,
         },
-        Ok(false) => {
-            // UNIQUE violation — look up the existing record.
-            match db::repos::mcp_command_idempotency::find_by_key(pool, &key_str).await {
-                Ok(Some(record)) => {
-                    if record.result_json == db::repos::mcp_command_idempotency::PENDING_SENTINEL {
-                        let age_ms = chrono::Utc::now().timestamp_millis() - record.committed_at_ms;
-                        let rid = crate::request_context::current_request_id();
-                        if age_ms < 30_000 {
-                            IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
-                                id,
-                                -32603,
-                                "idempotency key has an in-flight request; retry after completion",
-                                serde_json::json!({
-                                    "code": "IDEMPOTENCY_IN_FLIGHT",
-                                    "tool_name": canonical_tool_name,
-                                    "request_id": rid,
-                                }),
-                            ))
-                        } else {
-                            mcp_idempotency_committed_unack_recovery(
-                                pool,
-                                id,
-                                canonical_tool_name,
-                                &key_str,
-                                rid,
-                            )
-                            .await
-                        }
-                    } else if record.canonical_request_hash == canonical_hash {
-                        let result: serde_json::Value = serde_json::from_str(&record.result_json)
-                            .unwrap_or(serde_json::Value::Null);
-                        IdempotencyOutcome::Cached(JsonRpcResponse::success(
-                            id,
-                            serde_json::json!({
-                                "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap_or_default() }],
-                                "_idempotency": "duplicate_ok"
-                            }),
-                        ))
-                    } else {
-                        IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
-                            id,
-                            -32603,
-                            "idempotency conflict",
-                            serde_json::json!({
-                                "code": "IDEMPOTENCY_CONFLICT",
-                                "tool_name": canonical_tool_name,
-                            }),
-                        ))
-                    }
-                }
-                Ok(None) => {
-                    let rid = crate::request_context::current_request_id();
+        Ok(Some(record)) => {
+            if record.result_json == db::repos::mcp_command_idempotency::PENDING_SENTINEL {
+                let age_ms = chrono::Utc::now().timestamp_millis() - record.committed_at_ms;
+                let rid = crate::request_context::current_request_id();
+                if age_ms < 30_000 {
                     IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
                         id,
                         -32603,
-                        "idempotency storage error; retry",
+                        "idempotency key has an in-flight request; retry after completion",
                         serde_json::json!({
-                            "code": "SQLITE_CONTENTION_RETRY_EXHAUSTED",
+                            "code": "IDEMPOTENCY_IN_FLIGHT",
+                            "tool_name": canonical_tool_name,
                             "request_id": rid,
                         }),
                     ))
-                }
-                Err(e) => {
-                    let rid = crate::request_context::current_request_id();
-                    tracing::error!(
-                        error = %e,
-                        request_id = ?rid,
-                        tool = %canonical_tool_name,
-                        "idempotency lookup after conflict failed; failing closed"
-                    );
-                    IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
+                } else {
+                    mcp_idempotency_committed_unack_recovery(
+                        pool,
                         id,
-                        -32603,
-                        "idempotency storage unavailable",
-                        serde_json::json!({
-                            "code": "SQLITE_CONTENTION_RETRY_EXHAUSTED",
-                            "request_id": rid,
-                        }),
-                    ))
+                        canonical_tool_name,
+                        &key_str,
+                        rid,
+                    )
+                    .await
                 }
+            } else if record.canonical_request_hash == canonical_hash {
+                db::metrics::increment_counter("mcp_command_idempotency_replay_total");
+                let result: serde_json::Value =
+                    serde_json::from_str(&record.result_json).unwrap_or(serde_json::Value::Null);
+                IdempotencyOutcome::Cached(JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap_or_default() }],
+                        "_idempotency": "duplicate_ok"
+                    }),
+                ))
+            } else {
+                db::metrics::increment_counter("mcp_command_idempotency_conflict_total");
+                IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
+                    id,
+                    -32603,
+                    "idempotency conflict",
+                    serde_json::json!({
+                        "code": "IDEMPOTENCY_CONFLICT",
+                        "tool_name": canonical_tool_name,
+                    }),
+                ))
             }
         }
         Err(e) => {
@@ -1840,7 +1819,7 @@ async fn mcp_idempotency_precheck(
                 error = %e,
                 request_id = ?rid,
                 tool = %canonical_tool_name,
-                "idempotency insert_pending failed; failing closed per P081 contract"
+                "idempotency lookup failed; failing closed before command dispatch"
             );
             IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
                 id,
@@ -1896,13 +1875,27 @@ async fn mcp_idempotency_commit(
     {
         Ok(true) => None,
         Ok(false) => {
+            // P081 security review H-003 fix: Ok(false) means no pending record was
+            // found after a successful command dispatch. This is an invariant violation
+            // (the pending record must exist because mcp_idempotency_precheck inserted
+            // it). Treating it as success would leave no replay record, breaking the
+            // committed-unack and retry contract. Fail closed.
             let rid = crate::request_context::current_request_id();
-            tracing::warn!(
+            tracing::error!(
                 request_id = ?rid,
                 tool = %canonical_tool_name,
-                "idempotency update_result: no pending record found; command committed but result not cached"
+                "idempotency update_result returned Ok(false): pending record absent after commit; \
+                 failing closed to protect committed-unack contract"
             );
-            None
+            Some(JsonRpcResponse::error_with_data(
+                id,
+                -32603,
+                "idempotency replay record missing after commit; check system state before retry",
+                serde_json::json!({
+                    "code": "IDEMPOTENCY_COMMITTED_UNACK",
+                    "request_id": rid,
+                }),
+            ))
         }
         Err(e) => {
             let rid = crate::request_context::current_request_id();
@@ -1991,13 +1984,26 @@ async fn write_mcp_deny_audit(
         created_at_ms: timestamp_ms,
     };
 
-    db::repos::audit_log::append(pool, &entry).await
+    db::repos::audit_log::append(pool, &entry)
+        .await
+        .map_err(|e| {
+            db::metrics::increment_counter("audit_log_append_failure_total");
+            e
+        })
 }
 
 fn resource_template_id_for_uri(uri: &str) -> Option<ResourceTemplateId> {
     auth::all_resource_templates()
         .into_iter()
         .find(|id| uri_matches_template(uri, resource_template_uri(*id)))
+}
+
+fn resources_list_policy_transport(caller_class: &str) -> &'static str {
+    if caller_class == "observer" {
+        "mcp_tools_call"
+    } else {
+        "mcp_tools_list"
+    }
 }
 
 fn resource_template_uri(id: ResourceTemplateId) -> &'static str {
@@ -2464,8 +2470,8 @@ mod tests {
     use chrono::Utc;
     use db::pool::create_pool;
     use db::repos::{
-        artifact_contracts, artifacts, command_journal, ideas, projections, rollout_contract_checks,
-        runs, steward, validation,
+        artifact_contracts, artifacts, command_journal, ideas, projections,
+        rollout_contract_checks, runs, steward, validation,
     };
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
@@ -3527,6 +3533,55 @@ mod tests {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
     }
 
+    fn observer_principal() -> auth::Principal {
+        auth::Principal::new("test-observer", auth::PrincipalClass::Observer)
+    }
+
+    #[tokio::test]
+    async fn proposal_081_observer_resources_list_matches_compact_read_matrix_row() {
+        let pool = test_pool().await;
+        let policy = Arc::new(
+            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                auth::boundary::PolicyMode::Enforce,
+            )
+            .unwrap(),
+        );
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        )
+        .with_boundary_policy(policy);
+
+        let response = server
+            .handle_request(
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(serde_json::json!(1)),
+                    method: "resources/list".to_string(),
+                    params: Some(serde_json::json!({})),
+                },
+                &observer_principal(),
+            )
+            .await;
+
+        assert!(
+            response.error.is_none(),
+            "observer resources/list must be governed by p081.observer.mcp_tools_call.compact_read: {:?}",
+            response.error
+        );
+        let resources = response.result.expect("resources/list result")["resources"]
+            .as_array()
+            .cloned()
+            .expect("resources/list returns resource array");
+        assert!(
+            resources
+                .iter()
+                .any(|resource| resource["uri"] == "chainworks://approvals/inbox"),
+            "observer compact resources/list must still expose observer-readable resources"
+        );
+    }
+
     #[tokio::test]
     async fn proposal_075_storage_tool_dispatch_returns_typed_unauthorized() {
         let pool = test_pool().await;
@@ -3741,6 +3796,27 @@ mod tests {
             "audit_log_health.v1"
         );
         assert!(boundary["auditLogHealth"]["rowCount"].as_i64().is_some());
+        assert_eq!(boundary["auditLogHealth"]["writable"], true);
+        assert_eq!(boundary["auditLogHealth"]["retentionMinDays"], 90);
+        assert!(boundary["auditLogHealth"]["cleanupState"]
+            .as_str()
+            .is_some());
+        assert!(boundary["auditLogHealth"]["cleanupEligibleRowCount"]
+            .as_i64()
+            .is_some());
+        assert!(boundary["auditLogHealth"]["cleanupProtectedRowCount"]
+            .as_i64()
+            .is_some());
+        assert!(boundary["auditLogHealth"]["payloadBudgetBytes"]
+            .as_i64()
+            .is_some());
+        assert!(boundary["auditLogHealth"]["payloadUsedBytes"]
+            .as_i64()
+            .is_some());
+        assert_eq!(
+            boundary["auditLogHealth"]["shadowCoverageReportRef"],
+            "docs/evidence/boundary-policy-shadow-coverage/report.json"
+        );
         assert!(boundary["auditLogHealth"]["integrityState"]
             .as_str()
             .is_some());
@@ -4147,13 +4223,12 @@ mod tests {
             first["idea"]["id"], second["idea"]["id"],
             "same idempotency key + same request must replay the original result"
         );
-        let journal_count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM command_journal WHERE mcp_idempotency_key = ?1",
-        )
-        .bind(&key)
-        .fetch_one(&pool)
-        .await
-        .expect("journal count");
+        let journal_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM command_journal WHERE mcp_idempotency_key = ?1")
+                .bind(&key)
+                .fetch_one(&pool)
+                .await
+                .expect("journal count");
         assert_eq!(
             journal_count.0, 1,
             "idempotency replay must not append a second command_journal row"
@@ -4242,13 +4317,12 @@ mod tests {
         let recovery: serde_json::Value = serde_json::from_str(text).expect("recovery json");
         assert_eq!(recovery["journal_id"], journal_id);
 
-        let rows: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM command_journal WHERE mcp_idempotency_key = ?1",
-        )
-        .bind(&key)
-        .fetch_one(&pool)
-        .await
-        .expect("journal count");
+        let rows: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM command_journal WHERE mcp_idempotency_key = ?1")
+                .bind(&key)
+                .fetch_one(&pool)
+                .await
+                .expect("journal count");
         assert_eq!(rows.0, 1, "recovery must not create a second command row");
         let record = db::repos::mcp_command_idempotency::find_by_key(&pool, &key)
             .await
@@ -4259,6 +4333,37 @@ mod tests {
             db::repos::mcp_command_idempotency::PENDING_SENTINEL,
             "recovery must replace the pending sentinel with a durable recovery result"
         );
-        assert_eq!(record.command_journal_id.as_deref(), Some(journal_id.as_str()));
+        assert_eq!(
+            record.command_journal_id.as_deref(),
+            Some(journal_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn p081_idempotency_storage_unavailable_fails_closed_with_sqlite_contention_code() {
+        let pool = test_pool().await;
+        pool.close().await;
+
+        let outcome = mcp_idempotency_precheck(
+            &pool,
+            Some(serde_json::json!(1)),
+            "ideas.create",
+            &serde_json::json!({
+                "title": "contention",
+                "body": "closed pool simulates storage outage before dispatch",
+                "idempotency_key": uuid::Uuid::now_v7().to_string(),
+            }),
+            &operator_principal(),
+            Some("p081.agent_operator.mcp_tools_call.command"),
+        )
+        .await;
+
+        let IdempotencyOutcome::Denied(response) = outcome else {
+            panic!("storage outage must fail closed before dispatch");
+        };
+        let error = response.error.expect("error response");
+        assert_eq!(error.code, -32603);
+        let data = error.data.expect("structured error data");
+        assert_eq!(data["code"], "SQLITE_CONTENTION_RETRY_EXHAUSTED");
     }
 }

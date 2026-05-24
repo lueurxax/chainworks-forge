@@ -84,7 +84,9 @@ pub async fn execute(
                     "idea": idea,
                     "journal_id": commanded.journal_id,
                 })),
-                _ => Err(anyhow::anyhow!("ideas.create returned unexpected command result")),
+                _ => Err(anyhow::anyhow!(
+                    "ideas.create returned unexpected command result"
+                )),
             }
         }
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),

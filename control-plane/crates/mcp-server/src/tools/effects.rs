@@ -4,7 +4,7 @@ use sqlx::SqlitePool;
 use std::path::Path;
 
 use db::repos::runs;
-use db::repos::side_effects::{self, apply_operator_disposition, DispositionOutcome};
+use db::repos::side_effects::{self, apply_operator_disposition_tx, DispositionOutcome};
 use domain::side_effect::{
     EffectKind, SideEffect, SideEffectId, SideEffectStatus, MCP_ERROR_DISPOSITION_PAYLOAD_MISMATCH,
     MCP_ERROR_EFFECT_NOT_FOUND, MCP_ERROR_INVALID_STATUS_TRANSITION,
@@ -213,12 +213,13 @@ pub fn tool_specs() -> Vec<McpTool> {
             name: "effects.mark_conflict".to_string(),
             description: concat!(
                 "Mark a side-effect as conflict after operator confirmation. ",
-                "Requires disposition_id for audit idempotency."
+                "Requires disposition_id for domain-level idempotency and ",
+                "idempotency_key for MCP transport-level idempotency."
             )
             .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "required": ["effect_id", "disposition_id", "decision_json"],
+                "required": ["effect_id", "disposition_id", "decision_json", "idempotency_key"],
                 "properties": {
                     "effect_id": {
                         "type": "string",
@@ -226,11 +227,15 @@ pub fn tool_specs() -> Vec<McpTool> {
                     },
                     "disposition_id": {
                         "type": "string",
-                        "description": "Unique disposition ID for audit idempotency"
+                        "description": "Unique disposition ID for domain-level audit idempotency"
                     },
                     "decision_json": {
                         "type": "string",
                         "description": "JSON payload describing the conflict determination"
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "UUIDv7 idempotency key for MCP transport-level retry safety"
                     }
                 }
             }),
@@ -239,12 +244,13 @@ pub fn tool_specs() -> Vec<McpTool> {
             name: "effects.mark_unrecoverable".to_string(),
             description: concat!(
                 "Mark a side-effect as unrecoverable after operator confirmation. ",
-                "Requires disposition_id for audit idempotency."
+                "Requires disposition_id for domain-level idempotency and ",
+                "idempotency_key for MCP transport-level idempotency."
             )
             .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "required": ["effect_id", "disposition_id", "decision_json"],
+                "required": ["effect_id", "disposition_id", "decision_json", "idempotency_key"],
                 "properties": {
                     "effect_id": {
                         "type": "string",
@@ -252,11 +258,15 @@ pub fn tool_specs() -> Vec<McpTool> {
                     },
                     "disposition_id": {
                         "type": "string",
-                        "description": "Unique disposition ID for audit idempotency"
+                        "description": "Unique disposition ID for domain-level audit idempotency"
                     },
                     "decision_json": {
                         "type": "string",
                         "description": "JSON payload describing the unrecoverable determination"
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "UUIDv7 idempotency key for MCP transport-level retry safety"
                     }
                 }
             }),
@@ -265,12 +275,13 @@ pub fn tool_specs() -> Vec<McpTool> {
             name: "effects.clear_after_manual_verification".to_string(),
             description: concat!(
                 "Clear a side-effect after operator manual verification. ",
-                "Requires disposition_id and evidence of manual verification."
+                "Requires disposition_id and evidence of manual verification. ",
+                "idempotency_key for MCP transport-level idempotency."
             )
             .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "required": ["effect_id", "disposition_id", "decision_json"],
+                "required": ["effect_id", "disposition_id", "decision_json", "idempotency_key"],
                 "properties": {
                     "effect_id": {
                         "type": "string",
@@ -278,16 +289,99 @@ pub fn tool_specs() -> Vec<McpTool> {
                     },
                     "disposition_id": {
                         "type": "string",
-                        "description": "Unique disposition ID for audit idempotency"
+                        "description": "Unique disposition ID for domain-level audit idempotency"
                     },
                     "decision_json": {
                         "type": "string",
                         "description": "JSON payload describing the manual verification result"
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "UUIDv7 idempotency key for MCP transport-level retry safety"
                     }
                 }
             }),
         },
     ]
+}
+
+// ── P081: Effect-disposition write unit ───────────────────────────────────────
+
+/// Apply an operator disposition inside a single BEGIN IMMEDIATE write unit that
+/// also records a command_journal row. Returns the journal_id for MCP idempotency
+/// linkage and the disposition outcome for the MCP response payload.
+///
+/// Atomicity: command_journal row, disposition update, and settlement INSERT are
+/// all in the same SQLite transaction. If the transaction rolls back, no business
+/// state changes persist.
+async fn apply_effect_disposition_write_unit(
+    pool: &SqlitePool,
+    command_type: &str,
+    tool_name: &str,
+    effect_id: &SideEffectId,
+    new_status: SideEffectStatus,
+    disposition_id: &str,
+    decision_json: &str,
+    decision_json_hash: &str,
+    applied_by: &str,
+    now: chrono::DateTime<Utc>,
+    caller_principal_id: &str,
+    caller_principal_class: &str,
+    idempotency_key: Option<&str>,
+    boundary_row_id: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<(String, DispositionOutcome)> {
+    let mut tx = db::pool::begin_immediate_with_retry(pool, tool_name)
+        .await
+        .context("effect disposition: begin write unit")?;
+
+    let journal_id = uuid::Uuid::new_v4().to_string();
+    let payload = serde_json::json!({
+        "effect_id": effect_id.as_ref(),
+        "new_status": new_status.to_string(),
+        "disposition_id": disposition_id,
+    });
+
+    db::repos::command_journal::record_tx(
+        &mut tx,
+        &journal_id,
+        command_type,
+        &payload.to_string(),
+        None,
+        now,
+        Some("mcp"),
+        Some(caller_principal_id),
+        Some(caller_principal_class),
+        Some(tool_name),
+        request_id,
+        None,
+        idempotency_key,
+        boundary_row_id,
+    )
+    .await
+    .context("effect disposition: record command journal")?;
+
+    let outcome = apply_operator_disposition_tx(
+        &mut tx,
+        effect_id,
+        new_status,
+        "mcp_operator",
+        disposition_id,
+        decision_json,
+        decision_json_hash,
+        applied_by,
+        now,
+    )
+    .await
+    .context("effect disposition: apply disposition")?;
+
+    db::repos::command_journal::complete_entry_tx(&mut tx, &journal_id, Utc::now())
+        .await
+        .context("effect disposition: complete journal")?;
+
+    tx.commit().await.context("effect disposition: commit")?;
+
+    Ok((journal_id, outcome))
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -444,7 +538,7 @@ pub async fn handle_effects_reconcile(
 pub async fn handle_effects_mark_conflict(
     pool: &SqlitePool,
     params: &serde_json::Value,
-    applied_by: &str,
+    principal: &auth::Principal,
 ) -> Result<serde_json::Value> {
     let effect_id_str = params
         .get("effect_id")
@@ -491,16 +585,26 @@ pub async fn handle_effects_mark_conflict(
         ));
     }
 
-    let outcome = apply_operator_disposition(
+    let idempotency_key = crate::request_context::current_idempotency_key();
+    let boundary_row_id = crate::request_context::current_boundary_row_id();
+    let request_id = crate::request_context::current_request_id();
+
+    let (journal_id, outcome) = apply_effect_disposition_write_unit(
         pool,
+        "EffectsMarkConflict",
+        "effects.mark_conflict",
         &effect_id,
         SideEffectStatus::Conflict,
-        "mcp_operator",
         disposition_id,
         decision_json,
         &decision_hash,
-        applied_by,
+        &principal.id,
         Utc::now(),
+        &principal.id,
+        &principal.class.to_string(),
+        idempotency_key.as_deref(),
+        boundary_row_id.as_deref(),
+        request_id.as_deref(),
     )
     .await?;
 
@@ -509,12 +613,14 @@ pub async fn handle_effects_mark_conflict(
             "status": "applied",
             "effect_id": effect_id_str,
             "new_status": "conflict",
-            "disposition_id": disposition_id
+            "disposition_id": disposition_id,
+            "journal_id": journal_id
         })),
         DispositionOutcome::AlreadyApplied => Ok(serde_json::json!({
             "status": "already_applied",
             "effect_id": effect_id_str,
-            "disposition_id": disposition_id
+            "disposition_id": disposition_id,
+            "journal_id": journal_id
         })),
         DispositionOutcome::PayloadMismatch => Err(anyhow::anyhow!(
             "{}: disposition_id {} already used with different payload",
@@ -532,7 +638,7 @@ pub async fn handle_effects_mark_conflict(
 pub async fn handle_effects_mark_unrecoverable(
     pool: &SqlitePool,
     params: &serde_json::Value,
-    applied_by: &str,
+    principal: &auth::Principal,
 ) -> Result<serde_json::Value> {
     let effect_id_str = params
         .get("effect_id")
@@ -584,16 +690,26 @@ pub async fn handle_effects_mark_unrecoverable(
         ));
     }
 
-    let outcome = apply_operator_disposition(
+    let idempotency_key = crate::request_context::current_idempotency_key();
+    let boundary_row_id = crate::request_context::current_boundary_row_id();
+    let request_id = crate::request_context::current_request_id();
+
+    let (journal_id, outcome) = apply_effect_disposition_write_unit(
         pool,
+        "EffectsMarkUnrecoverable",
+        "effects.mark_unrecoverable",
         &effect_id,
         SideEffectStatus::Unrecoverable,
-        "mcp_operator",
         disposition_id,
         decision_json,
         &decision_hash,
-        applied_by,
+        &principal.id,
         Utc::now(),
+        &principal.id,
+        &principal.class.to_string(),
+        idempotency_key.as_deref(),
+        boundary_row_id.as_deref(),
+        request_id.as_deref(),
     )
     .await?;
 
@@ -602,12 +718,14 @@ pub async fn handle_effects_mark_unrecoverable(
             "status": "applied",
             "effect_id": effect_id_str,
             "new_status": "unrecoverable",
-            "disposition_id": disposition_id
+            "disposition_id": disposition_id,
+            "journal_id": journal_id
         })),
         DispositionOutcome::AlreadyApplied => Ok(serde_json::json!({
             "status": "already_applied",
             "effect_id": effect_id_str,
-            "disposition_id": disposition_id
+            "disposition_id": disposition_id,
+            "journal_id": journal_id
         })),
         DispositionOutcome::PayloadMismatch => Err(anyhow::anyhow!(
             "{}: disposition_id {} already used with different payload",
@@ -625,7 +743,7 @@ pub async fn handle_effects_mark_unrecoverable(
 pub async fn handle_effects_clear_after_manual_verification(
     pool: &SqlitePool,
     params: &serde_json::Value,
-    applied_by: &str,
+    principal: &auth::Principal,
 ) -> Result<serde_json::Value> {
     let effect_id_str = params
         .get("effect_id")
@@ -672,16 +790,26 @@ pub async fn handle_effects_clear_after_manual_verification(
         ));
     }
 
-    let outcome = apply_operator_disposition(
+    let idempotency_key = crate::request_context::current_idempotency_key();
+    let boundary_row_id = crate::request_context::current_boundary_row_id();
+    let request_id = crate::request_context::current_request_id();
+
+    let (journal_id, outcome) = apply_effect_disposition_write_unit(
         pool,
+        "EffectsClearAfterManualVerification",
+        "effects.clear_after_manual_verification",
         &effect_id,
         SideEffectStatus::Reconciled,
-        "mcp_operator",
         disposition_id,
         decision_json,
         &decision_hash,
-        applied_by,
+        &principal.id,
         Utc::now(),
+        &principal.id,
+        &principal.class.to_string(),
+        idempotency_key.as_deref(),
+        boundary_row_id.as_deref(),
+        request_id.as_deref(),
     )
     .await?;
 
@@ -690,12 +818,14 @@ pub async fn handle_effects_clear_after_manual_verification(
             "status": "applied",
             "effect_id": effect_id_str,
             "new_status": "reconciled",
-            "disposition_id": disposition_id
+            "disposition_id": disposition_id,
+            "journal_id": journal_id
         })),
         DispositionOutcome::AlreadyApplied => Ok(serde_json::json!({
             "status": "already_applied",
             "effect_id": effect_id_str,
-            "disposition_id": disposition_id
+            "disposition_id": disposition_id,
+            "journal_id": journal_id
         })),
         DispositionOutcome::PayloadMismatch => Err(anyhow::anyhow!(
             "{}: disposition_id {} already used with different payload",
@@ -822,12 +952,12 @@ pub async fn execute(
         "effects.list" => handle_effects_list(pool, &params).await,
         "effects.inspect" => handle_effects_inspect(pool, &params).await,
         "effects.reconcile" => handle_effects_reconcile(pool, &params).await,
-        "effects.mark_conflict" => handle_effects_mark_conflict(pool, &params, &principal.id).await,
+        "effects.mark_conflict" => handle_effects_mark_conflict(pool, &params, principal).await,
         "effects.mark_unrecoverable" => {
-            handle_effects_mark_unrecoverable(pool, &params, &principal.id).await
+            handle_effects_mark_unrecoverable(pool, &params, principal).await
         }
         "effects.clear_after_manual_verification" => {
-            handle_effects_clear_after_manual_verification(pool, &params, &principal.id).await
+            handle_effects_clear_after_manual_verification(pool, &params, principal).await
         }
         _ => Err(anyhow::anyhow!("Unknown effects tool: {tool_name}")),
     }

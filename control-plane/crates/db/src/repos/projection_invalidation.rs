@@ -182,6 +182,7 @@ pub async fn record_invalidation_internal(
     Ok(())
 }
 
+/// Returns the command_journal id so MCP transport can link mcp_command_idempotency.
 pub async fn clear_backlog(
     pool: &SqlitePool,
     projection_name: &str,
@@ -189,7 +190,9 @@ pub async fn clear_backlog(
     caller_principal_id: Option<&str>,
     caller_principal_class: Option<&str>,
     request_id: Option<&str>,
-) -> Result<()> {
+    mcp_idempotency_key: Option<&str>,
+    mcp_boundary_row_id: Option<&str>,
+) -> Result<String> {
     let now = Utc::now();
     let now_ms = now.timestamp_millis();
     let mut tx =
@@ -213,8 +216,8 @@ pub async fn clear_backlog(
         Some("storage.projections.clear_backlog"),
         request_id,
         None,
-        None,
-        None,
+        mcp_idempotency_key,
+        mcp_boundary_row_id,
     )
     .await?;
 
@@ -243,9 +246,10 @@ pub async fn clear_backlog(
 
     crate::repos::command_journal::complete_entry_tx(&mut tx, &journal_id, Utc::now()).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(journal_id)
 }
 
+/// Returns the command_journal id so MCP transport can link mcp_command_idempotency.
 pub async fn clear_poison(
     pool: &SqlitePool,
     projection_name: &str,
@@ -253,7 +257,9 @@ pub async fn clear_poison(
     caller_principal_id: Option<&str>,
     caller_principal_class: Option<&str>,
     request_id: Option<&str>,
-) -> Result<()> {
+    mcp_idempotency_key: Option<&str>,
+    mcp_boundary_row_id: Option<&str>,
+) -> Result<String> {
     let now = Utc::now();
     let now_ms = now.timestamp_millis();
     let mut tx =
@@ -278,8 +284,8 @@ pub async fn clear_poison(
         Some("storage.projections.clear_poison"),
         request_id,
         None,
-        None,
-        None,
+        mcp_idempotency_key,
+        mcp_boundary_row_id,
     )
     .await?;
 
@@ -299,7 +305,7 @@ pub async fn clear_poison(
 
     crate::repos::command_journal::complete_entry_tx(&mut tx, &journal_id, Utc::now()).await?;
     tx.commit().await?;
-    Ok(())
+    Ok(journal_id)
 }
 
 /// P087: Mark invalidation log rows as consumed after successful projection update.
@@ -484,7 +490,7 @@ mod tests {
         .unwrap();
         assert_eq!(count, 1);
 
-        clear_backlog(&pool, "runs_home", "runs", None, None, None)
+        clear_backlog(&pool, "runs_home", "runs", None, None, None, None, None)
             .await
             .expect("projection invalidation clear must be registered and executable");
         let count_after_clear: i64 = sqlx::query_scalar(

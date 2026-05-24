@@ -16,6 +16,7 @@ The UI must adhere to the following accessibility guidelines for various states:
 *   **Redacted `nil`**: A redacted `nil` value must expose an `accessibilityLabel` equal to the field display name, an `accessibilityValue` of "Restricted value", and an `accessibilityHint` stating "Permissions hide this value. Copy diagnostics for the access rule." It should also display a locked or disabled trait appropriate to the control, without implying the value is merely empty.
 *   **Required Tests**:
     *   `accessibility_redaction_parity`
+    *   `full_keyboard_access_redacted_nil_vs_ordinary_nil`
     *   `keyboard_full_access_actionability_false`
     *   `increase_contrast_redaction_state`
     *   `reduce_motion_alert_state`

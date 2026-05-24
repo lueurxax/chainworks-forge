@@ -71,6 +71,7 @@ It is never written back to `principals.json` as a persisted identity field.
 | `E_FIXTURE_DIGEST_MISMATCH` | 500 | Deployed fixture digest does not match embedded fixture. |
 | `SQLITE_CONTENTION_RETRY_EXHAUSTED` | 503 | SQLite busy timeout exceeded under bounded retry. |
 | `IDEMPOTENCY_CONFLICT` | 409 | Same key with different canonical request hash, or replayed by a different caller fingerprint. The conflict envelope never echoes the original `approval_id` or journal id. |
+| `IDEMPOTENCY_IN_FLIGHT` | — | MCP retry against a pending sentinel younger than 30 s; the caller must wait for the in-flight request to complete before retrying. |
 
 ---
 
@@ -109,20 +110,39 @@ Operators can inspect the active boundary runtime without reading raw audit rows
 - Observer GraphQL reads are denied by default. The only v1 opt-in read action is `graphql.read_only`; on that path server resolvers must null sensitive fields before response serialization and attach camelCase `extensions.redactions` entries with `redactionMode = field_null_redacted`.
 - MCP `runtime.health` includes the same object at `boundaryRuntime`.
 - MCP tool `operator.alerts.list` returns `operator_alerts_readback_v1` with the same bounded alert rows and lifecycle/native-delivery shape. It is allowed in `read_only_safe_mode` as a diagnostic read, while state-changing MCP calls remain denied.
-- `auditLogHealth` is bounded to `schemaVersion = "audit_log_health.v1"`, aggregate row count, latest row/checkpoint identifiers, latest checkpoint hash, and `integrityState` from checkpoint verification.
+- `auditLogHealth` is bounded to `schemaVersion = "audit_log_health.v1"`, aggregate row count, latest row/checkpoint identifiers, latest checkpoint hash, `integrityState` from checkpoint verification, audit writability, retention minimum, cleanup state, cleanup eligible/protected row counts, payload budget/used bytes, and the shadow coverage report reference. It never exposes raw audit rows.
+
+P081 rollout metrics are retained by exact name for enforcement readiness:
+
+- `p081_boundary_policy_enforcement_parity_percent`
+- `boundary_policy_decisions_total`
+- `boundary_policy_shadow_disagreement_total`
+- `auth_ambiguous_caller_warn_total`
+- `boundary_no_op_label_total`
+- `boundary_policy_evaluation_error_total`
+- `audit_log_append_failure_total`
+- `audit_log_rate_limited_total`
+- `operator_alert_native_delivery_total`
+- `approval_idempotency_duplicate_total`
+- `mcp_command_idempotency_replay_total`
+- `mcp_command_idempotency_conflict_total`
+- `approval_actionability_false_total`
+- `graphql_redaction_extensions_total`
+- `boundary_policy_decision_latency_ms`
+- `boundary_commit_transaction_latency_ms`
+- `audit_budget_cleanup_duration_ms`
+- `operator_alert_clear_latency_ms`
 
 ---
 
 ## Durable Idempotency Contract
 
-Allowed MCP state-changing calls use a durable preclaim plus command write-unit contract:
+Allowed MCP state-changing calls use a single-transaction command write-unit contract:
 
-1. Before dispatch, the MCP server writes a `mcp_command_idempotency` pending sentinel keyed by `idempotency_key`.
-2. The command write unit stamps the same `idempotency_key`, caller class, BoundaryPolicy row id, and request id into `command_journal` and any domain writes it owns.
-3. After dispatch returns, the MCP server updates the sentinel with the result JSON and committed `command_journal_id`.
-4. If a retry sees a committed sentinel with the same canonical request hash, it returns the cached result.
-5. If a retry sees an aged pending sentinel, committed-unack recovery checks `command_journal` for the same idempotency key. A committed journal row returns a recovery response and updates the sentinel; no command is re-executed.
-6. If no committed journal row exists, the retry fails closed as `IDEMPOTENCY_COMMITTED_UNACK`/storage unavailable instead of guessing.
+1. Before dispatch, the MCP server looks up `mcp_command_idempotency` by key. If a row exists with the same canonical request hash, the cached result is replayed. A pending sentinel younger than 30 s returns `IDEMPOTENCY_IN_FLIGHT`; an older pending sentinel triggers committed-unack recovery against `command_journal`. A hash mismatch returns `IDEMPOTENCY_CONFLICT`.
+2. The command write unit opens a `BEGIN IMMEDIATE` SQLite transaction and inserts the pending sentinel via `mcp_command_idempotency::insert_pending_tx`. The same transaction stamps `idempotency_key`, request hash, caller class, BoundaryPolicy row id, and request id into `command_journal`, writes any durable domain rows owned by that command unit, and appends required audit rows.
+3. After the transaction commits, the MCP server updates the sentinel with the result JSON and committed `command_journal_id`. Rollback before commit removes the sentinel along with the rest of the write unit.
+4. Committed-unack recovery checks `command_journal` for the same idempotency key. A committed journal row returns a recovery response and updates the sentinel; no command is re-executed. If no committed journal row exists, the retry fails closed with `SQLITE_CONTENTION_RETRY_EXHAUSTED` or `IDEMPOTENCY_COMMITTED_UNACK` instead of guessing.
 
 Post-commit projection rebuild may run after commit and is not part of the same write-unit guarantee. Acknowledgement of normal success occurs only after the command handler has committed and returned the journal-linked result.
 
@@ -179,6 +199,15 @@ migrations (`064_p081_audit_log.sql`, `065_p081_audit_log_checkpoints.sql`,
 `069_p081_approval_idempotency_request_hash.sql`,
 `070_p081_mcp_command_idempotency.sql`,
 `071_p081_command_journal_idempotency.sql`).
+
+`scripts/validate-p081-canaries.py` parses
+`docs/evidence/boundary-policy-shadow-coverage/boundary-policy-canaries.yaml` as
+the fixed `boundary_policy_canaries_v1` subset and fails closed on duplicate
+keys, unknown fields, malformed entries, matrix rows missing from the live
+fixture, or drift against
+`docs/evidence/boundary-policy-shadow-coverage/report.json`. It runs from the
+`proposal-081` gate so canary rows contribute to the same
+`boundary_policy_shadow_coverage_report_v1` schema as live observations.
 
 ---
 

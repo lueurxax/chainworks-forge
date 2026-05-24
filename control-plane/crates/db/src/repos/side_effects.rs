@@ -819,6 +819,105 @@ pub async fn reaper_transition_cas(
 
 // ── MCP operator disposition ──────────────────────────────────────────────────
 
+/// Transactional variant of `apply_operator_disposition` for use inside an
+/// existing BEGIN IMMEDIATE write unit.
+///
+/// The caller is responsible for the transaction lifecycle (commit/rollback).
+/// Returns the same `DispositionOutcome` values as the pool variant; the caller
+/// must roll back and return the appropriate replay/denial response on
+/// `AlreadyApplied`, `PayloadMismatch`, or `NotApplicable`.
+pub async fn apply_operator_disposition_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    effect_id: &SideEffectId,
+    new_status: SideEffectStatus,
+    settlement_source: &str,
+    disposition_id: &str,
+    decision_json: &str,
+    decision_json_hash: &str,
+    applied_by: &str,
+    now: DateTime<Utc>,
+) -> Result<DispositionOutcome> {
+    // Check for an existing settlement with this disposition_id.
+    let existing: Option<(String, String, String, Option<String>)> = sqlx::query_as(
+        r#"SELECT side_effect_id, settlement_status, decision_json_hash, decision_json
+           FROM side_effect_settlements
+           WHERE disposition_id = ?1"#,
+    )
+    .bind(disposition_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("apply_operator_disposition_tx: check existing")?;
+
+    if let Some((existing_side_effect_id, _, existing_hash, existing_text)) = existing {
+        if existing_side_effect_id != effect_id.as_ref() {
+            return Ok(DispositionOutcome::PayloadMismatch);
+        }
+        if existing_hash == decision_json_hash && existing_text.as_deref() == Some(decision_json) {
+            return Ok(DispositionOutcome::AlreadyApplied);
+        } else {
+            return Ok(DispositionOutcome::PayloadMismatch);
+        }
+    }
+
+    let existing_for_effect: Option<String> = sqlx::query_scalar(
+        r#"SELECT disposition_id FROM side_effect_settlements WHERE side_effect_id = ?1"#,
+    )
+    .bind(effect_id.as_ref())
+    .fetch_optional(&mut **tx)
+    .await
+    .context("apply_operator_disposition_tx: check existing settlement")?;
+
+    if let Some(existing_disp) = existing_for_effect {
+        if existing_disp == disposition_id {
+            return Ok(DispositionOutcome::AlreadyApplied);
+        }
+        return Ok(DispositionOutcome::NotApplicable);
+    }
+
+    let settlement_id = SideEffectSettlementId::new();
+    let new_status_str = new_status.to_string();
+
+    let rows_updated: u64 = sqlx::query(
+        r#"UPDATE side_effects
+           SET status = ?1,
+               updated_at = ?2
+           WHERE id = ?3
+             AND status IN ('needs_reconciliation', 'conflict', 'unrecoverable')"#,
+    )
+    .bind(&new_status_str)
+    .bind(now.to_rfc3339())
+    .bind(effect_id.as_ref())
+    .execute(&mut **tx)
+    .await
+    .context("apply_operator_disposition_tx: update")?
+    .rows_affected();
+
+    if rows_updated != 1 {
+        return Ok(DispositionOutcome::NotApplicable);
+    }
+
+    sqlx::query(
+        r#"INSERT INTO side_effect_settlements
+               (id, side_effect_id, settlement_status, settlement_source,
+                applied_at, applied_by, disposition_id, decision_json, decision_json_hash)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+    )
+    .bind(settlement_id.as_ref())
+    .bind(effect_id.as_ref())
+    .bind(&new_status_str)
+    .bind(settlement_source)
+    .bind(now.to_rfc3339())
+    .bind(applied_by)
+    .bind(disposition_id)
+    .bind(decision_json)
+    .bind(decision_json_hash)
+    .execute(&mut **tx)
+    .await
+    .context("apply_operator_disposition_tx: insert settlement")?;
+
+    Ok(DispositionOutcome::Applied)
+}
+
 /// Apply an operator disposition to a needs_reconciliation/conflict/unrecoverable effect.
 /// Enforces disposition_id idempotency: same id + same payload → idempotent success.
 pub async fn apply_operator_disposition(

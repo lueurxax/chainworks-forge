@@ -698,6 +698,7 @@ At the current HEAD baseline, Chainworks Forge remains the product described in 
   - **Redacted Nil:** The rendered control or value exposes accessibilityLabel equal to the field display name, accessibilityValue 'Restricted value', accessibilityHint 'Permissions hide this value. Copy diagnostics for the access rule.', and a locked or disabled trait appropriate to the control without pretending the value is empty.
   - **Required Tests**
     - accessibility_redaction_parity
+    - full_keyboard_access_redacted_nil_vs_ordinary_nil
     - keyboard_full_access_actionability_false
     - increase_contrast_redaction_state
     - reduce_motion_alert_state

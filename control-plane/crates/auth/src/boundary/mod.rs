@@ -2070,7 +2070,8 @@ mod tests {
             "observer graphql_query without explicit read-only action must fail closed, got {:?}",
             default_decision
         );
-        let opt_in_decision = policy.evaluate("observer", "graphql_query", Some("graphql.read_only"));
+        let opt_in_decision =
+            policy.evaluate("observer", "graphql_query", Some("graphql.read_only"));
         assert!(
             matches!(opt_in_decision, PolicyDecision::Allow { ref row_id } if row_id.as_deref() == Some("p081.observer.graphql_query.read_only_opt_in")),
             "observer graphql_query with explicit read-only action must use redacted opt-in row, got {:?}",
@@ -2105,8 +2106,11 @@ mod tests {
             "safe mode must deny mcp_tools_call (H-001), got {:?}",
             mcp_decision
         );
-        let alert_decision =
-            policy.evaluate("agent_operator", "mcp_tools_call", Some("operator.alerts.list"));
+        let alert_decision = policy.evaluate(
+            "agent_operator",
+            "mcp_tools_call",
+            Some("operator.alerts.list"),
+        );
         assert!(
             matches!(alert_decision, PolicyDecision::Allow { .. }),
             "safe mode must keep operator.alerts.list visible, got {:?}",

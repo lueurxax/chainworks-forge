@@ -455,6 +455,11 @@ pub struct CallerContext {
     /// is derived at dispatch time and must not round-trip through the command payload.
     #[serde(skip)]
     pub mcp_idempotency_key: Option<String>,
+    /// P081 Phase 5: canonical request hash computed at the MCP transport boundary.
+    /// This is carried only in memory so the command transaction can claim the
+    /// idempotency key atomically with the command journal and domain writes.
+    #[serde(skip)]
+    pub mcp_idempotency_request_hash: Option<String>,
     /// P081 Phase 3: Boundary matrix row_id that allowed this command. Persisted in
     /// command_journal for audit linkage. `None` in legacy_compat mode or when the policy
     /// returns LegacyPassthrough.
@@ -473,6 +478,7 @@ impl CallerContext {
             caller_class: None,
             token_id: None,
             mcp_idempotency_key: None,
+            mcp_idempotency_request_hash: None,
             boundary_row_id: None,
         }
     }
@@ -491,6 +497,7 @@ impl CallerContext {
             caller_class: None,
             token_id: None,
             mcp_idempotency_key: None,
+            mcp_idempotency_request_hash: None,
             boundary_row_id: None,
         }
     }
@@ -523,6 +530,12 @@ impl CallerContext {
         self
     }
 
+    /// P081 Phase 5: Attach the canonical MCP request hash for transactional idempotency.
+    pub fn with_mcp_idempotency_request_hash(mut self, hash: impl Into<String>) -> Self {
+        self.mcp_idempotency_request_hash = Some(hash.into());
+        self
+    }
+
     /// P081 Phase 3: Attach the boundary matrix row_id that allowed this command.
     pub fn with_boundary_row_id(mut self, row_id: impl Into<String>) -> Self {
         self.boundary_row_id = Some(row_id.into());
@@ -543,6 +556,7 @@ impl CallerContext {
             caller_class: None,
             token_id: None,
             mcp_idempotency_key: None,
+            mcp_idempotency_request_hash: None,
             boundary_row_id: None,
         }
     }

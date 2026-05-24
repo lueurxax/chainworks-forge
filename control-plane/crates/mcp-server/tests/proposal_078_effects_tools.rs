@@ -1,3 +1,4 @@
+use auth::{Principal, PrincipalClass};
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{ideas, runs, side_effects, stages};
@@ -323,6 +324,7 @@ async fn proposal_078_effects_mark_conflict_applies_operator_disposition() {
         "operator_notes": "Remote state diverged from local release ledger evidence."
     })
     .to_string();
+    let principal = Principal::new("operator-test", PrincipalClass::Operator);
 
     let payload = tools::effects::handle_effects_mark_conflict(
         &pool,
@@ -331,7 +333,7 @@ async fn proposal_078_effects_mark_conflict_applies_operator_disposition() {
             "disposition_id": disposition_id,
             "decision_json": decision_json
         }),
-        "operator-test",
+        &principal,
     )
     .await
     .unwrap();

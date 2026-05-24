@@ -16,8 +16,9 @@ use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger,
     approval_mutation_idempotency, approvals, artifact_contracts, audit_log, closeout,
     code_writer_completion_receipts, command_journal, ideas, legacy_discovery_overrides,
-    projections, retry_operator_instructions, retry_stage_execution_authorities, runs, scheduler,
-    sessions, stages, work_items, workflow_conflicts,
+    mcp_command_idempotency, projections, retry_operator_instructions,
+    retry_stage_execution_authorities, runs, scheduler, sessions, stages, work_items,
+    workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
@@ -230,6 +231,7 @@ struct CommandJournalEntry {
     token_id: Option<String>,
     // P081 Phase 3: MCP idempotency key and boundary matrix row_id for command_journal linkage.
     mcp_idempotency_key: Option<String>,
+    mcp_idempotency_request_hash: Option<String>,
     boundary_row_id: Option<String>,
 }
 
@@ -967,6 +969,7 @@ impl CommandJournalEntry {
             caller_class: caller.caller_class.clone(),
             token_id: caller.token_id.clone(),
             mcp_idempotency_key: caller.mcp_idempotency_key.clone(),
+            mcp_idempotency_request_hash: caller.mcp_idempotency_request_hash.clone(),
             boundary_row_id: caller.boundary_row_id.clone(),
         }
     }
@@ -980,6 +983,7 @@ impl CommandJournalEntry {
                 | "RejectStage"
                 | "RetryStage"
                 | "ResolveWorkflowConflictTransition"
+                | "ExtendWorkflowLoopBudget"
                 | "OverrideLegacyDiscoveryPolicy"
                 | "CancelRun"
                 | "ResetSession"
@@ -988,6 +992,59 @@ impl CommandJournalEntry {
                 | "SettleProposalGate"
         )
     }
+}
+
+async fn record_command_journal_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    journal: &CommandJournalEntry,
+) -> Result<()> {
+    if let Some(idempotency_key) = journal.mcp_idempotency_key.as_deref() {
+        let request_hash = journal
+            .mcp_idempotency_request_hash
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow!("MCP idempotency request hash missing for command write unit")
+            })?;
+        let tool_name = journal
+            .caller_tool
+            .as_deref()
+            .unwrap_or(journal.command_type);
+        let caller_fingerprint = journal
+            .caller_principal_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("MCP idempotency caller fingerprint missing"))?;
+        let claimed = mcp_command_idempotency::insert_pending_tx(
+            tx,
+            idempotency_key,
+            tool_name,
+            caller_fingerprint,
+            request_hash,
+            journal.boundary_row_id.as_deref(),
+        )
+        .await?;
+        if !claimed {
+            anyhow::bail!("IDEMPOTENCY_IN_FLIGHT: idempotency key already claimed or committed");
+        }
+    }
+
+    command_journal::record_tx(
+        tx,
+        &journal.id,
+        journal.command_type,
+        &journal.payload_json,
+        journal.run_id.as_deref(),
+        journal.created_at,
+        journal.caller_surface.as_deref(),
+        journal.caller_principal_id.as_deref(),
+        journal.caller_principal_class.as_deref(),
+        journal.caller_tool.as_deref(),
+        journal.request_id.as_deref(),
+        journal.caller_class.as_deref(),
+        journal.mcp_idempotency_key.as_deref(),
+        journal.boundary_row_id.as_deref(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))
 }
 
 const MAX_ROLLOUT_CONTRACT_PREFLIGHT_POLICY_JSON_BYTES: usize = 64 * 1024;
@@ -2187,24 +2244,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.CreateIdea", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
                 ideas::insert_tx(&mut tx, &idea).await?;
                 command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
                 tx.commit().await.context("commit create idea command")?;
@@ -2307,24 +2347,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.StartRun", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
                 let idea = if let Some(idea) = ideas::find_by_id_tx(&mut tx, c.idea_id).await? {
                     idea
                 } else {
@@ -2563,24 +2586,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.ApproveStage", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
                 let pending = approvals::list_by_run_tx(&mut tx, c.run_id).await?;
                 let approval = if let Some(approval) = pending.into_iter().find(|a| {
                     a.stage_id == c.stage_id
@@ -2696,24 +2702,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.RejectStage", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
                 let pending = approvals::list_by_run_tx(&mut tx, c.run_id).await?;
                 let approval = if let Some(approval) = pending.into_iter().find(|a| {
                     a.stage_id == c.stage_id
@@ -2854,24 +2843,7 @@ impl CommandHandler {
                 let mut retry_tx = self
                     .begin_command_transaction("command.RetryStage", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut retry_tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut retry_tx, journal).await?;
                 self.maybe_inject_retry_stage_failure("record_journal")?;
 
                 let run_stages = stages::list_by_run_tx(&mut retry_tx, c.run_id).await?;
@@ -3245,24 +3217,7 @@ impl CommandHandler {
                         journal.id.clone(),
                     )
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
 
                 let run = runs::find_by_id_tx(&mut tx, c.run_id)
                     .await?
@@ -3536,24 +3491,7 @@ impl CommandHandler {
                         journal.id.clone(),
                     )
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
 
                 let run = runs::find_by_id_tx(&mut tx, run_id)
                     .await?
@@ -3671,24 +3609,7 @@ impl CommandHandler {
                         journal.id.clone(),
                     )
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
                 let created =
                     legacy_discovery_overrides::create_for_pending_retry_tx(&mut tx, &input)
                         .await?;
@@ -3712,24 +3633,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.CancelRun", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
 
                 let run = if let Some(run) = runs::find_by_id_tx(&mut tx, c.run_id).await? {
                     run
@@ -3853,24 +3757,7 @@ impl CommandHandler {
                         journal.id.clone(),
                     )
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
 
                 // Validate the confirmation exists and is pending
                 let confirmation = db::repos::lead_mediation_confirmations::find_by_id_tx(
@@ -4130,24 +4017,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.ResetSession", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
 
                 let mut generation_ids_to_close = Vec::new();
 
@@ -4353,24 +4223,7 @@ impl CommandHandler {
                 let authoritative_stage_id = approval.stage_id.clone();
 
                 // Approval is actionable: record in command_journal inside the transaction.
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
 
                 approvals::resolve_tx(&mut tx, approval.id, decision.clone(), now, c.rationale)
                     .await?;
@@ -4701,24 +4554,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.SettleProposalGate", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                    journal.caller_class.as_deref(),
-                    journal.mcp_idempotency_key.as_deref(),
-                    journal.boundary_row_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
                 command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
                 tx.commit().await?;
                 db::pool::log_write_transaction("command.SettleProposalGate", tx_started);
@@ -4900,24 +4736,7 @@ impl CommandHandler {
         let mut retry_tx = self
             .begin_command_transaction("command.RetryStage", journal.id.clone())
             .await?;
-        command_journal::record_tx(
-            &mut retry_tx,
-            &journal.id,
-            journal.command_type,
-            &journal.payload_json,
-            journal.run_id.as_deref(),
-            journal.created_at,
-            journal.caller_surface.as_deref(),
-            journal.caller_principal_id.as_deref(),
-            journal.caller_principal_class.as_deref(),
-            journal.caller_tool.as_deref(),
-            journal.request_id.as_deref(),
-            journal.caller_class.as_deref(),
-            journal.mcp_idempotency_key.as_deref(),
-            journal.boundary_row_id.as_deref(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+        record_command_journal_tx(&mut retry_tx, journal).await?;
         apply_quota_retry_budget_for_stage_tx(
             &mut retry_tx,
             run_id,
@@ -5359,24 +5178,7 @@ impl CommandHandler {
         let mut retry_tx = self
             .begin_command_transaction("command.RetryAgentExecution", journal.id.clone())
             .await?;
-        command_journal::record_tx(
-            &mut retry_tx,
-            &journal.id,
-            journal.command_type,
-            &journal.payload_json,
-            journal.run_id.as_deref(),
-            journal.created_at,
-            journal.caller_surface.as_deref(),
-            journal.caller_principal_id.as_deref(),
-            journal.caller_principal_class.as_deref(),
-            journal.caller_tool.as_deref(),
-            journal.request_id.as_deref(),
-            journal.caller_class.as_deref(),
-            journal.mcp_idempotency_key.as_deref(),
-            journal.boundary_row_id.as_deref(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+        record_command_journal_tx(&mut retry_tx, journal).await?;
         apply_quota_retry_budget_for_stage_tx(
             &mut retry_tx,
             run_id,
@@ -5510,24 +5312,7 @@ impl CommandHandler {
         let mut tx = self
             .begin_command_transaction(context, journal.id.clone())
             .await?;
-        command_journal::record_tx(
-            &mut tx,
-            &journal.id,
-            journal.command_type,
-            &journal.payload_json,
-            journal.run_id.as_deref(),
-            journal.created_at,
-            journal.caller_surface.as_deref(),
-            journal.caller_principal_id.as_deref(),
-            journal.caller_principal_class.as_deref(),
-            journal.caller_tool.as_deref(),
-            journal.request_id.as_deref(),
-            journal.caller_class.as_deref(),
-            journal.mcp_idempotency_key.as_deref(),
-            journal.boundary_row_id.as_deref(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+        record_command_journal_tx(&mut tx, journal).await?;
         command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
         tx.commit().await?;
         db::pool::log_write_transaction(context, tx_started);
@@ -5544,24 +5329,7 @@ impl CommandHandler {
         let mut tx = self
             .begin_command_transaction(context, journal.id.clone())
             .await?;
-        command_journal::record_tx(
-            &mut tx,
-            &journal.id,
-            journal.command_type,
-            &journal.payload_json,
-            journal.run_id.as_deref(),
-            journal.created_at,
-            journal.caller_surface.as_deref(),
-            journal.caller_principal_id.as_deref(),
-            journal.caller_principal_class.as_deref(),
-            journal.caller_tool.as_deref(),
-            journal.request_id.as_deref(),
-            journal.caller_class.as_deref(),
-            journal.mcp_idempotency_key.as_deref(),
-            journal.boundary_row_id.as_deref(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+        record_command_journal_tx(&mut tx, journal).await?;
         command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), error).await?;
         tx.commit().await?;
         db::pool::log_write_transaction(context, tx_started);

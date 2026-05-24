@@ -32,6 +32,11 @@ tokio::task_local! {
     /// into `CallerContext.mcp_idempotency_key` and command_journal persists the linkage.
     pub static MCP_IDEMPOTENCY_KEY: Option<String>;
 
+    /// P081 Phase 5: canonical request hash for the current state-changing tool call.
+    /// Scoped beside the idempotency key so the command transaction can claim the
+    /// idempotency row atomically with command_journal and domain writes.
+    pub static MCP_IDEMPOTENCY_REQUEST_HASH: Option<String>;
+
     /// P081 Phase 3: Boundary matrix row_id that allowed the current tool call.
     /// Scoped by `server.rs` after BoundaryPolicy::Allow so command_journal carries
     /// the row_id for audit linkage without threading it through every tool handler.
@@ -79,9 +84,25 @@ where
     MCP_IDEMPOTENCY_KEY.scope(key, future).await
 }
 
+/// Wrap `future` so its inner tasks observe the canonical idempotency request hash.
+pub async fn scope_idempotency_request_hash<F, T>(hash: Option<String>, future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    MCP_IDEMPOTENCY_REQUEST_HASH.scope(hash, future).await
+}
+
 /// Read the ambient `MCP_IDEMPOTENCY_KEY` task-local.
 pub fn current_idempotency_key() -> Option<String> {
     MCP_IDEMPOTENCY_KEY.try_with(|k| k.clone()).ok().flatten()
+}
+
+/// Read the ambient `MCP_IDEMPOTENCY_REQUEST_HASH` task-local.
+pub fn current_idempotency_request_hash() -> Option<String> {
+    MCP_IDEMPOTENCY_REQUEST_HASH
+        .try_with(|h| h.clone())
+        .ok()
+        .flatten()
 }
 
 /// Wrap `future` so its inner tasks observe `row_id` on the `MCP_BOUNDARY_ROW_ID` task-local.
@@ -119,6 +140,9 @@ pub fn mcp_caller(principal: &auth::Principal, tool_name: &str) -> CallerContext
     // so command_journal carries the linkage without threading through every tool handler.
     if let Some(key) = current_idempotency_key() {
         caller = caller.with_mcp_idempotency_key(key);
+    }
+    if let Some(hash) = current_idempotency_request_hash() {
+        caller = caller.with_mcp_idempotency_request_hash(hash);
     }
     if let Some(row_id) = current_boundary_row_id() {
         caller = caller.with_boundary_row_id(row_id);

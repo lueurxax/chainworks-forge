@@ -136,7 +136,7 @@ pub fn build_schema(
         principal_table,
         reporter,
         None,
-        None,
+        Some(embedded_shadow_boundary_policy()),
     )
 }
 
@@ -155,7 +155,7 @@ pub fn build_schema_with_storage_writer(
         principal_table,
         reporter,
         Some(storage_writer_heartbeat),
-        None,
+        Some(embedded_shadow_boundary_policy()),
     )
 }
 
@@ -203,6 +203,13 @@ fn build_schema_inner(
         builder = builder.data(policy);
     }
     builder.finish()
+}
+
+fn embedded_shadow_boundary_policy() -> Arc<auth::boundary::BoundaryPolicy> {
+    Arc::new(
+        auth::boundary::BoundaryPolicy::from_embedded_with_mode(auth::boundary::PolicyMode::Shadow)
+            .expect("embedded P081 boundary fixture must be valid"),
+    )
 }
 
 pub struct QueryRoot;
@@ -290,6 +297,7 @@ async fn write_graphql_legacy_deny_audit(
         created_at_ms: now_ms,
     };
     if let Err(e) = audit_log::append(pool, &entry).await {
+        db::metrics::increment_counter("audit_log_append_failure_total");
         tracing::warn!(
             error = %e,
             transport,
@@ -366,6 +374,7 @@ async fn write_graphql_deny_audit(
         created_at_ms: now_ms,
     };
     audit_log::append(pool, &entry).await.map_err(|e| {
+        db::metrics::increment_counter("audit_log_append_failure_total");
         tracing::error!(
             error = %e,
             transport,
@@ -405,6 +414,14 @@ async fn boundary_runtime_readback_json(
             "latestCheckpointSeq": audit_health.latest_checkpoint_seq,
             "latestCheckpointHash": audit_health.latest_checkpoint_hash,
             "integrityState": integrity_state.as_str(),
+            "writable": audit_health.writable,
+            "retentionMinDays": audit_health.retention_min_days,
+            "cleanupState": audit_health.cleanup_state,
+            "cleanupEligibleRowCount": audit_health.cleanup_eligible_row_count,
+            "cleanupProtectedRowCount": audit_health.cleanup_protected_row_count,
+            "payloadBudgetBytes": audit_health.payload_budget_bytes,
+            "payloadUsedBytes": audit_health.payload_used_bytes,
+            "shadowCoverageReportRef": audit_health.shadow_coverage_report_ref,
         }
     }))
 }
@@ -7636,6 +7653,27 @@ mod tests {
             "audit_log_health.v1"
         );
         assert!(readback["auditLogHealth"]["rowCount"].as_i64().is_some());
+        assert_eq!(readback["auditLogHealth"]["writable"], true);
+        assert_eq!(readback["auditLogHealth"]["retentionMinDays"], 90);
+        assert!(readback["auditLogHealth"]["cleanupState"]
+            .as_str()
+            .is_some());
+        assert!(readback["auditLogHealth"]["cleanupEligibleRowCount"]
+            .as_i64()
+            .is_some());
+        assert!(readback["auditLogHealth"]["cleanupProtectedRowCount"]
+            .as_i64()
+            .is_some());
+        assert!(readback["auditLogHealth"]["payloadBudgetBytes"]
+            .as_i64()
+            .is_some());
+        assert!(readback["auditLogHealth"]["payloadUsedBytes"]
+            .as_i64()
+            .is_some());
+        assert_eq!(
+            readback["auditLogHealth"]["shadowCoverageReportRef"],
+            "docs/evidence/boundary-policy-shadow-coverage/report.json"
+        );
         assert!(
             readback["auditLogHealth"]["integrityState"]
                 .as_str()
@@ -7668,12 +7706,7 @@ mod tests {
         );
 
         let response = schema
-            .execute(
-                Request::new(
-                    r#"{ operatorAlerts }"#,
-                )
-                .data(test_principal()),
-            )
+            .execute(Request::new(r#"{ operatorAlerts }"#).data(test_principal()))
             .await;
 
         assert!(

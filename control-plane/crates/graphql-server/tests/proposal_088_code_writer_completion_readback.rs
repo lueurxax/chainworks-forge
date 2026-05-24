@@ -71,6 +71,7 @@ fn operator_caller() -> CallerContext {
         caller_class: None,
         token_id: None,
         mcp_idempotency_key: None,
+        mcp_idempotency_request_hash: None,
         boundary_row_id: None,
     }
 }

@@ -96,14 +96,21 @@ pub const P081_REQUIRED_METRICS: &[&str] = &[
     "p081_boundary_policy_enforcement_parity_percent",
     "boundary_policy_decisions_total",
     "boundary_policy_shadow_disagreement_total",
+    "auth_ambiguous_caller_warn_total",
+    "boundary_no_op_label_total",
     "audit_log_append_failure_total",
+    "audit_log_rate_limited_total",
     "operator_alert_native_delivery_total",
+    "operator_alert_clear_latency_ms",
     "mcp_command_idempotency_replay_total",
     "mcp_command_idempotency_conflict_total",
+    "approval_idempotency_duplicate_total",
     "boundary_policy_evaluation_error_total",
     "approval_actionability_false_total",
     "graphql_redaction_extensions_total",
     "boundary_policy_decision_latency_ms",
+    "boundary_commit_transaction_latency_ms",
+    "audit_budget_cleanup_duration_ms",
 ];
 
 fn metrics() -> &'static Mutex<SystemMetrics> {
@@ -162,6 +169,30 @@ pub fn record_p081_boundary_decision_latency(duration: Duration) {
     let mut m = metrics().lock().unwrap();
     m.hot_read_latency
         .entry("boundary_policy_decision_latency_ms".to_string())
+        .or_default()
+        .record(duration.as_millis() as u64);
+}
+
+pub fn record_p081_boundary_commit_transaction_latency(duration: Duration) {
+    let mut m = metrics().lock().unwrap();
+    m.hot_read_latency
+        .entry("boundary_commit_transaction_latency_ms".to_string())
+        .or_default()
+        .record(duration.as_millis() as u64);
+}
+
+pub fn record_p081_audit_budget_cleanup_duration(duration: Duration) {
+    let mut m = metrics().lock().unwrap();
+    m.hot_read_latency
+        .entry("audit_budget_cleanup_duration_ms".to_string())
+        .or_default()
+        .record(duration.as_millis() as u64);
+}
+
+pub fn record_p081_operator_alert_clear_latency(duration: Duration) {
+    let mut m = metrics().lock().unwrap();
+    m.hot_read_latency
+        .entry("operator_alert_clear_latency_ms".to_string())
         .or_default()
         .record(duration.as_millis() as u64);
 }
@@ -360,14 +391,21 @@ mod tests {
             "p081_boundary_policy_enforcement_parity_percent",
             "boundary_policy_decisions_total",
             "boundary_policy_shadow_disagreement_total",
+            "auth_ambiguous_caller_warn_total",
+            "boundary_no_op_label_total",
             "audit_log_append_failure_total",
+            "audit_log_rate_limited_total",
             "operator_alert_native_delivery_total",
+            "operator_alert_clear_latency_ms",
             "mcp_command_idempotency_replay_total",
             "mcp_command_idempotency_conflict_total",
+            "approval_idempotency_duplicate_total",
             "boundary_policy_evaluation_error_total",
             "approval_actionability_false_total",
             "graphql_redaction_extensions_total",
             "boundary_policy_decision_latency_ms",
+            "boundary_commit_transaction_latency_ms",
+            "audit_budget_cleanup_duration_ms",
         ] {
             assert!(
                 P081_REQUIRED_METRICS.contains(&metric),
@@ -384,10 +422,41 @@ mod tests {
             "enforce",
         );
         record_p081_boundary_decision_latency(Duration::from_millis(2));
+        record_p081_boundary_commit_transaction_latency(Duration::from_millis(3));
+        record_p081_audit_budget_cleanup_duration(Duration::from_millis(4));
+        record_p081_operator_alert_clear_latency(Duration::from_millis(5));
+        for counter in [
+            "boundary_policy_shadow_disagreement_total",
+            "auth_ambiguous_caller_warn_total",
+            "boundary_no_op_label_total",
+            "audit_log_append_failure_total",
+            "audit_log_rate_limited_total",
+            "operator_alert_native_delivery_total",
+            "mcp_command_idempotency_replay_total",
+            "mcp_command_idempotency_conflict_total",
+            "approval_idempotency_duplicate_total",
+            "boundary_policy_evaluation_error_total",
+            "approval_actionability_false_total",
+            "graphql_redaction_extensions_total",
+        ] {
+            increment_counter(counter);
+        }
         assert!(get_counter("boundary_policy_decisions_total") > 0);
         assert_eq!(
             get_hot_read_latest("boundary_policy_decision_latency_ms"),
             Some(2)
+        );
+        assert_eq!(
+            get_hot_read_latest("boundary_commit_transaction_latency_ms"),
+            Some(3)
+        );
+        assert_eq!(
+            get_hot_read_latest("audit_budget_cleanup_duration_ms"),
+            Some(4)
+        );
+        assert_eq!(
+            get_hot_read_latest("operator_alert_clear_latency_ms"),
+            Some(5)
         );
     }
 }

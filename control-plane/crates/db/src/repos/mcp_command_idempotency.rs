@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 /// Retention window: 7 days in milliseconds.
 const RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -102,6 +102,49 @@ pub async fn insert_pending(
         Ok(_) => Ok(true),
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(false),
         Err(e) => Err(e).context("mcp_command_idempotency: insert_pending"),
+    }
+}
+
+/// Transactional pending claim used by command write units.
+///
+/// The claim must be inserted in the same BEGIN IMMEDIATE transaction as the
+/// command_journal row and durable domain mutation. A unique-key conflict means
+/// another request has already claimed or committed this idempotency key; callers
+/// must roll back their command transaction and return a retry/replay response
+/// without writing business state.
+pub async fn insert_pending_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    idempotency_key: &str,
+    tool_name: &str,
+    caller_fingerprint: &str,
+    canonical_request_hash: &str,
+    boundary_row_id: Option<&str>,
+) -> Result<bool> {
+    let now_ms = Utc::now().timestamp_millis();
+    let now_str = Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        r#"INSERT OR FAIL INTO mcp_command_idempotency
+               (idempotency_key, tool_name, caller_fingerprint, canonical_request_hash,
+                row_id, command_journal_id, result_json, result_hash,
+                committed_at_ms, expires_at_ms, created_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, ?7, ?8, ?9)"#,
+    )
+    .bind(idempotency_key)
+    .bind(tool_name)
+    .bind(caller_fingerprint)
+    .bind(canonical_request_hash)
+    .bind(boundary_row_id)
+    .bind(PENDING_SENTINEL)
+    .bind(now_ms)
+    .bind(now_ms + RETENTION_MS)
+    .bind(&now_str)
+    .execute(&mut **tx)
+    .await;
+
+    match result {
+        Ok(_) => Ok(true),
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(false),
+        Err(e) => Err(e).context("mcp_command_idempotency: insert_pending_tx"),
     }
 }
 

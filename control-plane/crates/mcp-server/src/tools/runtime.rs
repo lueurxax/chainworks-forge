@@ -18,7 +18,8 @@ pub fn tool_specs() -> Vec<McpTool> {
         },
         McpTool {
             name: "operator.alerts.list".to_string(),
-            description: "Read bounded operator alerts derived from runtime policy health".to_string(),
+            description: "Read bounded operator alerts derived from runtime policy health"
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {}
@@ -51,6 +52,14 @@ pub async fn boundary_runtime_readback(
             "latestCheckpointSeq": audit_health.latest_checkpoint_seq,
             "latestCheckpointHash": audit_health.latest_checkpoint_hash,
             "integrityState": integrity_state.as_str(),
+            "writable": audit_health.writable,
+            "retentionMinDays": audit_health.retention_min_days,
+            "cleanupState": audit_health.cleanup_state,
+            "cleanupEligibleRowCount": audit_health.cleanup_eligible_row_count,
+            "cleanupProtectedRowCount": audit_health.cleanup_protected_row_count,
+            "payloadBudgetBytes": audit_health.payload_budget_bytes,
+            "payloadUsedBytes": audit_health.payload_used_bytes,
+            "shadowCoverageReportRef": audit_health.shadow_coverage_report_ref,
         }
     }))
 }
@@ -63,7 +72,10 @@ pub async fn operator_alerts_readback(
     let now_ms = Utc::now().timestamp_millis();
     let mut alerts = Vec::new();
 
-    if boundary_runtime["safeModeActive"].as_bool().unwrap_or(false) {
+    if boundary_runtime["safeModeActive"]
+        .as_bool()
+        .unwrap_or(false)
+    {
         alerts.push(json!({
             "schemaVersion": "operator_alert_v1",
             "id": "p081-safe-mode-active",

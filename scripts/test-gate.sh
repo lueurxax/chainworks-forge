@@ -6306,6 +6306,9 @@ for row in rows:
 print("P081: operator readback and shadow coverage fixtures valid")
 PY
 
+    log "P081: structured boundary-policy canary validator"
+    python3 "$ROOT_DIR/scripts/validate-p081-canaries.py" --root "$ROOT_DIR" --self-test
+
     log "P081: reliability proof inventory is gate-owned"
     python3 - "$ROOT_DIR" <<'PY'
 import pathlib, sys
@@ -6354,6 +6357,7 @@ PY
       cd "$ROOT_DIR/control-plane"
       cargo test -p db repos::audit_log:: -- --nocapture
       cargo test -p db metrics::tests::proposal_081_required_metric_names_are_declared_and_recordable -- --nocapture
+      cargo test -p db repos::audit_log::tests::append_and_health_roundtrip -- --nocapture
     )
 
     log "P081: migration compile check - audit_log and audit_log_checkpoints migrations exist"
@@ -6434,8 +6438,29 @@ PY
       cd "$ROOT_DIR/control-plane"
       RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_ideas_create_records_command_journal_and_idempotency_linkage -- --nocapture
       RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_ideas_create_idempotency_replay_does_not_duplicate_command_commit -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_idempotency_storage_unavailable_fails_closed_with_sqlite_contention_code -- --nocapture
       RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_idempotency_pending_sentinel_recovers_committed_unack_without_reexecution -- --nocapture
     )
+
+    log "P081: macOS accessibility contract source coverage"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+proposal = (root / "docs/proposals/081-boundary-first-api-auth-contract-matrix.md").read_text()
+reference = (root / "docs/reference/swift-macos-boundary-contract.md").read_text()
+tokens = [
+    "full_keyboard_access_redacted_nil_vs_ordinary_nil",
+    "increase_contrast_redaction_state",
+    "reduce_motion_alert_state",
+    "operator_alert_fires_and_clears_hidden_window",
+]
+for token in tokens:
+    if token not in proposal:
+        raise SystemExit(f"P081: proposal missing macOS accessibility proof token {token}")
+    if token not in reference:
+        raise SystemExit(f"P081: reference missing macOS accessibility proof token {token}")
+print("P081: macOS accessibility contract source coverage valid")
+PY
 
     log "P081: Swift approval action attempt idempotency store"
     run_targeted_tests "proposal-081-swift" "${PROPOSAL_081_SWIFT_TESTS[@]}"

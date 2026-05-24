@@ -333,7 +333,10 @@ impl PrincipalTable {
                 }
                 if let Some(parent) = path.parent() {
                     let parent_meta = std::fs::symlink_metadata(parent).map_err(|e| {
-                        AuthError::TableLoadFailed(format!("stat auth dir {}: {e}", parent.display()))
+                        AuthError::TableLoadFailed(format!(
+                            "stat auth dir {}: {e}",
+                            parent.display()
+                        ))
                     })?;
                     let parent_mode = parent_meta.mode() & 0o777;
                     if parent_mode != 0o700 {
@@ -2111,14 +2114,16 @@ mod tests {
 
         std::fs::remove_file(hard_link).unwrap();
         let public_dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(public_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(public_dir.path(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         let public_path = public_dir.path().join("principals.json");
         std::fs::copy(&path, &public_path).unwrap();
         std::fs::set_permissions(&public_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let err = PrincipalTable::load_or_bootstrap(&public_path).unwrap_err();
         assert!(
-            err.to_string().contains("parent directory must have mode 0700"),
+            err.to_string()
+                .contains("parent directory must have mode 0700"),
             "public auth dir must fail closed, got {err}"
         );
     }

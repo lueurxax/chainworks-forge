@@ -22,7 +22,7 @@
     {"row_id": "p081.automation.mcp_tools_list.discovery", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "automation_tools_list_scope"},
     {"row_id": "p081.automation.mcp_tools_call.command", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "p081_ideas_create_records_command_journal_and_idempotency_linkage"},
     {"row_id": "p081.observer.mcp_tools_call.compact_read", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "proposal_081_operator_alerts_list_exposes_safe_mode_alert"},
-    {"row_id": "p081.observer.graphql_query.read_only_opt_in", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "Proposal081GraphQLRedactionTests"},
+    {"row_id": "p081.observer.graphql_query.read_only_opt_in", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "proposal_081_observer_operator_alerts_redact_fields_without_graphql_errors"},
     {"row_id": "p081.developer_break_glass.debug_endpoint.disabled", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "boundary::tests::embedded_fixture_is_valid"}
   ]
 }

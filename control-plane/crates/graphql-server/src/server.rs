@@ -121,10 +121,9 @@ fn add_p081_response_redactions(response: &mut async_graphql::Response) {
     if redactions.is_empty() {
         return;
     }
-    response.extensions.insert(
-        "redactions".into(),
-        async_graphql::Value::List(redactions),
-    );
+    response
+        .extensions
+        .insert("redactions".into(), async_graphql::Value::List(redactions));
 }
 
 fn p081_redaction_from_error(err: &async_graphql::ServerError) -> Option<async_graphql::Value> {
@@ -264,7 +263,9 @@ async fn connection_init_data(
         .map_err(|close| async_graphql::Error::new(close.reason))
 }
 
-fn connection_init_payload_from_message(message: &Message) -> std::result::Result<serde_json::Value, P081WsClose> {
+fn connection_init_payload_from_message(
+    message: &Message,
+) -> std::result::Result<serde_json::Value, P081WsClose> {
     let bytes: Vec<u8> = match message {
         Message::Text(text) => text.as_str().as_bytes().to_vec(),
         Message::Binary(bytes) => bytes.to_vec(),
@@ -610,8 +611,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["errors"][0]["message"], "forbidden");
         assert_eq!(
-            json["extensions"]["redactions"][0]["redactionMode"],
-            "drop_resource",
+            json["extensions"]["redactions"][0]["redactionMode"], "drop_resource",
             "P081 GraphQL denial responses must expose top-level extensions.redactions"
         );
         let journal_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM command_journal")
@@ -694,9 +694,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_graphql_ws_rejects_missing_connection_init_auth() {
-        let err = p081_connection_init_data(serde_json::json!({}), auth::PrincipalTable::test_fixture())
-            .await
-            .expect_err("missing WS token must fail");
+        let err =
+            p081_connection_init_data(serde_json::json!({}), auth::PrincipalTable::test_fixture())
+                .await
+                .expect_err("missing WS token must fail");
 
         assert_eq!(err, P081WsClose::UNAUTHORIZED);
         assert_eq!(GRAPHQL_WS_UNAUTHORIZED_CLOSE_CODE, 4401);

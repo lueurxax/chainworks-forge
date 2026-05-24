@@ -106,6 +106,14 @@ pub struct AuditLogHealthSnapshot {
     pub latest_row_id: Option<String>,
     pub latest_checkpoint_seq: Option<i64>,
     pub latest_checkpoint_hash: Option<String>,
+    pub writable: bool,
+    pub retention_min_days: i64,
+    pub cleanup_state: String,
+    pub cleanup_eligible_row_count: i64,
+    pub cleanup_protected_row_count: i64,
+    pub payload_budget_bytes: i64,
+    pub payload_used_bytes: i64,
+    pub shadow_coverage_report_ref: String,
 }
 
 /// SEC-M-004: Integrity state from startup checkpoint verification.
@@ -763,11 +771,60 @@ pub async fn health_snapshot(pool: &SqlitePool) -> Result<AuditLogHealthSnapshot
         None => (None, None),
     };
 
+    let cutoff_ms = chrono::Utc::now().timestamp_millis() - RETENTION_MIN_MS;
+    let cleanup_eligible_row_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE created_at_ms < ?1 \
+           AND checkpoint_id IS NOT NULL",
+    )
+    .bind(cutoff_ms)
+    .fetch_one(pool)
+    .await
+    .context("audit_log cleanup eligible row count")?;
+    let cleanup_protected_row_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE created_at_ms < ?1 \
+           AND checkpoint_id IS NULL",
+    )
+    .bind(cutoff_ms)
+    .fetch_one(pool)
+    .await
+    .context("audit_log cleanup protected row count")?;
+    let payload_used_bytes: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(LENGTH(payload)), 0) FROM audit_log")
+            .fetch_one(pool)
+            .await
+            .context("audit_log payload used bytes")?;
+    let writable = sqlx::query_scalar::<_, i64>(
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_log') THEN 1 ELSE 0 END",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        == 1;
+    let cleanup_state = if cleanup_eligible_row_count > 0 {
+        "cleanup_due"
+    } else if cleanup_protected_row_count > 0 {
+        "waiting_for_checkpoint"
+    } else {
+        "healthy"
+    }
+    .to_string();
+
     Ok(AuditLogHealthSnapshot {
         row_count,
         latest_row_id,
         latest_checkpoint_seq,
         latest_checkpoint_hash,
+        writable,
+        retention_min_days: RETENTION_MIN_DAYS,
+        cleanup_state,
+        cleanup_eligible_row_count,
+        cleanup_protected_row_count,
+        payload_budget_bytes: row_count.saturating_mul(MAX_PAYLOAD_BYTES as i64),
+        payload_used_bytes,
+        shadow_coverage_report_ref: "docs/evidence/boundary-policy-shadow-coverage/report.json"
+            .to_string(),
     })
 }
 
@@ -789,6 +846,7 @@ const RETENTION_MIN_MS: i64 = RETENTION_MIN_DAYS * 24 * 60 * 60 * 1000;
 /// act as a compact proof-of-existence record and can be pruned independently
 /// once the operator has taken an external backup.
 pub async fn delete_old_rows(pool: &SqlitePool) -> Result<u64> {
+    let started = std::time::Instant::now();
     let cutoff_ms = chrono::Utc::now().timestamp_millis() - RETENTION_MIN_MS;
     let result = sqlx::query(
         "DELETE FROM audit_log \
@@ -799,6 +857,7 @@ pub async fn delete_old_rows(pool: &SqlitePool) -> Result<u64> {
     .execute(pool)
     .await
     .context("audit_log retention cleanup")?;
+    crate::metrics::record_p081_audit_budget_cleanup_duration(started.elapsed());
     Ok(result.rows_affected())
 }
 
@@ -847,6 +906,16 @@ mod tests {
         assert_eq!(snap.row_count, 1);
         assert_eq!(snap.latest_row_id.as_deref(), Some("entry-001"));
         assert!(snap.latest_checkpoint_seq.is_none());
+        assert!(snap.writable);
+        assert_eq!(snap.retention_min_days, 90);
+        assert_eq!(snap.cleanup_state, "waiting_for_checkpoint");
+        assert_eq!(snap.cleanup_eligible_row_count, 0);
+        assert_eq!(snap.cleanup_protected_row_count, 1);
+        assert!(snap.payload_budget_bytes >= snap.payload_used_bytes);
+        assert_eq!(
+            snap.shadow_coverage_report_ref,
+            "docs/evidence/boundary-policy-shadow-coverage/report.json"
+        );
     }
 
     #[tokio::test]

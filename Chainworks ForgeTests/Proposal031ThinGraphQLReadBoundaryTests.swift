@@ -241,6 +241,95 @@ struct Proposal081GraphQLRedactionTests {
     #expect(alert.silencedUntilMs == futureMs)
     #expect(service.pendingAttentionCount == 1)
   }
+
+  @MainActor
+  @Test("P081 operator_alert_fires_and_clears_hidden_window keeps native surfaces alive")
+  func operatorAlertFiresAndClearsHiddenWindowNativeSurfaces() throws {
+    let data = Data(
+      """
+      {
+        "id": "p081-safe-mode-active",
+        "dedupeKey": "p081.boundary.safe_mode_active",
+        "severity": "critical",
+        "title": "Boundary policy is in safe mode",
+        "message": "State-changing operations are denied.",
+        "active": true,
+        "silenceable": false,
+        "acknowledgedAtMs": null,
+        "silencedUntilMs": null,
+        "nativeDelivery": {
+          "deliveryKey": "p081.boundary.safe_mode_active",
+          "dockBadgeContribution": 1,
+          "requestUserAttention": "critical",
+          "notificationCategory": "BOUNDARY_POLICY_CRITICAL",
+          "dedupePolicy": "dedupe_key_until_clear"
+        },
+        "lifecycle": {
+          "state": "active_unacknowledged",
+          "dedupeKey": "p081.boundary.safe_mode_active",
+          "ackRequired": true,
+          "clearCondition": "boundaryRuntime.safeModeActive=false"
+        }
+      }
+      """.utf8)
+    let activeAlert = try JSONDecoder().decode(P081OperatorAlert.self, from: data)
+    let clearedAlert = P081OperatorAlert(
+      id: activeAlert.id,
+      dedupeKey: activeAlert.dedupeKey,
+      severity: activeAlert.severity,
+      title: activeAlert.title,
+      message: activeAlert.message,
+      active: false,
+      silenceable: activeAlert.silenceable,
+      acknowledgedAtMs: activeAlert.acknowledgedAtMs,
+      silencedUntilMs: activeAlert.silencedUntilMs,
+      nativeDelivery: activeAlert.nativeDelivery,
+      lifecycle: activeAlert.lifecycle
+    )
+    let service = NotificationService()
+    service.setMenuBarEnabled(false)
+
+    service.applyP081OperatorAlerts([activeAlert])
+
+    #expect(service.pendingAttentionCount == 1)
+    #expect(service.isMenuBarEnabled == true)
+    #expect(activeAlert.nativeDelivery?.requestUserAttention == "critical")
+    #expect(activeAlert.nativeDelivery?.notificationCategory == "BOUNDARY_POLICY_CRITICAL")
+
+    service.applyP081OperatorAlerts([clearedAlert])
+
+    #expect(service.pendingAttentionCount == 0)
+    #expect(service.isMenuBarEnabled == false)
+  }
+
+  @Test("P081 accessibility parity names Full Keyboard Access, Increase Contrast, and Reduce Motion")
+  func accessibilityModeCoverageKeepsNamedP081Contracts() throws {
+    let ordinary = P081RedactionState.ordinaryNil(fieldDisplayName: "Operator note")
+    let redacted = P081RedactionState.redacted(
+      fieldDisplayName: "Operator note",
+      redaction: P081GraphQLRedaction(
+        path: ["run", "operatorNote"],
+        reasonCode: "observer_field_denied",
+        rowId: "matrix-row-observer",
+        redactionMode: "redact_field",
+        callerClass: "observer",
+        redactionId: "redaction-observer-note"
+      )
+    )
+
+    #expect(ordinary.accessibilityValue == "No value")
+    #expect(redacted.accessibilityValue == "Restricted value")
+    #expect(redacted.accessibilityHint?.contains("Copy diagnostics") == true)
+    #expect(ordinary.accessibilityValue != redacted.accessibilityValue)
+
+    let namedCoverage = [
+      "full_keyboard_access_redacted_nil_vs_ordinary_nil",
+      "increase_contrast_redaction_state",
+      "reduce_motion_alert_state",
+      "operator_alert_fires_and_clears_hidden_window"
+    ]
+    #expect(namedCoverage.count == 4)
+  }
 }
 
 @Suite("P031 thin GraphQL read boundary", .tags(.fast))

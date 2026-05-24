@@ -397,10 +397,10 @@ mod tests {
         assert_eq!(bp["capability_schema_version"], 1);
     }
 
-    /// When no boundary policy is injected the initialize response must
-    /// still succeed — backward-compatible for tests that use test_server().
+    /// Legacy test constructors install the embedded shadow policy by default,
+    /// so new call sites do not silently bypass the boundary service.
     #[tokio::test]
-    async fn p081_mcp_initialize_without_policy_has_no_boundary_capability() {
+    async fn p081_mcp_initialize_default_constructor_exposes_shadow_boundary_capability() {
         let mcp = test_server().await;
         let response = handle_mcp_post(
             State(mcp),
@@ -412,10 +412,9 @@ mod tests {
 
         let json = response_json(response).await;
         assert!(json["error"].is_null(), "initialize must succeed: {json}");
-        assert!(
-            json["result"]["capabilities"]["boundary_policy"].is_null(),
-            "no boundary_policy key expected when policy not injected"
-        );
+        let bp = &json["result"]["capabilities"]["boundary_policy"];
+        assert_eq!(bp["mode"], "shadow");
+        assert_eq!(bp["denied_known_tool_code"], -32004);
     }
 
     // ── P081: known-but-denied tools must return -32004 ───────────────────
