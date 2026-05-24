@@ -34,8 +34,7 @@ use crate::types::session::{
     transient_db_unavailable_health, GqlSessionEventConnection, GqlSessionGenerationConnection,
     GqlSessionHealthReport, GqlSessionKpiSummary, GqlSessionLineage, GqlSessionLineageConnection,
     GqlSessionStatusChangedEvent, P046Config, P046LivePrincipalHandle,
-    SESSION_EVENTS_DEFAULT_FIRST, SESSION_EVENTS_MAX_FIRST, SESSION_GENERATIONS_DEFAULT_FIRST,
-    SESSION_GENERATIONS_MAX_FIRST, SESSION_LINEAGES_DEFAULT_FIRST, SESSION_LINEAGES_MAX_FIRST,
+    SESSION_EVENTS_MAX_FIRST, SESSION_GENERATIONS_MAX_FIRST, SESSION_LINEAGES_MAX_FIRST,
 };
 use crate::types::stage::{GqlAgentExecution, GqlStageExecution};
 use crate::types::steward::{
@@ -314,8 +313,10 @@ async fn p046_check_run_accessible(
     if principal.class != auth::PrincipalClass::Operator {
         return Err(Error::new("forbidden"));
     }
+    // Return a sanitized parse error (not "not found") so input validation failures
+    // are distinguishable from authorization outcomes and do not disclose row existence.
     let parsed: domain::ids::RunId =
-        run_id_str.parse().map_err(|_| Error::new("not found"))?;
+        run_id_str.parse().map_err(|_| Error::new("invalid_argument"))?;
     let pool_ref = pool.clone();
     match p046_retry_db("session_run_access", deadline, || {
         let pool_inner = pool_ref.clone();
@@ -962,7 +963,7 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
         run_id: ID,
-        first: Option<i32>,
+        #[graphql(default = 100)] first: i32,
         after: Option<String>,
     ) -> Result<GqlSessionLineageConnection> {
         require_operator_read(ctx)?;
@@ -977,9 +978,7 @@ impl QueryRoot {
         let pool = ctx.data::<SqlitePool>()?.clone();
         let resolver_deadline = p046_resolver_deadline();
         let resolver_start = std::time::Instant::now();
-        let limit = first
-            .map(|n| n as i64)
-            .unwrap_or(SESSION_LINEAGES_DEFAULT_FIRST);
+        let limit = first as i64;
         if limit > SESSION_LINEAGES_MAX_FIRST {
             return Err(Error::new("first exceeds maximum allowed value"));
         }
@@ -1016,12 +1015,14 @@ impl QueryRoot {
         })
         .await
         .map_err(|e| { warn!("p046 db error: {e:#}"); Error::new("db_unavailable") })?;
-        // Load per-lineage stats (generation_count, latest_event_at) in a single batch query.
-        // On transient DB failure return db_unavailable rather than silently defaulting to zeros.
+        // Load per-lineage stats (generation_count, latest_event_at, active_generation_status)
+        // scoped to the returned page's lineage IDs only — this bounds the DB work to the
+        // current page rather than scanning all lineages in the run.
+        let page_lineage_ids: Vec<String> = page.items.iter().map(|l| l.id.clone()).collect();
         let stats = match p046_retry_db("sessionLineages", resolver_deadline, || {
             let pool = pool.clone();
-            let run_id_str = run_id_str.clone();
-            async move { session_repo::aggregate_lineage_stats_for_run(&pool, &run_id_str).await }
+            let ids = page_lineage_ids.clone();
+            async move { session_repo::aggregate_lineage_stats_for_page(&pool, &ids).await }
         })
         .await
         {
@@ -1136,7 +1137,7 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
         lineage_id: ID,
-        first: Option<i32>,
+        #[graphql(default = 100)] first: i32,
         after: Option<String>,
     ) -> Result<GqlSessionGenerationConnection> {
         require_operator_read(ctx)?;
@@ -1151,9 +1152,7 @@ impl QueryRoot {
         let pool = ctx.data::<SqlitePool>()?;
         let resolver_deadline = p046_resolver_deadline();
         let resolver_start = std::time::Instant::now();
-        let limit = first
-            .map(|n| n as i64)
-            .unwrap_or(SESSION_GENERATIONS_DEFAULT_FIRST);
+        let limit = first as i64;
         if limit > SESSION_GENERATIONS_MAX_FIRST {
             return Err(Error::new("first exceeds maximum allowed value"));
         }
@@ -1237,7 +1236,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         lineage_id: ID,
         generation_id: Option<ID>,
-        first: Option<i32>,
+        #[graphql(default = 200)] first: i32,
         after: Option<String>,
     ) -> Result<GqlSessionEventConnection> {
         require_operator_read(ctx)?;
@@ -1252,9 +1251,7 @@ impl QueryRoot {
         let pool = ctx.data::<SqlitePool>()?;
         let resolver_deadline = p046_resolver_deadline();
         let resolver_start = std::time::Instant::now();
-        let limit = first
-            .map(|n| n as i64)
-            .unwrap_or(SESSION_EVENTS_DEFAULT_FIRST);
+        let limit = first as i64;
         if limit > SESSION_EVENTS_MAX_FIRST {
             return Err(Error::new("first exceeds maximum allowed value"));
         }

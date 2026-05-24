@@ -22,31 +22,52 @@ pub struct P046Config {
 ///
 /// The schema stores a snapshot `auth::PrincipalTable` for synchronous per-request
 /// auth. For long-lived subscriptions, per-emission rechecks must observe the most
-/// current revocation state. This handle wraps an `Arc<RwLock<…>>` so:
+/// current revocation state. This handle wraps an `Arc<RwLock<Option<…>>>` where
+/// `None` represents an unavailable/unloadable auth source (deny-all, fail-closed):
 /// - The daemon can write a refreshed table when principals.json changes.
-/// - Tests can write a revoked table to verify the subscription terminates.
+/// - On principals.json reload failure the daemon calls `mark_unavailable` so
+///   existing subscribers see `auth_ok == false` and terminate rather than
+///   continuing under stale grants.
+/// - Tests can write a revoked table or mark unavailable to verify termination.
 /// - Subscriptions read-lock the current value on every emission check.
 #[derive(Clone, Debug)]
-pub struct P046LivePrincipalHandle(pub Arc<tokio::sync::RwLock<auth::PrincipalTable>>);
+pub struct P046LivePrincipalHandle(pub Arc<tokio::sync::RwLock<Option<auth::PrincipalTable>>>);
 
 impl P046LivePrincipalHandle {
     pub fn new(table: auth::PrincipalTable) -> Self {
-        Self(Arc::new(tokio::sync::RwLock::new(table)))
+        Self(Arc::new(tokio::sync::RwLock::new(Some(table))))
     }
 
     /// Replace the current table (for daemon live-reload or test revocation).
     pub async fn update(&self, new_table: auth::PrincipalTable) {
         let mut w = self.0.write().await;
-        *w = new_table;
+        *w = Some(new_table);
     }
 
+    /// Mark the auth source unavailable (fail-closed). Called on principals.json
+    /// reload failure so that per-emission auth_ok returns false and running
+    /// subscriptions terminate with authorization_recheck_failed rather than
+    /// continuing under stale grants.
+    pub async fn mark_unavailable(&self) {
+        let mut w = self.0.write().await;
+        *w = None;
+    }
+
+    /// Returns true iff the live auth source is available AND the principal has
+    /// current operator-read permission. Returns false when the source is unavailable
+    /// (fail-closed) or when the principal is missing/revoked/downgraded.
     pub async fn auth_ok(&self, principal_id: &str) -> bool {
-        let table = self.0.read().await;
-        match auth::find_principal_by_id(&table, principal_id) {
+        let guard = self.0.read().await;
+        let table = match guard.as_ref() {
+            Some(t) => t,
+            // Auth source unavailable (reload failed) → deny-all fail-closed.
+            None => return false,
+        };
+        match auth::find_principal_by_id(table, principal_id) {
             Some(p) if p.class == auth::PrincipalClass::Operator => {
-                match auth::is_subscription_allowed_by_surface_policy(&table, principal_id) {
-                    Some(false) => false,
-                    _ => true,
+                match auth::is_subscription_allowed_by_surface_policy(table, principal_id) {
+                    Some(true) => true,
+                    _ => false,
                 }
             }
             _ => false,
@@ -233,6 +254,7 @@ impl GqlSessionLineage {
         l: SessionLineage,
         stats: Option<&db::repos::sessions::LineageStats>,
     ) -> Self {
+        let health_state = compute_lineage_health_state(&l, stats);
         Self {
             id: ID::from(l.id.clone()),
             run_id: l.run_id,
@@ -243,12 +265,50 @@ impl GqlSessionLineage {
             active_generation_id: l.active_generation_id,
             created_at: l.created_at.to_rfc3339(),
             closed_at: l.closed_at.map(|t| t.to_rfc3339()),
-            health_state: GqlSessionHealthState::Unknown,
+            health_state,
             generation_count: stats.map(|s| s.generation_count).unwrap_or(0),
             latest_event_at: stats
                 .and_then(|s| s.latest_event_at)
                 .map(|t| t.to_rfc3339()),
             active_generation: None,
+        }
+    }
+}
+
+/// Compute a per-lineage health state from lineage row data and aggregated stats.
+/// Uses the active generation status from stats (loaded by aggregate_lineage_stats_for_page)
+/// to determine:
+/// - HEALTHY: lineage has an active generation that is currently active.
+/// - WARNING: active_generation_id points to an invalidated/reset generation
+///   (invalidated_active_generation threshold).
+///   Or active_generation_id is set but no generation row found (active_generation_missing).
+/// - UNKNOWN: no active generation, lineage is initializing/closed, or insufficient data.
+fn compute_lineage_health_state(
+    l: &SessionLineage,
+    stats: Option<&db::repos::sessions::LineageStats>,
+) -> GqlSessionHealthState {
+    use domain::session::SessionGenerationStatus;
+    let Some(active_gen_id) = &l.active_generation_id else {
+        // No active generation: lineage is initializing or normally closed.
+        return GqlSessionHealthState::Unknown;
+    };
+    let _ = active_gen_id;
+    let Some(s) = stats else {
+        // No stats loaded → cannot determine health.
+        return GqlSessionHealthState::Unknown;
+    };
+    match &s.active_generation_status {
+        None => {
+            // active_generation_id is set but the generation row was not found.
+            GqlSessionHealthState::Warning
+        }
+        Some(SessionGenerationStatus::Active) => GqlSessionHealthState::Healthy,
+        Some(SessionGenerationStatus::Invalidated) | Some(SessionGenerationStatus::Reset) => {
+            GqlSessionHealthState::Warning
+        }
+        Some(SessionGenerationStatus::Closed) => {
+            // Active generation is closed; lineage may be in a transitional state.
+            GqlSessionHealthState::Unknown
         }
     }
 }
@@ -556,6 +616,11 @@ pub fn redact_event_details(
         "xoxb-", "xoxp-", "xoxa-", "xoxr-",    // Slack
         "ya29.",                                 // Google OAuth access tokens
         "eyJ",                                   // JWT (base64 header prefix)
+        // AWS IAM access key ID prefixes (access keys, session keys, batch operation,
+        // certificate, and credential group prefixes — all structurally credential-shaped).
+        "AKIA", "ASIA", "ABIA", "ACCA",
+        // Google API key prefix.
+        "AIza",
     ];
 
     // Closed-vocabulary sets for enum-like fields. These fields have a finite expected
@@ -580,6 +645,29 @@ pub fn redact_event_details(
     ];
     const CONTEXT_WINDOW_PRESSURE_BUCKET_VOCAB: &[&str] = &[
         "none", "low", "medium", "high", "critical", "unknown",
+    ];
+    // Closed vocabulary for summaryCode: lifecycle/outcome codes produced by control-plane
+    // session management. Secret-shaped tokens (AWS AKIA, Google AIza, high-entropy base64)
+    // cannot appear in this set, making the field safe even without prefix checks.
+    const SUMMARY_CODE_VOCAB: &[&str] = &[
+        "created", "active", "reused", "closed", "reset", "invalidated", "failed",
+        "completed", "context_pressure", "checkpoint", "repair", "operator_reset",
+        "transport_error", "timeout", "unknown",
+    ];
+    // Closed vocabulary for modelFamily: known provider model family identifiers.
+    const MODEL_FAMILY_VOCAB: &[&str] = &[
+        "claude", "gpt", "gemini", "codex", "llama", "mistral", "palm", "unknown",
+    ];
+    // Closed vocabulary for safeDiagnosticCode: bounded reason codes from
+    // p046_session_graphql_vocab_v1. Matches the proposal's reason_codes list exactly.
+    const SAFE_DIAGNOSTIC_CODE_VOCAB: &[&str] = &[
+        "stale_active_generation", "active_generation_missing", "generation_without_lineage",
+        "repeated_operator_reset", "invalidated_active_generation", "context_window_pressure",
+        "repair_failure_recent", "no_session_data", "transient_db_unavailable",
+        "redaction_unknown_event_type", "redaction_unknown_schema_version",
+        "redaction_unknown_details_shape", "redaction_size_limit_exceeded",
+        "subscription_resync_required", "slow_consumer_disconnected",
+        "authorization_recheck_failed", "sqlite_retry_exhausted", "unknown",
     ];
 
     // Value-type safety: all values must be scalars (string, number, bool, null).
@@ -615,7 +703,10 @@ pub fn redact_event_details(
             {
                 return (None, vec!["redaction_unknown_details_shape".to_string()]);
             }
-            // Per-field closed vocabulary for enum-like fields.
+            // Per-field closed vocabulary for enum-like fields. All string-valued
+            // fields must have a closed vocabulary to prevent secret-shaped tokens
+            // (e.g. AWS AKIA keys, Google AIza keys, high-entropy base58/base64)
+            // from passing through alphanumeric charset checks.
             serde_json::Value::String(s) => {
                 let vocab: Option<&[&str]> = match key.as_str() {
                     "providerKind" => Some(PROVIDER_KIND_VOCAB),
@@ -624,6 +715,10 @@ pub fn redact_event_details(
                     "endReason" => Some(END_REASON_VOCAB),
                     "tokenEstimateBucket" => Some(TOKEN_ESTIMATE_BUCKET_VOCAB),
                     "contextWindowPressureBucket" => Some(CONTEXT_WINDOW_PRESSURE_BUCKET_VOCAB),
+                    "summaryCode" => Some(SUMMARY_CODE_VOCAB),
+                    "modelFamily" => Some(MODEL_FAMILY_VOCAB),
+                    "safeDiagnosticCode" => Some(SAFE_DIAGNOSTIC_CODE_VOCAB),
+                    // schemaVersion is checked above (must equal the pinned version string).
                     _ => None,
                 };
                 if let Some(allowed) = vocab {
@@ -698,6 +793,49 @@ pub fn extract_typed_details(details_json: Option<&str>) -> Option<GqlSessionEve
         "xoxb-", "xoxp-", "xoxa-", "xoxr-",
         "ya29.",
         "eyJ",
+        // AWS IAM access key ID prefixes.
+        "AKIA", "ASIA", "ABIA", "ACCA",
+        // Google API key prefix.
+        "AIza",
+    ];
+    // Closed vocabularies for fields that are not already enum-restricted by redact_event_details.
+    // Applying them here ensures typedDetails also rejects secret-shaped tokens under these keys.
+    const SUMMARY_CODE_VOCAB: &[&str] = &[
+        "created", "active", "reused", "closed", "reset", "invalidated", "failed",
+        "completed", "context_pressure", "checkpoint", "repair", "operator_reset",
+        "transport_error", "timeout", "unknown",
+    ];
+    const MODEL_FAMILY_VOCAB: &[&str] = &[
+        "claude", "gpt", "gemini", "codex", "llama", "mistral", "palm", "unknown",
+    ];
+    const PROVIDER_KIND_VOCAB: &[&str] = &[
+        "claude", "codex", "gemini", "auggie", "junie", "goose", "unknown",
+    ];
+    const REUSE_DISPOSITION_VOCAB: &[&str] = &[
+        "new", "reused", "reset", "invalidated", "unknown",
+    ];
+    const RESET_REASON_VOCAB: &[&str] = &[
+        "operator_reset", "context_pressure", "transport_error", "timeout", "invalidated",
+        "output_contract_repair", "unknown",
+    ];
+    const END_REASON_VOCAB: &[&str] = &[
+        "completed", "failed", "operator_reset", "invalidated", "context_pressure",
+        "transport_error", "timeout", "unknown",
+    ];
+    const TOKEN_ESTIMATE_BUCKET_VOCAB: &[&str] = &[
+        "none", "tiny", "small", "medium", "large", "very_large", "unknown",
+    ];
+    const CONTEXT_WINDOW_PRESSURE_BUCKET_VOCAB: &[&str] = &[
+        "none", "low", "medium", "high", "critical", "unknown",
+    ];
+    const SAFE_DIAGNOSTIC_CODE_VOCAB: &[&str] = &[
+        "stale_active_generation", "active_generation_missing", "generation_without_lineage",
+        "repeated_operator_reset", "invalidated_active_generation", "context_window_pressure",
+        "repair_failure_recent", "no_session_data", "transient_db_unavailable",
+        "redaction_unknown_event_type", "redaction_unknown_schema_version",
+        "redaction_unknown_details_shape", "redaction_size_limit_exceeded",
+        "subscription_resync_required", "slow_consumer_disconnected",
+        "authorization_recheck_failed", "sqlite_retry_exhausted", "unknown",
     ];
 
     // Helper: check if a string value is operator-safe per the same rules used by
@@ -716,22 +854,31 @@ pub fn extract_typed_details(details_json: Option<&str>) -> Option<GqlSessionEve
         if CREDENTIAL_DENY_PREFIXES.iter().any(|p| s.starts_with(p)) {
             return None;
         }
+        if s.len() >= 16 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
         Some(s.to_string())
+    };
+    // Vocabulary-constrained helper: silently omits value when not in the closed set.
+    let safe_vocab = |v: &serde_json::Value, vocab: &[&str]| -> Option<String> {
+        let s = safe_str(v)?;
+        let s_lower = s.to_lowercase();
+        if vocab.contains(&s_lower.as_str()) { Some(s) } else { None }
     };
 
     let typed = GqlSessionEventTypedDetails {
         schema_version:                 obj.get("schemaVersion").and_then(safe_str),
-        summary_code:                   obj.get("summaryCode").and_then(safe_str),
-        provider_kind:                  obj.get("providerKind").and_then(safe_str),
-        model_family:                   obj.get("modelFamily").and_then(safe_str),
-        reuse_disposition:              obj.get("reuseDisposition").and_then(safe_str),
-        reset_reason:                   obj.get("resetReason").and_then(safe_str),
-        end_reason:                     obj.get("endReason").and_then(safe_str),
-        token_estimate_bucket:          obj.get("tokenEstimateBucket").and_then(safe_str),
-        context_window_pressure_bucket: obj.get("contextWindowPressureBucket").and_then(safe_str),
+        summary_code:                   obj.get("summaryCode").and_then(|v| safe_vocab(v, SUMMARY_CODE_VOCAB)),
+        provider_kind:                  obj.get("providerKind").and_then(|v| safe_vocab(v, PROVIDER_KIND_VOCAB)),
+        model_family:                   obj.get("modelFamily").and_then(|v| safe_vocab(v, MODEL_FAMILY_VOCAB)),
+        reuse_disposition:              obj.get("reuseDisposition").and_then(|v| safe_vocab(v, REUSE_DISPOSITION_VOCAB)),
+        reset_reason:                   obj.get("resetReason").and_then(|v| safe_vocab(v, RESET_REASON_VOCAB)),
+        end_reason:                     obj.get("endReason").and_then(|v| safe_vocab(v, END_REASON_VOCAB)),
+        token_estimate_bucket:          obj.get("tokenEstimateBucket").and_then(|v| safe_vocab(v, TOKEN_ESTIMATE_BUCKET_VOCAB)),
+        context_window_pressure_bucket: obj.get("contextWindowPressureBucket").and_then(|v| safe_vocab(v, CONTEXT_WINDOW_PRESSURE_BUCKET_VOCAB)),
         checkpoint_present:             obj.get("checkpointPresent").and_then(|v| v.as_bool()),
         repair_attempt_count:           obj.get("repairAttemptCount").and_then(|v| v.as_i64()),
-        safe_diagnostic_code:           obj.get("safeDiagnosticCode").and_then(safe_str),
+        safe_diagnostic_code:           obj.get("safeDiagnosticCode").and_then(|v| safe_vocab(v, SAFE_DIAGNOSTIC_CODE_VOCAB)),
     };
 
     // Return None if no safe field was found (fully unknown/unsafe payload).

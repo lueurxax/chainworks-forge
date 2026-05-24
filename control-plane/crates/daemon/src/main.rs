@@ -429,8 +429,14 @@ async fn run_daemon() -> Result<()> {
                             tracing::debug!("P046 principal table reloaded for live revocation");
                         }
                         Err(e) => {
+                            // Mark the auth source unavailable so running subscriptions
+                            // terminate fail-closed (authorization_recheck_failed) rather
+                            // than continuing under stale grants after a revocation write
+                            // that we could not observe.
+                            p046_live_handle.mark_unavailable().await;
                             tracing::warn!(
-                                "P046 principal reload failed (keeping current table): {e:#}"
+                                "P046 principal reload failed; auth source marked unavailable \
+                                 (subscriptions will fail-closed): {e:#}"
                             );
                         }
                     }

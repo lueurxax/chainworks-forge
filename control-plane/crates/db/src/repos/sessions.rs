@@ -1214,11 +1214,13 @@ pub async fn load_health_data_for_run(
     pool: &SqlitePool,
     run_id: &str,
 ) -> Result<SessionHealthData> {
-    // Cap at 256 lineages for memory safety; runs with >256 lineages receive capped health.
+    // Cap at 256 lineages for memory safety. ORDER BY created_at, id makes the cap
+    // deterministic: on large runs the same oldest-first set of lineages is always
+    // evaluated rather than an arbitrary subset.
     let lineages = sqlx::query(
         r#"SELECT id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
                   active_generation_id, created_at, closed_at
-           FROM session_lineages WHERE run_id = ?1 LIMIT 256"#,
+           FROM session_lineages WHERE run_id = ?1 ORDER BY created_at, id LIMIT 256"#,
     )
     .bind(run_id)
     .fetch_all(pool)
@@ -1258,7 +1260,7 @@ pub async fn load_health_data_for_run(
            FROM session_events e
            JOIN session_lineages l ON e.lineage_id = l.id
            WHERE l.run_id = ?1 AND e.event_type = 'operator_reset' AND e.recorded_at >= ?2
-           LIMIT 64"#,
+           ORDER BY e.recorded_at, e.id LIMIT 64"#,
     )
     .bind(run_id)
     .bind(&threshold_30m_ts)
@@ -1274,7 +1276,7 @@ pub async fn load_health_data_for_run(
            FROM session_events e
            JOIN session_lineages l ON e.lineage_id = l.id
            WHERE l.run_id = ?1 AND e.event_type = 'output_contract_repair_failed' AND e.recorded_at >= ?2
-           LIMIT 64"#,
+           ORDER BY e.recorded_at, e.id LIMIT 64"#,
     )
     .bind(run_id)
     .bind(&threshold_30m_ts)
@@ -1290,7 +1292,7 @@ pub async fn load_health_data_for_run(
            FROM session_events e
            JOIN session_lineages l ON e.lineage_id = l.id
            WHERE l.run_id = ?1 AND e.event_type = 'operator_reset' AND e.recorded_at >= ?2
-           LIMIT 64"#,
+           ORDER BY e.recorded_at, e.id LIMIT 64"#,
     )
     .bind(run_id)
     .bind(&threshold_24h_ts)
@@ -1372,9 +1374,13 @@ pub async fn latest_session_event_for_run(
 pub struct LineageStats {
     pub generation_count: i64,
     pub latest_event_at: Option<DateTime<Utc>>,
+    /// Status of the active generation (l.active_generation_id → g.status), if present.
+    /// None when the lineage has no active_generation_id or the generation row was not found.
+    pub active_generation_status: Option<SessionGenerationStatus>,
 }
 
-/// Load generation_count and latest_event_at for all lineages belonging to a run in one query.
+/// Load generation_count, latest_event_at, and active generation status for all lineages
+/// belonging to a run in one query.
 pub async fn aggregate_lineage_stats_for_run(
     pool: &SqlitePool,
     run_id: &str,
@@ -1383,18 +1389,57 @@ pub async fn aggregate_lineage_stats_for_run(
         r#"SELECT
              l.id AS lineage_id,
              COUNT(DISTINCT g.id) AS generation_count,
-             MAX(e.recorded_at) AS latest_event_at
+             MAX(e.recorded_at) AS latest_event_at,
+             ag.status AS active_gen_status
            FROM session_lineages l
            LEFT JOIN session_generations g ON g.lineage_id = l.id
            LEFT JOIN session_events e ON e.lineage_id = l.id
+           LEFT JOIN session_generations ag ON ag.id = l.active_generation_id
            WHERE l.run_id = ?1
-           GROUP BY l.id"#,
+           GROUP BY l.id, ag.status"#,
     )
     .bind(run_id)
     .fetch_all(pool)
     .await
     .context("aggregate lineage stats")?;
 
+    Ok(parse_lineage_stats_rows(rows))
+}
+
+/// Load generation_count, latest_event_at, and active generation status for a specific set of
+/// lineage row IDs (the current page). This bounds the DB work to the returned page rather
+/// than scanning all lineages in the run.
+pub async fn aggregate_lineage_stats_for_page(
+    pool: &SqlitePool,
+    lineage_row_ids: &[String],
+) -> Result<std::collections::HashMap<String, LineageStats>> {
+    if lineage_row_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut qb = sqlx::QueryBuilder::<Sqlite>::new(
+        r#"SELECT
+             l.id AS lineage_id,
+             COUNT(DISTINCT g.id) AS generation_count,
+             MAX(e.recorded_at) AS latest_event_at,
+             ag.status AS active_gen_status
+           FROM session_lineages l
+           LEFT JOIN session_generations g ON g.lineage_id = l.id
+           LEFT JOIN session_events e ON e.lineage_id = l.id
+           LEFT JOIN session_generations ag ON ag.id = l.active_generation_id
+           WHERE l.id IN ("#,
+    );
+    let mut sep = qb.separated(", ");
+    for id in lineage_row_ids {
+        sep.push_bind(id.as_str());
+    }
+    qb.push(") GROUP BY l.id, ag.status");
+    let rows = qb.build().fetch_all(pool).await.context("aggregate lineage stats for page")?;
+    Ok(parse_lineage_stats_rows(rows))
+}
+
+fn parse_lineage_stats_rows(
+    rows: Vec<sqlx::sqlite::SqliteRow>,
+) -> std::collections::HashMap<String, LineageStats> {
     let mut map = std::collections::HashMap::new();
     for row in rows {
         let lid: String = row.get("lineage_id");
@@ -1409,12 +1454,17 @@ pub async fn aggregate_lineage_stats_for_run(
             .map(parse_dt)
             .transpose()
             .unwrap_or(None);
-        map.insert(lid, LineageStats { generation_count, latest_event_at });
+        let active_gen_status_str: Option<String> =
+            row.try_get("active_gen_status").ok().flatten();
+        let active_generation_status = active_gen_status_str.as_deref().and_then(|s| {
+            serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+        });
+        map.insert(lid, LineageStats { generation_count, latest_event_at, active_generation_status });
     }
-    Ok(map)
+    map
 }
 
-/// Load generation_count and latest_event_at for a single lineage row.
+/// Load generation_count, latest_event_at, and active generation status for a single lineage row.
 pub async fn aggregate_lineage_stats_for_lineage(
     pool: &SqlitePool,
     lineage_row_id: &str,
@@ -1422,12 +1472,14 @@ pub async fn aggregate_lineage_stats_for_lineage(
     let row = sqlx::query(
         r#"SELECT
              COUNT(DISTINCT g.id) AS generation_count,
-             MAX(e.recorded_at) AS latest_event_at
+             MAX(e.recorded_at) AS latest_event_at,
+             ag.status AS active_gen_status
            FROM session_lineages l
            LEFT JOIN session_generations g ON g.lineage_id = l.id
            LEFT JOIN session_events e ON e.lineage_id = l.id
+           LEFT JOIN session_generations ag ON ag.id = l.active_generation_id
            WHERE l.id = ?1
-           GROUP BY l.id"#,
+           GROUP BY l.id, ag.status"#,
     )
     .bind(lineage_row_id)
     .fetch_optional(pool)
@@ -1446,7 +1498,11 @@ pub async fn aggregate_lineage_stats_for_lineage(
         .map(parse_dt)
         .transpose()
         .unwrap_or(None);
-    Ok(Some(LineageStats { generation_count, latest_event_at }))
+    let active_gen_status_str: Option<String> = row.try_get("active_gen_status").ok().flatten();
+    let active_generation_status = active_gen_status_str
+        .as_deref()
+        .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok());
+    Ok(Some(LineageStats { generation_count, latest_event_at, active_generation_status }))
 }
 
 fn parse_event_row(row: sqlx::sqlite::SqliteRow) -> Result<SessionEvent> {

@@ -813,7 +813,7 @@ async fn proposal_046_session_event_details_are_default_deny_redacted() {
             Some(
                 serde_json::json!({
                     "schemaVersion": "p046_event_details_redaction_v1",
-                    "summaryCode": "safe_summary",
+                    "summaryCode": "completed",
                     "providerKind": "codex"
                 })
                 .to_string(),
@@ -890,7 +890,7 @@ async fn proposal_046_session_event_details_are_default_deny_redacted() {
     );
     assert_eq!(
         safe_details["summaryCode"].as_str().unwrap(),
-        "safe_summary"
+        "completed"
     );
 
     assert_eq!(nodes[1]["eventId"].as_str().unwrap(), "unsafe-event");
@@ -2580,7 +2580,7 @@ async fn proposal_046_redaction_partial_safe_mixed_keys_fails_closed() {
 
     let json = serde_json::json!({
         "schemaVersion": "p046_event_details_redaction_v1",
-        "summaryCode": "safe_value",
+        "summaryCode": "completed",
         "rawPrompt": "this_must_not_pass"
     })
     .to_string();
@@ -2627,7 +2627,7 @@ async fn proposal_046_typed_details_partial_safe_returns_allowed_fields() {
 
     let json = serde_json::json!({
         "schemaVersion": "p046_event_details_redaction_v1",
-        "summaryCode": "safe_code",
+        "summaryCode": "created",
         "rawPrompt": "this_must_not_pass"
     })
     .to_string();
@@ -2640,7 +2640,7 @@ async fn proposal_046_typed_details_partial_safe_returns_allowed_fields() {
         "partial-safe payload must produce redaction_unknown_details_shape; got {warnings:?}"
     );
 
-    // typedDetails must extract only the allowed safe fields.
+    // typedDetails must extract only the allowed safe fields (silently omits rawPrompt).
     let typed = extract_typed_details(Some(&json));
     assert!(typed.is_some(), "partial-safe payload must produce non-null typedDetails");
     let td = typed.unwrap();
@@ -2651,7 +2651,7 @@ async fn proposal_046_typed_details_partial_safe_returns_allowed_fields() {
     );
     assert_eq!(
         td.summary_code.as_deref(),
-        Some("safe_code"),
+        Some("created"),
         "typedDetails must include safe summaryCode"
     );
 }
@@ -3051,7 +3051,8 @@ async fn proposal_046_redaction_rejects_jwt_in_reset_reason() {
 #[tokio::test]
 async fn proposal_046_redaction_accepts_safe_code_values() {
     use graphql_server::types::session::redact_event_details;
-    let json = r#"{"schemaVersion":"p046_event_details_redaction_v1","summaryCode":"SESSION_CLOSED","resetReason":"OPERATOR_RESET"}"#;
+    // Uses vocabulary-valid values: "closed" in SUMMARY_CODE_VOCAB, "operator_reset" in RESET_REASON_VOCAB.
+    let json = r#"{"schemaVersion":"p046_event_details_redaction_v1","summaryCode":"closed","resetReason":"operator_reset"}"#;
     let (redacted, warnings) = redact_event_details(Some(json));
     assert!(
         redacted.is_some(),
@@ -3062,8 +3063,8 @@ async fn proposal_046_redaction_accepts_safe_code_values() {
         "safe values must produce no warnings, got {warnings:?}"
     );
     let r = redacted.unwrap();
-    assert_eq!(r.summary_code.as_deref(), Some("SESSION_CLOSED"));
-    assert_eq!(r.reset_reason.as_deref(), Some("OPERATOR_RESET"));
+    assert_eq!(r.summary_code.as_deref(), Some("closed"));
+    assert_eq!(r.reset_reason.as_deref(), Some("operator_reset"));
 }
 
 // ── Live revocation test ───────────────────────────────────────────────────────
@@ -3245,5 +3246,337 @@ async fn proposal_046_health_generation_without_lineage_detected() {
         has_orphan_warning,
         "expected generation_without_lineage warning in sessionHealth; \
          warnings={warnings:?}"
+    );
+}
+
+// ── SEC-P046-001: mark_unavailable causes subscription to fail-closed ─────────
+//
+// After calling mark_unavailable (simulating a principals.json reload failure),
+// the per-emission auth_ok returns false and the subscription terminates with
+// authorization_recheck_failed rather than continuing under stale grants.
+
+#[tokio::test]
+async fn proposal_046_subscription_fails_closed_on_auth_source_unavailable() {
+    let pool = test_pool().await;
+    let run_id = "00000000-0000-0000-0000-000000000801";
+    seed_run(&pool, run_id).await;
+
+    // Seed session data so latest_session_event_for_run returns Some (allowing payload emission).
+    let lineage = lineage_fixture("unavail-lineage", run_id, "agent-a", "unavail-key", 0);
+    db::repos::sessions::insert_lineage(&pool, &lineage).await.unwrap();
+    let gen = generation_fixture("unavail-gen", &lineage.id, 1, 0);
+    db::repos::sessions::insert_generation(&pool, &gen).await.unwrap();
+    db::repos::sessions::insert_event(
+        &pool,
+        &event_fixture("unavail-ev-1", &lineage.id, &gen.id, 1, None),
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(128);
+    let handler = Arc::new(CommandHandler::new(
+        pool.clone(),
+        events.clone(),
+        WorkQueue::new(pool.clone()),
+    ));
+    let (schema, live_handle) = build_schema_with_session_observability_and_live_handle(
+        pool,
+        handler,
+        events.clone(),
+        auth::PrincipalTable::test_fixture(),
+        LifecycleReporter::new(15, "test-build", events.clone()),
+    );
+
+    let subscription = format!(
+        r#"subscription {{ sessionStatusChanged(runId: "{run_id}") {{ runId resyncRequired }} }}"#
+    );
+    let mut stream = schema.execute_stream(
+        Request::new(subscription).data(table_operator_principal()),
+    );
+
+    let run_id_parsed: RunId = run_id.parse().unwrap();
+
+    // First emission: passes because table is still available with test-operator.
+    let events_clone = events.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = events_clone.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
+    });
+    let first = tokio::time::timeout(
+        std::time::Duration::from_millis(800),
+        stream.next(),
+    )
+    .await
+    .expect("timed out waiting for first event")
+    .expect("stream ended before first event");
+    assert!(first.errors.is_empty(), "first emission should succeed, got {:?}", first.errors);
+
+    // Mark auth source unavailable (simulates principals.json reload failure).
+    live_handle.mark_unavailable().await;
+
+    // Second emission: auth_ok must return false (None table → deny-all).
+    let _ = events.send(DomainEvent::SessionEventRecorded { run_id: run_id_parsed });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        stream.next(),
+    )
+    .await
+    .expect("timed out waiting for fail-closed error after mark_unavailable")
+    .expect("stream ended without delivering error");
+
+    assert!(
+        result.errors.iter().any(|e| e.message == "authorization_recheck_failed"),
+        "auth source unavailable must terminate subscription with authorization_recheck_failed; \
+         got {:?}",
+        result.errors
+    );
+}
+
+// ── SEC-P046-002: secret-shaped token rejection in allowed redaction fields ────
+//
+// Verifies that AWS AKIA, AWS ASIA, Google AIza, and high-entropy base58-shaped
+// tokens injected into allowed keys (summaryCode, modelFamily, safeDiagnosticCode)
+// fail closed (detailsJsonRedacted=null + bounded warning) in both
+// redact_event_details and extract_typed_details.
+
+#[test]
+fn proposal_046_redaction_aws_akia_key_in_summary_code_fails_closed() {
+    use graphql_server::types::session::redact_event_details;
+    // AKIA-prefixed string looks alphanumeric but must be rejected by credential deny prefix.
+    let json = r#"{"schemaVersion":"p046_event_details_redaction_v1","summaryCode":"AKIAIOSFODNN7EXAMPLE"}"#;
+    let (result, warnings) = redact_event_details(Some(json));
+    assert!(
+        result.is_none(),
+        "AWS AKIA key in summaryCode must fail closed (detailsJsonRedacted=null)"
+    );
+    assert!(
+        !warnings.is_empty(),
+        "AWS AKIA key must produce a bounded warning"
+    );
+}
+
+#[test]
+fn proposal_046_redaction_aws_asia_key_fails_closed() {
+    use graphql_server::types::session::redact_event_details;
+    let json = r#"{"schemaVersion":"p046_event_details_redaction_v1","safeDiagnosticCode":"ASIAIOSFODNN7EXAMPLE"}"#;
+    let (result, warnings) = redact_event_details(Some(json));
+    assert!(result.is_none(), "AWS ASIA key must fail closed");
+    assert!(!warnings.is_empty(), "AWS ASIA key must produce a warning");
+}
+
+#[test]
+fn proposal_046_redaction_google_aiza_key_fails_closed() {
+    use graphql_server::types::session::redact_event_details;
+    let json = r#"{"schemaVersion":"p046_event_details_redaction_v1","modelFamily":"AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI"}"#;
+    let (result, warnings) = redact_event_details(Some(json));
+    assert!(result.is_none(), "Google AIza key must fail closed");
+    assert!(!warnings.is_empty(), "Google AIza key must produce a warning");
+}
+
+#[test]
+fn proposal_046_redaction_non_vocab_summary_code_fails_closed() {
+    use graphql_server::types::session::redact_event_details;
+    // "running" is alphanumeric and short but not in SUMMARY_CODE_VOCAB.
+    let json = r#"{"schemaVersion":"p046_event_details_redaction_v1","summaryCode":"running"}"#;
+    let (result, warnings) = redact_event_details(Some(json));
+    assert!(
+        result.is_none(),
+        "non-vocabulary summaryCode value must fail closed; got {result:?}"
+    );
+    assert!(!warnings.is_empty(), "non-vocabulary summaryCode must produce a warning");
+}
+
+#[test]
+fn proposal_046_redaction_non_vocab_model_family_fails_closed() {
+    use graphql_server::types::session::redact_event_details;
+    // "anthropic" is a valid company name but not in MODEL_FAMILY_VOCAB.
+    let json = r#"{"schemaVersion":"p046_event_details_redaction_v1","modelFamily":"anthropic"}"#;
+    let (result, warnings) = redact_event_details(Some(json));
+    assert!(
+        result.is_none(),
+        "non-vocabulary modelFamily must fail closed; got {result:?}"
+    );
+    assert!(!warnings.is_empty(), "non-vocabulary modelFamily must produce a warning");
+}
+
+#[test]
+fn proposal_046_typed_details_akia_in_summary_code_omitted() {
+    use graphql_server::types::session::extract_typed_details;
+    // extract_typed_details silently omits unsafe fields; AKIA must be omitted.
+    let json = r#"{"schemaVersion":"p046_event_details_redaction_v1","summaryCode":"AKIAIOSFODNN7EXAMPLE"}"#;
+    let typed = extract_typed_details(Some(json));
+    // schema_version passes (safe), summary_code must be None (AKIA rejected).
+    let summary = typed.as_ref().and_then(|t| t.summary_code.as_deref());
+    assert!(
+        summary.is_none(),
+        "AKIA key must be omitted from typedDetails.summaryCode; got {summary:?}"
+    );
+}
+
+#[test]
+fn proposal_046_typed_details_non_vocab_model_family_omitted() {
+    use graphql_server::types::session::extract_typed_details;
+    // "anthropic" not in MODEL_FAMILY_VOCAB — must be silently omitted.
+    let json = r#"{"schemaVersion":"p046_event_details_redaction_v1","modelFamily":"anthropic","providerKind":"claude"}"#;
+    let typed = extract_typed_details(Some(json));
+    let model = typed.as_ref().and_then(|t| t.model_family.as_deref());
+    assert!(
+        model.is_none(),
+        "non-vocabulary modelFamily must be omitted from typedDetails; got {model:?}"
+    );
+    // providerKind is still allowed (passes safe_str — no vocab check for providerKind in extract).
+    let provider = typed.as_ref().and_then(|t| t.provider_kind.as_deref());
+    assert!(provider.is_some(), "valid providerKind must be preserved");
+}
+
+// ── BLOCKER 6: malformed run IDs return invalid_argument ─────────────────────
+
+#[tokio::test]
+async fn proposal_046_session_lineages_malformed_run_id_returns_invalid_argument() {
+    let pool = test_pool().await;
+    let schema = make_schema_with_p046(pool);
+
+    // Deliberately non-UUID run_id should return invalid_argument, not not_found.
+    let query = r#"{ sessionLineages(runId: "not-a-valid-uuid") { nodes { id } } }"#;
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(
+        resp.errors.iter().any(|e| e.message == "invalid_argument"),
+        "malformed run ID must return invalid_argument; got {:?}",
+        resp.errors
+    );
+    // Must NOT return not_found (which would mask parse failure as a missing-row error).
+    assert!(
+        !resp.errors.iter().any(|e| e.message == "not found"),
+        "malformed run ID must not return not_found; got {:?}",
+        resp.errors
+    );
+}
+
+// ── BLOCKER 4: SessionLineage.healthState projected from persisted data ────────
+
+#[tokio::test]
+async fn proposal_046_lineage_health_state_is_warning_for_invalidated_active_gen() {
+    let pool = test_pool().await;
+    let run_id = "00000000-0000-0000-0000-000000000901";
+    seed_run(&pool, run_id).await;
+
+    let lineage = lineage_fixture("lineage-inv-active", run_id, "agent-a", "inv-active-key", 0);
+    db::repos::sessions::insert_lineage(&pool, &lineage).await.unwrap();
+
+    // Insert an INVALIDATED generation.
+    let mut gen = generation_fixture("gen-inv", &lineage.id, 1, 0);
+    gen.status = SessionGenerationStatus::Invalidated;
+    db::repos::sessions::insert_generation(&pool, &gen).await.unwrap();
+
+    // Point lineage to the invalidated generation as active.
+    db::repos::sessions::set_active_generation(&pool, &lineage.id, Some(&gen.id))
+        .await
+        .unwrap();
+
+    let schema = make_schema_with_p046(pool);
+    let query = format!(
+        r#"{{ sessionLineages(runId: "{run_id}") {{ nodes {{ id healthState }} }} }}"#
+    );
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(resp.errors.is_empty(), "query failed: {:?}", resp.errors);
+    let data = resp.data.into_json().unwrap();
+    let nodes = data["sessionLineages"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1, "expected 1 lineage");
+    let health = nodes[0]["healthState"].as_str().unwrap_or("null");
+    assert_eq!(
+        health, "WARNING",
+        "lineage with invalidated active generation must have healthState=WARNING; got {health}"
+    );
+}
+
+#[tokio::test]
+async fn proposal_046_lineage_health_state_is_healthy_for_active_gen() {
+    let pool = test_pool().await;
+    let run_id = "00000000-0000-0000-0000-000000000902";
+    seed_run(&pool, run_id).await;
+
+    let lineage = lineage_fixture("lineage-active-ok", run_id, "agent-a", "active-ok-key", 0);
+    db::repos::sessions::insert_lineage(&pool, &lineage).await.unwrap();
+
+    let gen = generation_fixture("gen-active-ok", &lineage.id, 1, 0);
+    db::repos::sessions::insert_generation(&pool, &gen).await.unwrap();
+
+    // Point lineage to the ACTIVE generation.
+    db::repos::sessions::set_active_generation(&pool, &lineage.id, Some(&gen.id))
+        .await
+        .unwrap();
+
+    let schema = make_schema_with_p046(pool);
+    let query = format!(
+        r#"{{ sessionLineages(runId: "{run_id}") {{ nodes {{ id healthState }} }} }}"#
+    );
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(resp.errors.is_empty(), "query failed: {:?}", resp.errors);
+    let data = resp.data.into_json().unwrap();
+    let nodes = data["sessionLineages"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1, "expected 1 lineage");
+    let health = nodes[0]["healthState"].as_str().unwrap_or("null");
+    assert_eq!(
+        health, "HEALTHY",
+        "lineage with active generation must have healthState=HEALTHY; got {health}"
+    );
+}
+
+// ── SDL defaultValue: first arguments encode defaults in schema ───────────────
+
+#[tokio::test]
+async fn proposal_046_sdl_first_argument_has_default_value_in_schema() {
+    let pool = test_pool().await;
+    let schema = make_schema_with_p046(pool);
+
+    // Introspect the sessionLineages field to confirm first has defaultValue=100.
+    let query = r#"{
+        __schema {
+            queryType {
+                fields {
+                    name
+                    args {
+                        name
+                        defaultValue
+                    }
+                }
+            }
+        }
+    }"#;
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(resp.errors.is_empty(), "introspection failed: {:?}", resp.errors);
+    let data = resp.data.into_json().unwrap();
+    let fields = data["__schema"]["queryType"]["fields"].as_array().unwrap();
+
+    // Check sessionLineages.first defaultValue.
+    let sl = fields.iter().find(|f| f["name"].as_str() == Some("sessionLineages"));
+    assert!(sl.is_some(), "sessionLineages must be in schema");
+    let sl_args = sl.unwrap()["args"].as_array().unwrap();
+    let sl_first = sl_args.iter().find(|a| a["name"].as_str() == Some("first"));
+    assert!(sl_first.is_some(), "sessionLineages must have first arg");
+    assert_eq!(
+        sl_first.unwrap()["defaultValue"].as_str(),
+        Some("100"),
+        "sessionLineages first must have defaultValue=100"
+    );
+
+    // Check sessionEvents.first defaultValue.
+    let se = fields.iter().find(|f| f["name"].as_str() == Some("sessionEvents"));
+    assert!(se.is_some(), "sessionEvents must be in schema");
+    let se_args = se.unwrap()["args"].as_array().unwrap();
+    let se_first = se_args.iter().find(|a| a["name"].as_str() == Some("first"));
+    assert!(se_first.is_some(), "sessionEvents must have first arg");
+    assert_eq!(
+        se_first.unwrap()["defaultValue"].as_str(),
+        Some("200"),
+        "sessionEvents first must have defaultValue=200"
     );
 }

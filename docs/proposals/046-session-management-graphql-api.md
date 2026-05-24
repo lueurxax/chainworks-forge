@@ -1,18 +1,18 @@
-# Proposal 046 Correction: Session Management GraphQL API Is Read/Subscription Only
+# Proposal 046: Session Management GraphQL API Is Read/Subscription Only
 
 | Field | Value |
 |---|---|
-| Date | 2026-04-25 |
-| Status | Correction / Amendment |
-| Corrects | `046-session-management-graphql-api.md` |
+| Date | 2026-05-21 |
+| Status | Approved R4 / implementation contract |
+| Corrects | Earlier P046 text that allowed `resetSession` |
 | Depends on | [UI action boundary](../reference/ui-action-boundary.md), Proposal 068 |
-| Goal | Correct P046 so GraphQL exposes session lineage inspection, health, KPIs, and subscriptions, but does not expose session reset mutations. Reset and reset-agent-session remain MCP-only. |
+| Goal | Expose bounded GraphQL session lineage, event, KPI, health, and live-status observability without adding any GraphQL session reset or control mutation. Reset and reset-agent-session remain MCP-only. |
 
 ---
 
 ## 1. Why this correction exists
 
-P046 currently includes an enhancement to a `resetSession` GraphQL mutation.
+Earlier P046 text included an enhancement to a `resetSession` GraphQL mutation.
 
 That conflicts with the implemented UI action boundary:
 
@@ -20,7 +20,7 @@ That conflicts with the implemented UI action boundary:
 - SwiftUI mutations are approval-only,
 - reset/reset agent session are MCP-only.
 
-Session data is still important to expose through GraphQL, but only as read and live status.
+Session data is still important to expose through GraphQL, but only as bounded readback and live status notification.
 
 ---
 
@@ -28,6 +28,7 @@ Session data is still important to expose through GraphQL, but only as read and 
 
 P046 should include:
 
+- `sessionObservabilityAvailable` capability probe
 - `sessionLineages`
 - `sessionLineage`
 - `sessionGenerations`
@@ -70,10 +71,11 @@ Allowed:
 
 ```graphql
 extend type Query {
-  sessionLineages(runId: ID!): [SessionLineage!]!
+  sessionObservabilityAvailable: Boolean!
+  sessionLineages(runId: ID!, first: Int, after: String): SessionLineageConnection!
   sessionLineage(id: ID!): SessionLineage
-  sessionGenerations(lineageId: ID!): [SessionGeneration!]!
-  sessionEvents(lineageId: ID!, generationId: ID): [SessionEvent!]!
+  sessionGenerations(lineageId: ID!, first: Int, after: String): SessionGenerationConnection!
+  sessionEvents(lineageId: ID!, generationId: ID, first: Int, after: String): SessionEventConnection!
   sessionKpiSummary(runId: ID!): SessionKpiSummary!
   sessionHealth(runId: ID!): SessionHealthReport!
 }
@@ -93,15 +95,20 @@ extend type Mutation {
 
 or any equivalent session reset mutation.
 
+The connection fields use `nodes`, `edges`, and `pageInfo`; resolvers apply deterministic ordering, opaque cursors, default limits, maximum limits, and sanitized `invalid cursor` errors. `sessionLineages` and `sessionGenerations` default to 100 rows and cap at 500. `sessionEvents` defaults to 200 rows and caps at 1000.
+
+Every P046 GraphQL field is gated by `CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY` and absent from the schema when disabled. Governed clients must probe capability/schema availability before constructing P046 documents.
+
+All P046 resolvers require operator-read authorization for the owning run. ID-based resolvers first resolve parent lineage/generation ownership, then return not-found-or-not-visible behavior for absent or unauthorized rows. Event details use the `p046_event_details_redaction_v1` default-deny allowlist, and raw `providerSessionId`, `bindingFingerprint`, `invocationOwnerKey`, and absolute working directories are replaced by derived operator-safe fields.
+
 ---
 
 ## 5. MCP ownership
 
 Session reset operations must live in MCP:
 
-- `sessions.reset`
-- `sessions.reset_agent`
-- or the canonical tool name already selected by the MCP control-plane implementation.
+- use the canonical MCP session reset capability selected by the MCP control-plane implementation.
+- P046 does not add, rename, or document a new MCP reset tool name.
 
 MCP reset tools must own:
 
@@ -123,13 +130,14 @@ SwiftUI may show:
 - session events,
 - session health warnings,
 - reset recommendation,
-- suggested MCP command.
+- generic suggested MCP action.
 
 SwiftUI may not reset a session.
+SwiftUI must gate P046 documents on capability/schema availability, keep P046 readback as transient MainActor UI state, and avoid SwiftData persistence or AppKit-owned GraphQL tasks for this proposal.
 
 Example UI copy:
 
-> “Session lineage appears stale. Suggested MCP action: `sessions.reset_agent`.”
+> “Session lineage appears stale. Suggested MCP action: use the MCP session reset capability.”
 
 ---
 
@@ -137,12 +145,14 @@ Example UI copy:
 
 P046 is complete when:
 
-1. session inspection works through GraphQL queries;
-2. session live updates work through GraphQL subscriptions;
+1. session inspection works through bounded GraphQL connection queries;
+2. session live updates work through the run-scoped `sessionStatusChanged` subscription;
 3. server-side session KPIs and health indicators are visible;
-4. no GraphQL session reset mutation exists;
-5. reset flows are documented as MCP-only;
-6. UI does not expose reset controls.
+4. every P046 query and subscription emission enforces operator-read authorization for the owning run;
+5. no GraphQL session reset or equivalent session-control mutation exists;
+6. reset flows are documented as MCP-only;
+7. UI does not expose reset controls and does not issue P046 documents when the schema/capability probe says fields are absent;
+8. rollout-contract fixtures and the `proposal-046` gate cover authorization, pagination, redaction, disabled schema behavior, retry exhaustion, subscription backpressure, and absence of reset/control mutations.
 
 ---
 
