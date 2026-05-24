@@ -418,11 +418,17 @@ async fn run_daemon() -> Result<()> {
                     db_writer.heartbeat.clone(),
                 );
             // P046: periodically reload principals.json so subscription auth rechecks
-            // observe revocation within ~30s, without requiring a daemon restart.
+            // observe revocation promptly, without requiring a daemon restart.
+            // Default interval is 2 seconds; override with CHAINWORKS_PRINCIPALS_RELOAD_SECS.
+            let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2);
             let principals_path_for_reload = paths.principals_path.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(principals_reload_secs))
+                        .await;
                     match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
                         Ok(new_table) => {
                             p046_live_handle.update(new_table).await;

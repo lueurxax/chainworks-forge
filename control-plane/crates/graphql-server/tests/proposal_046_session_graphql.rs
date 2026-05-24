@@ -3160,6 +3160,84 @@ async fn proposal_046_subscription_live_revocation_stops_emissions() {
     );
 }
 
+// ── File-backed principal revocation test ─────────────────────────────────────
+//
+// Verifies that revocation observed via a principals.json file reload is correctly
+// propagated through the P046LivePrincipalHandle mechanism. The daemon's reload loop
+// calls `PrincipalTable::load_or_bootstrap` then `live_handle.update(new_table)` —
+// this test proves that path works end-to-end without spinning up the daemon timer.
+
+#[tokio::test]
+async fn proposal_046_file_backed_principal_revocation_observed_by_live_handle() {
+    use graphql_server::types::session::P046LivePrincipalHandle;
+
+    let dir = tempfile::tempdir().unwrap();
+    let principals_path = dir.path().join("principals.json");
+
+    // Bootstrap the first table (creates the file with a default-operator entry).
+    let table1 = auth::PrincipalTable::load_or_bootstrap(&principals_path).unwrap();
+    let principal_id = "default-operator";
+
+    let live_handle = P046LivePrincipalHandle::new(table1);
+
+    // Confirm the principal is authorized in the initial table.
+    assert!(
+        live_handle.auth_ok(principal_id).await,
+        "default-operator must be authorized before revocation"
+    );
+
+    // Write a new principals.json that REPLACES default-operator with a different id.
+    // We must remove the file first (load_or_bootstrap creates with O_CREAT|O_EXCL),
+    // then write a replacement with 0600 permissions.
+    std::fs::remove_file(&principals_path).unwrap();
+    let revoked_json = r#"{
+        "schema_version": 2,
+        "principals": [{
+            "token": "other-token-revocation-test",
+            "id": "other-operator",
+            "class": "operator",
+            "surface_policies": {
+                "graphql": {
+                    "allow_queries": true,
+                    "allow_subscriptions": true,
+                    "allowed_mutations": ["approveApproval", "rejectApproval"]
+                },
+                "mcp": { "allowed_tools": [] }
+            }
+        }]
+    }"#;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&principals_path)
+            .unwrap();
+        f.write_all(revoked_json.as_bytes()).unwrap();
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&principals_path, revoked_json).unwrap();
+
+    // Simulate daemon reload: load the updated file and update the live handle.
+    let new_table = auth::PrincipalTable::load_or_bootstrap(&principals_path).unwrap();
+    live_handle.update(new_table).await;
+
+    // default-operator must now fail auth (revoked by file update).
+    assert!(
+        !live_handle.auth_ok(principal_id).await,
+        "default-operator must be denied after file-backed revocation"
+    );
+
+    // The replacement principal must pass auth.
+    assert!(
+        live_handle.auth_ok("other-operator").await,
+        "other-operator must be authorized after reload"
+    );
+}
+
 // ── Positive generation_without_lineage health test ───────────────────────────
 //
 // Inserts a session_generation whose lineage_id references a lineage scoped to this run
@@ -3578,5 +3656,59 @@ async fn proposal_046_sdl_first_argument_has_default_value_in_schema() {
         se_first.unwrap()["defaultValue"].as_str(),
         Some("200"),
         "sessionEvents first must have defaultValue=200"
+    );
+}
+
+// ── P046 sensitive-field boundary: raw session identifiers must NOT be in schema ──
+//
+// Verifies that invocationOwnerKey and providerSessionId are NOT exposed on the
+// AgentExecution and AgentExecutionRuntimeFacts GraphQL types. Any regression that
+// adds these fields back would break this test.
+
+async fn type_field_names(schema: &AppSchema, type_name: &str) -> Vec<String> {
+    let query = format!(
+        r#"{{
+          __type(name: "{type_name}") {{
+            fields {{ name }}
+          }}
+        }}"#
+    );
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(resp.errors.is_empty(), "introspection failed: {:?}", resp.errors);
+    let data = resp.data.into_json().unwrap();
+    data["__type"]["fields"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| f["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn proposal_046_agent_execution_schema_excludes_raw_sensitive_fields() {
+    let pool = test_pool().await;
+    let schema = make_schema_with_p046(pool);
+
+    let agent_execution_fields = type_field_names(&schema, "AgentExecution").await;
+    assert!(
+        !agent_execution_fields.contains(&"invocationOwnerKey".to_string()),
+        "AgentExecution must NOT expose invocationOwnerKey (P046 sensitive-field boundary); \
+         fields present: {agent_execution_fields:?}"
+    );
+
+    let runtime_facts_fields = type_field_names(&schema, "AgentExecutionRuntimeFacts").await;
+    assert!(
+        !runtime_facts_fields.contains(&"invocationOwnerKey".to_string()),
+        "AgentExecutionRuntimeFacts must NOT expose invocationOwnerKey (P046 sensitive-field boundary); \
+         fields present: {runtime_facts_fields:?}"
+    );
+    assert!(
+        !runtime_facts_fields.contains(&"providerSessionId".to_string()),
+        "AgentExecutionRuntimeFacts must NOT expose providerSessionId (P046 sensitive-field boundary); \
+         fields present: {runtime_facts_fields:?}"
     );
 }

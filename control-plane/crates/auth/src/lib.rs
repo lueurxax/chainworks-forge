@@ -303,11 +303,24 @@ fn normalize_principal_entries(
 
 // ── Token resolution ────────────────────────────────────────────────────
 
+/// Constant-time byte-slice equality — no early exit, prevents timing oracles.
+/// Runs in O(max(a.len(), b.len())); different lengths always return false.
+fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub fn resolve_bearer(token: &str, table: &PrincipalTable) -> Result<Principal, AuthError> {
     table
         .entries
         .iter()
-        .find(|e| e.token == token)
+        .find(|e| ct_eq_bytes(e.token.as_bytes(), token.as_bytes()))
         .map(Principal::from_entry)
         .ok_or(AuthError::UnknownToken)
 }
@@ -883,6 +896,28 @@ mod tests {
             assert!(!is_tool_allowed(&ag, tool), "Agent should deny {}", tool);
             assert!(!is_tool_allowed(&ob, tool), "Observer should deny {}", tool);
         }
+    }
+
+    #[test]
+    fn ct_eq_bytes_matches_equal_slices() {
+        assert!(ct_eq_bytes(b"tok-abc123", b"tok-abc123"));
+    }
+
+    #[test]
+    fn ct_eq_bytes_rejects_different_tokens() {
+        assert!(!ct_eq_bytes(b"tok-abc123", b"tok-abc124"));
+        assert!(!ct_eq_bytes(b"tok-abc123", b"different"));
+    }
+
+    #[test]
+    fn ct_eq_bytes_rejects_different_lengths() {
+        assert!(!ct_eq_bytes(b"tok-abc", b"tok-abc123"));
+        assert!(!ct_eq_bytes(b"", b"tok"));
+    }
+
+    #[test]
+    fn ct_eq_bytes_accepts_empty_equal_slices() {
+        assert!(ct_eq_bytes(b"", b""));
     }
 
     #[test]
