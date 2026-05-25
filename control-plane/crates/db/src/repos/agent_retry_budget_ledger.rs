@@ -265,6 +265,7 @@ pub async fn consume_early_quota_retry_tx(
 pub async fn active_provider_family_quota_wait(
     pool: &SqlitePool,
     provider_family: &str,
+    model: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Option<ProviderFamilyQuotaWait>> {
     mark_elapsed_provider_quota_waits(pool, now).await?;
@@ -280,12 +281,20 @@ pub async fn active_provider_family_quota_wait(
              AND ledger.retry_after IS NOT NULL
              AND ledger.retry_after > ?2
              AND COALESCE(ae.provider_family, ae.provider) = ?3
+             AND (
+               ae.model IS NULL
+               OR trim(ae.model) = ''
+               OR ?4 IS NULL
+               OR trim(?4) = ''
+               OR lower(ae.model) = lower(?4)
+             )
            ORDER BY ledger.retry_after ASC, ledger.created_at ASC
            LIMIT 1"#,
     )
     .bind(AgentFailureKind::ProviderQuota.to_string())
     .bind(now.to_rfc3339())
     .bind(provider_family)
+    .bind(model)
     .fetch_optional(pool)
     .await?;
 
@@ -297,6 +306,7 @@ pub async fn consume_active_provider_family_quota_for_retry_target(
     pool: &SqlitePool,
     target_stage_execution_id: StageExecutionId,
     provider_family: &str,
+    model: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Option<ProviderFamilyQuotaConsumeResult>> {
     let mut tx = crate::writer::begin_repository_transaction(
@@ -308,6 +318,7 @@ pub async fn consume_active_provider_family_quota_for_retry_target(
         &mut tx,
         target_stage_execution_id,
         provider_family,
+        model,
         now,
     )
     .await?;
@@ -319,6 +330,7 @@ pub async fn consume_active_provider_family_quota_for_retry_target_tx(
     tx: &mut Transaction<'_, Sqlite>,
     target_stage_execution_id: StageExecutionId,
     provider_family: &str,
+    model: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Option<ProviderFamilyQuotaConsumeResult>> {
     let authority = sqlx::query(
@@ -362,12 +374,20 @@ pub async fn consume_active_provider_family_quota_for_retry_target_tx(
              AND agent_execution_id IN (
                SELECT id FROM agent_executions
                WHERE COALESCE(provider_family, provider) = ?4
+                 AND (
+                   model IS NULL
+                   OR trim(model) = ''
+                   OR ?5 IS NULL
+                   OR trim(?5) = ''
+                   OR lower(model) = lower(?5)
+                 )
              )"#,
     )
     .bind(&source_command_journal_id)
     .bind(now.to_rfc3339())
     .bind(AgentFailureKind::ProviderQuota.to_string())
     .bind(provider_family)
+    .bind(model)
     .execute(&mut **tx)
     .await?
     .rows_affected();

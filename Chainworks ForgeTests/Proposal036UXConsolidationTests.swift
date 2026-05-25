@@ -1521,6 +1521,146 @@ final class Proposal036UXConsolidationTests: XCTestCase {
         XCTAssertEqual(stage?.transitions.first?.toLabel, "Proposal reviewed")
     }
 
+    func testWorkbenchStagesTopologyUsesBranchTracksWithoutDroppingWorkflowComplete() throws {
+        let model = RunsWorkbenchPresentationModel()
+        let stages = [
+            makeStageTopologyNode(1, "state_1_idea_received", "Idea received", transitions: ["state_2_proposal_drafted"]),
+            makeStageTopologyNode(2, "state_2_proposal_drafted", "Proposal drafted", transitions: ["state_3_initial_proposal_approval"]),
+            makeStageTopologyNode(3, "state_3_initial_proposal_approval", "Human approval: initial proposal", transitions: ["state_4_proposal_reviewed"]),
+            makeStageTopologyNode(4, "state_4_proposal_reviewed", "Proposal reviewed", transitions: ["state_6_implementation_approval", "state_5_proposal_refined"]),
+            makeStageTopologyNode(5, "state_5_proposal_refined", "Proposal refined", transitions: ["state_4_proposal_reviewed"]),
+            makeStageTopologyNode(6, "state_6_implementation_approval", "Human approval: implementation", transitions: ["state_7_implementation_started", "state_5_proposal_refined"]),
+            makeStageTopologyNode(7, "state_7_implementation_started", "Implementation started", transitions: ["state_9_implementation_reviewed", "state_8_implementation_continued"]),
+            makeStageTopologyNode(8, "state_8_implementation_continued", "Implementation continued until code work resolved", transitions: ["state_9_implementation_reviewed", "state_8_implementation_continued"]),
+            makeStageTopologyNode(9, "state_9_implementation_reviewed", "Implementation reviewed against proposal", transitions: ["state_11_manual_release", "state_10_implementation_refined"]),
+            makeStageTopologyNode(10, "state_10_implementation_refined", "Implementation refined", isCurrent: true, transitions: ["state_9_implementation_reviewed"]),
+            makeStageTopologyNode(11, "state_11_manual_release", "Manual release", transitions: ["state_12_workflow_complete"]),
+            makeStageTopologyNode(12, "state_12_workflow_complete", "Workflow complete", transitions: ["state_12_workflow_complete"])
+        ]
+
+        model.populate(from: makeRunDetail(stageTopology: stages))
+
+        let map = try XCTUnwrap(model.stageMap)
+        XCTAssertEqual(map.stages.map(\.id), stages.map(\.stageID))
+        XCTAssertEqual(map.layoutColumns.last?.title, "Terminal")
+        XCTAssertEqual(map.layoutColumns.last?.slots.first?.stage?.id, "state_12_workflow_complete")
+
+        let workLoop = try XCTUnwrap(map.layoutColumns.first { $0.title == "Implementation work loop" })
+        XCTAssertEqual(workLoop.slots.map(\.kind), [.stage, .bridge])
+        XCTAssertEqual(workLoop.slots.first?.stage?.id, "state_8_implementation_continued")
+        XCTAssertEqual(workLoop.slots.last?.bridgeLabel, "Review gate")
+
+        let reviewGate = try XCTUnwrap(map.layoutColumns.first { $0.title == "Review gate" })
+        XCTAssertEqual(reviewGate.slots.first?.stage?.id, "state_9_implementation_reviewed")
+        XCTAssertEqual(reviewGate.slots.first?.heightUnits, 2)
+
+        let implementationConnectors = try XCTUnwrap(
+            map.connectorColumns.first { $0.id == "connector-implementation-start" }
+        )
+        XCTAssertEqual(implementationConnectors.connectors.map(\.style), [.primary, .hidden])
+
+        let workLoopConnectors = try XCTUnwrap(
+            map.connectorColumns.first { $0.id == "connector-implementation-work-loop" }
+        )
+        XCTAssertEqual(workLoopConnectors.connectors.map(\.style), [.primary, .hidden])
+    }
+
+    private func makeStageTopologyNode(
+        _ ordinal: Int,
+        _ stageID: String,
+        _ title: String,
+        isCurrent: Bool = false,
+        transitions: [String]
+    ) -> P031StageTopologyPresentation {
+        P031StageTopologyPresentation(
+            stageID: stageID,
+            ordinal: ordinal,
+            title: title,
+            ownerAgentID: ownerAgentID(for: stageID),
+            ownerAgentTitle: ownerAgentTitle(for: stageID),
+            status: isCurrent ? "running" : "completed",
+            statusText: isCurrent ? "Running" : "Completed",
+            isCurrent: isCurrent,
+            iterationText: nil,
+            attemptText: "Attempt 1",
+            approvalRequired: stageID.contains("approval") || stageID.contains("manual_release"),
+            artifactCount: ordinal == 12 ? 1 : 0,
+            communicationCount: 0,
+            occurrences: [],
+            transitions: transitions.map { targetID in
+                P031StageTopologyTransitionPresentation(
+                    toStageID: targetID,
+                    toLabel: stageTitle(for: targetID),
+                    detail: nil
+                )
+            }
+        )
+    }
+
+    private func makeRunDetail(stageTopology: [P031StageTopologyPresentation]) -> P031RunDetailPresentation {
+        P031RunDetailPresentation(
+            title: "Run",
+            workflowLabel: "Full MVP Live",
+            statusLabel: "Running",
+            progressLabel: nil,
+            pendingApprovalsLabel: nil,
+            rolloutDecisionSummary: nil,
+            ideaContext: nil,
+            stageTransitions: [],
+            stageTopology: stageTopology,
+            approvalRows: [],
+            artifactRows: [],
+            artifactViewerRows: [],
+            reportRows: [],
+            catalogContext: nil,
+            closeoutReadiness: nil,
+            implementationCompletion: nil,
+            sideEffectReadback: nil,
+            freshness: P031FreshnessSnapshot(state: .live),
+            refreshFeedbackText: "Live",
+            emptyStateTitle: nil,
+            errorDescription: nil,
+            rawStatus: "running",
+            failedStages: 0
+        )
+    }
+
+    private func ownerAgentID(for stageID: String) -> String {
+        if stageID.contains("implementation_continued")
+            || stageID.contains("implementation_refined") {
+            return "code_writer"
+        }
+        if stageID.contains("proposal_drafted") || stageID.contains("proposal_refined") {
+            return "proposal_writer"
+        }
+        return "lead_orchestrator"
+    }
+
+    private func ownerAgentTitle(for stageID: String) -> String {
+        switch ownerAgentID(for: stageID) {
+        case "code_writer": return "Code Writer"
+        case "proposal_writer": return "Proposal Writer"
+        default: return "Lead Orchestrator"
+        }
+    }
+
+    private func stageTitle(for stageID: String) -> String {
+        [
+            "state_1_idea_received": "Idea received",
+            "state_2_proposal_drafted": "Proposal drafted",
+            "state_3_initial_proposal_approval": "Human approval: initial proposal",
+            "state_4_proposal_reviewed": "Proposal reviewed",
+            "state_5_proposal_refined": "Proposal refined",
+            "state_6_implementation_approval": "Human approval: implementation",
+            "state_7_implementation_started": "Implementation started",
+            "state_8_implementation_continued": "Implementation continued until code work resolved",
+            "state_9_implementation_reviewed": "Implementation reviewed against proposal",
+            "state_10_implementation_refined": "Implementation refined",
+            "state_11_manual_release": "Manual release",
+            "state_12_workflow_complete": "Workflow complete"
+        ][stageID] ?? stageID
+    }
+
     @MainActor
     func testWorkbenchTimelineUsesActiveDaemonAgentExecutions() {
         let model = RunsWorkbenchPresentationModel()

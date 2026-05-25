@@ -433,6 +433,15 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
 
     struct StageMap: Equatable {
         let stages: [StageCard]
+        let layoutColumns: [StageTopologyColumn]
+        let connectorColumns: [StageTopologyConnectorColumn]
+
+        init(stages: [StageCard]) {
+            self.stages = stages
+            let layout = StageTopologyLayoutBuilder.layout(for: stages)
+            self.layoutColumns = layout.columns
+            self.connectorColumns = layout.connectors
+        }
     }
 
     struct StageCard: Identifiable, Equatable {
@@ -457,6 +466,62 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         let transitions: [StageTransition]
     }
 
+    struct StageTopologyColumn: Identifiable, Equatable {
+        let id: String
+        let title: String
+        let slots: [StageTopologySlot]
+    }
+
+    struct StageTopologySlot: Identifiable, Equatable {
+        enum Kind: Equatable {
+            case stage
+            case bridge
+        }
+
+        let id: String
+        let kind: Kind
+        let stage: StageCard?
+        let bridgeLabel: String?
+        let heightUnits: Int
+
+        static func stage(_ stage: StageCard, heightUnits: Int = 1) -> StageTopologySlot {
+            StageTopologySlot(
+                id: "slot-\(stage.id)",
+                kind: .stage,
+                stage: stage,
+                bridgeLabel: nil,
+                heightUnits: max(1, heightUnits)
+            )
+        }
+
+        static func bridge(id: String, label: String, heightUnits: Int = 1) -> StageTopologySlot {
+            StageTopologySlot(
+                id: id,
+                kind: .bridge,
+                stage: nil,
+                bridgeLabel: label,
+                heightUnits: max(1, heightUnits)
+            )
+        }
+    }
+
+    struct StageTopologyConnectorColumn: Identifiable, Equatable {
+        let id: String
+        let connectors: [StageTopologyConnector]
+    }
+
+    struct StageTopologyConnector: Identifiable, Equatable {
+        enum Style: Equatable {
+            case primary
+            case retry
+            case manual
+            case hidden
+        }
+
+        let id: String
+        let style: Style
+    }
+
     struct StageOccurrence: Identifiable, Equatable {
         let id: String
         let agentTitle: String
@@ -470,6 +535,125 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         let id: String
         let toLabel: String
         let detail: String?
+    }
+
+    private struct StageTopologyLayoutBuilder {
+        struct Layout {
+            let columns: [StageTopologyColumn]
+            let connectors: [StageTopologyConnectorColumn]
+        }
+
+        private static let fullMVPOrder = [
+            "state_1_idea_received",
+            "state_2_proposal_drafted",
+            "state_3_initial_proposal_approval",
+            "state_4_proposal_reviewed",
+            "state_5_proposal_refined",
+            "state_6_implementation_approval",
+            "state_7_implementation_started",
+            "state_8_implementation_continued",
+            "state_9_implementation_reviewed",
+            "state_10_implementation_refined",
+            "state_11_manual_release",
+            "state_12_workflow_complete"
+        ]
+
+        static func layout(for stages: [StageCard]) -> Layout {
+            let byID = Dictionary(uniqueKeysWithValues: stages.map { ($0.id, $0) })
+            if fullMVPOrder.allSatisfy({ byID[$0] != nil }) {
+                return fullMVPLayout(byID: byID)
+            }
+            return sequentialLayout(for: stages)
+        }
+
+        private static func fullMVPLayout(byID: [String: StageCard]) -> Layout {
+            func stage(_ id: String, heightUnits: Int = 1) -> StageTopologySlot {
+                StageTopologySlot.stage(byID[id]!, heightUnits: heightUnits)
+            }
+            func column(_ id: String, _ title: String, _ slots: [StageTopologySlot]) -> StageTopologyColumn {
+                StageTopologyColumn(id: "column-\(id)", title: title, slots: slots)
+            }
+            func connector(
+                _ id: String,
+                _ styles: [StageTopologyConnector.Style]
+            ) -> StageTopologyConnectorColumn {
+                StageTopologyConnectorColumn(
+                    id: "connector-\(id)",
+                    connectors: styles.enumerated().map { index, style in
+                        StageTopologyConnector(id: "connector-\(id)-\(index)", style: style)
+                    }
+                )
+            }
+
+            let columns = [
+                column("intake", "Intake", [
+                    stage("state_1_idea_received")
+                ]),
+                column("draft", "Draft", [
+                    stage("state_2_proposal_drafted")
+                ]),
+                column("approval", "Approval", [
+                    stage("state_3_initial_proposal_approval")
+                ]),
+                column("proposal-review-loop", "Proposal review loop", [
+                    stage("state_4_proposal_reviewed", heightUnits: 2)
+                ]),
+                column("unique-targets", "Unique targets", [
+                    stage("state_6_implementation_approval"),
+                    stage("state_5_proposal_refined")
+                ]),
+                column("implementation-start", "Implementation start", [
+                    stage("state_7_implementation_started", heightUnits: 2)
+                ]),
+                column("implementation-work-loop", "Implementation work loop", [
+                    stage("state_8_implementation_continued"),
+                    .bridge(id: "bridge-implementation-review-gate", label: "Review gate")
+                ]),
+                column("review-gate", "Review gate", [
+                    stage("state_9_implementation_reviewed", heightUnits: 2)
+                ]),
+                column("closeout-branch", "Closeout branch", [
+                    stage("state_10_implementation_refined"),
+                    stage("state_11_manual_release")
+                ]),
+                column("terminal", "Terminal", [
+                    stage("state_12_workflow_complete")
+                ])
+            ]
+
+            let connectors = [
+                connector("intake", [.primary]),
+                connector("draft", [.primary]),
+                connector("approval", [.primary]),
+                connector("proposal-review-loop", [.primary, .retry]),
+                connector("unique-targets", [.primary, .hidden]),
+                connector("implementation-start", [.primary, .hidden]),
+                connector("implementation-work-loop", [.primary, .hidden]),
+                connector("review-gate", [.retry, .manual]),
+                connector("closeout-branch", [.hidden, .primary])
+            ]
+
+            return Layout(columns: columns, connectors: connectors)
+        }
+
+        private static func sequentialLayout(for stages: [StageCard]) -> Layout {
+            let columns = stages.map { stage in
+                StageTopologyColumn(
+                    id: "column-\(stage.id)",
+                    title: "Stage \(stage.ordinal)",
+                    slots: [.stage(stage)]
+                )
+            }
+            let connectors = stages.dropLast().map { stage in
+                StageTopologyConnectorColumn(
+                    id: "connector-\(stage.id)",
+                    connectors: [
+                        StageTopologyConnector(id: "connector-\(stage.id)-primary", style: .primary)
+                    ]
+                )
+            }
+            return Layout(columns: columns, connectors: connectors)
+        }
     }
 
     struct ApprovalRow: Identifiable, Equatable {

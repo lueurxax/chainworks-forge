@@ -1027,9 +1027,20 @@ async fn provider_quota_wait_blocks_same_provider_family_claim_only() {
     .unwrap();
 
     let now = Utc::now();
-    for (id, provider) in [
-        ("gemini-invoke-held", "gemini"),
-        ("codex-invoke-allowed", "codex_acp"),
+    for (id, provider, model, scheduled_at) in [
+        (
+            "gemini-different-model-allowed",
+            "gemini",
+            "other-test-model",
+            now - Duration::seconds(2),
+        ),
+        (
+            "gemini-invoke-held",
+            "gemini",
+            "gemini-3.1-pro-preview",
+            now - Duration::seconds(1),
+        ),
+        ("codex-invoke-allowed", "codex_acp", "test-model", now),
     ] {
         work_items::enqueue(
             &pool,
@@ -1041,7 +1052,7 @@ async fn provider_quota_wait_blocks_same_provider_family_claim_only() {
                     "stage_execution_id": stage_execution_id.to_string(),
                     "agent_id": id,
                     "provider": provider,
-                    "model": "test-model",
+                    "model": model,
                     "prompt": "run",
                     "task_name": id,
                     "task_inputs": ["input"],
@@ -1057,7 +1068,7 @@ async fn provider_quota_wait_blocks_same_provider_family_claim_only() {
                 run_id: Some(run_id),
                 stage_id: Some("implementation".into()),
                 created_at: now,
-                scheduled_at: now,
+                scheduled_at,
                 attempt_count: 0,
                 last_error: None,
             },
@@ -1065,6 +1076,15 @@ async fn provider_quota_wait_blocks_same_provider_family_claim_only() {
         .await
         .unwrap();
     }
+
+    let claimed_different_model = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("same provider family on a different model should still claim");
+    assert_eq!(
+        claimed_different_model.source_work_item_id,
+        "gemini-different-model-allowed"
+    );
 
     let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
         .await

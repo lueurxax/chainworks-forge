@@ -473,8 +473,9 @@ async fn invoke_item_has_start_capacity(
     }
     let provider_family =
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
+    let model = payload.get("model").and_then(|value| value.as_str());
     if let Some(wait) =
-        provider_quota_retry_wait_active(pool, &provider_family, chrono::Utc::now()).await?
+        provider_quota_retry_wait_active(pool, &provider_family, model, chrono::Utc::now()).await?
     {
         let stage_execution_id = payload
             .get("stage_execution_id")
@@ -486,6 +487,7 @@ async fn invoke_item_has_start_capacity(
                     pool,
                     stage_execution_id,
                     &provider_family,
+                    model,
                     chrono::Utc::now(),
                 )
                 .await?
@@ -577,9 +579,11 @@ async fn invoke_item_has_start_capacity(
 async fn provider_quota_retry_wait_active(
     pool: &SqlitePool,
     provider_family: &str,
+    model: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<agent_retry_budget_ledger::ProviderFamilyQuotaWait>> {
-    agent_retry_budget_ledger::active_provider_family_quota_wait(pool, provider_family, now).await
+    agent_retry_budget_ledger::active_provider_family_quota_wait(pool, provider_family, model, now)
+        .await
 }
 
 async fn record_provider_quota_wait_on_pending_item(

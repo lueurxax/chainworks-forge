@@ -2801,7 +2801,8 @@ impl Orchestrator {
             if same_provider_family_for_health_fallback(&source_provider, provider) {
                 return Ok(None);
             }
-            if provider_family_quota_wait_active(&self.pool, provider).await? {
+            let candidate_model = profile.get("model").and_then(serde_json::Value::as_str);
+            if provider_family_quota_wait_active(&self.pool, provider, candidate_model).await? {
                 warn!(
                     run_id = %run_id,
                     agent_id = %agent.agent_id,
@@ -2897,7 +2898,8 @@ impl Orchestrator {
             if provider == agent.provider {
                 continue;
             }
-            if provider_family_quota_wait_active(&self.pool, provider).await? {
+            let candidate_model = profile.get("model").and_then(serde_json::Value::as_str);
+            if provider_family_quota_wait_active(&self.pool, provider, candidate_model).await? {
                 warn!(
                     run_id = %run_id,
                     agent_id = %agent.agent_id,
@@ -3089,7 +3091,10 @@ impl Orchestrator {
                 if same_provider_family_for_health_fallback(&source_provider, fallback_provider) {
                     continue;
                 }
-                if provider_family_quota_wait_active(&self.pool, fallback_provider).await? {
+                let fallback_model = profile.get("model").and_then(serde_json::Value::as_str);
+                if provider_family_quota_wait_active(&self.pool, fallback_provider, fallback_model)
+                    .await?
+                {
                     warn!(
                         run_id = %run_id,
                         stage_id = %stage.stage_id,
@@ -6626,12 +6631,17 @@ fn provider_family_for_health_fallback(provider: &str) -> &str {
     }
 }
 
-async fn provider_family_quota_wait_active(pool: &SqlitePool, provider: &str) -> Result<bool> {
+async fn provider_family_quota_wait_active(
+    pool: &SqlitePool,
+    provider: &str,
+    model: Option<&str>,
+) -> Result<bool> {
     let provider_family = provider_family_for_health_fallback(provider);
     Ok(
         agent_retry_budget_ledger::active_provider_family_quota_wait(
             pool,
             provider_family,
+            model,
             Utc::now(),
         )
         .await?

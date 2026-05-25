@@ -5431,15 +5431,13 @@ private struct P036StageMapCard: View {
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(alignment: .top, spacing: 10) {
-                        ForEach(Array(map.stages.enumerated()), id: \.element.id) { index, stage in
-                            if index > 0 {
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(ForgeColor.Text.tertiary)
-                                    .frame(width: 18, height: 164)
-                                    .accessibilityHidden(true)
+                        ForEach(Array(map.layoutColumns.enumerated()), id: \.element.id) { index, column in
+                            P036StageTopologyColumnView(column: column)
+                            if index < map.connectorColumns.count {
+                                P036StageTopologyConnectorColumnView(
+                                    column: map.connectorColumns[index]
+                                )
                             }
-                            P036StageTopologyCard(stage: stage)
                         }
                     }
                     .padding(.vertical, 2)
@@ -5451,8 +5449,147 @@ private struct P036StageMapCard: View {
     }
 }
 
+private enum P036StageTopologyMetrics {
+    static let cardWidth: CGFloat = 292
+    static let cardHeight: CGFloat = 210
+    static let cardGap: CGFloat = 12
+    static let columnHeaderHeight: CGFloat = 22
+    static let connectorWidth: CGFloat = 34
+
+    static func slotHeight(units: Int) -> CGFloat {
+        let safeUnits = max(1, units)
+        return CGFloat(safeUnits) * cardHeight + CGFloat(safeUnits - 1) * cardGap
+    }
+}
+
+private struct P036StageTopologyColumnView: View {
+    let column: RunsWorkbenchPresentationModel.StageTopologyColumn
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: P036StageTopologyMetrics.cardGap) {
+            Text(column.title.uppercased())
+                .font(ForgeTypography.micro.weight(.semibold))
+                .foregroundStyle(ForgeColor.Text.tertiary)
+                .lineLimit(1)
+                .frame(
+                    width: P036StageTopologyMetrics.cardWidth,
+                    height: P036StageTopologyMetrics.columnHeaderHeight,
+                    alignment: .leading
+                )
+
+            ForEach(column.slots) { slot in
+                switch slot.kind {
+                case .stage:
+                    if let stage = slot.stage {
+                        P036StageTopologyCard(stage: stage, heightUnits: slot.heightUnits)
+                    }
+                case .bridge:
+                    P036StageTopologyBridgeLane(
+                        label: slot.bridgeLabel ?? "Transition",
+                        heightUnits: slot.heightUnits
+                    )
+                }
+            }
+        }
+    }
+}
+
+private struct P036StageTopologyConnectorColumnView: View {
+    let column: RunsWorkbenchPresentationModel.StageTopologyConnectorColumn
+
+    var body: some View {
+        VStack(spacing: P036StageTopologyMetrics.cardGap) {
+            Color.clear
+                .frame(
+                    width: P036StageTopologyMetrics.connectorWidth,
+                    height: P036StageTopologyMetrics.columnHeaderHeight
+                )
+
+            ForEach(column.connectors) { connector in
+                P036StageTopologyConnectorView(style: connector.style)
+                    .frame(
+                        width: P036StageTopologyMetrics.connectorWidth,
+                        height: P036StageTopologyMetrics.cardHeight
+                    )
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+private struct P036StageTopologyConnectorView: View {
+    let style: RunsWorkbenchPresentationModel.StageTopologyConnector.Style
+
+    var body: some View {
+        Group {
+            switch style {
+            case .primary:
+                connector(symbol: "arrow.right", tint: ForgeStatusColor.running)
+            case .retry:
+                connector(symbol: "arrow.uturn.left", tint: ForgeStatusColor.error)
+            case .manual:
+                connector(symbol: "arrow.right", tint: ForgeStatusColor.warning)
+            case .hidden:
+                Color.clear
+            }
+        }
+    }
+
+    private func connector(symbol: String, tint: Color) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(tint)
+            .frame(width: 30, height: 30)
+            .background(tint.opacity(0.12), in: Circle())
+            .overlay {
+                Circle().strokeBorder(tint.opacity(0.45), lineWidth: 1)
+            }
+    }
+}
+
+private struct P036StageTopologyBridgeLane: View {
+    let label: String
+    let heightUnits: Int
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Spacer()
+            Image(systemName: "arrow.right")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(ForgeStatusColor.running)
+                .frame(width: 42, height: 42)
+                .background(ForgeStatusColor.running.opacity(0.12), in: Circle())
+                .overlay {
+                    Circle().strokeBorder(ForgeStatusColor.running.opacity(0.4), lineWidth: 1)
+                }
+            Text(label.uppercased())
+                .font(ForgeTypography.micro.weight(.semibold))
+                .foregroundStyle(ForgeColor.Text.tertiary)
+                .lineLimit(1)
+            Spacer()
+        }
+        .frame(
+            width: P036StageTopologyMetrics.cardWidth,
+            height: P036StageTopologyMetrics.slotHeight(units: heightUnits)
+        )
+        .background(ForgeColor.Surface.elevated.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                .foregroundStyle(ForgeColor.Surface.border.opacity(0.7))
+        }
+        .accessibilityLabel("\(label) transition lane")
+    }
+}
+
 private struct P036StageTopologyCard: View {
     let stage: RunsWorkbenchPresentationModel.StageCard
+    let heightUnits: Int
+
+    init(stage: RunsWorkbenchPresentationModel.StageCard, heightUnits: Int = 1) {
+        self.stage = stage
+        self.heightUnits = heightUnits
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -5524,8 +5661,11 @@ private struct P036StageTopologyCard: View {
                 }
             }
         }
-        .frame(width: 272, alignment: .topLeading)
-        .frame(minHeight: 164, alignment: .topLeading)
+        .frame(
+            width: P036StageTopologyMetrics.cardWidth,
+            height: P036StageTopologyMetrics.slotHeight(units: heightUnits),
+            alignment: .topLeading
+        )
         .padding(12)
         .background(
             RoundedRectangle(cornerRadius: 8)

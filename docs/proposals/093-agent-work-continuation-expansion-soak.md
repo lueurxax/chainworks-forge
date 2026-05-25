@@ -5,8 +5,8 @@
 | Date | 2026-05-19 |
 | Status | Draft |
 | Author | Operator-directed split from agent work continuation implementation |
-| Depends on | Implemented agent work continuation contract in [`docs/reference/agent-work-continuation.md`](../reference/agent-work-continuation.md), validated and enabled without hold trips |
-| Related | Agent work continuation and lead-directed same-session resumption in [`docs/reference/agent-work-continuation.md`](../reference/agent-work-continuation.md) |
+| Depends on | Implemented live-handle continuation contract in [`docs/reference/agent-work-continuation.md`](../reference/agent-work-continuation.md), plus completion of [`Proposal 086: Provider Session Resurrection Completion`](086-agent-work-continuation-and-lead-directed-session-resumption.md) before resurrection-specific soak evidence is counted |
+| Related | Agent work continuation readback in [`docs/reference/agent-work-continuation.md`](../reference/agent-work-continuation.md), P086 provider-session resurrection completion |
 | Scope | Own expansion after the implemented continuation contract: 14-day no-hold soak, SLO-budget validation, and at least 100 successful continuations across 30 runs. |
 | Non-goal | Do not change the implemented phases 1-4 continuation contract. |
 
@@ -23,12 +23,16 @@ produced by more refinement cycles alone.
 
 Track expansion and soak as a separate follow-up proposal.
 
-The stable continuation contract already owns:
+The stable continuation baseline already owns:
 
 1. read-only continuation status/candidates and parity evidence;
 2. operator MCP live-handle continuation command path;
 3. lead-auto continuation hardening and enablement gates;
-4. provider-session resurrection per adapter with orphan-reap and attach-receipt evidence.
+
+Provider-session resurrection per adapter is not implemented by the baseline.
+It is active P086 scope. P093 may only count resurrection-specific soak or scale
+evidence after P086 implements a supported adapter path and its attach/orphan
+evidence.
 
 Proposal 093 owns only post-implementation expansion.
 

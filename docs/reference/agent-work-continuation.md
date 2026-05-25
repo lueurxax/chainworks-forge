@@ -2,7 +2,7 @@
 
 This document is the canonical contract for server-owned agent work continuation: MCP admission commands, read-only GraphQL/macOS readback, durable SQLite state, continuation evidence artifacts, lead-directed continuation, and provider-session continuity behavior.
 
-`P086`, `proposal-086`, `p086-continuation-*`, and `docs/reference/p086/schemas/` remain as retained historical aliases for gates, evidence, migration names, and schema paths. They are not active proposal dependencies.
+`P086`, `proposal-086`, `p086-continuation-*`, and `docs/reference/p086/schemas/` remain as retained historical aliases for the implemented live-handle continuation baseline, gates, evidence, migration names, and schema paths. The active P086 proposal now owns only the remaining provider-session resurrection completion work.
 
 ## Overview
 
@@ -107,4 +107,4 @@ Operator UI readback is passive. The Swift P031 run-detail query reads `continua
 
 Provider-specific resurrection enablement remains gated per adapter until that adapter can attach/resume by provider session id. Unsupported provider-session resurrection remains an explicit fail-closed mode rather than a fallback to fresh retry, and unsupported attempts are counted in the durable continuation metric table.
 
-Expansion/soak validation (14-day no-hold window, SLO-budget validation, 100 continuations across 30 runs) is intentionally tracked by [Proposal 093](../proposals/093-agent-work-continuation-expansion-soak.md) and depends on this implemented contract.
+Expansion/soak validation (14-day no-hold window, SLO-budget validation, 100 continuations across 30 runs) is intentionally tracked by [Proposal 093](../proposals/093-agent-work-continuation-expansion-soak.md). Resurrection-specific soak evidence depends on completing the active P086 provider-session resurrection proposal first.

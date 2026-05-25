@@ -88,10 +88,7 @@ fn auto_retry_latest_with_paths(params: Value, paths: P076Paths) -> Value {
                             diagnostic(
                                 "artifact_read_degraded",
                                 "error",
-                                format!(
-                                    "ledger parse failed at line {}: {error}",
-                                    idx + 1
-                                ),
+                                format!("ledger parse failed at line {}: {error}", idx + 1),
                                 Some(paths.ledger_path.to_string_lossy().as_ref()),
                             ),
                         );
@@ -383,16 +380,11 @@ mod tests {
         )
         .unwrap();
 
-        let payload = auto_retry_latest_with_paths(
-            json!({"run_id": "run-1"}),
-            test_paths(automation),
-        );
+        let payload =
+            auto_retry_latest_with_paths(json!({"run_id": "run-1"}), test_paths(automation));
 
         assert_eq!(payload["observations"][0]["run_id"], "run-1");
-        assert_eq!(
-            payload["diagnostics"][0]["code"],
-            "partial_trailing_record"
-        );
+        assert_eq!(payload["diagnostics"][0]["code"], "partial_trailing_record");
         assert_eq!(payload["diagnostics"][0]["severity"], "warning");
     }
 
@@ -413,10 +405,8 @@ mod tests {
         )
         .unwrap();
 
-        let payload = auto_retry_latest_with_paths(
-            json!({"run_id": "run-1"}),
-            test_paths(automation),
-        );
+        let payload =
+            auto_retry_latest_with_paths(json!({"run_id": "run-1"}), test_paths(automation));
 
         assert_eq!(payload["diagnostics"][0]["code"], "artifact_read_degraded");
         assert_eq!(payload["diagnostics"][0]["severity"], "error");

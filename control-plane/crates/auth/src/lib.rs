@@ -1103,10 +1103,9 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::AgentsContinueWork => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Agent)
         }
-        CapabilityToolId::AutomationAutoRetryLatest => matches!(
-            class,
-            PrincipalClass::Operator | PrincipalClass::Observer
-        ),
+        CapabilityToolId::AutomationAutoRetryLatest => {
+            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+        }
     }
 }
 
