@@ -1867,6 +1867,7 @@ async fn test_resolve_approval_rejects_mismatched_command_provenance() {
                 rationale: Some("mismatch should fail".into()),
                 run_id: other_run_id,
                 stage_id: "gated_stage".into(),
+                idempotency_key: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1920,6 +1921,7 @@ async fn test_resolve_approval_rejection_matches_reject_stage_semantics() {
                 rationale: Some("not ready".into()),
                 run_id,
                 stage_id: "gated_stage".into(),
+                idempotency_key: None,
             }),
             CallerContext::test_fixture(),
         )
@@ -1984,6 +1986,7 @@ async fn test_resolve_approval_rejects_manual_release_to_implementation_refineme
                 rationale: Some("implementation review still has code fixes".into()),
                 run_id,
                 stage_id: "state_11_manual_release".into(),
+                idempotency_key: None,
             }),
             CallerContext::mcp(
                 "operator-test",
@@ -2292,6 +2295,11 @@ async fn workflow_conflict_resolution_extends_loop_budget_atomically() {
                 principal_class: PrincipalClass::Operator,
                 caller_tool: "workflow_conflicts.resolve".into(),
                 request_id: None,
+                caller_class: None,
+                token_id: None,
+                mcp_idempotency_key: None,
+                mcp_idempotency_request_hash: None,
+                boundary_row_id: None,
             },
         )
         .await

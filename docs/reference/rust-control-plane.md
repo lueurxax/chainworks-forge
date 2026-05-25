@@ -106,10 +106,29 @@ domain  <--  db  <--  workflow
 ## Boundary shape
 
 The daemon exposes two northbound surfaces on a single port (default `0.0.0.0:4000`).
-Both surfaces are authenticated with bearer tokens (P029) and filter their
-visible area by the caller's principal class. See
+Both surfaces are authenticated with bearer tokens (P029) and filter their visible
+area by the caller's principal class. See
 [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md)
-for the full authentication and capability filtering reference.
+for the implemented authentication and capability filtering reference.
+
+P081 implements a boundary-first authorization contract that routes decisions
+through a shared `BoundaryPolicy` keyed on a server-derived `CallerClass`. The
+boundary matrix, executable fixture, validator, audit-log storage, `CallerClass`
+enum, and principal-table `schema_version 3` reader have landed. The
+daemon-injected `BoundaryPolicy` is wired into the `CommandHandler`, GraphQL
+query/subscription/mutation paths, and MCP `initialize`/`tools/list`/`tools/call`
+paths with mode-aware semantics (`shadow`, `enforce`, `read_only_safe_mode`,
+`legacy_compat`), and `command_journal.caller_class` is populated by the shared
+decision path. `approval_mutation_idempotency` backs the
+`approveApproval`/`rejectApproval` retry contract, while
+`mcp_command_idempotency` plus dispatcher enforcement governs state-changing MCP
+tools (require `idempotency_key`, replay cached result on duplicate hash,
+`IDEMPOTENCY_CONFLICT` on hash mismatch, reject `idempotency_key` on read-only
+tools). Bounded readback includes `boundaryRuntime`, GraphQL `operatorAlerts`,
+MCP `boundary.runtime.get` / `operator.alerts.list`, principal-file hardening,
+typed Swift `extensions.redactions` preservation, and redaction accessibility
+state tests; production mode selection remains governed by the rollout-mode and
+fixture rules in [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md).
 
 ### GraphQL
 
@@ -514,12 +533,10 @@ remaining byte budget is skipped without being read and truncates the pass.
 `storage.reconcile_evidence_orphans` exposes the sweep through MCP with camelCase
 `runId`, `dryRun`, and `maxFiles` parameters. `runId` is required for non-dry-run calls
 so recovered metadata is bound to a real run, and `artifact_root` is resolved
-server-side from `CHAINWORKS_META_ROOT` or the `DATABASE_URL` parent rather than from
-client-supplied paths.
-
-GraphQL `storageHealth` returns a typed `StorageHealth` SDL
+server-side from `CHAINWORKS_META_ROOT` or the `DATABASE_URL` parent rather than
+accepted from the client. GraphQL `storageHealth` returns a typed `StorageHealth` SDL
 object (`writer`, `wal`, `projections`, `evidenceSpool`, `killSwitches`, `thresholds`, `projectionFreshness`, `projectionFreshnessBySource`,
-  plus `updatedAt`/`staleAfterMs`/`isStale`) instead of an opaque JSON blob, with
+plus `updatedAt`/`staleAfterMs`/`isStale`) instead of an opaque JSON blob, with
 fail-closed defaults that map an absent or unrecognised `dbState` to `DEGRADED`,
 absent `writer.alive` to `false`, and no live writer heartbeat to stale/degraded
 readback. MCP storage diagnostics return typed error envelopes for `invalid_input`,
@@ -609,7 +626,7 @@ queue-wait latency.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`, `068_p081_audit_log.sql`, `069_p081_audit_log_checkpoints.sql`, `070_p081_caller_class.sql`, `071_p081_approval_idempotency.sql`, `072_p081_fix_payload_length_check.sql`, `073_p081_approval_idempotency_request_hash.sql`, `074_p081_mcp_command_idempotency.sql`, `075_p081_command_journal_idempotency.sql`):
 
 | Table | Purpose |
 |---|---|
@@ -638,6 +655,10 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `artifacts` | Artifact metadata (file path, format, checksum, provider, report kind) |
 | `work_items` | Internal work queue (kind, payload, status, attempts, errors) |
 | `command_journal` | Audit trail for mutating commands (type, payload, result, errors, caller metadata) |
+| `audit_log` | P081: Hash-chained durable audit evidence for boundary decisions (allow, deny, redaction, idempotency) |
+| `audit_log_checkpoints` | P081: Periodic checkpoint windows over `audit_log` for integrity verification and retention |
+| `approval_mutation_idempotency` | P081 Phase 5: Backing store for `approveApproval` / `rejectApproval` retry contract (one record per `idempotency_key` with 7-day retention) |
+| `mcp_command_idempotency` | P081: Backing store for state-changing MCP tool retry contract (one record per `idempotency_key` with 7-day retention; canonical request hash distinguishes replay from `IDEMPOTENCY_CONFLICT`) |
 
 **AgentExecution Owner Migration:**
 To support lead-mediated conflicts without synthetic stage states, `agent_executions`

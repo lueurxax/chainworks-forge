@@ -272,6 +272,7 @@ Implemented-system references:
 - [`docs/reference/mvp-sign-off.md`](docs/reference/mvp-sign-off.md)
 - [`docs/reference/test-gates.md`](docs/reference/test-gates.md)
 - [`docs/reference/agent-work-continuation.md`](docs/reference/agent-work-continuation.md)
+- [`docs/reference/boundary-first-api-auth-contract.md`](docs/reference/boundary-first-api-auth-contract.md)
 
 Examples:
 

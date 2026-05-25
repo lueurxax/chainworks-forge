@@ -14,7 +14,7 @@ pub mod storage;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 42] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 43] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -40,6 +40,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 42] {
         CapabilityToolId::StewardListAnalyses,
         CapabilityToolId::StewardGetAnalysis,
         CapabilityToolId::RuntimeHealth,
+        CapabilityToolId::OperatorAlertsList,
         CapabilityToolId::StorageHealth,
         CapabilityToolId::StorageWritePressure,
         CapabilityToolId::StorageEvidenceSpoolSummary,
@@ -103,6 +104,8 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
         "runtime.health" => Some(CapabilityToolId::RuntimeHealth),
+        "boundary.runtime.get" => Some(CapabilityToolId::RuntimeHealth),
+        "operator.alerts.list" => Some(CapabilityToolId::OperatorAlertsList),
         "storage.health" => Some(CapabilityToolId::StorageHealth),
         "storage.write_pressure" => Some(CapabilityToolId::StorageWritePressure),
         "storage.evidence_spool_summary" => Some(CapabilityToolId::StorageEvidenceSpoolSummary),
@@ -155,6 +158,8 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "steward_list_analyses" => "steward.list_analyses",
         "steward_get_analysis" => "steward.get_analysis",
         "runtime_health" => "runtime.health",
+        "boundary_runtime_get" => "boundary.runtime.get",
+        "operator_alerts_list" => "operator.alerts.list",
         "effects_list" => "effects.list",
         "effects_inspect" => "effects.inspect",
         "effects_reconcile" => "effects.reconcile",
@@ -239,6 +244,9 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         }
         CapabilityToolId::RuntimeHealth => {
             tool_spec_by_name(runtime::tool_specs(), "runtime.health")
+        }
+        CapabilityToolId::OperatorAlertsList => {
+            tool_spec_by_name(runtime::tool_specs(), "operator.alerts.list")
         }
         CapabilityToolId::StorageHealth => {
             tool_spec_by_name(storage::tool_specs(), "storage.health")

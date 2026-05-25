@@ -2,6 +2,14 @@ import Foundation
 import UserNotifications
 import AppKit
 
+struct P081OperatorAlertNativeDeliveryMetricEvent: Equatable, Sendable {
+    static let metricName = "operator_alert_native_delivery_total"
+
+    let severity: String
+    let surface: String
+    let result: String
+}
+
 // MARK: - P005-OPS §10: Notification Service
 
 /// Local notifications, dock badge, optional menu bar presence.
@@ -16,6 +24,12 @@ final class NotificationService {
     private(set) var isMenuBarEnabled: Bool = false
     private var preferences: NotificationPreferences
     private var authorizationStatus: UNAuthorizationStatus?
+    private var runAttentionCount: Int = 0
+    private var operatorAlertAttentionCount: Int = 0
+    private var userMenuBarEnabled: Bool = false
+    private var operatorAlertForcesMenuBar: Bool = false
+    private var deliveredOperatorAlertKeys: Set<String> = []
+    private(set) var p081NativeDeliveryMetricEvents: [P081OperatorAlertNativeDeliveryMetricEvent] = []
 
     init(preferences: NotificationPreferences = .defaultPreferences) {
         self.preferences = preferences
@@ -96,24 +110,56 @@ final class NotificationService {
 
     /// Update dock badge with count of runs requiring attention.
     func updateDockBadge(waitingApprovalCount: Int, blockedCount: Int) {
-        pendingAttentionCount = waitingApprovalCount + blockedCount
-        // Guard against unit-test contexts where NSApp may not be initialized
-        if let app = NSApp {
-            app.dockTile.badgeLabel = pendingAttentionCount > 0 ? "\(pendingAttentionCount)" : nil
-        }
+        runAttentionCount = waitingApprovalCount + blockedCount
+        refreshDockBadgeLabel()
     }
 
     func clearDockBadge() {
-        pendingAttentionCount = 0
-        if let app = NSApp {
-            app.dockTile.badgeLabel = nil
+        runAttentionCount = 0
+        operatorAlertAttentionCount = 0
+        deliveredOperatorAlertKeys.removeAll()
+        refreshDockBadgeLabel()
+    }
+
+    // MARK: - P081 Operator Alerts
+
+    func applyP081OperatorAlerts(_ alerts: [P081OperatorAlert], now: Date = Date()) {
+        let activeAlerts = alerts.filter(\.active)
+        operatorAlertForcesMenuBar = activeAlerts.contains { alert in
+            guard let delivery = alert.nativeDelivery else { return false }
+            return delivery.dockBadgeContribution > 0
+                || delivery.requestUserAttention.lowercased() == "critical"
+        }
+        refreshMenuBarState()
+        operatorAlertAttentionCount = activeAlerts.reduce(0) { total, alert in
+            total + max(0, alert.nativeDelivery?.dockBadgeContribution ?? 0)
+        }
+        refreshDockBadgeLabel()
+
+        let activeDeliveryKeys = Set(activeAlerts.compactMap(\.nativeDelivery?.deliveryKey))
+        deliveredOperatorAlertKeys.formIntersection(activeDeliveryKeys)
+
+        for alert in activeAlerts {
+            guard let nativeDelivery = alert.nativeDelivery else { continue }
+            if isP081OperatorAlertSilenced(alert, now: now) {
+                recordP081NativeDeliveryMetric(alert: alert, result: "silenced")
+                continue
+            }
+            guard deliveredOperatorAlertKeys.insert(nativeDelivery.deliveryKey).inserted else {
+                recordP081NativeDeliveryMetric(alert: alert, result: "deduped")
+                continue
+            }
+            requestP081OperatorAttention(nativeDelivery.requestUserAttention)
+            scheduleP081OperatorAlertNotification(alert, nativeDelivery: nativeDelivery)
+            recordP081NativeDeliveryMetric(alert: alert, result: "delivered")
         }
     }
 
     // MARK: - Menu Bar (§10)
 
     func setMenuBarEnabled(_ enabled: Bool) {
-        isMenuBarEnabled = enabled
+        userMenuBarEnabled = enabled
+        refreshMenuBarState()
     }
 
     // MARK: - Preferences
@@ -153,10 +199,60 @@ final class NotificationService {
     }
 
     private func incrementAttention() {
-        pendingAttentionCount += 1
+        runAttentionCount += 1
+        refreshDockBadgeLabel()
+    }
+
+    private func refreshDockBadgeLabel() {
+        pendingAttentionCount = max(0, runAttentionCount + operatorAlertAttentionCount)
         if let app = NSApp {
-            app.dockTile.badgeLabel = "\(pendingAttentionCount)"
+            app.dockTile.badgeLabel = pendingAttentionCount > 0 ? "\(pendingAttentionCount)" : nil
         }
+    }
+
+    private func refreshMenuBarState() {
+        isMenuBarEnabled = userMenuBarEnabled || operatorAlertForcesMenuBar
+    }
+
+    private func isP081OperatorAlertSilenced(_ alert: P081OperatorAlert, now: Date) -> Bool {
+        guard let silencedUntilMs = alert.silencedUntilMs else { return false }
+        let nowMs = Int(now.timeIntervalSince1970 * 1_000)
+        return silencedUntilMs > nowMs
+    }
+
+    private func requestP081OperatorAttention(_ mode: String) {
+        guard let app = NSApp else { return }
+        switch mode.lowercased() {
+        case "critical":
+            app.requestUserAttention(.criticalRequest)
+        case "informational", "info":
+            app.requestUserAttention(.informationalRequest)
+        default:
+            return
+        }
+    }
+
+    private func scheduleP081OperatorAlertNotification(
+        _ alert: P081OperatorAlert,
+        nativeDelivery: P081OperatorAlertNativeDelivery
+    ) {
+        guard !Self.notificationsSuppressedForCurrentProcess else { return }
+        let content = UNMutableNotificationContent()
+        content.title = alert.title
+        content.body = alert.message
+        content.sound = .default
+        content.categoryIdentifier = nativeDelivery.notificationCategory
+        scheduleNotification(id: "p081_operator_alert_\(nativeDelivery.deliveryKey)", content: content)
+    }
+
+    private func recordP081NativeDeliveryMetric(alert: P081OperatorAlert, result: String) {
+        p081NativeDeliveryMetricEvents.append(
+            P081OperatorAlertNativeDeliveryMetricEvent(
+                severity: alert.severity,
+                surface: "macos_notification_service",
+                result: result
+            )
+        )
     }
 
     private static var notificationsSuppressedForCurrentProcess: Bool {

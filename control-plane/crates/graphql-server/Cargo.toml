@@ -12,6 +12,7 @@ workflow = { path = "../workflow" }
 async-graphql = { workspace = true }
 async-graphql-axum = { workspace = true }
 axum = { workspace = true }
+futures-util = "0.3"
 sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
@@ -22,8 +23,8 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
-async-trait = "0.1"
 sha2 = "0.10"
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

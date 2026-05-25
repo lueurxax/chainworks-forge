@@ -1,0 +1,38 @@
+schema_version: boundary_policy_canaries_v1
+proposal_id: proposal-081
+matrix_id: p081-boundary-matrix-v1
+generated_from: docs/reference/boundary-first-api-auth-contract.json
+canaries:
+  - row_id: p081.ui_operator.graphql_query.read
+    test_id: proposal_081_boundary_runtime_graphql_readback_is_bounded
+    expected_decision: allow
+  - row_id: p081.ui_operator.graphql_subscription.subscribe
+    test_id: proposal_081_websocket_policy_reload_close_contract_is_explicit
+    expected_decision: allow
+  - row_id: p081.ui_operator.graphql_mutation.approval_action
+    test_id: Proposal081ApprovalActionAttemptStoreTests
+    expected_decision: allow
+  - row_id: p081.agent_operator.mcp_initialize.capability
+    test_id: proposal_081_runtime_health_includes_boundary_runtime_readback
+    expected_decision: allow
+  - row_id: p081.agent_operator.mcp_tools_list.discovery
+    test_id: mcp_tools_list_filters_denied_tools
+    expected_decision: allow
+  - row_id: p081.agent_operator.mcp_tools_call.command
+    test_id: p081_ideas_create_records_command_journal_and_idempotency_linkage
+    expected_decision: allow
+  - row_id: p081.automation.mcp_tools_list.discovery
+    test_id: automation_tools_list_scope
+    expected_decision: allow
+  - row_id: p081.automation.mcp_tools_call.command
+    test_id: p081_ideas_create_records_command_journal_and_idempotency_linkage
+    expected_decision: allow
+  - row_id: p081.observer.mcp_tools_call.compact_read
+    test_id: proposal_081_operator_alerts_list_exposes_safe_mode_alert
+    expected_decision: allow
+  - row_id: p081.observer.graphql_query.read_only_opt_in
+    test_id: proposal_081_observer_operator_alerts_redact_fields_without_graphql_errors
+    expected_decision: allow_redacted
+  - row_id: p081.developer_break_glass.debug_endpoint.disabled
+    test_id: boundary::tests::embedded_fixture_is_valid
+    expected_decision: deny

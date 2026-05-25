@@ -21,6 +21,11 @@ pub enum GqlDisabledReasonCode {
     ProjectionLag,
     Unauthorized,
     UnsupportedAction,
+    // P081 boundary policy reason codes
+    ApprovalNotActionable,
+    ObserverScope,
+    NonApprovalMutation,
+    CapabilityOutOfScope,
 }
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
@@ -72,5 +77,8 @@ pub fn is_report_metadata(format: &str, report_kind: Option<&str>) -> bool {
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 #[graphql(name = "MutationConflictResultCode", rename_items = "snake_case")]
 pub enum GqlMutationConflictResultCode {
+    /// Same-key idempotent replay: original result returned, no re-settlement.
     AlreadyResolved,
+    /// Terminal approval retried with a different idempotency key: zero settlement side effects.
+    ApprovalNotActionable,
 }

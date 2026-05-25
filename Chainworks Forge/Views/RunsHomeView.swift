@@ -842,6 +842,88 @@ private enum P077CloseoutReadinessFocus: Hashable {
     case modeExplainer
 }
 
+nonisolated final class P081ApprovalActionAttemptStore: @unchecked Sendable {
+    private let defaults: UserDefaults
+    private let storageKey: String
+    private let makeID: @Sendable () -> String
+    private let lock = NSLock()
+
+    init(
+        defaults: UserDefaults = .standard,
+        storageKey: String = "chainworks.p081.approval-action-attempts.v1",
+        makeID: @escaping @Sendable () -> String = { makeUUIDv7() }
+    ) {
+        self.defaults = defaults
+        self.storageKey = storageKey
+        self.makeID = makeID
+    }
+
+    func idempotencyKey(for approvalID: String, action: P072ApprovalDecisionAction) -> String {
+        let attemptKey = Self.attemptStorageKey(approvalID: approvalID, action: action)
+        lock.lock()
+        defer { lock.unlock() }
+
+        var attempts = loadLocked()
+        if let existing = attempts[attemptKey] {
+            return existing
+        }
+
+        let created = makeID()
+        attempts[attemptKey] = created
+        saveLocked(attempts)
+        return created
+    }
+
+    func clear(approvalID: String, action: P072ApprovalDecisionAction) {
+        let attemptKey = Self.attemptStorageKey(approvalID: approvalID, action: action)
+        lock.lock()
+        defer { lock.unlock() }
+
+        var attempts = loadLocked()
+        attempts.removeValue(forKey: attemptKey)
+        saveLocked(attempts)
+    }
+
+    func clearAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        defaults.removeObject(forKey: storageKey)
+    }
+
+    private func loadLocked() -> [String: String] {
+        guard let raw = defaults.dictionary(forKey: storageKey) else {
+            return [:]
+        }
+        return raw.compactMapValues { $0 as? String }
+    }
+
+    private func saveLocked(_ attempts: [String: String]) {
+        if attempts.isEmpty {
+            defaults.removeObject(forKey: storageKey)
+        } else {
+            defaults.set(attempts, forKey: storageKey)
+        }
+    }
+
+    private static func attemptStorageKey(
+        approvalID: String,
+        action: P072ApprovalDecisionAction
+    ) -> String {
+        let actionComponent: String
+        switch action {
+        case .approve:
+            actionComponent = "approve"
+        case .reject(let reason):
+            actionComponent = "reject:\(escaped(reason))"
+        }
+        return "approval:\(escaped(approvalID))|action:\(actionComponent)"
+    }
+
+    private static func escaped(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? value
+    }
+}
+
 @MainActor
 final class P031ThinReadDashboardModel: ObservableObject {
     @Published private(set) var runsHome: P031RunsHomePresentation?
@@ -969,7 +1051,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
         runtimeTimelinePublishTask?.cancel()
     }
 
-    static func bootstrap() -> P031ThinReadDashboardModel {
+    static func bootstrap(
+        approvalActionAttemptStore: P081ApprovalActionAttemptStore = P081ApprovalActionAttemptStore()
+    ) -> P031ThinReadDashboardModel {
         let endpoint = DaemonClientEndpoint.operatorDefault()
         let guideResource = P031OperatorWritePathGuideBootstrap.load()
         let store = P031GraphQLWorkflowReadStore(
@@ -988,17 +1072,27 @@ final class P031ThinReadDashboardModel: ObservableObject {
             coordinator: coordinator,
             settleApprovalAction: { approvalID, action in
                 do {
+                    let idempotencyKey = approvalActionAttemptStore.idempotencyKey(
+                        for: approvalID,
+                        action: action
+                    )
                     switch action {
                     case .approve:
-                        _ = try await approvalMutationClient.approve(approvalID: approvalID)
+                        _ = try await approvalMutationClient.approve(
+                            approvalID: approvalID,
+                            idempotencyKey: idempotencyKey
+                        )
                     case .reject(let reason):
                         _ = try await approvalMutationClient.reject(
                             approvalID: approvalID,
-                            reason: reason
+                            reason: reason,
+                            idempotencyKey: idempotencyKey
                         )
                     }
+                    approvalActionAttemptStore.clear(approvalID: approvalID, action: action)
                     return nil
                 } catch {
+                    // On error the key is retained so the next retry reuses the same key.
                     return P031ReadErrorPresenter.description(for: error)
                 }
             },
@@ -4888,6 +4982,31 @@ private struct P031FreshnessBadge: View {
 }
 
 
+
+// P081 Defect1: Generate a UUIDv7 string for approval action idempotency keys.
+// UUIDv7 embeds the current Unix timestamp in ms in the high 48 bits, version nibble 0x7
+// in bits 48-51, and random bytes elsewhere (RFC 9562). The server validates
+// idempotency keys as UUIDv7 (version nibble check) so UUIDv4 from UUID() must not be used.
+private nonisolated func makeUUIDv7() -> String {
+    let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+    var bytes = [UInt8](repeating: 0, count: 16)
+    bytes[0] = UInt8((nowMs >> 40) & 0xFF)
+    bytes[1] = UInt8((nowMs >> 32) & 0xFF)
+    bytes[2] = UInt8((nowMs >> 24) & 0xFF)
+    bytes[3] = UInt8((nowMs >> 16) & 0xFF)
+    bytes[4] = UInt8((nowMs >> 8) & 0xFF)
+    bytes[5] = UInt8(nowMs & 0xFF)
+    for i in 6..<16 { bytes[i] = UInt8.random(in: 0...255) }
+    bytes[6] = (bytes[6] & 0x0F) | 0x70  // version = 7
+    bytes[8] = (bytes[8] & 0x3F) | 0x80  // variant = 10xx
+    return String(
+        format: "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
 
 #Preview("Stages") {
     P036RunsHomePreviewHost(initialTab: .stages)

@@ -27,6 +27,7 @@ impl std::fmt::Display for PrincipalClass {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
+    CreateIdea(CreateIdeaCmd),
     StartRun(StartRunCmd),
     ApproveStage(ApproveStageCmd),
     RejectStage(RejectStageCmd),
@@ -58,6 +59,16 @@ pub enum Command {
     /// CallerContext.principal_id overrides the command's principal field at the engine
     /// boundary (BLK-008: bind from authenticated context, not caller-supplied payload).
     SettleProposalGate(SettleProposalGateCmd),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateIdeaCmd {
+    pub title: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -338,6 +349,11 @@ pub struct ResolveApprovalCmd {
     pub run_id: RunId,
     /// Server-resolved from approval_id — not supplied by caller.
     pub stage_id: String,
+    /// P081 Phase 5: client-supplied idempotency key (UUIDv7 per attempt).
+    /// When present, the command handler performs deduplication against
+    /// approval_mutation_idempotency and returns the original result on retry.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 // ── P077: Gate settlement command ──────────────────────────────────────
@@ -422,6 +438,33 @@ pub struct CallerContext {
     /// trail on one id.
     #[serde(default)]
     pub request_id: Option<String>,
+    /// P081 Phase 3: Request-scoped caller class derived at auth resolution time.
+    /// Stored as a snake_case string matching the boundary matrix caller_class enum.
+    /// `None` for pre-P081 command journal rows; deserialization uses `#[serde(default)]`
+    /// so existing rows remain readable.
+    #[serde(default)]
+    pub caller_class: Option<String>,
+    /// SEC-P081-M002: Derived token_id for audit correlation (base32 sha256 diagnostic id).
+    /// Not the raw bearer token. Never persisted to command_journal or wire; carried in
+    /// memory so audit_log entries can include it for incident correlation.
+    #[serde(skip)]
+    pub token_id: Option<String>,
+    /// P081 Phase 3: MCP idempotency key for state-changing calls. Persisted in
+    /// command_journal so replay readback can bind the journal row to the idempotency record.
+    /// `None` for GraphQL paths and pre-P081 MCP calls; `#[serde(skip)]` because the key
+    /// is derived at dispatch time and must not round-trip through the command payload.
+    #[serde(skip)]
+    pub mcp_idempotency_key: Option<String>,
+    /// P081 Phase 5: canonical request hash computed at the MCP transport boundary.
+    /// This is carried only in memory so the command transaction can claim the
+    /// idempotency key atomically with the command journal and domain writes.
+    #[serde(skip)]
+    pub mcp_idempotency_request_hash: Option<String>,
+    /// P081 Phase 3: Boundary matrix row_id that allowed this command. Persisted in
+    /// command_journal for audit linkage. `None` in legacy_compat mode or when the policy
+    /// returns LegacyPassthrough.
+    #[serde(skip)]
+    pub boundary_row_id: Option<String>,
 }
 
 impl CallerContext {
@@ -432,6 +475,11 @@ impl CallerContext {
             principal_class: principal_class.clone(),
             caller_tool: tool_name.to_string(),
             request_id: None,
+            caller_class: None,
+            token_id: None,
+            mcp_idempotency_key: None,
+            mcp_idempotency_request_hash: None,
+            boundary_row_id: None,
         }
     }
 
@@ -446,6 +494,11 @@ impl CallerContext {
             principal_class: principal_class.clone(),
             caller_tool: mutation_name.to_string(),
             request_id: None,
+            caller_class: None,
+            token_id: None,
+            mcp_idempotency_key: None,
+            mcp_idempotency_request_hash: None,
+            boundary_row_id: None,
         }
     }
 
@@ -454,6 +507,38 @@ impl CallerContext {
     /// client didn't send one). Returns `self` for builder-style chaining.
     pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
         self.request_id = Some(request_id.into());
+        self
+    }
+
+    /// P081 Phase 3: Attach a derived caller_class string. Returns `self`
+    /// for builder-style chaining.
+    pub fn with_caller_class(mut self, caller_class: impl Into<String>) -> Self {
+        self.caller_class = Some(caller_class.into());
+        self
+    }
+
+    /// SEC-P081-M002: Attach a derived token_id for audit correlation. Not the raw token.
+    /// Returns `self` for builder-style chaining.
+    pub fn with_token_id(mut self, token_id: impl Into<String>) -> Self {
+        self.token_id = Some(token_id.into());
+        self
+    }
+
+    /// P081 Phase 3: Attach the MCP idempotency key so command_journal persists the linkage.
+    pub fn with_mcp_idempotency_key(mut self, key: impl Into<String>) -> Self {
+        self.mcp_idempotency_key = Some(key.into());
+        self
+    }
+
+    /// P081 Phase 5: Attach the canonical MCP request hash for transactional idempotency.
+    pub fn with_mcp_idempotency_request_hash(mut self, hash: impl Into<String>) -> Self {
+        self.mcp_idempotency_request_hash = Some(hash.into());
+        self
+    }
+
+    /// P081 Phase 3: Attach the boundary matrix row_id that allowed this command.
+    pub fn with_boundary_row_id(mut self, row_id: impl Into<String>) -> Self {
+        self.boundary_row_id = Some(row_id.into());
         self
     }
 
@@ -468,6 +553,11 @@ impl CallerContext {
             principal_class: PrincipalClass::Operator,
             caller_tool: "test".to_string(),
             request_id: None,
+            caller_class: None,
+            token_id: None,
+            mcp_idempotency_key: None,
+            mcp_idempotency_request_hash: None,
+            boundary_row_id: None,
         }
     }
 }

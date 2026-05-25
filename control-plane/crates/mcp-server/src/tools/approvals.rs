@@ -1,10 +1,52 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 
+/// Validate that `key` is a well-formed UUIDv7 string.
+/// UUIDv7 format: xxxxxxxx-xxxx-7xxx-[89ab]xxx-xxxxxxxxxxxx (36 chars, version nibble = 7,
+/// variant nibble ∈ {8,9,a,b}). Rejects non-hex chars, wrong hyphens, wrong version/variant.
+fn validate_uuidv7_idempotency_key(key: &str) -> Result<()> {
+    if key.len() != 36 {
+        return Err(anyhow::anyhow!(
+            "idempotency_key must be a 36-character UUIDv7 string"
+        ));
+    }
+    let bytes = key.as_bytes();
+    for &pos in &[8usize, 13, 18, 23] {
+        if bytes[pos] != b'-' {
+            return Err(anyhow::anyhow!(
+                "idempotency_key must be UUIDv7 (hyphen expected at position {pos})"
+            ));
+        }
+    }
+    if bytes[14] != b'7' {
+        return Err(anyhow::anyhow!(
+            "idempotency_key must be UUIDv7 (version nibble at position 14 must be '7', got '{}')",
+            bytes[14] as char
+        ));
+    }
+    if !matches!(bytes[19], b'8' | b'9' | b'a' | b'b' | b'A' | b'B') {
+        return Err(anyhow::anyhow!(
+            "idempotency_key must be UUIDv7 (variant nibble at position 19 must be 8/9/a/b, got '{}')",
+            bytes[19] as char
+        ));
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            continue;
+        }
+        if !b.is_ascii_hexdigit() {
+            return Err(anyhow::anyhow!(
+                "idempotency_key must be UUIDv7 (non-hex character '{}' at position {i})",
+                b as char
+            ));
+        }
+    }
+    Ok(())
+}
+
 use db::repos::{approvals, lead_mediation_confirmations};
 use domain::commands::{
-    ApprovalResolutionDecision, ApproveStageCmd, Command, RejectStageCmd, ResolveApprovalCmd,
-    ResolveLeadMediationConfirmationCmd,
+    ApprovalResolutionDecision, Command, ResolveApprovalCmd, ResolveLeadMediationConfirmationCmd,
 };
 use domain::ids::{ApprovalId, RunId};
 use domain::mediation::{ApprovalInboxItem, ApprovalSubjectKind};
@@ -58,10 +100,10 @@ pub fn tool_specs() -> Vec<McpTool> {
                     },
                     "idempotency_key": {
                         "type": "string",
-                        "description": "Required for lead_mediation_confirmation"
+                        "description": "Required UUIDv7 per attempt. Must be provided for stage_approval and lead_mediation_confirmation. Enables safe retry without duplicate settlement."
                     }
                 },
-                "required": ["decision"]
+                "required": ["decision", "idempotency_key"]
             }),
         },
     ]
@@ -165,7 +207,15 @@ async fn resolve_stage_approval(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing 'decision'"))?;
     let comment = params["comment"].as_str().map(|s| s.to_string());
-    let caller = mcp_caller(&principal.id, &principal.class, "approvals.resolve");
+    // SEC-003: idempotency_key is required and must be a valid UUIDv7 for stage_approval.
+    let idempotency_key = params["idempotency_key"]
+        .as_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!("Missing required 'idempotency_key' for stage_approval resolution")
+        })?
+        .to_string();
+    validate_uuidv7_idempotency_key(&idempotency_key)?;
+    let caller = mcp_caller(&principal, "approvals.resolve");
 
     // P072: Prefer approval_id-based routing through ResolveApprovalCmd.
     if let Some(approval_id_str) = params["approval_id"].as_str() {
@@ -206,6 +256,7 @@ async fn resolve_stage_approval(
             rationale: comment,
             run_id: approval.run_id,
             stage_id: approval.stage_id,
+            idempotency_key: Some(idempotency_key.clone()),
         });
 
         let commanded = cmd_handler.handle(cmd, caller).await?;
@@ -216,6 +267,9 @@ async fn resolve_stage_approval(
     }
 
     // Legacy path: resolve by run_id + stage_id.
+    // SEC-P081: idempotency_key is already required above. Look up the pending
+    // approval by run_id+stage_id and route through ResolveApproval so the
+    // idempotency contract is enforced identically to the approval_id path.
     let run_id: RunId = params["run_id"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' (required when approval_id is absent)"))?
@@ -225,19 +279,28 @@ async fn resolve_stage_approval(
         .ok_or_else(|| anyhow::anyhow!("Missing 'stage_id' (required when approval_id is absent)"))?
         .to_string();
 
-    let cmd = match decision_str {
-        "granted" => Command::ApproveStage(ApproveStageCmd {
-            run_id,
-            stage_id,
-            comment,
-        }),
-        "rejected" => Command::RejectStage(RejectStageCmd {
-            run_id,
-            stage_id,
-            comment,
-        }),
-        other => return Err(anyhow::anyhow!("Unknown stage approval decision: {other}")),
-    };
+    let decision: ApprovalResolutionDecision = decision_str
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("{e}"))?;
+
+    let approval = approvals::find_pending_by_run_stage(cmd_handler.pool(), run_id, &stage_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No pending approval found for run '{}', stage '{}'",
+                run_id,
+                stage_id
+            )
+        })?;
+
+    let cmd = Command::ResolveApproval(ResolveApprovalCmd {
+        approval_id: approval.id,
+        decision,
+        rationale: comment,
+        run_id: approval.run_id,
+        stage_id: approval.stage_id,
+        idempotency_key: Some(idempotency_key.clone()),
+    });
 
     let commanded = cmd_handler.handle(cmd, caller).await?;
     Ok(serde_json::json!({
@@ -278,11 +341,6 @@ async fn resolve_mediation_confirmation(
             "conflict_fingerprint exceeds maximum length (512 bytes)"
         ));
     }
-    if idempotency_key.len() > 512 {
-        return Err(anyhow::anyhow!(
-            "idempotency_key exceeds maximum length (512 bytes)"
-        ));
-    }
     if conflict_fingerprint
         .bytes()
         .any(|b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t')
@@ -291,14 +349,8 @@ async fn resolve_mediation_confirmation(
             "conflict_fingerprint contains invalid control characters"
         ));
     }
-    if idempotency_key
-        .bytes()
-        .any(|b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t')
-    {
-        return Err(anyhow::anyhow!(
-            "idempotency_key contains invalid control characters"
-        ));
-    }
+    // SEC-003: idempotency_key for mediation confirmation must also be UUIDv7.
+    validate_uuidv7_idempotency_key(&idempotency_key)?;
 
     let decision: domain::mediation::MediationConfirmationDecision = decision_str
         .parse()
@@ -315,7 +367,7 @@ async fn resolve_mediation_confirmation(
     .ok_or_else(|| anyhow::anyhow!("Mediation confirmation '{}' not found", subject_id))?;
     let mediation_record_id = confirmation.mediation_record_id.clone();
 
-    let caller = mcp_caller(&principal.id, &principal.class, "approvals.resolve");
+    let caller = mcp_caller(&principal, "approvals.resolve");
     let cmd = Command::ResolveLeadMediationConfirmation(ResolveLeadMediationConfirmationCmd {
         run_id,
         mediation_record_id,

@@ -3083,12 +3083,10 @@ mod tests {
         let pool = crate::pool::create_pool("sqlite::memory:")
             .await
             .expect("in-memory pool");
-        crate::writer::register_shared_writer(
-            &pool,
-            std::sync::Arc::new(crate::writer::DbWriter::new(pool.clone())),
-        )
-        .await
-        .expect("register shared writer");
+        let writer = std::sync::Arc::new(crate::writer::DbWriter::new(pool.clone()));
+        crate::writer::register_shared_writer(&pool, writer)
+            .await
+            .unwrap();
         pool
     }
 

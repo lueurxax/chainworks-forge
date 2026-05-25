@@ -63,6 +63,9 @@ enum P036DeferredState: String, Codable, CaseIterable {
                 case .conflict: self = .conflict; return
                 case .duplicate: self = .duplicate; return
                 case .alreadyResolved: self = .alreadyResolved; return
+                case .approvalNotActionable: self = .alreadyResolved; return
+                case .observerScope: self = .unauthorized; return
+                case .nonApprovalMutation, .capabilityOutOfScope: self = .unsupported; return
                 case .writePathNotAvailable: self = .unavailable; return
                 }
             }

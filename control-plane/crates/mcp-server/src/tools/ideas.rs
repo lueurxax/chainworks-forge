@@ -2,11 +2,11 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use db::repos::ideas;
-use domain::idea::{Idea, IdeaStatus};
-use domain::ids::IdeaId;
-use engine::command_handler::CommandHandler;
+use domain::commands::{Command, CreateIdeaCmd};
+use engine::command_handler::{CommandHandler, CommandResult};
 
 use crate::protocol::McpTool;
+use crate::request_context;
 
 pub fn tool_specs() -> Vec<McpTool> {
     vec![
@@ -28,12 +28,13 @@ pub fn tool_specs() -> Vec<McpTool> {
             description: "Create a new idea".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "required": ["title", "body"],
+                "required": ["title", "body", "idempotency_key"],
                 "properties": {
                     "title": { "type": "string", "description": "Idea title" },
                     "body": { "type": "string", "description": "Idea body / description" },
                     "workspace_root_path": { "type": "string", "description": "Optional workspace root path" },
-                    "project_key": { "type": "string", "description": "Optional stable project cohort key" }
+                    "project_key": { "type": "string", "description": "Optional stable project cohort key" },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." }
                 }
             }),
         },
@@ -44,7 +45,8 @@ pub async fn execute(
     tool_name: &str,
     params: serde_json::Value,
     pool: &SqlitePool,
-    _cmd_handler: &CommandHandler,
+    cmd_handler: &CommandHandler,
+    principal: &auth::Principal,
 ) -> Result<serde_json::Value> {
     match tool_name {
         "ideas.list" => {
@@ -66,18 +68,26 @@ pub async fn execute(
                 .map(|s| s.to_string());
             let project_key = params["project_key"].as_str().map(|s| s.to_string());
 
-            let idea = Idea {
-                id: IdeaId::new(),
-                title,
-                body,
-                workspace_root_path,
-                project_key,
-                status: IdeaStatus::Draft,
-                created_at: chrono::Utc::now(),
-                archived_at: None,
-            };
-            ideas::insert(pool, &idea).await?;
-            Ok(serde_json::to_value(&idea)?)
+            let commanded = cmd_handler
+                .handle(
+                    Command::CreateIdea(CreateIdeaCmd {
+                        title,
+                        body,
+                        workspace_root_path,
+                        project_key,
+                    }),
+                    request_context::mcp_caller(principal, "ideas.create"),
+                )
+                .await?;
+            match commanded.result {
+                CommandResult::IdeaCreated { idea } => Ok(serde_json::json!({
+                    "idea": idea,
+                    "journal_id": commanded.journal_id,
+                })),
+                _ => Err(anyhow::anyhow!(
+                    "ideas.create returned unexpected command result"
+                )),
+            }
         }
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
     }

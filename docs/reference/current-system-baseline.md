@@ -24,6 +24,7 @@ At the current baseline, the product includes:
 - YAML-defined workflows and agent catalogs,
 - a compiled execution engine with resume, approvals, loops, and artifact persistence,
 - GraphQL-only thin UI boundary ensuring governed SwiftUI workflow truth is read from server projections,
+- boundary-first API authorization and audit policy through a daemon-injected `BoundaryPolicy` shared by GraphQL, MCP, and approval actionability paths,
 - lead conflict mediation for same-run resolution of workflow conflicts,
 - capacity-aware scheduling, fairness, executor backpressure, SQLite write serialization, and host interruption recovery (Rust daemon),
 - DbWriter bounded MPSC executor with priority lanes, deadlines, busy-retry classification, heartbeat, lane-starvation watchdog, graceful shutdown drain with populated terminal-operation admission allowlist, Class B coalescing buffer (500 ms drain-all flush, 64-merge force-flush, 1024-key saturation reject), per-lane oldest-enqueued reporting on `WriteRejected`, evidence file spool module (canonical `evidence/runs/...` layout, run-id-bound write-time path ownership check, symlink-escape rejection, `0o600`/`0o700` POSIX modes, checksum + double `fsync` + atomic no-replace commit), bounded `sweep_evidence_orphans` walk that backfills `recovered_orphan` metadata for crash-orphaned evidence files, stream-hashes candidates, skips over-budget candidates before read, and is exposed via the `storage.reconcile_evidence_orphans` MCP tool, evidence spool metadata schema, storage write-pressure snapshots, typed operator-only GraphQL `storageHealth`, operator-only MCP `storage.health` / `storage.write_pressure` / `storage.evidence_spool_summary` diagnostics, fail-closed stale/degraded storage readback when live writer health is unavailable, and a fail-closed write-budget registry gate that rejects temporary rollout bypasses, production runtime transaction paths outside DbWriter-owned entrypoints, and operation-registry drift,
@@ -73,6 +74,7 @@ Use these reference docs as the current source of truth:
 | Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
 | Rust control plane, scheduler, targeted retry authority, and retry payload recovery | [rust-control-plane.md](rust-control-plane.md) |
 | Auto-retry observation ledger | [auto-retry-observation-ledger.md](auto-retry-observation-ledger.md) |
+| API/auth boundary matrix, audit, and idempotency | [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md), [swift-macos-boundary-contract.md](swift-macos-boundary-contract.md) |
 | Proposal-loop feedback fidelity | [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) |
 | Live provider-backed proposal loop | [live-provider-execution-slice.md](live-provider-execution-slice.md) |
 | Operator shell | [operator-experience.md](operator-experience.md) |
@@ -124,6 +126,9 @@ Current baseline:
 - governed UI screens provide diagnostic identifiers and instructions for MCP-owned workflows when an action is external.
 
 That boundary is owned by [ui-action-boundary.md](ui-action-boundary.md), with read-shape details in [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md).
+P081 changes authorization, audit, idempotency, and actionability semantics for
+that boundary; it does not add non-approval UI mutations or move non-approval
+operator control off MCP.
 
 ### Provider boundary
 

@@ -32,6 +32,7 @@ use graphql_server::request_id::HEADER_NAME as REQUEST_ID_HEADER;
 use sqlx::{Row, SqlitePool};
 use std::sync::Arc;
 use tower::ServiceExt;
+use uuid;
 
 async fn test_pool() -> SqlitePool {
     let pool = create_pool("sqlite::memory:").await.unwrap();
@@ -203,9 +204,10 @@ async fn build_app(pool: SqlitePool) -> Router {
 }
 
 fn approve_approval_mutation(approval_id: ApprovalId) -> String {
+    let key = uuid::Uuid::now_v7();
     format!(
         r#"mutation {{
-          approveApproval(approvalId: "{approval_id}") {{
+          approveApproval(approvalId: "{approval_id}", idempotencyKey: "{key}") {{
             approval {{ id }}
             journalId
           }}
@@ -222,7 +224,7 @@ async fn post_mutation(
     let mut builder = Request::builder()
         .method("POST")
         .uri("/graphql")
-        .header("authorization", "Bearer test-token")
+        .header("authorization", "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx")
         .header("content-type", "application/json");
     if let Some(rid) = inbound_request_id {
         builder = builder.header(REQUEST_ID_HEADER, rid);

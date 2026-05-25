@@ -532,6 +532,11 @@ async fn proposal_088_mcp_runs_get_and_list_expose_implementation_completion() {
         "junie_repair_outputs_partially_materialized"
     );
 
+    // runs.list is projection-based (P087): rebuild projections so implementationCompletion is baked in.
+    db::repos::projections::rebuild_all_for_run(&pool, run_id)
+        .await
+        .unwrap();
+
     let run_list = mcp_runs::execute(
         "runs.list",
         serde_json::json!({}),

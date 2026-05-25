@@ -165,6 +165,8 @@ It serves:
 
 Non-status GraphQL requests and work-producing MCP calls are refused with typed protocol envelopes. Failed-serve mode still uses bearer auth for protected status surfaces.
 
+Failure-detail fields (`kind`, `detail`, `backup_path`) are disclosed only to authenticated callers. The `/mcp` JSON-RPC refusal envelope includes the full `failure` payload only when the request carries a valid bearer token; unauthenticated callers receive `state` alone. The catch-all route for unknown paths returns `{ error: "daemon_in_failed_state", state }` without `failure` to avoid disclosing diagnostic detail or filesystem paths to any caller that can reach an arbitrary URL.
+
 ## Logs, diagnostics, and request correlation
 
 Packaged mode writes JSON logs under:

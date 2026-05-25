@@ -610,16 +610,19 @@ struct P072ApprovalMutationResult: Decodable, Equatable, Sendable {
 struct P072ApprovalMutationClient<Transport: P031GraphQLReadTransport>: Sendable {
   let transport: Transport
 
-  func approve(approvalID: String) async throws -> P072ApprovalMutationResult {
+  func approve(approvalID: String, idempotencyKey: String) async throws -> P072ApprovalMutationResult {
     try await execute(
       P072ApproveApprovalPayload.self,
       operationName: "P072ApproveApproval",
       document: P031GraphQLDocuments.approveApproval,
-      variables: ["approvalId": .string(approvalID)]
+      variables: [
+        "approvalId": .string(approvalID),
+        "idempotencyKey": .string(idempotencyKey),
+      ]
     ).approveApproval
   }
 
-  func reject(approvalID: String, reason: String) async throws -> P072ApprovalMutationResult {
+  func reject(approvalID: String, reason: String, idempotencyKey: String) async throws -> P072ApprovalMutationResult {
     try await execute(
       P072RejectApprovalPayload.self,
       operationName: "P072RejectApproval",
@@ -627,6 +630,7 @@ struct P072ApprovalMutationClient<Transport: P031GraphQLReadTransport>: Sendable
       variables: [
         "approvalId": .string(approvalID),
         "reason": .string(reason),
+        "idempotencyKey": .string(idempotencyKey),
       ]
     ).rejectApproval
   }
@@ -928,13 +932,203 @@ extension URLSessionWebSocketTask.Message {
 nonisolated private struct P031GraphQLResponseEnvelope<Payload: Decodable>: Decodable {
   let data: Payload?
   let errors: [P031GraphQLResponseError]?
+  let extensions: P081GraphQLResponseExtensions?
 }
 
 nonisolated private struct P031GraphQLResponseError: Decodable {
   let message: String
 }
 
+struct P081GraphQLRedaction: Decodable, Equatable, Sendable {
+  let path: [String]
+  let reasonCode: String
+  let rowId: String?
+  let redactionMode: String
+  let callerClass: String?
+  let redactionId: String
+}
+
+struct P081GraphQLResponseExtensions: Decodable, Equatable, Sendable {
+  let redactions: [P081GraphQLRedaction]
+
+  init(redactions: [P081GraphQLRedaction] = []) {
+    self.redactions = redactions
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.redactions = try container.decodeIfPresent([P081GraphQLRedaction].self, forKey: .redactions) ?? []
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case redactions
+  }
+}
+
+struct P081OperatorAlert: Decodable, Equatable, Sendable {
+  let id: String
+  let dedupeKey: String
+  let severity: String
+  let title: String
+  let message: String
+  let active: Bool
+  let silenceable: Bool
+  let acknowledgedAtMs: Int?
+  let silencedUntilMs: Int?
+  let nativeDelivery: P081OperatorAlertNativeDelivery?
+  let lifecycle: P081OperatorAlertLifecycle?
+
+  var accessibilityLabel: String {
+    "\(title), \(severity)"
+  }
+
+  var accessibilityValue: String {
+    if let lifecycle {
+      return lifecycle.state
+    }
+    return active ? "active" : "cleared"
+  }
+
+  var accessibilityHint: String {
+    "Boundary alert. Copy diagnostics for \(dedupeKey)."
+  }
+}
+
+struct P081OperatorAlertNativeDelivery: Decodable, Equatable, Sendable {
+  let deliveryKey: String
+  let dockBadgeContribution: Int
+  let requestUserAttention: String
+  let notificationCategory: String
+  let dedupePolicy: String
+}
+
+struct P081OperatorAlertLifecycle: Decodable, Equatable, Sendable {
+  let state: String
+  let dedupeKey: String
+  let ackRequired: Bool
+  let clearCondition: String
+}
+
+enum P081RedactionState: Equatable, Sendable {
+  case ordinaryNil(fieldDisplayName: String)
+  case redacted(fieldDisplayName: String, redaction: P081GraphQLRedaction)
+  case dropResource(fieldDisplayName: String, denialCopy: String, redaction: P081GraphQLRedaction)
+
+  var accessibilityLabel: String {
+    switch self {
+    case .ordinaryNil(let fieldDisplayName),
+      .redacted(let fieldDisplayName, _):
+      return fieldDisplayName
+    case .dropResource:
+      return "Restricted view"
+    }
+  }
+
+  var accessibilityValue: String {
+    switch self {
+    case .ordinaryNil:
+      return "No value"
+    case .redacted:
+      return "Restricted value"
+    case .dropResource(_, let denialCopy, _):
+      return denialCopy
+    }
+  }
+
+  var accessibilityHint: String? {
+    switch self {
+    case .ordinaryNil:
+      return nil
+    case .redacted:
+      return "Permissions hide this value. Copy diagnostics for the access rule."
+    case .dropResource:
+      return "Permissions hide this resource. Copy diagnostics for the access rule."
+    }
+  }
+}
+
+struct P081AccessibilityModePolicy: Equatable, Sendable {
+  let fullKeyboardAccessEnabled: Bool
+  let increaseContrastEnabled: Bool
+  let reduceMotionEnabled: Bool
+
+  func presentation(for state: P081RedactionState) -> P081RedactionPresentation {
+    let restricted: Bool
+    switch state {
+    case .ordinaryNil:
+      restricted = false
+    case .redacted, .dropResource:
+      restricted = true
+    }
+    return P081RedactionPresentation(
+      accessibilityLabel: state.accessibilityLabel,
+      accessibilityValue: state.accessibilityValue,
+      accessibilityHint: state.accessibilityHint,
+      isKeyboardFocusable: fullKeyboardAccessEnabled,
+      visualTreatment: restricted && increaseContrastEnabled ? .highContrastRestricted : .ordinary
+    )
+  }
+
+  func disabledApprovalPresentation(reason: String) -> P081DisabledApprovalPresentation {
+    P081DisabledApprovalPresentation(
+      isActionEnabled: false,
+      isKeyboardFocusable: fullKeyboardAccessEnabled,
+      accessibilityHint: "Approval action disabled. \(reason)"
+    )
+  }
+
+  func alertPresentation(for severity: String) -> P081AlertPresentation {
+    if reduceMotionEnabled {
+      return P081AlertPresentation(allowsMotion: false, attentionStyle: .staticCritical)
+    }
+    return P081AlertPresentation(
+      allowsMotion: true,
+      attentionStyle: severity.lowercased() == "critical" ? .animatedCritical : .staticInformational
+    )
+  }
+}
+
+struct P081RedactionPresentation: Equatable, Sendable {
+  let accessibilityLabel: String
+  let accessibilityValue: String
+  let accessibilityHint: String?
+  let isKeyboardFocusable: Bool
+  let visualTreatment: P081RedactionVisualTreatment
+}
+
+enum P081RedactionVisualTreatment: Equatable, Sendable {
+  case ordinary
+  case highContrastRestricted
+}
+
+struct P081DisabledApprovalPresentation: Equatable, Sendable {
+  let isActionEnabled: Bool
+  let isKeyboardFocusable: Bool
+  let accessibilityHint: String
+}
+
+struct P081AlertPresentation: Equatable, Sendable {
+  let allowsMotion: Bool
+  let attentionStyle: P081AlertAttentionStyle
+}
+
+enum P081AlertAttentionStyle: Equatable, Sendable {
+  case animatedCritical
+  case staticCritical
+  case staticInformational
+}
+
 enum P031GraphQLResponseDecoder {
+  nonisolated static func decodeExtensions(from data: Data) throws -> P081GraphQLResponseExtensions {
+    let envelope: P031GraphQLResponseEnvelope<P031EmptyGraphQLPayload>
+    do {
+      envelope = try JSONDecoder().decode(P031GraphQLResponseEnvelope<P031EmptyGraphQLPayload>.self, from: data)
+    } catch {
+      throw P031GraphQLReadBoundaryError.decodingFailed(error.localizedDescription)
+    }
+    return envelope.extensions ?? P081GraphQLResponseExtensions()
+  }
+
   nonisolated static func decode<Payload: Decodable>(
     _ payloadType: Payload.Type,
     from data: Data,
@@ -955,6 +1149,8 @@ enum P031GraphQLResponseDecoder {
     return payload
   }
 }
+
+nonisolated private struct P031EmptyGraphQLPayload: Decodable {}
 
 enum P031ReadErrorPresenter {
   nonisolated static let schemaMismatchTitle = "Daemon schema mismatch"
@@ -1017,6 +1213,10 @@ enum P031DisabledReasonCode: String, Codable, CaseIterable, Equatable, Sendable 
   case conflict = "CONFLICT"
   case duplicate = "DUPLICATE"
   case alreadyResolved = "ALREADY_RESOLVED"
+  case approvalNotActionable = "APPROVAL_NOT_ACTIONABLE"
+  case observerScope = "OBSERVER_SCOPE"
+  case nonApprovalMutation = "NON_APPROVAL_MUTATION"
+  case capabilityOutOfScope = "CAPABILITY_OUT_OF_SCOPE"
 
   // Fail-closed: unknown server values decode to .writePathNotAvailable (most restrictive).
   init(from decoder: Decoder) throws {
@@ -3224,8 +3424,8 @@ enum P031GraphQLDocuments {
     """
 
   static let approveApproval = """
-    mutation P072ApproveApproval($approvalId: ID!) {
-      approveApproval(approvalId: $approvalId) {
+    mutation P072ApproveApproval($approvalId: ID!, $idempotencyKey: String!) {
+      approveApproval(approvalId: $approvalId, idempotencyKey: $idempotencyKey) {
         approval {
           id
           runId
@@ -3246,8 +3446,8 @@ enum P031GraphQLDocuments {
     """
 
   static let rejectApproval = """
-    mutation P072RejectApproval($approvalId: ID!, $reason: String!) {
-      rejectApproval(approvalId: $approvalId, reason: $reason) {
+    mutation P072RejectApproval($approvalId: ID!, $reason: String!, $idempotencyKey: String!) {
+      rejectApproval(approvalId: $approvalId, reason: $reason, idempotencyKey: $idempotencyKey) {
         approval {
           id
           runId
@@ -4573,6 +4773,14 @@ enum DisabledReasonPresenter {
       return "Duplicate"
     case .alreadyResolved:
       return "Already resolved"
+    case .approvalNotActionable:
+      return "Approval Not Actionable"
+    case .observerScope:
+      return "Read-Only Access"
+    case .nonApprovalMutation:
+      return "GraphQL Action Blocked"
+    case .capabilityOutOfScope:
+      return "Action Not Available"
     }
   }
 }

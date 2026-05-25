@@ -41,10 +41,13 @@ impl JsonRpcResponse {
         }
     }
 
+    /// Build an error response with structured `data`. Used for INTERNAL errors
+    /// so callers can include a stable code and request_id without leaking raw
+    /// error strings.
     pub fn error_with_data(
         id: Option<serde_json::Value>,
         code: i32,
-        message: String,
+        message: impl Into<String>,
         data: serde_json::Value,
     ) -> Self {
         JsonRpcResponse {
@@ -53,7 +56,35 @@ impl JsonRpcResponse {
             result: None,
             error: Some(JsonRpcError {
                 code,
-                message,
+                message: message.into(),
+                data: Some(data),
+            }),
+        }
+    }
+
+    /// Build a policy-denial error response per P081 MCP contract:
+    /// known-but-denied tools return -32004 with structured data containing
+    /// reason_code, caller_class, row_id, and boundary_policy_version.
+    pub fn policy_denial(
+        id: Option<serde_json::Value>,
+        reason_code: &str,
+        caller_class: &str,
+        row_id: Option<&str>,
+        policy_version: &str,
+    ) -> Self {
+        let data = serde_json::json!({
+            "reason_code": reason_code,
+            "caller_class": caller_class,
+            "row_id": row_id,
+            "boundary_policy_version": policy_version,
+        });
+        JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32004,
+                message: "tool denied".to_string(),
                 data: Some(data),
             }),
         }

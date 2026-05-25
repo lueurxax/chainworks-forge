@@ -165,6 +165,9 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
                         case .conflict: return .conflict
                         case .duplicate: return .duplicate
                         case .alreadyResolved: return .alreadyResolved
+                        case .approvalNotActionable: return .alreadyResolved
+                        case .observerScope: return .unauthorized
+                        case .nonApprovalMutation, .capabilityOutOfScope: return .unsupported
                         case .writePathNotAvailable: return .unavailable
                         }
                     }

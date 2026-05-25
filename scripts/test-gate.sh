@@ -245,6 +245,11 @@ PROPOSAL_085_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal085Tests"
 )
 
+PROPOSAL_081_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal081ApprovalActionAttemptStoreTests"
+  "Chainworks ForgeTests/Proposal081GraphQLRedactionTests"
+)
+
 P060_PROPOSAL_REVISION_ID="P060-r16-2026-04-22"
 PROPOSAL_060_CONTROL_ARTIFACT_DIR="docs/proposals/060-control-artifacts"
 PROPOSAL_060_CONTROL_ARTIFACT_SPECS=(
@@ -2393,6 +2398,7 @@ Available gates:
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
+  proposal-081|p081  Proposal 081 Phase 1 boundary-first API and auth contract matrix gate
   proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
   proposal-086|p086|p086-continuation-preflight
                   Proposal 086 Phase 0 preflight: migration shape, MCP/artifact schemas, and Rust unit tests
@@ -2443,6 +2449,7 @@ case "$GATE" in
     guard_direct_run_insertion
     guard_xcode_cargo_cache_policy
     guard_plan_tag_sync
+    "$ROOT_DIR/scripts/check-boundary-coverage.sh"
     ;;
   build)
     check_idle_environment allow_app
@@ -7093,6 +7100,339 @@ PY
     )
     run_targeted_tests "proposal-084" "${PROPOSAL_084_SWIFT_TESTS[@]}"
     log "Proposal 084 gate passed"
+    ;;
+  proposal-081|p081)
+    log "Proposal 081 gate: boundary-first API and auth contract matrix (Phase 1+2)"
+
+    log "P081: boundary coverage guardrail"
+    "$ROOT_DIR/scripts/check-boundary-coverage.sh"
+
+    log "P081: fixture JSON validity - verify boundary-first-api-auth-contract.json exists and is valid JSON"
+    python3 - <<'PY'
+import json, sys, pathlib
+root = pathlib.Path(sys.argv[0]).parent.parent if sys.argv[0] != "-" else pathlib.Path(".")
+import os
+root = pathlib.Path(os.environ.get("ROOT_DIR", "."))
+fixture_path = root / "docs/reference/boundary-first-api-auth-contract.json"
+if not fixture_path.exists():
+    raise SystemExit("P081: missing docs/reference/boundary-first-api-auth-contract.json")
+try:
+    fixture = json.loads(fixture_path.read_text())
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"P081: invalid JSON in boundary-first-api-auth-contract.json: {exc}") from exc
+if fixture.get("schema_version") != 1:
+    raise SystemExit(f"P081: expected schema_version 1, got {fixture.get('schema_version')}")
+if "matrix_id" not in fixture:
+    raise SystemExit("P081: boundary fixture missing matrix_id")
+if not fixture.get("rows"):
+    raise SystemExit("P081: boundary fixture rows array is empty")
+REQUIRED_ROW_IDS = [
+    "p081.ui_operator.graphql_query.read",
+    "p081.ui_operator.graphql_subscription.subscribe",
+    "p081.ui_operator.graphql_mutation.approval_action",
+    "p081.agent_operator.mcp_initialize.capability",
+    "p081.agent_operator.mcp_tools_list.discovery",
+    "p081.agent_operator.mcp_tools_call.command",
+    "p081.automation.mcp_tools_list.discovery",
+    "p081.automation.mcp_tools_call.command",
+    "p081.observer.mcp_tools_call.compact_read",
+    "p081.observer.graphql_query.read_only_opt_in",
+    "p081.developer_break_glass.debug_endpoint.disabled",
+]
+present_ids = {row["row_id"] for row in fixture["rows"]}
+for required in REQUIRED_ROW_IDS:
+    if required not in present_ids:
+        raise SystemExit(f"P081: required row '{required}' missing from fixture")
+print(f"P081: fixture valid - {len(fixture['rows'])} rows, all {len(REQUIRED_ROW_IDS)} required rows present")
+PY
+
+    log "P081: doc exists - verify boundary-first-api-auth-contract.md exists"
+    if [[ ! -f "$ROOT_DIR/docs/reference/boundary-first-api-auth-contract.md" ]]; then
+      die "P081: missing docs/reference/boundary-first-api-auth-contract.md"
+    fi
+
+    log "P081: operator readback and shadow coverage evidence fixtures"
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+matrix_path = root / "docs/reference/boundary-first-api-auth-contract.json"
+readback_path = root / "docs/evidence/rollout-contract/operator-readback/p081-full-surface.fixture.json"
+coverage_path = root / "docs/evidence/boundary-policy-shadow-coverage/report.json"
+canary_path = root / "docs/evidence/boundary-policy-shadow-coverage/boundary-policy-canaries.yaml"
+
+def load(path: pathlib.Path) -> dict:
+    if not path.exists():
+        raise SystemExit(f"P081: missing evidence fixture {path.relative_to(root)}")
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"P081: invalid JSON in {path.relative_to(root)}: {exc}") from exc
+
+readback = load(readback_path)
+fixture = load(matrix_path)
+present_ids = {row["row_id"] for row in fixture.get("rows") or []}
+if readback.get("schema_version") != "operator_readback_v1":
+    raise SystemExit("P081: operator readback fixture schema_version mismatch")
+if readback.get("proposal_id") != "proposal-081":
+    raise SystemExit("P081: operator readback fixture proposal_id mismatch")
+if readback.get("rollout_contract_status") != "pass":
+    raise SystemExit("P081: operator readback fixture must be pass")
+if "placeholder" in readback or "placeholder_pending_implementation_evidence" in json.dumps(readback):
+    raise SystemExit("P081: operator readback fixture still contains placeholder evidence")
+graphql = (readback.get("parity_lanes") or {}).get("graphql") or {}
+mcp = (readback.get("parity_lanes") or {}).get("mcp") or {}
+if not graphql.get("operatorAlerts"):
+    raise SystemExit("P081: GraphQL lane must include operatorAlerts proof")
+if (graphql.get("websocketPolicyReload") or {}).get("closeCode") != 4408:
+    raise SystemExit("P081: GraphQL lane must prove 4408 policy reload close code")
+if not (mcp.get("operator_alerts_list") or {}).get("alerts_include_safe_mode"):
+    raise SystemExit("P081: MCP lane must prove operator.alerts.list safe-mode alert")
+
+coverage = load(coverage_path)
+if not canary_path.exists():
+    raise SystemExit("P081: missing boundary-policy-canaries.yaml source artifact")
+canary_text = canary_path.read_text()
+if "schema_version: boundary_policy_canaries_v1" not in canary_text:
+    raise SystemExit("P081: boundary-policy-canaries.yaml schema_version mismatch")
+for required in present_ids:
+    if f"row_id: {required}" not in canary_text:
+        raise SystemExit(f"P081: boundary-policy-canaries.yaml missing row {required}")
+if "expected_decision: allow_redacted" not in canary_text:
+    raise SystemExit("P081: canary artifact must include allow_redacted observer proof")
+if coverage.get("schema_version") != "boundary_policy_shadow_coverage_report_v1":
+    raise SystemExit("P081: shadow coverage schema_version mismatch")
+if coverage.get("matrix_id") != fixture.get("matrix_id"):
+    raise SystemExit("P081: shadow coverage matrix_id mismatch")
+rows = coverage.get("rows") or []
+row_ids = {row.get("row_id") for row in rows}
+missing = sorted(present_ids - row_ids)
+if missing:
+    raise SystemExit(f"P081: shadow coverage missing matrix rows: {missing}")
+for row in rows:
+    if row.get("shadow_disagreement_count") != 0:
+        raise SystemExit(f"P081: shadow disagreement for {row.get('row_id')}")
+    if not row.get("canary_covered") and int(row.get("observation_count") or 0) < 10:
+        raise SystemExit(f"P081: row lacks canary coverage or 10 observations: {row.get('row_id')}")
+print("P081: operator readback and shadow coverage fixtures valid")
+PY
+
+    log "P081: structured boundary-policy canary validator"
+    python3 "$ROOT_DIR/scripts/validate-p081-canaries.py" --root "$ROOT_DIR" --self-test
+
+    log "P081: reliability proof inventory is gate-owned"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+inventory = {
+    "sqlite_contention": "SQLITE_CONTENTION_RETRY_EXHAUSTED",
+    "audit_outage": "E_AUDIT_UNAVAILABLE",
+    "subscription_gap_replay": "proposal_081_websocket_policy_reload_close_contract_is_explicit",
+    "safe_mode_exit_readback": "proposal_081_boundary_runtime_graphql_readback_is_bounded",
+    "sigterm_drain": "shutdown_drain_completes_within_deadline_exits_zero",
+    "denial_audit_backpressure": "audit_log.append",
+    "committed_unack_retry": "p081_idempotency_pending_sentinel_recovers_committed_unack_without_reexecution",
+}
+haystack = "\n".join(
+    path.read_text(errors="ignore")
+    for path in [
+        root / "scripts/test-gate.sh",
+        root / "control-plane/crates/graphql-server/src/schema.rs",
+        root / "control-plane/crates/graphql-server/src/server.rs",
+        root / "control-plane/crates/mcp-server/src/server.rs",
+        root / "control-plane/crates/db/src/repos/audit_log.rs",
+        root / "control-plane/crates/daemon/src/main.rs",
+    ]
+    if path.exists()
+)
+for name, token in inventory.items():
+    if token not in haystack:
+        raise SystemExit(f"P081: reliability proof inventory missing {name} token {token!r}")
+print("P081: reliability proof inventory valid")
+PY
+
+    log "P081: auth crate boundary module unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p auth boundary:: -- --nocapture
+    )
+
+    log "P081: auth crate CallerClass and CallerContext unit tests (Phase 2)"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p auth caller_class -- --nocapture
+    )
+
+    log "P081: db crate audit_log repo unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p db repos::audit_log:: -- --nocapture
+      cargo test -p db metrics::tests::proposal_081_required_metric_names_are_declared_and_recordable -- --nocapture
+      cargo test -p db repos::audit_log::tests::append_and_health_roundtrip -- --nocapture
+      cargo test -p db repos::audit_log::tests::p081_audit_budget_warning_and_safe_mode_emit_runtime_readback_and_metrics -- --nocapture
+      cargo test -p db repos::audit_log::tests::p081_audit_budget_recovery_exits_after_cleanup_and_half_open_probes -- --nocapture
+    )
+
+    log "P081: rollout metric labels and native-delivery semantics are gate-owned"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+metrics = (root / "control-plane/crates/db/src/metrics.rs").read_text()
+required_metric_tokens = [
+    '"boundary_policy_decision_latency_ms"',
+    '("transport", transport)',
+    '("caller_class", caller_class)',
+    '("mode", mode)',
+    '"boundary_commit_transaction_latency_ms"',
+    '("action_kind", action_kind)',
+    '("decision", decision)',
+    '"operator_alert_clear_latency_ms"',
+    '("alert_id", alert_id)',
+    '("severity", severity)',
+    'record_p081_audit_log_append_failure(event_type: &str, transport: &str, mode: &str)',
+    'event_type={event_type},transport={transport},mode={mode}',
+]
+for token in required_metric_tokens:
+    if token not in metrics:
+        raise SystemExit(f"P081: metrics.rs missing label/semantic token {token!r}")
+
+for rel in [
+    "control-plane/crates/graphql-server/src/schema.rs",
+    "control-plane/crates/mcp-server/src/tools/runtime.rs",
+    "control-plane/crates/mcp-server/src/server.rs",
+]:
+    content = (root / rel).read_text()
+    if 'increment_counter("audit_log_append_failure_total")' in content:
+        raise SystemExit(f"P081: {rel} still records bare audit_log_append_failure_total")
+    for stale in ["record_p081_operator_alert_native_delivery", "graphql_operator_alerts", "mcp_operator_alerts"]:
+        if stale in content and "operator_alert_native_delivery" in content:
+            raise SystemExit(f"P081: {rel} still records native-delivery as readback availability")
+
+notification = (root / "Chainworks Forge/Engine/NotificationService.swift").read_text()
+for token in [
+    'metricName = "operator_alert_native_delivery_total"',
+    'surface: "macos_notification_service"',
+    'result: "delivered"',
+    'result: "deduped"',
+    'result: "silenced"',
+]:
+    if token not in notification:
+        raise SystemExit(f"P081: NotificationService missing native metric token {token!r}")
+print("P081: rollout metric labels and native-delivery semantics valid")
+PY
+
+    log "P081: migration compile check - audit_log and audit_log_checkpoints migrations exist"
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/068_p081_audit_log.sql" ]]; then
+      die "P081: missing migration 068_p081_audit_log.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/069_p081_audit_log_checkpoints.sql" ]]; then
+      die "P081: missing migration 069_p081_audit_log_checkpoints.sql"
+    fi
+
+    log "P081: migration compile check - command_journal caller_class column migration exists (Phase 2)"
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/070_p081_caller_class.sql" ]]; then
+      die "P081: missing migration 070_p081_caller_class.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/071_p081_approval_idempotency.sql" ]]; then
+      die "P081: missing migration 071_p081_approval_idempotency.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/072_p081_fix_payload_length_check.sql" ]]; then
+      die "P081: missing migration 072_p081_fix_payload_length_check.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/073_p081_approval_idempotency_request_hash.sql" ]]; then
+      die "P081: missing migration 073_p081_approval_idempotency_request_hash.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/074_p081_mcp_command_idempotency.sql" ]]; then
+      die "P081: missing migration 074_p081_mcp_command_idempotency.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/075_p081_command_journal_idempotency.sql" ]]; then
+      die "P081: missing migration 075_p081_command_journal_idempotency.sql"
+    fi
+
+    log "P081: schema_version 3 bootstrap and unknown-version rejection tests (Phase 2)"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p auth bootstrap_emits_schema_version_3 -- --nocapture
+      cargo test -p auth v3_principal_table_rejects_unknown_schema_version -- --nocapture
+      cargo test -p auth v3_principal_table_derives_caller_class_not_stored -- --nocapture
+      cargo test -p auth p081_principals_file_rejects_hard_links_and_non_private_parent_dir -- --nocapture
+    )
+
+    log "P081: bounded GraphQL/MCP boundary runtime and operator alert readback tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p graphql-server proposal_081_boundary_runtime_graphql_readback_is_bounded -- --nocapture
+      cargo test -p graphql-server proposal_081_operator_alerts_surface_safe_mode_without_raw_audit_rows -- --nocapture
+      cargo test -p graphql-server proposal_081_observer_operator_alerts_redact_fields_without_graphql_errors -- --nocapture
+      cargo test -p graphql-server proposal_081_subscription_runtime_readback_exposes_cursor_gap_contract -- --nocapture
+      cargo test -p graphql-server proposal_081_runtime_subscription_payload_carries_cursor_generation_and_gap -- --nocapture
+      cargo test -p graphql-server proposal_081_audit_budget_safe_mode_denies_approval_mutation -- --nocapture
+      cargo test -p graphql-server proposal_081_websocket_policy_reload_close_contract_is_explicit -- --nocapture
+      cargo test -p graphql-server test_graphql_ws_rejects_missing_connection_init_auth -- --nocapture
+      cargo test -p graphql-server test_graphql_ws_rejects_non_ui_caller_with_forbidden_close -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server proposal_081_runtime_health_includes_boundary_runtime_readback -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server proposal_081_operator_alerts_list_exposes_safe_mode_alert -- --nocapture
+    )
+
+    log "P081: production daemon injects BoundaryPolicy through explicit constructors"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+main = (root / "control-plane/crates/daemon/src/main.rs").read_text()
+if "McpServer::new_with_storage_writer_and_boundary_policy" not in main:
+    raise SystemExit("P081: daemon must construct MCP server with explicit BoundaryPolicy constructor")
+if "graphql_server::schema::build_schema_with_storage_writer_and_boundary_policy" not in main:
+    raise SystemExit("P081: daemon must construct GraphQL schema with explicit BoundaryPolicy constructor")
+if re.search(r"McpServer::new_with_storage_writer\s*\(", main):
+    raise SystemExit("P081: production daemon must not use fail-open MCP constructor")
+if re.search(r"graphql_server::schema::build_schema\s*\(", main):
+    raise SystemExit("P081: production daemon must not use fail-open GraphQL schema constructor")
+print("P081: production daemon uses explicit BoundaryPolicy constructors")
+PY
+
+    log "P081: daemon shutdown drain reliability tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p daemon shutdown_drain_completes_within_deadline_exits_zero -- --nocapture
+      cargo test -p daemon shutdown_drain_exceeds_deadline_reports_timeout -- --nocapture
+    )
+
+    log "P081: MCP state-changing ideas.create is command-journaled and idempotency-linked"
+    (
+      cd "$ROOT_DIR/control-plane"
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_ideas_create_records_command_journal_and_idempotency_linkage -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_ideas_create_idempotency_replay_does_not_duplicate_command_commit -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_idempotency_storage_unavailable_fails_closed_with_sqlite_contention_code -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_idempotency_pending_sentinel_recovers_committed_unack_without_reexecution -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server proposal_081_audit_budget_safe_mode_denies_state_changing_mcp_call -- --nocapture
+    )
+
+    log "P081: macOS accessibility contract source coverage"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+proposal = (root / "docs/proposals/081-boundary-first-api-auth-contract-matrix.md").read_text()
+reference = (root / "docs/reference/swift-macos-boundary-contract.md").read_text()
+tokens = [
+    "full_keyboard_access_redacted_nil_vs_ordinary_nil",
+    "increase_contrast_redaction_state",
+    "reduce_motion_alert_state",
+    "operator_alert_fires_and_clears_hidden_window",
+]
+for token in tokens:
+    if token not in proposal:
+        raise SystemExit(f"P081: proposal missing macOS accessibility proof token {token}")
+    if token not in reference:
+        raise SystemExit(f"P081: reference missing macOS accessibility proof token {token}")
+print("P081: macOS accessibility contract source coverage valid")
+PY
+
+    log "P081: Swift approval action attempt idempotency store"
+    run_targeted_tests "proposal-081-swift" "${PROPOSAL_081_SWIFT_TESTS[@]}"
+
+    log "Proposal 081 boundary-first API/auth gate passed"
     ;;
   full)
     check_idle_environment strict

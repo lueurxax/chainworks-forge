@@ -40,6 +40,9 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [per-run-workspace-isolation.md](per-run-workspace-isolation.md) — Per-run meta-root derivation, path resolution, ACP env handoff, worktree exemption, transition/normalization isolation, and legacy fallback semantics
 - [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) — Canonical GraphQL projection read contract for the thin macOS client: implemented surfaces, projection freshness, freshness budgets, subscriptions, backpressure, and downstream UI consumption rules
 - [thin-client-read-model-affordance-contract.md](thin-client-read-model-affordance-contract.md) — GraphQL-driven thin-client affordance rows, payload/freshness/actionability mapping, fallback copy, and proof gates
+- [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md) — Boundary-First API and Auth Contract Matrix: P081 architectural overview, caller classification, policy evaluation, audit, idempotency, and macOS native boundary contracts
+- [boundary-first-api-auth-contract.json](boundary-first-api-auth-contract.json) — Boundary-First API and Auth Contract Matrix: executable fixture schema and contract
+- [swift-macos-boundary-contract.md](swift-macos-boundary-contract.md) — SwiftUI boundary contract (P081): accessibility parity, approval-attempt idempotency store, macOS commands, redaction envelope, window state, and native critical alert delivery
 
 ## Live Execution
 

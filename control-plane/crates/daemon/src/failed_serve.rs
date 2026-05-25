@@ -87,11 +87,10 @@ async fn graphql_daemon_status_only(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if auth::extract_bearer_token(auth_header)
+    let resolved = auth::extract_bearer_token(auth_header)
         .ok()
-        .and_then(|token| auth::resolve_bearer(token, &principal_table).ok())
-        .is_none()
-    {
+        .and_then(|token| auth::resolve_bearer(token, &principal_table).ok());
+    if resolved.is_none() {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -101,6 +100,12 @@ async fn graphql_daemon_status_only(
         )
             .into_response();
     }
+    // MEDIUM-001: backup_path and full failure detail are only disclosed to
+    // Operator-class principals (ui_operator). Observer and Agent tokens receive
+    // the same refusal shape but without the diagnostic backup path.
+    let is_operator = resolved
+        .map(|p| matches!(p.class, auth::PrincipalClass::Operator))
+        .unwrap_or(false);
 
     let text = std::str::from_utf8(&body).unwrap_or_default();
     // Try parse as JSON `{"query": "..."}` (standard GraphQL HTTP shape).
@@ -117,14 +122,20 @@ async fn graphql_daemon_status_only(
     let is_daemon_status_only = has_daemon_status && !has_mutation && !has_subscription;
 
     if !is_daemon_status_only {
-        return refusal_response(reporter.snapshot());
+        return refusal_response(reporter.snapshot(), is_operator);
     }
 
     // Build the daemonStatus envelope — mirrors graphql-server::GqlDaemonStatus
     // field names so a Swift client parses the same shape on the failed
     // and healthy paths.
+    // MEDIUM-001: the inner `json` field embeds the full DaemonStatus snapshot including
+    // backup_path; only Operator-class callers receive it.
     let snapshot = reporter.snapshot();
-    let json_str = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
+    let json_str = if is_operator {
+        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string())
+    } else {
+        "{}".to_string()
+    };
     let body = serde_json::json!({
         "data": {
             "daemonStatus": {
@@ -143,8 +154,19 @@ async fn graphql_daemon_status_only(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// SEC-002: catch-all for unknown paths returns a minimal response without failure
+/// detail or backup_path. Those diagnostic fields are only disclosed to authenticated
+/// callers via /graphql or /mcp, not to any caller that can reach an arbitrary path.
 async fn refuse_handler(Extension(reporter): Extension<LifecycleReporter>) -> impl IntoResponse {
-    refusal_response(reporter.snapshot())
+    let status = reporter.snapshot();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "daemon_in_failed_state",
+            "state": status.state.to_string(),
+        })),
+    )
+        .into_response()
 }
 
 /// R13 API-002 / §8.7: JSON-RPC–shaped refusal for `/mcp`. Parses the
@@ -154,8 +176,14 @@ async fn refuse_handler(Extension(reporter): Extension<LifecycleReporter>) -> im
 /// protocol-level status via the JSON-RPC envelope rather than the
 /// transport status code. Notifications (missing or null `id`) still
 /// get 202 Accepted per JSON-RPC 2.0.
+///
+/// SEC-P081: Failure detail (kind, detail, backup_path) is only returned
+/// to authenticated callers. Unauthenticated requests receive the state
+/// only, preventing diagnostic/file-path disclosure when startup has failed.
 async fn mcp_refuse_handler(
     Extension(reporter): Extension<LifecycleReporter>,
+    Extension(principal_table): Extension<auth::PrincipalTable>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let parsed: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
@@ -169,14 +197,37 @@ async fn mcp_refuse_handler(
         return (StatusCode::ACCEPTED, ()).into_response();
     }
 
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // MEDIUM-001: only Operator-class principals receive backup_path and full failure
+    // detail. Agent and Observer tokens see the state but not filesystem paths.
+    let resolved_class = auth::extract_bearer_token(auth_header)
+        .ok()
+        .and_then(|token| auth::resolve_bearer(token, &principal_table).ok())
+        .map(|p| p.class);
+    let is_operator = matches!(resolved_class, Some(auth::PrincipalClass::Operator));
+    let is_authenticated = resolved_class.is_some();
+
     let snapshot = reporter.snapshot();
-    let failure = snapshot.failure.as_ref().map(|f| {
-        serde_json::json!({
-            "kind": f.kind.to_string(),
-            "detail": f.detail,
-            "backup_path": f.backup_path,
+    let failure = if is_authenticated {
+        snapshot.failure.as_ref().map(|f| {
+            if is_operator {
+                serde_json::json!({
+                    "kind": f.kind.to_string(),
+                    "detail": f.detail,
+                    "backup_path": f.backup_path,
+                })
+            } else {
+                serde_json::json!({
+                    "kind": f.kind.to_string(),
+                })
+            }
         })
-    });
+    } else {
+        None
+    };
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -192,16 +243,28 @@ async fn mcp_refuse_handler(
     (StatusCode::OK, Json(body)).into_response()
 }
 
-fn refusal_response(status: domain::lifecycle::DaemonStatus) -> axum::response::Response {
+fn refusal_response(
+    status: domain::lifecycle::DaemonStatus,
+    is_operator: bool,
+) -> axum::response::Response {
+    // MEDIUM-001: backup_path is a local filesystem path that should only be
+    // disclosed to Operator-class principals. Non-operator authenticated callers
+    // see kind and detail but not backup_path.
     let failure = status
         .failure
         .as_ref()
         .map(|f| {
-            serde_json::json!({
-                "kind": f.kind.to_string(),
-                "detail": f.detail,
-                "backup_path": f.backup_path,
-            })
+            if is_operator {
+                serde_json::json!({
+                    "kind": f.kind.to_string(),
+                    "detail": f.detail,
+                    "backup_path": f.backup_path,
+                })
+            } else {
+                serde_json::json!({
+                    "kind": f.kind.to_string(),
+                })
+            }
         })
         .unwrap_or(serde_json::Value::Null);
     (
@@ -349,7 +412,7 @@ mod tests {
             "POST",
             "/graphql",
             Body::from(mutation.to_string()),
-            &[("authorization", "Bearer test-token")],
+            &[("authorization", "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx")],
         )
         .await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
@@ -404,7 +467,7 @@ mod tests {
             "POST",
             "/graphql",
             Body::from(query.to_string()),
-            &[("authorization", "Bearer test-token")],
+            &[("authorization", "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx")],
         )
         .await;
         assert_eq!(code, StatusCode::OK);
@@ -426,7 +489,7 @@ mod tests {
             "POST",
             "/graphql",
             Body::from(query.to_string()),
-            &[("authorization", "Bearer test-token")],
+            &[("authorization", "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx")],
         )
         .await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
@@ -436,11 +499,39 @@ mod tests {
     /// R13 API-002: `/mcp` in failed-serve must return a JSON-RPC
     /// -32000 envelope rather than a bare HTTP 503 blob. Preserves
     /// the inbound `id` so the client can match the response.
+    /// Authenticated callers receive full failure details.
     #[tokio::test]
     async fn test_failed_serve_mcp_returns_jsonrpc_error_with_request_id() {
         let req = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 7,
+            "method": "tools/list",
+            "params": {}
+        });
+        let (code, body) = call_with_body_and_headers(
+            test_failed_router(),
+            "POST",
+            "/mcp",
+            Body::from(req.to_string()),
+            &[("authorization", "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx")],
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 7);
+        assert_eq!(body["error"]["code"], -32000);
+        assert_eq!(body["error"]["message"], "daemon_in_failed_state");
+        assert_eq!(body["error"]["data"]["state"], "failed");
+        assert_eq!(body["error"]["data"]["failure"]["kind"], "migration_failed");
+    }
+
+    /// SEC-P081: unauthenticated `/mcp` in failed-serve must NOT disclose
+    /// failure details (kind, detail, backup_path). Only state is returned.
+    #[tokio::test]
+    async fn test_failed_serve_mcp_rejects_unauthenticated_failure_details() {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
             "method": "tools/list",
             "params": {}
         });
@@ -453,11 +544,14 @@ mod tests {
         .await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["jsonrpc"], "2.0");
-        assert_eq!(body["id"], 7);
+        assert_eq!(body["id"], 42);
         assert_eq!(body["error"]["code"], -32000);
-        assert_eq!(body["error"]["message"], "daemon_in_failed_state");
         assert_eq!(body["error"]["data"]["state"], "failed");
-        assert_eq!(body["error"]["data"]["failure"]["kind"], "migration_failed");
+        // Failure details must NOT be disclosed to unauthenticated callers.
+        assert!(
+            body["error"]["data"]["failure"].is_null(),
+            "failure details must be redacted for unauthenticated MCP callers"
+        );
     }
 
     #[tokio::test]
@@ -478,6 +572,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    /// SEC-002: the catch-all route for unknown paths must NOT disclose failure detail
+    /// or backup_path to unauthenticated callers. Only state and error are returned.
+    #[tokio::test]
+    async fn test_failed_serve_unknown_path_does_not_leak_failure_details() {
+        let (code, body) = call(test_failed_router(), "GET", "/unknown-path-xyz").await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "daemon_in_failed_state");
+        assert_eq!(body["state"], "failed");
+        // SEC-002: failure detail and backup_path must NOT be disclosed on the catch-all route.
+        assert!(
+            body.get("failure").is_none(),
+            "catch-all must not disclose failure details to unauthenticated callers"
+        );
+    }
+
+    /// SEC-002: catch-all route also does not disclose failure details for POST requests.
+    #[tokio::test]
+    async fn test_failed_serve_unknown_post_path_does_not_leak_failure_details() {
+        let (code, body) = call_with_body(
+            test_failed_router(),
+            "POST",
+            "/completely-unknown",
+            Body::from("{}"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "daemon_in_failed_state");
+        assert!(
+            body.get("failure").is_none(),
+            "catch-all POST must not disclose failure details"
+        );
     }
 
     #[tokio::test]
@@ -530,5 +657,61 @@ mod tests {
             "expected migration_failed kind in body:\n{text}"
         );
         server.abort();
+    }
+
+    // ── MEDIUM-001 regression: backup_path restricted to Operator-class ──────
+
+    /// MEDIUM-001: Observer-class token must not receive backup_path in MCP /mcp failure response.
+    /// Only Operator-class principals are allowed to see backup_path.
+    #[tokio::test]
+    async fn test_failed_serve_mcp_observer_does_not_receive_backup_path() {
+        let observer_table = auth::PrincipalTable::test_fixture_observer();
+        let router = build_failed_serve_router(test_reporter_failed(), observer_table);
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/list",
+            "params": {}
+        });
+        let (code, body) = call_with_body_and_headers(
+            router,
+            "POST",
+            "/mcp",
+            Body::from(req.to_string()),
+            &[("authorization", "Bearer observer-token-xxxxxxxxxxxxxxxxxx")],
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["error"]["code"], -32000);
+        // Observer must see state but not backup_path.
+        assert_eq!(body["error"]["data"]["state"], "failed");
+        assert!(
+            body["error"]["data"]["failure"]["backup_path"].is_null(),
+            "observer token must not receive backup_path in MCP failure response"
+        );
+    }
+
+    /// MEDIUM-001: Operator-class token receives full failure detail including backup_path in MCP.
+    #[tokio::test]
+    async fn test_failed_serve_mcp_operator_receives_backup_path() {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "tools/list",
+            "params": {}
+        });
+        let (code, body) = call_with_body_and_headers(
+            test_failed_router(),
+            "POST",
+            "/mcp",
+            Body::from(req.to_string()),
+            &[("authorization", "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx")],
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            body["error"]["data"]["failure"]["backup_path"],
+            "/tmp/db.backup"
+        );
     }
 }

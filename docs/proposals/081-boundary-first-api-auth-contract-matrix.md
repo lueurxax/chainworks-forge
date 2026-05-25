@@ -698,6 +698,7 @@ At the current HEAD baseline, Chainworks Forge remains the product described in 
   - **Redacted Nil:** The rendered control or value exposes accessibilityLabel equal to the field display name, accessibilityValue 'Restricted value', accessibilityHint 'Permissions hide this value. Copy diagnostics for the access rule.', and a locked or disabled trait appropriate to the control without pretending the value is empty.
   - **Required Tests**
     - accessibility_redaction_parity
+    - full_keyboard_access_redacted_nil_vs_ordinary_nil
     - keyboard_full_access_actionability_false
     - increase_contrast_redaction_state
     - reduce_motion_alert_state
@@ -1001,14 +1002,14 @@ At the current HEAD baseline, Chainworks Forge remains the product described in 
 - GraphQL query, subscription, mutation, MCP initialize, MCP tools/list, MCP tools/call, and approval actionability all call the same daemon-injected BoundaryPolicy instance.
 - GraphQL errors use the deterministic HTTP/WebSocket extensions contract with explicit camelCase fields.
 - MCP known-but-denied tools use -32004 while unknown tools remain -32601, with initialize capability signal for P081 servers.
-- State-changing allowed calls commit BoundaryPolicy decision, command_journal, idempotency, approval settlement, and other durable domain writes owned by that command write unit, plus any required audit_log rows, atomically in one BEGIN IMMEDIATE SQLite transaction using the existing control-plane write-unit pattern.
+- State-changing allowed calls use the P081 durable idempotency preclaim contract: a pending sentinel is written before dispatch, the command write unit stamps the same idempotency key and BoundaryPolicy row into command_journal/domain writes, and post-dispatch commit links the sentinel to the journal/result. If the process crashes after the command commits but before the result is acknowledged, committed-unack recovery resolves the pending sentinel from command_journal and refuses silent re-execution.
 - approveApproval and rejectApproval require idempotencyKey, check terminal state under settlement transaction, and do not double-settle on retry.
 - State-changing MCP commands have a required idempotency contract or are explicitly classified read-only and reject idempotencyKey.
 - Denial-side-effect tests prove denied calls create zero command_journal rows, zero approval settlements, and zero projection writes except matrix-declared audit rows.
 - scripts/check-boundary-coverage.sh is wired into test-gate guardrails and fails in-scope changes without matrix/fixture touch, matrix_row citation, or boundary-no-op label.
 - Security hardening tests prove principals.json mode/canonical-path checks, strict JSON parsing, constant-time bearer-token comparison, expiry enforcement, token_id derivation redaction, error-envelope non-disclosure, disabled break-glass non-disclosure, audit-log DoS controls, and audit/fixture tamper evidence.
 - boundary-policy-canaries.yaml has a validator and contributes canary rows to the same shadow coverage report schema as live observations.
-- SQLite contention, audit outage, subscription cursor/gap detection, safe-mode readback/exit, SIGTERM drain, committed-unack retry, and denial-audit backpressure behavior are covered by reliability tests.
+- SQLite contention, audit outage, subscription cursor/gap detection, safe-mode readback/exit, SIGTERM drain, committed-unack idempotency recovery, and denial-audit backpressure behavior are covered by reliability tests.
 - Operator alert contract has GraphQL/MCP readback, payload schema, severity/dedupe/silence/clear lifecycle, numeric thresholds/windows, macOS-native alert delivery, and alert-fires-and-clears tests with the main window hidden or inactive.
 - boundaryRuntime and audit_log_health readback expose policy mode, safe mode, fixture digests, audit writability, integrity state, retention/cleanup state, and shadow coverage report refs in bounded GraphQL and MCP diagnostic lanes without introducing a broad audit table browser.
 - Swift approval mutations use ApprovalActionAttemptStore-owned idempotencyKey generation/reuse, and typed GraphQL decoding preserves extensions.redactions so redacted nil differs from ordinary nil.

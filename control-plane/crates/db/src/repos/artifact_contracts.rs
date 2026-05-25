@@ -800,6 +800,9 @@ pub async fn expire_overrides_for_stage(
             Some("system"),
             Some("artifact_contract_override_expiry"),
             None,
+            None,
+            None,
+            None,
         )
         .await?;
         Some(journal_id)

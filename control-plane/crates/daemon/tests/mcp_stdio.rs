@@ -125,10 +125,8 @@ fn test_mcp_stdio_rejects_initialize_without_principal_token() {
     let response: serde_json::Value =
         serde_json::from_str(first_line.trim()).expect("stdio response should be JSON");
     assert_eq!(response["error"]["code"], -32000);
-    assert_eq!(
-        response["error"]["message"],
-        "unauthorized: principal_token required on initialize"
-    );
+    // SEC-REQ-1: All auth failures collapse to a single opaque message.
+    assert_eq!(response["error"]["message"], "unauthorized");
 
     assert_child_exits(&mut child, Duration::from_secs(2));
     let _ = fs::remove_file(db_path);
@@ -158,7 +156,7 @@ fn test_mcp_stdio_rejects_initialize_with_unknown_principal_token() {
     let stdin = child.stdin.as_mut().expect("stdin should be piped");
     writeln!(
         stdin,
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"principal_token\":\"unknown-token\"}}}}}}"
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"principal_token\":\"unknown-mcp-token-xxxxxxxxxxxxxx\"}}}}}}"
     )
     .expect("write initialize request");
     stdin.flush().expect("flush initialize request");
@@ -173,7 +171,8 @@ fn test_mcp_stdio_rejects_initialize_with_unknown_principal_token() {
     let response: serde_json::Value =
         serde_json::from_str(first_line.trim()).expect("stdio response should be JSON");
     assert_eq!(response["error"]["code"], -32000);
-    assert_eq!(response["error"]["message"], "unauthorized: unknown token");
+    // SEC-REQ-1: All auth failures collapse to a single opaque message.
+    assert_eq!(response["error"]["message"], "unauthorized");
 
     assert_child_exits(&mut child, Duration::from_secs(2));
     let _ = fs::remove_file(db_path);
@@ -205,7 +204,7 @@ fn test_mcp_stdio_binds_principal_for_session_lifetime() {
 
     writeln!(
         stdin,
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"principal_token\":\"known-token\"}}}}}}"
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"principal_token\":\"known-mcp-token-xxxxxxxxxxxxxxxx\"}}}}}}"
     )
     .expect("write initialize request");
     stdin.flush().expect("flush initialize request");
@@ -255,7 +254,7 @@ fn test_mcp_stdio_rejects_reinitialize_mid_session() {
 
     writeln!(
         stdin,
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"principal_token\":\"known-token\"}}}}}}"
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"principal_token\":\"known-mcp-token-xxxxxxxxxxxxxxxx\"}}}}}}"
     )
     .expect("write initialize request");
     stdin.flush().expect("flush initialize request");
@@ -263,7 +262,7 @@ fn test_mcp_stdio_rejects_reinitialize_mid_session() {
 
     writeln!(
         stdin,
-        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"principal_token\":\"known-token\"}}}}}}"
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"principal_token\":\"known-mcp-token-xxxxxxxxxxxxxxxx\"}}}}}}"
     )
     .expect("write second initialize request");
     stdin.flush().expect("flush second initialize request");
@@ -295,7 +294,7 @@ fn principal_fixture_json() -> &'static str {
       "schema_version": 2,
       "principals": [
         {
-          "token": "known-token",
+          "token": "known-mcp-token-xxxxxxxxxxxxxxxx",
           "id": "default-operator",
           "class": "operator",
           "surface_policies": {
