@@ -945,6 +945,77 @@ enum P081RedactionState: Equatable, Sendable {
   }
 }
 
+struct P081AccessibilityModePolicy: Equatable, Sendable {
+  let fullKeyboardAccessEnabled: Bool
+  let increaseContrastEnabled: Bool
+  let reduceMotionEnabled: Bool
+
+  func presentation(for state: P081RedactionState) -> P081RedactionPresentation {
+    let restricted: Bool
+    switch state {
+    case .ordinaryNil:
+      restricted = false
+    case .redacted, .dropResource:
+      restricted = true
+    }
+    return P081RedactionPresentation(
+      accessibilityLabel: state.accessibilityLabel,
+      accessibilityValue: state.accessibilityValue,
+      accessibilityHint: state.accessibilityHint,
+      isKeyboardFocusable: fullKeyboardAccessEnabled,
+      visualTreatment: restricted && increaseContrastEnabled ? .highContrastRestricted : .ordinary
+    )
+  }
+
+  func disabledApprovalPresentation(reason: String) -> P081DisabledApprovalPresentation {
+    P081DisabledApprovalPresentation(
+      isActionEnabled: false,
+      isKeyboardFocusable: fullKeyboardAccessEnabled,
+      accessibilityHint: "Approval action disabled. \(reason)"
+    )
+  }
+
+  func alertPresentation(for severity: String) -> P081AlertPresentation {
+    if reduceMotionEnabled {
+      return P081AlertPresentation(allowsMotion: false, attentionStyle: .staticCritical)
+    }
+    return P081AlertPresentation(
+      allowsMotion: true,
+      attentionStyle: severity.lowercased() == "critical" ? .animatedCritical : .staticInformational
+    )
+  }
+}
+
+struct P081RedactionPresentation: Equatable, Sendable {
+  let accessibilityLabel: String
+  let accessibilityValue: String
+  let accessibilityHint: String?
+  let isKeyboardFocusable: Bool
+  let visualTreatment: P081RedactionVisualTreatment
+}
+
+enum P081RedactionVisualTreatment: Equatable, Sendable {
+  case ordinary
+  case highContrastRestricted
+}
+
+struct P081DisabledApprovalPresentation: Equatable, Sendable {
+  let isActionEnabled: Bool
+  let isKeyboardFocusable: Bool
+  let accessibilityHint: String
+}
+
+struct P081AlertPresentation: Equatable, Sendable {
+  let allowsMotion: Bool
+  let attentionStyle: P081AlertAttentionStyle
+}
+
+enum P081AlertAttentionStyle: Equatable, Sendable {
+  case animatedCritical
+  case staticCritical
+  case staticInformational
+}
+
 enum P031GraphQLResponseDecoder {
   nonisolated static func decodeExtensions(from data: Data) throws -> P081GraphQLResponseExtensions {
     let envelope: P031GraphQLResponseEnvelope<P031EmptyGraphQLPayload>

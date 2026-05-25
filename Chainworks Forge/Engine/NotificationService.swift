@@ -2,6 +2,14 @@ import Foundation
 import UserNotifications
 import AppKit
 
+struct P081OperatorAlertNativeDeliveryMetricEvent: Equatable, Sendable {
+    static let metricName = "operator_alert_native_delivery_total"
+
+    let severity: String
+    let surface: String
+    let result: String
+}
+
 // MARK: - P005-OPS §10: Notification Service
 
 /// Local notifications, dock badge, optional menu bar presence.
@@ -21,6 +29,7 @@ final class NotificationService {
     private var userMenuBarEnabled: Bool = false
     private var operatorAlertForcesMenuBar: Bool = false
     private var deliveredOperatorAlertKeys: Set<String> = []
+    private(set) var p081NativeDeliveryMetricEvents: [P081OperatorAlertNativeDeliveryMetricEvent] = []
 
     init(preferences: NotificationPreferences = .defaultPreferences) {
         self.preferences = preferences
@@ -132,12 +141,17 @@ final class NotificationService {
 
         for alert in activeAlerts {
             guard let nativeDelivery = alert.nativeDelivery else { continue }
-            guard !isP081OperatorAlertSilenced(alert, now: now) else { continue }
+            if isP081OperatorAlertSilenced(alert, now: now) {
+                recordP081NativeDeliveryMetric(alert: alert, result: "silenced")
+                continue
+            }
             guard deliveredOperatorAlertKeys.insert(nativeDelivery.deliveryKey).inserted else {
+                recordP081NativeDeliveryMetric(alert: alert, result: "deduped")
                 continue
             }
             requestP081OperatorAttention(nativeDelivery.requestUserAttention)
             scheduleP081OperatorAlertNotification(alert, nativeDelivery: nativeDelivery)
+            recordP081NativeDeliveryMetric(alert: alert, result: "delivered")
         }
     }
 
@@ -229,6 +243,16 @@ final class NotificationService {
         content.sound = .default
         content.categoryIdentifier = nativeDelivery.notificationCategory
         scheduleNotification(id: "p081_operator_alert_\(nativeDelivery.deliveryKey)", content: content)
+    }
+
+    private func recordP081NativeDeliveryMetric(alert: P081OperatorAlert, result: String) {
+        p081NativeDeliveryMetricEvents.append(
+            P081OperatorAlertNativeDeliveryMetricEvent(
+                severity: alert.severity,
+                surface: "macos_notification_service",
+                result: result
+            )
+        )
     }
 
     private static var notificationsSuppressedForCurrentProcess: Bool {

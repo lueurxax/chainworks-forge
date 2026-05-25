@@ -29,6 +29,12 @@ pub struct MaintenanceOperation {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct RepairSlotResult {
+    pub operation: MaintenanceOperation,
+    pub journal_id: String,
+}
+
 pub async fn repair_slot(
     pool: &SqlitePool,
     idempotency_key: &str,
@@ -39,6 +45,36 @@ pub async fn repair_slot(
     request_id: Option<&str>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<MaintenanceOperation> {
+    Ok(repair_slot_with_mcp_context(
+        pool,
+        idempotency_key,
+        operation_id,
+        slot_generation,
+        caller_principal_id,
+        caller_principal_class,
+        request_id,
+        cancel,
+        None,
+        None,
+        None,
+    )
+    .await?
+    .operation)
+}
+
+pub async fn repair_slot_with_mcp_context(
+    pool: &SqlitePool,
+    idempotency_key: &str,
+    operation_id: &str,
+    slot_generation: i64,
+    caller_principal_id: &str,
+    caller_principal_class: &str,
+    request_id: Option<&str>,
+    cancel: tokio_util::sync::CancellationToken,
+    mcp_idempotency_key: Option<&str>,
+    mcp_idempotency_request_hash: Option<&str>,
+    mcp_boundary_row_id: Option<&str>,
+) -> Result<RepairSlotResult> {
     if idempotency_key.is_empty() {
         return Err(anyhow!("idempotency_key cannot be empty"));
     }
@@ -60,6 +96,9 @@ pub async fn repair_slot(
             caller_principal_class,
             request_id,
             cancel.clone(),
+            mcp_idempotency_key,
+            mcp_idempotency_request_hash,
+            mcp_boundary_row_id,
         )
         .await
         {
@@ -183,7 +222,10 @@ async fn repair_slot_once(
     caller_principal_class: &str,
     request_id: Option<&str>,
     cancel: tokio_util::sync::CancellationToken,
-) -> Result<MaintenanceOperation> {
+    mcp_idempotency_key: Option<&str>,
+    mcp_idempotency_request_hash: Option<&str>,
+    mcp_boundary_row_id: Option<&str>,
+) -> Result<RepairSlotResult> {
     // P087-SEC-L-002: validate lengths before consuming a writer slot.
     if idempotency_key.len() > 256 {
         return Err(anyhow!("idempotency_key too long (max 256 bytes)"));
@@ -207,6 +249,15 @@ async fn repair_slot_once(
         "slot_generation": slot_generation,
         "idempotency_key": idempotency_key,
     });
+    crate::repos::mcp_command_idempotency::claim_pending_for_command_tx(
+        &mut tx,
+        mcp_idempotency_key,
+        "storage.maintenance.repair_slot",
+        caller_principal_id,
+        mcp_idempotency_request_hash,
+        mcp_boundary_row_id,
+    )
+    .await?;
     crate::repos::command_journal::record_tx(
         &mut tx,
         &journal_id,
@@ -220,8 +271,8 @@ async fn repair_slot_once(
         Some("storage.maintenance.repair_slot"),
         request_id,
         None,
-        None,
-        None,
+        mcp_idempotency_key,
+        mcp_boundary_row_id,
     )
     .await?;
 
@@ -257,12 +308,18 @@ async fn repair_slot_once(
             crate::repos::command_journal::complete_entry_tx(&mut tx, &journal_id, Utc::now())
                 .await?;
             tx.commit().await?;
-            return row_to_maintenance_op(target_row);
+            return Ok(RepairSlotResult {
+                operation: row_to_maintenance_op(target_row)?,
+                journal_id,
+            });
         }
 
         crate::repos::command_journal::complete_entry_tx(&mut tx, &journal_id, Utc::now()).await?;
         tx.commit().await?;
-        return Ok(op);
+        return Ok(RepairSlotResult {
+            operation: op,
+            journal_id,
+        });
     }
 
     // P087: Check if already repaired by anyone (different idempotency key)
@@ -287,7 +344,10 @@ async fn repair_slot_once(
 
         crate::repos::command_journal::complete_entry_tx(&mut tx, &journal_id, Utc::now()).await?;
         tx.commit().await?;
-        return row_to_maintenance_op(target_row);
+        return Ok(RepairSlotResult {
+            operation: row_to_maintenance_op(target_row)?,
+            journal_id,
+        });
     }
 
     // 2. Read target operation
@@ -319,7 +379,10 @@ async fn repair_slot_once(
     if found_gen > slot_generation {
         crate::repos::command_journal::complete_entry_tx(&mut tx, &journal_id, Utc::now()).await?;
         tx.commit().await?;
-        return row_to_maintenance_op(target_row);
+        return Ok(RepairSlotResult {
+            operation: row_to_maintenance_op(target_row)?,
+            journal_id,
+        });
     }
 
     // Operations in 'running' or 'pending' state must be reaped by the
@@ -395,7 +458,10 @@ async fn repair_slot_once(
     let final_op = row_to_maintenance_op(final_row)?;
     crate::repos::command_journal::complete_entry_tx(&mut tx, &journal_id, Utc::now()).await?;
     tx.commit().await?;
-    Ok(final_op)
+    Ok(RepairSlotResult {
+        operation: final_op,
+        journal_id,
+    })
 }
 
 async fn release_slot_with_cas(

@@ -170,13 +170,18 @@ struct Proposal081GraphQLRedactionTests {
     service.applyP081OperatorAlerts([activeAlert])
     #expect(service.pendingAttentionCount == 3)
     #expect(service.isMenuBarEnabled == true)
+    #expect(service.p081NativeDeliveryMetricEvents.last?.severity == "critical")
+    #expect(service.p081NativeDeliveryMetricEvents.last?.surface == "macos_notification_service")
+    #expect(service.p081NativeDeliveryMetricEvents.last?.result == "delivered")
 
     service.applyP081OperatorAlerts([activeAlert])
     #expect(service.pendingAttentionCount == 3)
+    #expect(service.p081NativeDeliveryMetricEvents.last?.result == "deduped")
 
     service.applyP081OperatorAlerts([inactiveAlert])
     #expect(service.pendingAttentionCount == 2)
     #expect(service.isMenuBarEnabled == false)
+    #expect(P081OperatorAlertNativeDeliveryMetricEvent.metricName == "operator_alert_native_delivery_total")
   }
 
   @Test("P081 actionability_false keeps keyboard actions disabled with accessible diagnostics")
@@ -240,6 +245,9 @@ struct Proposal081GraphQLRedactionTests {
     #expect(alert.accessibilityValue == "silenced")
     #expect(alert.silencedUntilMs == futureMs)
     #expect(service.pendingAttentionCount == 1)
+    #expect(service.p081NativeDeliveryMetricEvents.last?.severity == "critical")
+    #expect(service.p081NativeDeliveryMetricEvents.last?.surface == "macos_notification_service")
+    #expect(service.p081NativeDeliveryMetricEvents.last?.result == "silenced")
   }
 
   @MainActor
@@ -295,6 +303,7 @@ struct Proposal081GraphQLRedactionTests {
     #expect(service.isMenuBarEnabled == true)
     #expect(activeAlert.nativeDelivery?.requestUserAttention == "critical")
     #expect(activeAlert.nativeDelivery?.notificationCategory == "BOUNDARY_POLICY_CRITICAL")
+    #expect(service.p081NativeDeliveryMetricEvents.last?.result == "delivered")
 
     service.applyP081OperatorAlerts([clearedAlert])
 
@@ -329,6 +338,49 @@ struct Proposal081GraphQLRedactionTests {
       "operator_alert_fires_and_clears_hidden_window"
     ]
     #expect(namedCoverage.count == 4)
+  }
+
+  @Test("P081 accessibility mode policy drives concrete keyboard, contrast, and motion behavior")
+  func accessibilityModesDriveConcreteP081Behavior() throws {
+    let redacted = P081RedactionState.redacted(
+      fieldDisplayName: "Operator note",
+      redaction: P081GraphQLRedaction(
+        path: ["run", "operatorNote"],
+        reasonCode: "observer_field_denied",
+        rowId: "matrix-row-observer",
+        redactionMode: "redact_field",
+        callerClass: "observer",
+        redactionId: "redaction-observer-note"
+      )
+    )
+    let ordinary = P081RedactionState.ordinaryNil(fieldDisplayName: "Operator note")
+
+    let fullKeyboard = P081AccessibilityModePolicy(
+      fullKeyboardAccessEnabled: true,
+      increaseContrastEnabled: false,
+      reduceMotionEnabled: false
+    )
+    #expect(fullKeyboard.presentation(for: redacted).isKeyboardFocusable == true)
+    #expect(fullKeyboard.presentation(for: ordinary).isKeyboardFocusable == true)
+    #expect(fullKeyboard.disabledApprovalPresentation(reason: "Boundary policy denied").isKeyboardFocusable == true)
+    #expect(fullKeyboard.disabledApprovalPresentation(reason: "Boundary policy denied").isActionEnabled == false)
+    #expect(fullKeyboard.disabledApprovalPresentation(reason: "Boundary policy denied").accessibilityHint.contains("Boundary policy denied"))
+
+    let highContrast = P081AccessibilityModePolicy(
+      fullKeyboardAccessEnabled: false,
+      increaseContrastEnabled: true,
+      reduceMotionEnabled: false
+    )
+    #expect(highContrast.presentation(for: redacted).visualTreatment == .highContrastRestricted)
+    #expect(highContrast.presentation(for: ordinary).visualTreatment == .ordinary)
+
+    let reducedMotion = P081AccessibilityModePolicy(
+      fullKeyboardAccessEnabled: false,
+      increaseContrastEnabled: false,
+      reduceMotionEnabled: true
+    )
+    #expect(reducedMotion.alertPresentation(for: "critical").allowsMotion == false)
+    #expect(reducedMotion.alertPresentation(for: "critical").attentionStyle == .staticCritical)
   }
 }
 

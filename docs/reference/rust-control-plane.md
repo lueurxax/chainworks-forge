@@ -111,27 +111,24 @@ area by the caller's principal class. See
 [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md)
 for the implemented authentication and capability filtering reference.
 
-P081 introduces a boundary-first authorization contract that routes every
-decision through a shared `BoundaryPolicy` keyed on a server-derived
-`CallerClass`. The boundary matrix, executable fixture, validator, audit-log
-storage, `CallerClass` enum, and principal-table `schema_version 3` reader have
-landed as Phase 1+2 scaffolding. Phase 3 daemon-injected `BoundaryPolicy` is now
-wired into the `CommandHandler`, GraphQL query/subscription/mutation paths, and
-the MCP `initialize`/`tools/list`/`tools/call` paths with mode-aware semantics
-(`shadow`, `enforce`, `read_only_safe_mode`, `legacy_compat`), and
-`command_journal.caller_class` is populated by the shared decision path. Phase 5
-`approval_mutation_idempotency` storage has landed for the
-`approveApproval`/`rejectApproval` retry contract, and the
-`mcp_command_idempotency` table plus dispatcher enforcement is wired for
-state-changing MCP tools (require `idempotency_key`, replay cached result on
-duplicate hash, `IDEMPOTENCY_CONFLICT` on hash mismatch, reject `idempotency_key`
-on read-only tools). Phase 4+5 readback now includes bounded `boundaryRuntime`,
-GraphQL `operatorAlerts`, MCP `operator.alerts.list`, principal-file hardening,
+P081 implements a boundary-first authorization contract that routes decisions
+through a shared `BoundaryPolicy` keyed on a server-derived `CallerClass`. The
+boundary matrix, executable fixture, validator, audit-log storage, `CallerClass`
+enum, and principal-table `schema_version 3` reader have landed. The
+daemon-injected `BoundaryPolicy` is wired into the `CommandHandler`, GraphQL
+query/subscription/mutation paths, and MCP `initialize`/`tools/list`/`tools/call`
+paths with mode-aware semantics (`shadow`, `enforce`, `read_only_safe_mode`,
+`legacy_compat`), and `command_journal.caller_class` is populated by the shared
+decision path. `approval_mutation_idempotency` backs the
+`approveApproval`/`rejectApproval` retry contract, while
+`mcp_command_idempotency` plus dispatcher enforcement governs state-changing MCP
+tools (require `idempotency_key`, replay cached result on duplicate hash,
+`IDEMPOTENCY_CONFLICT` on hash mismatch, reject `idempotency_key` on read-only
+tools). Bounded readback includes `boundaryRuntime`, GraphQL `operatorAlerts`,
+MCP `boundary.runtime.get` / `operator.alerts.list`, principal-file hardening,
 typed Swift `extensions.redactions` preservation, and redaction accessibility
-state tests; production enforce cutover still depends on live shadow observation
-collection and host-specific macOS native alert validation — see
-[boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md) for
-the matrix, rollout phases, and Phase status header.
+state tests; production mode selection remains governed by the rollout-mode and
+fixture rules in [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md).
 
 ### GraphQL
 

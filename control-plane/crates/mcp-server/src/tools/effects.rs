@@ -328,6 +328,7 @@ async fn apply_effect_disposition_write_unit(
     caller_principal_id: &str,
     caller_principal_class: &str,
     idempotency_key: Option<&str>,
+    idempotency_request_hash: Option<&str>,
     boundary_row_id: Option<&str>,
     request_id: Option<&str>,
 ) -> Result<(String, DispositionOutcome)> {
@@ -341,6 +342,17 @@ async fn apply_effect_disposition_write_unit(
         "new_status": new_status.to_string(),
         "disposition_id": disposition_id,
     });
+
+    db::repos::mcp_command_idempotency::claim_pending_for_command_tx(
+        &mut tx,
+        idempotency_key,
+        tool_name,
+        caller_principal_id,
+        idempotency_request_hash,
+        boundary_row_id,
+    )
+    .await
+    .context("effect disposition: claim mcp idempotency")?;
 
     db::repos::command_journal::record_tx(
         &mut tx,
@@ -586,6 +598,7 @@ pub async fn handle_effects_mark_conflict(
     }
 
     let idempotency_key = crate::request_context::current_idempotency_key();
+    let idempotency_request_hash = crate::request_context::current_idempotency_request_hash();
     let boundary_row_id = crate::request_context::current_boundary_row_id();
     let request_id = crate::request_context::current_request_id();
 
@@ -603,6 +616,7 @@ pub async fn handle_effects_mark_conflict(
         &principal.id,
         &principal.class.to_string(),
         idempotency_key.as_deref(),
+        idempotency_request_hash.as_deref(),
         boundary_row_id.as_deref(),
         request_id.as_deref(),
     )
@@ -691,6 +705,7 @@ pub async fn handle_effects_mark_unrecoverable(
     }
 
     let idempotency_key = crate::request_context::current_idempotency_key();
+    let idempotency_request_hash = crate::request_context::current_idempotency_request_hash();
     let boundary_row_id = crate::request_context::current_boundary_row_id();
     let request_id = crate::request_context::current_request_id();
 
@@ -708,6 +723,7 @@ pub async fn handle_effects_mark_unrecoverable(
         &principal.id,
         &principal.class.to_string(),
         idempotency_key.as_deref(),
+        idempotency_request_hash.as_deref(),
         boundary_row_id.as_deref(),
         request_id.as_deref(),
     )
@@ -791,6 +807,7 @@ pub async fn handle_effects_clear_after_manual_verification(
     }
 
     let idempotency_key = crate::request_context::current_idempotency_key();
+    let idempotency_request_hash = crate::request_context::current_idempotency_request_hash();
     let boundary_row_id = crate::request_context::current_boundary_row_id();
     let request_id = crate::request_context::current_request_id();
 
@@ -808,6 +825,7 @@ pub async fn handle_effects_clear_after_manual_verification(
         &principal.id,
         &principal.class.to_string(),
         idempotency_key.as_deref(),
+        idempotency_request_hash.as_deref(),
         boundary_row_id.as_deref(),
         request_id.as_deref(),
     )

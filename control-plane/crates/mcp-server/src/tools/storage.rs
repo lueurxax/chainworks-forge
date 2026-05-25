@@ -456,6 +456,11 @@ pub async fn execute_with_writer(
                     request_id,
                 ));
             }
+            if !dry_run {
+                anyhow::bail!(
+                    "storage.reconcile_evidence_orphans non-dry-run is disabled until it has a P081 atomic MCP write unit"
+                );
+            }
 
             // Resolve artifact root server-side — never from client params (SEC-001).
             let artifact_root = match resolve_artifact_root() {
@@ -525,7 +530,11 @@ pub async fn execute_with_writer(
                 ));
             }
 
-            match db::repos::maintenance::repair_slot(
+            let mcp_idempotency_key = crate::request_context::current_idempotency_key();
+            let mcp_idempotency_request_hash =
+                crate::request_context::current_idempotency_request_hash();
+            let mcp_boundary_row_id = crate::request_context::current_boundary_row_id();
+            match db::repos::maintenance::repair_slot_with_mcp_context(
                 pool,
                 idempotency_key,
                 op_id,
@@ -534,10 +543,17 @@ pub async fn execute_with_writer(
                 &principal.class.to_string(),
                 crate::request_context::current_request_id().as_deref(),
                 cancel,
+                mcp_idempotency_key.as_deref(),
+                mcp_idempotency_request_hash.as_deref(),
+                mcp_boundary_row_id.as_deref(),
             )
             .await
             {
-                Ok(op) => Ok(public_maintenance_operation(&op)),
+                Ok(result) => {
+                    let mut payload = public_maintenance_operation(&result.operation);
+                    payload["journal_id"] = serde_json::json!(result.journal_id);
+                    Ok(payload)
+                }
                 Err(e) => {
                     let (code, message) = repair_slot_public_error(&e);
                     Ok(typed_error(
@@ -574,6 +590,8 @@ pub async fn execute_with_writer(
 
             let principal_class = principal.class.to_string();
             let mcp_idempotency_key = crate::request_context::current_idempotency_key();
+            let mcp_idempotency_request_hash =
+                crate::request_context::current_idempotency_request_hash();
             let mcp_boundary_row_id = crate::request_context::current_boundary_row_id();
             let journal_id = db::repos::projection_invalidation::clear_backlog(
                 pool,
@@ -583,6 +601,7 @@ pub async fn execute_with_writer(
                 Some(&principal_class),
                 request_id,
                 mcp_idempotency_key.as_deref(),
+                mcp_idempotency_request_hash.as_deref(),
                 mcp_boundary_row_id.as_deref(),
             )
             .await?;
@@ -613,6 +632,8 @@ pub async fn execute_with_writer(
 
             let principal_class = principal.class.to_string();
             let mcp_idempotency_key = crate::request_context::current_idempotency_key();
+            let mcp_idempotency_request_hash =
+                crate::request_context::current_idempotency_request_hash();
             let mcp_boundary_row_id = crate::request_context::current_boundary_row_id();
             let journal_id = db::repos::projection_invalidation::clear_poison(
                 pool,
@@ -622,6 +643,7 @@ pub async fn execute_with_writer(
                 Some(&principal_class),
                 request_id,
                 mcp_idempotency_key.as_deref(),
+                mcp_idempotency_request_hash.as_deref(),
                 mcp_boundary_row_id.as_deref(),
             )
             .await?;

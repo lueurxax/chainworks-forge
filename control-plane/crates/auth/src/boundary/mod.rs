@@ -935,7 +935,10 @@ impl BoundaryPolicy {
             // GraphQL mutations and MCP tool calls are denied; bounded diagnostic
             // MCP reads remain available so operators can see why safe mode is active.
             if transport == "mcp_tools_call"
-                && matches!(action, Some("runtime.health" | "operator.alerts.list"))
+                && matches!(
+                    action,
+                    Some("runtime.health" | "boundary.runtime.get" | "operator.alerts.list")
+                )
             {
                 return PolicyDecision::Allow {
                     row_id: Some("p081.safe_mode.mcp_diagnostic_read".into()),

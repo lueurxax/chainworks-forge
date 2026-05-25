@@ -46,11 +46,11 @@ It is never written back to `principals.json` as a persisted identity field.
 | `ui_operator` | `graphql_mutation` | `p081.ui_operator.graphql_mutation.approval_action` | `approveApproval`, `rejectApproval` | `approval_record` | FORBIDDEN with NON_APPROVAL_MUTATION or APPROVAL_NOT_ACTIONABLE | `allowed_approval`, `denied_non_approval`, `no_journal_write_on_deny`, `approval_idempotency` |
 | `agent_operator` | `mcp_initialize` | `p081.agent_operator.mcp_initialize.capability` | `initialize` | `none` | auth failure without capability inventory | `mcp_initialize_boundary_policy_capability` |
 | `agent_operator` | `mcp_tools_list` | `p081.agent_operator.mcp_tools_list.discovery` | `tools/list`, `resources.list`, `resources.templates.list` | `none` | denied known tools omitted; no command_journal write | `mcp_tools_list_filters_denied_tools` |
-| `agent_operator` | `mcp_tools_call` | `p081.agent_operator.mcp_tools_call.command` | `runs.*`, `ideas.*`, `approvals.*`, `stages.*`, `reports.*`, `artifacts.*`, `steward.*`, `storage.*`, `runtime.*`, `effects.*`, `resources.*` (allow.wildcard=true) | `command_journal` | JSON-RPC -32004 with CAPABILITY_OUT_OF_SCOPE or MATRIX_NO_ROW | `allowed_mcp_command`, `denied_graphql_mutation`, `denied_out_of_scope_tool`, `mcp_command_idempotency` |
+| `agent_operator` | `mcp_tools_call` | `p081.agent_operator.mcp_tools_call.command` | `runs.*`, `ideas.*`, `approvals.*`, `stages.*`, `reports.*`, `artifacts.*`, `steward.*`, `storage.*`, `runtime.*`, `boundary.*`, `effects.*`, `resources.*` (allow.wildcard=true) | `command_journal` | JSON-RPC -32004 with CAPABILITY_OUT_OF_SCOPE or MATRIX_NO_ROW | `allowed_mcp_command`, `denied_graphql_mutation`, `denied_out_of_scope_tool`, `mcp_command_idempotency` |
 | `automation` | `mcp_tools_list` | `p081.automation.mcp_tools_list.discovery` | `tools/list`, `resources.list`, `resources.templates.list` | `none` | tools outside automation_capabilities omitted | `automation_tools_list_scope` |
-| `automation` | `mcp_tools_call` | `p081.automation.mcp_tools_call.command` | `runs.*`, `ideas.*`, `approvals.*`, `stages.*`, `reports.*`, `artifacts.*`, `steward.*`, `storage.*`, `runtime.*`, `effects.*`, `resources.*` (allow.wildcard=true) | `command_journal` | JSON-RPC -32004 with CAPABILITY_OUT_OF_SCOPE | `token_scope_matrix`, `denial_side_effect_test`, `mcp_command_idempotency` |
-| `observer` | `mcp_tools_call` | `p081.observer.mcp_tools_call.compact_read` | `runtime.health`, `runs.list`, `runs.get`, `approvals.list`, `approvals.get`, `stages.list`, `stages.get`, `artifacts.list`, `artifacts.get`, `reports.list`, `reports.get`, `steward.status`, `resources.list`, `resources.read` (allow.wildcard=false; redaction mode `actionability_false`) | `projection_read_model` | OBSERVER_SCOPE for mutations; actionability forced false | `observer_cannot_mutate`, `observer_compact_read_only` |
-| `observer` | `graphql_query` | `p081.observer.graphql_query.read_only_opt_in` | `graphql.read_only` (allow.enabled=false until opt-in lands) | `projection_read_model` | FORBIDDEN or redaction with OBSERVER_SCOPE; actionability forced false | `observer_graphql_default_denied`, `opt_in_redaction_parity`, `accessibility_redaction_parity` |
+| `automation` | `mcp_tools_call` | `p081.automation.mcp_tools_call.command` | `runs.*`, `ideas.*`, `approvals.*`, `stages.*`, `reports.*`, `artifacts.*`, `steward.*`, `storage.*`, `runtime.*`, `boundary.*`, `effects.*`, `resources.*` (allow.wildcard=true) | `command_journal` | JSON-RPC -32004 with CAPABILITY_OUT_OF_SCOPE | `token_scope_matrix`, `denial_side_effect_test`, `mcp_command_idempotency` |
+| `observer` | `mcp_tools_call` | `p081.observer.mcp_tools_call.compact_read` | `runtime.health`, `boundary.runtime.get`, `runs.list`, `runs.get`, `approvals.list`, `approvals.get`, `stages.list`, `stages.get`, `artifacts.list`, `artifacts.get`, `reports.list`, `reports.get`, `steward.status`, `resources.list`, `resources.read` (allow.wildcard=false; redaction mode `actionability_false`) | `projection_read_model` | OBSERVER_SCOPE for mutations; actionability forced false | `observer_cannot_mutate`, `observer_compact_read_only` |
+| `observer` | `graphql_query` | `p081.observer.graphql_query.read_only_opt_in` | `graphql.read_only` explicit opt-in | `projection_read_model` | FORBIDDEN or redaction with OBSERVER_SCOPE; actionability forced false | `observer_graphql_default_denied`, `opt_in_redaction_parity`, `accessibility_redaction_parity` |
 | `developer_break_glass` | `debug_endpoint` | `p081.developer_break_glass.debug_endpoint.disabled` | `debug.preflight` (allow.enabled=false until env gate set) | `audit_log` | BREAK_GLASS_DISABLED; E_AUDIT_UNAVAILABLE if audit row cannot commit | `env_gate_test`, `audit_event_assertion`, `no_projection_write_test`, `audit_unavailable_fail_closed` |
 
 ---
@@ -108,7 +108,7 @@ Operators can inspect the active boundary runtime without reading raw audit rows
 - GraphQL query `boundaryRuntime` returns `schemaVersion = "boundary_runtime.v1"`, `matrixId`, `policyInjected`, `policyMode`, `safeModeActive`, `fixtureDigest`, and `auditLogHealth`.
 - GraphQL query `operatorAlerts` returns bounded `operator_alert_v1` rows derived from boundary runtime health. The safe-mode alert uses dedupe key `p081.boundary.safe_mode_active`, severity `critical`, is not silenceable while active, and embeds only the bounded `boundaryRuntime` envelope. Each alert includes lifecycle fields (`acknowledgedAtMs`, `silencedUntilMs`, `lifecycle.state`, `lifecycle.dedupeKey`, `lifecycle.ackRequired`, `lifecycle.clearCondition`) plus a native-delivery descriptor (`deliveryKey`, `dockBadgeContribution`, `requestUserAttention`, `notificationCategory`, `dedupePolicy`) so the macOS shell can drive Dock/status/notification escalation from readback, not local inference.
 - Observer GraphQL reads are denied by default. The only v1 opt-in read action is `graphql.read_only`; on that path server resolvers must null sensitive fields before response serialization and attach camelCase `extensions.redactions` entries with `redactionMode = field_null_redacted`.
-- MCP `runtime.health` includes the same object at `boundaryRuntime`.
+- MCP `runtime.health` includes the same object at `boundaryRuntime` for compatibility. MCP `boundary.runtime.get` returns the same P081 object as top-level `snake_case` fields, matching the `initialize.boundary_policy.field_casing = snake_case` contract.
 - MCP tool `operator.alerts.list` returns `operator_alerts_readback_v1` with the same bounded alert rows and lifecycle/native-delivery shape. It is allowed in `read_only_safe_mode` as a diagnostic read, while state-changing MCP calls remain denied.
 - `auditLogHealth` is bounded to `schemaVersion = "audit_log_health.v1"`, aggregate row count, latest row/checkpoint identifiers, latest checkpoint hash, `integrityState` from checkpoint verification, audit writability, retention minimum, cleanup state, cleanup eligible/protected row counts, payload budget/used bytes, and the shadow coverage report reference. It never exposes raw audit rows.
 
@@ -120,18 +120,18 @@ P081 rollout metrics are retained by exact name for enforcement readiness:
 - `auth_ambiguous_caller_warn_total`
 - `boundary_no_op_label_total`
 - `boundary_policy_evaluation_error_total`
-- `audit_log_append_failure_total`
+- `audit_log_append_failure_total{event_type,transport,mode}`
 - `audit_log_rate_limited_total`
-- `operator_alert_native_delivery_total`
+- `operator_alert_native_delivery_total{severity,surface,result}`; emitted by the macOS notification service for actual delivered/deduped/silenced native alert outcomes, not by server-side readback availability.
 - `approval_idempotency_duplicate_total`
 - `mcp_command_idempotency_replay_total`
 - `mcp_command_idempotency_conflict_total`
 - `approval_actionability_false_total`
 - `graphql_redaction_extensions_total`
-- `boundary_policy_decision_latency_ms`
-- `boundary_commit_transaction_latency_ms`
+- `boundary_policy_decision_latency_ms{transport,caller_class,mode}`
+- `boundary_commit_transaction_latency_ms{transport,action_kind,decision}`
 - `audit_budget_cleanup_duration_ms`
-- `operator_alert_clear_latency_ms`
+- `operator_alert_clear_latency_ms{alert_id,severity}`
 
 ---
 
@@ -161,7 +161,7 @@ Post-commit projection rebuild may run after commit and is not part of the same 
 
 Kill switches (startup-only; daemon restart required):
 
-- `CHAINWORKS_BOUNDARY_POLICY` selects the policy mode. Accepted values: `shadow`, `enforce`, `read_only_safe_mode`, `legacy` / `legacy_compat`. With no override and no deployed fixture path, the daemon defaults to `shadow` until Phase 4 shadow-coverage gates are met (legacy P072 guards remain authoritative; the matrix is advisory only). When a valid deployed fixture is loaded via `CHAINWORKS_BOUNDARY_POLICY_PATH` and no override is set, the default is `enforce`. Set `CHAINWORKS_BOUNDARY_POLICY=enforce` only after Phase 4 exit evidence. In `read_only_safe_mode`, GraphQL mutations and state-changing MCP calls are denied, while read/subscription paths and bounded diagnostic MCP reads such as `runtime.health` and `operator.alerts.list` remain available.
+- `CHAINWORKS_BOUNDARY_POLICY` selects the policy mode. Accepted values: `shadow`, `enforce`, `read_only_safe_mode`, `legacy` / `legacy_compat`. With no override and no deployed fixture path, the daemon defaults to `shadow` until Phase 4 shadow-coverage gates are met (legacy P072 guards remain authoritative; the matrix is advisory only). When a valid deployed fixture is loaded via `CHAINWORKS_BOUNDARY_POLICY_PATH` and no override is set, the default is `enforce`. Set `CHAINWORKS_BOUNDARY_POLICY=enforce` only after Phase 4 exit evidence. In `read_only_safe_mode`, GraphQL mutations and state-changing MCP calls are denied, while read/subscription paths and bounded diagnostic MCP reads such as `runtime.health`, `boundary.runtime.get`, and `operator.alerts.list` remain available.
 - `CHAINWORKS_BOUNDARY_POLICY_PATH` optionally points at an absolute, non-symlink, regular-file path to a deployed boundary fixture JSON. The path must canonicalize to a location inside the trusted boundary fixture root (`${CHAINWORKS_META_ROOT:-~/.chainworks}/boundary/`); paths outside that root are rejected (SEC-M001). The daemon enters `read_only_safe_mode` (and falls back to the embedded last-known-good fixture) when the variable is set but the path is relative, a symlink, outside the trusted root, or cannot be canonicalized; when the file exceeds 1 MiB (SEC-M-002) or is not a regular file; or when the file fails to parse or validate. An unrecognized `CHAINWORKS_BOUNDARY_POLICY` value also coerces the daemon into `read_only_safe_mode` so a typo cannot silently fall back to `shadow`.
 - Audit checkpoint verification runs once at startup. If `verify_latest_checkpoint` returns `tamper_suspected`, the daemon replaces the constructed `BoundaryPolicy` with `read_only_safe_mode` so state-changing calls remain denied until an operator confirms or repairs the audit trail. `degraded` and `verified` outcomes do not change the policy mode.
 

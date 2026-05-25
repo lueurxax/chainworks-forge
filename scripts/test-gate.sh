@@ -6358,7 +6358,57 @@ PY
       cargo test -p db repos::audit_log:: -- --nocapture
       cargo test -p db metrics::tests::proposal_081_required_metric_names_are_declared_and_recordable -- --nocapture
       cargo test -p db repos::audit_log::tests::append_and_health_roundtrip -- --nocapture
+      cargo test -p db repos::audit_log::tests::p081_audit_budget_warning_and_safe_mode_emit_runtime_readback_and_metrics -- --nocapture
+      cargo test -p db repos::audit_log::tests::p081_audit_budget_recovery_exits_after_cleanup_and_half_open_probes -- --nocapture
     )
+
+    log "P081: rollout metric labels and native-delivery semantics are gate-owned"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+metrics = (root / "control-plane/crates/db/src/metrics.rs").read_text()
+required_metric_tokens = [
+    '"boundary_policy_decision_latency_ms"',
+    '("transport", transport)',
+    '("caller_class", caller_class)',
+    '("mode", mode)',
+    '"boundary_commit_transaction_latency_ms"',
+    '("action_kind", action_kind)',
+    '("decision", decision)',
+    '"operator_alert_clear_latency_ms"',
+    '("alert_id", alert_id)',
+    '("severity", severity)',
+    'record_p081_audit_log_append_failure(event_type: &str, transport: &str, mode: &str)',
+    'event_type={event_type},transport={transport},mode={mode}',
+]
+for token in required_metric_tokens:
+    if token not in metrics:
+        raise SystemExit(f"P081: metrics.rs missing label/semantic token {token!r}")
+
+for rel in [
+    "control-plane/crates/graphql-server/src/schema.rs",
+    "control-plane/crates/mcp-server/src/tools/runtime.rs",
+    "control-plane/crates/mcp-server/src/server.rs",
+]:
+    content = (root / rel).read_text()
+    if 'increment_counter("audit_log_append_failure_total")' in content:
+        raise SystemExit(f"P081: {rel} still records bare audit_log_append_failure_total")
+    for stale in ["record_p081_operator_alert_native_delivery", "graphql_operator_alerts", "mcp_operator_alerts"]:
+        if stale in content and "operator_alert_native_delivery" in content:
+            raise SystemExit(f"P081: {rel} still records native-delivery as readback availability")
+
+notification = (root / "Chainworks Forge/Engine/NotificationService.swift").read_text()
+for token in [
+    'metricName = "operator_alert_native_delivery_total"',
+    'surface: "macos_notification_service"',
+    'result: "delivered"',
+    'result: "deduped"',
+    'result: "silenced"',
+]:
+    if token not in notification:
+        raise SystemExit(f"P081: NotificationService missing native metric token {token!r}")
+print("P081: rollout metric labels and native-delivery semantics valid")
+PY
 
     log "P081: migration compile check - audit_log and audit_log_checkpoints migrations exist"
     if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/064_p081_audit_log.sql" ]]; then
@@ -6403,6 +6453,9 @@ PY
       cargo test -p graphql-server proposal_081_boundary_runtime_graphql_readback_is_bounded -- --nocapture
       cargo test -p graphql-server proposal_081_operator_alerts_surface_safe_mode_without_raw_audit_rows -- --nocapture
       cargo test -p graphql-server proposal_081_observer_operator_alerts_redact_fields_without_graphql_errors -- --nocapture
+      cargo test -p graphql-server proposal_081_subscription_runtime_readback_exposes_cursor_gap_contract -- --nocapture
+      cargo test -p graphql-server proposal_081_runtime_subscription_payload_carries_cursor_generation_and_gap -- --nocapture
+      cargo test -p graphql-server proposal_081_audit_budget_safe_mode_denies_approval_mutation -- --nocapture
       cargo test -p graphql-server proposal_081_websocket_policy_reload_close_contract_is_explicit -- --nocapture
       cargo test -p graphql-server test_graphql_ws_rejects_missing_connection_init_auth -- --nocapture
       cargo test -p graphql-server test_graphql_ws_rejects_non_ui_caller_with_forbidden_close -- --nocapture
@@ -6440,6 +6493,7 @@ PY
       RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_ideas_create_idempotency_replay_does_not_duplicate_command_commit -- --nocapture
       RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_idempotency_storage_unavailable_fails_closed_with_sqlite_contention_code -- --nocapture
       RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_idempotency_pending_sentinel_recovers_committed_unack_without_reexecution -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server proposal_081_audit_budget_safe_mode_denies_state_changing_mcp_call -- --nocapture
     )
 
     log "P081: macOS accessibility contract source coverage"

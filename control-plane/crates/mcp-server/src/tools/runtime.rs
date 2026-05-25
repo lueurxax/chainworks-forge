@@ -3,8 +3,11 @@ use auth::boundary::{BoundaryPolicy, PolicyMode};
 use chrono::Utc;
 use serde_json::json;
 use sqlx::SqlitePool;
+use std::sync::{Mutex, OnceLock};
 
 use crate::protocol::McpTool;
+
+static P081_MCP_SAFE_MODE_ALERT_OPENED_AT_MS: OnceLock<Mutex<Option<i64>>> = OnceLock::new();
 
 pub fn tool_specs() -> Vec<McpTool> {
     vec![
@@ -16,6 +19,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "properties": {}
             }),
         },
+        boundary_runtime_tool_spec(),
         McpTool {
             name: "operator.alerts.list".to_string(),
             description: "Read bounded operator alerts derived from runtime policy health"
@@ -28,6 +32,18 @@ pub fn tool_specs() -> Vec<McpTool> {
     ]
 }
 
+pub fn boundary_runtime_tool_spec() -> McpTool {
+    McpTool {
+        name: "boundary.runtime.get".to_string(),
+        description: "Read P081 boundary runtime diagnostics using the MCP snake_case contract"
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {}
+        }),
+    }
+}
+
 pub async fn boundary_runtime_readback(
     pool: &SqlitePool,
     boundary_policy: Option<&BoundaryPolicy>,
@@ -36,7 +52,8 @@ pub async fn boundary_runtime_readback(
     let integrity_state = db::repos::audit_log::verify_latest_checkpoint(pool).await;
     let safe_mode_active = boundary_policy
         .map(|policy| matches!(policy.mode(), PolicyMode::ReadOnlySafeMode))
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || audit_health.payload_budget_state == "read_only_safe_mode";
 
     Ok(json!({
         "schemaVersion": "boundary_runtime.v1",
@@ -44,7 +61,25 @@ pub async fn boundary_runtime_readback(
         "policyInjected": boundary_policy.is_some(),
         "policyMode": boundary_policy.map(|policy| policy.mode().as_str()),
         "safeModeActive": safe_mode_active,
+        "safeModeReason": if audit_health.payload_budget_state == "read_only_safe_mode" {
+            Some("AUDIT_BUDGET_EXHAUSTED")
+        } else if safe_mode_active {
+            Some("BOUNDARY_POLICY_SAFE_MODE")
+        } else {
+            None
+        },
         "fixtureDigest": boundary_policy.map(|policy| policy.fixture_digest()),
+        "subscriptionReplay": {
+            "schemaVersion": "subscription_replay_runtime_v1",
+            "sequenceCursor": "seq-0",
+            "projectionGeneration": 0,
+            "gapDetected": false,
+            "requestedCursor": null,
+            "oldestRetainedCursor": "seq-0",
+            "retentionMinutes": 15,
+            "retentionEventCount": 10000,
+            "requiresFullRefetch": false
+        },
         "auditLogHealth": {
             "schemaVersion": "audit_log_health.v1",
             "rowCount": audit_health.row_count,
@@ -53,15 +88,79 @@ pub async fn boundary_runtime_readback(
             "latestCheckpointHash": audit_health.latest_checkpoint_hash,
             "integrityState": integrity_state.as_str(),
             "writable": audit_health.writable,
+            "lastWriteOkAtMs": audit_health.last_write_ok_at_ms,
+            "consecutiveFailures": audit_health.consecutive_failures,
+            "cumulativeFailures": audit_health.cumulative_failures,
             "retentionMinDays": audit_health.retention_min_days,
             "cleanupState": audit_health.cleanup_state,
             "cleanupEligibleRowCount": audit_health.cleanup_eligible_row_count,
             "cleanupProtectedRowCount": audit_health.cleanup_protected_row_count,
+            "budgetBytes": audit_health.budget_bytes,
+            "usedBytes": audit_health.used_bytes,
             "payloadBudgetBytes": audit_health.payload_budget_bytes,
             "payloadUsedBytes": audit_health.payload_used_bytes,
+            "payloadBudgetState": audit_health.payload_budget_state,
+            "payloadBudgetUsedPercent": audit_health.payload_budget_used_percent,
+            "halfOpenProbeSuccessCount": audit_health.half_open_probe_success_count,
             "shadowCoverageReportRef": audit_health.shadow_coverage_report_ref,
         }
     }))
+}
+
+pub async fn boundary_runtime_readback_snake_case(
+    pool: &SqlitePool,
+    boundary_policy: Option<&BoundaryPolicy>,
+) -> Result<serde_json::Value> {
+    Ok(to_snake_case_value(
+        boundary_runtime_readback(pool, boundary_policy).await?,
+    ))
+}
+
+fn to_snake_case_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (camel_to_snake(&key), to_snake_case_value(value)))
+                .collect::<serde_json::Map<_, _>>(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(to_snake_case_value).collect())
+        }
+        other => other,
+    }
+}
+
+fn camel_to_snake(key: &str) -> String {
+    let mut out = String::with_capacity(key.len() + 4);
+    for (idx, ch) in key.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if idx > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn record_safe_mode_alert_lifecycle(active: bool, now_ms: i64) {
+    let slot = P081_MCP_SAFE_MODE_ALERT_OPENED_AT_MS.get_or_init(|| Mutex::new(None));
+    let mut opened = slot.lock().expect("p081 mcp alert lifecycle poisoned");
+    match (active, *opened) {
+        (true, None) => *opened = Some(now_ms),
+        (false, Some(opened_at)) => {
+            *opened = None;
+            let elapsed_ms = now_ms.saturating_sub(opened_at).max(0);
+            db::metrics::record_p081_operator_alert_clear_latency(
+                "p081-safe-mode-active",
+                "critical",
+                std::time::Duration::from_millis(elapsed_ms as u64),
+            );
+        }
+        _ => {}
+    }
 }
 
 pub async fn operator_alerts_readback(
@@ -72,10 +171,10 @@ pub async fn operator_alerts_readback(
     let now_ms = Utc::now().timestamp_millis();
     let mut alerts = Vec::new();
 
-    if boundary_runtime["safeModeActive"]
-        .as_bool()
-        .unwrap_or(false)
-    {
+    let safe_mode_active = boundary_runtime["safeModeActive"].as_bool().unwrap_or(false);
+    record_safe_mode_alert_lifecycle(safe_mode_active, now_ms);
+
+    if safe_mode_active {
         alerts.push(json!({
             "schemaVersion": "operator_alert_v1",
             "id": "p081-safe-mode-active",
@@ -154,6 +253,7 @@ pub async fn execute_with_name(
 ) -> Result<serde_json::Value> {
     match tool_name {
         "runtime.health" => execute(params, pool, boundary_policy).await,
+        "boundary.runtime.get" => boundary_runtime_readback_snake_case(pool, boundary_policy).await,
         "operator.alerts.list" => operator_alerts_readback(pool, boundary_policy).await,
         _ => Err(anyhow!("Unknown runtime tool: {tool_name}")),
     }

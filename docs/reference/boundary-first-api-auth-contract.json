@@ -170,7 +170,7 @@
       "row_id": "p081.agent_operator.mcp_tools_call.command",
       "caller_class": "agent_operator",
       "transports": ["mcp_tools_call"],
-      "actions": ["runs.*", "ideas.*", "approvals.*", "stages.*", "reports.*", "artifacts.*", "steward.*", "storage.*", "runtime.*", "effects.*", "resources.*"],
+      "actions": ["runs.*", "ideas.*", "approvals.*", "stages.*", "reports.*", "artifacts.*", "steward.*", "storage.*", "runtime.*", "boundary.*", "effects.*", "resources.*"],
       "allow": {
         "enabled": true,
         "wildcard": true,
@@ -235,7 +235,7 @@
       "row_id": "p081.automation.mcp_tools_call.command",
       "caller_class": "automation",
       "transports": ["mcp_tools_call"],
-      "actions": ["runs.*", "ideas.*", "approvals.*", "stages.*", "reports.*", "artifacts.*", "steward.*", "storage.*", "runtime.*", "effects.*", "resources.*"],
+      "actions": ["runs.*", "ideas.*", "approvals.*", "stages.*", "reports.*", "artifacts.*", "steward.*", "storage.*", "runtime.*", "boundary.*", "effects.*", "resources.*"],
       "allow": {
         "enabled": true,
         "wildcard": true,
@@ -269,7 +269,7 @@
       "caller_class": "observer",
       "transports": ["mcp_tools_call"],
       "actions": [
-        "runtime.health",
+        "runtime.health", "boundary.runtime.get",
         "runs.list", "runs.get",
         "approvals.list", "approvals.get",
         "stages.list", "stages.get",

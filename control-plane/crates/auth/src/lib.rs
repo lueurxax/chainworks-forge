@@ -1181,7 +1181,7 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
         "storage.health" => Some(CapabilityToolId::StorageHealth),
-        "runtime.health" => Some(CapabilityToolId::RuntimeHealth),
+        "runtime.health" | "boundary.runtime.get" => Some(CapabilityToolId::RuntimeHealth),
         "storage.write_pressure" => Some(CapabilityToolId::StorageWritePressure),
         "storage.evidence_spool_summary" => Some(CapabilityToolId::StorageEvidenceSpoolSummary),
         "storage.reconcile_evidence_orphans" => {
@@ -1205,6 +1205,17 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
 mod tests {
     use super::*;
     use domain::{CapabilityToolId, ResourceTemplateId};
+
+    fn secure_principal_table_file(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("principals.json");
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, path)
+    }
 
     #[test]
     fn principal_carries_typed_capability_sets() {
@@ -1452,9 +1463,7 @@ mod tests {
 
     #[test]
     fn legacy_default_operator_file_is_normalized_to_p072_ui_policy() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            file.path(),
+        let (_dir, path) = secure_principal_table_file(
             r#"{
               "principals": [
                 {
@@ -1464,10 +1473,9 @@ mod tests {
                 }
               ]
             }"#,
-        )
-        .unwrap();
+        );
 
-        let table = PrincipalTable::load_or_bootstrap(file.path()).unwrap();
+        let table = PrincipalTable::load_or_bootstrap(&path).unwrap();
 
         assert_eq!(
             is_mutation_allowed_by_surface_policy(&table, "default-operator", "approveApproval"),
@@ -1962,15 +1970,10 @@ mod tests {
     fn v3_principal_table_rejects_unknown_schema_version() {
         // Verify both an out-of-range high version and version 0 are rejected.
         for bad_version in [0u32, 99u32] {
-            let file = tempfile::NamedTempFile::new().unwrap();
-            std::fs::write(
-                file.path(),
-                format!(
-                    r#"{{"schema_version": {bad_version}, "principals": [{{"token": "t", "id": "i", "class": "operator"}}]}}"#
-                ),
-            )
-            .unwrap();
-            let err = PrincipalTable::load_or_bootstrap(file.path()).unwrap_err();
+            let (_dir, path) = secure_principal_table_file(&format!(
+                r#"{{"schema_version": {bad_version}, "principals": [{{"token": "t", "id": "i", "class": "operator"}}]}}"#
+            ));
+            let err = PrincipalTable::load_or_bootstrap(&path).unwrap_err();
             assert!(
                 err.to_string().contains("unsupported schema_version")
                     || err.to_string().contains("unknown schema_version"),
@@ -1983,9 +1986,7 @@ mod tests {
     fn v3_principal_table_derives_caller_class_not_stored() {
         // CallerClass is server-derived; principal entries must not store an
         // explicit caller_class field (deny_unknown_fields enforces this).
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            file.path(),
+        let (_dir, path) = secure_principal_table_file(
             r#"{
               "schema_version": 3,
               "principals": [
@@ -1997,9 +1998,8 @@ mod tests {
                 }
               ]
             }"#,
-        )
-        .unwrap();
-        let err = PrincipalTable::load_or_bootstrap(file.path()).unwrap_err();
+        );
+        let err = PrincipalTable::load_or_bootstrap(&path).unwrap_err();
         assert!(
             err.to_string().contains("caller_class") || err.to_string().contains("unknown field"),
             "principal entry with caller_class must be rejected as unknown field, got: {err}"
@@ -2011,9 +2011,7 @@ mod tests {
         // SEC-H-002: schema_version 3 must provide explicit surface_policies.
         // A v3 entry without surface_policies is rejected to prevent class-default
         // capability inheritance (fail-closed by design).
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            file.path(),
+        let (_dir, path) = secure_principal_table_file(
             r#"{
               "schema_version": 3,
               "principals": [
@@ -2024,9 +2022,8 @@ mod tests {
                 }
               ]
             }"#,
-        )
-        .unwrap();
-        let err = PrincipalTable::load_or_bootstrap(file.path()).unwrap_err();
+        );
+        let err = PrincipalTable::load_or_bootstrap(&path).unwrap_err();
         assert!(
             err.to_string().contains("surface_policies"),
             "v3 principal without surface_policies must be rejected (SEC-H-002); got: {err}"
@@ -2036,9 +2033,7 @@ mod tests {
     #[test]
     fn v3_principal_with_explicit_surface_policies_loads_as_agent_operator() {
         // SEC-H-002: v3 principal WITH explicit surface_policies succeeds and derives CallerClass.
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            file.path(),
+        let (_dir, path) = secure_principal_table_file(
             r#"{
               "schema_version": 3,
               "principals": [
@@ -2052,9 +2047,8 @@ mod tests {
                 }
               ]
             }"#,
-        )
-        .unwrap();
-        let table = PrincipalTable::load_or_bootstrap(file.path()).unwrap();
+        );
+        let table = PrincipalTable::load_or_bootstrap(&path).unwrap();
         assert_eq!(
             resolve_caller_class_for_token(&table, "tok-agent-v3"),
             Some(CallerClass::AgentOperator),

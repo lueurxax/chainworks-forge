@@ -487,8 +487,18 @@ mod tests {
     use engine::command_handler::CommandHandler;
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    fn secure_principal_table(contents: &str) -> auth::PrincipalTable {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("principals.json");
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        auth::PrincipalTable::load_or_bootstrap(&path).unwrap()
+    }
 
     fn test_reporter() -> LifecycleReporter {
         LifecycleReporter::new(0, "test-sha", event_bus::new_bus(16))
@@ -573,14 +583,9 @@ mod tests {
             .unwrap();
         let approval = make_approval(run_id, "state_6");
         approvals::insert(&pool, &approval).await.unwrap();
-        let principal_path = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            principal_path.path(),
+        let principal_table = secure_principal_table(
             r#"{"principals":[{"token":"observer-token-xxxxxxxxxxxxxxxxx","id":"observer","class":"observer"}]}"#,
-        )
-        .unwrap();
-        let principal_table =
-            auth::PrincipalTable::load_or_bootstrap(principal_path.path()).unwrap();
+        );
         let schema = crate::schema::build_schema(
             pool.clone(),
             make_command_handler(pool.clone()),
@@ -718,14 +723,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_graphql_ws_rejects_non_ui_caller_with_forbidden_close() {
-        let principal_path = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            principal_path.path(),
+        let principal_table = secure_principal_table(
             r#"{"principals":[{"token":"observer-token-xxxxxxxxxxxxxxxxx","id":"observer","class":"observer"}]}"#,
-        )
-        .unwrap();
-        let principal_table =
-            auth::PrincipalTable::load_or_bootstrap(principal_path.path()).unwrap();
+        );
         let err = p081_connection_init_data(
             serde_json::json!({"Authorization":"Bearer observer-token-xxxxxxxxxxxxxxxxx"}),
             principal_table,

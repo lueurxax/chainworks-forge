@@ -107,12 +107,20 @@ pub struct AuditLogHealthSnapshot {
     pub latest_checkpoint_seq: Option<i64>,
     pub latest_checkpoint_hash: Option<String>,
     pub writable: bool,
+    pub last_write_ok_at_ms: Option<i64>,
+    pub consecutive_failures: i64,
+    pub cumulative_failures: i64,
     pub retention_min_days: i64,
     pub cleanup_state: String,
     pub cleanup_eligible_row_count: i64,
     pub cleanup_protected_row_count: i64,
+    pub budget_bytes: i64,
+    pub used_bytes: i64,
     pub payload_budget_bytes: i64,
     pub payload_used_bytes: i64,
+    pub payload_budget_state: String,
+    pub payload_budget_used_percent: i64,
+    pub half_open_probe_success_count: i64,
     pub shadow_coverage_report_ref: String,
 }
 
@@ -753,11 +761,15 @@ pub async fn health_snapshot(pool: &SqlitePool) -> Result<AuditLogHealthSnapshot
         .await
         .context("audit_log row count")?;
 
-    let latest_row_id: Option<String> =
-        sqlx::query_scalar("SELECT id FROM audit_log ORDER BY created_at_ms DESC LIMIT 1")
-            .fetch_optional(pool)
-            .await
-            .context("audit_log latest row_id")?;
+    let latest_row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT id, created_at_ms FROM audit_log ORDER BY created_at_ms DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("audit_log latest row")?;
+    let (latest_row_id, last_write_ok_at_ms) = latest_row
+        .map(|(id, ts)| (Some(id), Some(ts)))
+        .unwrap_or((None, None));
 
     let checkpoint_row: Option<(i64, String)> = sqlx::query_as(
         "SELECT checkpoint_seq, checkpoint_hash FROM audit_log_checkpoints ORDER BY checkpoint_seq DESC LIMIT 1",
@@ -811,18 +823,60 @@ pub async fn health_snapshot(pool: &SqlitePool) -> Result<AuditLogHealthSnapshot
     }
     .to_string();
 
+    let payload_budget_bytes = row_count.saturating_mul(MAX_PAYLOAD_BYTES as i64);
+    let payload_budget_used_percent = if payload_budget_bytes > 0 {
+        ((payload_used_bytes.saturating_mul(100)) / payload_budget_bytes).clamp(0, 100)
+    } else {
+        0
+    };
+    let payload_budget_state = if payload_budget_used_percent >= 95 {
+        crate::metrics::record_p081_audit_log_rate_limited("audit_log", "AUDIT_BUDGET_EXHAUSTED");
+        "read_only_safe_mode"
+    } else if payload_budget_used_percent >= 80 {
+        "warning"
+    } else {
+        "healthy"
+    }
+    .to_string();
+
+    let half_open_probe_success_count =
+        if writable && payload_budget_state == "healthy" && payload_budget_used_percent < 80 {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM (
+                    SELECT id FROM audit_log
+                    WHERE event_type = 'audit_budget_half_open_probe'
+                      AND decision = 'allow'
+                    ORDER BY created_at_ms DESC
+                    LIMIT 3
+                )",
+            )
+            .fetch_one(pool)
+            .await
+            .context("audit_log half-open probe success count")?
+        } else {
+            0
+        };
+
     Ok(AuditLogHealthSnapshot {
         row_count,
         latest_row_id,
         latest_checkpoint_seq,
         latest_checkpoint_hash,
         writable,
+        last_write_ok_at_ms,
+        consecutive_failures: if writable { 0 } else { 1 },
+        cumulative_failures: if writable { 0 } else { 1 },
         retention_min_days: RETENTION_MIN_DAYS,
         cleanup_state,
         cleanup_eligible_row_count,
         cleanup_protected_row_count,
-        payload_budget_bytes: row_count.saturating_mul(MAX_PAYLOAD_BYTES as i64),
+        budget_bytes: payload_budget_bytes,
+        used_bytes: payload_used_bytes,
+        payload_budget_bytes,
         payload_used_bytes,
+        payload_budget_state,
+        payload_budget_used_percent,
+        half_open_probe_success_count,
         shadow_coverage_report_ref: "docs/evidence/boundary-policy-shadow-coverage/report.json"
             .to_string(),
     })
@@ -858,13 +912,73 @@ pub async fn delete_old_rows(pool: &SqlitePool) -> Result<u64> {
     .await
     .context("audit_log retention cleanup")?;
     crate::metrics::record_p081_audit_budget_cleanup_duration(started.elapsed());
+    let health = health_snapshot(pool).await?;
+    if health.writable
+        && health.payload_budget_state == "healthy"
+        && health.payload_budget_used_percent < 80
+        && health.half_open_probe_success_count < 3
+    {
+        append_half_open_recovery_probes(pool, 3 - health.half_open_probe_success_count).await?;
+    }
     Ok(result.rows_affected())
+}
+
+pub async fn audit_budget_requires_safe_mode(pool: &SqlitePool) -> Result<bool> {
+    Ok(health_snapshot(pool).await?.payload_budget_state == "read_only_safe_mode")
+}
+
+async fn append_half_open_recovery_probes(pool: &SqlitePool, missing: i64) -> Result<()> {
+    let missing = missing.clamp(0, 3);
+    for idx in 0..missing {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let id = format!("audit-budget-half-open-{}", uuid::Uuid::now_v7());
+        let request_id = format!("audit-budget-half-open-probe-{idx}");
+        let payload = serde_json::json!({
+            "schema_version": "audit_budget_half_open_probe_v1",
+            "probe_index": idx + 1,
+            "target_probe_count": 3
+        })
+        .to_string();
+        let entry = AuditEntry {
+            id: &id,
+            request_id: &request_id,
+            timestamp_ms: now_ms,
+            event_type: "audit_budget_half_open_probe",
+            principal_id: None,
+            principal_class: None,
+            caller_class: None,
+            token_id: None,
+            transport: "mcp_tools_call",
+            action_attempted: "half_open_probe",
+            decision: "allow",
+            denial_reason_code: None,
+            row_id: Some("p081.audit_budget.recovery.half_open_probe"),
+            env_gate_state: None,
+            source_ip_hash_or_local_process_id: None,
+            boundary_policy_mode: "read_only_safe_mode",
+            fixture_version: "p081-boundary-matrix-v1",
+            payload: &payload,
+            original_payload_bytes: None,
+            diagnostic_truncated: false,
+            checkpoint_id: None,
+            created_at_ms: now_ms,
+        };
+        append(pool, &entry).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pool::create_pool;
+    use std::sync::Mutex;
+
+    static METRICS_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn metrics_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        METRICS_TEST_MUTEX.lock().unwrap()
+    }
 
     async fn test_pool() -> SqlitePool {
         create_pool("sqlite::memory:").await.unwrap()
@@ -899,6 +1013,8 @@ mod tests {
 
     #[tokio::test]
     async fn append_and_health_roundtrip() {
+        let _metrics_lock = metrics_test_lock();
+        crate::metrics::reset_for_tests();
         let pool = test_pool().await;
         let entry = make_entry("entry-001", "req-001");
         append(&pool, &entry).await.unwrap();
@@ -915,6 +1031,86 @@ mod tests {
         assert_eq!(
             snap.shadow_coverage_report_ref,
             "docs/evidence/boundary-policy-shadow-coverage/report.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn p081_audit_budget_warning_and_safe_mode_emit_runtime_readback_and_metrics() {
+        let _metrics_lock = metrics_test_lock();
+        crate::metrics::reset_for_tests();
+        let pool = test_pool().await;
+
+        let warning_payload = "w".repeat(14_000);
+        let mut warning = make_entry("entry-budget-warning", "req-budget-warning");
+        warning.payload = &warning_payload;
+        append(&pool, &warning).await.unwrap();
+
+        let warning_snap = health_snapshot(&pool).await.unwrap();
+        assert_eq!(warning_snap.payload_budget_state, "warning");
+        assert!(warning_snap.payload_budget_used_percent >= 80);
+        assert_eq!(
+            crate::metrics::get_counter("audit_log_rate_limited_total"),
+            0,
+            "warning at 80 percent must not be reported as rate-limited"
+        );
+
+        let safe_pool = test_pool().await;
+        let safe_payload = "s".repeat(16_100);
+        let mut safe_mode = make_entry("entry-budget-safe-mode", "req-budget-safe-mode");
+        safe_mode.payload = &safe_payload;
+        append(&safe_pool, &safe_mode).await.unwrap();
+
+        let safe_snap = health_snapshot(&safe_pool).await.unwrap();
+        assert_eq!(safe_snap.payload_budget_state, "read_only_safe_mode");
+        assert!(safe_snap.payload_budget_used_percent >= 95);
+        assert_eq!(
+            safe_snap.half_open_probe_success_count, 0,
+            "budget recovery starts with zero half-open writes until cleanup lowers usage"
+        );
+        assert!(
+            crate::metrics::get_counter("audit_log_rate_limited_total") > 0,
+            "crossing the 95 percent audit budget must emit production rate-limit telemetry"
+        );
+    }
+
+    #[tokio::test]
+    async fn p081_audit_budget_recovery_exits_after_cleanup_and_half_open_probes() {
+        let _metrics_lock = metrics_test_lock();
+        crate::metrics::reset_for_tests();
+        let pool = test_pool().await;
+
+        let safe_payload = "s".repeat(16_100);
+        let mut safe_mode = make_entry("entry-budget-recover", "req-budget-recover");
+        safe_mode.payload = &safe_payload;
+        append(&pool, &safe_mode).await.unwrap();
+        sqlx::query(
+            "UPDATE audit_log \
+             SET checkpoint_id = 'cp-recover', created_at_ms = ?1 \
+             WHERE id = 'entry-budget-recover'",
+        )
+        .bind(chrono::Utc::now().timestamp_millis() - RETENTION_MIN_MS - 1_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let safe_snap = health_snapshot(&pool).await.unwrap();
+        assert_eq!(safe_snap.payload_budget_state, "read_only_safe_mode");
+        assert_eq!(safe_snap.half_open_probe_success_count, 0);
+
+        let deleted = delete_old_rows(&pool).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let recovered = health_snapshot(&pool).await.unwrap();
+        assert_eq!(recovered.payload_budget_state, "healthy");
+        assert!(recovered.payload_budget_used_percent < 80);
+        assert_eq!(
+            recovered.half_open_probe_success_count, 3,
+            "P081 safe-mode exit requires three successful half-open audit probes"
+        );
+        assert_eq!(
+            crate::metrics::get_hot_read_sample_count("audit_budget_cleanup_duration_ms"),
+            1,
+            "cleanup progress must emit the P081 cleanup duration metric"
         );
     }
 

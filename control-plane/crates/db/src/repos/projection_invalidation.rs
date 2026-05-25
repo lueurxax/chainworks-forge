@@ -191,6 +191,7 @@ pub async fn clear_backlog(
     caller_principal_class: Option<&str>,
     request_id: Option<&str>,
     mcp_idempotency_key: Option<&str>,
+    mcp_idempotency_request_hash: Option<&str>,
     mcp_boundary_row_id: Option<&str>,
 ) -> Result<String> {
     let now = Utc::now();
@@ -203,6 +204,15 @@ pub async fn clear_backlog(
         "projection_name": projection_name,
         "source_name": source_name,
     });
+    crate::repos::mcp_command_idempotency::claim_pending_for_command_tx(
+        &mut tx,
+        mcp_idempotency_key,
+        "storage.projections.clear_backlog",
+        caller_principal_id.unwrap_or_default(),
+        mcp_idempotency_request_hash,
+        mcp_boundary_row_id,
+    )
+    .await?;
     crate::repos::command_journal::record_tx(
         &mut tx,
         &journal_id,
@@ -258,6 +268,7 @@ pub async fn clear_poison(
     caller_principal_class: Option<&str>,
     request_id: Option<&str>,
     mcp_idempotency_key: Option<&str>,
+    mcp_idempotency_request_hash: Option<&str>,
     mcp_boundary_row_id: Option<&str>,
 ) -> Result<String> {
     let now = Utc::now();
@@ -271,6 +282,15 @@ pub async fn clear_poison(
         "projection_name": projection_name,
         "source_name": source_name,
     });
+    crate::repos::mcp_command_idempotency::claim_pending_for_command_tx(
+        &mut tx,
+        mcp_idempotency_key,
+        "storage.projections.clear_poison",
+        caller_principal_id.unwrap_or_default(),
+        mcp_idempotency_request_hash,
+        mcp_boundary_row_id,
+    )
+    .await?;
     crate::repos::command_journal::record_tx(
         &mut tx,
         &journal_id,
@@ -490,9 +510,19 @@ mod tests {
         .unwrap();
         assert_eq!(count, 1);
 
-        clear_backlog(&pool, "runs_home", "runs", None, None, None, None, None)
-            .await
-            .expect("projection invalidation clear must be registered and executable");
+        clear_backlog(
+            &pool,
+            "runs_home",
+            "runs",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("projection invalidation clear must be registered and executable");
         let count_after_clear: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM projection_invalidation_log \
              WHERE projection_name = 'runs_home' AND source_name = 'runs'",

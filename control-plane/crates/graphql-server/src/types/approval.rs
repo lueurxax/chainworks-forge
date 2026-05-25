@@ -170,6 +170,7 @@ impl GqlApproval {
                 denial_reason = %reason_code,
                 "BoundaryPolicy enforced: approval actionability denied"
             );
+            db::metrics::record_p081_approval_actionability_false(caller_class, None, &reason_code);
             self.available_actions = vec![];
             self.write_path_state = GqlWritePathState::WritePathNotAvailable;
             self.disabled_reason = Some(format!("boundary policy: {reason_code}"));

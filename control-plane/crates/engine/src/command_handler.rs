@@ -3,8 +3,10 @@ use anyhow::{anyhow, Context, Result};
 use auth;
 use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -990,6 +992,13 @@ impl CommandJournalEntry {
                 | "ResolveLeadMediationConfirmation"
                 | "ResolveApproval"
                 | "SettleProposalGate"
+                | "RunStewardAnalysis"
+                | "MainSyncRequest"
+                | "MainSyncRetry"
+                | "MainSyncSetRunOverride"
+                | "MainSyncRepairState"
+                | "MainSyncRecordRecoveryDecision"
+                | "KnowledgeCapsuleIgnore"
         )
     }
 }
@@ -1885,7 +1894,15 @@ impl CommandHandler {
         Ok(())
     }
 
-    pub async fn handle(&self, cmd: Command, caller: CallerContext) -> Result<Commanded> {
+    pub fn handle(
+        &self,
+        cmd: Command,
+        caller: CallerContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Commanded>> + Send + '_>> {
+        Box::pin(async move { self.handle_inner(cmd, caller).await })
+    }
+
+    async fn handle_inner(&self, cmd: Command, caller: CallerContext) -> Result<Commanded> {
         if matches!(&cmd, Command::OverrideArtifactContract(_))
             && caller.principal_class != PrincipalClass::Operator
         {
@@ -2052,6 +2069,10 @@ impl CommandHandler {
                                     // P081 Defect8: write approval_idempotency_duplicate audit row.
                                     // Best-effort: inability to write must not block returning the cached result.
                                     {
+                                        db::metrics::record_p081_approval_idempotency_duplicate(
+                                            action_name,
+                                            journal.caller_class.as_deref().unwrap_or("unknown"),
+                                        );
                                         let audit_id = uuid::Uuid::now_v7().to_string();
                                         let now_ms = chrono::Utc::now().timestamp_millis();
                                         let key_digest = {
@@ -3729,17 +3750,34 @@ impl CommandHandler {
                     .artifact_base
                     .or_else(|| std::env::var("CHAINWORKS_META_ROOT").ok())
                     .unwrap_or_else(|| ".chainworks".into());
-                self.work_queue
-                    .enqueue(
-                        WorkItemKind::StewardAnalysis,
-                        None,
-                        None,
-                        serde_json::json!({
+                let now = Utc::now();
+                let tx_started = Instant::now();
+                let mut tx = self
+                    .begin_command_transaction("command.RunStewardAnalysis", journal.id.clone())
+                    .await?;
+                record_command_journal_tx(&mut tx, journal).await?;
+                work_items::enqueue_tx(
+                    &mut tx,
+                    &WorkItem {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        kind: WorkItemKind::StewardAnalysis,
+                        payload_json: serde_json::to_string(&serde_json::json!({
                             "reason": c.reason,
                             "artifact_base": artifact_base,
-                        }),
-                    )
-                    .await?;
+                        }))?,
+                        status: WorkItemStatus::Pending,
+                        run_id: None,
+                        stage_id: None,
+                        created_at: now,
+                        scheduled_at: now,
+                        attempt_count: 0,
+                        last_error: None,
+                    },
+                )
+                .await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.RunStewardAnalysis", tx_started);
                 Ok(CommandResult::StewardAnalysisQueued)
             }
 
@@ -4176,6 +4214,12 @@ impl CommandHandler {
                                         "command.ResolveApproval",
                                         tx_started,
                                     );
+                                    db::metrics::record_p081_boundary_commit_transaction_latency(
+                                        "graphql_mutation",
+                                        action_name,
+                                        "idempotency_replay",
+                                        tx_started.elapsed(),
+                                    );
                                     // P081 fix: return sentinel with original journal_id so
                                     // the outer handle() returns Commanded { journal_id:
                                     // record.command_journal_id } instead of the fresh,
@@ -4194,6 +4238,12 @@ impl CommandHandler {
                         }
                         drop(tx);
                         db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                        db::metrics::record_p081_boundary_commit_transaction_latency(
+                            "graphql_mutation",
+                            action_name,
+                            "terminal_rejected",
+                            tx_started.elapsed(),
+                        );
                         // P081: approval is terminal but the idempotency key didn't match
                         // (different key, or no key supplied). This is NOT a same-key replay —
                         // it's a new attempt to re-settle a terminal approval, which is forbidden.
@@ -4207,6 +4257,12 @@ impl CommandHandler {
                     None => {
                         drop(tx);
                         db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                        db::metrics::record_p081_boundary_commit_transaction_latency(
+                            "graphql_mutation",
+                            action_name,
+                            "not_found",
+                            tx_started.elapsed(),
+                        );
                         return Err(anyhow!("Approval {} not found", c.approval_id));
                     }
                 };
@@ -4217,6 +4273,12 @@ impl CommandHandler {
                     );
                     drop(tx);
                     db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                    db::metrics::record_p081_boundary_commit_transaction_latency(
+                        "graphql_mutation",
+                        action_name,
+                        "provenance_mismatch",
+                        tx_started.elapsed(),
+                    );
                     return Err(err);
                 }
                 let authoritative_run_id = approval.run_id;
@@ -4451,6 +4513,12 @@ impl CommandHandler {
                 command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
                 tx.commit().await?;
                 db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                db::metrics::record_p081_boundary_commit_transaction_latency(
+                    "graphql_mutation",
+                    action_name,
+                    "committed",
+                    tx_started.elapsed(),
+                );
                 self.work_queue
                     .publish_scheduler_notification(scheduler_refresh);
                 if let Some((stage_execution_id, status)) = stage_status_event {

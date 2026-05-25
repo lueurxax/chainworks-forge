@@ -148,6 +148,40 @@ pub async fn insert_pending_tx(
     }
 }
 
+/// Claim an MCP idempotency key inside an existing command write unit.
+///
+/// Direct MCP tool write units that do not pass through `CommandHandler` still
+/// need the same pending-row claim before they record command_journal and apply
+/// durable mutations. If no key is present this is a no-op for legacy/direct
+/// test callers that bypass the MCP transport.
+pub async fn claim_pending_for_command_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    idempotency_key: Option<&str>,
+    tool_name: &str,
+    caller_fingerprint: &str,
+    canonical_request_hash: Option<&str>,
+    boundary_row_id: Option<&str>,
+) -> Result<()> {
+    let Some(idempotency_key) = idempotency_key else {
+        return Ok(());
+    };
+    let request_hash = canonical_request_hash
+        .ok_or_else(|| anyhow::anyhow!("MCP idempotency request hash missing for write unit"))?;
+    let claimed = insert_pending_tx(
+        tx,
+        idempotency_key,
+        tool_name,
+        caller_fingerprint,
+        request_hash,
+        boundary_row_id,
+    )
+    .await?;
+    if !claimed {
+        anyhow::bail!("IDEMPOTENCY_IN_FLIGHT: idempotency key already claimed or committed");
+    }
+    Ok(())
+}
+
 /// Update a pending claim record with the committed result.
 /// Only updates records whose result_json is still the pending sentinel
 /// to avoid overwriting a racing concurrent update.

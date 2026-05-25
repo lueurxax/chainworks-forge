@@ -1,8 +1,9 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use async_graphql::futures_util::StreamExt;
+use async_graphql::futures_util::{stream, StreamExt};
 use async_graphql::*;
 use sqlx::{Row, SqlitePool};
 use tokio_stream::wrappers::BroadcastStream;
@@ -35,6 +36,9 @@ use crate::types::steward::{
 };
 
 pub type AppSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
+
+static P081_SUBSCRIPTION_SEQUENCE: AtomicI64 = AtomicI64::new(0);
+static P081_GRAPHQL_SAFE_MODE_ALERT_OPENED_AT_MS: OnceLock<Mutex<Option<i64>>> = OnceLock::new();
 
 /// P081 server-side field redaction collector.
 ///
@@ -231,6 +235,22 @@ fn boundary_denial_error(
     })
 }
 
+fn record_p081_caller_class_diagnostics(
+    principal: &auth::Principal,
+    caller_class: &auth::CallerClass,
+    transport: &str,
+) {
+    let default = auth::derive_caller_class_from_principal_class(&principal.class);
+    if principal.caller_class_override.is_some() && default != *caller_class {
+        let principal_class = format!("{:?}", principal.class).to_lowercase();
+        db::metrics::record_p081_auth_ambiguous_caller_warn(
+            &principal_class,
+            "principal_override",
+            transport,
+        );
+    }
+}
+
 /// P081 MEDIUM-001: Write a best-effort audit row for legacy/shadow deny paths.
 /// Unlike write_graphql_deny_audit, audit failure here only produces a warning log
 /// rather than failing the request, because these are legacy guard denials where
@@ -297,7 +317,11 @@ async fn write_graphql_legacy_deny_audit(
         created_at_ms: now_ms,
     };
     if let Err(e) = audit_log::append(pool, &entry).await {
-        db::metrics::increment_counter("audit_log_append_failure_total");
+        db::metrics::record_p081_audit_log_append_failure(
+            "boundary_decision_deny",
+            transport,
+            &mode_str,
+        );
         tracing::warn!(
             error = %e,
             transport,
@@ -374,7 +398,11 @@ async fn write_graphql_deny_audit(
         created_at_ms: now_ms,
     };
     audit_log::append(pool, &entry).await.map_err(|e| {
-        db::metrics::increment_counter("audit_log_append_failure_total");
+        db::metrics::record_p081_audit_log_append_failure(
+            "boundary_decision_deny",
+            transport,
+            &mode_str,
+        );
         tracing::error!(
             error = %e,
             transport,
@@ -398,7 +426,10 @@ async fn boundary_runtime_readback_json(
     let integrity_state = audit_log::verify_latest_checkpoint(pool).await;
     let safe_mode_active = boundary_policy
         .map(|policy| matches!(policy.mode(), auth::boundary::PolicyMode::ReadOnlySafeMode))
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || audit_health.payload_budget_state == "read_only_safe_mode";
+    let latest_sequence = P081_SUBSCRIPTION_SEQUENCE.load(Ordering::SeqCst);
+    let oldest_retained_sequence = p081_oldest_retained_sequence(latest_sequence);
 
     Ok(serde_json::json!({
         "schemaVersion": "boundary_runtime.v1",
@@ -406,7 +437,20 @@ async fn boundary_runtime_readback_json(
         "policyInjected": boundary_policy.is_some(),
         "policyMode": boundary_policy.map(|policy| policy.mode().as_str()),
         "safeModeActive": safe_mode_active,
+        "safeModeReason": if audit_health.payload_budget_state == "read_only_safe_mode" {
+            Some("AUDIT_BUDGET_EXHAUSTED")
+        } else if safe_mode_active {
+            Some("BOUNDARY_POLICY_SAFE_MODE")
+        } else {
+            None
+        },
         "fixtureDigest": boundary_policy.map(|policy| policy.fixture_digest()),
+        "subscriptionReplay": p081_subscription_replay_readback(
+            None,
+            oldest_retained_sequence,
+            latest_sequence,
+            latest_sequence
+        ),
         "auditLogHealth": {
             "schemaVersion": "audit_log_health.v1",
             "rowCount": audit_health.row_count,
@@ -415,15 +459,73 @@ async fn boundary_runtime_readback_json(
             "latestCheckpointHash": audit_health.latest_checkpoint_hash,
             "integrityState": integrity_state.as_str(),
             "writable": audit_health.writable,
+            "lastWriteOkAtMs": audit_health.last_write_ok_at_ms,
+            "consecutiveFailures": audit_health.consecutive_failures,
+            "cumulativeFailures": audit_health.cumulative_failures,
             "retentionMinDays": audit_health.retention_min_days,
             "cleanupState": audit_health.cleanup_state,
             "cleanupEligibleRowCount": audit_health.cleanup_eligible_row_count,
             "cleanupProtectedRowCount": audit_health.cleanup_protected_row_count,
+            "budgetBytes": audit_health.budget_bytes,
+            "usedBytes": audit_health.used_bytes,
             "payloadBudgetBytes": audit_health.payload_budget_bytes,
             "payloadUsedBytes": audit_health.payload_used_bytes,
+            "payloadBudgetState": audit_health.payload_budget_state,
+            "payloadBudgetUsedPercent": audit_health.payload_budget_used_percent,
+            "halfOpenProbeSuccessCount": audit_health.half_open_probe_success_count,
             "shadowCoverageReportRef": audit_health.shadow_coverage_report_ref,
         }
     }))
+}
+
+fn p081_subscription_replay_readback(
+    requested_cursor: Option<&str>,
+    oldest_retained_sequence: i64,
+    latest_sequence: i64,
+    projection_generation: i64,
+) -> serde_json::Value {
+    let requested_sequence =
+        requested_cursor.and_then(|cursor| cursor.strip_prefix("seq-")?.parse::<i64>().ok());
+    let gap_detected = requested_sequence
+        .map(|sequence| sequence < oldest_retained_sequence || sequence > latest_sequence)
+        .unwrap_or(false);
+    serde_json::json!({
+        "schemaVersion": "subscription_replay_runtime_v1",
+        "sequenceCursor": format!("seq-{latest_sequence}"),
+        "projectionGeneration": projection_generation,
+        "gapDetected": gap_detected,
+        "requestedCursor": requested_cursor,
+        "oldestRetainedCursor": format!("seq-{oldest_retained_sequence}"),
+        "retentionMinutes": 15,
+        "retentionEventCount": 10000,
+        "requiresFullRefetch": gap_detected
+    })
+}
+
+fn p081_oldest_retained_sequence(latest_sequence: i64) -> i64 {
+    latest_sequence.saturating_sub(9_999).max(0)
+}
+
+fn p081_next_subscription_sequence() -> i64 {
+    P081_SUBSCRIPTION_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn p081_record_safe_mode_alert_lifecycle(active: bool, now_ms: i64) {
+    let slot = P081_GRAPHQL_SAFE_MODE_ALERT_OPENED_AT_MS.get_or_init(|| Mutex::new(None));
+    let mut opened = slot.lock().expect("p081 safe-mode alert lifecycle poisoned");
+    match (active, *opened) {
+        (true, None) => *opened = Some(now_ms),
+        (false, Some(opened_at)) => {
+            *opened = None;
+            let elapsed_ms = now_ms.saturating_sub(opened_at).max(0);
+            db::metrics::record_p081_operator_alert_clear_latency(
+                "p081-boundary-safe-mode-active",
+                "critical",
+                std::time::Duration::from_millis(elapsed_ms as u64),
+            );
+        }
+        _ => {}
+    }
 }
 
 async fn p081_operator_alerts_json(
@@ -434,7 +536,10 @@ async fn p081_operator_alerts_json(
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut alerts = Vec::new();
 
-    if runtime["safeModeActive"].as_bool().unwrap_or(false) {
+    let safe_mode_active = runtime["safeModeActive"].as_bool().unwrap_or(false);
+    p081_record_safe_mode_alert_lifecycle(safe_mode_active, now_ms);
+
+    if safe_mode_active {
         alerts.push(serde_json::json!({
             "schemaVersion": "operator_alert_v1",
             "id": "p081-safe-mode-active",
@@ -572,6 +677,7 @@ async fn require_observer_opt_in_read(ctx: &Context<'_>) -> Result<GraphqlReadAu
         .data::<auth::Principal>()
         .map_err(|_| Error::new("unauthorized"))?;
     let caller_class = auth::derive_caller_class(principal);
+    record_p081_caller_class_diagnostics(principal, &caller_class, "graphql_query");
     let action = if caller_class.as_str() == "observer" {
         Some("graphql.read_only")
     } else {
@@ -595,7 +701,13 @@ async fn require_graphql_read(
     if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
         let started = std::time::Instant::now();
         let decision = policy.evaluate(caller_class.as_str(), "graphql_query", action);
-        db::metrics::record_p081_boundary_decision_latency(started.elapsed());
+        let elapsed = started.elapsed();
+        db::metrics::record_p081_boundary_decision_latency(
+            "graphql_query",
+            caller_class.as_str(),
+            policy.mode().as_str(),
+            elapsed,
+        );
         match decision {
             auth::boundary::PolicyDecision::Allow { row_id } => {
                 db::metrics::record_p081_boundary_decision(
@@ -674,9 +786,28 @@ async fn require_graphql_read(
                             row_id = ?row_id,
                             "BoundaryPolicy shadow: matrix would deny this graphql_query request"
                         );
+                        if principal.class == auth::PrincipalClass::Operator {
+                            db::metrics::record_p081_boundary_policy_enforcement_parity(
+                                "allow",
+                                "deny",
+                            );
+                            db::metrics::record_p081_boundary_shadow_disagreement(
+                                "graphql_query",
+                                row_id.as_deref(),
+                                caller_class.as_str(),
+                                action.unwrap_or("query"),
+                                "allow",
+                                "deny",
+                                Some(reason_code.as_str()),
+                            );
+                        }
                         // Preserve legacy fail-closed: non-Operator callers that the
                         // matrix would deny must still be denied in shadow mode.
                         if principal.class != auth::PrincipalClass::Operator {
+                            db::metrics::record_p081_boundary_policy_enforcement_parity(
+                                "deny",
+                                "deny",
+                            );
                             // MEDIUM-001: best-effort audit for shadow-mode denials.
                             write_graphql_legacy_deny_audit(
                                 ctx,
@@ -697,6 +828,14 @@ async fn require_graphql_read(
                         }
                     }
                     auth::boundary::PolicyDecision::Allow { row_id } => {
+                        db::metrics::record_p081_boundary_policy_enforcement_parity(
+                            if principal.class == auth::PrincipalClass::Operator {
+                                "allow"
+                            } else {
+                                "deny"
+                            },
+                            "allow",
+                        );
                         db::metrics::record_p081_boundary_decision(
                             "graphql_query",
                             row_id.as_deref(),
@@ -715,6 +854,10 @@ async fn require_graphql_read(
                 }
             }
             auth::boundary::PolicyDecision::LegacyPassthrough => {
+                db::metrics::record_p081_boundary_no_op_label(
+                    "chainworks-forge",
+                    &chrono::Utc::now().format("%Y-%m").to_string(),
+                );
                 // Legacy compat: operator-only, matching the pre-P081 P072 guard.
                 // Observer and Agent principals are denied; only Operators may pass through
                 // to the P072 surface policy check below. Exempting observer here would allow
@@ -737,6 +880,7 @@ async fn require_graphql_read(
             }
         }
     } else if principal.class != auth::PrincipalClass::Operator {
+        db::metrics::record_p081_boundary_policy_evaluation_error("graphql_query", "policy_missing");
         // No BoundaryPolicy available — fall back to operator-only guard.
         // No audit written here: this seam does not yet have bounded DB access.
         return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
@@ -781,7 +925,17 @@ async fn require_subscription_read(ctx: &Context<'_>) -> Result<()> {
 
     if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
         let caller_class = auth::derive_caller_class(principal);
-        match policy.evaluate(caller_class.as_str(), "graphql_subscription", None) {
+        record_p081_caller_class_diagnostics(principal, &caller_class, "graphql_subscription");
+        let started = std::time::Instant::now();
+        let decision = policy.evaluate(caller_class.as_str(), "graphql_subscription", None);
+        let elapsed = started.elapsed();
+        db::metrics::record_p081_boundary_decision_latency(
+            "graphql_subscription",
+            caller_class.as_str(),
+            policy.mode().as_str(),
+            elapsed,
+        );
+        match decision {
             auth::boundary::PolicyDecision::Allow { .. } => {}
             auth::boundary::PolicyDecision::Deny {
                 reason_code,
@@ -824,7 +978,26 @@ async fn require_subscription_read(ctx: &Context<'_>) -> Result<()> {
                         row_id = ?row_id,
                         "BoundaryPolicy shadow: matrix would deny this graphql_subscription"
                     );
+                    if principal.class == auth::PrincipalClass::Operator {
+                        db::metrics::record_p081_boundary_policy_enforcement_parity(
+                            "allow",
+                            "deny",
+                        );
+                        db::metrics::record_p081_boundary_shadow_disagreement(
+                            "graphql_subscription",
+                            row_id.as_deref(),
+                            caller_class.as_str(),
+                            "subscription",
+                            "allow",
+                            "deny",
+                            Some(reason_code.as_str()),
+                        );
+                    }
                     if principal.class != auth::PrincipalClass::Operator {
+                        db::metrics::record_p081_boundary_policy_enforcement_parity(
+                            "deny",
+                            "deny",
+                        );
                         // MEDIUM-001: best-effort audit for shadow-mode subscription denials.
                         write_graphql_legacy_deny_audit(
                             ctx,
@@ -846,6 +1019,10 @@ async fn require_subscription_read(ctx: &Context<'_>) -> Result<()> {
                 }
             }
             auth::boundary::PolicyDecision::LegacyPassthrough => {
+                db::metrics::record_p081_boundary_no_op_label(
+                    "chainworks-forge",
+                    &chrono::Utc::now().format("%Y-%m").to_string(),
+                );
                 if principal.class != auth::PrincipalClass::Operator {
                     // MEDIUM-001: best-effort audit for legacy-passthrough subscription denials.
                     write_graphql_legacy_deny_audit(
@@ -864,6 +1041,10 @@ async fn require_subscription_read(ctx: &Context<'_>) -> Result<()> {
             }
         }
     } else if principal.class != auth::PrincipalClass::Operator {
+        db::metrics::record_p081_boundary_policy_evaluation_error(
+            "graphql_subscription",
+            "policy_missing",
+        );
         // No BoundaryPolicy available — fall back to operator-only guard.
         // No audit written here: this seam does not yet have bounded DB access.
         return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
@@ -2500,11 +2681,11 @@ async fn mutation_allowed(
     principal: &auth::Principal,
     mutation: MutationName,
 ) -> Result<(), async_graphql::Error> {
+    let caller_class = auth::derive_caller_class(principal);
     // P081 Phase 3: consult the shared BoundaryPolicy when it is injected.
     // ui_operator on graphql_mutation is allowed by the matrix (approval actions).
     // Any other caller_class that lacks a matching row returns MATRIX_NO_ROW → denied.
     if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
-        let caller_class = auth::derive_caller_class(principal);
         match policy.evaluate(
             caller_class.as_str(),
             "graphql_mutation",
@@ -2551,10 +2732,47 @@ async fn mutation_allowed(
                         row_id = ?row_id,
                         "BoundaryPolicy shadow: matrix would deny this graphql_mutation"
                     );
+                    if principal.class == auth::PrincipalClass::Operator {
+                        db::metrics::record_p081_boundary_policy_enforcement_parity(
+                            "allow",
+                            "deny",
+                        );
+                        db::metrics::record_p081_boundary_shadow_disagreement(
+                            "graphql_mutation",
+                            row_id.as_deref(),
+                            caller_class.as_str(),
+                            mutation.graphql_name(),
+                            "allow",
+                            "deny",
+                            Some(reason_code.as_str()),
+                        );
+                    }
                 }
             }
             auth::boundary::PolicyDecision::Allow { .. }
             | auth::boundary::PolicyDecision::LegacyPassthrough => {}
+        }
+    } else {
+        db::metrics::record_p081_boundary_policy_evaluation_error(
+            "graphql_mutation",
+            "policy_missing",
+        );
+    }
+
+    if let Ok(pool) = ctx.data::<SqlitePool>() {
+        if audit_log::audit_budget_requires_safe_mode(pool)
+            .await
+            .map_err(|e| Error::new(e.to_string()))?
+        {
+            db::metrics::record_p081_audit_log_rate_limited(
+                "graphql_mutation",
+                "AUDIT_BUDGET_EXHAUSTED",
+            );
+            return Err(boundary_denial_error(
+                "AUDIT_BUDGET_EXHAUSTED",
+                Some("p081.audit_budget.safe_mode"),
+                Some(caller_class.as_str()),
+            ));
         }
     }
 
@@ -3041,15 +3259,46 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
         run_id: Option<ID>,
+        replay_cursor: Option<String>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRuntimeEvent>>>>
     {
         require_subscription_read(ctx).await?;
 
         let events = ctx.data::<EventSender>()?.clone();
         let filter_run_id: Option<RunId> = run_id.and_then(|id| id.parse().ok());
+        let latest_sequence = P081_SUBSCRIPTION_SEQUENCE.load(Ordering::SeqCst);
+        let replay = p081_subscription_replay_readback(
+            replay_cursor.as_deref(),
+            p081_oldest_retained_sequence(latest_sequence),
+            latest_sequence,
+            latest_sequence,
+        );
+        let bootstrap_frames = if replay["gapDetected"].as_bool().unwrap_or(false) {
+            vec![Ok(Some(GqlRuntimeEvent {
+                run_id: ID(
+                    filter_run_id
+                        .unwrap_or_else(|| RunId::from(uuid::Uuid::nil()))
+                        .to_string(),
+                ),
+                stage_id: "boundary_subscription_replay".to_string(),
+                agent_id: "control_plane".to_string(),
+                provider: "control_plane".to_string(),
+                event_kind: "subscription_gap_detected".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                sequence_cursor: replay["sequenceCursor"]
+                    .as_str()
+                    .unwrap_or("seq-0")
+                    .to_string(),
+                projection_generation: replay["projectionGeneration"].as_i64().unwrap_or(0),
+                gap_detected: true,
+                requires_full_refetch: true,
+            }))]
+        } else {
+            Vec::new()
+        };
 
         let rx = events.subscribe();
-        Ok(BroadcastStream::new(rx).filter_map(move |msg| {
+        let live = BroadcastStream::new(rx).filter_map(move |msg| {
             let fut = async move {
                 let event = msg.ok()?;
                 match event {
@@ -3060,6 +3309,7 @@ impl SubscriptionRoot {
                         provider,
                         event_kind,
                     } => {
+                        let sequence = p081_next_subscription_sequence();
                         if let Some(fid) = filter_run_id {
                             if run_id != fid {
                                 return None;
@@ -3072,13 +3322,18 @@ impl SubscriptionRoot {
                             provider,
                             event_kind,
                             timestamp: chrono::Utc::now().to_rfc3339(),
+                            sequence_cursor: format!("seq-{sequence}"),
+                            projection_generation: sequence,
+                            gap_detected: false,
+                            requires_full_refetch: false,
                         })))
                     }
                     _ => None,
                 }
             };
             fut
-        }))
+        });
+        Ok(stream::iter(bootstrap_frames).chain(live))
     }
 
     /// P042 §5.2 push surface. Emits a `GqlDaemonStatus` frame on every
@@ -3120,6 +3375,10 @@ pub struct GqlRuntimeEvent {
     /// "session_started" | "session_completed" | "session_failed"
     pub event_kind: String,
     pub timestamp: String,
+    pub sequence_cursor: String,
+    pub projection_generation: i64,
+    pub gap_detected: bool,
+    pub requires_full_refetch: bool,
 }
 
 #[cfg(test)]
@@ -3130,8 +3389,8 @@ mod tests {
     use chrono::Utc;
     use db::pool::create_pool;
     use db::repos::{
-        artifact_contracts, artifacts, ideas, projections, rollout_contract_checks, runs, stages,
-        steward, workflow_conflicts,
+        artifact_contracts, artifacts, audit_log, ideas, projections, rollout_contract_checks,
+        runs, stages, steward, workflow_conflicts,
     };
     use db::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
     use domain::artifact::{Artifact, ArtifactFormat};
@@ -5040,6 +5299,95 @@ mod tests {
             json["runStatusChanged"]["id"],
             serde_json::json!(run_id.to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_081_runtime_subscription_payload_carries_cursor_generation_and_gap() {
+        use async_graphql::futures_util::StreamExt;
+
+        let pool = p043_test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let run_id = RunId::new();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            bus.clone(),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        let mut live_stream = schema.execute_stream(
+            Request::new(format!(
+                r#"
+                subscription {{
+                  runtimeStatusChanged(runId: "{run_id}") {{
+                    eventKind
+                    sequenceCursor
+                    projectionGeneration
+                    gapDetected
+                    requiresFullRefetch
+                  }}
+                }}
+                "#
+            ))
+            .data(test_principal()),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = bus.send(DomainEvent::RuntimeStatusChanged {
+                run_id,
+                stage_id: "state_9".into(),
+                agent_id: "code_writer".into(),
+                provider: "codex".into(),
+                event_kind: "session_started".into(),
+            });
+        });
+
+        let live_frame = tokio::time::timeout(std::time::Duration::from_secs(5), live_stream.next())
+            .await
+            .expect("runtime status subscription frame timed out")
+            .expect("runtime status subscription ended");
+        assert!(live_frame.errors.is_empty(), "{live_frame:?}");
+        let live_json = live_frame.data.into_json().unwrap();
+        let live = &live_json["runtimeStatusChanged"];
+        assert_eq!(live["eventKind"], "session_started");
+        assert!(
+            live["sequenceCursor"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("seq-"),
+            "live subscription payload must carry sequenceCursor"
+        );
+        assert!(live["projectionGeneration"].as_i64().unwrap_or(0) > 0);
+        assert_eq!(live["gapDetected"], false);
+        assert_eq!(live["requiresFullRefetch"], false);
+
+        let mut gap_stream = schema.execute_stream(
+            Request::new(
+                r#"
+                subscription {
+                  runtimeStatusChanged(replayCursor: "seq-999999999") {
+                    eventKind
+                    sequenceCursor
+                    projectionGeneration
+                    gapDetected
+                    requiresFullRefetch
+                  }
+                }
+                "#,
+            )
+            .data(test_principal()),
+        );
+        let gap_frame = tokio::time::timeout(std::time::Duration::from_secs(1), gap_stream.next())
+            .await
+            .expect("gap frame timed out")
+            .expect("gap stream ended");
+        assert!(gap_frame.errors.is_empty(), "{gap_frame:?}");
+        let gap_json = gap_frame.data.into_json().unwrap();
+        let gap = &gap_json["runtimeStatusChanged"];
+        assert_eq!(gap["eventKind"], "subscription_gap_detected");
+        assert_eq!(gap["gapDetected"], true);
+        assert_eq!(gap["requiresFullRefetch"], true);
     }
 
     #[tokio::test]
@@ -7670,6 +8018,34 @@ mod tests {
         assert!(readback["auditLogHealth"]["payloadUsedBytes"]
             .as_i64()
             .is_some());
+        let audit_health = readback["auditLogHealth"]
+            .as_object()
+            .expect("audit health object");
+        assert!(audit_health.contains_key("lastWriteOkAtMs"));
+        assert!(audit_health.contains_key("consecutiveFailures"));
+        assert!(audit_health.contains_key("cumulativeFailures"));
+        assert!(audit_health.contains_key("budgetBytes"));
+        assert!(audit_health.contains_key("usedBytes"));
+        assert!(audit_health.contains_key("payloadBudgetState"));
+        assert!(audit_health.contains_key("payloadBudgetUsedPercent"));
+        assert!(audit_health.contains_key("halfOpenProbeSuccessCount"));
+        assert!(readback["auditLogHealth"]["consecutiveFailures"]
+            .as_i64()
+            .is_some());
+        assert!(readback["auditLogHealth"]["cumulativeFailures"]
+            .as_i64()
+            .is_some());
+        assert!(readback["auditLogHealth"]["budgetBytes"].as_i64().is_some());
+        assert!(readback["auditLogHealth"]["usedBytes"].as_i64().is_some());
+        assert!(readback["auditLogHealth"]["payloadBudgetState"]
+            .as_str()
+            .is_some());
+        assert!(readback["auditLogHealth"]["payloadBudgetUsedPercent"]
+            .as_i64()
+            .is_some());
+        assert!(readback["auditLogHealth"]["halfOpenProbeSuccessCount"]
+            .as_i64()
+            .is_some());
         assert_eq!(
             readback["auditLogHealth"]["shadowCoverageReportRef"],
             "docs/evidence/boundary-policy-shadow-coverage/report.json"
@@ -7735,6 +8111,60 @@ mod tests {
         assert!(
             !safe_mode.to_string().contains("\"rows\""),
             "operatorAlerts must not expose raw audit rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_081_subscription_runtime_readback_exposes_cursor_gap_contract() {
+        let pool = test_pool().await;
+        let schema = build_schema_inner(
+            pool,
+            make_command_handler(test_pool().await),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+            None,
+            Some(Arc::new(
+                auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                    auth::boundary::PolicyMode::Enforce,
+                )
+                .unwrap(),
+            )),
+        );
+
+        let response = schema
+            .execute(Request::new("{ boundaryRuntime }").data(test_principal()))
+            .await;
+        assert!(response.errors.is_empty(), "{response:?}");
+        let json = response.data.into_json().unwrap();
+        let subscription = &json["boundaryRuntime"]["subscriptionReplay"];
+        assert_eq!(
+            subscription["schemaVersion"],
+            "subscription_replay_runtime_v1"
+        );
+        assert!(subscription["sequenceCursor"].as_str().is_some());
+        assert!(subscription["projectionGeneration"].as_i64().is_some());
+        assert_eq!(subscription["gapDetected"], serde_json::Value::Bool(false));
+        assert_eq!(
+            subscription["requiresFullRefetch"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(subscription["retentionMinutes"], 15);
+        assert_eq!(subscription["retentionEventCount"], 10_000);
+
+        let inside_window = p081_subscription_replay_readback(Some("seq-95"), 90, 100, 7);
+        assert_eq!(inside_window["gapDetected"], serde_json::Value::Bool(false));
+        assert_eq!(
+            inside_window["requiresFullRefetch"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(inside_window["projectionGeneration"], 7);
+
+        let outside_window = p081_subscription_replay_readback(Some("seq-89"), 90, 100, 7);
+        assert_eq!(outside_window["gapDetected"], serde_json::Value::Bool(true));
+        assert_eq!(
+            outside_window["requiresFullRefetch"],
+            serde_json::Value::Bool(true)
         );
     }
 
@@ -7894,6 +8324,61 @@ mod tests {
         assert!(
             data["approveApproval"]["journalId"].is_string(),
             "approveApproval must return journalId"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_081_audit_budget_safe_mode_denies_approval_mutation() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let stage = make_manual_gate_stage(run_id, "state_6");
+        stages::insert(&pool, &stage).await.unwrap();
+        let approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &approval).await.unwrap();
+        force_p081_audit_budget_safe_mode(&pool).await;
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        let denied = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8081-000000000002") {{
+                        approval {{ id decision }}
+                        journalId
+                      }}
+                    }}"#,
+                    approval.id
+                ))
+                .data(test_principal()),
+            )
+            .await;
+        assert!(
+            denied
+                .errors
+                .iter()
+                .any(|error| format!("{error:?}").contains("AUDIT_BUDGET_EXHAUSTED")),
+            "audit budget safe mode must deny approval mutation: {denied:?}"
+        );
+        let current = approvals::find_by_id(&pool, approval.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.decision,
+            ApprovalDecision::Pending,
+            "denied approval mutation must not mutate approval state"
         );
     }
 
@@ -8822,6 +9307,38 @@ mod tests {
 
     fn operator_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    async fn force_p081_audit_budget_safe_mode(pool: &SqlitePool) {
+        let now_ms = Utc::now().timestamp_millis();
+        let payload = "x".repeat(16_100);
+        let entry = audit_log::AuditEntry {
+            id: "p081-graphql-budget-safe-mode",
+            request_id: "p081-graphql-budget-safe-mode",
+            timestamp_ms: now_ms,
+            event_type: "policy_denied",
+            principal_id: Some("test-operator"),
+            principal_class: Some("operator"),
+            caller_class: Some("ui_operator"),
+            token_id: None,
+            transport: "graphql_mutation",
+            action_attempted: "approveApproval",
+            decision: "deny",
+            denial_reason_code: None,
+            row_id: Some("p081.audit_budget.safe_mode"),
+            env_gate_state: None,
+            source_ip_hash_or_local_process_id: None,
+            boundary_policy_mode: "enforce",
+            fixture_version: "p081-boundary-matrix-v1",
+            payload: &payload,
+            original_payload_bytes: None,
+            diagnostic_truncated: false,
+            checkpoint_id: None,
+            created_at_ms: now_ms,
+        };
+        audit_log::append(pool, &entry).await.unwrap();
+        let health = audit_log::health_snapshot(pool).await.unwrap();
+        assert_eq!(health.payload_budget_state, "read_only_safe_mode");
     }
 
     #[tokio::test]

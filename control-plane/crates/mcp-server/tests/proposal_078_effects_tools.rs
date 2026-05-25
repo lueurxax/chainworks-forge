@@ -8,7 +8,7 @@ use domain::run::{Run, RunStatus};
 use domain::side_effect::{EffectKind, SideEffect, SideEffectId, SideEffectStatus};
 use domain::stage::{StageExecution, StageStatus};
 use domain::CapabilityToolId;
-use mcp_server::tools;
+use mcp_server::{request_context, tools};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -345,6 +345,75 @@ async fn proposal_078_effects_mark_conflict_applies_operator_disposition() {
         .unwrap()
         .expect("effect must remain durable");
     assert_eq!(loaded.status, SideEffectStatus::Conflict);
+}
+
+#[tokio::test]
+async fn proposal_081_effects_mark_conflict_claims_mcp_idempotency_in_write_unit() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let (pool, effect_id) = seed_effect(&tempdir, EffectKind::GitPush, None).await;
+    let disposition_id = uuid::Uuid::new_v4().to_string();
+    let decision_json = serde_json::json!({
+        "schema_version": "side_effect_decision_v1",
+        "decision": "conflict",
+        "operator_notes": "Remote state diverged from local release ledger evidence."
+    })
+    .to_string();
+    let principal = Principal::new("operator-test", PrincipalClass::Operator);
+    let key = uuid::Uuid::now_v7().to_string();
+    let request_hash = "sha256:p081-effects-request";
+    let row_id = "p081.agent_operator.mcp_tools_call.command";
+
+    let payload = request_context::scope_idempotency_key(
+        Some(key.clone()),
+        request_context::scope_idempotency_request_hash(
+            Some(request_hash.to_string()),
+            request_context::scope_boundary_row_id(
+                Some(row_id.to_string()),
+                tools::effects::handle_effects_mark_conflict(
+                    &pool,
+                    &serde_json::json!({
+                        "effect_id": effect_id.to_string(),
+                        "disposition_id": disposition_id,
+                        "decision_json": decision_json
+                    }),
+                    &principal,
+                ),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let journal_id = payload["journal_id"]
+        .as_str()
+        .expect("effects mutation must return journal_id");
+    let idempotency: (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT result_json, command_journal_id, row_id FROM mcp_command_idempotency \
+         WHERE idempotency_key = ?1",
+    )
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("effects write unit must claim MCP idempotency row");
+    assert_eq!(
+        idempotency.0,
+        db::repos::mcp_command_idempotency::PENDING_SENTINEL,
+        "direct handler leaves final result update to the MCP server"
+    );
+    assert!(idempotency.1.is_none());
+    assert_eq!(idempotency.2.as_deref(), Some(row_id));
+
+    let journal: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT result_status, mcp_idempotency_key, boundary_row_id \
+         FROM command_journal WHERE id = ?1",
+    )
+    .bind(journal_id)
+    .fetch_one(&pool)
+    .await
+    .expect("effects write unit must record command_journal row");
+    assert_eq!(journal.0, "completed");
+    assert_eq!(journal.1, key);
+    assert_eq!(journal.2.as_deref(), Some(row_id));
 }
 
 #[test]

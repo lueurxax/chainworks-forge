@@ -16,6 +16,7 @@ use crate::protocol::JsonRpcResponse;
 use crate::protocol::McpTool;
 use crate::tools;
 use domain::events::DomainEvent;
+use domain::CapabilityToolId;
 use domain::ResourceTemplateId;
 
 pub struct McpServer {
@@ -358,7 +359,8 @@ impl McpServer {
         principal: &auth::Principal,
     ) -> JsonRpcResponse {
         let started = std::time::Instant::now();
-        let response = self.handle_request_inner(req, principal).await;
+        let response =
+            Box::pin(async move { self.handle_request_inner(req, principal).await }).await;
         db::metrics::record_mcp_liveness_gate_duration(started.elapsed());
         response
     }
@@ -408,7 +410,6 @@ impl McpServer {
                             )
                             .await
                             {
-                                db::metrics::increment_counter("audit_log_append_failure_total");
                                 tracing::error!(
                                     error = %e,
                                     "boundary deny audit write failed; failing closed (mcp_initialize)"
@@ -477,11 +478,20 @@ impl McpServer {
                 // Shadow mode logs the matrix decision without filtering.
                 if let Some(policy) = &self.boundary_policy {
                     let caller_class = auth::derive_caller_class_for_mcp(&principal);
-                    match policy.evaluate(
+                    let started = std::time::Instant::now();
+                    let decision = policy.evaluate(
                         caller_class.as_str(),
                         "mcp_tools_list",
                         Some("tools/list"),
-                    ) {
+                    );
+                    let elapsed = started.elapsed();
+                    db::metrics::record_p081_boundary_decision_latency(
+                        "mcp_tools_list",
+                        caller_class.as_str(),
+                        policy.mode().as_str(),
+                        elapsed,
+                    );
+                    match decision {
                         auth::boundary::PolicyDecision::Deny {
                             reason_code,
                             row_id,
@@ -507,7 +517,6 @@ impl McpServer {
                             )
                             .await
                             {
-                                db::metrics::increment_counter("audit_log_append_failure_total");
                                 tracing::error!(
                                     error = %e,
                                     "boundary deny audit write failed; failing closed (mcp_tools_list)"
@@ -536,6 +545,21 @@ impl McpServer {
                                     row_id = ?row_id,
                                     "BoundaryPolicy shadow: matrix would filter mcp_tools_list"
                                 );
+                                if principal.class == auth::PrincipalClass::Operator {
+                                    db::metrics::record_p081_boundary_policy_enforcement_parity(
+                                        "allow",
+                                        "deny",
+                                    );
+                                    db::metrics::record_p081_boundary_shadow_disagreement(
+                                        "mcp_tools_list",
+                                        row_id.as_deref(),
+                                        caller_class.as_str(),
+                                        "tools/list",
+                                        "allow",
+                                        "deny",
+                                        Some(reason_code.as_str()),
+                                    );
+                                }
                             }
                         }
                         auth::boundary::PolicyDecision::Allow { .. }
@@ -593,11 +617,20 @@ impl McpServer {
                 let mut policy_allowed_row_id: Option<String> = None;
                 if let Some(policy) = &self.boundary_policy {
                     let caller_class = auth::derive_caller_class_for_mcp(&principal);
-                    match policy.evaluate(
+                    let started = std::time::Instant::now();
+                    let decision = policy.evaluate(
                         caller_class.as_str(),
                         "mcp_tools_call",
                         Some(canonical_tool_name),
-                    ) {
+                    );
+                    let elapsed = started.elapsed();
+                    db::metrics::record_p081_boundary_decision_latency(
+                        "mcp_tools_call",
+                        caller_class.as_str(),
+                        policy.mode().as_str(),
+                        elapsed,
+                    );
+                    match decision {
                         auth::boundary::PolicyDecision::Deny {
                             reason_code,
                             row_id,
@@ -617,7 +650,6 @@ impl McpServer {
                             )
                             .await
                             {
-                                db::metrics::increment_counter("audit_log_append_failure_total");
                                 tracing::error!(
                                     error = %e,
                                     "boundary deny audit write failed; failing closed (mcp_tools_call)"
@@ -651,6 +683,21 @@ impl McpServer {
                                     row_id = ?row_id,
                                     "BoundaryPolicy shadow: matrix would deny this mcp_tools_call"
                                 );
+                                if principal.class == auth::PrincipalClass::Operator {
+                                    db::metrics::record_p081_boundary_policy_enforcement_parity(
+                                        "allow",
+                                        "deny",
+                                    );
+                                    db::metrics::record_p081_boundary_shadow_disagreement(
+                                        "mcp_tools_call",
+                                        row_id.as_deref(),
+                                        caller_class.as_str(),
+                                        canonical_tool_name,
+                                        "allow",
+                                        "deny",
+                                        Some(reason_code.as_str()),
+                                    );
+                                }
                             }
                         }
                         auth::boundary::PolicyDecision::Allow { row_id } => {
@@ -677,7 +724,6 @@ impl McpServer {
                     )
                     .await
                     {
-                        db::metrics::increment_counter("audit_log_append_failure_total");
                         tracing::warn!(error = %e, tool = %canonical_tool_name, "capability-denial audit write failed; returning fail-closed denial");
                         return JsonRpcResponse::policy_denial(
                             id,
@@ -717,6 +763,41 @@ impl McpServer {
                 }
 
                 let tool_params = params["arguments"].clone();
+
+                if is_state_changing_call(canonical_tool_name, &tool_params) {
+                    match db::repos::audit_log::audit_budget_requires_safe_mode(&self.pool).await {
+                        Ok(true) => {
+                            let caller_class = auth::derive_caller_class_for_mcp(&principal);
+                            db::metrics::record_p081_audit_log_rate_limited(
+                                "mcp_tools_call",
+                                "AUDIT_BUDGET_EXHAUSTED",
+                            );
+                            return JsonRpcResponse::policy_denial(
+                                id,
+                                "AUDIT_BUDGET_EXHAUSTED",
+                                caller_class.as_str(),
+                                Some("p081.audit_budget.safe_mode"),
+                                "p081-boundary-matrix-v1",
+                            );
+                        }
+                        Err(e) => {
+                            db::metrics::record_p081_boundary_policy_evaluation_error(
+                                "mcp_tools_call",
+                                "audit_budget_health_unavailable",
+                            );
+                            tracing::error!(
+                                error = %e,
+                                "P081 audit-budget health unavailable; denying state-changing MCP call"
+                            );
+                            return JsonRpcResponse::error(
+                                id,
+                                -32000,
+                                "audit budget health unavailable".to_string(),
+                            );
+                        }
+                        Ok(false) => {}
+                    }
+                }
 
                 // P081 AC-13: MCP command idempotency enforcement.
                 // The transport validates and looks up the key before dispatch; the pending
@@ -1094,6 +1175,14 @@ impl McpServer {
             .filter(|id| tools::p064_operator_tool_enabled(&tools::mcp_tool_for(*id).name))
             .map(tools::mcp_tool_for)
             .map(tools::codex_compatible_tool)
+            .chain(
+                principal
+                    .tool_capabilities
+                    .contains(&CapabilityToolId::RuntimeHealth)
+                    .then(|| {
+                        tools::codex_compatible_tool(tools::runtime::boundary_runtime_tool_spec())
+                    }),
+            )
             .collect()
     }
 
@@ -1442,6 +1531,14 @@ impl McpServer {
                 self.boundary_policy.as_deref(),
             )
             .await
+        } else if tool_name == "boundary.runtime.get" {
+            tools::runtime::execute_with_name(
+                tool_name,
+                params,
+                pool,
+                self.boundary_policy.as_deref(),
+            )
+            .await
         } else if tool_name == "operator.alerts.list" {
             tools::runtime::execute_with_name(
                 tool_name,
@@ -1537,6 +1634,7 @@ fn is_read_only_tool(tool_name: &str) -> bool {
             | "steward.list_analyses"
             | "steward.get_analysis"
             | "runtime.health"
+            | "boundary.runtime.get"
             | "storage.health"
             | "storage.write_pressure"
             | "storage.evidence_spool_summary"
@@ -1597,6 +1695,29 @@ fn derive_token_id_for_idempotency(principal: &auth::Principal) -> String {
     crate::request_context::current_token_id().unwrap_or_default()
 }
 
+fn canonicalize_json_for_hash(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                if let Some(child) = map.get(key) {
+                    canonical.insert(key.clone(), canonicalize_json_for_hash(child));
+                }
+            }
+            serde_json::Value::Object(canonical)
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(canonicalize_json_for_hash)
+                .collect::<Vec<_>>(),
+        ),
+        _ => value.clone(),
+    }
+}
+
 /// Compute canonical_request_hash for idempotency deduplication.
 /// The idempotency_key itself is excluded from the hash (it is retry metadata).
 /// Also strips camelCase idempotencyKey if present.
@@ -1615,9 +1736,10 @@ fn compute_canonical_request_hash(
         map.remove("idempotency_key");
         map.remove("idempotencyKey");
     }
+    let args_canonical = canonicalize_json_for_hash(&args_sorted);
     let canonical = serde_json::json!({
         "tool_name": tool_name,
-        "arguments": args_sorted,
+        "arguments": args_canonical,
         "caller_class": caller_class,
         "principal_id": principal_id,
         "token_id": token_id,
@@ -1987,7 +2109,11 @@ async fn write_mcp_deny_audit(
     db::repos::audit_log::append(pool, &entry)
         .await
         .map_err(|e| {
-            db::metrics::increment_counter("audit_log_append_failure_total");
+            db::metrics::record_p081_audit_log_append_failure(
+                "boundary_decision",
+                transport,
+                mode,
+            );
             e
         })
 }
@@ -2470,7 +2596,7 @@ mod tests {
     use chrono::Utc;
     use db::pool::create_pool;
     use db::repos::{
-        artifact_contracts, artifacts, command_journal, ideas, projections,
+        artifact_contracts, artifacts, audit_log, command_journal, ideas, projections,
         rollout_contract_checks, runs, steward, validation,
     };
     use domain::artifact::{Artifact, ArtifactFormat};
@@ -3537,6 +3663,38 @@ mod tests {
         auth::Principal::new("test-observer", auth::PrincipalClass::Observer)
     }
 
+    async fn force_p081_audit_budget_safe_mode(pool: &sqlx::SqlitePool) {
+        let now_ms = Utc::now().timestamp_millis();
+        let payload = "x".repeat(16_100);
+        let entry = audit_log::AuditEntry {
+            id: "p081-mcp-budget-safe-mode",
+            request_id: "p081-mcp-budget-safe-mode",
+            timestamp_ms: now_ms,
+            event_type: "policy_denied",
+            principal_id: Some("test-operator"),
+            principal_class: Some("operator"),
+            caller_class: Some("ui_operator"),
+            token_id: None,
+            transport: "mcp_tools_call",
+            action_attempted: "ideas.create",
+            decision: "deny",
+            denial_reason_code: None,
+            row_id: Some("p081.audit_budget.safe_mode"),
+            env_gate_state: None,
+            source_ip_hash_or_local_process_id: None,
+            boundary_policy_mode: "enforce",
+            fixture_version: "p081-boundary-matrix-v1",
+            payload: &payload,
+            original_payload_bytes: None,
+            diagnostic_truncated: false,
+            checkpoint_id: None,
+            created_at_ms: now_ms,
+        };
+        audit_log::append(pool, &entry).await.unwrap();
+        let health = audit_log::health_snapshot(pool).await.unwrap();
+        assert_eq!(health.payload_budget_state, "read_only_safe_mode");
+    }
+
     #[tokio::test]
     async fn proposal_081_observer_resources_list_matches_compact_read_matrix_row() {
         let pool = test_pool().await;
@@ -3580,6 +3738,56 @@ mod tests {
                 .any(|resource| resource["uri"] == "chainworks://approvals/inbox"),
             "observer compact resources/list must still expose observer-readable resources"
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_081_audit_budget_safe_mode_denies_state_changing_mcp_call() {
+        let pool = test_pool().await;
+        force_p081_audit_budget_safe_mode(&pool).await;
+        let policy = Arc::new(
+            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                auth::boundary::PolicyMode::Enforce,
+            )
+            .unwrap(),
+        );
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        )
+        .with_boundary_policy(policy);
+
+        let response = server
+            .handle_request(
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(serde_json::json!(81)),
+                    method: "tools/call".to_string(),
+                    params: Some(serde_json::json!({
+                        "name": "ideas.create",
+                        "arguments": {
+                            "title": "blocked by audit budget",
+                            "body": "must not commit",
+                            "idempotency_key": "01900000-0000-7000-8081-000000000001"
+                        }
+                    })),
+                },
+                &operator_principal(),
+            )
+            .await;
+
+        let error = response
+            .error
+            .expect("audit budget safe mode must deny state-changing call");
+        assert_eq!(error.code, -32004);
+        let data = error.data.expect("policy denial data");
+        assert_eq!(data["reason_code"], "AUDIT_BUDGET_EXHAUSTED");
+        assert_eq!(data["row_id"], "p081.audit_budget.safe_mode");
+        let ideas: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ideas")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ideas, 0, "denied MCP call must not mutate domain state");
     }
 
     #[tokio::test]
@@ -3824,6 +4032,26 @@ mod tests {
             boundary.get("rows").is_none(),
             "runtime.health must expose bounded audit health, not raw audit rows"
         );
+
+        let snake_payload = call_tool_and_parse(
+            &server,
+            &operator_principal(),
+            "boundary.runtime.get",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(snake_payload["schema_version"], "boundary_runtime.v1");
+        assert_eq!(snake_payload["matrix_id"], "p081-boundary-matrix-v1");
+        assert_eq!(snake_payload["policy_injected"], true);
+        assert_eq!(
+            snake_payload["audit_log_health"]["schema_version"],
+            "audit_log_health.v1"
+        );
+        assert!(snake_payload["auditLogHealth"].is_null());
+        assert_eq!(
+            snake_payload["subscription_replay"]["sequence_cursor"],
+            "seq-0"
+        );
     }
 
     #[tokio::test]
@@ -3919,6 +4147,10 @@ mod tests {
         assert!(
             tools.iter().any(|tool| tool["name"] == "runtime_health"),
             "operator tools/list must expose runtime.health as Codex-compatible runtime_health"
+        );
+        assert!(
+            tools.iter().any(|tool| tool["name"] == "boundary_runtime_get"),
+            "operator tools/list must expose P081 boundary.runtime.get as Codex-compatible boundary_runtime_get"
         );
 
         let runs_resource = server
@@ -4242,6 +4474,129 @@ mod tests {
             idea_count.0, 1,
             "idempotency replay must not duplicate domain writes"
         );
+    }
+
+    #[test]
+    fn p081_canonical_request_hash_sorts_nested_argument_objects() {
+        let left = serde_json::json!({
+            "idempotency_key": uuid::Uuid::now_v7().to_string(),
+            "projectionName": "runs_home",
+            "nested": {
+                "b": 2,
+                "a": 1,
+                "array": [
+                    { "z": true, "a": false }
+                ]
+            }
+        });
+        let right = serde_json::json!({
+            "projectionName": "runs_home",
+            "nested": {
+                "array": [
+                    { "a": false, "z": true }
+                ],
+                "a": 1,
+                "b": 2
+            },
+            "idempotencyKey": uuid::Uuid::now_v7().to_string()
+        });
+
+        assert_eq!(
+            compute_canonical_request_hash(
+                "storage.projections.clear_backlog",
+                &left,
+                "agent_operator",
+                "test-operator",
+                "token:test",
+                Some("p081.agent_operator.mcp_tools_call.command"),
+            ),
+            compute_canonical_request_hash(
+                "storage.projections.clear_backlog",
+                &right,
+                "agent_operator",
+                "test-operator",
+                "token:test",
+                Some("p081.agent_operator.mcp_tools_call.command"),
+            ),
+            "nested JSON key order and idempotency-key casing must not change the retry hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn p081_storage_clear_backlog_claims_idempotency_in_write_unit() {
+        let pool = test_pool().await;
+        let principal = operator_principal();
+        let key = uuid::Uuid::now_v7().to_string();
+        let request_hash = "sha256:p081-storage-request";
+        let row_id = "p081.agent_operator.mcp_tools_call.command";
+        let args = serde_json::json!({
+            "projectionName": "p081-test-projection",
+            "sourceName": "p081-test-source",
+        });
+
+        let first = crate::request_context::scope_idempotency_key(
+            Some(key.clone()),
+            crate::request_context::scope_idempotency_request_hash(
+                Some(request_hash.to_string()),
+                crate::request_context::scope_boundary_row_id(
+                    Some(row_id.to_string()),
+                    tools::storage::execute_with_writer(
+                        "storage.projections.clear_backlog",
+                        args,
+                        &pool,
+                        None,
+                        &principal,
+                        tokio_util::sync::CancellationToken::new(),
+                        Some("request-p081-storage"),
+                    ),
+                ),
+            ),
+        )
+        .await
+        .expect("storage projection clear must succeed");
+
+        let journal_id = first["journal_id"]
+            .as_str()
+            .expect("storage projection clear must return journal_id");
+
+        let journal_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM command_journal WHERE mcp_idempotency_key = ?1")
+                .bind(&key)
+                .fetch_one(&pool)
+                .await
+                .expect("journal count");
+        assert_eq!(
+            journal_count.0, 1,
+            "storage write unit must append exactly one command_journal row"
+        );
+
+        let idempotency: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT result_json, command_journal_id, row_id FROM mcp_command_idempotency \
+             WHERE idempotency_key = ?1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("idempotency row must exist");
+        assert_eq!(
+            idempotency.0,
+            db::repos::mcp_command_idempotency::PENDING_SENTINEL,
+            "direct handler leaves final result update to the MCP server"
+        );
+        assert!(idempotency.1.is_none());
+        assert_eq!(idempotency.2.as_deref(), Some(row_id));
+
+        let result_json = serde_json::to_string(&first).unwrap();
+        let committed = db::repos::mcp_command_idempotency::update_result(
+            &pool,
+            &key,
+            &result_json,
+            None,
+            Some(journal_id),
+        )
+        .await
+        .expect("server-side idempotency finalization must update pending row");
+        assert!(committed);
     }
 
     #[tokio::test]

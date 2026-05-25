@@ -145,6 +145,89 @@ pub fn increment_counter_with_label(name: &str, label: &str) {
     *m.counters.entry(key).or_default() += 1;
 }
 
+fn metric_key(name: &str, labels: &[(&str, &str)]) -> String {
+    if labels.is_empty() {
+        return name.to_string();
+    }
+    let suffix = labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{name}:{suffix}")
+}
+
+fn record_labeled_histogram(name: &str, labels: &[(&str, &str)], value: u64) {
+    let mut m = metrics().lock().unwrap();
+    m.hot_read_latency
+        .entry(name.to_string())
+        .or_default()
+        .record(value);
+    m.hot_read_latency
+        .entry(metric_key(name, labels))
+        .or_default()
+        .record(value);
+}
+
+pub fn reset_for_tests() {
+    let mut m = metrics().lock().unwrap();
+    *m = SystemMetrics::default();
+}
+
+pub fn record_p081_auth_ambiguous_caller_warn(
+    principal_class: &str,
+    surface_policy_hash: &str,
+    transport: &str,
+) {
+    increment_counter("auth_ambiguous_caller_warn_total");
+    increment_counter_with_label(
+        "auth_ambiguous_caller_warn_total",
+        &format!(
+            "principal_class={principal_class},surface_policy_hash={surface_policy_hash},transport={transport}"
+        ),
+    );
+}
+
+pub fn record_p081_boundary_no_op_label(repo: &str, month: &str) {
+    increment_counter("boundary_no_op_label_total");
+    increment_counter_with_label(
+        "boundary_no_op_label_total",
+        &format!("repo={repo},month={month}"),
+    );
+}
+
+pub fn record_p081_audit_log_rate_limited(transport: &str, reason_code: &str) {
+    increment_counter("audit_log_rate_limited_total");
+    increment_counter_with_label(
+        "audit_log_rate_limited_total",
+        &format!("transport={transport},reason_code={reason_code}"),
+    );
+}
+
+pub fn record_p081_audit_log_append_failure(event_type: &str, transport: &str, mode: &str) {
+    increment_counter("audit_log_append_failure_total");
+    increment_counter_with_label(
+        "audit_log_append_failure_total",
+        &format!("event_type={event_type},transport={transport},mode={mode}"),
+    );
+}
+
+pub fn record_p081_operator_alert_native_delivery(severity: &str, surface: &str, result: &str) {
+    increment_counter("operator_alert_native_delivery_total");
+    increment_counter_with_label(
+        "operator_alert_native_delivery_total",
+        &format!("severity={severity},surface={surface},result={result}"),
+    );
+}
+
+pub fn record_p081_approval_idempotency_duplicate(action: &str, caller_class: &str) {
+    increment_counter("approval_idempotency_duplicate_total");
+    increment_counter_with_label(
+        "approval_idempotency_duplicate_total",
+        &format!("action={action},caller_class={caller_class}"),
+    );
+}
+
 pub fn record_p081_boundary_decision(
     transport: &str,
     row_id: Option<&str>,
@@ -165,20 +248,38 @@ pub fn record_p081_boundary_decision(
     );
 }
 
-pub fn record_p081_boundary_decision_latency(duration: Duration) {
-    let mut m = metrics().lock().unwrap();
-    m.hot_read_latency
-        .entry("boundary_policy_decision_latency_ms".to_string())
-        .or_default()
-        .record(duration.as_millis() as u64);
+pub fn record_p081_boundary_decision_latency(
+    transport: &str,
+    caller_class: &str,
+    mode: &str,
+    duration: Duration,
+) {
+    record_labeled_histogram(
+        "boundary_policy_decision_latency_ms",
+        &[
+            ("transport", transport),
+            ("caller_class", caller_class),
+            ("mode", mode),
+        ],
+        duration.as_millis() as u64,
+    );
 }
 
-pub fn record_p081_boundary_commit_transaction_latency(duration: Duration) {
-    let mut m = metrics().lock().unwrap();
-    m.hot_read_latency
-        .entry("boundary_commit_transaction_latency_ms".to_string())
-        .or_default()
-        .record(duration.as_millis() as u64);
+pub fn record_p081_boundary_commit_transaction_latency(
+    transport: &str,
+    action_kind: &str,
+    decision: &str,
+    duration: Duration,
+) {
+    record_labeled_histogram(
+        "boundary_commit_transaction_latency_ms",
+        &[
+            ("transport", transport),
+            ("action_kind", action_kind),
+            ("decision", decision),
+        ],
+        duration.as_millis() as u64,
+    );
 }
 
 pub fn record_p081_audit_budget_cleanup_duration(duration: Duration) {
@@ -189,12 +290,79 @@ pub fn record_p081_audit_budget_cleanup_duration(duration: Duration) {
         .record(duration.as_millis() as u64);
 }
 
-pub fn record_p081_operator_alert_clear_latency(duration: Duration) {
+pub fn record_p081_operator_alert_clear_latency(
+    alert_id: &str,
+    severity: &str,
+    duration: Duration,
+) {
+    record_labeled_histogram(
+        "operator_alert_clear_latency_ms",
+        &[("alert_id", alert_id), ("severity", severity)],
+        duration.as_millis() as u64,
+    );
+}
+
+pub fn record_p081_boundary_policy_enforcement_parity_percent(percent: u64) {
     let mut m = metrics().lock().unwrap();
     m.hot_read_latency
-        .entry("operator_alert_clear_latency_ms".to_string())
+        .entry("p081_boundary_policy_enforcement_parity_percent".to_string())
         .or_default()
-        .record(duration.as_millis() as u64);
+        .record(percent.min(100));
+}
+
+pub fn record_p081_boundary_policy_enforcement_parity(
+    legacy_decision: &str,
+    matrix_decision: &str,
+) {
+    let percent = if legacy_decision == matrix_decision {
+        100
+    } else {
+        0
+    };
+    record_p081_boundary_policy_enforcement_parity_percent(percent);
+}
+
+pub fn record_p081_boundary_shadow_disagreement(
+    transport: &str,
+    row_id: Option<&str>,
+    caller_class: &str,
+    action_kind: &str,
+    legacy_decision: &str,
+    matrix_decision: &str,
+    denial_reason_code: Option<&str>,
+) {
+    increment_counter("boundary_policy_shadow_disagreement_total");
+    increment_counter_with_label(
+        "boundary_policy_shadow_disagreement_total",
+        &format!(
+            "transport={transport},row_id={},caller_class={caller_class},action_kind={action_kind},legacy_decision={legacy_decision},matrix_decision={matrix_decision},denial_reason_code={}",
+            row_id.unwrap_or("none"),
+            denial_reason_code.unwrap_or("none")
+        ),
+    );
+}
+
+pub fn record_p081_boundary_policy_evaluation_error(transport: &str, mode: &str) {
+    increment_counter("boundary_policy_evaluation_error_total");
+    increment_counter_with_label(
+        "boundary_policy_evaluation_error_total",
+        &format!("transport={transport},mode={mode}"),
+    );
+}
+
+pub fn record_p081_approval_actionability_false(
+    caller_class: &str,
+    row_id: Option<&str>,
+    reason_code: &str,
+) {
+    increment_counter("approval_actionability_false_total");
+    increment_counter_with_label(
+        "approval_actionability_false_total",
+        &format!(
+            "caller_class={caller_class},row_id={},reason_code={reason_code}",
+            row_id.unwrap_or("none")
+        ),
+    );
 }
 
 pub fn get_counter(name: &str) -> u64 {
@@ -421,33 +589,83 @@ mod tests {
             None,
             "enforce",
         );
-        record_p081_boundary_decision_latency(Duration::from_millis(2));
-        record_p081_boundary_commit_transaction_latency(Duration::from_millis(3));
+        record_p081_boundary_decision_latency(
+            "graphql_query",
+            "observer",
+            "enforce",
+            Duration::from_millis(2),
+        );
+        record_p081_boundary_commit_transaction_latency(
+            "graphql_mutation",
+            "approve",
+            "committed",
+            Duration::from_millis(3),
+        );
         record_p081_audit_budget_cleanup_duration(Duration::from_millis(4));
-        record_p081_operator_alert_clear_latency(Duration::from_millis(5));
+        record_p081_operator_alert_clear_latency(
+            "p081-boundary-safe-mode-active",
+            "critical",
+            Duration::from_millis(5),
+        );
+        record_p081_boundary_policy_enforcement_parity_percent(100);
+        record_p081_boundary_shadow_disagreement(
+            "graphql_query",
+            Some("p081.observer.graphql_query.read_only_opt_in"),
+            "observer",
+            "graphql.read_only",
+            "allow",
+            "deny",
+            Some("OBSERVER_SCOPE"),
+        );
+        record_p081_boundary_policy_evaluation_error("graphql_query", "enforce");
+        record_p081_approval_actionability_false(
+            "observer",
+            Some("p081.observer.graphql_mutation.none"),
+            "OBSERVER_SCOPE",
+        );
         for counter in [
-            "boundary_policy_shadow_disagreement_total",
             "auth_ambiguous_caller_warn_total",
             "boundary_no_op_label_total",
-            "audit_log_append_failure_total",
             "audit_log_rate_limited_total",
-            "operator_alert_native_delivery_total",
             "mcp_command_idempotency_replay_total",
             "mcp_command_idempotency_conflict_total",
             "approval_idempotency_duplicate_total",
-            "boundary_policy_evaluation_error_total",
-            "approval_actionability_false_total",
             "graphql_redaction_extensions_total",
         ] {
             increment_counter(counter);
         }
+        record_p081_audit_log_append_failure(
+            "boundary_decision_deny",
+            "graphql_query",
+            "enforce",
+        );
+        record_p081_operator_alert_native_delivery("critical", "macos", "delivered");
         assert!(get_counter("boundary_policy_decisions_total") > 0);
+        assert!(get_counter("boundary_policy_shadow_disagreement_total") > 0);
+        assert!(get_counter("boundary_policy_evaluation_error_total") > 0);
+        assert!(get_counter("approval_actionability_false_total") > 0);
         assert_eq!(
             get_hot_read_latest("boundary_policy_decision_latency_ms"),
             Some(2)
         );
         assert_eq!(
+            get_hot_read_latest(
+                "boundary_policy_decision_latency_ms:transport=graphql_query,caller_class=observer,mode=enforce"
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            get_hot_read_latest("p081_boundary_policy_enforcement_parity_percent"),
+            Some(100)
+        );
+        assert_eq!(
             get_hot_read_latest("boundary_commit_transaction_latency_ms"),
+            Some(3)
+        );
+        assert_eq!(
+            get_hot_read_latest(
+                "boundary_commit_transaction_latency_ms:transport=graphql_mutation,action_kind=approve,decision=committed"
+            ),
             Some(3)
         );
         assert_eq!(
@@ -457,6 +675,22 @@ mod tests {
         assert_eq!(
             get_hot_read_latest("operator_alert_clear_latency_ms"),
             Some(5)
+        );
+        assert_eq!(
+            get_hot_read_latest(
+                "operator_alert_clear_latency_ms:alert_id=p081-boundary-safe-mode-active,severity=critical"
+            ),
+            Some(5)
+        );
+        assert!(
+            get_counter(
+                "audit_log_append_failure_total:event_type=boundary_decision_deny,transport=graphql_query,mode=enforce"
+            ) > 0
+        );
+        assert!(
+            get_counter(
+                "operator_alert_native_delivery_total:severity=critical,surface=macos,result=delivered"
+            ) > 0
         );
     }
 }

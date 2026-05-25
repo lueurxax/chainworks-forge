@@ -25,19 +25,17 @@ MCP is the external control plane for operational commands. GraphQL is the UI re
 
 Both surfaces are authenticated with bearer tokens and filter their visible surface area by the caller's principal class. MCP command tools and approval-gate GraphQL mutations converge on a single `engine::command_handler::CommandHandler` for command execution. Every command execution writes an auditable row to `command_journal` tagged with the caller's surface, principal id, principal class, and tool/mutation name.
 
-P081 introduces a boundary-first authorization contract that supersedes the static
-principal-class filtering described in this document. The matrix, executable
-fixture, validator, audit-log storage, `CallerClass` enum, and principal-table
-`schema_version 3` reader have landed (Phase 1+2 scaffolding). Phase 3 daemon-injected
-`BoundaryPolicy` is now wired into MCP `initialize`, `tools/list`, and `tools/call`
-with mode-aware semantics (`shadow`, `enforce`, `read_only_safe_mode`,
-`legacy_compat`). The `-32004` "known but denied" JSON-RPC code, the `initialize`
-`boundary_policy` capability advertisement (`capability_schema_version: 1`), and
-population of `command_journal.caller_class` are now wired through the shared
-`BoundaryPolicy` decision path; observer field-level redaction parity and full
-enforce-mode cutover remain Phase 4+5 work — see
-[boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md) for the
-matrix, rollout phases, and Phase status header.
+P081 adds the boundary-first authorization contract that supersedes static-only
+principal-class filtering. The matrix, executable fixture, validator, audit-log
+storage, `CallerClass` enum, and principal-table `schema_version 3` reader are
+implemented. A daemon-injected `BoundaryPolicy` governs MCP `initialize`,
+`tools/list`, and `tools/call` with mode-aware semantics (`shadow`, `enforce`,
+`read_only_safe_mode`, `legacy_compat`). Known-but-denied tools return JSON-RPC
+`-32004` with structured policy data, `initialize` advertises the
+`boundary_policy` capability (`capability_schema_version: 1`), and
+`command_journal.caller_class` is populated by the shared decision path. See
+[boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md) for
+the matrix, rollout modes, audit, idempotency, and readback contracts.
 
 ## Scope
 
@@ -379,10 +377,10 @@ Current Rust schema compatibility note: older non-approval GraphQL mutation reso
 
 ### Enforcement points
 
-- `McpServer::handle_request` filters `tools/list` through `visible_tool_specs` (which calls `auth::filter_tools`), and gates every `tools/call` by `principal.tool_capabilities.contains(&tool_id)`. A denied tool returns `-32601 "Method not found: <name>"` (not `"forbidden"`) so the error does not leak capability existence.
+- `McpServer::handle_request` filters `tools/list` through `visible_tool_specs` (which calls `auth::filter_tools`), evaluates the injected P081 `BoundaryPolicy` for known `tools/call` requests, and then applies the caller token capability set. Unknown tools and feature-gated tools return `-32601 "Method not found: <name>"`; known-but-denied tools return `-32004 "tool denied"` with `error.data.reason_code`, `caller_class`, `row_id`, and `boundary_policy_version`. Storage diagnostics tools keep their typed success-envelope error protocol after the required deny audit row commits.
 - `resources/list` is filtered by `auth::filter_resources` over `auth::all_resource_templates()`.
 - `resources/read` parses the concrete URI into a `ResourceTemplateId` via `resource_template_id_for_uri`, then calls `auth::match_resource_uri`. A denied read returns `-32002 "Resource not found"`.
-- GraphQL approval mutation resolvers read `Principal` from `async_graphql::Context`, call the same capability policy, and return `Error::new("forbidden")` on denial.
+- GraphQL approval mutation resolvers read `Principal` from `async_graphql::Context`, evaluate the same injected `BoundaryPolicy`, and return the P081 denial envelope before command side effects on denial.
 
 Implementation: `control-plane/crates/auth/src/lib.rs` (`filter_tools`, `filter_resources`, `match_resource_uri`, `tool_allowed_for_class`, `resource_allowed_for_class`), `control-plane/crates/mcp-server/src/server.rs` (`handle_request`, `visible_tool_specs`), `control-plane/crates/graphql-server/src/schema.rs` (approval mutation resolvers and explicitly quarantined legacy compatibility resolvers).
 
