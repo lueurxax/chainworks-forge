@@ -138,6 +138,8 @@ fixture rules in [boundary-first-api-auth-contract.md](boundary-first-api-auth-c
 
 Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`, `storageHealth`.
 
+**P046 session observability queries** (gated by `CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY`; absent from the schema when disabled): `sessionObservabilityAvailable`, `sessionLineages(runId)`, `sessionLineage(id)`, `sessionGenerations(lineageId)`, `sessionEvents(lineageId, generationId?)`, `sessionKpiSummary(runId)`, `sessionHealth(runId)`. Governed clients use `sessionObservabilityAvailable` as the lightweight capability probe before issuing the other P046 documents. All resolvers enforce operator-read authorization scoped to the owning run, use cursor pagination with deterministic ordering and bounded `first`, and return derived non-secret references in place of raw `providerSessionId`, `bindingFingerprint`, `invocationOwnerKey`, and absolute `workingDirectory`. Event details follow the `p046_event_details_redaction_v1` default-deny allowlist. P046 is read/subscription-only — no `resetSession` or equivalent session-control mutation is exposed; reset remains MCP-only (see [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md#operator-surfaces)).
+
 **Storage Health Readback:**
 The `storageHealth` query exposes the current health state of the storage subsystem, including `DbWriter`, WAL, projections, evidence spool, and freshness details for the implemented local storage tiering and read-path liveness contract. It preserves the legacy `projections` field and exposes identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `projectionFreshness` and `projectionFreshnessBySource`.
 
@@ -154,7 +156,7 @@ settlement surface. Non-approval operator commands such as starting runs,
 retrying stages, cancelling runs, resolving workflow conflicts, and recovery
 actions are MCP-only.
 
-Subscriptions: `runStatusChanged`, `stageStatusChanged`, `approvalRequested`, `approvalResolved`, `runtimeStatusChanged`.
+Subscriptions: `runStatusChanged`, `stageStatusChanged`, `approvalRequested`, `approvalResolved`, `runtimeStatusChanged`. When P046 is enabled, the schema also exposes `sessionStatusChanged(runId)`, which authorizes the principal at subscription setup and rechecks operator-read on every emission, filters by `run_id` before resolving payloads, uses a bounded 64-payload per-subscriber buffer with at-most-once `resyncRequired` between successful payloads, and disconnects slow consumers after 5 s of full queue or 3 consecutive enqueue failures.
 
 Implementation: `control-plane/crates/graphql-server/src/schema.rs`.
 

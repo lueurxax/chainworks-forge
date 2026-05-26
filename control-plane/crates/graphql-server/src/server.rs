@@ -17,6 +17,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::schema::{attach_p081_collected_redactions, AppSchema, P081GraphqlRedactionCollector};
+use crate::types::session::P046LiveCredential;
 
 async fn graphql_playground() -> impl IntoResponse {
     Html(async_graphql::http::playground_source(
@@ -245,6 +246,10 @@ async fn p081_connection_init_data(
                 let token_id = auth::derive_token_id(token, &principal.id);
                 let mut data = async_graphql::Data::default();
                 data.insert(crate::auth_layer::GraphqlTokenId(token_id));
+                data.insert(P046LiveCredential {
+                    principal_id: principal.id.clone(),
+                    token_fingerprint: auth::token_fingerprint(token),
+                });
                 data.insert(principal);
                 Ok(data)
             }

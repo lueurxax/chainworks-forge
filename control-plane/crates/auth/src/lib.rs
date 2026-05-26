@@ -277,6 +277,14 @@ impl PrincipalTable {
         }
     }
 
+    pub fn test_fixture_with_id(id: impl Into<String>) -> Self {
+        let mut table = Self::test_fixture();
+        if let Some(entry) = table.entries.first_mut() {
+            entry.id = id.into();
+        }
+        table
+    }
+
     /// Observer-class fixture for cross-crate tests that need a non-operator token.
     /// Token length meets the 32-byte minimum required by extract_bearer_token.
     pub fn test_fixture_observer() -> Self {
@@ -626,6 +634,32 @@ pub fn resolve_bearer(token: &str, table: &PrincipalTable) -> Result<Principal, 
         }
     }
     found.ok_or(AuthError::UnknownToken)
+}
+
+/// Non-secret stable fingerprint for comparing a connection credential against
+/// a later-reloaded principal table without retaining or exposing the bearer.
+pub fn token_fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(token.as_bytes());
+    let mut out = String::with_capacity("sha256:".len() + digest.len() * 2);
+    out.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+pub fn principal_token_fingerprint_by_id(
+    table: &PrincipalTable,
+    principal_id: &str,
+) -> Option<String> {
+    table
+        .entries
+        .iter()
+        .find(|entry| entry.id == principal_id)
+        .map(|entry| token_fingerprint(&entry.token))
 }
 
 /// Extract bearer token from an Authorization header value.

@@ -1,38 +1,13 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-046"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:authorization_recheck_transient_open",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "authorization_recheck_transient_open",
+  "description": "Subscription per-emission auth recheck silently continues on transient authorization lookup failure rather than terminating fail-closed.",
+  "hold_condition": "sessionStatusChanged continues emitting after principal operator-read authorization is revoked or authorization recheck fails transiently.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_subscription_open_on_transient_auth_failure",
+  "fixture_input": {
+    "auth_lookup_behavior": "transient_lookup_failure",
+    "expected_result": "stream_terminates_with_authorization_recheck_failed_error"
+  }
 }

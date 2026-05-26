@@ -1,38 +1,14 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-046"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:disabled_schema_client_unguarded",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "disabled_schema_client_unguarded",
+  "description": "SwiftUI or another governed client issues P046 GraphQL documents when schema/capability discovery says P046 fields are absent or CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY is disabled.",
+  "hold_condition": "SwiftUI or another governed client sends P046 documents when schema/capability discovery says P046 fields are absent.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_client_unguarded_disabled_schema",
+  "fixture_input": {
+    "feature_flag": "disabled",
+    "client_query_issued": "{ sessionLineages(runId: \"x\") { nodes { id } } }",
+    "expected_result": "graphql_validation_error_not_product_error"
+  }
 }

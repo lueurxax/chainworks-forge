@@ -522,6 +522,33 @@ Important:
 - this gate hard-depends on `proposal-029`
 - `proposal-033` is the repo-owned proof lane for [acp-runtime-transport.md](acp-runtime-transport.md)
 
+### `proposal-046|p046`
+
+Session observability GraphQL proof gate. Operational truth lives in [rust-control-plane.md](rust-control-plane.md#graphql) and [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md#operator-surfaces).
+
+Scope:
+
+- runs `cargo test -p graphql-server --test proposal_046_session_graphql` plus the `p046_retry_db` unit-test lane in `graphql-server` for the pinned retry policy
+- verifies the operator readback fixture under `docs/evidence/rollout-contract/operator-readback/`, the proposal-specific negative fixtures under `docs/evidence/rollout-contract/negative/`, and the P046 metric inventory in `graphql-server` source
+- covers SDL snapshots (Connection/Edge/PageInfo shape, cursor nullability, absence of `resetSession` and any equivalent session-control mutation), feature-flag disabled-schema behavior, operator-read authorization across `runId`- and ID-based resolvers, parent-run/lineage ownership lookup with not-found-or-not-visible behavior, cursor pagination and `limit+1` `hasNextPage` semantics, sanitized invalid-cursor errors, derived non-secret replacements for `providerSessionId`/`bindingFingerprint`/`invocationOwnerKey`/`workingDirectory`, the pinned transient sqlite retry policy (3 attempts, 50/150 ms backoff, ≤250 ms sleep budget, ≥250 ms resolver headroom, deterministic `db_unavailable` or `UNKNOWN/transient_db_unavailable` on exhaustion), event-details redaction (`p046_event_details_redaction_v1` allowlist, unknown-shape fail-closed), and `sessionStatusChanged` run-filtering, per-emission authorization recheck, 64-payload per-subscriber buffer, at-most-once `resyncRequired`, and slow-consumer disconnect
+
+Host policy:
+
+- local target only; runtime/unit proof lane without a UI target
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-046
+./scripts/test-gate.sh p046
+```
+
+Important:
+
+- P046 is read/subscription-only by contract — no GraphQL `resetSession`, `closeSession`, `invalidateSession`, or equivalent session-control mutation may appear in the schema; reset remains MCP-only
+- P046 GraphQL fields are gated by `CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY`; clients must gate documents on capability/schema discovery so disabled-schema mode does not produce validation errors
+- no SQL schema migration or additive index is allowed in this slice; profiling-driven indexing requires a follow-up proposal revision
+
 ### `proposal-036|p036`
 
 macOS operator navigation and read-model UX gate. The alias retains the historical proposal number; the stable behavior contract is [macos-operator-navigation.md](macos-operator-navigation.md).

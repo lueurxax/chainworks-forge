@@ -241,9 +241,13 @@ stays in-process and is never logged or emitted on the wire.
 
 ### Rotation
 
-Token rotation, revocation, and delegation are out of scope for the current implementation. The principal table is read once at daemon startup; to rotate a token, edit the file and restart the daemon.
+Token rotation, revocation, and delegation are out of scope for the current implementation on MCP transports. The principal table consumed by MCP HTTP and stdio is loaded once at daemon startup; to rotate or revoke an MCP token, edit `principals.json` and restart the daemon.
 
-Implementation: `control-plane/crates/auth/src/lib.rs` (`PrincipalTable::load_or_bootstrap`, `resolve_bearer`, `extract_bearer_token`), `control-plane/crates/daemon/src/main.rs` (`principals_path_from_env`).
+P046 GraphQL session observability subscriptions are the exception: the daemon spawns a periodic `principals.json` reloader (default interval 2 s, override with `CHAINWORKS_PRINCIPALS_RELOAD_SECS`) that updates the dedicated P046 live auth source used by per-emission authorization recheck. A revocation written to the file is observed by `sessionStatusChanged` within roughly one reload interval and the affected stream terminates fail-closed; reload failures mark the source unavailable so subscriptions terminate with `authorization_recheck_failed` rather than continuing under stale grants. MCP token resolution is not affected by this reloader.
+
+Bearer-token equality on every lookup uses a constant-time byte comparison so timing side channels cannot probe the principal table.
+
+Implementation: `control-plane/crates/auth/src/lib.rs` (`PrincipalTable::load_or_bootstrap`, `resolve_bearer`, `extract_bearer_token`, `ct_eq_bytes`), `control-plane/crates/daemon/src/main.rs` (`principals_path_from_env`, P046 principals reload loop).
 
 ## Bearer auth on transports
 

@@ -274,6 +274,8 @@ Budget evaluation runs **before** sending `session/prompt` on a reused session. 
 - `AgentSessionInspector`,
 - run/report/export surfaces that show session disposition truth.
 
+Notably, GraphQL explicitly does not expose a `resetSession` mutation or any equivalent session reset or control mutation; such operations are restricted to MCP-only interfaces.
+
 ### Reset must be deterministic
 
 After operator reset:

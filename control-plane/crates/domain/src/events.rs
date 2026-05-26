@@ -104,4 +104,9 @@ pub enum DomainEvent {
         slot_generation: i64,
         error: String,
     },
+    /// P046: A session_events row was persisted. Wakes sessionStatusChanged subscribers
+    /// so live status changes are delivered without waiting for unrelated runtime events.
+    SessionEventRecorded {
+        run_id: RunId,
+    },
 }

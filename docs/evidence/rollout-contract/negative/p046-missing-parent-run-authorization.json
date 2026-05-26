@@ -1,38 +1,14 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-046"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:missing_parent_run_authorization",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "missing_parent_run_authorization",
+  "description": "ID-based resolver (sessionLineage, sessionGenerations, sessionEvents) returns data without first resolving parent run ownership and applying operator-read authorization for that run.",
+  "hold_condition": "Any P046 ID-based resolver returns data before resolving parent run ownership and applying operator-read authorization.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_missing_parent_run_authorization",
+  "fixture_input": {
+    "principal_class": "Observer",
+    "query": "{ sessionLineage(id: \"some-lineage-id\") { id } }",
+    "expected_error": "forbidden"
+  }
 }

@@ -36,6 +36,7 @@ These are not active workstreams:
   - keep scoped to contract-output repair/fallback;
   - do not include release agents;
   - do not bypass durable side-effect safety.
+- **P046** Session observability via GraphQL: Provides session read and subscription-only behavior, exposing corrected read fields and `sessionStatusChanged` subscription, with no `resetSession` mutation and robust operator-read authorization.
 
 ## Parallel UI recovery lane
 
@@ -58,7 +59,7 @@ After the write-budget and durable side-effect safety rails are in place:
 - **Auto-retry observation ledger / P080** effect-aware recovery and stale execution reconciliation.
 - **P079** contract-aware output repair and provider fallback.
 - **P031** corrected GraphQL thin UI closeout, if not already closed by the UI recovery lane.
-- **P046** session read/subscription-only behavior.
+
 
 ## Next
 

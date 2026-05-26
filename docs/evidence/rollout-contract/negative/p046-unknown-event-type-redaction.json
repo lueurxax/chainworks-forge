@@ -1,38 +1,14 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-046"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:unknown_event_type_redaction",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "unknown_event_type_redaction",
+  "description": "Unknown event_type, unknown schema_version, or unknown details_json shape is passed through to GraphQL rather than failing closed to detailsJsonRedacted=null plus bounded warning.",
+  "hold_condition": "Unknown event_type, schema_version, or details_json shape does not fail closed to detailsJsonRedacted=null plus bounded warning.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_unknown_shape_not_fail_closed",
+  "fixture_input": {
+    "event_type": "unknown_future_event_type",
+    "event_details_json": "{\"schemaVersion\":\"future_unknown_schema\",\"someKey\":\"someValue\"}",
+    "expected_result": "details_json_redacted_null_with_redaction_unknown_event_type_or_unknown_schema_version_warning"
+  }
 }

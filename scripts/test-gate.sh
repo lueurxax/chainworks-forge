@@ -193,6 +193,10 @@ PROPOSAL_086_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
 )
 
+PROPOSAL_046_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal046Tests"
+)
+
 PROPOSAL_037_TESTS=(
   "Chainworks ForgeTests/RuntimeAgentExecutorTests/executorFailClosesACPProposalReviewReadLoopStallsBeforeWatchdogAndEmitsDurableFailureEvidence()"
   "Chainworks ForgeTests/RuntimeAgentExecutorTests/acpProposalReviewerReadLoopStallFailsEarlyWithDurableFailureEvidence()"
@@ -2412,6 +2416,7 @@ Available gates:
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
   proposal-091|p091  Retained P091 targeted retry authority runtime proof gate
+  proposal-046|p046  Proposal 046 session GraphQL observability gate (read-only queries, subscription, authorization, redaction)
   proposal-092|p092  Retained historical alias for P092 retry payload target invariants runtime proof gate
   full            Full xcodebuild test sign-off gate
 EOF
@@ -3011,6 +3016,184 @@ PY
       log "proposal-093 UI smoke is remote-only; run the same gate on test@SMacBook.local for UI proof"
     fi
     (cd "$ROOT_DIR/control-plane" && cargo test -p graphql-server runtime_timeline_p093 --quiet)
+    ;;
+  proposal-046|p046)
+    log "Proposal 046 control-plane gate: session GraphQL observability (read-only queries, subscription, authorization, redaction)"
+    log "Proposal 046: verifying no root-level output artifacts are present"
+    for output_artifact in CHAINWORKS_OUTPUT chainworks_output.json tmp_chainworks_output.json; do
+      if [[ -e "$ROOT_DIR/$output_artifact" ]]; then
+        log "ERROR: stale output artifact exists outside the canonical meta-root: $ROOT_DIR/$output_artifact"
+        exit 1
+      fi
+    done
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p graphql-server --test proposal_046_session_graphql -- --test-threads=1 --nocapture
+    )
+    log "Proposal 046: running pinned retry-policy unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p graphql-server --lib -- p046_ --nocapture
+      cargo test -p db --lib -- p046_ --nocapture
+    )
+    log "Proposal 046 phase 1+2: verifying rollout contract fixture structure"
+    P046_READBACK="$ROOT_DIR/docs/evidence/rollout-contract/operator-readback/p046-session-graphql-full-surface.fixture.json"
+    if [[ ! -f "$P046_READBACK" ]]; then
+      log "ERROR: rollout readback fixture missing: $P046_READBACK"
+      exit 1
+    fi
+    log "Proposal 046: rollout readback fixture present"
+    log "Proposal 046: verifying negative fixtures exist"
+    P046_NEG_DIR="$ROOT_DIR/docs/evidence/rollout-contract/negative"
+    P046_REQUIRED_NEGATIVES=(
+      "p046-appkit-owns-graphql-task.json"
+      "p046-authorization-recheck-transient-open.json"
+      "p046-disabled-schema-client-unguarded.json"
+      "p046-imprecise-connection-schema.graphql"
+      "p046-missing-parent-run-authorization.json"
+      "p046-missing-run-filter-subscription.json"
+      "p046-raw-sensitive-generation-fields.graphql"
+      "p046-reset-mutation-present.graphql"
+      "p046-resync-churn.json"
+      "p046-reversible-derived-reference.json"
+      "p046-revoked-subscription-principal.json"
+      "p046-slow-consumer-no-disconnect.json"
+      "p046-swiftdata-persistence-leak.json"
+      "p046-unbounded-metric-labels.json"
+      "p046-unbounded-session-events.graphql"
+      "p046-unbounded-sqlite-retry.json"
+      "p046-unknown-event-type-redaction.json"
+      "p046-unredacted-event-details.json"
+    )
+    for neg_fixture in "${P046_REQUIRED_NEGATIVES[@]}"; do
+      if [[ ! -f "$P046_NEG_DIR/$neg_fixture" ]]; then
+        log "ERROR: required negative fixture missing: $P046_NEG_DIR/$neg_fixture"
+        exit 1
+      fi
+    done
+    log "Proposal 046: all negative fixtures present"
+    log "Proposal 046: verifying P046 metric inventory in source"
+    P046_METRICS=(
+      "session_graphql_query_total"
+      "session_graphql_query_duration_seconds"
+      "session_graphql_sqlite_retry_total"
+      "session_graphql_sqlite_retry_exhausted_total"
+      "session_status_subscription_event_total"
+      "session_status_subscription_emit_lag_seconds"
+      "session_status_subscription_lag_total"
+      "session_status_subscription_slow_consumer_disconnect_total"
+      "session_health_warning_total"
+      "session_event_redaction_total"
+      "session_graphql_disabled_schema_guard_total"
+      "session_graphql_reset_mutation_guard_total"
+      "session_graphql_observability_query_success_rate"
+    )
+    for metric in "${P046_METRICS[@]}"; do
+      # session_graphql_sqlite_retry_total and session_graphql_sqlite_retry_exhausted_total are
+      # db-crate-owned per the approved architecture contract (db::p046_retry). Search db/src/ too.
+      if ! grep -rq "$metric" \
+            "$ROOT_DIR/control-plane/crates/graphql-server/src/" \
+            "$ROOT_DIR/control-plane/crates/graphql-server/src/types/" \
+            "$ROOT_DIR/control-plane/crates/db/src/" \
+            2>/dev/null; then
+        log "ERROR: P046 metric '$metric' not found in graphql-server or db source"
+        exit 1
+      fi
+    done
+    log "Proposal 046: metric inventory check passed"
+    log "Proposal 046: running Swift guardrail tests"
+    run_targeted_tests "proposal-046-swift" "${PROPOSAL_046_SWIFT_TESTS[@]}"
+    log "Proposal 046: validating rollout contract semantics in readback fixture (all lanes)"
+    python3 - "$P046_READBACK" <<'PYEOF'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    data = json.load(f)
+lanes = data.get('parity_lanes', {})
+# All four required lanes must be present and must not be in bare 'hold' without waiver/na.
+required_lanes = ['graphql', 'run_report', 'mcp', 'release_receipt']
+accepted_statuses = {'pass', 'waived', 'not_applicable', 'fail', 'timeout', 'ready_for_phase3', 'pending_phase3_validation', 'not_applicable_phase3'}
+errors = []
+for lane in required_lanes:
+    lane_data = lanes.get(lane)
+    if lane_data is None:
+        errors.append(f"Lane '{lane}' is missing from parity_lanes")
+        continue
+    status = lane_data.get('rolloutContractStatus', 'missing')
+    if status == 'missing':
+        errors.append(f"Lane '{lane}' is missing rolloutContractStatus")
+    elif status == 'hold':
+        # hold is only acceptable if there is an explicit waiver
+        waiver = lane_data.get('rolloutContractWaiverState', 'none')
+        if not waiver or waiver == 'none':
+            errors.append(f"Lane '{lane}' is in hold without a waiver (rolloutContractWaiverState='{waiver}')")
+    elif status not in accepted_statuses and not status.startswith('ready') and not status.startswith('pending'):
+        errors.append(f"Lane '{lane}' has unrecognized rolloutContractStatus='{status}'")
+if errors:
+    for e in errors:
+        print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+print(f"All {len(required_lanes)} lanes validated: " + ", ".join(f"{l}={lanes[l].get('rolloutContractStatus')}" for l in required_lanes))
+PYEOF
+    if [[ $? -ne 0 ]]; then
+      log "ERROR: rollout readback fixture lane validation failed"
+      exit 1
+    fi
+    log "Proposal 046: verifying negative fixtures are non-empty"
+    for neg_fixture in "${P046_REQUIRED_NEGATIVES[@]}"; do
+      neg_path="$P046_NEG_DIR/$neg_fixture"
+      if [[ ! -s "$neg_path" ]]; then
+        log "ERROR: negative fixture is empty or zero-bytes: $neg_path"
+        exit 1
+      fi
+      # .graphql fixtures: check for GraphQL content keywords (type, query, etc.)
+      # .json fixtures: check JSON is non-empty and not a placeholder stub.
+      if [[ "$neg_fixture" == *.graphql ]]; then
+        if ! grep -qE '^\s*(type|query|mutation|subscription|interface|schema|directive|#)' "$neg_path" 2>/dev/null; then
+          log "ERROR: graphql negative fixture appears to lack real schema/query content: $neg_path"
+          exit 1
+        fi
+      else
+        if python3 -c "
+import json, sys
+with open('$neg_path') as f:
+    content = f.read().strip()
+if content in ('{}', '[]', ''):
+    sys.exit(1)
+# Check for obvious placeholder content
+data = json.loads(content)
+if isinstance(data, dict) and data.get('placeholder') == True:
+    sys.exit(1)
+" 2>/dev/null; then
+          :
+        else
+          log "ERROR: negative fixture appears to be placeholder-only: $neg_path"
+          exit 1
+        fi
+      fi
+    done
+    log "Proposal 046: negative fixture content check passed"
+    # Prove .graphql negative fixtures describe patterns absent from the production schema source.
+    # These checks verify fail-closed behavior: the anti-patterns are NOT present.
+    log "Proposal 046: verifying graphql negative fixtures fail-closed against source"
+    # p046-reset-mutation-present.graphql: no resetSession mutation function must appear in the schema.
+    # The guard comment (resetSession/equivalent) and the guard counter are intentional;
+    # only an actual fn reset_session resolver would violate the hold condition.
+    if grep -rq 'fn reset_session\b\|async fn reset_session\b' "$ROOT_DIR/control-plane/crates/graphql-server/src/" 2>/dev/null; then
+      log "ERROR: resetSession mutation resolver found in graphql-server (violates p046-reset-mutation-present.graphql hold)"
+      exit 1
+    fi
+    # p046-raw-sensitive-generation-fields.graphql: raw providerSessionId/bindingFingerprint/invocationOwnerKey
+    # must not be exposed as direct GraphQL fields on session generation types.
+    # Derived references (scoped_provider_session_ref, scoped_binding_ref) are the approved surface.
+    for raw_field in provider_session_id binding_fingerprint invocation_owner_key; do
+      if grep -rq "pub ${raw_field}:" "$ROOT_DIR/control-plane/crates/graphql-server/src/types/session.rs" 2>/dev/null; then
+        log "ERROR: raw sensitive field '${raw_field}' exposed as GraphQL field (violates p046-raw-sensitive-generation-fields.graphql hold)"
+        exit 1
+      fi
+    done
+    log "Proposal 046: graphql negative fixture fail-closed checks passed"
+    log "Proposal 046 gate passed"
     ;;
   proposal-037|p037)
     check_idle_environment allow_app

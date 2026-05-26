@@ -56,3 +56,10 @@ control-plane/crates/daemon/principals.json
 
 # P042 §10.5 release-host credentials (checked via example template only).
 scripts/packaging.env
+
+# Generated Chainworks run-output envelopes — must never be committed.
+# These are produced by agent sessions at repo root when the output channel
+# is misconfigured; the engine materializes canonical outputs at the run meta-root.
+/CHAINWORKS_OUTPUT
+/chainworks_output.json
+/tmp_chainworks_output.json

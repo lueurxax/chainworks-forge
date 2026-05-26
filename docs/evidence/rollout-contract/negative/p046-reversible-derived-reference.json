@@ -1,38 +1,14 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-046"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:reversible_derived_reference",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "reversible_derived_reference",
+  "description": "Derived reference (providerSessionRef, bindingProfileRef, invocationOwnerRef) equals, contains, or is trivially reversible to the raw sensitive value.",
+  "hold_condition": "Raw providerSessionId, bindingFingerprint, invocationOwnerKey, absolute workingDirectory, or reversible/scopeless derived references appear in P046 GraphQL schema or payload.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_reversible_derived_reference",
+  "fixture_input": {
+    "raw_provider_session_id": "provider-session-secret-abc123",
+    "derived_ref": "provider-session-secret-abc123",
+    "expected_result": "derived_ref_must_not_equal_or_contain_raw_value"
+  }
 }

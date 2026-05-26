@@ -707,8 +707,8 @@ async fn run_daemon() -> Result<()> {
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");
 
-            let schema =
-                graphql_server::schema::build_schema_with_storage_writer_and_boundary_policy(
+            let (schema, p046_live_handle) =
+                graphql_server::schema::build_schema_with_storage_writer_boundary_policy_and_handle(
                     pool.clone(),
                     cmd_handler.clone(),
                     events.clone(),
@@ -717,6 +717,37 @@ async fn run_daemon() -> Result<()> {
                     db_writer.heartbeat.clone(),
                     Arc::clone(&boundary_policy),
                 );
+            // P046: periodically reload principals.json so subscription auth rechecks
+            // observe revocation promptly, without requiring a daemon restart.
+            // Default interval is 2 seconds; override with CHAINWORKS_PRINCIPALS_RELOAD_SECS.
+            let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2);
+            let principals_path_for_reload = paths.principals_path.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(principals_reload_secs))
+                        .await;
+                    match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
+                        Ok(new_table) => {
+                            p046_live_handle.update(new_table).await;
+                            tracing::debug!("P046 principal table reloaded for live revocation");
+                        }
+                        Err(e) => {
+                            // Mark the auth source unavailable so running subscriptions
+                            // terminate fail-closed (authorization_recheck_failed) rather
+                            // than continuing under stale grants after a revocation write
+                            // that we could not observe.
+                            p046_live_handle.mark_unavailable().await;
+                            tracing::warn!(
+                                "P046 principal reload failed; auth source marked unavailable \
+                                 (subscriptions will fail-closed): {e:#}"
+                            );
+                        }
+                    }
+                }
+            });
 
             // §7.3 port fallback: bind the listener here so the
             // 4000→ephemeral fallback + `daemon.port` write runs before the

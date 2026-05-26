@@ -673,3 +673,1082 @@ fn session_event_type_to_str(event_type: &SessionEventType) -> &'static str {
         SessionEventType::CodeWriterCompletionFailed => "code_writer_completion_failed",
     }
 }
+
+// ── P046: paginated read helpers ─────────────────────────────────────────────
+
+pub struct SessionLineagePage {
+    pub items: Vec<SessionLineage>,
+    pub has_next_page: bool,
+    pub start_cursor: Option<String>,
+    pub end_cursor: Option<String>,
+}
+
+pub struct SessionGenerationPage {
+    pub items: Vec<SessionGeneration>,
+    pub has_next_page: bool,
+    pub start_cursor: Option<String>,
+    pub end_cursor: Option<String>,
+}
+
+pub struct SessionEventPage {
+    pub items: Vec<SessionEvent>,
+    pub has_next_page: bool,
+    pub start_cursor: Option<String>,
+    pub end_cursor: Option<String>,
+    /// The generationId filter active when this page was produced; empty string means no filter.
+    /// Cursors are bound to this value so reuse under a different filter is rejected.
+    pub gen_id_filter: String,
+}
+
+pub struct SessionKpiSummary {
+    pub lineage_count: i64,
+    pub generation_count: i64,
+    pub active_generation_count: i64,
+    pub closed_generation_count: i64,
+    pub reset_generation_count: i64,
+    pub invalidated_generation_count: i64,
+    pub reuse_event_count: i64,
+    pub operator_reset_event_count: i64,
+    pub total_turn_count: i64,
+    pub total_prompt_tokens: i64,
+    pub total_cost_cents: i64,
+    pub latest_activity_at: Option<DateTime<Utc>>,
+    pub stale_active_generation_count: i64,
+}
+
+pub struct SessionHealthData {
+    pub lineages: Vec<SessionLineage>,
+    pub active_generations: Vec<SessionGeneration>,
+    pub recent_operator_reset_events: Vec<SessionEvent>,
+    pub recent_repair_failed_events: Vec<SessionEvent>,
+    /// Operator reset events within the last 24 hours (for the ≥3 threshold check).
+    pub operator_reset_events_24h: Vec<SessionEvent>,
+    /// Whether the owning run is in a terminal state (completed/failed/cancelled).
+    /// Stale-active-generation warnings are suppressed for terminal runs.
+    pub run_is_terminal: bool,
+    /// Number of generation rows for this run whose lineage_id does not exist in session_lineages.
+    /// Non-zero indicates a data integrity problem (generation_without_lineage health condition).
+    pub orphan_generation_count: i64,
+}
+
+fn encode_cursor_parts(parts: &[String]) -> String {
+    use base64::Engine as _;
+    let raw = parts.join("\x00");
+    base64::engine::general_purpose::STANDARD.encode(raw.as_bytes())
+}
+
+fn decode_cursor_parts(cursor: &str, expected_len: usize) -> Option<Vec<String>> {
+    use base64::Engine as _;
+    if cursor.is_empty() {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(cursor)
+        .ok()?;
+    let raw = String::from_utf8(bytes).ok()?;
+    let parts: Vec<String> = raw.split('\x00').map(str::to_string).collect();
+    (parts.len() == expected_len).then_some(parts)
+}
+
+fn valid_cursor_id(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn valid_cursor_timestamp(value: &str) -> bool {
+    DateTime::parse_from_rfc3339(value).is_ok()
+}
+
+const P046_CURSOR_VERSION: &str = "p046_cursor_v1";
+const P046_EVENT_CURSOR_KIND: &str = "session_event";
+const P046_LINEAGE_CURSOR_KIND: &str = "session_lineage";
+const P046_GENERATION_CURSOR_KIND: &str = "session_generation";
+
+/// Encode an event cursor bound to its lineage and generation-filter dimensions.
+/// Format: (version, kind, lineage_id, gen_id_filter_or_empty, recorded_at, id) — 6 parts.
+/// `gen_id_filter_or_empty` is the active generationId filter, or "" for an unfiltered query.
+pub fn encode_session_cursor(
+    lineage_id: &str,
+    gen_id_filter_or_empty: &str,
+    created_at: &str,
+    id: &str,
+) -> String {
+    encode_cursor_parts(&[
+        P046_CURSOR_VERSION.to_string(),
+        P046_EVENT_CURSOR_KIND.to_string(),
+        lineage_id.to_string(),
+        gen_id_filter_or_empty.to_string(),
+        created_at.to_string(),
+        id.to_string(),
+    ])
+}
+
+/// Decode a cursor produced by `encode_session_cursor`. Returns None for invalid cursors.
+/// Returns (lineage_id, gen_id_filter_or_empty, recorded_at, id).
+pub fn decode_session_cursor(cursor: &str) -> Option<(String, String, String, String)> {
+    let parts = decode_cursor_parts(cursor, 6)?;
+    if parts[0] != P046_CURSOR_VERSION
+        || parts[1] != P046_EVENT_CURSOR_KIND
+        || !valid_cursor_id(&parts[2])
+        || !valid_cursor_timestamp(&parts[4])
+        || !valid_cursor_id(&parts[5])
+    {
+        return None;
+    }
+    Some((
+        parts[2].clone(),
+        parts[3].clone(),
+        parts[4].clone(),
+        parts[5].clone(),
+    ))
+}
+
+/// Cursor format: (version, kind, run_id, agent_id, lineage_id, created_at, id) — 7 parts.
+/// The run_id prefix binds the cursor to the owning run so cross-run reuse is rejected.
+pub fn encode_session_lineage_cursor(lineage: &SessionLineage) -> String {
+    encode_cursor_parts(&[
+        P046_CURSOR_VERSION.to_string(),
+        P046_LINEAGE_CURSOR_KIND.to_string(),
+        lineage.run_id.clone(),
+        lineage.agent_id.clone(),
+        lineage.lineage_id.clone(),
+        lineage.created_at.to_rfc3339(),
+        lineage.id.clone(),
+    ])
+}
+
+/// Returns (run_id, agent_id, lineage_id, created_at, id) or None for invalid cursors.
+pub fn decode_session_lineage_cursor(
+    cursor: &str,
+) -> Option<(String, String, String, String, String)> {
+    let parts = decode_cursor_parts(cursor, 7)?;
+    if parts[0] != P046_CURSOR_VERSION
+        || parts[1] != P046_LINEAGE_CURSOR_KIND
+        || !valid_cursor_id(&parts[2])
+        || !valid_cursor_id(&parts[3])
+        || !valid_cursor_id(&parts[4])
+        || !valid_cursor_timestamp(&parts[5])
+        || !valid_cursor_id(&parts[6])
+    {
+        return None;
+    }
+    Some((
+        parts[2].clone(),
+        parts[3].clone(),
+        parts[4].clone(),
+        parts[5].clone(),
+        parts[6].clone(),
+    ))
+}
+
+/// Encodes a generation cursor bound to its lineage_id filter.
+/// Format: (version, kind, lineage_id, generation, created_at, id) — 6 parts.
+pub fn encode_session_generation_cursor(generation: &SessionGeneration) -> String {
+    encode_cursor_parts(&[
+        P046_CURSOR_VERSION.to_string(),
+        P046_GENERATION_CURSOR_KIND.to_string(),
+        generation.lineage_id.clone(),
+        generation.generation.to_string(),
+        generation.created_at.to_rfc3339(),
+        generation.id.clone(),
+    ])
+}
+
+/// Returns (lineage_id, generation, created_at, id) or None for invalid cursors.
+pub fn decode_session_generation_cursor(cursor: &str) -> Option<(String, i64, String, String)> {
+    let parts = decode_cursor_parts(cursor, 6)?;
+    if parts[0] != P046_CURSOR_VERSION
+        || parts[1] != P046_GENERATION_CURSOR_KIND
+        || !valid_cursor_id(&parts[2])
+        || !valid_cursor_timestamp(&parts[4])
+        || !valid_cursor_id(&parts[5])
+    {
+        return None;
+    }
+    Some((
+        parts[2].clone(),
+        parts[3].parse().ok()?,
+        parts[4].clone(),
+        parts[5].clone(),
+    ))
+}
+
+pub async fn list_lineages_for_run_paginated(
+    pool: &SqlitePool,
+    run_id: &str,
+    first: i64,
+    after_cursor: Option<&str>,
+) -> Result<SessionLineagePage> {
+    if let Some(c) = after_cursor {
+        match decode_session_lineage_cursor(c) {
+            Some((cursor_run_id, _, _, _, _)) if cursor_run_id == run_id => {}
+            Some(_) => anyhow::bail!("invalid cursor"), // wrong run
+            None => anyhow::bail!("invalid cursor"),
+        }
+    }
+    let limit = first + 1;
+    let rows = if let Some(cursor) = after_cursor {
+        let (_, agent_id, lineage_key, ts, cid) =
+            decode_session_lineage_cursor(cursor).expect("cursor validated above");
+        sqlx::query(
+            r#"SELECT id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
+                      active_generation_id, created_at, closed_at
+               FROM session_lineages
+               WHERE run_id = ?1
+                 AND (
+                      agent_id > ?2
+                   OR (agent_id = ?2 AND lineage_id > ?3)
+                   OR (agent_id = ?2 AND lineage_id = ?3 AND created_at > ?4)
+                   OR (agent_id = ?2 AND lineage_id = ?3 AND created_at = ?4 AND id > ?5)
+                 )
+               ORDER BY agent_id ASC, lineage_id ASC, created_at ASC, id ASC
+               LIMIT ?6"#,
+        )
+        .bind(run_id)
+        .bind(&agent_id)
+        .bind(&lineage_key)
+        .bind(&ts)
+        .bind(&cid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("list session lineages paginated")?
+    } else {
+        sqlx::query(
+            r#"SELECT id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
+                      active_generation_id, created_at, closed_at
+               FROM session_lineages
+               WHERE run_id = ?1
+               ORDER BY agent_id ASC, lineage_id ASC, created_at ASC, id ASC
+               LIMIT ?2"#,
+        )
+        .bind(run_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("list session lineages paginated")?
+    };
+
+    let has_next_page = rows.len() as i64 > first;
+    let all_items: Vec<SessionLineage> = rows
+        .into_iter()
+        .take(first as usize)
+        .map(parse_lineage_row)
+        .collect::<Result<Vec<_>>>()?;
+
+    let start_cursor = all_items.first().map(encode_session_lineage_cursor);
+    let end_cursor = all_items.last().map(encode_session_lineage_cursor);
+
+    Ok(SessionLineagePage {
+        items: all_items,
+        has_next_page,
+        start_cursor,
+        end_cursor,
+    })
+}
+
+/// Returns the run_id that owns a given lineage row id, or None if not found.
+pub async fn find_lineage_owner_run(
+    pool: &SqlitePool,
+    lineage_row_id: &str,
+) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT run_id FROM session_lineages WHERE id = ?1")
+        .bind(lineage_row_id)
+        .fetch_optional(pool)
+        .await
+        .context("find lineage owner run")?;
+    Ok(row.map(|r| r.get::<String, _>("run_id")))
+}
+
+pub async fn list_generations_for_lineage_paginated(
+    pool: &SqlitePool,
+    lineage_id: &str,
+    first: i64,
+    after_cursor: Option<&str>,
+) -> Result<SessionGenerationPage> {
+    if let Some(c) = after_cursor {
+        match decode_session_generation_cursor(c) {
+            Some((cursor_lineage_id, _, _, _)) if cursor_lineage_id == lineage_id => {}
+            Some(_) => anyhow::bail!("invalid cursor"), // mismatched filter
+            None => anyhow::bail!("invalid cursor"),
+        }
+    }
+    let limit = first + 1;
+    let rows = if let Some(cursor) = after_cursor {
+        let (_, generation, ts, cid) =
+            decode_session_generation_cursor(cursor).expect("cursor validated above");
+        sqlx::query(
+            r#"SELECT id, lineage_id, generation, invocation_owner_key, provider_session_id,
+                      binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
+                      workspace_mode, runtime_provider, runtime_model, status, turn_count,
+                      estimated_input_tokens, latest_cached_input_tokens, latest_output_tokens,
+                      latest_model_context_window, cumulative_prompt_tokens, cumulative_cost_cents,
+                      created_at, last_activity_at, ended_at, end_reason
+               FROM session_generations
+               WHERE lineage_id = ?1
+                 AND (
+                      generation > ?2
+                   OR (generation = ?2 AND created_at > ?3)
+                   OR (generation = ?2 AND created_at = ?3 AND id > ?4)
+                 )
+               ORDER BY generation ASC, created_at ASC, id ASC
+               LIMIT ?5"#,
+        )
+        .bind(lineage_id)
+        .bind(generation)
+        .bind(&ts)
+        .bind(&cid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("list generations paginated")?
+    } else {
+        sqlx::query(
+            r#"SELECT id, lineage_id, generation, invocation_owner_key, provider_session_id,
+                      binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
+                      workspace_mode, runtime_provider, runtime_model, status, turn_count,
+                      estimated_input_tokens, latest_cached_input_tokens, latest_output_tokens,
+                      latest_model_context_window, cumulative_prompt_tokens, cumulative_cost_cents,
+                      created_at, last_activity_at, ended_at, end_reason
+               FROM session_generations
+               WHERE lineage_id = ?1
+               ORDER BY generation ASC, created_at ASC, id ASC
+               LIMIT ?2"#,
+        )
+        .bind(lineage_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("list generations paginated")?
+    };
+
+    let has_next_page = rows.len() as i64 > first;
+    let all_items: Vec<SessionGeneration> = rows
+        .into_iter()
+        .take(first as usize)
+        .map(parse_generation_row)
+        .collect::<Result<Vec<_>>>()?;
+
+    let start_cursor = all_items.first().map(encode_session_generation_cursor);
+    let end_cursor = all_items.last().map(encode_session_generation_cursor);
+
+    Ok(SessionGenerationPage {
+        items: all_items,
+        has_next_page,
+        start_cursor,
+        end_cursor,
+    })
+}
+
+/// Returns (generation, owning_run_id) or None if not found.
+pub async fn find_generation_with_lineage_owner(
+    pool: &SqlitePool,
+    generation_id: &str,
+) -> Result<Option<(SessionGeneration, String)>> {
+    let row = sqlx::query(
+        r#"SELECT g.id, g.lineage_id, g.generation, g.invocation_owner_key, g.provider_session_id,
+                  g.binding_fingerprint, g.rehydrated_from_checkpoint_artifact_id, g.working_directory,
+                  g.workspace_mode, g.runtime_provider, g.runtime_model, g.status, g.turn_count,
+                  g.estimated_input_tokens, g.latest_cached_input_tokens, g.latest_output_tokens,
+                  g.latest_model_context_window, g.cumulative_prompt_tokens, g.cumulative_cost_cents,
+                  g.created_at, g.last_activity_at, g.ended_at, g.end_reason,
+                  l.run_id AS owning_run_id
+           FROM session_generations g
+           JOIN session_lineages l ON g.lineage_id = l.id
+           WHERE g.id = ?1"#,
+    )
+    .bind(generation_id)
+    .fetch_optional(pool)
+    .await
+    .context("find generation with lineage owner")?;
+
+    match row {
+        None => Ok(None),
+        Some(r) => {
+            let run_id: String = r.get("owning_run_id");
+            let gen = parse_generation_row(r)?;
+            Ok(Some((gen, run_id)))
+        }
+    }
+}
+
+pub async fn list_events_paginated(
+    pool: &SqlitePool,
+    lineage_id: &str,
+    generation_id_filter: Option<&str>,
+    first: i64,
+    after_cursor: Option<&str>,
+) -> Result<SessionEventPage> {
+    let gen_id_filter_key = generation_id_filter.unwrap_or("");
+    if let Some(c) = after_cursor {
+        match decode_session_cursor(c) {
+            Some((cursor_lid, cursor_gen, _, _))
+                if cursor_lid == lineage_id && cursor_gen == gen_id_filter_key => {}
+            Some(_) => anyhow::bail!("invalid cursor"), // mismatched filter or lineage
+            None => anyhow::bail!("invalid cursor"),
+        }
+    }
+    let limit = first + 1;
+    // Strip lineage_id + gen filter from decoded cursor; use only ts+id for WHERE clause.
+    let cursor_parts = after_cursor
+        .and_then(decode_session_cursor)
+        .map(|(_, _, ts, id)| (ts, id));
+
+    let rows = match (cursor_parts, generation_id_filter) {
+        (Some((ts, cid)), Some(gen_id)) => sqlx::query(
+            r#"SELECT id, lineage_id, generation_id, event_type, recorded_at, details_json
+               FROM session_events
+               WHERE lineage_id = ?1 AND generation_id = ?2
+                 AND (recorded_at > ?3 OR (recorded_at = ?3 AND id > ?4))
+               ORDER BY recorded_at ASC, id ASC LIMIT ?5"#,
+        )
+        .bind(lineage_id)
+        .bind(gen_id)
+        .bind(&ts)
+        .bind(&cid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("list events paginated")?,
+
+        (Some((ts, cid)), None) => sqlx::query(
+            r#"SELECT id, lineage_id, generation_id, event_type, recorded_at, details_json
+               FROM session_events
+               WHERE lineage_id = ?1
+                 AND (recorded_at > ?2 OR (recorded_at = ?2 AND id > ?3))
+               ORDER BY recorded_at ASC, id ASC LIMIT ?4"#,
+        )
+        .bind(lineage_id)
+        .bind(&ts)
+        .bind(&cid)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("list events paginated")?,
+
+        (None, Some(gen_id)) => sqlx::query(
+            r#"SELECT id, lineage_id, generation_id, event_type, recorded_at, details_json
+               FROM session_events
+               WHERE lineage_id = ?1 AND generation_id = ?2
+               ORDER BY recorded_at ASC, id ASC LIMIT ?3"#,
+        )
+        .bind(lineage_id)
+        .bind(gen_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("list events paginated")?,
+
+        (None, None) => sqlx::query(
+            r#"SELECT id, lineage_id, generation_id, event_type, recorded_at, details_json
+               FROM session_events
+               WHERE lineage_id = ?1
+               ORDER BY recorded_at ASC, id ASC LIMIT ?2"#,
+        )
+        .bind(lineage_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("list events paginated")?,
+    };
+
+    let has_next_page = rows.len() as i64 > first;
+    let all_items: Vec<SessionEvent> = rows
+        .into_iter()
+        .take(first as usize)
+        .map(parse_event_row)
+        .collect::<Result<Vec<_>>>()?;
+
+    let start_cursor = all_items.first().map(|e| {
+        encode_session_cursor(
+            &e.lineage_id,
+            gen_id_filter_key,
+            &e.recorded_at.to_rfc3339(),
+            &e.id,
+        )
+    });
+    let end_cursor = all_items.last().map(|e| {
+        encode_session_cursor(
+            &e.lineage_id,
+            gen_id_filter_key,
+            &e.recorded_at.to_rfc3339(),
+            &e.id,
+        )
+    });
+
+    Ok(SessionEventPage {
+        items: all_items,
+        has_next_page,
+        start_cursor,
+        end_cursor,
+        gen_id_filter: gen_id_filter_key.to_string(),
+    })
+}
+
+pub async fn aggregate_kpis_for_run(pool: &SqlitePool, run_id: &str) -> Result<SessionKpiSummary> {
+    let stale_threshold = (chrono::Utc::now() - chrono::Duration::minutes(15)).to_rfc3339();
+    let row = sqlx::query(
+        r#"SELECT
+             COUNT(DISTINCT l.id) AS lineage_count,
+             COUNT(g.id) AS generation_count,
+             SUM(CASE WHEN g.status = 'active' THEN 1 ELSE 0 END) AS active_generation_count,
+             SUM(CASE WHEN g.status = 'closed' THEN 1 ELSE 0 END) AS closed_generation_count,
+             SUM(CASE WHEN g.status = 'reset' THEN 1 ELSE 0 END) AS reset_generation_count,
+             SUM(CASE WHEN g.status = 'invalidated' THEN 1 ELSE 0 END) AS invalidated_generation_count,
+             COALESCE(SUM(g.turn_count), 0) AS total_turn_count,
+             COALESCE(SUM(g.cumulative_prompt_tokens), 0) AS total_prompt_tokens,
+             COALESCE(SUM(g.cumulative_cost_cents), 0) AS total_cost_cents,
+             MAX(g.last_activity_at) AS latest_activity_at,
+             SUM(CASE WHEN g.status = 'active' AND g.last_activity_at IS NOT NULL AND g.last_activity_at < ?2 THEN 1 ELSE 0 END) AS stale_active_generation_count
+           FROM session_lineages l
+           LEFT JOIN session_generations g ON g.lineage_id = l.id
+           WHERE l.run_id = ?1"#,
+    )
+    .bind(run_id)
+    .bind(&stale_threshold)
+    .fetch_one(pool)
+    .await
+    .context("aggregate session kpis")?;
+
+    let latest_activity_str: Option<String> = row.try_get("latest_activity_at").ok().flatten();
+    let latest_activity_at = latest_activity_str.as_deref().map(parse_dt).transpose()?;
+
+    // Count reuse and operator reset events as separate lightweight queries.
+    let reuse_row = sqlx::query(
+        r#"SELECT COUNT(*) AS cnt FROM session_events e
+           JOIN session_lineages l ON e.lineage_id = l.id
+           WHERE l.run_id = ?1 AND e.event_type = 'reused'"#,
+    )
+    .bind(run_id)
+    .fetch_one(pool)
+    .await
+    .context("count reuse events for kpi")?;
+    let reuse_event_count: i64 = reuse_row.get("cnt");
+
+    let reset_ev_row = sqlx::query(
+        r#"SELECT COUNT(*) AS cnt FROM session_events e
+           JOIN session_lineages l ON e.lineage_id = l.id
+           WHERE l.run_id = ?1 AND e.event_type = 'operator_reset'"#,
+    )
+    .bind(run_id)
+    .fetch_one(pool)
+    .await
+    .context("count operator reset events for kpi")?;
+    let operator_reset_event_count: i64 = reset_ev_row.get("cnt");
+
+    Ok(SessionKpiSummary {
+        lineage_count: row.get("lineage_count"),
+        generation_count: row.get("generation_count"),
+        active_generation_count: row
+            .get::<Option<i64>, _>("active_generation_count")
+            .unwrap_or(0),
+        closed_generation_count: row
+            .get::<Option<i64>, _>("closed_generation_count")
+            .unwrap_or(0),
+        reset_generation_count: row
+            .get::<Option<i64>, _>("reset_generation_count")
+            .unwrap_or(0),
+        invalidated_generation_count: row
+            .get::<Option<i64>, _>("invalidated_generation_count")
+            .unwrap_or(0),
+        reuse_event_count,
+        operator_reset_event_count,
+        total_turn_count: row.get("total_turn_count"),
+        total_prompt_tokens: row.get("total_prompt_tokens"),
+        total_cost_cents: row.get("total_cost_cents"),
+        latest_activity_at,
+        stale_active_generation_count: row
+            .get::<Option<i64>, _>("stale_active_generation_count")
+            .unwrap_or(0),
+    })
+}
+
+pub async fn load_health_data_for_run(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<SessionHealthData> {
+    let lineages = sqlx::query(
+        r#"SELECT id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
+                  active_generation_id, created_at, closed_at
+           FROM session_lineages WHERE run_id = ?1 ORDER BY created_at, id"#,
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+    .context("load lineages for health")?
+    .into_iter()
+    .map(parse_lineage_row)
+    .collect::<Result<Vec<_>>>()?;
+
+    // Load all generations referenced by active_generation_id regardless of their own status,
+    // so health can detect invalidated_active_generation (active_generation_id points to
+    // a generation whose status is INVALIDATED or RESET).
+    let active_generations = sqlx::query(
+        r#"SELECT g.id, g.lineage_id, g.generation, g.invocation_owner_key, g.provider_session_id,
+                  g.binding_fingerprint, g.rehydrated_from_checkpoint_artifact_id, g.working_directory,
+                  g.workspace_mode, g.runtime_provider, g.runtime_model, g.status, g.turn_count,
+                  g.estimated_input_tokens, g.latest_cached_input_tokens, g.latest_output_tokens,
+                  g.latest_model_context_window, g.cumulative_prompt_tokens, g.cumulative_cost_cents,
+                  g.created_at, g.last_activity_at, g.ended_at, g.end_reason
+           FROM session_generations g
+           JOIN session_lineages l ON g.lineage_id = l.id
+           WHERE l.run_id = ?1 AND l.active_generation_id = g.id"#,
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+    .context("load active generations for health")?
+    .into_iter()
+    .map(parse_generation_row)
+    .collect::<Result<Vec<_>>>()?;
+
+    let threshold_30m_ts = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+    let threshold_24h_ts = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+
+    let recent_operator_reset_events = sqlx::query(
+        r#"SELECT e.id, e.lineage_id, e.generation_id, e.event_type, e.recorded_at, e.details_json
+           FROM session_events e
+           JOIN session_lineages l ON e.lineage_id = l.id
+           WHERE l.run_id = ?1 AND e.event_type = 'operator_reset' AND e.recorded_at >= ?2
+           ORDER BY e.recorded_at, e.id"#,
+    )
+    .bind(run_id)
+    .bind(&threshold_30m_ts)
+    .fetch_all(pool)
+    .await
+    .context("load operator reset events for health")?
+    .into_iter()
+    .map(parse_event_row)
+    .collect::<Result<Vec<_>>>()?;
+
+    let recent_repair_failed_events = sqlx::query(
+        r#"SELECT e.id, e.lineage_id, e.generation_id, e.event_type, e.recorded_at, e.details_json
+           FROM session_events e
+           JOIN session_lineages l ON e.lineage_id = l.id
+           WHERE l.run_id = ?1 AND e.event_type = 'output_contract_repair_failed' AND e.recorded_at >= ?2
+           ORDER BY e.recorded_at, e.id"#,
+    )
+    .bind(run_id)
+    .bind(&threshold_30m_ts)
+    .fetch_all(pool)
+    .await
+    .context("load repair failed events for health")?
+    .into_iter()
+    .map(parse_event_row)
+    .collect::<Result<Vec<_>>>()?;
+
+    let operator_reset_events_24h = sqlx::query(
+        r#"SELECT e.id, e.lineage_id, e.generation_id, e.event_type, e.recorded_at, e.details_json
+           FROM session_events e
+           JOIN session_lineages l ON e.lineage_id = l.id
+           WHERE l.run_id = ?1 AND e.event_type = 'operator_reset' AND e.recorded_at >= ?2
+           ORDER BY e.recorded_at, e.id"#,
+    )
+    .bind(run_id)
+    .bind(&threshold_24h_ts)
+    .fetch_all(pool)
+    .await
+    .context("load 24h operator reset events for health")?
+    .into_iter()
+    .map(parse_event_row)
+    .collect::<Result<Vec<_>>>()?;
+
+    // Determine if the run is terminal (completed/failed/cancelled/cancelling).
+    let run_is_terminal = sqlx::query("SELECT status FROM runs WHERE id = ?1")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+        .context("load run status for health")?
+        .map(|r| {
+            let status: String = r.get("status");
+            matches!(
+                status.as_str(),
+                "completed" | "failed" | "cancelled" | "cancelling"
+            )
+        })
+        .unwrap_or(false);
+
+    // Run-scoped orphan probe: count generation rows that were created for this run
+    // (via agent_executions → stage_executions.run_id) but whose lineage row no longer
+    // exists in session_lineages. Uses agent_executions for run-scoping rather than
+    // session_lineages, which avoids the self-contradictory pattern of querying a table
+    // for IDs and then checking they don't exist in that same table.
+    let orphan_generation_count: i64 = sqlx::query(
+        r#"SELECT COUNT(*) as cnt FROM session_generations g
+           WHERE g.lineage_id IN (
+               SELECT DISTINCT ae.session_lineage_id
+               FROM agent_executions ae
+               JOIN stage_executions se ON ae.stage_execution_id = se.id
+               WHERE se.run_id = ?1
+                 AND ae.session_lineage_id IS NOT NULL
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM session_lineages sl WHERE sl.id = g.lineage_id
+           )"#,
+    )
+    .bind(run_id)
+    .fetch_one(pool)
+    .await
+    .map(|r| r.get::<i64, _>("cnt"))
+    .unwrap_or(0);
+
+    Ok(SessionHealthData {
+        lineages,
+        active_generations,
+        recent_operator_reset_events,
+        recent_repair_failed_events,
+        operator_reset_events_24h,
+        run_is_terminal,
+        orphan_generation_count,
+    })
+}
+
+/// Returns the most recent session event for any lineage belonging to the run, or None.
+pub async fn latest_session_event_for_run(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Option<SessionEvent>> {
+    let row = sqlx::query(
+        r#"SELECT e.id, e.lineage_id, e.generation_id, e.event_type, e.recorded_at, e.details_json
+           FROM session_events e
+           JOIN session_lineages l ON e.lineage_id = l.id
+           WHERE l.run_id = ?1
+           ORDER BY e.recorded_at DESC, e.id DESC
+           LIMIT 1"#,
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+    .context("latest session event for run")?;
+    row.map(parse_event_row).transpose()
+}
+
+/// Per-lineage aggregated stats used to populate GqlSessionLineage computed fields.
+pub struct LineageStats {
+    pub generation_count: i64,
+    pub latest_event_at: Option<DateTime<Utc>>,
+    /// Status of the active generation (l.active_generation_id → g.status), if present.
+    /// None when the lineage has no active_generation_id or the generation row was not found.
+    pub active_generation_status: Option<SessionGenerationStatus>,
+}
+
+/// Load generation_count, latest_event_at, and active generation status for all lineages
+/// belonging to a run in one query.
+pub async fn aggregate_lineage_stats_for_run(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<std::collections::HashMap<String, LineageStats>> {
+    let rows = sqlx::query(
+        r#"SELECT
+             l.id AS lineage_id,
+             COUNT(DISTINCT g.id) AS generation_count,
+             MAX(e.recorded_at) AS latest_event_at,
+             ag.status AS active_gen_status
+           FROM session_lineages l
+           LEFT JOIN session_generations g ON g.lineage_id = l.id
+           LEFT JOIN session_events e ON e.lineage_id = l.id
+           LEFT JOIN session_generations ag ON ag.id = l.active_generation_id
+           WHERE l.run_id = ?1
+           GROUP BY l.id, ag.status"#,
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+    .context("aggregate lineage stats")?;
+
+    Ok(parse_lineage_stats_rows(rows))
+}
+
+/// Load generation_count, latest_event_at, and active generation status for a specific set of
+/// lineage row IDs (the current page). This bounds the DB work to the returned page rather
+/// than scanning all lineages in the run.
+pub async fn aggregate_lineage_stats_for_page(
+    pool: &SqlitePool,
+    lineage_row_ids: &[String],
+) -> Result<std::collections::HashMap<String, LineageStats>> {
+    if lineage_row_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut qb = sqlx::QueryBuilder::<Sqlite>::new(
+        r#"SELECT
+             l.id AS lineage_id,
+             COUNT(DISTINCT g.id) AS generation_count,
+             MAX(e.recorded_at) AS latest_event_at,
+             ag.status AS active_gen_status
+           FROM session_lineages l
+           LEFT JOIN session_generations g ON g.lineage_id = l.id
+           LEFT JOIN session_events e ON e.lineage_id = l.id
+           LEFT JOIN session_generations ag ON ag.id = l.active_generation_id
+           WHERE l.id IN ("#,
+    );
+    let mut sep = qb.separated(", ");
+    for id in lineage_row_ids {
+        sep.push_bind(id.as_str());
+    }
+    qb.push(") GROUP BY l.id, ag.status");
+    let rows = qb
+        .build()
+        .fetch_all(pool)
+        .await
+        .context("aggregate lineage stats for page")?;
+    Ok(parse_lineage_stats_rows(rows))
+}
+
+fn parse_lineage_stats_rows(
+    rows: Vec<sqlx::sqlite::SqliteRow>,
+) -> std::collections::HashMap<String, LineageStats> {
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let lid: String = row.get("lineage_id");
+        let generation_count: i64 = row
+            .try_get::<Option<i64>, _>("generation_count")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let latest_event_at_str: Option<String> = row.try_get("latest_event_at").ok().flatten();
+        let latest_event_at = latest_event_at_str
+            .as_deref()
+            .map(parse_dt)
+            .transpose()
+            .unwrap_or(None);
+        let active_gen_status_str: Option<String> = row.try_get("active_gen_status").ok().flatten();
+        let active_generation_status = active_gen_status_str
+            .as_deref()
+            .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok());
+        map.insert(
+            lid,
+            LineageStats {
+                generation_count,
+                latest_event_at,
+                active_generation_status,
+            },
+        );
+    }
+    map
+}
+
+/// Load generation_count, latest_event_at, and active generation status for a single lineage row.
+pub async fn aggregate_lineage_stats_for_lineage(
+    pool: &SqlitePool,
+    lineage_row_id: &str,
+) -> Result<Option<LineageStats>> {
+    let row = sqlx::query(
+        r#"SELECT
+             COUNT(DISTINCT g.id) AS generation_count,
+             MAX(e.recorded_at) AS latest_event_at,
+             ag.status AS active_gen_status
+           FROM session_lineages l
+           LEFT JOIN session_generations g ON g.lineage_id = l.id
+           LEFT JOIN session_events e ON e.lineage_id = l.id
+           LEFT JOIN session_generations ag ON ag.id = l.active_generation_id
+           WHERE l.id = ?1
+           GROUP BY l.id, ag.status"#,
+    )
+    .bind(lineage_row_id)
+    .fetch_optional(pool)
+    .await
+    .context("aggregate lineage stats for single lineage")?;
+
+    let Some(row) = row else { return Ok(None) };
+    let generation_count: i64 = row
+        .try_get::<Option<i64>, _>("generation_count")
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let latest_event_at_str: Option<String> = row.try_get("latest_event_at").ok().flatten();
+    let latest_event_at = latest_event_at_str
+        .as_deref()
+        .map(parse_dt)
+        .transpose()
+        .unwrap_or(None);
+    let active_gen_status_str: Option<String> = row.try_get("active_gen_status").ok().flatten();
+    let active_generation_status = active_gen_status_str
+        .as_deref()
+        .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok());
+    Ok(Some(LineageStats {
+        generation_count,
+        latest_event_at,
+        active_generation_status,
+    }))
+}
+
+fn parse_event_row(row: sqlx::sqlite::SqliteRow) -> Result<SessionEvent> {
+    let event_type_str: String = row.get("event_type");
+    let recorded_at_str: String = row.get("recorded_at");
+    Ok(SessionEvent {
+        id: row.get("id"),
+        lineage_id: row.get("lineage_id"),
+        generation_id: row.get("generation_id"),
+        event_type: session_event_type_from_str(&event_type_str)?,
+        recorded_at: parse_dt(&recorded_at_str)?,
+        details_json: row.get("details_json"),
+    })
+}
+
+fn session_event_type_from_str(s: &str) -> Result<SessionEventType> {
+    match s {
+        "created" => Ok(SessionEventType::Created),
+        "reused" => Ok(SessionEventType::Reused),
+        "invalidated" => Ok(SessionEventType::Invalidated),
+        "closed" => Ok(SessionEventType::Closed),
+        "operator_reset" => Ok(SessionEventType::OperatorReset),
+        "budget_exceeded" => Ok(SessionEventType::BudgetExceeded),
+        "compacted" => Ok(SessionEventType::Compacted),
+        "output_contract_repair_started" => Ok(SessionEventType::OutputContractRepairStarted),
+        "output_contract_repair_succeeded" => Ok(SessionEventType::OutputContractRepairSucceeded),
+        "output_contract_repair_failed" => Ok(SessionEventType::OutputContractRepairFailed),
+        "output_contract_repair_skipped" => Ok(SessionEventType::OutputContractRepairSkipped),
+        "code_writer_completion_started" => Ok(SessionEventType::CodeWriterCompletionStarted),
+        "code_writer_completion_succeeded" => Ok(SessionEventType::CodeWriterCompletionSucceeded),
+        "code_writer_completion_failed" => Ok(SessionEventType::CodeWriterCompletionFailed),
+        // Unknown event types map to Compacted which renders as UNKNOWN_EVENT_SHAPE in GraphQL.
+        // Details are withheld by the GraphQL redaction layer.
+        other => {
+            tracing::warn!(
+                "p046 unknown session event type in DB: {other:?}; mapping to UNKNOWN_EVENT_SHAPE"
+            );
+            Ok(SessionEventType::Compacted)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID_TS: &str = "2026-05-25T21:41:52Z";
+
+    #[test]
+    fn p046_event_cursor_rejects_non_rfc3339_timestamp() {
+        let cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_EVENT_CURSOR_KIND.into(),
+            "lineage-1".into(),
+            "generation-1".into(),
+            "not-a-timestamp".into(),
+            "event-1".into(),
+        ]);
+
+        assert!(
+            decode_session_cursor(&cursor).is_none(),
+            "event cursors must validate timestamp tuple components"
+        );
+    }
+
+    #[test]
+    fn p046_lineage_cursor_rejects_non_rfc3339_timestamp() {
+        let cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_LINEAGE_CURSOR_KIND.into(),
+            "run-1".into(),
+            "agent-1".into(),
+            "lineage-key-1".into(),
+            "not-a-timestamp".into(),
+            "lineage-row-1".into(),
+        ]);
+
+        assert!(
+            decode_session_lineage_cursor(&cursor).is_none(),
+            "lineage cursors must validate timestamp tuple components"
+        );
+    }
+
+    #[test]
+    fn p046_generation_cursor_rejects_non_rfc3339_timestamp() {
+        let cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_GENERATION_CURSOR_KIND.into(),
+            "lineage-1".into(),
+            "1".into(),
+            "not-a-timestamp".into(),
+            "generation-row-1".into(),
+        ]);
+
+        assert!(
+            decode_session_generation_cursor(&cursor).is_none(),
+            "generation cursors must validate timestamp tuple components"
+        );
+    }
+
+    #[test]
+    fn p046_cursors_reject_empty_stable_ids() {
+        let event_cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_EVENT_CURSOR_KIND.into(),
+            "lineage-1".into(),
+            "".into(),
+            VALID_TS.into(),
+            "".into(),
+        ]);
+        let lineage_cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_LINEAGE_CURSOR_KIND.into(),
+            "run-1".into(),
+            "".into(),
+            "lineage-key-1".into(),
+            VALID_TS.into(),
+            "lineage-row-1".into(),
+        ]);
+        let generation_cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_GENERATION_CURSOR_KIND.into(),
+            "lineage-1".into(),
+            "1".into(),
+            VALID_TS.into(),
+            "".into(),
+        ]);
+
+        assert!(decode_session_cursor(&event_cursor).is_none());
+        assert!(decode_session_lineage_cursor(&lineage_cursor).is_none());
+        assert!(decode_session_generation_cursor(&generation_cursor).is_none());
+    }
+
+    #[test]
+    fn p046_cursors_reject_wrong_connection_kind() {
+        let event_cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_EVENT_CURSOR_KIND.into(),
+            "lineage-1".into(),
+            "generation-1".into(),
+            VALID_TS.into(),
+            "event-1".into(),
+        ]);
+        let generation_cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_GENERATION_CURSOR_KIND.into(),
+            "lineage-1".into(),
+            "1".into(),
+            VALID_TS.into(),
+            "generation-row-1".into(),
+        ]);
+        let lineage_cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_LINEAGE_CURSOR_KIND.into(),
+            "run-1".into(),
+            "agent-1".into(),
+            "lineage-key-1".into(),
+            VALID_TS.into(),
+            "lineage-row-1".into(),
+        ]);
+
+        assert!(
+            decode_session_cursor(&generation_cursor).is_none(),
+            "sessionEvents must reject generation cursors even when their tuple length matches"
+        );
+        assert!(
+            decode_session_generation_cursor(&event_cursor).is_none(),
+            "sessionGenerations must reject event cursors even when their tuple length matches"
+        );
+        assert!(
+            decode_session_lineage_cursor(&event_cursor).is_none(),
+            "sessionLineages must reject event cursors"
+        );
+        assert!(
+            decode_session_lineage_cursor(&generation_cursor).is_none(),
+            "sessionLineages must reject generation cursors"
+        );
+        assert!(
+            decode_session_cursor(&lineage_cursor).is_none(),
+            "sessionEvents must reject lineage cursors"
+        );
+    }
+}

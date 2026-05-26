@@ -86,13 +86,11 @@ pub struct GqlAgentExecutionRuntimeFacts {
     pub ignored_late_output_count: i64,
     pub session_lineage_id: Option<ID>,
     pub session_generation_id: Option<ID>,
-    pub invocation_owner_key: Option<String>,
     pub session_reuse_scope: Option<String>,
     pub session_family_id: Option<String>,
     pub session_reuse_disposition: Option<String>,
     pub session_reuse_reason: Option<String>,
     pub session_reset_reason: Option<String>,
-    pub provider_session_id: Option<String>,
     pub active_session_generation_id: Option<ID>,
     pub active_generation_matches_execution: Option<bool>,
     pub generation_status: Option<String>,
@@ -166,6 +164,9 @@ pub struct GqlAgentExecution {
     pub session_lineage_id: Option<String>,
     pub session_generation_id: Option<String>,
     pub rehydrated_from_checkpoint_artifact_id: Option<String>,
+    /// Raw invocation owner key — kept in struct for runtime_facts derivation but
+    /// excluded from the GraphQL schema to satisfy the P046 sensitive-field boundary.
+    #[graphql(skip)]
     pub invocation_owner_key: Option<String>,
     pub session_reuse_scope: Option<String>,
     pub session_family_id: Option<String>,
@@ -736,8 +737,6 @@ impl GqlAgentExecutionRuntimeFacts {
         generation: Option<&SessionGeneration>,
         include_operator_debug: bool,
     ) -> Self {
-        let provider_session_id =
-            generation.and_then(|generation| generation.provider_session_id.clone());
         let generation_status = generation.map(|generation| {
             sessions::session_generation_status_to_str(&generation.status).to_string()
         });
@@ -834,13 +833,11 @@ impl GqlAgentExecutionRuntimeFacts {
             ignored_late_output_count: facts.ignored_late_output_count,
             session_lineage_id: execution.session_lineage_id.clone().map(ID),
             session_generation_id: execution.session_generation_id.clone().map(ID),
-            invocation_owner_key: execution.invocation_owner_key.clone(),
             session_reuse_scope: execution.session_reuse_scope.clone(),
             session_family_id: execution.session_family_id.clone(),
             session_reuse_disposition: execution.session_reuse_disposition.clone(),
             session_reuse_reason: facts.session_reuse_reason,
             session_reset_reason: execution.session_reset_reason.clone(),
-            provider_session_id,
             active_session_generation_id,
             active_generation_matches_execution,
             generation_status,

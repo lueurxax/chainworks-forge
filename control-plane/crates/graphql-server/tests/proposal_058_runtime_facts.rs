@@ -396,7 +396,6 @@ async fn proposal_058_agent_execution_exposes_runtime_facts_and_session_provenan
                             sessionLineageId
                             sessionGenerationId
                             rehydratedFromCheckpointArtifactId
-                            invocationOwnerKey
                             sessionReuseScope
                             sessionFamilyId
                             runtimeFacts {{
@@ -416,7 +415,6 @@ async fn proposal_058_agent_execution_exposes_runtime_facts_and_session_provenan
                                 lateOutputCount
                                 ignoredLateOutputCount
                                 sessionReuseReason
-                                providerSessionId
                                 activeSessionGenerationId
                                 activeGenerationMatchesExecution
                                 generationStatus
@@ -452,7 +450,6 @@ async fn proposal_058_agent_execution_exposes_runtime_facts_and_session_provenan
         execution["rehydratedFromCheckpointArtifactId"],
         "checkpoint-1"
     );
-    assert_eq!(execution["invocationOwnerKey"], "owner-key");
     assert_eq!(
         execution["sessionReuseScope"],
         "same_agent_family_within_run"
@@ -496,7 +493,6 @@ async fn proposal_058_agent_execution_exposes_runtime_facts_and_session_provenan
         runtime_facts["sessionReuseReason"],
         "same_family_within_run"
     );
-    assert_eq!(runtime_facts["providerSessionId"], "provider-session-1");
     assert_eq!(
         runtime_facts["activeSessionGenerationId"],
         "session-generation-1"

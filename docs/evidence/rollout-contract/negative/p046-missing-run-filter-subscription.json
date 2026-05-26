@@ -1,38 +1,14 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-046"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:missing_run_filter_subscription",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "missing_run_filter_subscription",
+  "description": "sessionStatusChanged emits events for a different run_id than the one subscribed to.",
+  "hold_condition": "sessionStatusChanged does not filter by run_id before emitting.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_cross_run_subscription_leak",
+  "fixture_input": {
+    "subscribed_run_id": "run-A",
+    "emitted_run_id": "run-B",
+    "expected_result": "no_emission_for_run_b_subscriber"
+  }
 }

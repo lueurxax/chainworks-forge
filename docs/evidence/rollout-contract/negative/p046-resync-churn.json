@@ -1,38 +1,13 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
-  },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-046"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:resync_churn",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "resync_churn",
+  "description": "Subscription emits multiple resyncRequired=true payloads in a row without a successful non-resync payload between them.",
+  "hold_condition": "sessionStatusChanged lacks a 64 payload per-subscriber buffer cap, at-most-once resyncRequired behavior, or slow-consumer disconnect criteria.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_resync_churn",
+  "fixture_input": {
+    "lag_events": 3,
+    "expected_result": "at_most_one_resync_required_between_successful_payloads"
+  }
 }
