@@ -307,6 +307,9 @@ private actor DebugPackagedDaemonProcess {
         }
 
         var environment = ProcessInfo.processInfo.environment
+        for (key, value) in Self.bundledDaemonEnvironment(bundleURL: bundleURL) {
+            environment[key] = value
+        }
         environment["MODE"] = "packaged-app"
         environment["PATH"] = DebugPackagedDaemonProcess.providerPath(
             existing: environment["PATH"]
@@ -326,6 +329,38 @@ private actor DebugPackagedDaemonProcess {
         }
         try process.run()
         return process
+    }
+
+    private nonisolated static func bundledDaemonEnvironment(bundleURL: URL) -> [String: String] {
+        let contentsURL = bundleURL.appendingPathComponent("Contents", isDirectory: true)
+        let plistCandidates = [
+            contentsURL
+                .appendingPathComponent("Resources", isDirectory: true)
+                .appendingPathComponent("com.chainworks.forge.daemon.plist", isDirectory: false),
+            contentsURL
+                .appendingPathComponent("Library", isDirectory: true)
+                .appendingPathComponent("LaunchAgents", isDirectory: true)
+                .appendingPathComponent("com.chainworks.forge.daemon.plist", isDirectory: false)
+        ]
+
+        for plistURL in plistCandidates {
+            guard let data = try? Data(contentsOf: plistURL),
+                  let plist = try? PropertyListSerialization.propertyList(
+                    from: data,
+                    options: [],
+                    format: nil
+                  ) as? [String: Any],
+                  let environment = plist["EnvironmentVariables"] as? [String: Any] else {
+                continue
+            }
+            return environment.reduce(into: [String: String]()) { result, entry in
+                if let value = entry.value as? String {
+                    result[entry.key] = value
+                }
+            }
+        }
+
+        return [:]
     }
 
     private func existingPackagedDaemonIsRunning() -> Bool {
