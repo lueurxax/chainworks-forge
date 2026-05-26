@@ -14,7 +14,7 @@ pub mod storage;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 43] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 44] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -31,6 +31,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 43] {
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
         CapabilityToolId::StagesRetry,
+        CapabilityToolId::StagesConsumeProviderQuotaHold,
         CapabilityToolId::WorkflowConflictsResolve,
         CapabilityToolId::WorkflowLoopBudgetExtend,
         CapabilityToolId::LegacyDiscoveryOverrideCreate,
@@ -95,6 +96,9 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
         "stages.retry" => Some(CapabilityToolId::StagesRetry),
+        "stages.consume_provider_quota_hold" => {
+            Some(CapabilityToolId::StagesConsumeProviderQuotaHold)
+        }
         "workflow_conflicts.resolve" => Some(CapabilityToolId::WorkflowConflictsResolve),
         "workflow_loop_budget.extend" => Some(CapabilityToolId::WorkflowLoopBudgetExtend),
         "legacy_discovery_override_create" => Some(CapabilityToolId::LegacyDiscoveryOverrideCreate),
@@ -150,6 +154,7 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "approvals_list" => "approvals.list",
         "approvals_resolve" => "approvals.resolve",
         "stages_retry" => "stages.retry",
+        "stages_consume_provider_quota_hold" => "stages.consume_provider_quota_hold",
         "workflow_conflicts_resolve" => "workflow_conflicts.resolve",
         "workflow_loop_budget_extend" => "workflow_loop_budget.extend",
         "reports_get" => "reports.get",
@@ -220,6 +225,9 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
             tool_spec_by_name(approvals::tool_specs(), "approvals.resolve")
         }
         CapabilityToolId::StagesRetry => tool_spec_by_name(stages::tool_specs(), "stages.retry"),
+        CapabilityToolId::StagesConsumeProviderQuotaHold => {
+            tool_spec_by_name(stages::tool_specs(), "stages.consume_provider_quota_hold")
+        }
         CapabilityToolId::WorkflowConflictsResolve => {
             tool_spec_by_name(stages::tool_specs(), "workflow_conflicts.resolve")
         }

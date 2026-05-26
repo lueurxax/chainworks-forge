@@ -1002,7 +1002,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 43] {
+fn all_tool_capabilities() -> [CapabilityToolId; 44] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -1019,6 +1019,7 @@ fn all_tool_capabilities() -> [CapabilityToolId; 43] {
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
         CapabilityToolId::StagesRetry,
+        CapabilityToolId::StagesConsumeProviderQuotaHold,
         CapabilityToolId::WorkflowConflictsResolve,
         CapabilityToolId::WorkflowLoopBudgetExtend,
         CapabilityToolId::LegacyDiscoveryOverrideCreate,
@@ -1077,6 +1078,9 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         }
         CapabilityToolId::ApprovalsResolve => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StagesRetry => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::StagesConsumeProviderQuotaHold => {
+            matches!(class, PrincipalClass::Operator)
+        }
         CapabilityToolId::WorkflowConflictsResolve => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::WorkflowLoopBudgetExtend => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::LegacyDiscoveryOverrideCreate => {
@@ -1226,6 +1230,9 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
         "stages.retry" => Some(CapabilityToolId::StagesRetry),
+        "stages.consume_provider_quota_hold" => {
+            Some(CapabilityToolId::StagesConsumeProviderQuotaHold)
+        }
         "workflow_conflicts.resolve" => Some(CapabilityToolId::WorkflowConflictsResolve),
         "legacy_discovery_override_create" => Some(CapabilityToolId::LegacyDiscoveryOverrideCreate),
         "reports.get" => Some(CapabilityToolId::ReportsGet),

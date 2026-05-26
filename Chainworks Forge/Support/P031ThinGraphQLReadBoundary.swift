@@ -5597,6 +5597,7 @@ struct P031StageTopologyPresentation: Equatable, Sendable {
 
 struct P031RunDetailPresentation: Equatable, Sendable {
   let title: String
+  let runID: String?
   let workflowLabel: String?
   let statusLabel: String
   let progressLabel: String?
@@ -5625,6 +5626,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
 
   nonisolated init(
     title: String,
+    runID: String? = nil,
     workflowLabel: String?,
     statusLabel: String,
     progressLabel: String?,
@@ -5651,6 +5653,7 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     failedStages: Int
   ) {
     self.title = title
+    self.runID = runID
     self.workflowLabel = workflowLabel
     self.statusLabel = statusLabel
     self.progressLabel = progressLabel
@@ -6587,6 +6590,7 @@ enum P031RunDetailPresenter {
 
     return P031RunDetailPresentation(
       title: title,
+      runID: run?.id,
       workflowLabel: workflowLabel,
       statusLabel: statusLabel,
       progressLabel: progressLabel,
@@ -6679,6 +6683,7 @@ enum P031RunDetailPresenter {
   ) -> P031RunDetailPresentation {
     P031RunDetailPresentation(
       title: "Run unavailable",
+      runID: nil,
       workflowLabel: nil,
       statusLabel: "Unavailable",
       progressLabel: nil,

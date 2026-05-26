@@ -80,6 +80,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
     func populate(from detail: P031RunDetailPresentation) {
         summaryHeader = SummaryHeader(
             title: detail.title,
+            runID: detail.runID,
             status: detail.statusLabel,
             workflowLabel: detail.workflowLabel,
             progressLabel: detail.progressLabel,
@@ -421,6 +422,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
 
     struct SummaryHeader: Equatable {
         let title: String
+        let runID: String?
         let status: String
         let workflowLabel: String?
         let progressLabel: String?

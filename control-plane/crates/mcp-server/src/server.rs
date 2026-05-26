@@ -1625,6 +1625,7 @@ fn is_state_changing_tool(tool_name: &str) -> bool {
             | "runs.settle_proposal_gate"
             | "ideas.create"
             | "stages.retry"
+            | "stages.consume_provider_quota_hold"
             | "legacy_discovery_override_create"
             | "workflow_conflicts.resolve"
             | "workflow_loop_budget.extend"
@@ -2394,6 +2395,7 @@ mod p029_capability_tests {
             "approvals.list",
             "approvals.resolve",
             "stages.retry",
+            "stages.consume_provider_quota_hold",
             "workflow_conflicts.resolve",
             "legacy_discovery_override_create",
             "reports.get",
@@ -2436,6 +2438,7 @@ mod p029_capability_tests {
             "approvals.list",
             "approvals.resolve",
             "stages.retry",
+            "stages.consume_provider_quota_hold",
             "legacy_discovery_override_create",
             "runs.cancel",
             "steward.run_analysis",
@@ -2474,6 +2477,7 @@ mod p029_capability_tests {
             "runs.cancel",
             "approvals.resolve",
             "stages.retry",
+            "stages.consume_provider_quota_hold",
             "legacy_discovery_override_create",
             "steward.run_analysis",
         ] {

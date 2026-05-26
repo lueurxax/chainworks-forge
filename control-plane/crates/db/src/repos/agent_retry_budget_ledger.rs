@@ -402,6 +402,48 @@ pub async fn consume_active_provider_family_quota_for_retry_target_tx(
     }))
 }
 
+pub async fn consume_active_provider_family_quota_for_operator_override_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    provider_family: &str,
+    model: Option<&str>,
+    now: DateTime<Utc>,
+    journal_id: &str,
+) -> Result<u64> {
+    let updated = sqlx::query(
+        r#"UPDATE agent_retry_budget_ledger
+           SET normal_budget_consumed = 1,
+               early_retry_journal_id = COALESCE(early_retry_journal_id, ?1),
+               state = 'early_retry_consumed',
+               updated_at = ?2
+           WHERE failure_kind = ?3
+             AND normal_budget_consumed = 0
+             AND state = 'waiting_for_reset'
+             AND retry_after IS NOT NULL
+             AND retry_after > ?2
+             AND agent_execution_id IN (
+               SELECT id FROM agent_executions
+               WHERE COALESCE(provider_family, provider) = ?4
+                 AND (
+                   model IS NULL
+                   OR trim(model) = ''
+                   OR ?5 IS NULL
+                   OR trim(?5) = ''
+                   OR lower(model) = lower(?5)
+                 )
+             )"#,
+    )
+    .bind(journal_id)
+    .bind(now.to_rfc3339())
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .bind(provider_family)
+    .bind(model)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+
+    Ok(updated)
+}
+
 pub async fn find_by_id_tx(
     tx: &mut Transaction<'_, Sqlite>,
     ledger_id: &str,

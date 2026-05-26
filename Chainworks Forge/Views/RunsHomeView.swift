@@ -5408,6 +5408,7 @@ private struct P036SystemReadinessCard: View {
 private struct P036RunDetailSummaryCard: View {
     let header: RunsWorkbenchPresentationModel.SummaryHeader
     let onCheckSystemReadiness: () -> Void
+    @State private var copyFeedback: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -5418,6 +5419,9 @@ private struct P036RunDetailSummaryCard: View {
                     Text(header.status)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                    if let runID = header.runID {
+                        runIDCopyControl(runID)
+                    }
                 }
                 Spacer()
 
@@ -5431,6 +5435,35 @@ private struct P036RunDetailSummaryCard: View {
         .padding(20)
         .background(Color.primary.opacity(0.03))
         .cornerRadius(12)
+    }
+
+    private func runIDCopyControl(_ runID: String) -> some View {
+        Button {
+            copyRunID(runID)
+        } label: {
+            Label("Run \(shortRunID(runID))", systemImage: "doc.on.doc")
+                .labelStyle(.titleAndIcon)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(ForgeColor.Text.secondary)
+        .help(copyFeedback ?? "Copy full run ID: \(runID)")
+        .accessibilityLabel("Copy run ID \(runID)")
+        .accessibilityIdentifier("run-overview-copy-run-id")
+    }
+
+    private func shortRunID(_ runID: String) -> String {
+        let prefix = String(runID.prefix(5))
+        return runID.count > 5 ? "\(prefix)..." : prefix
+    }
+
+    private func copyRunID(_ runID: String) {
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(runID, forType: .string)
+        copyFeedback = "Copied full run ID"
+        #endif
     }
 }
 

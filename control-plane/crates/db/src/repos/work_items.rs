@@ -112,6 +112,72 @@ pub async fn record_pending_invoke_agent_wait_reason(
     Ok(updated > 0)
 }
 
+pub async fn list_pending_invoke_agents_for_run_stage_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    stage_id: &str,
+) -> Result<Vec<WorkItem>> {
+    let pending_status = WorkItemStatus::Pending.to_string();
+    let invoke_kind = WorkItemKind::InvokeAgent.to_string();
+    let rows = sqlx::query(
+        r#"SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
+           FROM work_items
+           WHERE run_id = ?1
+             AND stage_id = ?2
+             AND kind = ?3
+             AND status = ?4
+           ORDER BY scheduled_at ASC, rowid ASC"#,
+    )
+    .bind(run_id.to_string())
+    .bind(stage_id)
+    .bind(&invoke_kind)
+    .bind(&pending_status)
+    .fetch_all(&mut **tx)
+    .await
+    .context("list pending InvokeAgent work items by run/stage")?;
+
+    rows.into_iter()
+        .map(|row| {
+            parse_work_item_row(
+                row.get("id"),
+                row.get("kind"),
+                row.get("payload_json"),
+                row.get("status"),
+                row.get("run_id"),
+                row.get("stage_id"),
+                row.get("created_at"),
+                row.get("scheduled_at"),
+                row.get("attempt_count"),
+                row.get("last_error"),
+            )
+        })
+        .collect()
+}
+
+pub async fn release_pending_invoke_agent_quota_wait_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let updated = sqlx::query(
+        r#"UPDATE work_items
+           SET last_error = NULL,
+               scheduled_at = ?1
+           WHERE id = ?2
+             AND kind = ?3
+             AND status = ?4"#,
+    )
+    .bind(now.to_rfc3339())
+    .bind(work_item_id)
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Pending.to_string())
+    .execute(&mut **tx)
+    .await
+    .context("release pending InvokeAgent quota wait")?
+    .rows_affected();
+    Ok(updated > 0)
+}
+
 async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Option<WorkItem>> {
     // Use a transaction to atomically select and update the next pending item.
     let tx_started = Instant::now();

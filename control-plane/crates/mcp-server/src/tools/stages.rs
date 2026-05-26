@@ -2,8 +2,9 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use domain::commands::{
-    Command, ExtendWorkflowLoopBudgetCmd, OverrideLegacyDiscoveryPolicyCmd,
-    ResolveWorkflowConflictTransitionCmd, RetryStageCmd, WorkflowLoopBudgetExtensionCmd,
+    Command, ConsumeProviderQuotaHoldCmd, ExtendWorkflowLoopBudgetCmd,
+    OverrideLegacyDiscoveryPolicyCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
+    WorkflowLoopBudgetExtensionCmd,
 };
 use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::ids::{RunId, StageExecutionId};
@@ -32,6 +33,22 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "legacy_discovery_override_policy": { "type": "string", "enum": ["workflow_opt_in"], "description": "Optional audited one-shot legacy discovery policy for this retry attempt." },
                     "legacy_discovery_override_reason": { "type": "string", "description": "Required reason when legacy_discovery_override_policy is set." },
                     "operator_instruction": { "type": "string", "description": "Optional one-shot operator instruction for the retry-created invocation scope (1-2000 chars, operator-only)." }
+                }
+            }),
+        },
+        McpTool {
+            name: "stages.consume_provider_quota_hold".to_string(),
+            description:
+                "Consume an active provider quota hold for an existing pending InvokeAgent"
+                    .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["run_id", "stage_id", "reason", "idempotency_key"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "stage_id": { "type": "string" },
+                    "reason": { "type": "string", "description": "Operator audit reason for overriding the active quota hold." },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe repair." }
                 }
             }),
         },
@@ -178,6 +195,52 @@ pub async fn execute(
                 "journal_id": commanded.journal_id,
                 "legacy_discovery_override_id": legacy_discovery_override_id,
                 "retry_instruction_binding_id": retry_instruction_binding_id,
+            }))
+        }
+
+        "stages.consume_provider_quota_hold" => {
+            let run_id: RunId = params["run_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
+                .parse()?;
+            let stage_id = params["stage_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'stage_id'"))?
+                .to_string();
+            let reason = params["reason"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+                .to_string();
+
+            let caller = mcp_caller(&principal, "stages.consume_provider_quota_hold");
+            let cmd = Command::ConsumeProviderQuotaHold(ConsumeProviderQuotaHoldCmd {
+                run_id,
+                stage_id,
+                reason,
+            });
+            let commanded = cmd_handler.handle(cmd, caller).await?;
+            let (result_run_id, result_stage_id, consumed_ledger_count, released_work_item_count) =
+                match &commanded.result {
+                    engine::command_handler::CommandResult::ProviderQuotaHoldConsumed {
+                        run_id,
+                        stage_id,
+                        consumed_ledger_count,
+                        released_work_item_count,
+                    } => (
+                        run_id.to_string(),
+                        stage_id.clone(),
+                        *consumed_ledger_count,
+                        *released_work_item_count,
+                    ),
+                    _ => anyhow::bail!("Unexpected command result"),
+                };
+            Ok(serde_json::json!({
+                "consumed": true,
+                "run_id": result_run_id,
+                "stage_id": result_stage_id,
+                "consumed_ledger_count": consumed_ledger_count,
+                "released_work_item_count": released_work_item_count,
+                "journal_id": commanded.journal_id,
             }))
         }
 

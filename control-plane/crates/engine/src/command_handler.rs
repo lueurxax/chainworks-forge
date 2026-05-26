@@ -29,8 +29,9 @@ use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSet
 use domain::approval::ApprovalDecision;
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::commands::{
-    ApprovalResolutionDecision, CallerContext, Command, ExtendWorkflowLoopBudgetCmd,
-    ProposalGateSettlementAction, SettleProposalGateCmd, WorkflowLoopBudgetExtensionCmd,
+    ApprovalResolutionDecision, CallerContext, Command, ConsumeProviderQuotaHoldCmd,
+    ExtendWorkflowLoopBudgetCmd, ProposalGateSettlementAction, SettleProposalGateCmd,
+    WorkflowLoopBudgetExtensionCmd,
 };
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
@@ -38,7 +39,7 @@ use domain::ids::{ApprovalId, RunId};
 use domain::proposal_gate_result::{
     ProposalGateFailureClassification, ProposalGateLineage, ProposalGateResult, ProposalGateStatus,
 };
-use domain::provider::InvokeAgentCapacityConfig;
+use domain::provider::{InvokeAgentCapacityConfig, ProviderFamily};
 use domain::retry_authority::{
     sanitize_targeted_retry_invoke_payload, RetryAuthorityEntryKind, RetryAuthorityState,
     RetryStageExecutionAuthority, TargetedRetryPayloadIdentity,
@@ -103,6 +104,12 @@ pub enum CommandResult {
         legacy_discovery_override_id: Option<String>,
         /// P065: binding id when operator instruction was attached.
         retry_instruction_binding_id: Option<String>,
+    },
+    ProviderQuotaHoldConsumed {
+        run_id: RunId,
+        stage_id: String,
+        consumed_ledger_count: u64,
+        released_work_item_count: u64,
     },
     WorkflowConflictTransitionSelected {
         run_id: RunId,
@@ -915,6 +922,7 @@ impl CommandJournalEntry {
             Command::ApproveStage(_) => "ApproveStage",
             Command::RejectStage(_) => "RejectStage",
             Command::RetryStage(_) => "RetryStage",
+            Command::ConsumeProviderQuotaHold(_) => "ConsumeProviderQuotaHold",
             Command::ResolveWorkflowConflictTransition(_) => "ResolveWorkflowConflictTransition",
             Command::ExtendWorkflowLoopBudget(_) => "ExtendWorkflowLoopBudget",
             Command::OverrideLegacyDiscoveryPolicy(_) => "OverrideLegacyDiscoveryPolicy",
@@ -940,6 +948,7 @@ impl CommandJournalEntry {
             Command::ApproveStage(c) => Some(c.run_id.to_string()),
             Command::RejectStage(c) => Some(c.run_id.to_string()),
             Command::RetryStage(c) => Some(c.run_id.to_string()),
+            Command::ConsumeProviderQuotaHold(c) => Some(c.run_id.to_string()),
             Command::ResolveWorkflowConflictTransition(c) => Some(c.run_id.to_string()),
             Command::ExtendWorkflowLoopBudget(c) => Some(c.run_id.to_string()),
             Command::OverrideLegacyDiscoveryPolicy(c) => Some(c.run_id.to_string()),
@@ -986,6 +995,7 @@ impl CommandJournalEntry {
                 | "ApproveStage"
                 | "RejectStage"
                 | "RetryStage"
+                | "ConsumeProviderQuotaHold"
                 | "ResolveWorkflowConflictTransition"
                 | "ExtendWorkflowLoopBudget"
                 | "OverrideLegacyDiscoveryPolicy"
@@ -1936,6 +1946,11 @@ impl CommandHandler {
         {
             anyhow::bail!("forbidden: RetryStage operator_instruction requires operator principal");
         }
+        if matches!(&cmd, Command::ConsumeProviderQuotaHold(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: ConsumeProviderQuotaHold requires operator principal");
+        }
         if matches!(&cmd, Command::ResolveWorkflowConflictTransition(_))
             && caller.principal_class != PrincipalClass::Operator
         {
@@ -2830,6 +2845,12 @@ impl CommandHandler {
                 })
             }
 
+            Command::ConsumeProviderQuotaHold(c) => {
+                return self
+                    .consume_provider_quota_hold(c, journal, journal_id)
+                    .await;
+            }
+
             Command::RetryStage(c) => {
                 // P065: validate operator_instruction early (before any DB writes)
                 let validated_instruction = if let Some(ref raw) = c.operator_instruction {
@@ -3718,6 +3739,18 @@ impl CommandHandler {
                 self.work_queue
                     .publish_scheduler_notification(settlement.scheduler_refresh);
 
+                let _ = self.events.send(DomainEvent::RunStatusChanged {
+                    run_id: c.run_id,
+                    status: RunStatus::Cancelling,
+                });
+
+                cancellation::spawn_finalize_settlement(
+                    self.pool.clone(),
+                    self.events.clone(),
+                    self.acp.clone(),
+                    c.run_id,
+                );
+
                 // Worktree cleanup on cancel (Proposal 007).
                 if let Some(ref wt) = run.worktree_root {
                     if let Err(e) =
@@ -3731,18 +3764,6 @@ impl CommandHandler {
                         );
                     }
                 }
-
-                let _ = self.events.send(DomainEvent::RunStatusChanged {
-                    run_id: c.run_id,
-                    status: RunStatus::Cancelling,
-                });
-
-                cancellation::spawn_finalize_settlement(
-                    self.pool.clone(),
-                    self.events.clone(),
-                    self.acp.clone(),
-                    c.run_id,
-                );
 
                 Ok(CommandResult::RunCancelled { run_id: c.run_id })
             }
@@ -4136,7 +4157,9 @@ impl CommandHandler {
                     .publish_scheduler_notification(scheduler_refresh);
 
                 // Notify session subscribers that a session event was persisted.
-                let _ = self.events.send(DomainEvent::SessionEventRecorded { run_id: c.run_id });
+                let _ = self
+                    .events
+                    .send(DomainEvent::SessionEventRecorded { run_id: c.run_id });
 
                 if let Some(acp) = &self.acp {
                     for generation_id in generation_ids_to_close {
@@ -4750,6 +4773,202 @@ impl CommandHandler {
                 })
             }
         }
+    }
+
+    async fn consume_provider_quota_hold(
+        &self,
+        c: ConsumeProviderQuotaHoldCmd,
+        journal: &CommandJournalEntry,
+        journal_id: &str,
+    ) -> Result<CommandResult> {
+        let reason = c.reason.trim();
+        if reason.is_empty() {
+            anyhow::bail!("reason is required");
+        }
+        if reason.chars().count() > 1000 {
+            anyhow::bail!("reason must be 1000 characters or fewer");
+        }
+
+        let now = Utc::now();
+        let tx_started = Instant::now();
+        let mut tx = self
+            .begin_command_transaction("command.ConsumeProviderQuotaHold", journal.id.clone())
+            .await?;
+        record_command_journal_tx(&mut tx, journal).await?;
+
+        let run = runs::find_by_id_tx(&mut tx, c.run_id)
+            .await?
+            .ok_or_else(|| anyhow!("Run {} not found", c.run_id));
+        let run = match run {
+            Ok(run) => run,
+            Err(error) => {
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    &error.to_string(),
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+                return Err(error);
+            }
+        };
+        if run.status != RunStatus::Running {
+            let error = anyhow!(
+                "Run {} is {} and has no running pending quota invoke to release",
+                c.run_id,
+                run.status
+            );
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &error.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+            return Err(error);
+        }
+
+        let run_stages = stages::list_by_run_tx(&mut tx, c.run_id).await?;
+        let latest_stage = run_stages
+            .iter()
+            .filter(|stage| stage.stage_id == c.stage_id)
+            .max_by_key(|stage| stage.started_at);
+        let latest_stage = match latest_stage {
+            Some(stage) => stage,
+            None => {
+                let error = anyhow!("Stage {} not found", c.stage_id);
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    &error.to_string(),
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+                return Err(error);
+            }
+        };
+        if latest_stage.status != StageStatus::Running {
+            let error = anyhow!(
+                "Stage {} latest attempt is {} and has no running pending quota invoke to release",
+                c.stage_id,
+                latest_stage.status
+            );
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &error.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+            return Err(error);
+        }
+
+        let pending_items =
+            work_items::list_pending_invoke_agents_for_run_stage_tx(&mut tx, c.run_id, &c.stage_id)
+                .await?;
+        let mut candidates: Vec<(WorkItem, String, Option<String>)> = Vec::new();
+        for item in pending_items {
+            let last_error = item.last_error.as_deref().unwrap_or_default();
+            if !last_error.starts_with("provider_quota_wait") {
+                continue;
+            }
+            let payload: serde_json::Value = serde_json::from_str(&item.payload_json)
+                .with_context(|| format!("parse InvokeAgent payload for {}", item.id))?;
+            let provider = payload
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("InvokeAgent work item {} has no provider", item.id))?;
+            let provider_family = ProviderFamily::canonicalize_known_alias(provider)
+                .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+            let model = payload
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            candidates.push((item, provider_family, model));
+        }
+        if candidates.is_empty() {
+            let error = anyhow!(
+                "No pending InvokeAgent provider_quota_wait found for run {} stage {}",
+                c.run_id,
+                c.stage_id
+            );
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &error.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+            return Err(error);
+        }
+
+        let mut consumed_keys: Vec<(String, Option<String>, bool)> = Vec::new();
+        let mut consumed_ledger_count = 0_u64;
+        for (_, provider_family, model) in &candidates {
+            if consumed_keys.iter().any(|(seen_family, seen_model, _)| {
+                seen_family == provider_family && seen_model == model
+            }) {
+                continue;
+            }
+            let consumed =
+                agent_retry_budget_ledger::consume_active_provider_family_quota_for_operator_override_tx(
+                    &mut tx,
+                    provider_family,
+                    model.as_deref(),
+                    now,
+                    journal_id,
+                )
+                .await?;
+            consumed_ledger_count += consumed;
+            consumed_keys.push((provider_family.clone(), model.clone(), consumed > 0));
+        }
+
+        if consumed_ledger_count == 0 {
+            let error = anyhow!(
+                "No active provider quota hold found for pending InvokeAgent in run {} stage {}",
+                c.run_id,
+                c.stage_id
+            );
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &error.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+            return Err(error);
+        }
+
+        let mut released_work_item_count = 0_u64;
+        for (item, provider_family, model) in candidates {
+            let quota_consumed_for_item =
+                consumed_keys
+                    .iter()
+                    .any(|(seen_family, seen_model, consumed)| {
+                        *consumed && seen_family == &provider_family && seen_model == &model
+                    });
+            if quota_consumed_for_item
+                && work_items::release_pending_invoke_agent_quota_wait_tx(&mut tx, &item.id, now)
+                    .await?
+            {
+                released_work_item_count += 1;
+            }
+        }
+
+        let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+            &mut tx,
+            &self.capacity_config,
+            now,
+            "command.ConsumeProviderQuotaHold",
+            0,
+        )
+        .await?;
+        command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+        tx.commit().await?;
+        db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+        self.work_queue
+            .publish_scheduler_notification(scheduler_refresh);
+
+        Ok(CommandResult::ProviderQuotaHoldConsumed {
+            run_id: c.run_id,
+            stage_id: c.stage_id,
+            consumed_ledger_count,
+            released_work_item_count,
+        })
     }
 
     async fn retry_stage_latest_attempt(
@@ -5864,6 +6083,9 @@ reviewer_override:
             request_id: None,
             caller_class: None,
             token_id: None,
+            mcp_idempotency_key: None,
+            mcp_idempotency_request_hash: None,
+            boundary_row_id: None,
         };
         let caller = CallerContext::mcp(
             "operator-1",
@@ -5919,6 +6141,9 @@ reviewer_override:
             request_id: None,
             caller_class: None,
             token_id: None,
+            mcp_idempotency_key: None,
+            mcp_idempotency_request_hash: None,
+            boundary_row_id: None,
         };
         let caller = CallerContext::mcp(
             "operator-1",
@@ -5963,6 +6188,9 @@ reviewer_override:
             request_id: None,
             caller_class: None,
             token_id: None,
+            mcp_idempotency_key: None,
+            mcp_idempotency_request_hash: None,
+            boundary_row_id: None,
         };
         let caller = CallerContext::mcp(
             "operator-1",

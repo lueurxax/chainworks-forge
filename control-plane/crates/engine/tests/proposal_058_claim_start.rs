@@ -10,7 +10,7 @@ use domain::artifact_contracts::{
     ActiveArtifactGenerationInput, ArtifactSourceGenerationClaim, ArtifactSourceGenerationClaimKey,
     SourceGenerationImportDecision,
 };
-use domain::commands::{CallerContext, Command, RetryStageCmd};
+use domain::commands::{CallerContext, Command, ConsumeProviderQuotaHoldCmd, RetryStageCmd};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::mediation::OwnerKind;
@@ -3197,4 +3197,213 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
         Some(commanded.journal_id)
     );
     assert_eq!(rows[0].get::<String, _>("state"), "early_retry_consumed");
+}
+
+#[tokio::test]
+async fn proposal_058_operator_can_consume_quota_hold_for_existing_pending_retry_invoke() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let blocking_stage_execution_id = StageExecutionId::new();
+    let blocking_agent_execution_id = AgentExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P058 quota pending invoke".into(),
+            body: "consume existing pending invoke quota hold".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "implementation".into(),
+            label: "Implementation".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 2,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: Some("operator_retry".into()),
+        },
+    )
+    .await
+    .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: blocking_stage_execution_id,
+            run_id,
+            stage_id: "previous".into(),
+            label: "Previous".into(),
+            status: StageStatus::Failed,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+    agent_executions::insert(
+        &pool,
+        &AgentExecution {
+            id: blocking_agent_execution_id,
+            stage_execution_id: Some(blocking_stage_execution_id),
+            agent_id: "code_writer".into(),
+            provider: "claude".into(),
+            model: Some("sonnet".into()),
+            status: AgentStatus::Failed,
+            started_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            owner_execution_lineage_id: Some(blocking_stage_execution_id.to_string()),
+            session_lineage_id: Some("lineage-quota".into()),
+            session_generation_id: Some("generation-quota".into()),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some("owner-key-quota".into()),
+            session_reuse_scope: Some("same_agent_family_within_run".into()),
+            session_family_id: Some("code_writer".into()),
+            session_reuse_disposition: Some("fresh".into()),
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+        },
+    )
+    .await
+    .unwrap();
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        blocking_stage_execution_id,
+        blocking_agent_execution_id,
+        Some(Utc::now() + Duration::hours(1)),
+    )
+    .await
+    .unwrap();
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: format!("p058-invoke:{stage_execution_id}:0"),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "implementation",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "code_writer",
+                "provider": "claude",
+                "model": "sonnet",
+                "declared_outputs": []
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("implementation".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 0,
+            last_error: Some(format!(
+                "provider_quota_wait: provider_family=claude; retry_after={}",
+                ledger.retry_after.as_ref().unwrap().to_rfc3339()
+            )),
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = CommandHandler::new(
+        pool.clone(),
+        event_bus::new_bus(16),
+        WorkQueue::new(pool.clone()),
+    );
+    let commanded = handler
+        .handle(
+            Command::ConsumeProviderQuotaHold(ConsumeProviderQuotaHoldCmd {
+                run_id,
+                stage_id: "implementation".into(),
+                reason: "operator confirmed cooldown elapsed".into(),
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        commanded.result,
+        engine::command_handler::CommandResult::ProviderQuotaHoldConsumed {
+            consumed_ledger_count: 1,
+            released_work_item_count: 1,
+            ..
+        }
+    ));
+    let row = sqlx::query(
+        "SELECT normal_budget_consumed, early_retry_journal_id, state FROM agent_retry_budget_ledger WHERE id = ?1",
+    )
+    .bind(&ledger.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    use sqlx::Row;
+    assert_eq!(row.get::<i64, _>("normal_budget_consumed"), 1);
+    assert_eq!(
+        row.get::<Option<String>, _>("early_retry_journal_id"),
+        Some(commanded.journal_id)
+    );
+    assert_eq!(row.get::<String, _>("state"), "early_retry_consumed");
+
+    let released = work_items::find_by_id(&pool, &format!("p058-invoke:{stage_execution_id}:0"))
+        .await
+        .unwrap()
+        .expect("released work item");
+    assert_eq!(released.status, WorkItemStatus::Pending);
+    assert_eq!(released.last_error, None);
 }

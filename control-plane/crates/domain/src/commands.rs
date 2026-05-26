@@ -32,6 +32,7 @@ pub enum Command {
     ApproveStage(ApproveStageCmd),
     RejectStage(RejectStageCmd),
     RetryStage(RetryStageCmd),
+    ConsumeProviderQuotaHold(ConsumeProviderQuotaHoldCmd),
     ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd),
     ExtendWorkflowLoopBudget(ExtendWorkflowLoopBudgetCmd),
     OverrideLegacyDiscoveryPolicy(OverrideLegacyDiscoveryPolicyCmd),
@@ -132,6 +133,13 @@ pub struct RetryStageCmd {
     /// P065: Optional one-shot operator instruction for the retry-created invocation scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_instruction: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConsumeProviderQuotaHoldCmd {
+    pub run_id: RunId,
+    pub stage_id: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
