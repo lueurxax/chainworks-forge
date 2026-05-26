@@ -3033,7 +3033,8 @@ PY
     log "Proposal 046: running pinned retry-policy unit tests"
     (
       cd "$ROOT_DIR/control-plane"
-      cargo test -p graphql-server --lib -- p046_retry_db --nocapture
+      cargo test -p graphql-server --lib -- p046_ --nocapture
+      cargo test -p db --lib -- p046_ --nocapture
     )
     log "Proposal 046 phase 1+2: verifying rollout contract fixture structure"
     P046_READBACK="$ROOT_DIR/docs/evidence/rollout-contract/operator-readback/p046-session-graphql-full-surface.fixture.json"

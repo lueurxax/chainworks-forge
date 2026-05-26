@@ -451,7 +451,7 @@ use db::p046_retry::p046_retry_db;
 fn session_event_type_metric_label(event_type: &domain::session::SessionEventType) -> &'static str {
     use domain::session::SessionEventType;
     match event_type {
-        SessionEventType::Created => "LINEAGE_CREATED",
+        SessionEventType::Created => "GENERATION_STARTED",
         SessionEventType::Reused => "SESSION_REUSED",
         SessionEventType::Invalidated => "GENERATION_INVALIDATED",
         SessionEventType::Closed => "GENERATION_CLOSED",

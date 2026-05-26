@@ -277,6 +277,14 @@ impl PrincipalTable {
         }
     }
 
+    pub fn test_fixture_with_id(id: impl Into<String>) -> Self {
+        let mut table = Self::test_fixture();
+        if let Some(entry) = table.entries.first_mut() {
+            entry.id = id.into();
+        }
+        table
+    }
+
     /// Observer-class fixture for cross-crate tests that need a non-operator token.
     /// Token length meets the 32-byte minimum required by extract_bearer_token.
     pub fn test_fixture_observer() -> Self {

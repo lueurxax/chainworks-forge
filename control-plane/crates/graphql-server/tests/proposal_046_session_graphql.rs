@@ -970,6 +970,12 @@ async fn proposal_046_invalid_cursor_returns_sanitized_error() {
     let pool = test_pool().await;
     let schema = make_schema_with_p046(pool);
 
+    let structurally_valid_bad_timestamp = db::repos::sessions::encode_session_cursor(
+        "lineage-invalid-cursor",
+        "",
+        "not-a-rfc3339-timestamp",
+        "event-1",
+    );
     let cases = [
         r#"{ sessionLineages(runId: "00000000-0000-0000-0000-000000000001", after: "NOTACURSOR") { nodes { id } } }"#,
         r#"{ sessionGenerations(lineageId: "lineage-invalid-cursor", after: "NOTACURSOR") { nodes { id } } }"#,
@@ -986,6 +992,41 @@ async fn proposal_046_invalid_cursor_returns_sanitized_error() {
             resp.errors
         );
     }
+
+    let query = format!(
+        r#"{{
+          sessionEvents(lineageId: "lineage-invalid-cursor", after: "{structurally_valid_bad_timestamp}") {{
+            nodes {{ id }}
+          }}
+        }}"#
+    );
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(
+        resp.errors.iter().any(|e| e.message == "invalid cursor"),
+        "structurally valid cursor with malformed timestamp must return sanitized invalid cursor; got: {:?}",
+        resp.errors
+    );
+
+    let wrong_type_generation_cursor = db::repos::sessions::encode_session_generation_cursor(
+        &generation_fixture("wrong-type-generation", "lineage-invalid-cursor", 1, 0),
+    );
+    let query = format!(
+        r#"{{
+          sessionEvents(lineageId: "lineage-invalid-cursor", after: "{wrong_type_generation_cursor}") {{
+            nodes {{ id }}
+          }}
+        }}"#
+    );
+    let resp = schema
+        .execute(Request::new(query).data(operator_principal()))
+        .await;
+    assert!(
+        resp.errors.iter().any(|e| e.message == "invalid cursor"),
+        "wrong-type cursor must return sanitized invalid cursor; got: {:?}",
+        resp.errors
+    );
 }
 
 // ── Subscription schema presence ─────────────────────────────────────────────
@@ -3549,6 +3590,9 @@ async fn proposal_046_subscription_same_principal_token_rotation_stops_emissions
     );
 
     let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .unwrap();
     let principals_path = dir.path().join("principals.json");
     let rotated_json = r#"{
         "schema_version": 2,
@@ -3612,6 +3656,9 @@ async fn proposal_046_file_backed_principal_revocation_observed_by_live_handle()
     use graphql_server::types::session::{P046LiveCredential, P046LivePrincipalHandle};
 
     let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .unwrap();
     let principals_path = dir.path().join("principals.json");
 
     // Bootstrap the first table (creates the file with a default-operator entry).

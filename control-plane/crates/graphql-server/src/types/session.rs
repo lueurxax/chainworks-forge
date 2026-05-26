@@ -157,7 +157,7 @@ pub enum GqlSessionEventType {
 impl From<&SessionEventType> for GqlSessionEventType {
     fn from(t: &SessionEventType) -> Self {
         match t {
-            SessionEventType::Created => Self::LineageCreated,
+            SessionEventType::Created => Self::GenerationStarted,
             SessionEventType::Reused => Self::SessionReused,
             SessionEventType::Invalidated => Self::GenerationInvalidated,
             SessionEventType::Closed => Self::GenerationClosed,
@@ -1525,11 +1525,12 @@ pub fn session_event_to_status_changed(
 }
 
 pub fn resync_event(run_id: &str) -> GqlSessionStatusChangedEvent {
+    let synthetic_id = format!("resync:{run_id}:{}", uuid::Uuid::new_v4());
     GqlSessionStatusChangedEvent {
         run_id: run_id.to_string(),
-        lineage_id: None,
-        generation_id: None,
-        event_id: None,
+        lineage_id: Some(synthetic_id.clone()),
+        generation_id: Some(synthetic_id.clone()),
+        event_id: Some(synthetic_id),
         status: GqlSessionStatusChangedStatus::ResyncRequired,
         event_type: GqlSessionEventType::UnknownEventShape,
         recorded_at: Utc::now().to_rfc3339(),
@@ -1539,6 +1540,64 @@ pub fn resync_event(run_id: &str) -> GqlSessionStatusChangedEvent {
 }
 
 // ── Pagination limit constants ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use domain::session::{SessionEvent, SessionEventType};
+
+    #[test]
+    fn p046_created_generation_events_render_as_generation_started() {
+        let event = SessionEvent {
+            id: "event-created-generation".to_string(),
+            lineage_id: "lineage-1".to_string(),
+            generation_id: "generation-1".to_string(),
+            event_type: SessionEventType::Created,
+            recorded_at: Utc::now(),
+            details_json: None,
+        };
+
+        let gql_event = GqlSessionEvent::from(event.clone());
+        assert_eq!(gql_event.event_type, GqlSessionEventType::GenerationStarted);
+
+        let status_event = session_event_to_status_changed(&event, "run-1");
+        assert_eq!(
+            status_event.event_type,
+            GqlSessionEventType::GenerationStarted
+        );
+    }
+
+    #[test]
+    fn p046_resync_status_event_keeps_contract_identity_fields() {
+        let event = resync_event("run-1");
+
+        assert_eq!(event.run_id, "run-1");
+        assert_eq!(event.status, GqlSessionStatusChangedStatus::ResyncRequired);
+        assert!(event.resync_required);
+        assert!(
+            event
+                .event_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("resync:run-1:")),
+            "resync payload must carry a stable synthetic event identity: {event:?}"
+        );
+        assert!(
+            event
+                .lineage_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("resync:run-1:")),
+            "resync payload must carry a synthetic lineage identity: {event:?}"
+        );
+        assert!(
+            event
+                .generation_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("resync:run-1:")),
+            "resync payload must carry a synthetic generation identity: {event:?}"
+        );
+    }
+}
 
 pub const SESSION_LINEAGES_DEFAULT_FIRST: i64 = 100;
 pub const SESSION_LINEAGES_MAX_FIRST: i64 = 500;

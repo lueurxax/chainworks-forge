@@ -750,8 +750,21 @@ fn decode_cursor_parts(cursor: &str, expected_len: usize) -> Option<Vec<String>>
     (parts.len() == expected_len).then_some(parts)
 }
 
+fn valid_cursor_id(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn valid_cursor_timestamp(value: &str) -> bool {
+    DateTime::parse_from_rfc3339(value).is_ok()
+}
+
+const P046_CURSOR_VERSION: &str = "p046_cursor_v1";
+const P046_EVENT_CURSOR_KIND: &str = "session_event";
+const P046_LINEAGE_CURSOR_KIND: &str = "session_lineage";
+const P046_GENERATION_CURSOR_KIND: &str = "session_generation";
+
 /// Encode an event cursor bound to its lineage and generation-filter dimensions.
-/// Format: (lineage_id, gen_id_filter_or_empty, recorded_at, id) — 4 parts.
+/// Format: (version, kind, lineage_id, gen_id_filter_or_empty, recorded_at, id) — 6 parts.
 /// `gen_id_filter_or_empty` is the active generationId filter, or "" for an unfiltered query.
 pub fn encode_session_cursor(
     lineage_id: &str,
@@ -760,6 +773,8 @@ pub fn encode_session_cursor(
     id: &str,
 ) -> String {
     encode_cursor_parts(&[
+        P046_CURSOR_VERSION.to_string(),
+        P046_EVENT_CURSOR_KIND.to_string(),
         lineage_id.to_string(),
         gen_id_filter_or_empty.to_string(),
         created_at.to_string(),
@@ -770,19 +785,29 @@ pub fn encode_session_cursor(
 /// Decode a cursor produced by `encode_session_cursor`. Returns None for invalid cursors.
 /// Returns (lineage_id, gen_id_filter_or_empty, recorded_at, id).
 pub fn decode_session_cursor(cursor: &str) -> Option<(String, String, String, String)> {
-    let parts = decode_cursor_parts(cursor, 4)?;
+    let parts = decode_cursor_parts(cursor, 6)?;
+    if parts[0] != P046_CURSOR_VERSION
+        || parts[1] != P046_EVENT_CURSOR_KIND
+        || !valid_cursor_id(&parts[2])
+        || !valid_cursor_timestamp(&parts[4])
+        || !valid_cursor_id(&parts[5])
+    {
+        return None;
+    }
     Some((
-        parts[0].clone(),
-        parts[1].clone(),
         parts[2].clone(),
         parts[3].clone(),
+        parts[4].clone(),
+        parts[5].clone(),
     ))
 }
 
-/// Cursor format: (run_id, agent_id, lineage_id, created_at, id) — 5 parts.
+/// Cursor format: (version, kind, run_id, agent_id, lineage_id, created_at, id) — 7 parts.
 /// The run_id prefix binds the cursor to the owning run so cross-run reuse is rejected.
 pub fn encode_session_lineage_cursor(lineage: &SessionLineage) -> String {
     encode_cursor_parts(&[
+        P046_CURSOR_VERSION.to_string(),
+        P046_LINEAGE_CURSOR_KIND.to_string(),
         lineage.run_id.clone(),
         lineage.agent_id.clone(),
         lineage.lineage_id.clone(),
@@ -795,20 +820,32 @@ pub fn encode_session_lineage_cursor(lineage: &SessionLineage) -> String {
 pub fn decode_session_lineage_cursor(
     cursor: &str,
 ) -> Option<(String, String, String, String, String)> {
-    let parts = decode_cursor_parts(cursor, 5)?;
+    let parts = decode_cursor_parts(cursor, 7)?;
+    if parts[0] != P046_CURSOR_VERSION
+        || parts[1] != P046_LINEAGE_CURSOR_KIND
+        || !valid_cursor_id(&parts[2])
+        || !valid_cursor_id(&parts[3])
+        || !valid_cursor_id(&parts[4])
+        || !valid_cursor_timestamp(&parts[5])
+        || !valid_cursor_id(&parts[6])
+    {
+        return None;
+    }
     Some((
-        parts[0].clone(),
-        parts[1].clone(),
         parts[2].clone(),
         parts[3].clone(),
         parts[4].clone(),
+        parts[5].clone(),
+        parts[6].clone(),
     ))
 }
 
 /// Encodes a generation cursor bound to its lineage_id filter.
-/// Format: (lineage_id, generation, created_at, id) — 4 parts.
+/// Format: (version, kind, lineage_id, generation, created_at, id) — 6 parts.
 pub fn encode_session_generation_cursor(generation: &SessionGeneration) -> String {
     encode_cursor_parts(&[
+        P046_CURSOR_VERSION.to_string(),
+        P046_GENERATION_CURSOR_KIND.to_string(),
         generation.lineage_id.clone(),
         generation.generation.to_string(),
         generation.created_at.to_rfc3339(),
@@ -818,12 +855,20 @@ pub fn encode_session_generation_cursor(generation: &SessionGeneration) -> Strin
 
 /// Returns (lineage_id, generation, created_at, id) or None for invalid cursors.
 pub fn decode_session_generation_cursor(cursor: &str) -> Option<(String, i64, String, String)> {
-    let parts = decode_cursor_parts(cursor, 4)?;
+    let parts = decode_cursor_parts(cursor, 6)?;
+    if parts[0] != P046_CURSOR_VERSION
+        || parts[1] != P046_GENERATION_CURSOR_KIND
+        || !valid_cursor_id(&parts[2])
+        || !valid_cursor_timestamp(&parts[4])
+        || !valid_cursor_id(&parts[5])
+    {
+        return None;
+    }
     Some((
-        parts[0].clone(),
-        parts[1].parse().ok()?,
         parts[2].clone(),
-        parts[3].clone(),
+        parts[3].parse().ok()?,
+        parts[4].clone(),
+        parts[5].clone(),
     ))
 }
 
@@ -1563,5 +1608,147 @@ fn session_event_type_from_str(s: &str) -> Result<SessionEventType> {
             );
             Ok(SessionEventType::Compacted)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID_TS: &str = "2026-05-25T21:41:52Z";
+
+    #[test]
+    fn p046_event_cursor_rejects_non_rfc3339_timestamp() {
+        let cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_EVENT_CURSOR_KIND.into(),
+            "lineage-1".into(),
+            "generation-1".into(),
+            "not-a-timestamp".into(),
+            "event-1".into(),
+        ]);
+
+        assert!(
+            decode_session_cursor(&cursor).is_none(),
+            "event cursors must validate timestamp tuple components"
+        );
+    }
+
+    #[test]
+    fn p046_lineage_cursor_rejects_non_rfc3339_timestamp() {
+        let cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_LINEAGE_CURSOR_KIND.into(),
+            "run-1".into(),
+            "agent-1".into(),
+            "lineage-key-1".into(),
+            "not-a-timestamp".into(),
+            "lineage-row-1".into(),
+        ]);
+
+        assert!(
+            decode_session_lineage_cursor(&cursor).is_none(),
+            "lineage cursors must validate timestamp tuple components"
+        );
+    }
+
+    #[test]
+    fn p046_generation_cursor_rejects_non_rfc3339_timestamp() {
+        let cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_GENERATION_CURSOR_KIND.into(),
+            "lineage-1".into(),
+            "1".into(),
+            "not-a-timestamp".into(),
+            "generation-row-1".into(),
+        ]);
+
+        assert!(
+            decode_session_generation_cursor(&cursor).is_none(),
+            "generation cursors must validate timestamp tuple components"
+        );
+    }
+
+    #[test]
+    fn p046_cursors_reject_empty_stable_ids() {
+        let event_cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_EVENT_CURSOR_KIND.into(),
+            "lineage-1".into(),
+            "".into(),
+            VALID_TS.into(),
+            "".into(),
+        ]);
+        let lineage_cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_LINEAGE_CURSOR_KIND.into(),
+            "run-1".into(),
+            "".into(),
+            "lineage-key-1".into(),
+            VALID_TS.into(),
+            "lineage-row-1".into(),
+        ]);
+        let generation_cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_GENERATION_CURSOR_KIND.into(),
+            "lineage-1".into(),
+            "1".into(),
+            VALID_TS.into(),
+            "".into(),
+        ]);
+
+        assert!(decode_session_cursor(&event_cursor).is_none());
+        assert!(decode_session_lineage_cursor(&lineage_cursor).is_none());
+        assert!(decode_session_generation_cursor(&generation_cursor).is_none());
+    }
+
+    #[test]
+    fn p046_cursors_reject_wrong_connection_kind() {
+        let event_cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_EVENT_CURSOR_KIND.into(),
+            "lineage-1".into(),
+            "generation-1".into(),
+            VALID_TS.into(),
+            "event-1".into(),
+        ]);
+        let generation_cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_GENERATION_CURSOR_KIND.into(),
+            "lineage-1".into(),
+            "1".into(),
+            VALID_TS.into(),
+            "generation-row-1".into(),
+        ]);
+        let lineage_cursor = encode_cursor_parts(&[
+            P046_CURSOR_VERSION.into(),
+            P046_LINEAGE_CURSOR_KIND.into(),
+            "run-1".into(),
+            "agent-1".into(),
+            "lineage-key-1".into(),
+            VALID_TS.into(),
+            "lineage-row-1".into(),
+        ]);
+
+        assert!(
+            decode_session_cursor(&generation_cursor).is_none(),
+            "sessionEvents must reject generation cursors even when their tuple length matches"
+        );
+        assert!(
+            decode_session_generation_cursor(&event_cursor).is_none(),
+            "sessionGenerations must reject event cursors even when their tuple length matches"
+        );
+        assert!(
+            decode_session_lineage_cursor(&event_cursor).is_none(),
+            "sessionLineages must reject event cursors"
+        );
+        assert!(
+            decode_session_lineage_cursor(&generation_cursor).is_none(),
+            "sessionLineages must reject generation cursors"
+        );
+        assert!(
+            decode_session_cursor(&lineage_cursor).is_none(),
+            "sessionEvents must reject lineage cursors"
+        );
     }
 }
