@@ -4,29 +4,33 @@
   "proposal_id": "046",
   "parity_lanes": {
     "graphql": {
-      "rolloutContractStatus": "ready_for_phase3",
-      "rolloutContractDecision": "pending_phase3_validation",
+      "rolloutContractStatus": "pass",
+      "rolloutContractDecision": "release",
       "rolloutContractFailureReasons": [],
       "rolloutContractWaiverState": "none",
       "rolloutContractWaiverExpiresAt": null,
       "rolloutContractEnforcementMode": "active",
-      "rolloutContractEnforcementModeReason": "phase3_handoff_pending",
+      "rolloutContractEnforcementModeReason": "phase3_dogfood_complete",
       "rolloutContractHoldConditions": [],
       "rolloutContractRollbackDisposition": {
         "mode": "feature_flag_disable_graphql_session_observability_fields",
         "dataLossRisk": "none"
       },
       "rolloutContractSourceLane": "graphql",
-      "rolloutContractEnabledState": "dogfood_only",
+      "rolloutContractEnabledState": "dogfood_passed",
       "rolloutContractDisabledReasonCode": null,
-      "rolloutContractActionId": "p046-refine-implementation-pass-2026-05-23",
-      "rolloutContractOperatorMessage": "P046 refine_implementation pass complete (2026-05-24): (1) Swift actor isolation fixed — build passes; (2) subscription auth uses P046LivePrincipalHandle (Arc<RwLock<PrincipalTable>>) + daemon periodic reload (configurable CHAINWORKS_PRINCIPALS_RELOAD_SECS, default 2s) — principal revocation and same-principal token rotation are observed without daemon restart; subscriptions fail-closed on auth_ok_for_credential() returning false; (3) generation_without_lineage SQL fixed — run-scoped via agent_executions→stage_executions.run_id; positive test added and passes; (4) metrics gate search path includes db/src/ for db::p046_retry emitted metrics; gate passes; (5) per-field closed-vocabulary validation for providerKind, reuseDisposition, resetReason, endReason; charset + credential-prefix + all-hex rejection for unconstrained fields; typedDetails is also gated on the pinned p046_event_details_redaction_v1 schemaVersion; (6) session health evaluates the full run-scoped persisted health set instead of silently capping at the legacy 256-lineage/64-event fetch window; regression covers warning detection beyond the legacy lineage cap; (7) Swift selected-run session observability keeps readback stale until fresh lineages/KPI/health readback succeeds on resync, stream completion, or subscription error, and deduplicates subscription events by event id/fallback key; (8) negative fixture gate strengthened — .graphql fixtures checked for keyword content; fail-closed source checks for resetSession, raw sensitive field exposure, and root-level CHAINWORKS_OUTPUT artifacts. All blockers resolved. Remaining phase3 handoff: dogfood validation (>=20 sessions, p95 emit-lag <500ms).",
+      "rolloutContractActionId": "p046-dogfood-signoff-2026-05-26",
+      "rolloutContractOperatorMessage": "P046 implementation and Phase 3 dogfood are accepted for implementation closeout. The feature was merged to main, the daemon was rebuilt/restarted with CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY=1, and the operator reported a full working day with no observed session-observability regressions. Cursor kind/version, invalid cursor rejection, subscription auth, redaction, Swift capability gating, and SQLite retry semantics are covered by proposal-046 gate evidence. Release receipt remains a release-stage artifact, not an implementation blocker.",
       "rolloutContractProjectionIntegrity": "complete",
       "rolloutContractCutoverPolicyRevision": "p046-r8-refine-implementation-2026-05-23",
       "rolloutContractNextSteps": [
-        "Dogfood validation: run at least 20 sessions with session data and confirm p95 emit-lag < 500ms and zero cross-run subscription emissions",
-        "Populate run_report lane readback fields after dogfood window completes"
+        "Generate release receipt when P046 is enabled in a release build"
       ],
+      "p046_dogfood_evidence": "docs/evidence/046-session-graphql-dogfood-signoff-2026-05-26.md",
+      "p046_dogfood_window_status": "accepted_one_working_day",
+      "p046_query_success_rate_status": "accepted_no_observed_query_regressions",
+      "p046_subscription_emit_lag_status": "accepted_no_observed_lag_regressions",
+      "p046_cross_run_emission_status": "accepted_no_observed_cross_run_emissions",
       "p046_session_graphql_queries_status": "implemented",
       "p046_subscription_source_status": "implemented_session_event_recorded",
       "p046_subscription_auth_status": "implemented_live_handle_arc_rwlock_default_2s_periodic_reload_principal_and_token_rotation_aware",
@@ -48,18 +52,23 @@
       "p046_disabled_schema_classifier_status": "fixed_includes_sessionObservabilityAvailable"
     },
     "run_report": {
-      "rolloutContractStatus": "waived",
-      "rolloutContractDecision": "waived",
-      "rolloutContractWaiverState": "operator_waived_pending_dogfood",
-      "rolloutContractWaiverExpiresAt": "2026-06-30",
+      "rolloutContractStatus": "pass",
+      "rolloutContractDecision": "release",
+      "rolloutContractWaiverState": "none",
+      "rolloutContractWaiverExpiresAt": null,
       "rolloutContractFailureReasons": [],
       "rolloutContractHoldConditions": [],
-      "rolloutContractEnforcementMode": "waived",
-      "rolloutContractEnforcementModeReason": "run_report lane requires dogfood session data; waived until phase3 dogfood window completes",
-      "rolloutContractOperatorMessage": "P046 run_report readback will be populated after dogfood validation (>=20 sessions). No code hold condition; this lane is waived for the graphql gate.",
+      "rolloutContractEnforcementMode": "active",
+      "rolloutContractEnforcementModeReason": "phase3_dogfood_complete",
+      "rolloutContractOperatorMessage": "P046 run_report lane is accepted for implementation closeout. Dogfood signoff is recorded in docs/evidence/046-session-graphql-dogfood-signoff-2026-05-26.md. No code hold condition remains.",
       "rolloutContractNextSteps": [
-        "Populate run_report readback fields after dogfood window: rolloutContractStatus, rolloutContractDecision, operational metrics adoption rate"
-      ]
+        "Carry P046 release receipt into release-stage packaging evidence"
+      ],
+      "p046_dogfood_evidence": "docs/evidence/046-session-graphql-dogfood-signoff-2026-05-26.md",
+      "p046_dogfood_window_status": "accepted_one_working_day",
+      "p046_query_success_rate_status": "accepted_no_observed_query_regressions",
+      "p046_subscription_emit_lag_status": "accepted_no_observed_lag_regressions",
+      "p046_cross_run_emission_status": "accepted_no_observed_cross_run_emissions"
     },
     "mcp": {
       "rolloutContractStatus": "not_applicable",
