@@ -315,6 +315,14 @@ async fn terminal_check_can_be_recomputed_after_repair(
         return Ok(false);
     }
 
+    if previous
+        .failure_reasons
+        .iter()
+        .any(|reason| reason == "stale_rollout_contract_check_hash_drift")
+    {
+        return Ok(true);
+    }
+
     let green_terminal_count: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*)
            FROM rollout_contract_checks
@@ -4929,6 +4937,69 @@ mod tests {
         assert_eq!(repaired.check.decision, RolloutContractDecision::Release);
         assert_eq!(
             repaired.check.projection_integrity,
+            ProjectionIntegrity::Valid
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_hash_drift_with_prior_green_recomputes_on_next_preflight() {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("test.db").display());
+        let pool = test_pool(&url).await;
+        let mut run = test_run();
+        run.workspace_root = dir.path().to_string_lossy().to_string();
+        run.artifact_root = dir
+            .path()
+            .join("run-artifacts")
+            .to_string_lossy()
+            .to_string();
+        apply_enforce_policy(&mut run);
+
+        let proposal_path = dir.path().join("approved-proposal.json");
+        let proposal = serde_json::json!({
+            "source_proposal": "docs/proposals/084-executable-rollout-gates-and-observability-contract.md",
+            "proposal_revision_id": "p084-r5",
+            "rollout_contract_v1": valid_rollout_contract()
+        });
+        std::fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+        let artifact = test_artifact(&run, proposal_path.to_string_lossy().to_string());
+
+        let first =
+            implementation_run_start_rollout_contract_preflight(&pool, &run, Some(&artifact))
+                .await
+                .unwrap();
+        assert_eq!(first.action, RolloutContractPreflightAction::Allow);
+        assert_eq!(first.check.status, RolloutContractStatus::Pass);
+
+        let revised = serde_json::json!({
+            "source_proposal": "docs/proposals/084-executable-rollout-gates-and-observability-contract.md",
+            "proposal_revision_id": "p084-r6",
+            "rollout_contract_v1": valid_rollout_contract()
+        });
+        std::fs::write(&proposal_path, serde_json::to_vec(&revised).unwrap()).unwrap();
+
+        let stale =
+            implementation_run_start_rollout_contract_preflight(&pool, &run, Some(&artifact))
+                .await
+                .unwrap();
+        assert_eq!(stale.action, RolloutContractPreflightAction::Hold);
+        assert_eq!(stale.check.status, RolloutContractStatus::Stale);
+        assert_eq!(
+            stale.check.failure_reasons,
+            vec!["stale_rollout_contract_check_hash_drift"]
+        );
+
+        let reindexed =
+            implementation_run_start_rollout_contract_preflight(&pool, &run, Some(&artifact))
+                .await
+                .unwrap();
+        assert_ne!(stale.check.id, reindexed.check.id);
+        assert_eq!(reindexed.action, RolloutContractPreflightAction::Allow);
+        assert_eq!(reindexed.check.status, RolloutContractStatus::Pass);
+        assert_eq!(reindexed.check.decision, RolloutContractDecision::Release);
+        assert_eq!(reindexed.check.proposal_revision_id, "p084-r6");
+        assert_eq!(
+            reindexed.check.projection_integrity,
             ProjectionIntegrity::Valid
         );
     }

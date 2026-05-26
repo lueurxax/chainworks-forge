@@ -2,7 +2,7 @@ use chrono::{Duration, Utc};
 use db::pool::create_pool;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, artifact_contracts,
-    ideas, runs, sessions, stages, work_items,
+    ideas, retry_stage_execution_authorities, runs, sessions, stages, work_items,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentExecution, AgentOutputSettlement, AgentStatus, ArtifactSourceClaimState};
@@ -14,6 +14,9 @@ use domain::commands::{CallerContext, Command, RetryStageCmd};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::mediation::OwnerKind;
+use domain::retry_authority::{
+    RetryAuthorityEntryKind, RetryAuthorityState, RetryStageExecutionAuthority,
+};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
 use engine::command_handler::CommandHandler;
@@ -913,6 +916,604 @@ async fn proposal_058_xcode_mcp_invoke_claim_respects_configured_xcode_capacity(
         third.is_none(),
         "a third Xcode MCP invocation must wait once the configured cap is reached"
     );
+}
+
+#[tokio::test]
+async fn provider_quota_wait_blocks_same_provider_family_claim_only() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "Provider quota guard".into(),
+            body: "provider quota should hold only matching provider family".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "implementation".into(),
+            label: "Implementation".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let failed_gemini_execution_id = AgentExecutionId::new();
+    agent_executions::insert(
+        &pool,
+        &AgentExecution {
+            id: failed_gemini_execution_id,
+            stage_execution_id: Some(stage_execution_id),
+            agent_id: "lead_orchestrator".into(),
+            provider: "gemini".into(),
+            model: Some("gemini-3.1-pro-preview".into()),
+            status: AgentStatus::Failed,
+            started_at: Utc::now() - Duration::minutes(10),
+            completed_at: Some(Utc::now() - Duration::minutes(5)),
+            owner_execution_lineage_id: Some(stage_execution_id.to_string()),
+            session_lineage_id: Some("lineage-gemini".into()),
+            session_generation_id: Some("generation-gemini".into()),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some("owner-key".into()),
+            session_reuse_scope: Some("same_agent_family_within_run".into()),
+            session_family_id: Some("orchestration_loop".into()),
+            session_reuse_disposition: Some("fresh".into()),
+            session_reset_reason: None,
+            backend_profile_id: Some("gemini_reasoning_pro_high".into()),
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+        },
+    )
+    .await
+    .unwrap();
+    let retry_after = Utc::now() + Duration::hours(1);
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        stage_execution_id,
+        failed_gemini_execution_id,
+        Some(retry_after),
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    for (id, provider, model, scheduled_at) in [
+        (
+            "gemini-different-model-allowed",
+            "gemini",
+            "other-test-model",
+            now - Duration::seconds(2),
+        ),
+        (
+            "gemini-invoke-held",
+            "gemini",
+            "gemini-3.1-pro-preview",
+            now - Duration::seconds(1),
+        ),
+        ("codex-invoke-allowed", "codex_acp", "test-model", now),
+    ] {
+        work_items::enqueue(
+            &pool,
+            &WorkItem {
+                id: id.into(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "stage_id": "implementation",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "agent_id": id,
+                    "provider": provider,
+                    "model": model,
+                    "prompt": "run",
+                    "task_name": id,
+                    "task_inputs": ["input"],
+                    "task_outputs": ["output"],
+                    "declared_outputs": [],
+                    "requested_mcp_server_ids": [],
+                    "session_reuse_scope": "same_agent_family_within_run",
+                    "session_family_id": id,
+                    "worktree_write_enabled": false
+                })
+                .to_string(),
+                status: WorkItemStatus::Pending,
+                run_id: Some(run_id),
+                stage_id: Some("implementation".into()),
+                created_at: now,
+                scheduled_at,
+                attempt_count: 0,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let claimed_different_model = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("same provider family on a different model should still claim");
+    assert_eq!(
+        claimed_different_model.source_work_item_id,
+        "gemini-different-model-allowed"
+    );
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("non-degraded provider should still claim");
+    assert_eq!(claimed.source_work_item_id, "codex-invoke-allowed");
+
+    let pending = work_items::list_by_status(&pool, WorkItemStatus::Pending)
+        .await
+        .unwrap();
+    assert!(
+        pending.iter().any(|item| item.id == "gemini-invoke-held"),
+        "Gemini work item should remain pending while provider quota wait is active"
+    );
+
+    sqlx::query(
+        "UPDATE agent_retry_budget_ledger SET normal_budget_consumed = 1, state = 'early_retry_consumed' WHERE id = ?1",
+    )
+    .bind(&ledger.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let claimed_after_budget_override = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("explicit quota budget consumption should allow Gemini claim");
+    assert_eq!(
+        claimed_after_budget_override.source_work_item_id,
+        "gemini-invoke-held"
+    );
+}
+
+#[tokio::test]
+async fn operator_retry_consumes_active_provider_family_quota_wait_for_target_stage() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let blocking_run_id = RunId::new();
+    let retry_run_id = RunId::new();
+    let blocking_stage_execution_id = StageExecutionId::new();
+    let retry_stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "Provider family quota retry override".into(),
+            body: "operator retry should consume active provider-family quota waits".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(blocking_run_id, idea_id))
+        .await
+        .unwrap();
+    runs::insert(&pool, &make_run(retry_run_id, idea_id))
+        .await
+        .unwrap();
+
+    for (run_id, stage_execution_id, status) in [
+        (
+            blocking_run_id,
+            blocking_stage_execution_id,
+            StageStatus::Failed,
+        ),
+        (retry_run_id, retry_stage_execution_id, StageStatus::Running),
+    ] {
+        stages::insert(
+            &pool,
+            &StageExecution {
+                id: stage_execution_id,
+                run_id,
+                stage_id: "implementation".into(),
+                label: "Implementation".into(),
+                status,
+                iteration: 1,
+                attempt_number: 1,
+                settlement_kind: None,
+                started_at: Utc::now(),
+                completed_at: None,
+                owner_agent: None,
+                provider: None,
+                model: None,
+                stage_type: None,
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let failed_claude_execution_id = AgentExecutionId::new();
+    agent_executions::insert(
+        &pool,
+        &AgentExecution {
+            id: failed_claude_execution_id,
+            stage_execution_id: Some(blocking_stage_execution_id),
+            agent_id: "code_writer".into(),
+            provider: "claude".into(),
+            model: Some("sonnet".into()),
+            status: AgentStatus::Failed,
+            started_at: Utc::now() - Duration::minutes(10),
+            completed_at: Some(Utc::now() - Duration::minutes(5)),
+            owner_execution_lineage_id: Some(blocking_stage_execution_id.to_string()),
+            session_lineage_id: Some("lineage-claude".into()),
+            session_generation_id: Some("generation-claude".into()),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some("owner-key".into()),
+            session_reuse_scope: Some("same_agent_family_within_run".into()),
+            session_family_id: Some("code_writer".into()),
+            session_reuse_disposition: Some("fresh".into()),
+            session_reset_reason: None,
+            backend_profile_id: Some("claude_builder_high".into()),
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let retry_after = Utc::now() + Duration::hours(1);
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        blocking_run_id,
+        blocking_stage_execution_id,
+        failed_claude_execution_id,
+        Some(retry_after),
+    )
+    .await
+    .unwrap();
+
+    let journal_id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now();
+    sqlx::query(
+        r#"INSERT INTO command_journal
+           (id, command_type, payload_json, result_status, run_id, created_at, completed_at)
+           VALUES (?1, 'RetryStage', ?2, 'completed', ?3, ?4, ?4)"#,
+    )
+    .bind(&journal_id)
+    .bind(
+        serde_json::json!({
+            "RetryStage": {
+                "run_id": retry_run_id.to_string(),
+                "stage_id": "implementation",
+                "consume_quota_budget_now": true,
+                "agent_execution_id": null,
+                "operator_instruction": "retry despite provider family quota wait"
+            }
+        })
+        .to_string(),
+    )
+    .bind(retry_run_id.to_string())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    retry_stage_execution_authorities::create_active(
+        &pool,
+        &RetryStageExecutionAuthority {
+            id: format!("p091-retry-authority:{retry_stage_execution_id}"),
+            run_id: retry_run_id,
+            stage_id: "implementation".into(),
+            target_stage_execution_id: retry_stage_execution_id,
+            entry_kind: RetryAuthorityEntryKind::FullStageRetry,
+            source_command_journal_id: Some(journal_id.clone()),
+            source_retry_work_item_id: Some(retry_stage_execution_id.to_string()),
+            source_invoke_work_item_id: None,
+            source_agent_execution_id: None,
+            authority_state: RetryAuthorityState::Active,
+            created_at: now,
+            updated_at: now,
+            terminal_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: "claude-retry-invoke".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "implementation",
+                "stage_execution_id": retry_stage_execution_id.to_string(),
+                "agent_id": "code_writer",
+                "provider": "claude",
+                "model": "sonnet",
+                "prompt": "run",
+                "task_name": "implementation",
+                "task_inputs": ["input"],
+                "task_outputs": ["output"],
+                "declared_outputs": [],
+                "requested_mcp_server_ids": [],
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "code_writer",
+                "worktree_write_enabled": false
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(retry_run_id),
+            stage_id: Some("implementation".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("operator retry should consume the active provider-family quota wait");
+    assert_eq!(claimed.source_work_item_id, "claude-retry-invoke");
+
+    let row = sqlx::query(
+        "SELECT normal_budget_consumed, early_retry_journal_id, state FROM agent_retry_budget_ledger WHERE id = ?1",
+    )
+    .bind(&ledger.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    use sqlx::Row;
+    assert_eq!(row.get::<i64, _>("normal_budget_consumed"), 1);
+    assert_eq!(
+        row.get::<Option<String>, _>("early_retry_journal_id"),
+        Some(journal_id)
+    );
+    assert_eq!(row.get::<String, _>("state"), "early_retry_consumed");
+}
+
+#[tokio::test]
+async fn expired_provider_quota_wait_is_marked_reset_elapsed_before_claim() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "Expired provider quota cleanup".into(),
+            body: "claim should normalize elapsed quota waits before reporting blockers".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "implementation".into(),
+            label: "Implementation".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let failed_claude_execution_id = AgentExecutionId::new();
+    agent_executions::insert(
+        &pool,
+        &AgentExecution {
+            id: failed_claude_execution_id,
+            stage_execution_id: Some(stage_execution_id),
+            agent_id: "code_writer".into(),
+            provider: "claude".into(),
+            model: Some("sonnet".into()),
+            status: AgentStatus::Failed,
+            started_at: Utc::now() - Duration::minutes(10),
+            completed_at: Some(Utc::now() - Duration::minutes(5)),
+            owner_execution_lineage_id: Some(stage_execution_id.to_string()),
+            session_lineage_id: Some("lineage-expired-claude".into()),
+            session_generation_id: Some("generation-expired-claude".into()),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some("owner-key".into()),
+            session_reuse_scope: Some("same_agent_family_within_run".into()),
+            session_family_id: Some("code_writer".into()),
+            session_reuse_disposition: Some("fresh".into()),
+            session_reset_reason: None,
+            backend_profile_id: Some("claude_builder_high".into()),
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        stage_execution_id,
+        failed_claude_execution_id,
+        Some(Utc::now() + Duration::hours(1)),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"UPDATE agent_retry_budget_ledger
+           SET retry_after = ?1, state = 'waiting_for_reset', normal_budget_consumed = 0
+           WHERE id = ?2"#,
+    )
+    .bind((Utc::now() - Duration::minutes(1)).to_rfc3339())
+    .bind(&ledger.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: "claude-expired-quota-invoke".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "implementation",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "code_writer",
+                "provider": "claude",
+                "model": "sonnet",
+                "prompt": "run",
+                "task_name": "implementation",
+                "task_inputs": ["input"],
+                "task_outputs": ["output"],
+                "declared_outputs": [],
+                "requested_mcp_server_ids": [],
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "code_writer",
+                "worktree_write_enabled": false
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("implementation".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("elapsed provider quota wait should not block claim");
+    assert_eq!(claimed.source_work_item_id, "claude-expired-quota-invoke");
+
+    let row = sqlx::query(
+        "SELECT state, normal_budget_consumed FROM agent_retry_budget_ledger WHERE id = ?1",
+    )
+    .bind(&ledger.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    use sqlx::Row;
+    assert_eq!(row.get::<String, _>("state"), "reset_elapsed");
+    assert_eq!(row.get::<i64, _>("normal_budget_consumed"), 0);
 }
 
 #[tokio::test]

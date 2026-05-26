@@ -87,6 +87,42 @@ pub async fn find_by_id_tx(
     .transpose()
 }
 
+/// Find the pending approval for a given run_id and stage_id.
+/// Returns the most recently requested pending approval if multiple exist.
+pub async fn find_pending_by_run_stage(
+    pool: &SqlitePool,
+    run_id: RunId,
+    stage_id: &str,
+) -> Result<Option<Approval>> {
+    let run_id_str = run_id.to_string();
+    let row = sqlx::query(
+        r#"SELECT id, run_id, stage_id, decision, requested_at, decided_at, comment, expires_at
+           FROM approvals
+           WHERE run_id = ?1 AND stage_id = ?2 AND (decision = 'pending' OR decision = 'requested')
+           ORDER BY requested_at DESC
+           LIMIT 1"#,
+    )
+    .bind(run_id_str)
+    .bind(stage_id)
+    .fetch_optional(pool)
+    .await
+    .context("find pending approval by run and stage")?;
+
+    row.map(|r| {
+        parse_approval_row(
+            r.get("id"),
+            r.get("run_id"),
+            r.get("stage_id"),
+            r.get("decision"),
+            r.get("requested_at"),
+            r.get("decided_at"),
+            r.get("comment"),
+            r.get("expires_at"),
+        )
+    })
+    .transpose()
+}
+
 pub async fn list_pending(pool: &SqlitePool) -> Result<Vec<Approval>> {
     let rows = sqlx::query(
         r#"SELECT id, run_id, stage_id, decision, requested_at, decided_at, comment, expires_at

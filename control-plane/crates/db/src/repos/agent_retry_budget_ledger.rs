@@ -24,6 +24,21 @@ pub struct AgentRetryBudgetLedgerRow {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderFamilyQuotaWait {
+    pub ledger_id: String,
+    pub run_id: RunId,
+    pub stage_execution_id: Option<StageExecutionId>,
+    pub agent_execution_id: AgentExecutionId,
+    pub retry_after: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderFamilyQuotaConsumeResult {
+    pub source_command_journal_id: String,
+    pub consumed_count: u64,
+}
+
 pub async fn upsert_quota_failure(
     pool: &SqlitePool,
     run_id: RunId,
@@ -189,6 +204,42 @@ pub async fn mark_quota_reset_elapsed_tx(
     find_by_id_tx(tx, ledger_id).await
 }
 
+pub async fn mark_elapsed_provider_quota_waits(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> Result<u64> {
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "agent_retry_budget_ledger.mark_elapsed_provider_quota_waits",
+    )
+    .await?;
+    let updated = mark_elapsed_provider_quota_waits_tx(&mut tx, now).await?;
+    tx.commit().await?;
+    Ok(updated)
+}
+
+pub async fn mark_elapsed_provider_quota_waits_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    now: DateTime<Utc>,
+) -> Result<u64> {
+    let updated = sqlx::query(
+        r#"UPDATE agent_retry_budget_ledger
+           SET state = 'reset_elapsed',
+               updated_at = ?1
+           WHERE failure_kind = ?2
+             AND normal_budget_consumed = 0
+             AND state = 'waiting_for_reset'
+             AND retry_after IS NOT NULL
+             AND retry_after <= ?1"#,
+    )
+    .bind(now.to_rfc3339())
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(updated)
+}
+
 pub async fn consume_early_quota_retry_tx(
     tx: &mut Transaction<'_, Sqlite>,
     ledger_id: &str,
@@ -211,6 +262,146 @@ pub async fn consume_early_quota_retry_tx(
     find_by_id_tx(tx, ledger_id).await
 }
 
+pub async fn active_provider_family_quota_wait(
+    pool: &SqlitePool,
+    provider_family: &str,
+    model: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<ProviderFamilyQuotaWait>> {
+    mark_elapsed_provider_quota_waits(pool, now).await?;
+
+    let row = sqlx::query(
+        r#"SELECT ledger.id, ledger.run_id, ledger.stage_execution_id,
+                  ledger.agent_execution_id, ledger.retry_after
+           FROM agent_retry_budget_ledger ledger
+           INNER JOIN agent_executions ae ON ae.id = ledger.agent_execution_id
+           WHERE ledger.failure_kind = ?1
+             AND ledger.normal_budget_consumed = 0
+             AND ledger.state = 'waiting_for_reset'
+             AND ledger.retry_after IS NOT NULL
+             AND ledger.retry_after > ?2
+             AND COALESCE(ae.provider_family, ae.provider) = ?3
+             AND (
+               ae.model IS NULL
+               OR trim(ae.model) = ''
+               OR ?4 IS NULL
+               OR trim(?4) = ''
+               OR lower(ae.model) = lower(?4)
+             )
+           ORDER BY ledger.retry_after ASC, ledger.created_at ASC
+           LIMIT 1"#,
+    )
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .bind(now.to_rfc3339())
+    .bind(provider_family)
+    .bind(model)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|row| parse_provider_family_quota_wait_row(&row))
+        .transpose()
+}
+
+pub async fn consume_active_provider_family_quota_for_retry_target(
+    pool: &SqlitePool,
+    target_stage_execution_id: StageExecutionId,
+    provider_family: &str,
+    model: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<ProviderFamilyQuotaConsumeResult>> {
+    let mut tx = crate::writer::begin_repository_transaction(
+        pool,
+        "agent_retry_budget_ledger.consume_provider_family_quota_for_retry_target",
+    )
+    .await?;
+    let result = consume_active_provider_family_quota_for_retry_target_tx(
+        &mut tx,
+        target_stage_execution_id,
+        provider_family,
+        model,
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+pub async fn consume_active_provider_family_quota_for_retry_target_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    target_stage_execution_id: StageExecutionId,
+    provider_family: &str,
+    model: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<ProviderFamilyQuotaConsumeResult>> {
+    let authority = sqlx::query(
+        r#"SELECT rsa.source_command_journal_id, cj.payload_json
+           FROM retry_stage_execution_authorities rsa
+           INNER JOIN command_journal cj ON cj.id = rsa.source_command_journal_id
+           WHERE rsa.target_stage_execution_id = ?1
+             AND rsa.authority_state = 'active'
+           LIMIT 1"#,
+    )
+    .bind(target_stage_execution_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let Some(authority) = authority else {
+        return Ok(None);
+    };
+    let source_command_journal_id: String = authority.get("source_command_journal_id");
+    let payload_json: String = authority.get("payload_json");
+    let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+    let consume_quota_budget_now = payload
+        .get("RetryStage")
+        .and_then(|value| value.get("consume_quota_budget_now"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !consume_quota_budget_now {
+        return Ok(None);
+    }
+
+    let updated = sqlx::query(
+        r#"UPDATE agent_retry_budget_ledger
+           SET normal_budget_consumed = 1,
+               early_retry_journal_id = COALESCE(early_retry_journal_id, ?1),
+               state = 'early_retry_consumed',
+               updated_at = ?2
+           WHERE failure_kind = ?3
+             AND normal_budget_consumed = 0
+             AND state = 'waiting_for_reset'
+             AND retry_after IS NOT NULL
+             AND retry_after > ?2
+             AND agent_execution_id IN (
+               SELECT id FROM agent_executions
+               WHERE COALESCE(provider_family, provider) = ?4
+                 AND (
+                   model IS NULL
+                   OR trim(model) = ''
+                   OR ?5 IS NULL
+                   OR trim(?5) = ''
+                   OR lower(model) = lower(?5)
+                 )
+             )"#,
+    )
+    .bind(&source_command_journal_id)
+    .bind(now.to_rfc3339())
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .bind(provider_family)
+    .bind(model)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+
+    if updated == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(ProviderFamilyQuotaConsumeResult {
+        source_command_journal_id,
+        consumed_count: updated,
+    }))
+}
+
 pub async fn find_by_id_tx(
     tx: &mut Transaction<'_, Sqlite>,
     ledger_id: &str,
@@ -226,6 +417,26 @@ pub async fn find_by_id_tx(
     .fetch_one(&mut **tx)
     .await?;
     parse_row(&row)
+}
+
+fn parse_provider_family_quota_wait_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<ProviderFamilyQuotaWait> {
+    let run_id: String = row.get("run_id");
+    let stage_execution_id: Option<String> = row.get("stage_execution_id");
+    let agent_execution_id: String = row.get("agent_execution_id");
+    let retry_after: String = row.get("retry_after");
+    Ok(ProviderFamilyQuotaWait {
+        ledger_id: row.get("id"),
+        run_id: run_id.parse().map_err(|e| anyhow::anyhow!("{e}"))?,
+        stage_execution_id: stage_execution_id
+            .map(|value| value.parse().map_err(|e| anyhow::anyhow!("{e}")))
+            .transpose()?,
+        agent_execution_id: agent_execution_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        retry_after: DateTime::parse_from_rfc3339(&retry_after)?.with_timezone(&Utc),
+    })
 }
 
 fn parse_row(row: &sqlx::sqlite::SqliteRow) -> Result<AgentRetryBudgetLedgerRow> {

@@ -152,6 +152,45 @@ pub struct WorktreePolicy {
     pub write_enabled: bool,
 }
 
+/// P086: Explicit opt-in for same-session work continuation.
+/// Agents without this field are not eligible for continuation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContinuationCapabilityYaml {
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_triggers: Vec<String>,
+    #[serde(default)]
+    pub allowed_session_scope: Vec<String>,
+    #[serde(default)]
+    pub forbidden_stage_kinds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_handle_continuation: Option<LiveHandleContinuationYaml>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_resurrection: Option<ProviderSessionResurrectionYaml>,
+    #[serde(default)]
+    pub require_same_worktree: bool,
+    #[serde(default)]
+    pub require_no_unresolved_side_effects: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LiveHandleContinuationYaml {
+    pub enabled: bool,
+    #[serde(default)]
+    pub require_live_session: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProviderSessionResurrectionYaml {
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_triggers: Vec<String>,
+    #[serde(default)]
+    pub require_recorded_provider_session_id: bool,
+    #[serde(default)]
+    pub fail_closed_when_unsupported: bool,
+}
+
 /// System-level role attached to an agent catalog entry.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -182,6 +221,8 @@ pub struct AgentEntry {
     pub prompt: Option<String>,
     pub notes: Option<String>,
     pub worktree_policy: Option<WorktreePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_capability: Option<ContinuationCapabilityYaml>,
     pub required_tools: Option<Vec<String>>,
     #[serde(default)]
     pub xcode_broker_required: Option<bool>,

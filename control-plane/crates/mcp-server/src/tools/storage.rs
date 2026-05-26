@@ -216,7 +216,7 @@ pub fn tool_specs() -> Vec<McpTool> {
         },
         McpTool {
             name: "storage.projections.clear_backlog".to_string(),
-            description: "Clear the projection invalidation backlog for a specific projection and source (Proposal 087)".to_string(),
+            description: "Clear the projection invalidation backlog for a specific projection and source (Proposal 087). Requires idempotency_key for MCP transport-level retry safety.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -227,14 +227,18 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "sourceName": {
                         "type": "string",
                         "description": "Name of the source"
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "UUIDv7 idempotency key for MCP transport-level retry safety"
                     }
                 },
-                "required": ["projectionName", "sourceName"]
+                "required": ["projectionName", "sourceName", "idempotency_key"]
             }),
         },
         McpTool {
             name: "storage.projections.clear_poison".to_string(),
-            description: "Clear the poison flag for a specific projection and source (Proposal 087)".to_string(),
+            description: "Clear the poison flag for a specific projection and source (Proposal 087). Requires idempotency_key for MCP transport-level retry safety.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -245,9 +249,13 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "sourceName": {
                         "type": "string",
                         "description": "Name of the source"
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "UUIDv7 idempotency key for MCP transport-level retry safety"
                     }
                 },
-                "required": ["projectionName", "sourceName"]
+                "required": ["projectionName", "sourceName", "idempotency_key"]
             }),
         },
     ]
@@ -448,6 +456,11 @@ pub async fn execute_with_writer(
                     request_id,
                 ));
             }
+            if !dry_run {
+                anyhow::bail!(
+                    "storage.reconcile_evidence_orphans non-dry-run is disabled until it has a P081 atomic MCP write unit"
+                );
+            }
 
             // Resolve artifact root server-side — never from client params (SEC-001).
             let artifact_root = match resolve_artifact_root() {
@@ -517,7 +530,11 @@ pub async fn execute_with_writer(
                 ));
             }
 
-            match db::repos::maintenance::repair_slot(
+            let mcp_idempotency_key = crate::request_context::current_idempotency_key();
+            let mcp_idempotency_request_hash =
+                crate::request_context::current_idempotency_request_hash();
+            let mcp_boundary_row_id = crate::request_context::current_boundary_row_id();
+            match db::repos::maintenance::repair_slot_with_mcp_context(
                 pool,
                 idempotency_key,
                 op_id,
@@ -526,10 +543,17 @@ pub async fn execute_with_writer(
                 &principal.class.to_string(),
                 crate::request_context::current_request_id().as_deref(),
                 cancel,
+                mcp_idempotency_key.as_deref(),
+                mcp_idempotency_request_hash.as_deref(),
+                mcp_boundary_row_id.as_deref(),
             )
             .await
             {
-                Ok(op) => Ok(public_maintenance_operation(&op)),
+                Ok(result) => {
+                    let mut payload = public_maintenance_operation(&result.operation);
+                    payload["journal_id"] = serde_json::json!(result.journal_id);
+                    Ok(payload)
+                }
                 Err(e) => {
                     let (code, message) = repair_slot_public_error(&e);
                     Ok(typed_error(
@@ -564,16 +588,24 @@ pub async fn execute_with_writer(
                 ));
             }
 
-            db::repos::projection_invalidation::clear_backlog(
+            let principal_class = principal.class.to_string();
+            let mcp_idempotency_key = crate::request_context::current_idempotency_key();
+            let mcp_idempotency_request_hash =
+                crate::request_context::current_idempotency_request_hash();
+            let mcp_boundary_row_id = crate::request_context::current_boundary_row_id();
+            let journal_id = db::repos::projection_invalidation::clear_backlog(
                 pool,
                 projection_name,
                 source_name,
                 Some(&principal.id),
-                Some(&principal.class.to_string()),
+                Some(&principal_class),
                 request_id,
+                mcp_idempotency_key.as_deref(),
+                mcp_idempotency_request_hash.as_deref(),
+                mcp_boundary_row_id.as_deref(),
             )
             .await?;
-            Ok(serde_json::json!({ "success": true }))
+            Ok(serde_json::json!({ "success": true, "journal_id": journal_id }))
         }
         "storage.projections.clear_poison" => {
             let projection_name = params["projectionName"].as_str().unwrap_or_default();
@@ -598,16 +630,24 @@ pub async fn execute_with_writer(
                 ));
             }
 
-            db::repos::projection_invalidation::clear_poison(
+            let principal_class = principal.class.to_string();
+            let mcp_idempotency_key = crate::request_context::current_idempotency_key();
+            let mcp_idempotency_request_hash =
+                crate::request_context::current_idempotency_request_hash();
+            let mcp_boundary_row_id = crate::request_context::current_boundary_row_id();
+            let journal_id = db::repos::projection_invalidation::clear_poison(
                 pool,
                 projection_name,
                 source_name,
                 Some(&principal.id),
-                Some(&principal.class.to_string()),
+                Some(&principal_class),
                 request_id,
+                mcp_idempotency_key.as_deref(),
+                mcp_idempotency_request_hash.as_deref(),
+                mcp_boundary_row_id.as_deref(),
             )
             .await?;
-            Ok(serde_json::json!({ "success": true }))
+            Ok(serde_json::json!({ "success": true, "journal_id": journal_id }))
         }
         _ => Err(anyhow::anyhow!("Unknown storage tool: {tool_name}")),
     }

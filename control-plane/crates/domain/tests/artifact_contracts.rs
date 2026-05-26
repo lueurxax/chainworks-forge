@@ -252,6 +252,37 @@ fn nonblocking_code_tail_does_not_keep_implementation_loop_open() {
 }
 
 #[test]
+fn nonblocking_code_writer_task_with_red_verification_forces_code_fixes() {
+    let mut raw = valid_v2();
+    raw["verification_green"] = json!(false);
+    raw["remaining_code_tasks"] = json!([{
+        "summary": "Phase 2 background continuation worker is not implemented",
+        "owner": "code_writer",
+        "blocking": false,
+        "evidence": "p086-continuation-readback is red until the worker produces runtime evidence"
+    }]);
+    raw["handoff_tasks"] = json!([{
+        "summary": "collect rollout evidence after worker implementation",
+        "owner_class": "manual_evidence",
+        "target_stage": "phase_2_operator_command",
+        "blocking_review": true,
+        "evidence": "runtime evidence depends on code-owned worker paths"
+    }]);
+
+    let summary = parse_implementation_self_assessment_v2(&raw, context());
+
+    assert_eq!(
+        summary.status,
+        ImplementationSelfAssessmentStatus::NeedsCodeFixes
+    );
+    assert_eq!(summary.blocking_remaining_code_task_count, Some(0));
+    assert!(summary
+        .warnings
+        .iter()
+        .any(|warning| warning.code == "suspicious_nonblocking_code_tasks_with_handoff"));
+}
+
+#[test]
 fn generic_status_normalization_accepts_handoff_required() {
     let normalized = normalize_contract_status(
         IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,

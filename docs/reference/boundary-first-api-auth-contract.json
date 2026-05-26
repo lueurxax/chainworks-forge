@@ -1,0 +1,376 @@
+{
+  "schema_version": 1,
+  "matrix_id": "p081-boundary-matrix-v1",
+  "generated_from": "docs/reference/boundary-first-api-auth-contract.md",
+  "enum_casing": "snake_case",
+  "rows": [
+    {
+      "row_id": "p081.ui_operator.graphql_query.read",
+      "caller_class": "ui_operator",
+      "transports": ["graphql_query"],
+      "actions": ["runs.get", "approvals.get", "artifacts.get"],
+      "allow": {
+        "enabled": true,
+        "wildcard": false,
+        "conditions": []
+      },
+      "deny": {
+        "reason_code": "CAPABILITY_OUT_OF_SCOPE",
+        "side_effects": [],
+        "client_visibility": "UNAUTHENTICATED"
+      },
+      "redaction": {
+        "mode": "field_null_redacted",
+        "paths": [],
+        "extensions_required": true
+      },
+      "authoritative_record": "projection_read_model",
+      "read_model_delta": {
+        "scope": "operator-scoped read fields",
+        "deny_behavior": "UNAUTHENTICATED, AMBIGUOUS_CALLER, CAPABILITY_OUT_OF_SCOPE, or field redaction before resolver data exposure"
+      },
+      "required_tests": [
+        "query_allow",
+        "redaction_parity",
+        "graphql_extensions_casing"
+      ],
+      "rollout_mode": "shadow",
+      "deprecated_after_phase": null
+    },
+    {
+      "row_id": "p081.ui_operator.graphql_subscription.subscribe",
+      "caller_class": "ui_operator",
+      "transports": ["graphql_subscription"],
+      "actions": ["runs.subscribe", "approvals.subscribe", "artifacts.subscribe"],
+      "allow": {
+        "enabled": true,
+        "wildcard": false,
+        "conditions": []
+      },
+      "deny": {
+        "reason_code": "CAPABILITY_OUT_OF_SCOPE",
+        "side_effects": [],
+        "client_visibility": "FORBIDDEN"
+      },
+      "redaction": {
+        "mode": "none",
+        "paths": [],
+        "extensions_required": false
+      },
+      "authoritative_record": "projection_read_model",
+      "read_model_delta": {
+        "scope": "subscription event stream",
+        "deny_behavior": "connection_init denial or subscribe-start operation error with no events"
+      },
+      "required_tests": [
+        "subscription_allow",
+        "subscription_denied_at_subscribe_start",
+        "subscription_policy_reload_reconnect"
+      ],
+      "rollout_mode": "shadow",
+      "deprecated_after_phase": null
+    },
+    {
+      "row_id": "p081.ui_operator.graphql_mutation.approval_action",
+      "caller_class": "ui_operator",
+      "transports": ["graphql_mutation"],
+      "actions": ["approveApproval", "rejectApproval"],
+      "allow": {
+        "enabled": true,
+        "wildcard": false,
+        "conditions": []
+      },
+      "deny": {
+        "reason_code": "NON_APPROVAL_MUTATION",
+        "side_effects": [],
+        "client_visibility": "FORBIDDEN"
+      },
+      "redaction": {
+        "mode": "actionability_false",
+        "paths": [],
+        "extensions_required": true
+      },
+      "authoritative_record": "approval_record",
+      "read_model_delta": {
+        "scope": "approval settlement",
+        "deny_behavior": "FORBIDDEN with NON_APPROVAL_MUTATION or APPROVAL_NOT_ACTIONABLE before side effects"
+      },
+      "required_tests": [
+        "allowed_approval",
+        "denied_non_approval",
+        "no_journal_write_on_deny",
+        "approval_idempotency"
+      ],
+      "rollout_mode": "shadow",
+      "deprecated_after_phase": null
+    },
+    {
+      "row_id": "p081.agent_operator.mcp_initialize.capability",
+      "caller_class": "agent_operator",
+      "transports": ["mcp_initialize"],
+      "actions": ["initialize"],
+      "allow": {
+        "enabled": true,
+        "wildcard": false,
+        "conditions": []
+      },
+      "deny": {
+        "reason_code": "UNAUTHENTICATED",
+        "side_effects": [],
+        "client_visibility": "UNAUTHENTICATED"
+      },
+      "redaction": {
+        "mode": "none",
+        "paths": [],
+        "extensions_required": false
+      },
+      "authoritative_record": "none",
+      "read_model_delta": {
+        "scope": "capability negotiation",
+        "deny_behavior": "auth failure without capability inventory"
+      },
+      "required_tests": [
+        "mcp_initialize_boundary_policy_capability"
+      ],
+      "rollout_mode": "shadow",
+      "deprecated_after_phase": null
+    },
+    {
+      "row_id": "p081.agent_operator.mcp_tools_list.discovery",
+      "caller_class": "agent_operator",
+      "transports": ["mcp_tools_list"],
+      "actions": ["tools/list", "resources.list", "resources.templates.list"],
+      "allow": {
+        "enabled": true,
+        "wildcard": false,
+        "conditions": []
+      },
+      "deny": {
+        "reason_code": "CAPABILITY_OUT_OF_SCOPE",
+        "side_effects": [],
+        "client_visibility": "CAPABILITY_OUT_OF_SCOPE"
+      },
+      "redaction": {
+        "mode": "drop_resource",
+        "paths": [],
+        "extensions_required": false
+      },
+      "authoritative_record": "none",
+      "read_model_delta": {
+        "scope": "tool discovery list",
+        "deny_behavior": "denied known tools omitted; no command_journal write"
+      },
+      "required_tests": [
+        "mcp_tools_list_filters_denied_tools"
+      ],
+      "rollout_mode": "shadow",
+      "deprecated_after_phase": null
+    },
+    {
+      "row_id": "p081.agent_operator.mcp_tools_call.command",
+      "caller_class": "agent_operator",
+      "transports": ["mcp_tools_call"],
+      "actions": ["runs.*", "ideas.*", "approvals.*", "stages.*", "reports.*", "artifacts.*", "steward.*", "storage.*", "runtime.*", "boundary.*", "effects.*", "resources.*"],
+      "allow": {
+        "enabled": true,
+        "wildcard": true,
+        "conditions": []
+      },
+      "deny": {
+        "reason_code": "CAPABILITY_OUT_OF_SCOPE",
+        "side_effects": [],
+        "client_visibility": "CAPABILITY_OUT_OF_SCOPE"
+      },
+      "redaction": {
+        "mode": "none",
+        "paths": [],
+        "extensions_required": false
+      },
+      "authoritative_record": "command_journal",
+      "read_model_delta": {
+        "scope": "command execution",
+        "deny_behavior": "JSON-RPC -32004 with CAPABILITY_OUT_OF_SCOPE or MATRIX_NO_ROW"
+      },
+      "required_tests": [
+        "allowed_mcp_command",
+        "denied_graphql_mutation",
+        "denied_out_of_scope_tool",
+        "mcp_command_idempotency"
+      ],
+      "rollout_mode": "shadow",
+      "deprecated_after_phase": null
+    },
+    {
+      "row_id": "p081.automation.mcp_tools_list.discovery",
+      "caller_class": "automation",
+      "transports": ["mcp_tools_list"],
+      "actions": ["tools/list", "resources.list", "resources.templates.list"],
+      "allow": {
+        "enabled": true,
+        "wildcard": false,
+        "conditions": []
+      },
+      "deny": {
+        "reason_code": "CAPABILITY_OUT_OF_SCOPE",
+        "side_effects": [],
+        "client_visibility": "CAPABILITY_OUT_OF_SCOPE"
+      },
+      "redaction": {
+        "mode": "drop_resource",
+        "paths": [],
+        "extensions_required": false
+      },
+      "authoritative_record": "none",
+      "read_model_delta": {
+        "scope": "automation tool discovery",
+        "deny_behavior": "tools outside automation_capabilities omitted"
+      },
+      "required_tests": [
+        "automation_tools_list_scope"
+      ],
+      "rollout_mode": "shadow",
+      "deprecated_after_phase": null
+    },
+    {
+      "row_id": "p081.automation.mcp_tools_call.command",
+      "caller_class": "automation",
+      "transports": ["mcp_tools_call"],
+      "actions": ["runs.*", "ideas.*", "approvals.*", "stages.*", "reports.*", "artifacts.*", "steward.*", "storage.*", "runtime.*", "boundary.*", "effects.*", "resources.*"],
+      "allow": {
+        "enabled": true,
+        "wildcard": true,
+        "conditions": []
+      },
+      "deny": {
+        "reason_code": "CAPABILITY_OUT_OF_SCOPE",
+        "side_effects": [],
+        "client_visibility": "CAPABILITY_OUT_OF_SCOPE"
+      },
+      "redaction": {
+        "mode": "none",
+        "paths": [],
+        "extensions_required": false
+      },
+      "authoritative_record": "command_journal",
+      "read_model_delta": {
+        "scope": "automation command execution",
+        "deny_behavior": "JSON-RPC -32004 with CAPABILITY_OUT_OF_SCOPE"
+      },
+      "required_tests": [
+        "token_scope_matrix",
+        "denial_side_effect_test",
+        "mcp_command_idempotency"
+      ],
+      "rollout_mode": "shadow",
+      "deprecated_after_phase": null
+    },
+    {
+      "row_id": "p081.observer.mcp_tools_call.compact_read",
+      "caller_class": "observer",
+      "transports": ["mcp_tools_call"],
+      "actions": [
+        "runtime.health", "boundary.runtime.get",
+        "runs.list", "runs.get",
+        "approvals.list", "approvals.get",
+        "stages.list", "stages.get",
+        "artifacts.list", "artifacts.get",
+        "reports.list", "reports.get",
+        "steward.status",
+        "resources.list", "resources.read"
+      ],
+      "allow": {
+        "enabled": true,
+        "wildcard": false,
+        "conditions": []
+      },
+      "deny": {
+        "reason_code": "OBSERVER_SCOPE",
+        "side_effects": [],
+        "client_visibility": "OBSERVER_SCOPE"
+      },
+      "redaction": {
+        "mode": "actionability_false",
+        "paths": [],
+        "extensions_required": false
+      },
+      "authoritative_record": "projection_read_model",
+      "read_model_delta": {
+        "scope": "compact read-only diagnostics",
+        "deny_behavior": "OBSERVER_SCOPE for mutations; actionability forced false"
+      },
+      "required_tests": [
+        "observer_cannot_mutate",
+        "observer_compact_read_only"
+      ],
+      "rollout_mode": "shadow",
+      "deprecated_after_phase": null
+    },
+    {
+      "row_id": "p081.observer.graphql_query.read_only_opt_in",
+      "caller_class": "observer",
+      "transports": ["graphql_query"],
+      "actions": ["graphql.read_only"],
+      "allow": {
+        "enabled": true,
+        "wildcard": false,
+        "conditions": []
+      },
+      "deny": {
+        "reason_code": "OBSERVER_SCOPE",
+        "side_effects": [],
+        "client_visibility": "FORBIDDEN"
+      },
+      "redaction": {
+        "mode": "field_null_redacted",
+        "paths": [],
+        "extensions_required": true
+      },
+      "authoritative_record": "projection_read_model",
+      "read_model_delta": {
+        "scope": "opt-in read-only fields",
+        "deny_behavior": "FORBIDDEN or redaction with OBSERVER_SCOPE; actionability forced false"
+      },
+      "required_tests": [
+        "observer_graphql_default_denied",
+        "opt_in_redaction_parity",
+        "accessibility_redaction_parity"
+      ],
+      "rollout_mode": "shadow",
+      "deprecated_after_phase": null
+    },
+    {
+      "row_id": "p081.developer_break_glass.debug_endpoint.disabled",
+      "caller_class": "developer_break_glass",
+      "transports": ["debug_endpoint"],
+      "actions": ["debug.preflight"],
+      "allow": {
+        "enabled": false,
+        "wildcard": false,
+        "conditions": []
+      },
+      "deny": {
+        "reason_code": "BREAK_GLASS_DISABLED",
+        "side_effects": [],
+        "client_visibility": "BREAK_GLASS_DISABLED"
+      },
+      "redaction": {
+        "mode": "none",
+        "paths": [],
+        "extensions_required": false
+      },
+      "authoritative_record": "audit_log",
+      "read_model_delta": {
+        "scope": "break-glass diagnostic preflight",
+        "deny_behavior": "BREAK_GLASS_DISABLED when env gate absent; E_AUDIT_UNAVAILABLE if durable audit row cannot be written"
+      },
+      "required_tests": [
+        "env_gate_test",
+        "audit_event_assertion",
+        "no_projection_write_test",
+        "audit_unavailable_fail_closed"
+      ],
+      "rollout_mode": "shadow",
+      "deprecated_after_phase": null
+    }
+  ]
+}

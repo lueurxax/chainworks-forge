@@ -42,6 +42,7 @@ struct MetricsSnapshot: Codable, Hashable, Sendable {
     let p036GlobalAttentionIndicatorTotal: Int
     let p036InlineApprovalRenderTotal: Int
     let p036OperatorTaskAttemptTotal: Int
+    let p036OperatorTaskAttemptLabels: [P036OperatorTaskAttemptSample]
     let p036TimelineBatchFlushTotal: Int
     let p036TimelineCardCollapseTotal: Int
     let p036ArtifactPayloadStateTotal: Int
@@ -130,14 +131,22 @@ struct MetricsCollector {
         let laneCount = allRuns.compactMap { $0.loopCounters["p036_workbench_lane_count"] }.sorted().last ?? 0
         let timelineEntryCount = allRuns.compactMap { $0.loopCounters["p036_timeline_entry_count"] }.sorted().last ?? 0
         // Required named metrics (event-site counters; accumulated from loopCounters, zero until wired)
-        let tabRouteResTotal = allRuns.compactMap { $0.loopCounters["p036_tab_route_resolution_total"] }.reduce(0, +)
-        let attentionTotal = allRuns.compactMap { $0.loopCounters["p036_global_attention_indicator_total"] }.reduce(0, +)
-        let approvalRenderTotal = allRuns.compactMap { $0.loopCounters["p036_inline_approval_render_total"] }.reduce(0, +)
-        let taskAttemptTotal = allRuns.compactMap { $0.loopCounters["p036_operator_task_attempt_total"] }.reduce(0, +)
-        let batchFlushTotal = allRuns.compactMap { $0.loopCounters["p036_timeline_batch_flush_total"] }.reduce(0, +)
-        let cardCollapseTotal = allRuns.compactMap { $0.loopCounters["p036_timeline_card_collapse_total"] }.reduce(0, +)
-        let artifactPayloadTotal = allRuns.compactMap { $0.loopCounters["p036_artifact_payload_state_total"] }.reduce(0, +)
-        let projectionGapTotal = allRuns.compactMap { $0.loopCounters["p036_projection_gap_deferred_total"] }.reduce(0, +)
+        let tabRouteResTotal = allRuns.compactMap { $0.loopCounters[P036UICounterStore.tabRouteResolutionTotal] }.reduce(0, +)
+            + P036UICounterStore.value(for: P036UICounterStore.tabRouteResolutionTotal)
+        let attentionTotal = allRuns.compactMap { $0.loopCounters[P036UICounterStore.attentionIndicatorTotal] }.reduce(0, +)
+            + P036UICounterStore.value(for: P036UICounterStore.attentionIndicatorTotal)
+        let approvalRenderTotal = allRuns.compactMap { $0.loopCounters[P036UICounterStore.inlineApprovalRenderTotal] }.reduce(0, +)
+            + P036UICounterStore.value(for: P036UICounterStore.inlineApprovalRenderTotal)
+        let taskAttemptTotal = allRuns.compactMap { $0.loopCounters[P036UICounterStore.operatorTaskAttemptTotal] }.reduce(0, +)
+            + P036UICounterStore.value(for: P036UICounterStore.operatorTaskAttemptTotal)
+        let batchFlushTotal = allRuns.compactMap { $0.loopCounters[P036UICounterStore.timelineBatchFlushTotal] }.reduce(0, +)
+            + P036UICounterStore.value(for: P036UICounterStore.timelineBatchFlushTotal)
+        let cardCollapseTotal = allRuns.compactMap { $0.loopCounters[P036UICounterStore.timelineCardCollapseTotal] }.reduce(0, +)
+            + P036UICounterStore.value(for: P036UICounterStore.timelineCardCollapseTotal)
+        let artifactPayloadTotal = allRuns.compactMap { $0.loopCounters[P036UICounterStore.artifactPayloadStateTotal] }.reduce(0, +)
+            + P036UICounterStore.value(for: P036UICounterStore.artifactPayloadStateTotal)
+        let projectionGapTotal = allRuns.compactMap { $0.loopCounters[P036UICounterStore.projectionGapDeferredTotal] }.reduce(0, +)
+            + P036UICounterStore.value(for: P036UICounterStore.projectionGapDeferredTotal)
 
         return MetricsSnapshot(
             runCount: allRuns.count,
@@ -164,6 +173,7 @@ struct MetricsCollector {
             p036GlobalAttentionIndicatorTotal: attentionTotal,
             p036InlineApprovalRenderTotal: approvalRenderTotal,
             p036OperatorTaskAttemptTotal: taskAttemptTotal,
+            p036OperatorTaskAttemptLabels: P036UICounterStore.operatorTaskAttemptSamples(),
             p036TimelineBatchFlushTotal: batchFlushTotal,
             p036TimelineCardCollapseTotal: cardCollapseTotal,
             p036ArtifactPayloadStateTotal: artifactPayloadTotal,
@@ -180,10 +190,15 @@ struct MetricsCollector {
             costPerRunMedianCents: nil, costByStageFamily: [:],
             failedRunRate: 0, blockedRunRate: 0, driftEventCount: 0, resumedRunCount: 0,
             p036NavigationTabSelection: 0, p036WorkbenchLaneCount: 0, p036TimelineEntryCount: 0,
-            p036TabRouteResolutionTotal: 0, p036GlobalAttentionIndicatorTotal: 0,
-            p036InlineApprovalRenderTotal: 0, p036OperatorTaskAttemptTotal: 0,
-            p036TimelineBatchFlushTotal: 0, p036TimelineCardCollapseTotal: 0,
-            p036ArtifactPayloadStateTotal: 0, p036ProjectionGapDeferredTotal: 0
+            p036TabRouteResolutionTotal: P036UICounterStore.value(for: P036UICounterStore.tabRouteResolutionTotal),
+            p036GlobalAttentionIndicatorTotal: P036UICounterStore.value(for: P036UICounterStore.attentionIndicatorTotal),
+            p036InlineApprovalRenderTotal: P036UICounterStore.value(for: P036UICounterStore.inlineApprovalRenderTotal),
+            p036OperatorTaskAttemptTotal: P036UICounterStore.value(for: P036UICounterStore.operatorTaskAttemptTotal),
+            p036OperatorTaskAttemptLabels: P036UICounterStore.operatorTaskAttemptSamples(),
+            p036TimelineBatchFlushTotal: P036UICounterStore.value(for: P036UICounterStore.timelineBatchFlushTotal),
+            p036TimelineCardCollapseTotal: P036UICounterStore.value(for: P036UICounterStore.timelineCardCollapseTotal),
+            p036ArtifactPayloadStateTotal: P036UICounterStore.value(for: P036UICounterStore.artifactPayloadStateTotal),
+            p036ProjectionGapDeferredTotal: P036UICounterStore.value(for: P036UICounterStore.projectionGapDeferredTotal)
         )
     }
 

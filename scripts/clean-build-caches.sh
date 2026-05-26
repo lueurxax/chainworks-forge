@@ -11,11 +11,10 @@
 #
 # Default pass removes:
 #   * `control-plane/target/proposal-*` / `target/p*-*` orphan
-#     CARGO_TARGET_DIRs from other proposals' gates.
-#   * `$TMPDIR/chainworks-test-gates/p042-swift-*-DerivedData` stamps
-#     older than the two most recent.
-#   * `$TMPDIR/chainworks-test-gates/proposal-0*-DerivedData` and
-#     `/*-target` dirs from other proposals' gates.
+#     CARGO_TARGET_DIRs from other proposals' gates, unless cargo is
+#     actively building/testing.
+#   * `$TMPDIR/chainworks-test-gates` DerivedData, xcresult, and target
+#     residuals not referenced by currently running xcodebuild commands.
 #   * All but the most recently modified
 #     `~/Library/Developer/Xcode/DerivedData/Chainworks_Forge-*` root.
 #
@@ -59,46 +58,75 @@ delete() {
     fi
 }
 
-bail_if_cargo_running() {
+is_cargo_running() {
     if pgrep -lf 'cargo test|cargo build' >/dev/null 2>&1; then
-        echo "error: cargo build/test is running; refusing to touch target/"
-        echo "       rerun this script after the build finishes, or kill cargo first."
-        exit 2
+        return 0
     fi
+    return 1
+}
+
+load_active_tmp_paths() {
+    ACTIVE_TMP_PATHS=()
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        ACTIVE_TMP_PATHS+=("$path")
+    done < <(
+        ps -axo command |
+            awk -v base="$TMP_BASE/" '
+                /xcodebuild/ {
+                    for (i = 1; i <= NF; i++) {
+                        if (index($i, base) == 1) print $i
+                    }
+                }
+            ' |
+            sort -u
+    )
+}
+
+is_active_tmp_path() {
+    local candidate="$1"
+    local active
+    for active in "${ACTIVE_TMP_PATHS[@]:-}"; do
+        if [[ "$candidate" == "$active" ]]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 # ── 1. Orphan per-proposal target dirs ───────────────────────────────
 TARGET_ROOT="$ROOT_DIR/control-plane/target"
 if [[ -d "$TARGET_ROOT" ]]; then
-    bail_if_cargo_running
-    # Collect every direct child of target/ that is neither debug,
-    # release, nor a cargo metadata file. Those are per-proposal
-    # CARGO_TARGET_DIRs used by other gates.
-    for entry in "$TARGET_ROOT"/*; do
-        [[ -d "$entry" ]] || continue
-        name="$(basename "$entry")"
-        case "$name" in
-            debug|release|doc|tmp) continue ;;
-        esac
-        say "removing orphan target dir $entry"
-        delete "$entry"
-    done
+    if is_cargo_running; then
+        say "cargo build/test is running; skipping control-plane/target cleanup"
+    else
+        # Collect every direct child of target/ that is neither debug,
+        # release, nor a cargo metadata file. Those are per-proposal
+        # CARGO_TARGET_DIRs used by other gates.
+        for entry in "$TARGET_ROOT"/*; do
+            [[ -d "$entry" ]] || continue
+            name="$(basename "$entry")"
+            case "$name" in
+                debug|release|doc|tmp) continue ;;
+            esac
+            say "removing orphan target dir $entry"
+            delete "$entry"
+        done
+    fi
 fi
 
-# ── 2. Swift gate DerivedData prune (keep 2 newest) ──────────────────
+# ── 2. Swift gate residuals ──────────────────────────────────────────
 if [[ -d "$TMP_BASE" ]]; then
-    while IFS= read -r stale; do
-        [[ -n "$stale" ]] || continue
-        say "removing stale Swift DerivedData $stale"
-        delete "$stale"
-    done < <(ls -dt "$TMP_BASE"/p042-swift-*-DerivedData 2>/dev/null | tail -n +3)
-
-    # Other proposals' residuals are never consumed by the P042 gate.
-    for pat in "proposal-0*-DerivedData" "p*-readloop-targeted-DerivedData" "proposal-0*-target" "p*-regression-target"; do
+    load_active_tmp_paths
+    for pat in "*-DerivedData" "*.xcresult" "proposal-0*-target" "p*-regression-target" "p*-readloop-targeted-DerivedData"; do
         # shellcheck disable=SC2086
         for stale in "$TMP_BASE"/${pat}; do
             [[ -e "$stale" ]] || continue
-            say "removing other-proposal residual $stale"
+            if is_active_tmp_path "$stale"; then
+                say "keeping active xcodebuild path $stale"
+                continue
+            fi
+            say "removing stale Swift gate residual $stale"
             delete "$stale"
         done
     done
@@ -119,14 +147,17 @@ fi
 
 # ── 4. --aggressive: incremental + release ───────────────────────────
 if [[ "$AGGRESSIVE" -eq 1 ]]; then
-    bail_if_cargo_running
-    if [[ -d "$TARGET_ROOT/debug/incremental" ]]; then
-        say "removing target/debug/incremental (regenerates on next cargo run)"
-        delete "$TARGET_ROOT/debug/incremental"
-    fi
-    if [[ -d "$TARGET_ROOT/release" ]]; then
-        say "removing target/release (only used by packaging lane / Xcode Release)"
-        delete "$TARGET_ROOT/release"
+    if is_cargo_running; then
+        say "cargo build/test is running; skipping aggressive target cleanup"
+    else
+        if [[ -d "$TARGET_ROOT/debug/incremental" ]]; then
+            say "removing target/debug/incremental (regenerates on next cargo run)"
+            delete "$TARGET_ROOT/debug/incremental"
+        fi
+        if [[ -d "$TARGET_ROOT/release" ]]; then
+            say "removing target/release (only used by packaging lane / Xcode Release)"
+            delete "$TARGET_ROOT/release"
+        fi
     fi
 fi
 

@@ -80,7 +80,7 @@ It is supposed to stay partially open and grow over time.
 
 The GraphQL-only read boundary is implemented and documented as repository truth in [query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md). The technical closeout evidence is complete; this backlog owns the remaining productization and operator-acceptance work over that boundary.
 
-- Honest operator dogfood after P036 restores enough inspection ergonomics to evaluate real workflows.
+- Honest operator dogfood over the implemented consolidated navigation baseline in [macos-operator-navigation.md](../reference/macos-operator-navigation.md).
 - Follow-up workflow-completion notes from the release-owner sign-off.
 - Release-candidate readiness for daemon lifecycle behavior, schema mismatch detection, and the operator-facing update-daemon flow.
 - Productization of the read-only write-path guidance so operators understand which actions are external, unavailable, or approval-only.

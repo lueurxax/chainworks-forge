@@ -1,4 +1,5 @@
 use async_graphql::*;
+use auth;
 use db::repos::projections::ApprovalInboxRow;
 use domain::approval::Approval;
 
@@ -115,5 +116,66 @@ fn approval_actionability_fields(
             GqlWritePathState::WritePathNotAvailable,
             Some(format!("approval already {decision}")),
         )
+    }
+}
+
+/// Map a P081 boundary denial reason_code string to the correct GqlDisabledReasonCode.
+fn boundary_reason_to_disabled_code(reason_code: &str) -> GqlDisabledReasonCode {
+    match reason_code {
+        "APPROVAL_NOT_ACTIONABLE" => GqlDisabledReasonCode::ApprovalNotActionable,
+        "OBSERVER_SCOPE" => GqlDisabledReasonCode::ObserverScope,
+        "NON_APPROVAL_MUTATION" => GqlDisabledReasonCode::NonApprovalMutation,
+        "CAPABILITY_OUT_OF_SCOPE" => GqlDisabledReasonCode::CapabilityOutOfScope,
+        _ => GqlDisabledReasonCode::UnsupportedAction,
+    }
+}
+
+impl GqlApproval {
+    /// P081 Phase 4: Apply BoundaryPolicy actionability filtering.
+    /// If the caller's graphql_mutation row enforces a deny, clear available_actions.
+    /// Shadow mode logs but does not remove actionability (non-enforcing).
+    pub fn with_boundary_actionability(
+        mut self,
+        caller_class: &str,
+        decision: &auth::boundary::PolicyDecision,
+    ) -> Self {
+        let enforced_denial = match decision {
+            auth::boundary::PolicyDecision::Deny { reason_code, .. } => Some(reason_code.clone()),
+            auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                // Shadow: log but do not enforce actionability restriction.
+                if let auth::boundary::PolicyDecision::Deny {
+                    reason_code,
+                    row_id,
+                    ..
+                } = matched_decision.as_ref()
+                {
+                    tracing::debug!(
+                        caller_class,
+                        transport = "graphql_mutation",
+                        reason_code = %reason_code,
+                        row_id = ?row_id,
+                        "BoundaryPolicy shadow: matrix would restrict approval actionability"
+                    );
+                }
+                None
+            }
+            auth::boundary::PolicyDecision::Allow { .. }
+            | auth::boundary::PolicyDecision::LegacyPassthrough => None,
+        };
+
+        if let Some(reason_code) = enforced_denial {
+            // SEC-P081-003: Detail logged server-side; not exposed on the wire.
+            tracing::debug!(
+                caller_class,
+                denial_reason = %reason_code,
+                "BoundaryPolicy enforced: approval actionability denied"
+            );
+            db::metrics::record_p081_approval_actionability_false(caller_class, None, &reason_code);
+            self.available_actions = vec![];
+            self.write_path_state = GqlWritePathState::WritePathNotAvailable;
+            self.disabled_reason = Some(format!("boundary policy: {reason_code}"));
+            self.disabled_reason_code = Some(boundary_reason_to_disabled_code(&reason_code));
+        }
+        self
     }
 }

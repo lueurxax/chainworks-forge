@@ -25,7 +25,7 @@ pub fn tool_specs() -> Vec<McpTool> {
             description: "Start a new run for an idea".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "required": ["idea_id", "workflow_id", "workflow_title", "workspace_root", "artifact_root", "workflow_yaml_path", "agent_catalog_yaml_path"],
+                "required": ["idea_id", "workflow_id", "workflow_title", "workspace_root", "artifact_root", "workflow_yaml_path", "agent_catalog_yaml_path", "idempotency_key"],
                 "properties": {
                     "idea_id": { "type": "string", "description": "ID of the idea" },
                     "workflow_id": { "type": "string" },
@@ -39,7 +39,8 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "rollout_contract_preflight_policy_json": {
                         "type": "string",
                         "description": "P084 rollout-contract run-start policy request JSON, capped at 64 KiB by the engine. Accepts waiver and/or enforcement_mode objects; server stamps authorization, principal, and audit event."
-                    }
+                    },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." }
                 }
             }),
         },
@@ -56,7 +57,7 @@ pub fn tool_specs() -> Vec<McpTool> {
         },
         McpTool {
             name: "runs.list".to_string(),
-            description: "List all runs".to_string(),
+            description: "List active runs".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {}
@@ -67,9 +68,10 @@ pub fn tool_specs() -> Vec<McpTool> {
             description: "Cancel a run".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "required": ["run_id"],
+                "required": ["run_id", "idempotency_key"],
                 "properties": {
-                    "run_id": { "type": "string" }
+                    "run_id": { "type": "string" },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." }
                 }
             }),
         },
@@ -277,7 +279,7 @@ pub async fn execute(
                 .as_str()
                 .map(String::from);
 
-            let caller = mcp_caller(&principal.id, &principal.class, "runs.start");
+            let caller = mcp_caller(&principal, "runs.start");
             let cmd = Command::StartRun(StartRunCmd {
                 idea_id,
                 workflow_id,
@@ -377,8 +379,16 @@ pub async fn execute(
         }
 
         "runs.list" => {
-            let items = projections::list_all_projection(pool).await?;
-            Ok(serde_json::to_value(items)?)
+            let started = std::time::Instant::now();
+            let items = projections::list_active_projection(pool).await?;
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                let value = serde_json::to_value(item)?;
+                let value = attach_implementation_self_assessment_summary(pool, value).await?;
+                values.push(value);
+            }
+            db::metrics::record_hot_read_latency("runs.list", started.elapsed());
+            Ok(serde_json::Value::Array(values))
         }
 
         "runs.cancel" => {
@@ -386,7 +396,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
                 .parse()?;
-            let caller = mcp_caller(&principal.id, &principal.class, "runs.cancel");
+            let caller = mcp_caller(&principal, "runs.cancel");
             let cmd = Command::CancelRun(CancelRunCmd { run_id });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             Ok(serde_json::json!({
@@ -406,7 +416,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
                 .to_string();
-            let caller = mcp_caller(&principal.id, &principal.class, "runs.main_sync.request");
+            let caller = mcp_caller(&principal, "runs.main_sync.request");
             cmd_handler
                 .handle(
                     Command::MainSyncRequest(MainSyncRequestCmd {
@@ -432,7 +442,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
                 .to_string();
-            let caller = mcp_caller(&principal.id, &principal.class, "runs.main_sync.retry");
+            let caller = mcp_caller(&principal, "runs.main_sync.retry");
             cmd_handler
                 .handle(
                     Command::MainSyncRetry(MainSyncRetryCmd {
@@ -458,11 +468,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
                 .to_string();
-            let caller = mcp_caller(
-                &principal.id,
-                &principal.class,
-                "runs.main_sync.set_override",
-            );
+            let caller = mcp_caller(&principal, "runs.main_sync.set_override");
             cmd_handler
                 .handle(
                     Command::MainSyncSetRunOverride(MainSyncSetRunOverrideCmd {
@@ -480,11 +486,7 @@ pub async fn execute(
 
         "runs.main_sync.repair_state" => {
             let run_id = parse_run_id(&params)?;
-            let caller = mcp_caller(
-                &principal.id,
-                &principal.class,
-                "runs.main_sync.repair_state",
-            );
+            let caller = mcp_caller(&principal, "runs.main_sync.repair_state");
             cmd_handler
                 .handle(
                     Command::MainSyncRepairState(MainSyncRepairStateCmd {
@@ -509,11 +511,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'summary'"))?
                 .to_string();
-            let caller = mcp_caller(
-                &principal.id,
-                &principal.class,
-                "runs.main_sync.record_recovery_decision",
-            );
+            let caller = mcp_caller(&principal, "runs.main_sync.record_recovery_decision");
             cmd_handler
                 .handle(
                     Command::MainSyncRecordRecoveryDecision(MainSyncRecordRecoveryDecisionCmd {
@@ -539,11 +537,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
                 .to_string();
-            let caller = mcp_caller(
-                &principal.id,
-                &principal.class,
-                "runs.knowledge_capsule.ignore",
-            );
+            let caller = mcp_caller(&principal, "runs.knowledge_capsule.ignore");
             cmd_handler
                 .handle(
                     Command::KnowledgeCapsuleIgnore(KnowledgeCapsuleIgnoreCmd {
@@ -707,7 +701,7 @@ pub async fn execute(
                 other => anyhow::bail!("invalid proposal gate settlement action '{other}'"),
             };
 
-            let caller = mcp_caller(&principal.id, &principal.class, "runs.settle_proposal_gate");
+            let caller = mcp_caller(&principal, "runs.settle_proposal_gate");
             let commanded = cmd_handler
                 .handle(
                     Command::SettleProposalGate(SettleProposalGateCmd {
@@ -827,19 +821,32 @@ async fn attach_implementation_self_assessment_summary(
         .map(|check| check.operator_readback_json_for_lane("mcp")),
         None => None,
     };
+    // P087/P088: If the projection already includes implementationCompletion (baked by
+    // refresh_run_list_readbacks via rebuild_all_for_run), use it directly and skip all
+    // receipt DB queries — the full-fidelity receipts list is available on the single-run
+    // detail path. Fall back to live receipt queries only for legacy runs without baked
+    // projections so the list path stays to one query per run.
+    let projected_implementation_completion = value
+        .get("implementationCompletion")
+        .filter(|v| !v.is_null())
+        .cloned();
     let code_writer_completion_receipts = match run_id {
         Some(run_id) => {
-            let receipts = code_writer_completion_receipts::list_by_run(pool, run_id).await?;
-            let canonical_receipts =
-                code_writer_completion_receipts::list_canonical_by_run(pool, run_id).await?;
-            Some((
-                serde_json::to_value(&receipts)?,
-                serde_json::to_value(
+            if let Some(projected) = projected_implementation_completion {
+                Some((serde_json::Value::Null, projected))
+            } else {
+                let canonical_receipts =
+                    code_writer_completion_receipts::list_canonical_by_run(pool, run_id).await?;
+                let implementation_completion = serde_json::to_value(
                     domain::code_writer_completion::project_implementation_completion(
                         &canonical_receipts,
                     ),
-                )?,
-            ))
+                )?;
+                Some((
+                    serde_json::to_value(&canonical_receipts)?,
+                    implementation_completion,
+                ))
+            }
         }
         None => None,
     };
@@ -1045,12 +1052,10 @@ mod tests {
         let pool = create_pool("sqlite::memory:")
             .await
             .expect("in-memory pool failed");
-        db::writer::register_shared_writer(
-            &pool,
-            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
-        )
-        .await
-        .expect("register shared writer");
+        let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .expect("register shared DbWriter for test pool");
         pool
     }
 
@@ -1455,36 +1460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runs_get_includes_implementation_self_assessment_summary() {
-        let pool = test_pool().await;
-        let idea_id = IdeaId::new();
-        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        let run = make_run(RunId::new(), idea_id);
-        runs::insert(&pool, &run).await.unwrap();
-        persist_blocked_implementation_summary(&pool, run.id).await;
-        db::repos::projections::rebuild_all_for_run(&pool, run.id)
-            .await
-            .unwrap();
-
-        let handler = make_command_handler(pool.clone());
-        let result = execute(
-            "runs.get",
-            serde_json::json!({"run_id": run.id.to_string()}),
-            &pool,
-            &handler,
-            &test_principal(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            result["implementation_self_assessment_summary"]["status"],
-            serde_json::json!("blocked")
-        );
-    }
-
-    #[tokio::test]
-    async fn proposal_087_runs_list_is_projection_only_without_detail_attachments() {
+    async fn runs_list_includes_implementation_self_assessment_summary() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
@@ -1507,22 +1483,106 @@ mod tests {
         .unwrap();
 
         let item = result.as_array().unwrap().first().unwrap();
-        for forbidden in [
-            "implementation_self_assessment_summary",
-            "code_writer_completion_receipts",
-            "rollout_contract_readback",
-            "side_effect_readback",
-        ] {
-            assert!(
-                item.get(forbidden).is_none(),
-                "runs.list must stay projection-only and omit {forbidden}: {item}"
-            );
-        }
-        assert!(
-            item.get("implementationCompletion").is_some(),
-            "runs.list keeps P088 compatibility via projection-backed compact summary"
+        assert_eq!(
+            item["implementation_self_assessment_summary"]["status"],
+            serde_json::json!("blocked")
         );
-        assert_eq!(item["total_stages"], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn runs_list_records_production_read_latency_metric() {
+        db::repos::storage_health::reset_read_path_metrics_for_tests();
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let run = make_run(RunId::new(), idea_id);
+        runs::insert(&pool, &run).await.unwrap();
+        db::repos::projections::rebuild_all_for_run(&pool, run.id)
+            .await
+            .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        execute(
+            "runs.list",
+            serde_json::json!({}),
+            &pool,
+            &handler,
+            &test_principal(),
+        )
+        .await
+        .unwrap();
+
+        let health = db::repos::storage_health::storage_health(&pool)
+            .await
+            .unwrap();
+        assert!(
+            health["readPath"]["runsList"]["sampleCount"]
+                .as_u64()
+                .is_some_and(|n| n >= 1),
+            "expected at least 1 runs.list sample after call"
+        );
+        assert!(health["readPath"]["runsList"]["p95Ms"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn proposal_087_runs_list_p95_stays_under_budget_from_projection() {
+        db::repos::storage_health::reset_read_path_metrics_for_tests();
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        for index in 0..120 {
+            let run = make_run(RunId::new(), idea_id);
+            runs::insert(&pool, &run).await.unwrap();
+            sqlx::query(
+                r#"INSERT INTO run_summaries
+                   (run_id, idea_id, workflow_title, status, total_stages, completed_stages,
+                    failed_stages, pending_approvals, started_at, updated_at)
+                   VALUES (?1, ?2, ?3, 'ready', ?4, 0, 0, 0, ?5, ?5)"#,
+            )
+            .bind(run.id.to_string())
+            .bind(idea_id.to_string())
+            .bind(format!("Workflow {index}"))
+            .bind((index % 4) as i64)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let handler = make_command_handler(pool.clone());
+        let mut durations_ms = Vec::new();
+        for _ in 0..8 {
+            let started = std::time::Instant::now();
+            let result = execute(
+                "runs.list",
+                serde_json::json!({}),
+                &pool,
+                &handler,
+                &test_principal(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.as_array().unwrap().len(), 120);
+            durations_ms.push(started.elapsed().as_millis() as u64);
+        }
+        durations_ms.sort_unstable();
+        let p95 = durations_ms[durations_ms.len() - 1];
+        assert!(
+            p95 <= 500,
+            "projection-backed runs.list p95 must stay under 500 ms, got {p95} ms from samples {durations_ms:?}"
+        );
+
+        let health = db::repos::storage_health::storage_health(&pool)
+            .await
+            .unwrap();
+        assert_eq!(health["readPath"]["runsList"]["sampleCount"], 8);
+        assert!(
+            health["readPath"]["runsList"]["p95Ms"]
+                .as_u64()
+                .unwrap_or(u64::MAX)
+                <= 500
+        );
     }
 
     #[test]

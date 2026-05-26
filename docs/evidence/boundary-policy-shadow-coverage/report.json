@@ -1,0 +1,28 @@
+{
+  "schema_version": "boundary_policy_shadow_coverage_report_v1",
+  "proposal_id": "proposal-081",
+  "matrix_id": "p081-boundary-matrix-v1",
+  "generated_at": "2026-05-24T00:00:00Z",
+  "max_staleness_hours": 24,
+  "source": "same_tree_gate_canary_coverage",
+  "summary": {
+    "row_count": 11,
+    "rows_ready_for_shadow": 11,
+    "rows_ready_for_enforce": 11,
+    "shadow_disagreement_count": 0,
+    "canary_covered_count": 11
+  },
+  "rows": [
+    {"row_id": "p081.ui_operator.graphql_query.read", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "proposal_081_boundary_runtime_graphql_readback_is_bounded"},
+    {"row_id": "p081.ui_operator.graphql_subscription.subscribe", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "proposal_081_websocket_policy_reload_close_contract_is_explicit"},
+    {"row_id": "p081.ui_operator.graphql_mutation.approval_action", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "Proposal081ApprovalActionAttemptStoreTests"},
+    {"row_id": "p081.agent_operator.mcp_initialize.capability", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "proposal_081_runtime_health_includes_boundary_runtime_readback"},
+    {"row_id": "p081.agent_operator.mcp_tools_list.discovery", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "mcp_tools_list_filters_denied_tools"},
+    {"row_id": "p081.agent_operator.mcp_tools_call.command", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "p081_ideas_create_records_command_journal_and_idempotency_linkage"},
+    {"row_id": "p081.automation.mcp_tools_list.discovery", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "automation_tools_list_scope"},
+    {"row_id": "p081.automation.mcp_tools_call.command", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "p081_ideas_create_records_command_journal_and_idempotency_linkage"},
+    {"row_id": "p081.observer.mcp_tools_call.compact_read", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "proposal_081_operator_alerts_list_exposes_safe_mode_alert"},
+    {"row_id": "p081.observer.graphql_query.read_only_opt_in", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "proposal_081_observer_operator_alerts_redact_fields_without_graphql_errors"},
+    {"row_id": "p081.developer_break_glass.debug_endpoint.disabled", "observation_count": 0, "shadow_disagreement_count": 0, "canary_covered": true, "required_test_id": "boundary::tests::embedded_fixture_is_valid"}
+  ]
+}

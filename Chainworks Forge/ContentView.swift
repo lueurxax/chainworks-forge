@@ -52,6 +52,8 @@ struct ContentView: View {
     enum UISurface: String {
         case completedExportHub = "completed_export_hub"
         case p077CloseoutReadiness = "p077_closeout_readiness"
+        case p093TimelineProof = "p093_timeline_proof"
+        case p093TimelineSingleAgentProof = "p093_timeline_single_agent_proof"
     }
 
 
@@ -111,170 +113,172 @@ struct ContentView: View {
         }
     }
 
-    private var tabShell: some View {
-        TabView(selection: $selectedTab) {
-            tabContent(.runs) {
-                RunsHomeView(model: runsModel, workbench: workbench, initialTab: .overview)
+    private var tabShell: AnyView {
+        AnyView(
+            P036MainShell(
+                selectedTab: $selectedTab,
+                pendingApprovals: runsModel.totalPendingApprovalCount,
+                blockedRuns: runsModel.runsHome?.rows.filter { $0.lane == .blocked }.count ?? 0,
+                runningRuns: runsModel.runsHome?.rows.filter { $0.lane == .running }.count ?? 0
+            ) {
+                selectedTabContent
             }
-            .tabItem { Label("Runs", systemImage: "house") }
-            .tag(Tab.runs)
-            .badge(runsModel.totalPendingApprovalCount > 0 ? runsModel.totalPendingApprovalCount : 0)
-
-            tabContent(.ideas) {
-                if P031IdeasCompatibilitySurface.usesUITestFixture {
-                    P031IdeasCompatibilitySurface()
-                } else {
-                    P031DaemonIdeasSurface()
-                }
+            .onAppear(perform: applyStartupRoute)
+            .onReceive(NotificationCenter.default.publisher(for: .chainworksSelectTab), perform: handleTabSelectionNotification)
+            .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { _ in openRunsHome() }
+            .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenSystemReadiness)) { _ in openSystemReadiness() }
+            .onChange(of: runsModel.runsHome) {
+                syncRunsHomePresentation()
             }
-            .tabItem { Label("Ideas", systemImage: "lightbulb") }
-            .tag(Tab.ideas)
-
-            tabContent(.definitions) {
-                DefinitionsView(
-                    catalogURL: exampleFileURL(
-                        environmentKey: "CHAINWORKS_AGENT_CATALOG_SOURCE_PATH",
-                        bundleName: "agents",
-                        repoRelativePath: "examples/agents/agents.yaml"
-                    ),
-                    workflowURL: exampleFileURL(
-                        environmentKey: "CHAINWORKS_WORKFLOW_SOURCE_PATH",
-                        bundleName: "workflow",
-                        repoRelativePath: "examples/workflows/workflow.yaml"
-                    ),
-                    compactWorkflowURL: exampleFileURL(
-                        environmentKey: nil,
-                        bundleName: "proposal-to-release",
-                        repoRelativePath: "examples/workflows/proposal-to-release.yaml"
-                    ),
-                    segmentRequest: $definitionsSegmentRequest
-                )
+            .onChange(of: runsModel.runDetail) {
+                syncRunDetailPresentation()
             }
-            .tabItem { Label("Definitions", systemImage: "square.grid.2x2") }
-            .tag(Tab.definitions)
-
-            tabContent(.settings) {
-                SettingsView(
-                    runsModel: runsModel,
-                    workbench: workbench,
-                    returnRunID: systemReadinessReturnRunID,
-                    onClearReturnRunID: { systemReadinessReturnRunID = nil }
-                )
+            .onChange(of: runsModel.daemonLifecycle) {
+                syncReadinessPresentation()
             }
-            .tabItem { Label("Settings", systemImage: "slider.horizontal.3") }
-            .tag(Tab.settings)
+            .onChange(of: runsModel.schedulerHealth) {
+                syncReadinessPresentation()
+            }
+            .onOpenURL(perform: handleOpenURL)
+        )
+    }
 
-        }
-        .task(id: forcedInitialTab?.rawValue ?? "default") {
-            guard let forcedInitialTab, selectedTab != forcedInitialTab else { return }
+    private func applyStartupRoute() {
+        if let forcedInitialTab, selectedTab != forcedInitialTab {
             selectedTab = forcedInitialTab
         }
-        // P036: when CHAINWORKS_UI_TEST_INITIAL_TAB=approvals, post the waiting-approval
-        // focus notification after the view has loaded and data may have settled.
-        .task(id: focusWaitingApprovalOnLoad ? "approvals-focus" : "noop") {
-            guard focusWaitingApprovalOnLoad else { return }
-            // PC-003: set workbench flag so RunsHomeView handles it on mount even if
-            // lanes haven't loaded yet (onChange initial:true picks it up).
-            workbench.requestFocusWaitingApprovalLane()
-            NotificationCenter.default.post(name: .chainworksFocusWaitingApprovalLane, object: nil)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .chainworksSelectTab)) { notification in
-            let rawValueFromUserInfo = notification.userInfo?["tab"] as? String
-            let rawValueFromObject = notification.object as? String
-            let rawValue = rawValueFromUserInfo ?? rawValueFromObject
 
-            guard let rawValue, let tab = Tab.from(rawValue: rawValue) else {
-                #if DEBUG
-                if let rawValue {
-                    print("[P036] chainworksSelectTab: unknown rawValue '\(rawValue)'")
-                }
-                #endif
-                return
-            }
-            let previousTab = selectedTab
-            selectedTab = tab
-            P036UICounters.shared.recordTabRouteResolution(
-                source: previousTab.rawValue,
-                target: tab.rawValue,
-                result: "routed"
-            )
+        guard focusWaitingApprovalOnLoad else { return }
+        // PC-003: set workbench flag so RunsHomeView handles it on mount even if
+        // lanes haven't loaded yet (onChange initial:true picks it up).
+        focusWaitingApprovalLane()
+    }
 
-            // Segment routing: honor both camelCase and title-case alias forms so
-            // CHAINWORKS_UI_TEST_INITIAL_TAB and notification routing stay in sync.
-            switch rawValue {
-            case "workflowInspector", "Workflow Inspector":
-                definitionsSegmentRequest = .workflows
-            case "agentCatalog", "Agent Catalog":
-                definitionsSegmentRequest = .agents
-            case "Approvals", "approvals":
-                // PC-003: set workbench flag before posting notification. The flag survives
-                // the tab-switch render cycle so RunsHomeView picks it up on mount even
-                // if the notification fires before the view is in the hierarchy.
-                workbench.requestFocusWaitingApprovalLane()
-                NotificationCenter.default.post(name: .chainworksFocusWaitingApprovalLane, object: nil)
-            default:
-                break
+    private func handleTabSelectionNotification(_ notification: Notification) {
+        let rawValueFromUserInfo = notification.userInfo?["tab"] as? String
+        let rawValueFromObject = notification.object as? String
+        let rawValue = rawValueFromUserInfo ?? rawValueFromObject
+
+        guard let rawValue, let tab = Tab.from(rawValue: rawValue) else {
+            #if DEBUG
+            if let rawValue {
+                print("[P036] chainworksSelectTab: unknown rawValue '\(rawValue)'")
             }
+            #endif
+            return
         }
-        .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { _ in
-            selectedTab = .runs
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenSystemReadiness)) { _ in
-            // Capture the currently selected run as a return target before switching tabs,
-            // so the operator can navigate back to the exact run after inspecting readiness.
-            systemReadinessReturnRunID = runsModel.selectedRunID
-            selectedTab = .settings
-        }
-        .onChange(of: runsModel.runsHome) {
-            if let newValue = runsModel.runsHome {
-                workbench.populate(from: newValue)
-            }
-        }
-        .onChange(of: runsModel.runDetail) {
-            if let newValue = runsModel.runDetail {
-                workbench.populate(from: newValue)
-            }
-        }
-        .onChange(of: runsModel.daemonLifecycle) {
-            workbench.populate(daemon: runsModel.daemonLifecycle, scheduler: runsModel.schedulerHealth)
-        }
-        .onChange(of: runsModel.schedulerHealth) {
-            workbench.populate(daemon: runsModel.daemonLifecycle, scheduler: runsModel.schedulerHealth)
-        }
-        .onOpenURL { url in
-            guard url.scheme == "chainworks" else { return }
-            switch url.host {
-            case "runs":
-                selectedTab = .runs
-                if let runID = url.pathComponents.last, runID != "/" {
-                    runsModel.selectRun(runID)
-                }
-            case "ideas":
-                selectedTab = .ideas
-            case "definitions":
-                selectedTab = .definitions
-            case "settings":
-                selectedTab = .settings
-            case "approvals":
-                selectedTab = .runs
-                // PC-003: set workbench flag before notification for same race fix as selectTab path.
-                workbench.requestFocusWaitingApprovalLane()
-                NotificationCenter.default.post(name: .chainworksFocusWaitingApprovalLane, object: nil)
-            default:
-                break
-            }
+
+        selectTab(tab, result: "routed")
+
+        switch rawValue {
+        case "workflowInspector", "Workflow Inspector":
+            definitionsSegmentRequest = .workflows
+        case "agentCatalog", "Agent Catalog":
+            definitionsSegmentRequest = .agents
+        case "Approvals", "approvals":
+            focusWaitingApprovalLane()
+        default:
+            break
         }
     }
 
+    private func handleOpenURL(_ url: URL) {
+        guard url.scheme == "chainworks" else { return }
+        switch url.host {
+        case "runs":
+            selectTab(.runs, result: "deep_link")
+            if let runID = url.pathComponents.last, runID != "/" {
+                runsModel.selectRun(runID)
+            }
+        case "ideas":
+            selectTab(.ideas, result: "deep_link")
+        case "definitions":
+            selectTab(.definitions, result: "deep_link")
+        case "settings":
+            selectTab(.settings, result: "deep_link")
+        case "approvals":
+            selectTab(.runs, result: "deep_link")
+            focusWaitingApprovalLane()
+        default:
+            break
+        }
+    }
+
+    private func selectTab(_ tab: Tab, result: String) {
+        let previousTab = selectedTab
+        selectedTab = tab
+        P036UICounters.shared.recordTabRouteResolution(
+            source: previousTab.rawValue,
+            target: tab.rawValue,
+            result: previousTab == tab ? "already_selected" : result
+        )
+    }
+
+    private func focusWaitingApprovalLane() {
+        workbench.requestFocusWaitingApprovalLane()
+        NotificationCenter.default.post(name: .chainworksFocusWaitingApprovalLane, object: nil)
+    }
+
+    private func openRunsHome() {
+        selectTab(.runs, result: "notification")
+    }
+
+    private func openSystemReadiness() {
+        systemReadinessReturnRunID = runsModel.selectedRunID
+        selectTab(.settings, result: "notification")
+    }
+
+    private func syncRunsHomePresentation() {
+        guard let runsHome = runsModel.runsHome else { return }
+        workbench.populate(from: runsHome)
+    }
+
+    private func syncRunDetailPresentation() {
+        guard let runDetail = runsModel.runDetail else { return }
+        workbench.populate(from: runDetail)
+    }
+
+    private func syncReadinessPresentation() {
+        workbench.populate(daemon: runsModel.daemonLifecycle, scheduler: runsModel.schedulerHealth)
+    }
+
     @ViewBuilder
-    private func tabContent<Content: View>(
-        _ tab: Tab,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        if selectedTab == tab {
-            content()
-        } else {
-            Color.clear.accessibilityHidden(true)
+    private var selectedTabContent: some View {
+        switch selectedTab {
+        case .runs:
+            RunsHomeView(model: runsModel, workbench: workbench, initialTab: .overview)
+        case .ideas:
+            if P031IdeasCompatibilitySurface.usesUITestFixture {
+                P031IdeasCompatibilitySurface()
+            } else {
+                P031DaemonIdeasSurface()
+            }
+        case .definitions:
+            DefinitionsView(
+                catalogURL: exampleFileURL(
+                    environmentKey: "CHAINWORKS_AGENT_CATALOG_SOURCE_PATH",
+                    bundleName: "agents",
+                    repoRelativePath: "examples/agents/agents.yaml"
+                ),
+                workflowURL: exampleFileURL(
+                    environmentKey: "CHAINWORKS_WORKFLOW_SOURCE_PATH",
+                    bundleName: "workflow",
+                    repoRelativePath: "examples/workflows/workflow.yaml"
+                ),
+                compactWorkflowURL: exampleFileURL(
+                    environmentKey: nil,
+                    bundleName: "proposal-to-release",
+                    repoRelativePath: "examples/workflows/proposal-to-release.yaml"
+                ),
+                segmentRequest: $definitionsSegmentRequest
+            )
+        case .settings:
+            SettingsView(
+                runsModel: runsModel,
+                workbench: workbench,
+                returnRunID: systemReadinessReturnRunID,
+                onClearReturnRunID: { systemReadinessReturnRunID = nil }
+            )
         }
     }
 
@@ -302,6 +306,18 @@ struct ContentView: View {
 #else
             RunsHomeView(workbench: workbench)
 #endif
+        case .p093TimelineProof:
+#if DEBUG
+            P093TimelineProofSurface()
+#else
+            RunsHomeView(workbench: workbench)
+#endif
+        case .p093TimelineSingleAgentProof:
+#if DEBUG
+            P093TimelineProofSurface(singleAgentOnly: true)
+#else
+            RunsHomeView(workbench: workbench)
+#endif
         }
     }
 
@@ -320,6 +336,43 @@ struct ContentView: View {
             configuredURL: configuredURL,
             repoRelativePath: repoRelativePath,
             bundledURL: Bundle.main.url(forResource: bundleName, withExtension: "yaml")
+        )
+    }
+}
+
+private struct P036MainShell<Content: View>: View {
+    @Binding var selectedTab: ContentView.Tab
+
+    let pendingApprovals: Int
+    let blockedRuns: Int
+    let runningRuns: Int
+    @ViewBuilder let content: () -> Content
+
+    var body: AnyView {
+        AnyView(
+            HStack(spacing: 0) {
+                P036ShellSidebar(
+                    selectedTab: selectedTab,
+                    pendingApprovals: pendingApprovals,
+                    blockedRuns: blockedRuns,
+                    runningRuns: runningRuns,
+                    onSelect: selectTab
+                )
+                Divider()
+                content()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .background(ForgeColor.Surface.appBackground)
+        )
+    }
+
+    private func selectTab(_ tab: ContentView.Tab) {
+        let previousTab = selectedTab
+        selectedTab = tab
+        P036UICounters.shared.recordTabRouteResolution(
+            source: previousTab.rawValue,
+            target: tab.rawValue,
+            result: previousTab == tab ? "already_selected" : "routed"
         )
     }
 }
@@ -572,7 +625,7 @@ private struct P031DaemonIdeaRunRow: View {
             Spacer()
             if let pending = run.pendingApprovals, pending > 0 {
                 Image(systemName: "checkmark.seal.fill")
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(ForgeStatusColor.approval)
                     .font(.caption)
                 Text("\(pending)")
                     .font(.caption.monospacedDigit())
@@ -920,6 +973,121 @@ private struct P031CompletedExportHubCompatibilitySurface: View {
         } catch {
             exportMessage = "Export failed: \(error.localizedDescription)"
         }
+    }
+}
+
+
+private struct P036ShellSidebar: View {
+    let selectedTab: ContentView.Tab
+    let pendingApprovals: Int
+    let blockedRuns: Int
+    let runningRuns: Int
+    let onSelect: (ContentView.Tab) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 10) {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(ForgeColor.Brand.accent)
+                        .frame(width: 28, height: 28)
+                        .overlay {
+                            Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(.white)
+                        }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Chainworks Forge")
+                            .font(.headline)
+                        Text("Run control plane")
+                            .font(ForgeTypography.micro)
+                            .foregroundStyle(ForgeColor.Text.secondary)
+                    }
+                }
+                if pendingApprovals > 0 || blockedRuns > 0 || runningRuns > 0 {
+                    HStack(spacing: 6) {
+                        if pendingApprovals > 0 {
+                            sidebarCount("Approvals", pendingApprovals, ForgeStatusColor.approval)
+                        }
+                        if blockedRuns > 0 {
+                            sidebarCount("Blocked", blockedRuns, ForgeStatusColor.error)
+                        }
+                        if runningRuns > 0 {
+                            sidebarCount("Running", runningRuns, ForgeStatusColor.running)
+                        }
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Workspace")
+                    .font(ForgeTypography.micro.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                    .textCase(.uppercase)
+                sidebarButton(.runs, icon: "square.stack.3d.up", count: pendingApprovals)
+                sidebarButton(.ideas, icon: "lightbulb")
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Catalog")
+                    .font(ForgeTypography.micro.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                    .textCase(.uppercase)
+                sidebarButton(.definitions, icon: "square.grid.2x2")
+                sidebarButton(.settings, icon: "slider.horizontal.3")
+            }
+
+            Spacer()
+        }
+        .padding(14)
+        .frame(minWidth: 230, idealWidth: 230, maxWidth: 230, maxHeight: .infinity, alignment: .topLeading)
+        .background(ForgeColor.Surface.elevated)
+        .accessibilityIdentifier("p036-branded-sidebar")
+    }
+
+    @ViewBuilder
+    private func sidebarButton(_ tab: ContentView.Tab, icon: String, count: Int = 0) -> some View {
+        Button {
+            onSelect(tab)
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: icon)
+                    .frame(width: 16)
+                Text(tab.rawValue)
+                    .font(.subheadline.weight(selectedTab == tab ? .semibold : .regular))
+                Spacer()
+                if count > 0 {
+                    Text("\(count)")
+                        .font(ForgeTypography.micro.weight(.semibold))
+                        .foregroundStyle(ForgeStatusColor.approval)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(ForgeStatusColor.approval.opacity(0.16), in: Capsule())
+                }
+            }
+            .foregroundStyle(selectedTab == tab ? ForgeColor.Text.primary : ForgeColor.Text.secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                selectedTab == tab ? ForgeColor.Brand.accentMuted : Color.clear,
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(selectedTab == tab ? ForgeColor.Brand.accent.opacity(0.28) : Color.clear, lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("p036-sidebar-\(tab.rawValue.lowercased())")
+    }
+
+    private func sidebarCount(_ label: String, _ value: Int, _ color: Color) -> some View {
+        Text("\(label) \(value)")
+            .font(ForgeTypography.micro.weight(.semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.14), in: Capsule())
     }
 }
 

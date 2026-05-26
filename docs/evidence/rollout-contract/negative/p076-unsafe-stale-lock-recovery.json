@@ -1,0 +1,15 @@
+{
+  "fixture_description": "P076 stale lock recovery that used simple token replacement without verifying all required identity fields, allowing a window where two writers could proceed concurrently.",
+  "proves_unsafe_stale_lock_recovery": true,
+  "violation": "stale_lock_recovery_used_simple_overwrite_without_compare_and_replace",
+  "hold_condition_triggered": "Unsafe stale-lock recovery",
+  "required_behavior": "Stale lock recovery must use atomic compare-and-replace on the lock token. Token verification failure records observe_only and exits. Liveness must check hostname, boot/session identity, PID, process start time, command identity, and token.",
+  "recovery_attempt": {
+    "method_used": "direct_overwrite",
+    "correct_method": "atomic_compare_and_replace_on_lock_token",
+    "token_verified_before_replace": false,
+    "liveness_fields_checked": ["hostname", "pid"],
+    "liveness_fields_not_checked": ["boot_id_or_session_id", "process_start_time", "command_identity"],
+    "risk": "Another writer may have acquired the lock between the liveness check and the replacement, creating two concurrent writers."
+  }
+}

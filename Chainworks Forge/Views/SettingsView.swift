@@ -10,7 +10,7 @@ struct SettingsView: View {
     @State private var showDiagnosticsDetail = false
     
     enum Segment: String, CaseIterable {
-        case readiness = "System Readiness"
+        case readiness = "System readiness"
         case provider = "Provider"
     }
     
@@ -31,12 +31,7 @@ struct SettingsView: View {
                 case .readiness:
                     systemReadinessView
                 case .provider:
-                    P031OperatorPlaceholder(
-                        title: "Provider Settings",
-                        message: "Provider configuration is owned by the control plane and packaged daemon.",
-                        identifier: "provider-settings-view",
-                        titleIdentifier: "provider-settings-title"
-                    )
+                    providerSettingsView
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -49,35 +44,35 @@ struct SettingsView: View {
     
     private var systemReadinessView: some View {
         List {
-            Section("Overall Readiness") {
+            Section("Overall readiness") {
                 HStack {
                     Text("Status")
                     Spacer()
                     if workbench.freshnessAndHealth?.isReadinessDeferred == true {
-                        Label("Readiness Pending", systemImage: "clock.badge.questionmark")
+                        Label("Readiness pending", systemImage: "clock.badge.questionmark")
                             .foregroundStyle(.secondary)
                     } else if workbench.freshnessAndHealth?.isSystemReady == true {
                         Label("Ready", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
+                            .foregroundStyle(ForgeStatusColor.success)
                     } else {
-                        Label("Check Diagnostics", systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
+                        Label("Check diagnostics", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(ForgeStatusColor.warning)
                     }
                 }
             }
             
             Section {
-                DisclosureGroup("Diagnostics & Configuration Paths") {
+                DisclosureGroup("Diagnostics and configuration paths") {
                     VStack(alignment: .leading, spacing: 10) {
-                        LabeledContent("App Bundle", value: redactedPath(Bundle.main.bundlePath))
-                        LabeledContent("Working Dir", value: redactedPath(FileManager.default.currentDirectoryPath))
+                        LabeledContent("App bundle", value: redactedPath(Bundle.main.bundlePath))
+                        LabeledContent("Working directory", value: redactedPath(FileManager.default.currentDirectoryPath))
                     }
                     .padding(.vertical, 4)
                 }
             }
             .accessibilityIdentifier("settings-diagnostics-section")
             
-            Section("Provider Health") {
+            Section("Provider health") {
                 if let readback = runsModel.schedulerHealth, !readback.activeProviders.isEmpty {
                     ForEach(readback.activeProviders) { provider in
                         LabeledContent(provider.providerFamily, value: "\(provider.activeCount) active")
@@ -89,12 +84,12 @@ struct SettingsView: View {
             }
             
             Section("Readiness") {
-                LabeledContent("Server Status", value: workbench.freshnessAndHealth?.daemonHealth ?? "Unknown")
-                LabeledContent("MCP Hub", value: workbench.freshnessAndHealth?.mcpHubStatus ?? "Unknown")
+                LabeledContent("Server status", value: workbench.freshnessAndHealth?.daemonHealth ?? "Unknown")
+                LabeledContent("MCP hub", value: workbench.freshnessAndHealth?.mcpHubStatus ?? "Unknown")
                 LabeledContent("Capabilities", value: workbench.freshnessAndHealth?.capabilitiesStatus ?? "Pending")
             }
             
-            Section("Scheduler Health") {
+            Section("Scheduler health") {
                 if let schedulerLabel = workbench.freshnessAndHealth?.schedulerHealth {
                     LabeledContent("Status", value: schedulerLabel)
                 } else {
@@ -103,7 +98,7 @@ struct SettingsView: View {
                 }
             }
             
-            Section("Daemon Connection") {
+            Section("Daemon connection") {
                 if let daemon = runsModel.daemonLifecycle {
                     LabeledContent("Mode", value: daemon.state?.rawValue.capitalized ?? "Unknown")
                     LabeledContent("Uptime", value: "\(daemon.uptimeSeconds ?? 0)s")
@@ -113,7 +108,7 @@ struct SettingsView: View {
                     }
                 } else {
                     Text("Daemon disconnected or unavailable")
-                        .foregroundStyle(.red)
+                        .foregroundStyle(ForgeStatusColor.error)
                 }
             }
 
@@ -130,7 +125,7 @@ struct SettingsView: View {
                     } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Return to Run")
+                                Text("Return to run")
                                     .font(.body)
                                 if let title = returnTitle {
                                     Text(title)
@@ -150,7 +145,7 @@ struct SettingsView: View {
             }
 
             if let blocked = runsModel.runsHome?.rows.filter({ $0.lane == .blocked }), !blocked.isEmpty {
-                Section("Actionable Runs") {
+                Section("Actionable runs") {
                     ForEach(blocked, id: \.runID) { run in
                         Button {
                             NotificationCenter.default.post(name: .chainworksOpenRunInRunsHome, object: run.runID)
@@ -170,9 +165,9 @@ struct SettingsView: View {
             }
             
             Section {
-                Toggle("Show Diagnostics Detail", isOn: $showDiagnosticsDetail)
+                Toggle("Show diagnostics detail", isOn: $showDiagnosticsDetail)
                     .accessibilityIdentifier("settings-diagnostics-detail-toggle")
-                Button("Refresh Readiness") {
+                Button("Refresh readiness") {
                     Task {
                         await runsModel.refreshDaemonLifecycle()
                     }
@@ -182,6 +177,53 @@ struct SettingsView: View {
         }
         .listStyle(.inset)
         .accessibilityIdentifier("system-readiness-view")
+    }
+
+    private var providerSettingsView: some View {
+        List {
+            Section("Provider capacity") {
+                if let readback = runsModel.schedulerHealth, !readback.activeProviders.isEmpty {
+                    ForEach(readback.activeProviders) { provider in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text(provider.providerFamily)
+                                    .font(ForgeTypography.cardTitle)
+                                Spacer()
+                                StatusCapsule(
+                                    text: "\(provider.activeCount) active",
+                                    color: provider.activeCount > 0 ? ForgeStatusColor.running : ForgeStatusColor.neutral,
+                                    icon: provider.activeCount > 0 ? "bolt.fill" : "pause.circle",
+                                    size: .small
+                                )
+                            }
+                            Text("Control-plane provider family")
+                                .font(ForgeTypography.supporting)
+                                .foregroundStyle(ForgeColor.Text.secondary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                } else {
+                    ContentUnavailableView(
+                        "No provider readback",
+                        systemImage: "externaldrive.badge.questionmark",
+                        description: Text("Refresh readiness to load provider capacity from the control plane.")
+                    )
+                }
+            }
+
+            Section("Runtime diagnostics") {
+                LabeledContent("Daemon", value: workbench.freshnessAndHealth?.daemonHealth ?? "Unknown")
+                LabeledContent("Scheduler", value: workbench.freshnessAndHealth?.schedulerHealth ?? "Unavailable")
+                LabeledContent("Capabilities", value: workbench.freshnessAndHealth?.capabilitiesStatus ?? "Pending")
+                Button("Refresh provider diagnostics") {
+                    Task {
+                        await runsModel.refreshDaemonLifecycle()
+                    }
+                }
+            }
+        }
+        .listStyle(.inset)
+        .accessibilityIdentifier("provider-settings-view")
     }
     
     private func redactedPath(_ path: String) -> String {

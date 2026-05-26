@@ -1,43 +1,20 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "forced_cancel_proof",
+  "fixture_purpose": "Cancellation must fail closed: before provider_send it settles cancelled with artifacts, after provider_send it records provider_cancel and moves to reconciliation instead of releasing the worktree as safe.",
+  "status": "pass",
+  "evidence_kind": "code_and_regression_test",
+  "evidence": {
+    "implemented": {
+      "location": "control-plane/crates/engine/src/executor.rs::run_continuation_worker",
+      "mechanism": "cancelling rows check the provider_send ledger. No provider_send settles cancelled/cancelled_before_provider_send with terminal artifacts. Existing provider_send records provider_cancel and moves to needs_continuation_reconciliation/cancel_termination_unverified."
+    },
+    "supporting_repo_helpers": [
+      "control-plane/crates/db/src/repos/agent_work_continuations.rs::has_side_effect_ledger_row",
+      "control-plane/crates/db/src/repos/agent_work_continuations.rs::insert_side_effect_ledger_row"
+    ]
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:cancel_timeout_termination_unverified",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "cancel_without_termination_proof_fails_closed"
 }

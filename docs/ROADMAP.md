@@ -21,7 +21,8 @@ These are not active workstreams:
 
 ## Recently Stabilized
 
-- **P087** Local storage tiering, read-path liveness, and SQLite exit criteria. Preserves existing GraphQL `StorageHealth.projections` while exposing new identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `StorageHealth.projectionFreshness` and `StorageHealth.projectionFreshnessBySource`.
+- **Storage tiering/read-path liveness (retained alias: P087)**. Preserves existing GraphQL `StorageHealth.projections` while exposing identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `StorageHealth.projectionFreshness` and `StorageHealth.projectionFreshnessBySource`. Operational truth lives in [query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) and [rust-control-plane.md](reference/rust-control-plane.md).
+- **Retry authority payload target invariants and recovery (retained historical alias: P092)**. Targeted retry payloads keep current target routing separate from source provenance, valid completed retry invokes can be recovered through startup/live reconciliation, and durable `retry_payload_recovery_events` back GraphQL/MCP/report readback. Operational truth lives in [rust-control-plane.md](reference/rust-control-plane.md#retry-payload-target-invariants-and-recovery) and [test-gates.md](reference/test-gates.md#proposal-092p092-retained-historical-alias).
 - **P073 freeze mode**.
 - **P084** minimal rollout-gate template and proposal readiness contract: template, linter, run-start preflight, authoritative storage, and four-lane operator readback.
 - **UI action boundary / P072 closeout gate**:
@@ -42,7 +43,7 @@ These are not active workstreams:
 This lane may proceed in parallel with durable side-effect stabilization as long as it preserves the implemented write-budget contract and does not add non-approval UI mutations.
 
 - **P085** thin-client read-model parity and affordance contract.
-- **P036** visual/navigation restoration over the GraphQL read model.
+- Implemented macOS operator navigation baseline over the GraphQL read model ([reference](reference/macos-operator-navigation.md)).
 - **P032** productization, dogfood evidence, accessibility/readiness, and honest operator sign-off.
 
 Goal:
@@ -55,7 +56,7 @@ After the write-budget and durable side-effect safety rails are in place:
 
 - **P081** boundary-first API/auth contract matrix.
 - **P082** recovery/retry state-machine test matrix.
-- **P076/P080** effect-aware recovery and stale execution reconciliation.
+- **Auto-retry observation ledger / P080** effect-aware recovery and stale execution reconciliation.
 - **P079** contract-aware output repair and provider fallback.
 - **P031** corrected GraphQL thin UI closeout, if not already closed by the UI recovery lane.
 
@@ -72,10 +73,9 @@ After the safety and UI recovery lanes stabilize:
 
 ## Backlog
 
-- Future **P086** agent limit observatory / runtime budget dashboard.
-
+- Agent work continuation and lead-directed same-session resumption — live-handle continuation admission, MCP/GraphQL read surfaces, schemas, migrations, background worker settlement, lead-auto decision-artifact validation, duplicate-send reconciliation, cancellation handling, and restart orphan-reap proof are implemented under [`docs/reference/agent-work-continuation.md`](reference/agent-work-continuation.md). Per-adapter `provider_session_resurrection` remains explicit fail-closed until an adapter declares attach/resume support. Expansion/soak is tracked separately under [P093](proposals/093-agent-work-continuation-expansion-soak.md). The retained `P086` names are gate/schema/evidence aliases only; the earlier "agent limit observatory / runtime budget dashboard" idea suggested under this slot is retired and needs a new proposal number if revived.
 - Additional ACP runtime/provider expansion only after the stabilization window.
-- Additional UI polish only after P036/P032 restore stable operator ergonomics.
+- Additional UI polish builds on the implemented macOS operator navigation baseline and the P032 productization lane.
 
 ## Current critical path
 
@@ -87,7 +87,7 @@ P073 freeze mode
 → implemented SQLite write discipline
 → durable side-effect ledger
 → P082 recovery/retry matrix
-→ P076/P080 effect-aware recovery
+→ auto-retry ledger / P080 effect-aware recovery
 → P079 output repair/fallback
 → P038 compaction
 → P083 ownership invariants
@@ -99,6 +99,6 @@ Parallel UI lane:
 ```text
 P081 stable enough
 → P085 read-model/affordance contract
-→ P036 visual/navigation restoration
+→ implemented macOS operator navigation baseline
 → P032 dogfood/productization closeout
 ```

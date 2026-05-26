@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents.continue_work.request.schema.json",
+  "title": "agents.continue_work request",
+  "description": "P086: MCP request schema for agents.continue_work command.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "agent_execution_id",
+    "trigger_kind",
+    "idempotency_key"
+  ],
+  "anyOf": [
+    {"required": ["continuation_mode"]},
+    {"required": ["mode"]}
+  ],
+  "properties": {
+    "agent_execution_id": {
+      "type": "string",
+      "description": "UUID of the AgentExecution to continue.",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Optional expected Run id. When present, it must match the AgentExecution run.",
+      "maxLength": 200
+    },
+    "stage_execution_id": {
+      "type": "string",
+      "description": "Optional expected StageExecution id. When present, it must match the AgentExecution owner.",
+      "maxLength": 200
+    },
+    "session_generation_id": {
+      "type": "string",
+      "description": "Optional expected live session generation id. When present, it must match the AgentExecution session.",
+      "maxLength": 200
+    },
+    "provider_session_id": {
+      "type": "string",
+      "description": "Optional expected provider-native session id. When present, it must match the live session binding.",
+      "maxLength": 200
+    },
+    "continuation_mode": {
+      "type": "string",
+      "enum": ["live_handle_continuation", "provider_session_resurrection"],
+      "description": "Canonical P086 continuation mode."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["live_handle_continuation", "provider_session_resurrection"],
+      "description": "Deprecated compatibility alias for continuation_mode."
+    },
+    "trigger_kind": {
+      "type": "string",
+      "enum": ["operator_mcp", "lead_auto"],
+      "description": "What triggered this continuation."
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Client-supplied idempotency key. UUID recommended."
+    },
+    "operator_instruction": {
+      "type": "string",
+      "description": "Operator or lead instruction to include in the canonical mode-reset continuation prompt.",
+      "maxLength": 8000
+    },
+    "max_turns": {
+      "type": "integer",
+      "description": "Maximum provider turns for the continuation prompt.",
+      "minimum": 1,
+      "maximum": 20
+    },
+    "max_wall_clock_seconds": {
+      "type": "integer",
+      "description": "Maximum wall-clock seconds for the continuation prompt.",
+      "minimum": 30,
+      "maximum": 7200
+    },
+    "blockers": {
+      "type": "array",
+      "description": "Current blockers that justify continuation.",
+      "maxItems": 20,
+      "items": {"type": "string", "maxLength": 1000}
+    },
+    "lead_decision_artifact_id": {
+      "type": "string",
+      "description": "Required for lead_auto: ID of the lead_continuation_decision_v1 artifact."
+    },
+    "lead_decision_artifact_sha256": {
+      "type": "string",
+      "description": "Required for lead_auto: lowercase hex SHA-256 (64 chars) of the decision artifact bytes.",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "continuation_instruction_sha256": {
+      "type": "string",
+      "description": "Required for lead_auto: lowercase hex SHA-256 (64 chars) of the instruction text.",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

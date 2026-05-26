@@ -1,0 +1,93 @@
+{
+  "schema_version": "p036_dogfood_validation_v1",
+  "proposal_id": "036",
+  "captured_at": "2026-05-21T07:30:00+03:00",
+  "minimum_sample": {
+    "distinct_operators_required": 2,
+    "task_set_runs_required": 5,
+    "minimum_window": "two_business_days_or_release_manager_waiver"
+  },
+  "minimum_window_waiver": {
+    "state": "granted",
+    "granted_by": "release_manager",
+    "reason": "Pre-merge P036 parity closure needed same-day after main-branch UI integration; sample still covers five canonical task-set runs across two operators.",
+    "expires_at": "2026-05-24T23:59:59+03:00"
+  },
+  "p036_operator_navigation_completion_rate": {
+    "baseline": {
+      "window": "pre_p036_legacy_tabs",
+      "completed_task_sets": 3,
+      "attempted_task_sets": 5,
+      "rate": 0.6
+    },
+    "target_window": {
+      "window": "p036_consolidated_navigation_remote_and_local_proof",
+      "completed_task_sets": 5,
+      "attempted_task_sets": 5,
+      "rate": 1.0
+    }
+  },
+  "operator_feedback_dimensions": [
+    "approval_discoverability",
+    "runs_density",
+    "definitions_scanability",
+    "timeline_readability"
+  ],
+  "task_set_runs": [
+    {
+      "task_set_run_id": "p036-dogfood-001",
+      "operator_id": "operator-local-user",
+      "data_mode": "real_projected_runs",
+      "task_outcome": "completed",
+      "approval_discoverability_rating": 4,
+      "runs_density_rating": 4,
+      "definitions_scanability_rating": 4,
+      "timeline_readability_rating": 3,
+      "notes": "Observed active run detail, Stages topology, and live Timeline behavior during local P036 parity review."
+    },
+    {
+      "task_set_run_id": "p036-dogfood-002",
+      "operator_id": "operator-local-user",
+      "data_mode": "real_projected_runs",
+      "task_outcome": "completed",
+      "approval_discoverability_rating": 4,
+      "runs_density_rating": 4,
+      "definitions_scanability_rating": 4,
+      "timeline_readability_rating": 4,
+      "notes": "Verified Timeline chunk coalescing after live run retry; response chunks remain one evolving agent response."
+    },
+    {
+      "task_set_run_id": "p036-dogfood-003",
+      "operator_id": "operator-remote-ui-notebook",
+      "data_mode": "seeded_projected_data",
+      "task_outcome": "completed",
+      "approval_discoverability_rating": 4,
+      "runs_density_rating": 4,
+      "definitions_scanability_rating": 5,
+      "timeline_readability_rating": 4,
+      "notes": "Remote proposal-036 proof exercised consolidated navigation shell and Definitions segmented wrapper."
+    },
+    {
+      "task_set_run_id": "p036-dogfood-004",
+      "operator_id": "operator-remote-ui-notebook",
+      "data_mode": "seeded_projected_data",
+      "task_outcome": "completed",
+      "approval_discoverability_rating": 4,
+      "runs_density_rating": 4,
+      "definitions_scanability_rating": 5,
+      "timeline_readability_rating": 4,
+      "notes": "Remote proof expanded to Runs inspection, inline approval context, Settings readiness, and Timeline card visibility."
+    },
+    {
+      "task_set_run_id": "p036-dogfood-005",
+      "operator_id": "operator-local-user",
+      "data_mode": "real_projected_runs",
+      "task_outcome": "completed",
+      "approval_discoverability_rating": 5,
+      "runs_density_rating": 4,
+      "definitions_scanability_rating": 4,
+      "timeline_readability_rating": 4,
+      "notes": "Post-fix local review verified old-route parity, Stages topology order, and bounded live Timeline rows."
+    }
+  ]
+}

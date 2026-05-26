@@ -1,1216 +1,464 @@
-# Proposal 086: Agent Work Continuation and Lead-Directed Same-Session Resumption
+# Proposal 086: Provider Session Resurrection Completion
 
 | Field | Value |
 |---|---|
 | Date | 2026-05-07 |
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
-| Depends on | [Local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), [durable side-effect ledger](../reference/rust-control-plane.md#durable-side-effect-ledger) for side-effect lanes, P081 Boundary Matrix / UI Action Boundary |
-| Related | P079 Contract-Aware Output Repair, P080 Continuous Stale Execution Reconciliation, Session Lineage Reference, ACP Runtime Transport |
-| Scope | Add an in-band way to continue useful agent work through server-owned provider session continuity instead of forcing a fresh retry that re-discovers the proposal, repository, blockers, and current diff. Support live-handle continuation first, define provider-session resurrection by known provider `session_id` for adapters that can attach/resume that provider session, fail closed for adapters that cannot, and allow both operator-triggered continuation through MCP and lead-directed automatic continuation under strict eligibility and safety rules. |
-| Goal | Reduce wasted time and model/runtime burn on implementation work by preserving useful provider-session continuity while still recording Chainworks truth, evidence, provenance, and safety boundaries. |
+| Depends on | Implemented live-handle continuation contract in [Agent Work Continuation](../reference/agent-work-continuation.md), [ACP Runtime Transport](../reference/acp-runtime-transport.md), [Local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), [durable side-effect ledger](../reference/rust-control-plane.md#durable-side-effect-ledger) |
+| Related | P079 Contract-Aware Output Repair, P080 Continuous Stale Execution Reconciliation, P093 Agent Work Continuation Expansion Soak |
+| Scope | Complete the remaining `provider_session_resurrection` implementation: start a new Chainworks-managed ACP process and attach/resume a known provider session id for adapters that support it, while preserving the existing fail-closed unsupported behavior for adapters that do not. |
+| Non-goal | Do not re-implement already shipped live-handle continuation, continuation readback, lead-auto live-handle admission, continuation metrics plumbing, or Phase 5 soak/scale evidence. P093 owns soak/scale only and must not be treated as owning provider-session resurrection implementation. |
+| Goal | Allow an operator to continue useful code-writer work from a provider session id even after Chainworks no longer owns the live ACP handle, without falling back to a fresh retry or losing provenance. |
 
 ---
 
-## 1. Why this proposal exists
+## 1. Current Implemented Baseline
 
-The current retry model is too expensive for implementation work.
+The following behavior is already implemented and is therefore not the remaining
+P086 work:
 
-When a code-writing agent partially completes useful work but stops too early or fails output settlement, a normal retry often creates a fresh provider session. That fresh session frequently redoes expensive work:
+- `agents.continue_work` exists as the server-owned MCP command.
+- `live_handle_continuation` can send an additional prompt through an existing
+  live ACP handle when Chainworks still owns that handle.
+- Continuation rows, request fingerprints, idempotent admission, side-effect
+  ledger ordering, supervised-worker records, continuation artifacts, metrics,
+  readback, and GraphQL query surfaces exist.
+- `lead_auto` is limited to live-handle continuation and validates a structured
+  decision artifact before admission.
+- Unsupported `provider_session_resurrection` requests fail closed with
+  `provider_session_resurrection_unsupported` and must not become ordinary
+  retry, output repair, checkpoint rehydration, or `SessionReuseDisposition::Reused`.
+- The SwiftUI app remains read-only for continuation state and does not expose
+  a continuation mutation surface.
 
-- rereads the proposal,
-- rereads audit/review artifacts,
-- re-explores the repository,
-- rediscovers current blockers,
-- re-understands the same worktree diff,
-- burns time and subscription/runtime limits before doing new work.
+This proposal keeps that baseline intact and closes the remaining successful
+resurrection path.
 
-A direct manual experiment showed that using the same provider session context can work much better: the agent continued its previous mental/work context, wrote more code, ran tests, and did not restart discovery.
+## 2. Problem
 
-However, the manual direct-ACP continuation was out-of-band:
+The current system has the typed `provider_session_resurrection` mode but no
+adapter can successfully attach/resume a provider session id after the live ACP
+handle is gone. This leaves a real product gap:
 
-- Chainworks did not record it as an execution event,
-- no durable continuation receipt existed,
-- no lineage/provenance was recorded,
-- no scheduler/recovery truth advanced,
-- later workflow retry still had to re-accept/verify the work.
+- If output repair or continuation should happen after the ACP subprocess was
+  closed, the only durable context is the provider session id.
+- A normal retry starts a fresh provider session and can spend substantial time
+  rediscovering proposal context, repository state, tests, and current blockers.
+- The explicit fail-closed unsupported mode is safer than a silent retry, but it
+  is not a full implementation of provider-session continuity.
 
-This proposal turns that successful manual pattern into a first-class, server-owned operation.
+The remaining P086 work is to turn the explicit mode from "recognized but
+unsupported" into a working adapter-backed continuation path where provider
+support exists.
 
-Experiment evidence is captured in [P086 Evidence: Manual Provider-Session Resurrection Experiment](../evidence/086-agent-work-continuation-and-session-resumption/manual-provider-session-resurrection-2026-05-08.md). The important lesson from that experiment is that we did not merely use an already-live Chainworks runtime handle. We revived/continued a provider session by known provider `session_id` outside Chainworks ownership. P086 therefore needs to model both live runtime-handle continuation and provider-session resurrection by provider `session_id`.
+## 3. Required Behavior
 
-Provider-session resurrection does **not** mean keeping an old OS-level ACP
-subprocess alive after daemon restart. Any ACP subprocess orphaned by daemon
-restart must be terminated/reaped first and recorded as recovery evidence. The
-resurrection path then starts a new Chainworks-managed ACP process/handle and
-asks the provider adapter to attach/resume the known provider `session_id`, with
-an attach receipt linked to the continuation.
+### 3.1 Adapter Capability Contract
 
----
+Each ACP adapter must declare whether it supports provider-session resurrection.
 
-## 2. Key distinction
+The canonical owner is the Rust ACP adapter boundary in
+`control-plane/crates/acp/src/adapters/mod.rs`. Add a versioned contract such
+as `ProviderSessionResurrectionCapability` and expose it through `AcpAdapter`
+before MCP admission or the continuation worker can attempt resurrection.
 
-This proposal introduces a third operation that must remain distinct from retry and output repair.
+The capability declaration must include:
 
-## 2.1 Retry
+- provider family and adapter id;
+- capability schema/version string;
+- whether attach/resume by provider session id is supported;
+- required launch arguments, session/new fields, or environment values;
+- the typed attach request shape accepted by the adapter;
+- the typed attach result shape returned by the adapter;
+- whether the adapter can prove the resumed provider session id after attach;
+- the authoritative proof source used for requested-vs-actual identity;
+- whether the resumed session is safe for write-enabled code-writer work;
+- failure classes for unsupported, rejected, expired, mismatched, or unverifiable
+  provider sessions.
 
-Retry means:
+The failure classes must be typed, persisted, and visible to the MCP admission
+path and continuation worker. At minimum they must distinguish:
 
-> create a new execution attempt and run the task again.
+- `unsupported`;
+- `provider_rejected`;
+- `expired_or_missing_session`;
+- `actual_session_mismatch`;
+- `identity_unverifiable`;
+- `quota_hold`;
+- `auth_failure`;
+- `launch_failed`;
+- `orphan_reap_failed`;
+- `attach_receipt_persist_failed`.
 
-Retry may create a new session or reuse one only if normal session policy allows it.
+Adapters with no proven attach/resume mechanism must continue to fail closed
+with `provider_session_resurrection_unsupported`.
 
-Retry is appropriate when the prior attempt is invalid or should be replaced.
+### 3.2 Frozen Run Catalog Capability Gate
 
-## 2.2 Output repair
+Adapter support is necessary but not sufficient. Provider-session resurrection
+may be admitted only when the frozen run catalog for the target run explicitly
+opts the `code_writer` into that mode.
 
-Output repair means:
+The admission gate must require both:
 
-> the agent likely did the work, but the required machine output envelope is missing or invalid.
+1. The selected ACP adapter declares a supported, enabled
+   `ProviderSessionResurrectionCapability`.
+2. The run's frozen catalog snapshot contains
+   `code_writer.continuation_capability.enabled = true` and
+   `code_writer.continuation_capability.provider_session_resurrection.enabled =
+   true`, with the requested `trigger_kind` allowed and any required session
+   fields satisfied.
 
-Output repair asks the same session to return the missing contract payload.
+Old snapshots, missing `continuation_capability`, missing
+`provider_session_resurrection`, disabled subtrees, malformed catalog JSON,
+missing `code_writer`, trigger mismatch, or unsatisfied
+`require_recorded_provider_session_id` must fail closed before any resurrection
+work item is enqueued.
 
-This is owned by P079.
+This gate uses frozen run truth, not the current repository catalog. Updating
+`examples/agents/agents.yaml` only affects new runs; existing runs remain bound
+to their captured catalog snapshot unless an explicit governed snapshot-migration
+mechanism is added by a separate proposal.
 
-## 2.3 Work continuation
+Existing `live_handle_continuation` catalog behavior remains unchanged. Enabling
+provider-session resurrection must not weaken the current live-handle checks for
+`continuation_capability.enabled`, allowed triggers, live-handle mode opt-in, or
+required live session presence.
 
-Work continuation means:
+### 3.3 Claude Provider Resurrection
 
-> the agent has useful provider-session context and likely useful partial work; send another task turn into the same provider session so the agent can continue the implementation work instead of starting over.
+Claude is the first required supported adapter because current Chainworks runs
+use Claude code-writer sessions and the provider exposes session-id continuity.
 
-Work continuation is not a retry and not output repair.
+The Claude ACP adapter must be able to:
 
-It is an additional same-session implementation turn with explicit evidence, guardrails, and provenance.
+1. Start a new Chainworks-managed `claude-agent-acp` subprocess.
+2. Ask Claude to resume the recorded provider session id.
+3. Prove that the new ACP session is attached to the requested provider session
+   id before sending the continuation prompt.
+4. Reject the continuation if the provider reports a different session id, an
+   expired session, missing local session store, quota hold, auth failure, or an
+   unsupported resume path.
 
-## 2.4 Live continuation vs provider-session resurrection
+The implementation must not depend on the old ACP subprocess still being alive.
 
-This proposal must distinguish two transport paths.
+The proposal is not satisfied by a launch flag alone. The Claude adapter must
+define the exact proof source that binds the new ACP process to the requested
+provider session id. The first acceptable implementation must use a provider
+session identity returned or observable after attach, for example a
+`session/new` response field, an ACP event field, or a Claude session-store
+readback that can be tied to the newly opened ACP session. The attach result
+must record both:
 
-**Live-handle continuation** means Chainworks already owns a live ACP handle in `AcpRuntimeManager` for the target `session_generation_id`. The server validates that the live handle still matches the recorded provider session id, then sends another prompt into that handle.
+- `requested_provider_session_id`;
+- `actual_provider_session_id`;
+- `identity_proof_source`;
+- `identity_proof_observed_at`;
+- `identity_proof_artifact_id` when the proof is read from a file or transcript.
 
-**Provider-session resurrection** means Chainworks no longer owns a live handle, but the operator or durable run truth has a known provider `session_id`, and the provider adapter can attach/resume that provider session by id. This is the behavior exercised manually during the continuation investigation. It must be represented as an explicit continuation mode, not as ordinary retry, output repair, or checkpoint rehydration.
+If the adapter cannot observe an actual provider session id and prove it equals
+the requested id, the resurrection must fail with `identity_unverifiable` before
+any continuation prompt is sent.
 
-Provider-session resurrection is provider-session continuity, not process
-continuity. If daemon restart left an old ACP subprocess alive, RecoveryService
-must terminate/reap that orphan and persist the outcome before any
-provider-session resurrection can be accepted. A supported resurrection creates
-a new managed ACP process/handle and attaches that new handle to the recorded
-provider session id.
+### 3.4 Generic Resurrection Flow
 
-The current implemented reference path only documents live-handle reuse and checkpoint rehydration. See [Session Lineage Reuse and Operator Reset](../reference/session-lineage-reuse-and-operator-reset.md#live-acp-session-ownership). `AcpRuntimeManager::prompt_session` currently prompts an existing live generation and does not attach to a provider session solely by provider `session_id`. P086 must add that attach/resume path for provider adapters that expose the capability; profiles without that adapter support must report the mode as unsupported and fail closed.
+`agents.continue_work` with `continuation_mode=provider_session_resurrection`
+must:
 
----
+1. Validate the target `agent_execution_id`, run, stage execution, agent id,
+   provider family, model family, worktree root, and provider session id.
+2. Verify frozen catalog opt-in for `code_writer` provider-session resurrection
+   before enqueueing work.
+3. Verify the target is a stage-owned `code_writer` execution and the stage is
+   not a release, publish, upload, distribution, commit, push, security,
+   prepush-review, or lead-orchestration lane.
+4. Reject if unresolved side-effect ledger rows, pending approvals, active
+   continuations, mismatched worktree, or provider-family quota holds make the
+   continuation unsafe.
+5. If daemon restart left a stale ACP subprocess, reap or fail closed with
+   durable orphan-reap evidence before attempting resurrection.
+6. Start a new managed ACP process through the adapter resurrection path.
+7. Persist a provider-session attach receipt before the continuation prompt is
+   sent.
+8. Send the canonical P086 mode-reset continuation prompt through the resumed
+   session.
+9. Settle the continuation using the existing continuation artifact/readback
+   path, never by creating a normal stage retry.
 
-## 3. Core decision
+### 3.5 Output Repair Use Case
 
-Add a new server-owned operation:
+Provider-session resurrection must support the P079/P088 output-repair shape:
+
+- a code-writer produced useful work or a useful completion;
+- the machine-readable `CHAINWORKS_OUTPUT` was malformed or incomplete;
+- Chainworks no longer has a live ACP handle;
+- the operator wants a short continuation that returns only corrected required
+  outputs, using the provider session that already did the work.
+
+The repair prompt must explicitly forbid additional code edits unless the
+operator instruction allows them.
+
+Output-only repair also needs machine-checkable proof, not only prompt wording.
+For output-only resurrection requests, Chainworks must capture a pre/post
+worktree source snapshot or equivalent diff summary and record
+`changed_source_files == 0`. If source edits are intentionally allowed by the
+operator, the request and receipt must say so explicitly and list the changed
+source files.
+
+### 3.6 Durable State And Replay Contract
+
+Provider-session resurrection must be recoverable across daemon crashes without
+duplicating the provider prompt and without falling back to retry.
+
+The existing `agent_work_continuations.status` lifecycle remains authoritative
+and backward-compatible. Do not add these resurrection phases as new `status`
+values. The current status contract (`accepted`, `queued`, `starting`,
+`running`, `preflight_passed`, `prompt_sent`, `observing`,
+`worktree_observed`, `needs_continuation_reconciliation`, `finalizing`,
+`cancelling`, and terminal states) continues to drive generic continuation
+readback.
+
+Provider-session resurrection adds a separate nullable typed substate:
 
 ```text
-agents.continue_work
+agent_work_continuations.resurrection_phase TEXT NULL
 ```
 
-This operation sends a continuation prompt for a specific agent execution through one of two validated continuation modes:
-
-1. an existing live ACP session generation owned by `AcpRuntimeManager`;
-2. a provider-session resurrection path, when the adapter explicitly supports attach/resume by known provider `session_id`.
-
-It is available in two ways:
-
-1. **Operator-triggered continuation** through MCP.
-2. **Lead-directed automatic continuation** when the lead produces a valid continuation decision and the server validates it.
-
-SwiftUI must not invoke this operation directly and must not render an in-app
-Continue command surface for P086. Operator-triggered continuation is an MCP
-operator action outside the governed app UI.
-
-GraphQL may show continuation state and evidence, but there is no GraphQL mutation for continuation.
-
----
-
-## 4. Initial scope
-
-## 4.1 First supported agent class
-
-Initial support is for:
-
-- `code_writer`
-
-Optional later support:
-
-- `docs_guardian`
-- bounded implementation helper agents
-
-## 4.2 Explicitly not supported initially
-
-Do not allow continuation for:
-
-- `lead_orchestrator`
-- proposal reviewers
-- proposal aggregators
-- security checker
-- prepush reviewer
-- release agents
-- commit/push agents
-- Connect/upload/distribution agents
-- any stage with unresolved external side-effect ledger entries
-
-## 4.3 Why code writer first
-
-The code writer is the role where same-session continuity is most valuable:
-
-- it remembers current diff,
-- remembers which files were inspected,
-- remembers tests already run,
-- remembers blockers,
-- can continue editing without full rediscovery.
-
-At the same time, code-writing work can be read back through deterministic worktree evidence:
-
-- changed files,
-- diff summary,
-- tests,
-- generated artifacts.
-
-That makes it safer than release/publish side effects.
-
----
-
-## 5. Relationship to existing session lineage rules
-
-The existing session-lineage contract intentionally fails closed when ownership, binding fingerprint, invocation owner, retry instruction hash, worktree, MCP inventory, or output contract changes.
-
-That is correct for ordinary reuse.
-
-Work continuation does not weaken those rules globally.
-
-Instead, it introduces a **targeted continuation command** that:
-
-- points to a specific existing generation,
-- validates compatibility,
-- records an explicit one-shot continuation,
-- sends a bounded prompt through the selected provider-continuity transport,
-- records the result as continuation evidence,
-- does not pretend this was an ordinary retry.
-
-This keeps normal session reuse strict while allowing operator/lead-controlled continuity where it is actually useful.
-
----
-
-## 6. Eligibility
-
-A continuation request is eligible only if all are true:
-
-1. source run exists;
-2. source stage execution exists;
-3. source agent execution exists;
-4. agent role is continuation-capable;
-5. session generation exists;
-6. provider session id is present;
-7. requested continuation mode is valid;
-8. generation belongs to the same run;
-9. generation belongs to the same agent or an explicitly compatible continuation family;
-10. worktree/workdir matches the target execution;
-11. runtime profile / adapter family is compatible;
-12. no unresolved side-effect ledger entry exists for the run/stage/agent;
-13. target stage is not release/publish/git-push/upload/distribution;
-14. continuation count is within policy limits;
-15. prompt mode-reset guard can be applied;
-16. the selected transport path passes its mode-specific checks.
-
-For `live_handle_continuation`, mode-specific checks are:
-
-1. ACP runtime manager has a live handle for the session generation;
-2. live handle provider session id matches the recorded provider session id.
-
-For `provider_session_resurrection`, mode-specific checks are:
-
-1. trigger is `operator_mcp` in the first implementation;
-2. provider session id is recorded and explicitly supplied or resolved from run truth;
-3. adapter/runtime profile declares provider-session resurrection support;
-4. resurrection target belongs to the same run, agent execution, worktree, and provider family;
-5. restart recovery has no unreaped ACP subprocess for the target session generation, provider session id, worktree, or agent execution;
-6. if an orphan ACP subprocess was found, it was terminated/reaped and the reap outcome was persisted before terminalizing stale runtime truth;
-7. a new managed ACP process/handle can be created for the continuation;
-8. attach/resume receipt can be persisted before prompt execution.
-
-If provider-session resurrection is requested but unsupported by the adapter/runtime, continuation must fail closed with `provider_session_resurrection_unsupported`. It must not silently fall back to fresh retry or checkpoint rehydration.
-
-If any check fails, continuation must fail closed.
-
-## 7.1 Daemon restart and orphan ACP recovery
-
-Daemon restart creates a hard boundary between process continuity and provider
-session continuity:
-
-1. `AcpRuntimeManager` live handles from the prior daemon generation are dead.
-2. Any surviving ACP subprocess from that generation is an orphan, not a valid
-   continuation handle.
-3. RecoveryService must locate known child/provider helper processes using the
-   durable supervised-process/session-generation registry.
-4. RecoveryService must terminate/reap matching orphan ACP subprocesses before
-   it marks stale continuations terminal or accepts provider-session
-   resurrection for the same run/stage/agent/provider session.
-5. The reap attempt must produce durable evidence: old pid, session generation,
-   provider session id when known, signal/deadline, outcome, and timestamp.
-6. If reap fails or cannot be proven, continuation fails closed with
-   `orphan_acp_reap_failed` or `orphan_acp_reap_unverified`.
-7. A successful provider-session resurrection then starts a new
-   Chainworks-managed ACP process/handle and attaches/resumes the known provider
-   `session_id`; it never reuses the orphan OS process.
-
-This is the implementation form of the manual evidence: preserve provider
-context by attaching a new managed ACP runtime to the old provider session id,
-while still cleaning up unsafe orphan subprocesses after restart.
-
----
-
-## 7. Triggers
-
-## 7.1 Operator-triggered continuation
-
-MCP tool:
-
-```text
-agents.continue_work
-```
-
-Operator provides:
-
-- run id,
-- stage execution id,
-- agent execution id,
-- session generation id,
-- continuation mode,
-- optional provider session id for provider-session resurrection,
-- operator instruction,
-- optional max turn/time budget,
-- optional explicit blockers to continue from.
-
-The server validates eligibility before sending anything to ACP.
-
-## 7.2 Lead-directed automatic continuation
-
-The lead may request continuation by emitting:
-
-```text
-lead_continuation_decision_v1
-```
-
-This is a recommendation, not authority.
-
-The server must validate it before execution.
-
-The lead may request continuation when:
-
-- code writer produced useful partial work,
-- changed files exist or meaningful implementation progress exists,
-- blockers remain,
-- normal retry would likely lose valuable live context,
-- current session is live for automatic continuation,
-- task is not a release/publish side-effect lane,
-- continuation policy allows lead-triggered continuation.
-
-The lead must not request continuation to bypass output contracts or safety gates.
-
-## 7.3 Automatic continuation policy limits
-
-Default limits:
-
-- max 1 lead-directed continuation per agent execution,
-- max 2 lead-directed continuations per stage execution,
-- no lead-directed continuation after unresolved side-effect warning,
-- no lead-directed continuation after provider-mode mismatch classified as strict-output incompatible,
-- no lead-directed continuation for release agents.
-
-Operator-triggered continuation may have a separate higher limit, but still requires validation.
-
----
-
-## 8. Data model
-
-## 8.1 `agent_work_continuations`
-
-Suggested table:
-
-```sql
-CREATE TABLE agent_work_continuations (
-  id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL,
-  stage_execution_id TEXT NOT NULL,
-  agent_execution_id TEXT NOT NULL,
-  session_lineage_id TEXT NOT NULL,
-  session_generation_id TEXT NOT NULL,
-  provider_session_id TEXT NOT NULL,
-  continuation_mode TEXT NOT NULL,
-  resurrected_from_provider_session_id TEXT,
-  live_handle_required INTEGER NOT NULL DEFAULT 1,
-  adapter_resume_capability TEXT,
-  trigger_kind TEXT NOT NULL,
-  requested_by TEXT,
-  idempotency_scope TEXT NOT NULL,
-  idempotency_key TEXT NOT NULL,
-  request_fingerprint_sha256 TEXT NOT NULL,
-  canonical_request_artifact_id TEXT,
-  response_fingerprint_sha256 TEXT,
-  response_artifact_id TEXT,
-  conflict_count INTEGER NOT NULL DEFAULT 0,
-  lead_decision_artifact_id TEXT,
-  operator_instruction_sha256 TEXT,
-  prompt_template_version TEXT NOT NULL,
-  status TEXT NOT NULL,
-  started_at TEXT,
-  completed_at TEXT,
-  failed_at TEXT,
-  failure_reason TEXT,
-  attach_receipt_artifact_id TEXT,
-  evidence_bundle_artifact_id TEXT,
-  worktree_readback_artifact_id TEXT,
-  continuation_report_artifact_id TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE UNIQUE INDEX idx_agent_work_continuations_idempotency
-ON agent_work_continuations(idempotency_scope, idempotency_key);
-```
-
-`idempotency_key` is not meaningful by itself. It is valid only with persisted
-`idempotency_scope` and `request_fingerprint_sha256`.
-
-The default scope is:
-
-```text
-agents.continue_work:{caller_principal_id}
-```
-
-The canonical request fingerprint includes run, stage, agent, session,
-provider, policy, and prompt-template identity, so two different continuation
-targets using the same key cannot collapse into one replay.
-
-## 8.2 Canonical request fingerprint
-
-`agents.continue_work` computes `request_fingerprint_sha256` from canonical
-JSON, not from raw request bytes.
-
-The canonical request must include:
-
-```json
-{
-  "command": "agents.continue_work",
-  "run_id": "...",
-  "stage_execution_id": "...",
-  "agent_execution_id": "...",
-  "session_generation_id": "...",
-  "provider_session_id": "...",
-  "trigger_kind": "operator_mcp | lead_auto",
-  "caller_principal_id": "...",
-  "operator_instruction_sha256": "...",
-  "lead_decision_artifact_id": "...",
-  "lead_decision_artifact_sha256": "...",
-  "prompt_template_version": "...",
-  "max_turns": 1,
-  "max_wall_clock_seconds": 1800,
-  "worktree_root": "...",
-  "runtime_profile_id": "...",
-  "continuation_policy_version": "..."
-}
-```
-
-Canonical JSON rules:
-
-- sorted keys;
-- normalized defaults;
-- normalized line endings before hashing instruction text;
-- stable null versus absent handling;
-- no timestamps, random request ids, display labels, or raw long instruction
-  text when an artifact pointer plus SHA is available.
-
-For lead-directed continuation, the server may derive `idempotency_key` as:
-
-```text
-lead-auto:{lead_decision_id}
-```
-
-The fingerprint still must include `lead_decision_artifact_id`,
-`lead_decision_artifact_sha256`, `agent_execution_id`,
-`session_generation_id`, `continuation_instruction_sha256`, and
-`continuation_policy_version`. If the lead decision artifact changes while the
-same idempotency key is reused, the request is an idempotency conflict.
-
-## 8.3 Replay versus conflict semantics
-
-| Existing row | Incoming request | Result |
-|---|---|---|
-| same `idempotency_scope` + key, same fingerprint, terminal success | replay | return previous response |
-| same scope + key, same fingerprint, `requested` / `preflight_passed` / `prompt_sent` / `observing` | replay | return existing continuation status; do not start another task |
-| same scope + key, same fingerprint, `failed` / `preflight_failed` | replay | return the same failure unless caller uses a new idempotency key |
-| same scope + key, different fingerprint | conflict | return `idempotency_conflict`; do not mutate |
-| no row | new request | create row and continue |
-
-Conflict response:
-
-```json
-{
-  "error": "idempotency_conflict",
-  "idempotency_key": "...",
-  "existing_continuation_id": "...",
-  "existing_request_fingerprint": "...",
-  "incoming_request_fingerprint": "...",
-  "message": "Same idempotency key was used with a different canonical request."
-}
-```
-
-If a duplicate request reaches a continuation that already passed
-`prompt_sent`, the server must not send the continuation prompt again. It
-returns the existing status or enters continuation reconciliation.
-
-## 8.4 Prompt-sent crash window
-
-`agents.continue_work` can change the worktree. If the daemon crashes after
-the prompt is delivered to ACP but before result settlement, the retry path
-must assume the agent may already have edited files.
-
-State progression:
-
-```text
-requested
--> preflight_passed
--> prompt_sent
--> observing
--> worktree_observed
--> settled
-```
-
-When recovery sees `prompt_sent` or `observing` without a settled result, it
-must not resend the prompt. It moves the continuation to
-`needs_continuation_reconciliation` and gathers readback:
-
-- worktree diff and ownership evidence;
-- ACP transcript/tool evidence if available;
-- continuation report or no-progress evidence if present;
-- relevant tests or gate outputs if they were produced.
-
-Reconciliation settles the existing continuation record. It does not create a
-new continuation turn and does not reuse the same idempotency key for a second
-provider send.
-
-## 8.5 `trigger_kind`
-
-Allowed values:
-
-- `operator_mcp`
-- `lead_auto`
-
-## 8.6 `continuation_mode`
-
-Allowed values:
-
-- `live_handle_continuation`
-- `provider_session_resurrection`
-
-## 8.7 `status`
-
-Allowed values:
-
-- `requested`
-- `preflight_passed`
-- `preflight_failed`
-- `provider_session_resurrection_unsupported`
-- `provider_session_not_found`
-- `provider_session_attach_failed`
-- `orphan_acp_reap_failed`
-- `orphan_acp_reap_unverified`
-- `prompt_sent`
-- `observing`
-- `worktree_observed`
-- `needs_continuation_reconciliation`
-- `settled`
-- `completed`
-- `failed`
-- `rejected`
-- `cancelled`
-
-## 8.8 New artifacts
-
-- `agent_continuation_evidence_bundle`
-- `agent_continuation_report`
-- `worktree_continuation_readback`
-- `lead_continuation_decision`
-- `provider_session_attach_receipt`
-- `continuation_canonical_request`
-- `continuation_response_snapshot`
-
----
-
-## 9. Evidence model
-
-Continuation must not depend on the agent returning a strict `CHAINWORKS_OUTPUT` envelope.
-
-The server records truth through readback:
-
-- ACP transcript evidence,
-- tool trace evidence,
-- worktree diff summary,
-- changed files manifest,
-- tests run and results,
-- generated artifacts,
-- final human summary if the provider produced one.
-
-The continuation itself does not automatically settle the stage as complete.
-
-It creates evidence that the normal workflow can later validate, review, or retry.
-
----
-
-## 10. Persistence and write-budget rules
-
-Continuation must obey the implemented write-budget contract.
-
-Rules:
-
-- ACP transcript goes to file spool;
-- tool traces go to file spool;
-- stdout/stderr go to file spool;
-- SQLite stores compact metadata and artifact pointers only;
-- do not create one SQLite row per stream chunk;
-- continuation metadata is a compact record;
-- worktree readback is a compact artifact pointer.
-
----
-
-## 11. Side-effect safety
-
-Continuation must obey the durable side-effect ledger.
-
-If unresolved side-effect ledger entries exist, continuation fails with:
-
-```text
-requires_effect_reconciliation
-```
-
-Continuation is forbidden for:
-
-- release agents,
-- git push stages,
-- Connect upload stages,
-- publish/distribution stages,
-- stages that may have already changed the external world.
-
-The only allowed initial lane is implementation/code editing without irreversible external release effects.
-
----
-
-## 12. MCP tools
-
-## 12.1 `agents.continue_work`
-
-Input:
-
-```json
-{
-  "run_id": "...",
-  "stage_execution_id": "...",
-  "agent_execution_id": "...",
-  "idempotency_key": "...",
-  "session_generation_id": "...",
-  "continuation_mode": "live_handle_continuation",
-  "provider_session_id": "...",
-  "operator_instruction": "...",
-  "max_turns": 1,
-  "max_wall_clock_seconds": 1800
-}
-```
-
-`continuation_mode` may be:
-
-- `live_handle_continuation`, requiring an existing live `AcpRuntimeManager` handle;
-- `provider_session_resurrection`, requiring adapter support for attach/resume by provider `session_id`.
-
-If `provider_session_resurrection` is requested and unsupported, the output status must be `provider_session_resurrection_unsupported`.
-
-Output:
-
-```json
-{
-  "continuation_id": "...",
-  "status": "completed",
-  "continuation_mode": "live_handle_continuation",
-  "request_fingerprint_sha256": "...",
-  "response_fingerprint_sha256": "...",
-  "session_generation_id": "...",
-  "provider_session_id": "...",
-  "canonical_request_artifact_id": "...",
-  "response_artifact_id": "...",
-  "attach_receipt_artifact_id": "...",
-  "evidence_bundle_artifact_id": "...",
-  "worktree_readback_artifact_id": "...",
-  "continuation_report_artifact_id": "..."
-}
-```
-
-## 12.2 `agents.continuation_status`
-
-Reads status and evidence for a continuation.
-
-## 12.3 `agents.continuation_candidates`
-
-Optional first version.
-
-Returns executions with:
-
-- live compatible session,
-- resumable provider session candidate when adapter capability exists,
-- useful partial work signals,
-- no unresolved side effects,
-- continuation-capable role.
-
----
-
-## 13. GraphQL readback
-
-GraphQL exposes continuation state for UI inspection only. The governed SwiftUI
-app is read-only for P086 continuation: it may show that continuation happened,
-is running, failed, or produced evidence, but it must not offer a Continue button,
-menu item, keyboard shortcut, or any other command affordance.
-
-Suggested fields:
-
-```graphql
-type AgentContinuation {
-  id: ID!
-  status: AgentContinuationStatus!
-  triggerKind: ContinuationTriggerKind!
-  continuationMode: ContinuationMode!
-  agentExecutionId: ID!
-  sessionGenerationId: ID!
-  providerSessionId: String!
-  resurrectedFromProviderSessionId: String
-  startedAt: DateTime
-  completedAt: DateTime
-  failureReason: String
-  attachReceipt: Artifact
-  evidenceBundle: Artifact
-  worktreeReadback: Artifact
-  continuationReport: Artifact
-}
-```
-
-No GraphQL mutation.
-
-SwiftUI may show:
-
-- continuation history,
-- evidence bundle,
-- changed files,
-- tests,
-- whether continuation was operator-triggered or lead-directed,
-- failure/no-progress reason and resulting evidence after an attempted continuation.
-
-SwiftUI must not show a recommended next MCP action or any call-to-action that
-looks executable inside the app. The UI contract is readback only: it reports the
-fact and result of a continuation already performed by MCP/lead orchestration.
-
----
-
-## 14. Lead continuation decision contract
-
-The lead must emit a structured decision when requesting automatic continuation.
-
-## 14.1 `lead_continuation_decision_v1`
-
-Required fields:
-
-```json
-{
-  "decision_id": "...",
-  "run_id": "...",
-  "stage_execution_id": "...",
-  "agent_execution_id": "...",
-  "agent_id": "code_writer",
-  "session_generation_id": "...",
-  "reason": "...",
-  "continuation_instruction": "...",
-  "expected_next_work": [
-    "..."
-  ],
-  "known_completed_work": [
-    "..."
-  ],
-  "known_blockers": [
-    "..."
-  ],
-  "safety_checks": {
-    "no_release_side_effect": true,
-    "no_unresolved_effect_ledger": true,
-    "same_worktree_required": true
-  },
-  "stop_conditions": [
-    "..."
-  ],
-  "max_turns": 1,
-  "max_wall_clock_seconds": 1800
-}
-```
-
-The server must verify every safety condition.
-The lead decision cannot override server policy.
-
----
-
-## 15. Prompt design
-
-This proposal includes canonical prompt templates because the success of continuation depends heavily on mode reset.
-
-The most important issue discovered manually:
-
-> if the prior turn was output-contract repair, the provider session may remain mentally stuck in “return corrected machine output” mode.
-
-Every continuation prompt must therefore explicitly reset the mode.
-
----
-
-# 15.1 Common Mode Reset Header
-
-This header is prepended to every continuation prompt.
-
-```text
-You are continuing implementation work in an existing Chainworks agent session.
-
-This is NOT output-contract repair.
-Do NOT try to fix or return CHAINWORKS_OUTPUT.
-Do NOT respond with only a JSON object.
-Do NOT write or edit Chainworks run metadata under .chainworks/runs unless explicitly instructed.
-Do NOT restart full project/proposal discovery unless you need a specific missing fact.
-
-You are continuing coding work in the existing worktree.
-Use the context already established in this session:
-- files already inspected,
-- diffs already made,
-- tests already run,
-- blockers already found,
-- reviewer/audit/prepush findings already read.
-
-Your job is to continue useful implementation work from the current state, not to start over.
-```
-
----
-
-# 15.2 Operator-Triggered Continuation Prompt
-
-```text
-{COMMON_MODE_RESET_HEADER}
-
-Operator continuation request
-=============================
-
-Run:
-{run_id}
-
-Stage execution:
-{stage_execution_id}
-
-Agent execution:
-{agent_execution_id}
-
-Worktree:
-{worktree_root}
-
-Operator instruction:
-{operator_instruction}
-
-Known current context
-=====================
-
-Previously completed or partially completed work:
-{known_completed_work}
-
-Known remaining blockers:
-{known_blockers}
-
-Relevant review/audit/prepush findings:
-{relevant_findings}
-
-Rules for this continuation
-===========================
-
-1. Continue from the existing patch and session context.
-2. Do not redo broad repository discovery unless necessary for a specific missing fact.
-3. Prefer making concrete code changes over writing plans.
-4. Do not touch release, git push, upload, publish, or external distribution operations.
-5. Do not commit.
-6. Do not push.
-7. Do not modify run control-plane metadata.
-8. If you need to inspect files, inspect only the minimum necessary.
-9. If tests are available and relevant, run focused tests first.
-10. Stop when you have made the next meaningful unit of progress or when a real blocker prevents progress.
-
-Closeout requirements
-=====================
-
-At the end, provide a concise human summary with these sections:
-
-- Changed files
-- Tests run
-- Remaining blockers with file-level evidence
-- What should happen next
-
-Do not claim implementation complete unless:
-- the requested code changes are made,
-- relevant tests are green or their failure is explained,
-- remaining blockers are explicitly listed.
-```
-
----
-
-# 15.3 Lead-Directed Automatic Continuation Prompt
-
-```text
-{COMMON_MODE_RESET_HEADER}
-
-Lead-directed continuation
-==========================
-
-The lead has determined that this agent should continue work in the same live session instead of starting a fresh retry.
-
-Reason:
-{lead_reason}
-
-Current implementation goal:
-{implementation_goal}
-
-Known completed work:
-{known_completed_work}
-
-Known remaining blockers:
-{known_blockers}
-
-Expected next work:
-{expected_next_work}
-
-Stop conditions:
-{stop_conditions}
-
-Safety constraints
-==================
-
-- This is implementation continuation only.
-- Do not perform release, git push, upload, publish, or external distribution.
-- Do not attempt output-contract repair.
-- Do not return CHAINWORKS_OUTPUT.
-- Do not write plans instead of doing code work unless a real blocker prevents coding.
-- Do not restart broad discovery.
-- Continue from the existing patch.
-
-Closeout requirements
-=====================
-
-At the end, provide a concise human summary with:
-
-- Changed files
-- Tests run
-- Remaining blockers with file-level evidence
-- Whether another continuation is useful
-- Whether normal workflow retry/validation should run next
-```
-
----
-
-# 15.4 Anti-Planning Guard
-
-If the provider starts writing a plan instead of doing implementation work, the continuation supervisor should treat that as a weak/no-progress result unless the plan identifies a real blocker.
-
-Heuristic signals:
-
-- plan file created but no code diff,
-- long “I will do” response,
-- no changed files,
-- no test execution,
-- no blocker with file-level evidence.
-
-Result classification:
-
-```text
-continuation_no_useful_progress
-```
-
-The engine may then:
-
-- stop automatic continuations,
-- ask operator,
-- or fall back to normal retry.
-
----
-
-# 15.5 Closeout Evaluation Prompt for Lead
-
-This prompt is for the lead to evaluate continuation evidence, not to perform coding.
-
-```text
-You are evaluating a continuation turn after a code-writing agent continued work in the same provider session.
-
-Do not perform code changes.
-Do not request another continuation unless the evidence shows useful progress and a clear next unit of work.
-
-Inputs:
-- continuation report
-- worktree readback
-- changed files
-- test results
-- remaining blockers
-- original implementation goal
-
-Return a decision object with:
-
-{
-  "continue_again": true | false,
-  "reason": "...",
-  "next_instruction": "...",
-  "blocking_issues": [...],
-  "ready_for_normal_validation": true | false
-}
-
-Rules:
-- continue_again may be true only if another continuation is likely to produce concrete code progress.
-- do not continue just because the agent wrote a plan.
-- prefer normal workflow validation when the worktree has meaningful completed work.
-- never request continuation for release or external side-effect stages.
-```
-
----
-
-## 16. Automatic continuation policy
-
-Automatic continuation must be conservative.
-
-## 16.1 Allowed automatic trigger
-
-The lead may trigger continuation when all are true:
-
-- agent is continuation-capable;
-- live session exists;
-- worktree has useful partial progress or previous transcript shows useful context;
-- lead identifies a concrete next unit of work;
-- normal retry would likely waste rediscovery effort;
-- no unresolved effect ledger entry exists;
-- continuation budget remains.
-
-## 16.2 Forbidden automatic trigger
-
-Lead must not auto-continue when:
-
-- stage is release/publish/upload/git-push related;
-- side-effect ledger has unresolved entries;
-- provider session is dead;
-- worktree changed outside expected root;
-- prior continuation made no useful progress;
-- the next step is approval/review/release rather than implementation;
-- max continuation count reached.
-
-## 16.3 Continuation budget
-
-Suggested defaults:
-
-```yaml
-continuation_policy:
-  code_writer:
-    enabled: true
-    lead_auto_enabled: true
-    operator_mcp_enabled: true
-    max_lead_continuations_per_agent_execution: 1
-    max_lead_continuations_per_stage_execution: 2
-    max_operator_continuations_per_agent_execution: 3
-    max_wall_clock_seconds: 1800
-    max_turns_per_continuation: 1
-```
-
-Operator continuation can be more permissive than lead auto continuation, but still must pass safety preflight.
-
-Lead-directed automatic continuation is initially limited to `live_handle_continuation`. Provider-session resurrection is operator-triggered only until adapter support, attach receipts, and readback behavior have enough production evidence for automation.
-
----
-
-## 17. Agent configuration
-
-Add continuation capability to agent catalog.
-
-Example:
-
-```yaml
-agents:
-  - id: code_writer
-    continuation_capability:
-      enabled: true
-      allowed_triggers:
-        - operator_mcp
-        - lead_auto
-      allowed_session_scope:
-        - same_agent
-        - same_agent_family_within_run
-      forbidden_stage_kinds:
-        - release
-        - publish
-        - git_push
-        - upload
-      live_handle_continuation:
-        enabled: true
-        require_live_session: true
-      provider_session_resurrection:
-        enabled: false
-        allowed_triggers:
-          - operator_mcp
-        require_recorded_provider_session_id: true
-        fail_closed_when_unsupported: true
-      require_same_worktree: true
-      require_no_unresolved_side_effects: true
-```
-
-For agents without this field, continuation is disabled.
-
-`provider_session_resurrection.enabled: false` is intentional for adapters that cannot attach/resume by provider `session_id`. The server still needs the field so an operator request can fail with an explicit unsupported status instead of falling back to a fresh retry and losing the provider context the operator asked to preserve.
-
----
-
-## 18. Relationship to P079
-
-P079 handles contract-aware output repair.
-
-P086 handles work continuation.
-
-If a code writer produced useful work but failed final output settlement, the runtime may choose among:
-
-1. output repair, if the work is done and only contract payload is missing;
-2. continuation, if useful work exists but implementation is not done;
-3. normal retry, if the attempt is invalid or session is unusable.
-
-A failed output repair should not automatically cause another repair attempt if the provider is stuck in repair mode.
-
-Instead, the engine may classify:
-
-```text
-repair_mode_contaminated_session
-```
-
-and choose:
-
-- continuation with mode reset, if code work should continue;
-- fallback retry, if only machine output is needed;
-- operator review, if ambiguous.
-
----
-
-## 19. Relationship to P080
-
-P080 stale execution reconciliation may recommend continuation only for stale or blocked work that has:
-
-- live provider session,
-- useful partial implementation context,
-- no side-effect risk,
-- continuation-capable agent role.
-
-P080 must not auto-continue release side-effect lanes.
-
----
-
-## 20. Metrics
-
-Track:
-
-- continuation count per run/stage/agent;
-- fresh session avoided count;
-- average time saved vs fresh retry estimate;
-- continuation useful-progress rate;
-- no-progress continuation rate;
-- tests passed after continuation;
-- changed files after continuation;
-- operator-triggered vs lead-triggered continuation success rate;
-- follow-up normal validation success rate;
-- provider/session budget impact.
-- orphan ACP subprocesses found/reaped after daemon restart;
-- provider-session resurrection attach success/failure after orphan reap.
-
-These metrics should feed future limit observability work.
-
----
-
-## 21. Tests
-
-Required tests:
-
-1. `agents.continue_work` uses same live provider session.
-2. No new session generation is created for continuation.
-3. Wrong run generation is rejected.
-4. Wrong agent generation is rejected.
-5. Dead provider session is rejected.
-6. Release/publish/git-push stage is rejected.
-7. Unresolved side-effect ledger entry returns `requires_effect_reconciliation`.
-8. Last turn output-repair contamination results in prompt mode reset.
-9. Lead decision can trigger continuation only when policy allows.
-10. Lead decision cannot override server safety policy.
-11. Continuation evidence is spooled to files, not high-volume SQLite rows.
-12. GraphQL exposes continuation readback but no mutation.
-12a. SwiftUI exposes continuation readback/history only and never renders an
-    in-app Continue command surface.
-13. No-progress plan-only continuation is classified as no useful progress.
-14. Worktree readback captures changed files after continuation.
-15. Provider-session resurrection request fails closed when adapter capability is absent.
-16. Supported provider-session resurrection attaches/resumes by known provider session id without an existing live handle and records `provider_session_resurrection`.
-17. Provider-session resurrection is not recorded as ordinary retry, output repair, checkpoint rehydration, or normal `SessionReuseDisposition::Reused`.
-18. Lead-directed automatic continuation cannot request provider-session resurrection until policy explicitly enables it.
-19. Daemon restart recovery terminates/reaps orphan ACP subprocesses before
-    terminalizing stale continuation truth for that provider session.
-20. Provider-session resurrection after restart starts a new managed ACP process
-    and attaches/resumes the recorded provider `session_id`; it never reuses the
-    orphan OS process.
-21. Provider-session resurrection fails closed when orphan ACP subprocess reap
-    is unverified or fails.
-22. Same idempotency key plus same canonical request and completed continuation
-    returns the previous response.
-23. Same idempotency key plus different canonical request returns
-    `idempotency_conflict`.
-24. Same idempotency key plus same request at `prompt_sent` does not send
-    another provider prompt.
-25. Crash after prompt delivery but before settlement becomes
-    `needs_continuation_reconciliation`.
-26. Continuation reconciliation reads worktree/transcript evidence and settles
-    without sending another continuation turn.
-27. Lead-auto continuation stores `lead_decision_artifact_sha256` in the
-    canonical request artifact.
-28. Operator instruction changes with the same idempotency key are rejected as
-    `idempotency_conflict`.
-
----
-
-## 22. Acceptance criteria
-
-P086 is complete when:
-
-1. operator can continue a code writer in an existing live ACP session through MCP;
-2. provider-session resurrection by known provider `session_id` is either implemented for supported adapters or explicitly exposed as a fail-closed unsupported continuation mode;
-3. lead can request automatic continuation through a structured decision artifact;
-4. server validates all continuation eligibility and safety conditions;
-5. continuation prompts use the canonical mode reset template;
-6. release and side-effect stages are fail-closed;
-7. continuation evidence is recorded in Chainworks truth;
-8. no high-volume evidence is inserted into SQLite;
-9. UI can read continuation status through GraphQL but cannot invoke continuation;
-10. normal retry remains separate from continuation;
-11. output repair remains separate from continuation;
-12. checkpoint rehydration remains separate from provider-session resurrection.
-13. idempotent replay is based on persisted canonical request fingerprints, not
-    uniqueness alone;
-14. duplicate requests after `prompt_sent` never resend the provider prompt and
-    use continuation reconciliation instead.
-
----
-
-## 23. Final recommendation
-
-Chainworks currently overuses retry for situations where continuation is the better primitive.
-
-Retry is for replacing an attempt.
-Output repair is for fixing missing machine payloads.
-Continuation is for preserving useful implementation context and pushing the same provider coding context forward.
-
-This proposal adds continuation without weakening durable execution truth.
-
-It should reduce wasted rediscovery, lower session churn, improve code-writer throughput, and keep the operator in control.
+The field is populated only when
+`mode = 'provider_session_resurrection'`. It must have a DB `CHECK` constraint,
+typed Rust enum, MCP/GraphQL/report readback, and receipt mirroring. Existing
+`live_handle_continuation` rows must keep `resurrection_phase = NULL`.
+
+Allowed resurrection phases:
+
+1. `admitted`: request fingerprint accepted; no process spawned.
+2. `launching`: managed ACP process spawn requested.
+3. `launched`: new child pid/process group recorded.
+4. `attaching`: adapter attach/resume request started.
+5. `attached_unprompted`: requested and actual provider session ids verified;
+   attach receipt persisted; no continuation prompt has been sent.
+6. `prompting`: continuation prompt send has started and prompt artifact id is
+   durable.
+7. `settling`: provider response is being collected and artifacts are being
+   settled.
+8. `completed` or `failed_closed`.
+
+Compatibility mapping to the existing status lifecycle:
+
+| `resurrection_phase` | Compatible `status` values |
+|---|---|
+| `admitted` | `accepted`, `queued` |
+| `launching` | `starting`, `running` |
+| `launched` | `starting`, `running` |
+| `attaching` | `starting`, `running`, `preflight_passed` |
+| `attached_unprompted` | `preflight_passed` |
+| `prompting` | `prompt_sent` |
+| `settling` | `observing`, `worktree_observed`, `needs_continuation_reconciliation`, `finalizing` |
+| `completed` | `succeeded`, `no_progress` |
+| `failed_closed` | `failed`, `cancelled` |
+
+`attached_unprompted` is the critical replay boundary: identity proof and the
+attach receipt are durable, but the provider prompt has not been sent.
+`prompting` may be entered only after the prompt-send marker and prompt artifact
+id are durable and `status` has advanced to `prompt_sent`.
+
+Replay rules:
+
+- A crash in `admitted` can retry admission idempotently.
+- A crash in `launching` or `launched` must reap the managed child if it exists,
+  record orphan-reap evidence, and restart attach from a clean process.
+- A crash in `attaching` must either prove the child never received a prompt or
+  fail closed; it must not assume prompt safety.
+- A crash in `attached_unprompted` may send the prompt once after verifying the
+  attach receipt, live child ownership, and prompt-not-sent marker.
+- A crash in `prompting` or later must not send the prompt again unless the
+  persisted prompt-send record proves the provider did not receive it. If that
+  cannot be proven, fail closed and require operator action.
+- No replay path may create a normal retry or output-repair attempt as a
+  fallback for resurrection failure.
+
+The claim/replay implementation must classify both fields together. A row with
+`status = prompt_sent` or later is never rewound to a pre-prompt phase. A row
+with `resurrection_phase = attached_unprompted` may advance to prompt only
+after revalidating managed process ownership, provider identity proof, and
+prompt-not-sent evidence.
+
+## 4. Data And Evidence
+
+A successful resurrection must write durable evidence that lets an operator and
+future audit distinguish it from retry:
+
+- continuation id;
+- source `agent_execution_id`;
+- source `session_generation_id`;
+- requested provider session id;
+- actual provider session id after attach;
+- adapter capability version;
+- old ACP process/orphan reap outcome if applicable;
+- new ACP child pid and process-group id;
+- attach attempt timestamps and result;
+- canonical request artifact id;
+- attach receipt artifact id;
+- response/result artifact ids;
+- no-progress or failure reason when the attach or prompt does not complete.
+
+The provider-session attach receipt schema must be tightened or versioned. A
+passing resurrection receipt cannot rely on `additionalProperties` to carry the
+important audit fields. Either evolve
+`docs/reference/p086/schemas/artifacts/provider_session_attach_receipt_v1.schema.json`
+for resurrection-specific required fields or add
+`provider_session_attach_receipt_v2.schema.json`.
+
+For `mode = provider_session_resurrection`, the receipt schema must require:
+
+- `requested_provider_session_id`;
+- `actual_provider_session_id`;
+- `identity_proof_source`;
+- `identity_proof_observed_at`;
+- `adapter_id`;
+- `adapter_capability_version`;
+- `attach_request_id` or equivalent idempotency key;
+- `managed_child_pid`;
+- `managed_process_group_id`;
+- `process_started_at`;
+- `attach_started_at`;
+- `attach_completed_at`;
+- `prompt_sent_at` as nullable or absent until prompt send;
+- `resurrection_phase`;
+- `orphan_reap_required`;
+- `orphan_reap_verified`;
+- typed `failure_class` when attach fails.
+
+Readback must expose the same fields through MCP/GraphQL/report surfaces without
+requiring operators to inspect raw JSON artifacts.
+
+Metric/readback surfaces must count:
+
+- resurrection requested;
+- unsupported;
+- attach success;
+- attach failure;
+- prompt sent after resurrection;
+- no-progress after resurrection;
+- useful-progress after resurrection;
+- fresh retry avoided.
+
+Existing metrics that only count unsupported attempts are insufficient for this
+proposal.
+
+## 5. Safety Rules
+
+Provider-session resurrection must fail closed when any of these are true:
+
+- adapter capability is absent or disabled;
+- provider session id is missing, malformed, redacted, expired, or does not
+  match the target agent execution;
+- provider resumes a different session id than requested;
+- worktree root or provider family does not match durable target truth;
+- unresolved side-effect rows or pending approvals exist for the target run or
+  stage;
+- stale ACP orphan reap is required but cannot be verified;
+- quota/auth/runtime health prevents a safe attach;
+- the continuation would touch a release, publish, upload, distribution, commit,
+  push, prepush-review, security, or lead-orchestration lane.
+
+Fail-closed means no provider prompt is sent and no fresh retry is scheduled as
+a fallback.
+
+## 6. Tests
+
+Required tests and evidence:
+
+1. Unit test: unsupported adapters still reject
+   `provider_session_resurrection` with `provider_session_resurrection_unsupported`.
+2. MCP admission test: a frozen catalog with
+   `code_writer.continuation_capability.provider_session_resurrection.enabled =
+   false` rejects provider-session resurrection before work enqueue.
+3. MCP admission test: old snapshots, missing `continuation_capability`, missing
+   `provider_session_resurrection`, malformed catalog JSON, missing
+   `code_writer`, trigger mismatch, or missing required provider session id fail
+   closed before work enqueue.
+4. Compatibility test: existing `live_handle_continuation` catalog behavior
+   remains unchanged while provider-session resurrection is independently
+   gated.
+5. Unit test: Claude adapter builds the correct resume/attach launch/session
+   request for a provider session id.
+6. Integration test: supported resurrection starts a new managed ACP process and
+   records requested and actual provider session ids.
+7. Integration test: mismatched resumed provider session id rejects before
+   prompt send.
+8. Integration test: missing/expired provider session rejects before prompt
+   send with a typed failure reason.
+9. Integration test: stale ACP process is reaped or the resurrection fails
+   closed before attach.
+10. Continuation worker test: resurrection is recorded as
+   `provider_session_resurrection`, not retry, output repair, checkpoint
+   rehydration, or normal session reuse.
+11. Output-repair test: malformed `CHAINWORKS_OUTPUT` can be corrected through a
+   resurrected provider session without changing source files when the operator
+   asked for output-only repair.
+12. Output-only repair test: source snapshot evidence records
+   `changed_source_files == 0`; a deliberately allowed source-edit request must
+   record the explicit operator allowance and changed file list.
+13. Crash/replay tests: crashes in `launching`, `launched`, `attaching`,
+    `attached_unprompted`, and `prompting` follow the replay rules without
+    duplicate prompt send and without normal retry fallback.
+14. DB/API compatibility test: existing live-handle continuation statuses remain
+    accepted by the DB and readback surfaces; provider-session resurrection rows
+    persist a typed `resurrection_phase` without adding new
+    `agent_work_continuations.status` values.
+15. Replay classification test: `attached_unprompted` is distinguishable from
+    `prompt_sent` through DB, MCP, GraphQL, reports, and receipt readback.
+16. Receipt schema test: resurrection receipts fail schema validation if they
+    omit requested id, actual id, proof source, adapter capability version,
+    process ownership evidence, timestamps, or typed failure class.
+17. Readback test: MCP/GraphQL/report surfaces expose attach receipt, actual
+    provider session id, resurrection phase, and resurrection result.
+18. Proposal gate: `./scripts/test-gate.sh proposal-086` covers the above or a
+    focused `proposal-086-resurrection` gate is added and documented.
+
+## 7. Acceptance Criteria
+
+1. At least Claude provider-session resurrection is implemented and enabled by
+   both explicit adapter capability and frozen run catalog
+   `code_writer.continuation_capability.provider_session_resurrection` opt-in.
+2. `agents.continue_work` can continue a code-writer execution by known provider
+   session id after Chainworks no longer owns the live ACP handle.
+3. The resumed provider session id is verified before any continuation prompt is
+   sent.
+4. Unsupported adapters and unsafe targets continue to fail closed without
+   falling back to fresh retry.
+5. Old snapshots, missing/malformed catalog capability fields, disabled
+   provider-session resurrection, trigger mismatch, or missing required provider
+   session id reject before work enqueue.
+6. Existing live-handle catalog behavior remains unchanged.
+7. Resurrection writes attach receipts, process ownership evidence, output
+   artifacts, and readback data sufficient to audit the path end to end.
+8. Resurrection is separately identifiable in metrics and reports.
+9. The output-repair use case is proven for malformed final
+   `CHAINWORKS_OUTPUT`, including machine-checkable no-source-change proof for
+   output-only repair.
+10. Crash/replay evidence proves no duplicate prompt send and no fresh retry
+   fallback across resurrection phases.
+11. Existing continuation `status` values remain backward-compatible; resurrection
+   replay uses typed `resurrection_phase` readback instead of overloading the
+   generic status lifecycle.
+12. Canonical proposal gate evidence passes on the same tree.
+
+## 8. Non-Goals And Follow-Up Ownership
+
+P093 owns only soak/scale after this implementation is complete:
+
+- 14-day no-hold soak;
+- SLO-budget validation;
+- 100 successful continuations across 30 runs;
+- expansion readiness decisions.
+
+P093 does not own implementation of provider-session resurrection. Until this
+proposal is implemented, provider-session resurrection is unfinished P086 scope,
+not an acceptable "Ready with Risks" tail.
+
+Future support for additional providers may be added by separate provider
+adapter proposals after Claude is proven, but the generic contract and at least
+one production-relevant supported adapter must be completed here.

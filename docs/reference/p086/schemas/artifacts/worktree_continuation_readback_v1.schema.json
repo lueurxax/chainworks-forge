@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chainworks.local/schemas/p086/worktree_continuation_readback_v1.schema.json",
+  "title": "worktree_continuation_readback_v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact_kind", "run_id", "stage_execution_id", "agent_execution_id", "continuation_id", "created_at", "redaction_tier", "retention_policy", "payload"],
+  "properties": {
+    "schema_version": { "const": "worktree_continuation_readback_v1" },
+    "artifact_kind": { "const": "worktree_continuation_readback" },
+    "run_id": { "type": "string" },
+    "stage_execution_id": { "type": "string" },
+    "agent_execution_id": { "type": "string" },
+    "continuation_id": { "type": "string" },
+    "created_at": { "type": "string" },
+    "redaction_tier": { "type": "string" },
+    "retention_policy": { "type": "string" },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["git_status_available", "changed_files", "status_entries"],
+      "properties": {
+        "worktree_root": { "type": ["string", "null"] },
+        "git_status_available": { "type": "boolean" },
+        "changed_files": { "type": "array", "items": { "type": "string" } },
+        "status_entries": { "type": "array", "items": { "type": "string" } },
+        "readback_failure": { "type": "string" }
+      }
+    }
+  }
+}

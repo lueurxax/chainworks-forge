@@ -182,6 +182,60 @@ pub async fn get_current_blocking_conflict_tx(
     row.map(|row| decode_conflict_row(&row)).transpose()
 }
 
+/// Batch-fetch the current blocking conflict for each run_id in the list.
+/// Returns a HashMap keyed by run_id string. Runs without a blocking conflict
+/// are absent from the map. Designed for the runs-list query to avoid N+1 lookups.
+pub async fn get_blocking_conflicts_for_runs(
+    pool: &SqlitePool,
+    run_ids: &[String],
+) -> Result<std::collections::HashMap<String, WorkflowConflictRecord>> {
+    if run_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let statuses = current_blocking_statuses();
+    // Build a single query using a VALUES list for the run_id IN clause.
+    // SQLite supports parameterized IN only by repeating ? placeholders.
+    let placeholders = run_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let status_start = run_ids.len() + 1;
+    let sql = format!(
+        "SELECT run_id, record_json FROM workflow_conflicts \
+         WHERE run_id IN ({}) AND status IN (?{}, ?{}, ?{}) \
+         ORDER BY run_id, updated_at DESC, created_at DESC",
+        placeholders,
+        status_start,
+        status_start + 1,
+        status_start + 2,
+    );
+    let mut q = sqlx::query(&sql);
+    for id in run_ids {
+        q = q.bind(id);
+    }
+    q = q.bind(statuses[0].to_string());
+    q = q.bind(statuses[1].to_string());
+    q = q.bind(statuses[2].to_string());
+    let rows = q
+        .fetch_all(pool)
+        .await
+        .context("batch get blocking workflow conflicts")?;
+
+    let mut map: std::collections::HashMap<String, WorkflowConflictRecord> =
+        std::collections::HashMap::new();
+    for row in &rows {
+        let run_id: String = row.try_get("run_id").context("run_id column")?;
+        if map.contains_key(&run_id) {
+            continue; // Keep only the first (most-recently-updated) row per run.
+        }
+        let record = decode_conflict_row(row)?;
+        map.insert(run_id, record);
+    }
+    Ok(map)
+}
+
 pub async fn list_conflict_history_for_run(
     pool: &SqlitePool,
     run_id: RunId,

@@ -1,3 +1,5 @@
+import Darwin
+import Dispatch
 import XCTest
 @testable import Chainworks_Forge
 
@@ -694,6 +696,63 @@ final class Proposal036UXConsolidationTests: XCTestCase {
         XCTAssertEqual(summaries[0].detail, "Summary 2")
     }
 
+    @MainActor
+    func testWorkbenchTimelineKeepsActiveAgentsOutOfEventCards() {
+        let model = RunsWorkbenchPresentationModel()
+        let detail = P031RunDetailPresentation(
+            title: "Run",
+            workflowLabel: "Workflow",
+            statusLabel: "Running",
+            progressLabel: "1/1 stages",
+            pendingApprovalsLabel: nil,
+            rolloutDecisionSummary: nil,
+            ideaContext: nil,
+            stageTransitions: [],
+            approvalRows: [],
+            artifactRows: [],
+            artifactViewerRows: [],
+            reportRows: [],
+            activeAgentTimelineEntries: [
+                P031ActiveAgentTimelinePresentation(
+                    id: "active-earlier",
+                    title: "Earlier Active Agent",
+                    detail: "earlier active text",
+                    timestamp: Date(timeIntervalSince1970: 3),
+                    stageID: "stage-1",
+                    agentID: "agent-earlier",
+                    sessionID: "session-earlier"
+                ),
+                P031ActiveAgentTimelinePresentation(
+                    id: "active-selected",
+                    title: "Selected Active Agent",
+                    detail: "selected active text",
+                    timestamp: Date(timeIntervalSince1970: 4),
+                    stageID: "stage-1",
+                    agentID: "agent-selected",
+                    sessionID: "session-selected"
+                )
+            ],
+            catalogContext: nil,
+            closeoutReadiness: nil,
+            implementationCompletion: nil,
+            sideEffectReadback: nil,
+            freshness: P031FreshnessSnapshot(state: .live),
+            refreshFeedbackText: "Live",
+            emptyStateTitle: nil,
+            errorDescription: nil,
+            rawStatus: "running",
+            failedStages: 0
+        )
+
+        model.selectActiveTimelineAgent("agent-earlier")
+        model.populate(from: detail)
+
+        XCTAssertEqual(model.timelineEntries.count, 0)
+        XCTAssertEqual(model.selectedActiveTimelineAgentID, "agent-earlier")
+        XCTAssertEqual(model.activeTimelineAgents.map(\.id), ["agent-earlier", "agent-selected"])
+        XCTAssertEqual(model.activeTimelineAgents.first?.eventCount, 0)
+    }
+
     func testWorkflowOrdering() {
         let state1 = WorkflowState(label: "S1", type: "start", owner: "o1", approval: nil, run: nil, runAfterApproval: nil, loop: nil, transitions: [Transition(to: "s2", when: "true")])
         let state2 = WorkflowState(label: "S2", type: "end", owner: "o1", approval: nil, run: nil, runAfterApproval: nil, loop: nil, transitions: [])
@@ -1099,6 +1158,83 @@ final class Proposal036UXConsolidationTests: XCTestCase {
     }
 
     @MainActor
+    func testP036UICountersRecordTimelineCardCollapse() {
+        P036UICounters.shared.reset()
+        P036UICounters.shared.recordTimelineCardCollapse(count: 2, reason: "completed_stage_start")
+        XCTAssertEqual(P036UICounters.shared.timelineCardCollapseTotal, 2)
+        XCTAssertEqual(
+            P036UICounterStore.value(for: P036UICounterStore.timelineCardCollapseTotal),
+            2,
+            "Timeline card collapse counter must persist for MetricsCollector readback"
+        )
+    }
+
+    @MainActor
+    func testP036UICountersRecordOperatorTaskAttempt() {
+        P036UICounters.shared.reset()
+        P036UICounters.shared.recordOperatorTaskAttempt(
+            taskID: "runs.settle_approval",
+            result: "blocked",
+            blockedReason: "write_failed"
+        )
+        XCTAssertEqual(P036UICounters.shared.operatorTaskAttemptTotal, 1)
+        XCTAssertEqual(
+            P036UICounterStore.value(for: P036UICounterStore.operatorTaskAttemptTotal),
+            1,
+            "Operator task attempts must persist for dogfood and remote-smoke metric readback"
+        )
+        XCTAssertEqual(
+            P036UICounterStore.operatorTaskAttemptSamples(),
+            [
+                P036OperatorTaskAttemptSample(
+                    taskID: "runs.settle_approval",
+                    result: "blocked",
+                    blockedReason: "write_failed",
+                    count: 1
+                )
+            ],
+            "Operator task attempt readback must preserve task_id, result, and blocked_reason labels"
+        )
+    }
+
+    func testP036ReleaseEvidenceCoversDogfoodRemoteUIAndRolloutReadback() throws {
+        let dogfood = try loadEvidenceObject("docs/evidence/macos-operator-navigation/dogfood-validation-2026-05-21.json")
+        let dogfoodRuns = try XCTUnwrap(dogfood["task_set_runs"] as? [[String: Any]])
+        XCTAssertGreaterThanOrEqual(dogfoodRuns.count, 5, "Phase 2.5 dogfood must include at least five task-set runs")
+        let operators = Set(dogfoodRuns.compactMap { $0["operator_id"] as? String })
+        XCTAssertGreaterThanOrEqual(operators.count, 2, "Phase 2.5 dogfood must include at least two operators")
+        for run in dogfoodRuns {
+            XCTAssertNotNil(run["timeline_readability_rating"], "Every dogfood run must capture timeline readability")
+            XCTAssertNotNil(run["task_outcome"], "Every dogfood run must capture task outcome")
+        }
+        let navigationMetric = try XCTUnwrap(dogfood["p036_operator_navigation_completion_rate"] as? [String: Any])
+        XCTAssertNotNil(navigationMetric["baseline"])
+        XCTAssertNotNil(navigationMetric["target_window"])
+
+        let remoteUI = try loadEvidenceObject("docs/evidence/macos-operator-navigation/remote-ui-accessibility-proof-2026-05-21.json")
+        let coveredSurfaces = Set((remoteUI["covered_surfaces"] as? [String]) ?? [])
+        XCTAssertTrue(coveredSurfaces.isSuperset(of: [
+            "navigation",
+            "runs_inspection",
+            "global_approval_context",
+            "inline_approval_context",
+            "ideas_deep_link_to_runs",
+            "definitions_segment_switch",
+            "settings_readiness_route",
+            "heavy_tool_timeline_flow"
+        ]))
+        XCTAssertFalse((remoteUI["remote_result_bundle"] as? String ?? "").isEmpty)
+        XCTAssertGreaterThanOrEqual((remoteUI["accessibility_checks"] as? [String])?.count ?? 0, 3)
+
+        let rollout = try loadEvidenceObject("docs/evidence/macos-operator-navigation/rollout-readback-live-2026-05-21.json")
+        let lanes = try XCTUnwrap(rollout["lanes"] as? [String: Any])
+        for lane in ["run_report", "mcp", "release_receipt", "graphql"] {
+            let payload = try XCTUnwrap(lanes[lane] as? [String: Any], "Missing P036 rollout readback lane \(lane)")
+            XCTAssertEqual(payload["rollout_contract_status"] as? String ?? payload["rolloutContractStatus"] as? String, "pass")
+        }
+    }
+
+    @MainActor
     func testWorkbenchPopulateEmitsApprovalRenderMetric() {
         P036UICounters.shared.reset()
         let model = RunsWorkbenchPresentationModel()
@@ -1258,6 +1394,334 @@ final class Proposal036UXConsolidationTests: XCTestCase {
         P036UICounters.shared.recordProjectionGapDeferred(count: 1, surface: "timeline", gapClass: "live_events")
         XCTAssertEqual(P036UICounters.shared.projectionGapDeferredTotal, 1,
                        "Timeline deferred state must emit p036_projection_gap_deferred_total")
+    }
+
+    @MainActor
+    func testWorkbenchTimelineDoesNotDuplicateStageProjection() {
+        P036UICounters.shared.reset()
+        let model = RunsWorkbenchPresentationModel()
+        let detail = P031RunDetailPresentation(
+            title: "Run",
+            workflowLabel: "proposal-loop-live",
+            statusLabel: "Running",
+            progressLabel: "1 of 2 stages",
+            pendingApprovalsLabel: nil,
+            rolloutDecisionSummary: nil,
+            ideaContext: nil,
+            stageTransitions: [
+                P031StageTransitionPresentation(
+                    stageExecutionID: "stage-1",
+                    stageTitle: "Plan",
+                    statusText: "Completed",
+                    attemptText: "Attempt 1",
+                    startedLabel: "Started: 2026-05-20 08:00",
+                    completedLabel: "Completed: 2026-05-20 08:05",
+                    durationLabel: "Duration: 5m",
+                    connectorState: .completed,
+                    evidenceLabels: ["Artifacts", "Completed"],
+                    accessibilityLabel: "Plan completed"
+                )
+            ],
+            approvalRows: [],
+            artifactRows: [],
+            artifactViewerRows: [],
+            reportRows: [],
+            catalogContext: nil,
+            closeoutReadiness: nil,
+            implementationCompletion: nil,
+            sideEffectReadback: nil,
+            freshness: P031FreshnessSnapshot(state: .live),
+            refreshFeedbackText: "Live",
+            emptyStateTitle: nil,
+            errorDescription: nil,
+            rawStatus: "running",
+            failedStages: 0
+        )
+
+        model.populate(from: detail)
+
+        XCTAssertEqual(model.timelineEntries.count, 0)
+        XCTAssertEqual(P036UICounters.shared.timelineCardCollapseTotal, 0)
+        XCTAssertEqual(model.stageMap?.stages.count, 0,
+            "Stages tab must not render from stageTransitions; topology readback is the visual source")
+    }
+
+    @MainActor
+    func testWorkbenchStagesUseDaemonTopologyReadback() {
+        let model = RunsWorkbenchPresentationModel()
+        let detail = P031RunDetailPresentation(
+            title: "Run",
+            workflowLabel: "proposal-loop-live",
+            statusLabel: "Running",
+            progressLabel: "1 of 2 stages",
+            pendingApprovalsLabel: nil,
+            rolloutDecisionSummary: nil,
+            ideaContext: nil,
+            stageTransitions: [],
+            stageTopology: [
+                P031StageTopologyPresentation(
+                    stageID: "state_2",
+                    ordinal: 2,
+                    title: "Proposal drafted",
+                    ownerAgentID: "proposal_writer",
+                    ownerAgentTitle: "Proposal Writer",
+                    status: "running",
+                    statusText: "Running",
+                    isCurrent: true,
+                    iterationText: "Iteration 1",
+                    attemptText: "Attempt 2",
+                    approvalRequired: true,
+                    artifactCount: 3,
+                    communicationCount: 4,
+                    occurrences: [
+                        P031StageTopologyOccurrencePresentation(
+                            agentID: "proposal_writer",
+                            agentTitle: "Proposal Writer",
+                            taskName: "Draft proposal",
+                            statusText: "Running",
+                            providerLabel: "codex · gpt-5.5",
+                            executionCountLabel: "2 attempts"
+                        )
+                    ],
+                    transitions: [
+                        P031StageTopologyTransitionPresentation(
+                            toStageID: "state_3",
+                            toLabel: "Proposal reviewed",
+                            detail: "exists('proposal_current')"
+                        )
+                    ]
+                )
+            ],
+            approvalRows: [],
+            artifactRows: [],
+            artifactViewerRows: [],
+            reportRows: [],
+            catalogContext: nil,
+            closeoutReadiness: nil,
+            implementationCompletion: nil,
+            sideEffectReadback: nil,
+            freshness: P031FreshnessSnapshot(state: .live),
+            refreshFeedbackText: "Live",
+            emptyStateTitle: nil,
+            errorDescription: nil,
+            rawStatus: "running",
+            failedStages: 0
+        )
+
+        model.populate(from: detail)
+
+        let stage = model.stageMap?.stages.first
+        XCTAssertEqual(stage?.id, "state_2")
+        XCTAssertEqual(stage?.title, "Proposal drafted")
+        XCTAssertEqual(stage?.ownerAgentTitle, "Proposal Writer")
+        XCTAssertEqual(stage?.status, "active")
+        XCTAssertEqual(stage?.isCurrent, true)
+        XCTAssertEqual(stage?.artifactCount, 3)
+        XCTAssertEqual(stage?.occurrences.first?.taskName, "Draft proposal")
+        XCTAssertEqual(stage?.transitions.first?.toLabel, "Proposal reviewed")
+    }
+
+    func testWorkbenchStagesTopologyUsesBranchTracksWithoutDroppingWorkflowComplete() throws {
+        let model = RunsWorkbenchPresentationModel()
+        let stages = [
+            makeStageTopologyNode(1, "state_1_idea_received", "Idea received", transitions: ["state_2_proposal_drafted"]),
+            makeStageTopologyNode(2, "state_2_proposal_drafted", "Proposal drafted", transitions: ["state_3_initial_proposal_approval"]),
+            makeStageTopologyNode(3, "state_3_initial_proposal_approval", "Human approval: initial proposal", transitions: ["state_4_proposal_reviewed"]),
+            makeStageTopologyNode(4, "state_4_proposal_reviewed", "Proposal reviewed", transitions: ["state_6_implementation_approval", "state_5_proposal_refined"]),
+            makeStageTopologyNode(5, "state_5_proposal_refined", "Proposal refined", transitions: ["state_4_proposal_reviewed"]),
+            makeStageTopologyNode(6, "state_6_implementation_approval", "Human approval: implementation", transitions: ["state_7_implementation_started", "state_5_proposal_refined"]),
+            makeStageTopologyNode(7, "state_7_implementation_started", "Implementation started", transitions: ["state_9_implementation_reviewed", "state_8_implementation_continued"]),
+            makeStageTopologyNode(8, "state_8_implementation_continued", "Implementation continued until code work resolved", transitions: ["state_9_implementation_reviewed", "state_8_implementation_continued"]),
+            makeStageTopologyNode(9, "state_9_implementation_reviewed", "Implementation reviewed against proposal", transitions: ["state_11_manual_release", "state_10_implementation_refined"]),
+            makeStageTopologyNode(10, "state_10_implementation_refined", "Implementation refined", isCurrent: true, transitions: ["state_9_implementation_reviewed"]),
+            makeStageTopologyNode(11, "state_11_manual_release", "Manual release", transitions: ["state_12_workflow_complete"]),
+            makeStageTopologyNode(12, "state_12_workflow_complete", "Workflow complete", transitions: ["state_12_workflow_complete"])
+        ]
+
+        model.populate(from: makeRunDetail(stageTopology: stages))
+
+        let map = try XCTUnwrap(model.stageMap)
+        XCTAssertEqual(map.stages.map(\.id), stages.map(\.stageID))
+        XCTAssertEqual(map.layoutColumns.last?.title, "Terminal")
+        XCTAssertEqual(map.layoutColumns.last?.slots.first?.stage?.id, "state_12_workflow_complete")
+
+        let workLoop = try XCTUnwrap(map.layoutColumns.first { $0.title == "Implementation work loop" })
+        XCTAssertEqual(workLoop.slots.map(\.kind), [.stage, .bridge])
+        XCTAssertEqual(workLoop.slots.first?.stage?.id, "state_8_implementation_continued")
+        XCTAssertEqual(workLoop.slots.last?.bridgeLabel, "Review gate")
+
+        let reviewGate = try XCTUnwrap(map.layoutColumns.first { $0.title == "Review gate" })
+        XCTAssertEqual(reviewGate.slots.first?.stage?.id, "state_9_implementation_reviewed")
+        XCTAssertEqual(reviewGate.slots.first?.heightUnits, 2)
+
+        let implementationConnectors = try XCTUnwrap(
+            map.connectorColumns.first { $0.id == "connector-implementation-start" }
+        )
+        XCTAssertEqual(implementationConnectors.connectors.map(\.style), [.primary, .hidden])
+
+        let workLoopConnectors = try XCTUnwrap(
+            map.connectorColumns.first { $0.id == "connector-implementation-work-loop" }
+        )
+        XCTAssertEqual(workLoopConnectors.connectors.map(\.style), [.primary, .hidden])
+    }
+
+    private func makeStageTopologyNode(
+        _ ordinal: Int,
+        _ stageID: String,
+        _ title: String,
+        isCurrent: Bool = false,
+        transitions: [String]
+    ) -> P031StageTopologyPresentation {
+        P031StageTopologyPresentation(
+            stageID: stageID,
+            ordinal: ordinal,
+            title: title,
+            ownerAgentID: ownerAgentID(for: stageID),
+            ownerAgentTitle: ownerAgentTitle(for: stageID),
+            status: isCurrent ? "running" : "completed",
+            statusText: isCurrent ? "Running" : "Completed",
+            isCurrent: isCurrent,
+            iterationText: nil,
+            attemptText: "Attempt 1",
+            approvalRequired: stageID.contains("approval") || stageID.contains("manual_release"),
+            artifactCount: ordinal == 12 ? 1 : 0,
+            communicationCount: 0,
+            occurrences: [],
+            transitions: transitions.map { targetID in
+                P031StageTopologyTransitionPresentation(
+                    toStageID: targetID,
+                    toLabel: stageTitle(for: targetID),
+                    detail: nil
+                )
+            }
+        )
+    }
+
+    private func makeRunDetail(stageTopology: [P031StageTopologyPresentation]) -> P031RunDetailPresentation {
+        P031RunDetailPresentation(
+            title: "Run",
+            workflowLabel: "Full MVP Live",
+            statusLabel: "Running",
+            progressLabel: nil,
+            pendingApprovalsLabel: nil,
+            rolloutDecisionSummary: nil,
+            ideaContext: nil,
+            stageTransitions: [],
+            stageTopology: stageTopology,
+            approvalRows: [],
+            artifactRows: [],
+            artifactViewerRows: [],
+            reportRows: [],
+            catalogContext: nil,
+            closeoutReadiness: nil,
+            implementationCompletion: nil,
+            sideEffectReadback: nil,
+            freshness: P031FreshnessSnapshot(state: .live),
+            refreshFeedbackText: "Live",
+            emptyStateTitle: nil,
+            errorDescription: nil,
+            rawStatus: "running",
+            failedStages: 0
+        )
+    }
+
+    private func ownerAgentID(for stageID: String) -> String {
+        if stageID.contains("implementation_continued")
+            || stageID.contains("implementation_refined") {
+            return "code_writer"
+        }
+        if stageID.contains("proposal_drafted") || stageID.contains("proposal_refined") {
+            return "proposal_writer"
+        }
+        return "lead_orchestrator"
+    }
+
+    private func ownerAgentTitle(for stageID: String) -> String {
+        switch ownerAgentID(for: stageID) {
+        case "code_writer": return "Code Writer"
+        case "proposal_writer": return "Proposal Writer"
+        default: return "Lead Orchestrator"
+        }
+    }
+
+    private func stageTitle(for stageID: String) -> String {
+        [
+            "state_1_idea_received": "Idea received",
+            "state_2_proposal_drafted": "Proposal drafted",
+            "state_3_initial_proposal_approval": "Human approval: initial proposal",
+            "state_4_proposal_reviewed": "Proposal reviewed",
+            "state_5_proposal_refined": "Proposal refined",
+            "state_6_implementation_approval": "Human approval: implementation",
+            "state_7_implementation_started": "Implementation started",
+            "state_8_implementation_continued": "Implementation continued until code work resolved",
+            "state_9_implementation_reviewed": "Implementation reviewed against proposal",
+            "state_10_implementation_refined": "Implementation refined",
+            "state_11_manual_release": "Manual release",
+            "state_12_workflow_complete": "Workflow complete"
+        ][stageID] ?? stageID
+    }
+
+    @MainActor
+    func testWorkbenchTimelineUsesActiveDaemonAgentExecutions() {
+        let model = RunsWorkbenchPresentationModel()
+        let startedAt = Date(timeIntervalSince1970: 1_779_301_418)
+        let detail = P031RunDetailPresentation(
+            title: "Run",
+            workflowLabel: "proposal-loop-live",
+            statusLabel: "Running",
+            progressLabel: "114/189 stages",
+            pendingApprovalsLabel: nil,
+            rolloutDecisionSummary: nil,
+            ideaContext: nil,
+            stageTransitions: [
+                P031StageTransitionPresentation(
+                    stageExecutionID: "stage-exec-1",
+                    stageTitle: "Implementation reviewed against proposal",
+                    statusText: "Running",
+                    attemptText: "Attempt 1",
+                    startedLabel: "Started",
+                    completedLabel: nil,
+                    durationLabel: nil,
+                    connectorState: .running,
+                    evidenceLabels: [],
+                    accessibilityLabel: "Implementation review running"
+                )
+            ],
+            approvalRows: [],
+            artifactRows: [],
+            artifactViewerRows: [],
+            reportRows: [],
+            activeAgentTimelineEntries: [
+                P031ActiveAgentTimelinePresentation(
+                    id: "active-agent-exec-1",
+                    title: "Security Checker",
+                    detail: "Running via codex_acp gpt-5.5",
+                    timestamp: startedAt,
+                    stageID: "state_9_implementation_reviewed",
+                    agentID: "security_checker",
+                    sessionID: "generation-1"
+                )
+            ],
+            catalogContext: nil,
+            closeoutReadiness: nil,
+            implementationCompletion: nil,
+            sideEffectReadback: nil,
+            freshness: P031FreshnessSnapshot(state: .live),
+            refreshFeedbackText: "Live",
+            emptyStateTitle: nil,
+            errorDescription: nil,
+            rawStatus: "running",
+            failedStages: 0
+        )
+
+        model.populate(from: detail)
+
+        XCTAssertEqual(model.timelineEntries.count, 0)
+        XCTAssertEqual(model.activeTimelineAgents.count, 1)
+        XCTAssertEqual(model.activeTimelineAgents.first?.id, "security_checker")
+        XCTAssertEqual(model.activeTimelineAgents.first?.title, "Security Checker")
+        XCTAssertEqual(model.activeTimelineAgents.first?.stageID, "state_9_implementation_reviewed")
+        XCTAssertEqual(model.activeTimelineAgents.first?.sessionID, "generation-1")
     }
 
     // MARK: - Approvals tab removal after Phase 2c parity cutover (PC-008)
@@ -1528,6 +1992,1130 @@ final class Proposal036UXConsolidationTests: XCTestCase {
             "Waiting run must be reachable after flag-set + populate sequence")
     }
 
+    func testRunsHomeAvoidsEquatableOnChangeForLargeReadPayloads() throws {
+        let source = try runsHomeViewSource()
+
+        XCTAssertFalse(
+            source.contains(".onChange(of: model.runDetail)"),
+            "runDetail contains artifactViewerRows; onChange forces deep Equatable comparison on the SwiftUI hot path"
+        )
+        XCTAssertFalse(
+            source.contains(".onChange(of: model.approvalInbox)"),
+            "approval inbox updates should not require broad SwiftUI Equatable diffing"
+        )
+        XCTAssertFalse(
+            source.contains(".onChange(of: workbench.sidebarLanes)"),
+            "sidebar lanes can be publisher-driven without comparing every row"
+        )
+        XCTAssertTrue(source.contains(".onReceive(model.$runDetail.compactMap { $0 })"))
+        XCTAssertTrue(source.contains(".onReceive(model.$approvalInbox.compactMap { $0 })"))
+        XCTAssertTrue(source.contains(".onReceive(workbench.$sidebarLanes)"))
+    }
+
+    func testStagesTabUsesTopologyCardsInsteadOfVerticalRailRows() throws {
+        let source = try runsHomeViewSource()
+
+        XCTAssertTrue(
+            source.contains("runStageTopology") == false,
+            "RunsHomeView should receive topology through the presenter, not issue GraphQL directly"
+        )
+        XCTAssertTrue(
+            source.contains("ScrollView(.horizontal"),
+            "Stages should use the old Topology-style horizontal lane"
+        )
+        XCTAssertTrue(
+            source.contains("P036StageTopologyCard"),
+            "Stages should render topology cards"
+        )
+        XCTAssertFalse(
+            source.contains("P036StageRailRow"),
+            "Stages tab must not use the interim vertical rail-only implementation"
+        )
+    }
+
+    func testTimelineTabUsesOldSpineGrammarFromControlPlaneReadback() throws {
+        let source = try runsHomeViewSource()
+
+        XCTAssertTrue(
+            source.contains("GroupBox(\"Timeline\")"),
+            "Timeline tab should use the old focused timeline group rather than a single status-row panel"
+        )
+        XCTAssertTrue(
+            source.contains("\"No Timeline Data\""),
+            "Timeline empty state should match the old timeline inspector grammar"
+        )
+        XCTAssertTrue(
+            source.contains("entry.surfaceLabel"),
+            "Timeline cards should show the event/readback surface label like the old timeline spine"
+        )
+        XCTAssertTrue(
+            source.contains("entry.stageID"),
+            "Timeline cards should show stage metadata from control-plane readback"
+        )
+        XCTAssertFalse(
+            source.contains("title: \"Live agent timeline\""),
+            "Timeline tab must not regress to the interim active-agent status-card heading"
+        )
+        XCTAssertFalse(
+            source.contains("\"No active agent events\""),
+            "Timeline tab must not keep the interim active-agent status-card empty state"
+        )
+    }
+
+    func testTimelineRowsUseP093ExpandableCardContract() throws {
+        let source = try runsHomeViewSource()
+        let rowStart = try XCTUnwrap(source.range(of: "private struct TimelineEntryRow: View"))
+        let rowEnd = try XCTUnwrap(source[rowStart.lowerBound...].range(of: "private struct P031RunDetailSummaryCard"))
+        let rowSource = String(source[rowStart.lowerBound..<rowEnd.lowerBound])
+
+        XCTAssertTrue(
+            rowSource.contains("let isExpanded: Bool"),
+            "Timeline rows need an explicit expansion state; current collapsed cards must remain visible."
+        )
+        XCTAssertFalse(
+            rowSource.contains("Button(action: onToggleExpanded)"),
+            "Timeline rows must not wrap the whole card in a Button because expanded-card copy buttons create nested macOS controls."
+        )
+        XCTAssertTrue(
+            rowSource.contains(".onTapGesture") && rowSource.contains("onToggleExpanded()"),
+            "Timeline rows should use explicit card tap handling so every event card can expand and collapse."
+        )
+        XCTAssertTrue(
+            rowSource.contains("P093FormattedTimelineDetail"),
+            "Expanded rows should use the bounded formatted P093 detail renderer."
+        )
+        XCTAssertTrue(
+            rowSource.contains(".lineLimit(3)"),
+            "Collapsed cards should stay standard-sized instead of rendering long response tails."
+        )
+        XCTAssertTrue(
+            rowSource.contains("contextMenu"),
+            "Event IDs should be easy to copy without showing state/time metadata inline."
+        )
+        XCTAssertTrue(
+            rowSource.contains("Copy Timeline event ID") && rowSource.contains("shortID(entry.id)"),
+            "Collapsed compact event IDs should be directly copyable with an accessible label."
+        )
+        XCTAssertTrue(
+            rowSource.contains("metadataHelp"),
+            "State/time metadata should move behind hover/help affordances."
+        )
+        XCTAssertTrue(
+            rowSource.contains("Copy retained raw content") && rowSource.contains("Copy full raw content"),
+            "Expanded cards should expose truthful raw copy labels for full versus retained timeline detail."
+        )
+        XCTAssertTrue(
+            rowSource.contains("@FocusState"),
+            "Hover-only metadata must have a keyboard-focus equivalent."
+        )
+    }
+
+    func testP093RuntimeReadbackRequestsOwnedTimelineFields() throws {
+        let source = try thinGraphQLReadBoundarySource()
+        let requiredFields = [
+            "id",
+            "rawDetail",
+            "rawDetailBytes",
+            "rawDetailTruncated",
+            "rawDetailHandle",
+            "rawDetailDigest",
+            "fullRawAvailable",
+            "detailDigest",
+            "detailCharCount",
+            "chunkCount",
+            "isStreaming",
+            "isTerminal",
+            "stateLabel",
+            "agentTitle",
+            "stageLabel",
+            "taskLabel",
+            "lastEventAt",
+            "eventCount",
+            "selectionOrder",
+            "selectionUnavailableReason"
+        ]
+
+        for field in requiredFields {
+            XCTAssertTrue(
+                source.contains(field),
+                "Runtime timeline subscription should request daemon-owned P093 field \(field)."
+            )
+        }
+    }
+
+    func testP093RuntimeTimelineMissingRawDetailBytesStaysNil() throws {
+        let event = P031RuntimeTimelineEventReadModel(
+            runID: "run-raw-bytes",
+            stageID: "stage-live",
+            agentID: "code_writer",
+            provider: "codex",
+            eventKind: "meaningful_progress",
+            title: "Agent response",
+            detail: "retained detail",
+            surfaceLabel: "text_chunk",
+            sessionGenerationID: "session-generation-1",
+            timestamp: "2026-05-21T12:00:00Z",
+            rawDetail: "daemon retained raw detail",
+            rawDetailBytes: nil,
+            rawDetailTruncated: true,
+            rawDetailHandle: nil,
+            rawDetailDigest: nil,
+            fullRawAvailable: false
+        )
+
+        let presentation = try XCTUnwrap(P031RuntimeTimelineEventPresenter.presentation(for: event))
+
+        XCTAssertNil(
+            presentation.rawDetailBytes,
+            "rawDetailBytes is daemon-owned; Swift must omit the count when the daemon omits it."
+        )
+        XCTAssertFalse(
+            presentation.fullRawAvailable,
+            "Missing daemon raw byte truth must fail closed and avoid full-copy claims."
+        )
+    }
+
+    func testP093SwiftResolvesRawDetailOnlyThroughDaemonResolver() throws {
+        let readBoundarySource = try thinGraphQLReadBoundarySource()
+        let runsHomeSource = try runsHomeViewSource()
+
+        XCTAssertTrue(
+            readBoundarySource.contains("struct P031TimelineRawDetailReadModel"),
+            "Swift needs a typed daemon-owned raw-detail resolver result model."
+        )
+        XCTAssertTrue(
+            readBoundarySource.contains("func fetchTimelineRawDetail(handle: String) async throws -> P031TimelineRawDetailReadModel"),
+            "The read boundary must expose timelineRawDetail(handle:) instead of leaving handles as inert strings."
+        )
+        XCTAssertTrue(
+            readBoundarySource.contains("query P031TimelineRawDetail($handle: ID!)"),
+            "Swift must use the named GraphQL resolver for opaque timeline raw-detail handles."
+        )
+        XCTAssertTrue(
+            runsHomeSource.contains("resolveTimelineRawDetailAction"),
+            "Timeline UI needs an injected resolver action so copy/expand behavior can request full raw content from the daemon."
+        )
+        XCTAssertTrue(
+            runsHomeSource.contains("rawDetailResolutionStatus"),
+            "Resolver failure statuses must be represented in UI state so copy labels fail closed."
+        )
+        XCTAssertTrue(
+            runsHomeSource.contains("digest_mismatch") && runsHomeSource.contains("handle_expired"),
+            "Swift metadata should surface stale/digest mismatch resolver failures without claiming full raw content."
+        )
+    }
+
+    func testP093FormatterEnforcesBudgetsAndLRUCache() throws {
+        let source = try runsHomeViewSource()
+
+        XCTAssertTrue(source.contains("formattedPreviewInputLimit = 96 * 1024"))
+        XCTAssertTrue(source.contains("jsonPrettyPrintInputLimit = 64 * 1024"))
+        XCTAssertTrue(source.contains("codeBlockPreviewLimit = 32 * 1024"))
+        XCTAssertTrue(source.contains("parseTimeFallbackLimitSeconds = 0.050"))
+        XCTAssertTrue(source.contains("fallbackReason: .parseBudgetExceeded"))
+        XCTAssertTrue(
+            source.contains("render(detail: detail, now:"),
+            "Formatter budget behavior should be testable with an injectable clock."
+        )
+        XCTAssertTrue(source.contains("formatterVersion"))
+        XCTAssertTrue(source.contains("maxCacheEntries = 32"))
+        XCTAssertTrue(source.contains("Preview truncated"))
+        XCTAssertTrue(
+            source.contains("P093TimelineMarkdownTextBlock")
+                && source.contains("AttributedString(")
+                && source.contains("interpretedSyntax: .full"),
+            "Expanded Timeline details should use a synchronous Markdown-attributed text renderer so cards cannot show a blank async loading pane."
+        )
+        XCTAssertTrue(
+            source.contains("P093TimelineCodeBlock"),
+            "Expanded Timeline details should render prepared JSON/code blocks directly instead of sending raw CHAINWORKS_OUTPUT payloads through the Markdown renderer."
+        )
+        XCTAssertFalse(
+            source.contains("Copy code block"),
+            "Capped code-block copy controls must not imply the copied preview is the full block."
+        )
+        XCTAssertFalse(
+            source.contains("copyCodePreviewToPasteboard"),
+            "Timeline code preview copy should not duplicate renderer-specific copy controls; full raw copy is handled by the card."
+        )
+        XCTAssertTrue(source.contains("P093TimelineFormatterCache"))
+        XCTAssertTrue(source.contains("evictLeastRecentlyUsedEntry"))
+        XCTAssertTrue(
+            source.contains("event.id") && source.contains("entry.detailDigest") && source.contains("entry.detailCharCount") && source.contains("entry.chunkCount"),
+            "Formatter cache keys should use event ID plus daemon digest, with documented count/chunk fallback."
+        )
+    }
+
+    func testP093ExpandedTimelinePreservesScrollDuringLiveChunkUpdates() throws {
+        let source = try runsHomeViewSource()
+        let detailStart = try XCTUnwrap(source.range(of: "private struct P093FormattedTimelineDetail: View"))
+        let detailEnd = try XCTUnwrap(source[detailStart.lowerBound...].range(of: "#if os(macOS)\nprivate struct P093StableTimelineScrollView"))
+        let detailSource = String(source[detailStart.lowerBound..<detailEnd.lowerBound])
+        let cardStart = try XCTUnwrap(source.range(of: "private struct P036TimelineWorkbenchCard: View"))
+        let cardEnd = try XCTUnwrap(source[cardStart.lowerBound...].range(of: "private struct TimelineAgentOption"))
+        let cardSource = String(source[cardStart.lowerBound..<cardEnd.lowerBound])
+
+        XCTAssertTrue(
+            detailSource.contains("ScrollView {") && detailSource.contains("formattedContent"),
+            "Expanded timeline markdown should render visible content inside a bounded scroll container."
+        )
+        XCTAssertTrue(
+            source.contains("expandedMinimumHeight(for: expandedDetail)"),
+            "Expanded timeline cards must give the scroll container a non-zero height when detail exists; otherwise short provider events can show buttons while hiding the visible summary text."
+        )
+        XCTAssertFalse(
+            detailSource.contains("P093StableTimelineScrollView"),
+            "The previous AppKit stable scroll host regressed into blank expanded cards; timeline should not route formatted content through it."
+        )
+        XCTAssertTrue(
+            cardSource.contains("scrollToNewestIfNotInspecting") && cardSource.contains("guard expandedEntryID == nil else { return }"),
+            "The outer timeline must not auto-scroll to newest rows while an operator is inspecting an expanded card."
+        )
+        XCTAssertTrue(
+            source.contains("transaction.animation = nil"),
+            "Expanded streaming content updates should suppress implicit animation to avoid visible card jitter."
+        )
+    }
+
+    func testP093ExpandedTimelineMinimumHeightPreservesShortProviderDetails() throws {
+        let shortProviderDetail = "completed · writer.rs · sed -n '340,375p' control-plane/crates/db/src/writer.rs"
+        let emptyProviderDetail = "   \n  "
+
+        XCTAssertGreaterThan(
+            P093TimelineFormattedResult.expandedMinimumHeight(for: shortProviderDetail),
+            0,
+            "Expanded provider cards with non-empty collapsed text must reserve visible space for the detail body."
+        )
+        XCTAssertEqual(
+            P093TimelineFormattedResult.expandedMinimumHeight(for: emptyProviderDetail),
+            0,
+            "Truly empty cards should not grow just because they are expanded."
+        )
+    }
+
+    func testP093FormatterBudgetFallsBackWithInjectedClock() throws {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        var calls = 0
+        let result = P093TimelineFormattedResult.render(
+            detail: #"{"kind":"budget"}"#,
+            now: {
+                defer { calls += 1 }
+                return calls == 0 ? start : start.addingTimeInterval(0.060)
+            }
+        )
+
+        XCTAssertEqual(result.blocks, [.text(#"{"kind":"budget"}"#)])
+        XCTAssertEqual(result.content, #"{"kind":"budget"}"#)
+        XCTAssertTrue(result.previewTruncated)
+        XCTAssertEqual(result.fallbackReason, .parseBudgetExceeded)
+    }
+
+    func testP093FormatterDoesNotTreatInstructionMentionsAsChainworksOutputMarkers() throws {
+        let detail = """
+        ## Required Outputs
+        Return each required output through the final `CHAINWORKS_OUTPUT` object using the canonical path keys below.
+
+        - `proposal_review_macos` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f/reviews/proposal/macos.json`
+        """
+
+        let result = P093TimelineFormattedResult.render(detail: detail)
+
+        XCTAssertTrue(
+            result.blocks.contains { block in
+                guard case let .text(text) = block else { return false }
+                return text.contains("Required Outputs")
+                    && text.contains("CHAINWORKS_OUTPUT")
+            },
+            "Instruction prose mentioning CHAINWORKS_OUTPUT should stay Markdown text rather than becoming a false output payload block."
+        )
+        XCTAssertFalse(
+            result.blocks.contains { block in
+                guard case let .code(code) = block else { return false }
+                return code.contains("proposal_review_macos")
+            },
+            "Only a real top-level JSON payload or standalone marker should trigger CHAINWORKS_OUTPUT code rendering."
+        )
+    }
+
+    func testP093FormatterNormalizesInlineMarkdownFenceOpeners() throws {
+        let detail = """
+        Check SessionEventType enum variants```console 6:pub enum SessionGenerationStatus { 15:pub enum SessionEventType {
+
+        ```
+        15  pub enum SessionEventType {
+        """
+
+        let result = P093TimelineFormattedResult.render(detail: detail)
+        XCTAssertTrue(
+            result.content.contains("variants\n```console\n6:pub enum SessionGenerationStatus"),
+            "Timeline markdown should split provider-squashed inline fence openers before document rendering."
+        )
+
+        let blocks = MarkdownDocumentParser.parse(result.content, localRoots: [])
+        XCTAssertEqual(blocks.filter { $0.kind == .codeBlock }.count, 1)
+        XCTAssertTrue(
+            blocks.contains { block in
+                guard case let .paragraph(text) = block else { return false }
+                return text.contains("15  pub enum SessionEventType")
+            },
+            "The second fence should close the code block instead of swallowing all following text."
+        )
+    }
+
+    func testP093FormatterNormalizesClosingFenceWithTrailingText() throws {
+        let detail = """
+        Inspect mapping```console 40:impl From<&SessionGenerationStatus>
+        52:pub enum GqlSessionEventType {
+        ```Ah, the `domain::session::SessionEventType` differs from what I expected.
+        """
+
+        let result = P093TimelineFormattedResult.render(detail: detail)
+        XCTAssertTrue(result.content.contains("52:pub enum GqlSessionEventType {\n```\nAh, the"))
+
+        let blocks = MarkdownDocumentParser.parse(result.content, localRoots: [])
+        XCTAssertEqual(blocks.filter { $0.kind == .codeBlock }.count, 1)
+        XCTAssertTrue(
+            blocks.contains { block in
+                guard case let .paragraph(text) = block else { return false }
+                return text.contains("domain::session::SessionEventType")
+            },
+            "Trailing prose after a closing fence should remain prose, not part of an unterminated code block."
+        )
+    }
+
+    func testP093FormatterPrettyPrintsTopLevelChainworksOutputJSON() throws {
+        let detail = """
+        {"CHAINWORKS_OUTPUT":{"/Users/user/Documents/ChainworksForge/.chainworks/runs/260ec20f/proposals/current/proposal.md":{"schema_version":"proposal_document_v1","proposal_id":"proposal-076","goals":["Persist observations","Expose evidence"]}}}
+        """
+
+        let result = P093TimelineFormattedResult.render(detail: detail)
+
+        XCTAssertTrue(
+            result.blocks.contains { block in
+                guard case let .code(code) = block else { return false }
+                return code.contains("\"CHAINWORKS_OUTPUT\"")
+                    && code.contains("\"proposal_id\" : \"proposal-076\"")
+                    && code.contains("\"goals\"")
+            },
+            "Top-level CHAINWORKS_OUTPUT JSON should render as a readable code block, not as an empty expanded card."
+        )
+    }
+
+    func testP093TimelineUsesNewestFirstOrderAndAgentSelector() throws {
+        let source = try runsHomeViewSource()
+        let cardStart = try XCTUnwrap(source.range(of: "private struct P036TimelineWorkbenchCard: View"))
+        let cardEnd = try XCTUnwrap(source[cardStart.lowerBound...].range(of: "private struct TimelineAgentOption"))
+        let cardSource = String(source[cardStart.lowerBound..<cardEnd.lowerBound])
+
+        XCTAssertTrue(
+            source.contains("return lhs.timestamp > rhs.timestamp"),
+            "Timeline cards should render newest first."
+        )
+        XCTAssertTrue(
+            source.contains("TimelineAgentSelector"),
+            "Multiple active agents should have a dedicated selector instead of mixing event streams."
+        )
+        XCTAssertTrue(
+            source.contains("activeAgents: workbench.activeTimelineAgents"),
+            "Timeline selector should prefer backend active-agent readback over Swift-local event sorting."
+        )
+        XCTAssertTrue(
+            source.contains("selectedAgentID"),
+            "Timeline selection must be explicit so switching agents can collapse stale expanded cards."
+        )
+        XCTAssertFalse(
+            cardSource.contains("max(\n                        agent.eventCount"),
+            "Swift must not override daemon-owned active-agent event counts with partial local visible-entry counts."
+        )
+        XCTAssertFalse(
+            cardSource.contains("latestByAgent"),
+            "Swift must not build active-agent selector options from local timeline rows when daemon readback is absent."
+        )
+        XCTAssertTrue(
+            cardSource.contains("selectionUnavailableReason"),
+            "Missing daemon selector data should render as degraded/unavailable state rather than local inference."
+        )
+        XCTAssertTrue(
+            cardSource.contains("taskLabel") && cardSource.contains("status") && cardSource.contains("sessionID"),
+            "Selector options should expose daemon task/status/session context instead of title/provider only."
+        )
+        XCTAssertTrue(
+            source.contains("latestActivityLabel") && source.contains("selectionStatusLabel"),
+            "Selector rows should render latest activity and daemon status from active-agent readback."
+        )
+    }
+
+    func testP093FormatterHandlesFencedBlocksAndJSON() throws {
+        let source = try runsHomeViewSource()
+
+        XCTAssertTrue(
+            source.contains("P093FormattedTimelineDetail"),
+            "Timeline should use the P093 formatter for expanded detail."
+        )
+        XCTAssertTrue(
+            source.contains("hasPrefix(\"```\")"),
+            "Formatter should recognize fenced code blocks."
+        )
+        XCTAssertTrue(
+            source.contains("JSONSerialization"),
+            "Formatter should pretty-print valid JSON instead of showing dense one-line blobs."
+        )
+        XCTAssertTrue(
+            source.contains("CHAINWORKS_OUTPUT"),
+            "Formatter should recognize structured Chainworks output embedded after prose."
+        )
+        XCTAssertTrue(
+            source.contains("firstPrettyPrintedJSONFragment"),
+            "Formatter should extract embedded JSON fragments instead of requiring the entire response to be JSON."
+        )
+    }
+
+    func testP093CollapsedStreamingResponseUsesMetadataOnlyBody() throws {
+        let source = try runsHomeViewSource()
+        let rowStart = try XCTUnwrap(source.range(of: "private struct TimelineEntryRow: View"))
+        let rowEnd = try XCTUnwrap(source[rowStart.lowerBound...].range(of: "private var expandedDetail"))
+        let rowSource = String(source[rowStart.lowerBound..<rowEnd.lowerBound])
+
+        XCTAssertTrue(
+            rowSource.contains("streamingResponseSummary"),
+            "Collapsed streaming response cards should render stable progress metadata, not a moving raw response tail."
+        )
+        XCTAssertFalse(
+            rowSource.contains("guard isResponseEntry, entry.isTerminal else { return previewDetail }"),
+            "Collapsed streaming responses must not fall through to the raw preview tail."
+        )
+        XCTAssertTrue(
+            rowSource.contains("entry.chunkCount") && rowSource.contains("entry.rawDetailBytes"),
+            "The stable collapsed streaming body should be derived from daemon/buffer metadata."
+        )
+    }
+
+    func testP093RawDetailHandleIsNotResolvedThroughSwiftFilesystem() throws {
+        let source = try runsHomeViewSource() + "\n" + thinGraphQLReadBoundarySource()
+        let suspiciousPatterns = [
+            "FileManager.default.contents",
+            "String(contentsOfFile:",
+            "String(contentsOf:",
+            "URL(fileURLWithPath: rawDetailHandle",
+            "rawDetailHandle).path"
+        ]
+
+        for pattern in suspiciousPatterns {
+            XCTAssertFalse(
+                source.contains(pattern),
+                "Swift must not dereference rawDetailHandle through local filesystem pattern \(pattern)."
+            )
+        }
+        XCTAssertTrue(
+            source.contains("rawDetailHandle"),
+            "The read model should still carry the opaque daemon handle for control-plane resolution."
+        )
+    }
+
+    func testRuntimeTimelineTruncatedRawDetailDoesNotClaimFullAvailability() throws {
+        let runID = "run-truncated-response"
+        let sessionID = "session-generation-1"
+        var buffer = P036RuntimeTimelineBuffer()
+        let oversizedChunk = String(repeating: "x", count: 525_000)
+        buffer.record(
+            P031RuntimeTimelineEventPresentation(
+                id: "oversized-response",
+                runID: runID,
+                stageID: "stage-live",
+                agentID: "code_writer",
+                provider: "junie",
+                eventKind: "meaningful_progress",
+                title: "Agent response",
+                detail: oversizedChunk,
+                surfaceLabel: "text_chunk",
+                sessionGenerationID: sessionID,
+                timestamp: try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-05-20T18:00:00Z"))
+            ),
+            selectedRunID: runID
+        )
+
+        let response = try XCTUnwrap(buffer.events.first)
+        XCTAssertTrue(response.rawDetailTruncated)
+        XCTAssertFalse(response.fullRawAvailable)
+    }
+
+    func testRuntimeTimelineRetainedRawDetailUsesUtf8ByteBudget() throws {
+        let runID = "run-utf8-byte-budget"
+        let sessionID = "session-generation-1"
+        var buffer = P036RuntimeTimelineBuffer()
+        let oversizedChunk = String(repeating: "🙂", count: 200_000)
+        buffer.record(
+            P031RuntimeTimelineEventPresentation(
+                id: "oversized-response",
+                runID: runID,
+                stageID: "stage-live",
+                agentID: "code_writer",
+                provider: "junie",
+                eventKind: "meaningful_progress",
+                title: "Agent response",
+                detail: oversizedChunk,
+                surfaceLabel: "text_chunk",
+                sessionGenerationID: sessionID,
+                timestamp: try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-05-20T18:00:00Z"))
+            ),
+            selectedRunID: runID
+        )
+
+        let response = try XCTUnwrap(buffer.events.first)
+        let retainedRawDetail = try XCTUnwrap(response.rawDetail)
+        XCTAssertTrue(response.rawDetailTruncated)
+        XCTAssertLessThanOrEqual(retainedRawDetail.utf8.count, 512 * 1024)
+        XCTAssertFalse(retainedRawDetail.isEmpty)
+    }
+
+    func testRunsTimelineHonorsReduceMotionForLiveUpdates() throws {
+        let source = try runsHomeViewSource()
+        let rowStart = try XCTUnwrap(source.range(of: "private struct TimelineEntryRow: View"))
+        let rowEnd = try XCTUnwrap(source[rowStart.lowerBound...].range(of: "private var iconName"))
+        let rowSource = String(source[rowStart.lowerBound..<rowEnd.lowerBound])
+        let cardStart = try XCTUnwrap(source.range(of: "private struct P036TimelineWorkbenchCard: View"))
+        let cardEnd = try XCTUnwrap(source[cardStart.lowerBound...].range(of: "private struct P036ApprovalWorkbenchCard: View"))
+        let cardSource = String(source[cardStart.lowerBound..<cardEnd.lowerBound])
+
+        XCTAssertTrue(
+            rowSource.contains("@Environment(\\.accessibilityReduceMotion)"),
+            "Timeline rows must read Reduce Motion before choosing a transition."
+        )
+        XCTAssertTrue(
+            rowSource.contains("reduceMotion ? .opacity : .asymmetric"),
+            "Timeline rows should fall back to opacity instead of spatial push when Reduce Motion is enabled."
+        )
+        XCTAssertTrue(
+            cardSource.contains("@Environment(\\.accessibilityReduceMotion)"),
+            "Timeline card should read Reduce Motion before animating live updates."
+        )
+        XCTAssertTrue(
+            cardSource.contains("reduceMotion ? nil : .spring"),
+            "Timeline live-update animations should disable spring motion when Reduce Motion is enabled."
+        )
+    }
+
+    func testArtifactWorkbenchRendersBoundedPreviewRows() throws {
+        let source = try runsHomeViewSource()
+
+        XCTAssertTrue(
+            source.contains("private let visibleRowLimit = 24"),
+            "The run workbench artifact card should not instantiate every artifact row in large runs"
+        )
+        XCTAssertTrue(
+            source.contains("rows.prefix(visibleRowLimit)"),
+            "Artifact workbench preview must use a bounded prefix; full artifact inspection belongs to the detail surface"
+        )
+        XCTAssertTrue(
+            source.contains("ForEach(visibleRows)"),
+            "SwiftUI should render only the bounded artifact preview rows on the hot run-detail path"
+        )
+    }
+
+    func testWorkbenchPopulateBatchesArtifactPayloadMetricWrites() throws {
+        let source = try runsWorkbenchPresentationModelSource()
+
+        XCTAssertFalse(
+            source.contains("recordArtifactPayloadState(\n                count: 1"),
+            "Artifact metric writes must not happen once per row on the SwiftUI refresh path"
+        )
+        XCTAssertTrue(
+            source.contains("count: artifactsAndReports.count"),
+            "Artifact metric writes should be aggregated after artifact rows are built"
+        )
+        XCTAssertTrue(
+            source.contains("artifactCount: stage.artifactCount"),
+            "Stage artifact counts should come from daemon topology readback, not per-stage artifact filtering"
+        )
+    }
+
+    func testWorkbenchTimelineDoesNotReadLegacySwiftOrchestratorTimeline() throws {
+        let source = try runsWorkbenchPresentationModelSource()
+
+        XCTAssertFalse(
+            source.contains("projection.liveTimeline"),
+            "P036 Timeline must be populated from control-plane active-agent readback, not the legacy Swift orchestrator timeline."
+        )
+        XCTAssertFalse(
+            source.contains("func populate(from projection: WorkflowMapProjection)"),
+            "The workbench should not keep a legacy projection-backed timeline populate path after control-plane cutover."
+        )
+        XCTAssertTrue(
+            source.contains("detail.activeAgentTimelineEntries"),
+            "The workbench timeline should consume active daemon agent executions from the P031 run detail read model."
+        )
+    }
+
+    func testTimelineUsesRuntimeTranscriptSubscriptionForLiveAgentEvents() throws {
+        let readBoundarySource = try thinGraphQLReadBoundarySource()
+        let runsHomeSource = try runsHomeViewSource()
+
+        XCTAssertTrue(
+            readBoundarySource.contains("runtimeStatusChanged(runId: $runId)"),
+            "Live Timeline should subscribe to daemon runtime transcript events instead of relying only on active-agent rows."
+        )
+        XCTAssertTrue(
+            readBoundarySource.contains("let detail: String?") && readBoundarySource.contains("let surfaceLabel: String?"),
+            "Runtime timeline readback should include bounded event detail and surface labels for prompt/text/tool events."
+        )
+        XCTAssertTrue(
+            runsHomeSource.contains("runtimeTimelineEvents"),
+            "RunsHomeView should render transient runtime transcript events while the active agent is running."
+        )
+        XCTAssertTrue(
+            runsHomeSource.contains("P036RuntimeTimelineBuffer"),
+            "RunsHomeView should route live transcript events through the bounded P036 timeline buffer."
+        )
+        XCTAssertTrue(
+            runsHomeSource.contains("events.count > 40"),
+            "The live transcript buffer must stay bounded."
+        )
+        XCTAssertTrue(
+            runsHomeSource.contains("terminalEvent.sessionGenerationID"),
+            "Terminal lifecycle events may not include a session generation; completion must still clear the active agent transcript."
+        )
+    }
+
+    func testRuntimeTimelineAppendsChunksIntoOneLiveResponse() async throws {
+        let runID = "run-live-chunks"
+        let sessionID = "session-generation-1"
+        let events = (0..<45).map { index in
+            runtimeTimelineReadEvent(
+                runID: runID,
+                detail: "chunk-\(index) ",
+                surfaceLabel: "text_chunk",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:00:\(String(format: "%02d", index % 60))Z"
+            )
+        }
+        let model = makeRuntimeTimelineDashboardModel(
+            runID: runID,
+            events: events,
+            runtimeTimelineFlushInterval: 0
+        )
+
+        await model.loadIfNeeded()
+        await waitForRuntimeTimelineDetail(model, containing: "chunk-44")
+
+        XCTAssertEqual(model.runtimeTimelineEvents.count, 1)
+        XCTAssertEqual(model.runtimeTimelineEvents.first?.surfaceLabel, "text_chunk")
+        XCTAssertTrue(model.runtimeTimelineEvents.first?.detail.contains("chunk-0") == true)
+        XCTAssertTrue(model.runtimeTimelineEvents.first?.detail.contains("chunk-44") == true)
+    }
+
+    func testRuntimeTimelineBufferKeepsStableResponseIdentityWhileAppendingChunks() throws {
+        let runID = "run-stable-live-response"
+        let sessionID = "session-generation-1"
+        var buffer = P036RuntimeTimelineBuffer()
+        let firstEvent = P031RuntimeTimelineEventPresentation(
+            id: "first-response-row",
+            runID: runID,
+            stageID: "stage-live",
+            agentID: "code_writer",
+            provider: "junie",
+            eventKind: "meaningful_progress",
+            title: "Agent response",
+            detail: "first chunk ",
+            surfaceLabel: "text_chunk",
+            sessionGenerationID: sessionID,
+            timestamp: try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-05-20T18:00:00Z"))
+        )
+        let secondEvent = P031RuntimeTimelineEventPresentation(
+            id: "second-response-row",
+            runID: runID,
+            stageID: "stage-live",
+            agentID: "code_writer",
+            provider: "junie",
+            eventKind: "meaningful_progress",
+            title: "Agent response",
+            detail: "second chunk",
+            surfaceLabel: "text_chunk",
+            sessionGenerationID: sessionID,
+            timestamp: try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-05-20T18:00:01Z"))
+        )
+
+        buffer.record(firstEvent, selectedRunID: runID)
+        let stableResponseID = try XCTUnwrap(buffer.events.first?.id)
+        buffer.record(secondEvent, selectedRunID: runID)
+
+        let response = try XCTUnwrap(buffer.events.first)
+        XCTAssertEqual(buffer.events.count, 1)
+        XCTAssertEqual(response.id, stableResponseID)
+        XCTAssertTrue(response.detail.contains("first chunk"))
+        XCTAssertTrue(response.detail.contains("second chunk"))
+    }
+
+    func testRuntimeTimelineCollapsesProviderActionProgressAfterCompletion() throws {
+        let runID = "run-provider-action-collapse"
+        let sessionID = "session-generation-1"
+        var buffer = P036RuntimeTimelineBuffer()
+        let started = P031RuntimeTimelineEventPresentation(
+            id: "read-started",
+            runID: runID,
+            stageID: "state_9_implementation_reviewed",
+            agentID: "security_checker",
+            provider: "codex",
+            eventKind: "meaningful_progress",
+            title: "Provider activity",
+            detail: "Read auth_layer.rs · in_progress · read · /repo/control-plane/crates/graphql-server/src/auth_layer.rs",
+            surfaceLabel: "provider_activity",
+            sessionGenerationID: sessionID,
+            timestamp: try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-05-22T05:30:44Z"))
+        )
+        let completed = P031RuntimeTimelineEventPresentation(
+            id: "read-completed",
+            runID: runID,
+            stageID: "state_9_implementation_reviewed",
+            agentID: "security_checker",
+            provider: "codex",
+            eventKind: "meaningful_progress",
+            title: "Provider activity",
+            detail: "completed · auth_layer.rs · sed -n '1,220p' control-plane/crates/graphql-server/src/auth_layer.rs · control-plane/crates/graphql-server/src/auth_layer.rs",
+            surfaceLabel: "provider_activity",
+            sessionGenerationID: sessionID,
+            timestamp: try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-05-22T05:30:45Z"))
+        )
+
+        buffer.record(started, selectedRunID: runID)
+        buffer.record(completed, selectedRunID: runID)
+
+        XCTAssertEqual(buffer.events.count, 1)
+        let action = try XCTUnwrap(buffer.events.first)
+        XCTAssertEqual(action.id, "read-completed")
+        XCTAssertEqual(action.surfaceLabel, "provider_activity")
+        XCTAssertTrue(action.detail.contains("completed"))
+        XCTAssertFalse(action.detail.contains("in_progress"))
+    }
+
+    func testRuntimeTimelineAppendsInterleavedChunksIntoExistingLiveResponse() async throws {
+        let runID = "run-live-interleaved-chunks"
+        let sessionID = "session-generation-1"
+        let events = [
+            runtimeTimelineReadEvent(
+                runID: runID,
+                detail: "first chunk ",
+                surfaceLabel: "text_chunk",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:00:00Z"
+            ),
+            runtimeTimelineReadEvent(
+                runID: runID,
+                eventKind: "session_started",
+                title: "Session started",
+                detail: "session_started",
+                surfaceLabel: "session_started",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:00:01Z"
+            ),
+            runtimeTimelineReadEvent(
+                runID: runID,
+                eventKind: "prompt_sent",
+                title: "Prompt sent",
+                detail: "operator prompt",
+                surfaceLabel: "operator_prompt",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:00:02Z"
+            ),
+            runtimeTimelineReadEvent(
+                runID: runID,
+                detail: "second chunk",
+                surfaceLabel: "text_chunk",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:00:03Z"
+            )
+        ]
+        let model = makeRuntimeTimelineDashboardModel(
+            runID: runID,
+            events: events,
+            runtimeTimelineFlushInterval: 0
+        )
+
+        await model.loadIfNeeded()
+        await waitForRuntimeTimelineDetail(model, containing: "second chunk")
+
+        let responseRows = model.runtimeTimelineEvents.filter { $0.surfaceLabel == "text_chunk" }
+        XCTAssertEqual(responseRows.count, 1)
+        XCTAssertTrue(responseRows.first?.detail.contains("first chunk") == true)
+        XCTAssertTrue(responseRows.first?.detail.contains("second chunk") == true)
+        XCTAssertEqual(model.runtimeTimelineEvents.last?.surfaceLabel, "text_chunk")
+    }
+
+    func testRuntimeTimelineKeepsLiveResponseWhileTrimmingInterleavedEvents() async throws {
+        let runID = "run-live-chunk-trimming"
+        let sessionID = "session-generation-1"
+        var events = [
+            runtimeTimelineReadEvent(
+                runID: runID,
+                detail: "first retained chunk ",
+                surfaceLabel: "text_chunk",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:00:00Z"
+            )
+        ]
+        events.append(contentsOf: (1...45).map { index in
+            runtimeTimelineReadEvent(
+                runID: runID,
+                eventKind: "tool_event",
+                title: "Tool event",
+                detail: "tool event \(index)",
+                surfaceLabel: "tool_event",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:00:\(String(format: "%02d", index % 60))Z"
+            )
+        })
+        events.append(
+            runtimeTimelineReadEvent(
+                runID: runID,
+                detail: "second retained chunk",
+                surfaceLabel: "text_chunk",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:01:00Z"
+            )
+        )
+        let model = makeRuntimeTimelineDashboardModel(
+            runID: runID,
+            events: events,
+            runtimeTimelineFlushInterval: 0
+        )
+
+        await model.loadIfNeeded()
+        await waitForRuntimeTimelineDetail(model, containing: "second retained chunk")
+
+        let responseRows = model.runtimeTimelineEvents.filter { $0.surfaceLabel == "text_chunk" }
+        XCTAssertEqual(responseRows.count, 1)
+        XCTAssertTrue(responseRows.first?.detail.contains("first retained chunk") == true)
+        XCTAssertTrue(responseRows.first?.detail.contains("second retained chunk") == true)
+        XCTAssertLessThanOrEqual(model.runtimeTimelineEvents.count, 40)
+    }
+
+    func testRuntimeTimelineKeepsAccumulatedLiveResponseWithoutHiddenPlaceholder() async throws {
+        let runID = "run-live-long-response"
+        let sessionID = "session-generation-1"
+        let events = (0..<30).map { index in
+            runtimeTimelineReadEvent(
+                runID: runID,
+                detail: "chunk-\(index)-" + String(repeating: "x", count: 1_000) + "\n",
+                surfaceLabel: "text_chunk",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:00:\(String(format: "%02d", index % 60))Z"
+            )
+        }
+        let model = makeRuntimeTimelineDashboardModel(
+            runID: runID,
+            events: events,
+            runtimeTimelineFlushInterval: 0
+        )
+
+        await model.loadIfNeeded()
+        await waitForRuntimeTimelineDetail(model, containing: "chunk-29")
+
+        let response = try XCTUnwrap(model.runtimeTimelineEvents.first)
+        XCTAssertEqual(model.runtimeTimelineEvents.count, 1)
+        XCTAssertEqual(response.surfaceLabel, "text_chunk")
+        XCTAssertTrue(response.detail.contains("chunk-0"))
+        XCTAssertTrue(response.detail.contains("chunk-29"))
+        XCTAssertFalse(
+            response.detail.contains("earlier response content hidden"),
+            "Live response accumulation must not visually imply that the in-flight answer disappeared."
+        )
+    }
+
+    func testRuntimeTimelineCollapsesChunksOnlyAfterResponseEndsIntoSummaryCard() async throws {
+        let runID = "run-terminal-summary"
+        let sessionID = "session-generation-1"
+        var events = (0..<5).map { index in
+            runtimeTimelineReadEvent(
+                runID: runID,
+                detail: "response chunk \(index)",
+                surfaceLabel: "text_chunk",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:01:\(String(format: "%02d", index))Z"
+            )
+        }
+        events.append(
+            runtimeTimelineReadEvent(
+                runID: runID,
+                eventKind: "session_completed",
+                title: nil,
+                detail: nil,
+                surfaceLabel: nil,
+                sessionGenerationID: nil,
+                timestamp: "2026-05-20T18:01:10Z"
+            )
+        )
+        let model = makeRuntimeTimelineDashboardModel(
+            runID: runID,
+            events: events,
+            runtimeTimelineFlushInterval: 0
+        )
+
+        await model.loadIfNeeded()
+        await waitForRuntimeTimelineCount(model, minimumCount: 1)
+
+        XCTAssertEqual(model.runtimeTimelineEvents.count, 1)
+        let response = try XCTUnwrap(model.runtimeTimelineEvents.first)
+        XCTAssertEqual(response.surfaceLabel, "agent_summary")
+        XCTAssertEqual(response.title, "Agent response complete")
+        XCTAssertTrue(response.detail.contains("Response complete"))
+        XCTAssertTrue(response.detail.contains("5 chunks"))
+        XCTAssertFalse(
+            response.detail.contains("response chunk 0"),
+            "Completed response cards should show summary metadata when collapsed, not an arbitrary tail of the message."
+        )
+        XCTAssertTrue(response.rawDetail?.contains("response chunk 0") == true)
+        XCTAssertTrue(response.rawDetail?.contains("response chunk 4") == true)
+    }
+
+    func testRuntimeTimelineFinalResponseSummaryKeepsAccumulatedRawDetail() async throws {
+        let runID = "run-final-response-accumulated-chunks"
+        let sessionID = "session-generation-1"
+        let events = [
+            runtimeTimelineReadEvent(
+                runID: runID,
+                detail: "first chunk ",
+                surfaceLabel: "text_chunk",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:01:00Z"
+            ),
+            runtimeTimelineReadEvent(
+                runID: runID,
+                detail: "second chunk ",
+                surfaceLabel: "text_chunk",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:01:01Z"
+            ),
+            runtimeTimelineReadEvent(
+                runID: runID,
+                eventKind: "meaningful_progress",
+                title: "Final response",
+                detail: "terminal only",
+                surfaceLabel: "final_response",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:01:02Z"
+            )
+        ]
+        let model = makeRuntimeTimelineDashboardModel(
+            runID: runID,
+            events: events,
+            runtimeTimelineFlushInterval: 0
+        )
+
+        await model.loadIfNeeded()
+        await waitForRuntimeTimelineCount(model, minimumCount: 1)
+
+        XCTAssertEqual(model.runtimeTimelineEvents.count, 1)
+        let response = try XCTUnwrap(model.runtimeTimelineEvents.first)
+        XCTAssertEqual(response.surfaceLabel, "agent_summary")
+        XCTAssertTrue(response.detail.contains("2 chunks"))
+        XCTAssertFalse(response.detail.contains("first chunk"))
+        XCTAssertFalse(response.detail.contains("second chunk"))
+        XCTAssertTrue(response.rawDetail?.contains("first chunk") == true)
+        XCTAssertTrue(response.rawDetail?.contains("second chunk") == true)
+        XCTAssertFalse(response.rawDetail?.contains("terminal only") == true)
+    }
+
+    func testRuntimeTimelineCompletedSummaryDoesNotExposeLongRawTailWhenCollapsed() async throws {
+        let runID = "run-completed-long-response"
+        let sessionID = "session-generation-1"
+        var events = (0..<40).map { index in
+            runtimeTimelineReadEvent(
+                runID: runID,
+                detail: "completed-chunk-\(index)-" + String(repeating: "y", count: 500) + "\n",
+                surfaceLabel: "text_chunk",
+                sessionGenerationID: sessionID,
+                timestamp: "2026-05-20T18:01:\(String(format: "%02d", index % 60))Z"
+            )
+        }
+        events.append(
+            runtimeTimelineReadEvent(
+                runID: runID,
+                eventKind: "session_completed",
+                title: nil,
+                detail: nil,
+                surfaceLabel: nil,
+                sessionGenerationID: nil,
+                timestamp: "2026-05-20T18:02:10Z"
+            )
+        )
+        let model = makeRuntimeTimelineDashboardModel(
+            runID: runID,
+            events: events,
+            runtimeTimelineFlushInterval: 0
+        )
+
+        await model.loadIfNeeded()
+        await waitForRuntimeTimelineSurface(model, surfaceLabel: "agent_summary")
+
+        let response = try XCTUnwrap(model.runtimeTimelineEvents.first)
+        XCTAssertEqual(model.runtimeTimelineEvents.count, 1)
+        XCTAssertEqual(response.surfaceLabel, "agent_summary")
+        XCTAssertTrue(response.detail.contains("40 chunks"))
+        XCTAssertFalse(response.detail.contains("completed-chunk-0"))
+        XCTAssertFalse(response.detail.contains("completed-chunk-39"))
+        XCTAssertTrue(response.rawDetail?.contains("completed-chunk-0") == true)
+        XCTAssertTrue(response.rawDetail?.contains("completed-chunk-39") == true)
+        XCTAssertFalse(response.detail.contains("terminal only"))
+    }
+
+    func testRuntimeTimelineBatchesRunsSubscriptionPublishes() async throws {
+        P036UICounters.shared.reset()
+        let baselineFlushTotal = P036UICounters.shared.timelineBatchFlushTotal
+        let runID = "run-batched-chunks"
+        let events = [
+            runtimeTimelineReadEvent(
+                runID: runID,
+                detail: "first chunk ",
+                surfaceLabel: "text_chunk",
+                timestamp: "2026-05-20T18:02:00Z"
+            ),
+            runtimeTimelineReadEvent(
+                runID: runID,
+                detail: "second chunk",
+                surfaceLabel: "text_chunk",
+                timestamp: "2026-05-20T18:02:01Z"
+            )
+        ]
+        let model = makeRuntimeTimelineDashboardModel(
+            runID: runID,
+            events: events,
+            runtimeTimelineFlushInterval: 60
+        )
+
+        await model.loadIfNeeded()
+        await waitForRuntimeTimelineCount(model, minimumCount: 1)
+
+        XCTAssertEqual(model.runtimeTimelineEvents.count, 1)
+        XCTAssertTrue(model.runtimeTimelineEvents.first?.detail.contains("first chunk") == true)
+        XCTAssertFalse(
+            model.runtimeTimelineEvents.first?.detail.contains("second chunk") == true,
+            "Runs timeline should batch rapid chunk updates instead of publishing every subscription event."
+        )
+        XCTAssertGreaterThan(P036UICounters.shared.timelineBatchFlushTotal, baselineFlushTotal)
+    }
+
+    func testReadBoundaryDateParserCachesFormatters() throws {
+        let source = try thinGraphQLReadBoundarySource()
+        guard let parserRange = source.range(of: "private enum P031ReadBoundaryDateParser"),
+              let extensionRange = source.range(of: "private extension P031StageReadModel") else {
+            XCTFail("Expected P031ReadBoundaryDateParser source block")
+            return
+        }
+        let parserSource = String(source[parserRange.lowerBound..<extensionRange.lowerBound])
+
+        XCTAssertTrue(
+            parserSource.contains("Thread.current.threadDictionary"),
+            "Run detail presentation should reuse date formatters instead of allocating them per stage/artifact row"
+        )
+        XCTAssertFalse(
+            parserSource.contains("let fractional = ISO8601DateFormatter()"),
+            "Per-call ISO8601DateFormatter allocation showed up in the P036 Time Profiler trace"
+        )
+        XCTAssertFalse(
+            parserSource.contains("let standard = ISO8601DateFormatter()"),
+            "Per-call ISO8601DateFormatter allocation showed up in the P036 Time Profiler trace"
+        )
+    }
+
     // MARK: - Recovery evidence stable IDs
 
     func testRecoveryEvidenceRowsUseStableIndexBasedIDs() {
@@ -1588,5 +3176,137 @@ final class Proposal036UXConsolidationTests: XCTestCase {
         workbench.populate(from: detail)
         let idsAgain = workbench.recoveryEvidence.map(\.id)
         XCTAssertEqual(ids, idsAgain, "Recovery evidence IDs must be stable across repeated populate() calls")
+    }
+
+    private func runsHomeViewSource() throws -> String {
+        try sourceFile("Chainworks Forge/Views/RunsHomeView.swift")
+    }
+
+    private func runsWorkbenchPresentationModelSource() throws -> String {
+        try sourceFile("Chainworks Forge/Models/RunsWorkbenchPresentationModel.swift")
+    }
+
+    private func thinGraphQLReadBoundarySource() throws -> String {
+        try sourceFile("Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift")
+    }
+
+    private func makeRuntimeTimelineDashboardModel(
+        runID: String,
+        events: [P031RuntimeTimelineEventReadModel],
+        runtimeTimelineFlushInterval: TimeInterval = 0
+    ) -> P031ThinReadDashboardModel {
+        let run = P031RunRowReadModel(
+            id: runID,
+            status: "running",
+            ideaTitle: "Runtime timeline run",
+            workflowTitle: "Full MVP Live",
+            freshnessState: .live,
+            totalStages: 1,
+            completedStages: 0,
+            failedStages: 0,
+            pendingApprovals: 0
+        )
+        let store = P031InMemoryWorkflowReadStore(
+            runs: [run],
+            runDetailsByRunID: [
+                runID: P031RunDetailReadModel(run: run, stages: [], artifacts: [])
+            ],
+            runtimeTimelineEvents: [runID: events]
+        )
+        return P031ThinReadDashboardModel(
+            coordinator: P031ThinWorkflowScreenCoordinator(store: store),
+            runtimeTimelineFlushInterval: runtimeTimelineFlushInterval
+        )
+    }
+
+    private func runtimeTimelineReadEvent(
+        runID: String,
+        eventKind: String = "meaningful_progress",
+        title: String? = "Agent response",
+        detail: String? = "chunk",
+        surfaceLabel: String? = "text_chunk",
+        sessionGenerationID: String? = "session-generation-1",
+        timestamp: String
+    ) -> P031RuntimeTimelineEventReadModel {
+        P031RuntimeTimelineEventReadModel(
+            runID: runID,
+            stageID: "stage-live",
+            agentID: "code_writer",
+            provider: "junie",
+            eventKind: eventKind,
+            title: title,
+            detail: detail,
+            surfaceLabel: surfaceLabel,
+            sessionGenerationID: sessionGenerationID,
+            timestamp: timestamp
+        )
+    }
+
+    private func waitForRuntimeTimelineCount(
+        _ model: P031ThinReadDashboardModel,
+        minimumCount: Int
+    ) async {
+        for _ in 0..<100 {
+            if model.runtimeTimelineEvents.count >= minimumCount {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private func waitForRuntimeTimelineDetail(
+        _ model: P031ThinReadDashboardModel,
+        containing needle: String
+    ) async {
+        for _ in 0..<100 {
+            if model.runtimeTimelineEvents.contains(where: { $0.detail.contains(needle) }) {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private func waitForRuntimeTimelineSurface(
+        _ model: P031ThinReadDashboardModel,
+        surfaceLabel: String
+    ) async {
+        for _ in 0..<100 {
+            if model.runtimeTimelineEvents.contains(where: { $0.surfaceLabel == surfaceLabel }) {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private func sourceFile(_ path: String) throws -> String {
+        let data = try snapshotFileData(path)
+        return try XCTUnwrap(String(data: data, encoding: .utf8))
+    }
+
+    private func loadEvidenceObject(_ path: String) throws -> [String: Any] {
+        let data = try snapshotFileData(path)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    private func snapshotFileData(_ path: String) throws -> Data {
+        let snapshotRoots = [
+            ProcessInfo.processInfo.environment["CHAINWORKS_TEST_SOURCE_ROOT"],
+            URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+                .appendingPathComponent("chainworks-test-gates/source-snapshot", isDirectory: true)
+                .path
+        ].compactMap { root -> String? in
+            guard let root, !root.isEmpty else { return nil }
+            return root
+        }
+
+        for snapshotRoot in snapshotRoots {
+            let sourceURL = URL(fileURLWithPath: snapshotRoot, isDirectory: true)
+                .appendingPathComponent(path, isDirectory: false)
+            guard FileManager.default.fileExists(atPath: sourceURL.path) else { continue }
+            return try Data(contentsOf: sourceURL)
+        }
+
+        XCTFail("Source/evidence tests require a test-gate source snapshot; run through scripts/test-gate.sh")
+        return Data()
     }
 }

@@ -98,6 +98,12 @@ pub struct AcpRuntimeManager {
     xcode_shim_runtime: RwLock<Option<XcodeShimRuntimeConfig>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpLiveSessionProcessBinding {
+    pub child_pid: u32,
+    pub process_group_id: u32,
+}
+
 #[derive(Clone)]
 struct XcodeShimRuntimeConfig {
     store: Arc<dyn XcodeShimGrantStore>,
@@ -266,6 +272,30 @@ impl AcpRuntimeManager {
             Some(expected) => session.provider_session_id().await == expected,
             None => true,
         }
+    }
+
+    pub async fn live_session_process_binding(
+        &self,
+        generation_id: &str,
+    ) -> Option<AcpLiveSessionProcessBinding> {
+        let session = {
+            let sessions = self.live_sessions.lock().await;
+            sessions.get(generation_id).cloned()
+        }?;
+        if !session.is_live().await {
+            self.live_sessions.lock().await.remove(generation_id);
+            let cleanup = self.live_xcode_leases.lock().await.remove(generation_id);
+            self.release_xcode_leases(cleanup).await;
+            return None;
+        }
+        let child_pid = session.child_pid().await?;
+        Some(AcpLiveSessionProcessBinding {
+            child_pid,
+            // ACP adapters launch children into a fresh process group with the
+            // child pid as pgid, so recording both values makes recovery
+            // explicit without probing arbitrary processes by command line.
+            process_group_id: child_pid,
+        })
     }
 
     /// Start a fresh ACP session and keep it alive if requested.

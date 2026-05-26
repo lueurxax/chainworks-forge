@@ -610,16 +610,19 @@ struct P072ApprovalMutationResult: Decodable, Equatable, Sendable {
 struct P072ApprovalMutationClient<Transport: P031GraphQLReadTransport>: Sendable {
   let transport: Transport
 
-  func approve(approvalID: String) async throws -> P072ApprovalMutationResult {
+  func approve(approvalID: String, idempotencyKey: String) async throws -> P072ApprovalMutationResult {
     try await execute(
       P072ApproveApprovalPayload.self,
       operationName: "P072ApproveApproval",
       document: P031GraphQLDocuments.approveApproval,
-      variables: ["approvalId": .string(approvalID)]
+      variables: [
+        "approvalId": .string(approvalID),
+        "idempotencyKey": .string(idempotencyKey),
+      ]
     ).approveApproval
   }
 
-  func reject(approvalID: String, reason: String) async throws -> P072ApprovalMutationResult {
+  func reject(approvalID: String, reason: String, idempotencyKey: String) async throws -> P072ApprovalMutationResult {
     try await execute(
       P072RejectApprovalPayload.self,
       operationName: "P072RejectApproval",
@@ -627,6 +630,7 @@ struct P072ApprovalMutationClient<Transport: P031GraphQLReadTransport>: Sendable
       variables: [
         "approvalId": .string(approvalID),
         "reason": .string(reason),
+        "idempotencyKey": .string(idempotencyKey),
       ]
     ).rejectApproval
   }
@@ -928,13 +932,203 @@ extension URLSessionWebSocketTask.Message {
 nonisolated private struct P031GraphQLResponseEnvelope<Payload: Decodable>: Decodable {
   let data: Payload?
   let errors: [P031GraphQLResponseError]?
+  let extensions: P081GraphQLResponseExtensions?
 }
 
 nonisolated private struct P031GraphQLResponseError: Decodable {
   let message: String
 }
 
+struct P081GraphQLRedaction: Decodable, Equatable, Sendable {
+  let path: [String]
+  let reasonCode: String
+  let rowId: String?
+  let redactionMode: String
+  let callerClass: String?
+  let redactionId: String
+}
+
+struct P081GraphQLResponseExtensions: Decodable, Equatable, Sendable {
+  let redactions: [P081GraphQLRedaction]
+
+  init(redactions: [P081GraphQLRedaction] = []) {
+    self.redactions = redactions
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.redactions = try container.decodeIfPresent([P081GraphQLRedaction].self, forKey: .redactions) ?? []
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case redactions
+  }
+}
+
+struct P081OperatorAlert: Decodable, Equatable, Sendable {
+  let id: String
+  let dedupeKey: String
+  let severity: String
+  let title: String
+  let message: String
+  let active: Bool
+  let silenceable: Bool
+  let acknowledgedAtMs: Int?
+  let silencedUntilMs: Int?
+  let nativeDelivery: P081OperatorAlertNativeDelivery?
+  let lifecycle: P081OperatorAlertLifecycle?
+
+  var accessibilityLabel: String {
+    "\(title), \(severity)"
+  }
+
+  var accessibilityValue: String {
+    if let lifecycle {
+      return lifecycle.state
+    }
+    return active ? "active" : "cleared"
+  }
+
+  var accessibilityHint: String {
+    "Boundary alert. Copy diagnostics for \(dedupeKey)."
+  }
+}
+
+struct P081OperatorAlertNativeDelivery: Decodable, Equatable, Sendable {
+  let deliveryKey: String
+  let dockBadgeContribution: Int
+  let requestUserAttention: String
+  let notificationCategory: String
+  let dedupePolicy: String
+}
+
+struct P081OperatorAlertLifecycle: Decodable, Equatable, Sendable {
+  let state: String
+  let dedupeKey: String
+  let ackRequired: Bool
+  let clearCondition: String
+}
+
+enum P081RedactionState: Equatable, Sendable {
+  case ordinaryNil(fieldDisplayName: String)
+  case redacted(fieldDisplayName: String, redaction: P081GraphQLRedaction)
+  case dropResource(fieldDisplayName: String, denialCopy: String, redaction: P081GraphQLRedaction)
+
+  var accessibilityLabel: String {
+    switch self {
+    case .ordinaryNil(let fieldDisplayName),
+      .redacted(let fieldDisplayName, _):
+      return fieldDisplayName
+    case .dropResource:
+      return "Restricted view"
+    }
+  }
+
+  var accessibilityValue: String {
+    switch self {
+    case .ordinaryNil:
+      return "No value"
+    case .redacted:
+      return "Restricted value"
+    case .dropResource(_, let denialCopy, _):
+      return denialCopy
+    }
+  }
+
+  var accessibilityHint: String? {
+    switch self {
+    case .ordinaryNil:
+      return nil
+    case .redacted:
+      return "Permissions hide this value. Copy diagnostics for the access rule."
+    case .dropResource:
+      return "Permissions hide this resource. Copy diagnostics for the access rule."
+    }
+  }
+}
+
+struct P081AccessibilityModePolicy: Equatable, Sendable {
+  let fullKeyboardAccessEnabled: Bool
+  let increaseContrastEnabled: Bool
+  let reduceMotionEnabled: Bool
+
+  func presentation(for state: P081RedactionState) -> P081RedactionPresentation {
+    let restricted: Bool
+    switch state {
+    case .ordinaryNil:
+      restricted = false
+    case .redacted, .dropResource:
+      restricted = true
+    }
+    return P081RedactionPresentation(
+      accessibilityLabel: state.accessibilityLabel,
+      accessibilityValue: state.accessibilityValue,
+      accessibilityHint: state.accessibilityHint,
+      isKeyboardFocusable: fullKeyboardAccessEnabled,
+      visualTreatment: restricted && increaseContrastEnabled ? .highContrastRestricted : .ordinary
+    )
+  }
+
+  func disabledApprovalPresentation(reason: String) -> P081DisabledApprovalPresentation {
+    P081DisabledApprovalPresentation(
+      isActionEnabled: false,
+      isKeyboardFocusable: fullKeyboardAccessEnabled,
+      accessibilityHint: "Approval action disabled. \(reason)"
+    )
+  }
+
+  func alertPresentation(for severity: String) -> P081AlertPresentation {
+    if reduceMotionEnabled {
+      return P081AlertPresentation(allowsMotion: false, attentionStyle: .staticCritical)
+    }
+    return P081AlertPresentation(
+      allowsMotion: true,
+      attentionStyle: severity.lowercased() == "critical" ? .animatedCritical : .staticInformational
+    )
+  }
+}
+
+struct P081RedactionPresentation: Equatable, Sendable {
+  let accessibilityLabel: String
+  let accessibilityValue: String
+  let accessibilityHint: String?
+  let isKeyboardFocusable: Bool
+  let visualTreatment: P081RedactionVisualTreatment
+}
+
+enum P081RedactionVisualTreatment: Equatable, Sendable {
+  case ordinary
+  case highContrastRestricted
+}
+
+struct P081DisabledApprovalPresentation: Equatable, Sendable {
+  let isActionEnabled: Bool
+  let isKeyboardFocusable: Bool
+  let accessibilityHint: String
+}
+
+struct P081AlertPresentation: Equatable, Sendable {
+  let allowsMotion: Bool
+  let attentionStyle: P081AlertAttentionStyle
+}
+
+enum P081AlertAttentionStyle: Equatable, Sendable {
+  case animatedCritical
+  case staticCritical
+  case staticInformational
+}
+
 enum P031GraphQLResponseDecoder {
+  nonisolated static func decodeExtensions(from data: Data) throws -> P081GraphQLResponseExtensions {
+    let envelope: P031GraphQLResponseEnvelope<P031EmptyGraphQLPayload>
+    do {
+      envelope = try JSONDecoder().decode(P031GraphQLResponseEnvelope<P031EmptyGraphQLPayload>.self, from: data)
+    } catch {
+      throw P031GraphQLReadBoundaryError.decodingFailed(error.localizedDescription)
+    }
+    return envelope.extensions ?? P081GraphQLResponseExtensions()
+  }
+
   nonisolated static func decode<Payload: Decodable>(
     _ payloadType: Payload.Type,
     from data: Data,
@@ -955,6 +1149,8 @@ enum P031GraphQLResponseDecoder {
     return payload
   }
 }
+
+nonisolated private struct P031EmptyGraphQLPayload: Decodable {}
 
 enum P031ReadErrorPresenter {
   nonisolated static let schemaMismatchTitle = "Daemon schema mismatch"
@@ -1017,6 +1213,10 @@ enum P031DisabledReasonCode: String, Codable, CaseIterable, Equatable, Sendable 
   case conflict = "CONFLICT"
   case duplicate = "DUPLICATE"
   case alreadyResolved = "ALREADY_RESOLVED"
+  case approvalNotActionable = "APPROVAL_NOT_ACTIONABLE"
+  case observerScope = "OBSERVER_SCOPE"
+  case nonApprovalMutation = "NON_APPROVAL_MUTATION"
+  case capabilityOutOfScope = "CAPABILITY_OUT_OF_SCOPE"
 
   // Fail-closed: unknown server values decode to .writePathNotAvailable (most restrictive).
   init(from decoder: Decoder) throws {
@@ -1900,6 +2100,161 @@ struct P031RunStatusChangedReadModel: Decodable, Equatable, Sendable {
   let projectionLag: Bool?
 }
 
+struct P031RuntimeTimelineEventReadModel: Decodable, Equatable, Sendable {
+  let id: String?
+  let runID: String
+  let stageID: String
+  let agentID: String
+  let provider: String
+  let eventKind: String
+  let title: String?
+  let detail: String?
+  let surfaceLabel: String?
+  let sessionGenerationID: String?
+  let timestamp: String
+  let rawDetail: String?
+  let rawDetailBytes: Int?
+  let rawDetailTruncated: Bool?
+  let rawDetailHandle: String?
+  let rawDetailDigest: String?
+  let fullRawAvailable: Bool?
+  let detailDigest: String?
+  let detailCharCount: Int?
+  let chunkCount: Int?
+  let isStreaming: Bool?
+  let isTerminal: Bool?
+  let stateLabel: String?
+
+  enum CodingKeys: String, CodingKey {
+    case id
+    case runID = "runId"
+    case stageID = "stageId"
+    case agentID = "agentId"
+    case provider
+    case eventKind
+    case title
+    case detail
+    case surfaceLabel
+    case sessionGenerationID = "sessionGenerationId"
+    case timestamp
+    case rawDetail
+    case rawDetailBytes
+    case rawDetailTruncated
+    case rawDetailHandle
+    case rawDetailDigest
+    case fullRawAvailable
+    case detailDigest
+    case detailCharCount
+    case chunkCount
+    case isStreaming
+    case isTerminal
+    case stateLabel
+  }
+
+  nonisolated init(
+    id: String? = nil,
+    runID: String,
+    stageID: String,
+    agentID: String,
+    provider: String,
+    eventKind: String,
+    title: String? = nil,
+    detail: String? = nil,
+    surfaceLabel: String? = nil,
+    sessionGenerationID: String? = nil,
+    timestamp: String,
+    rawDetail: String? = nil,
+    rawDetailBytes: Int? = nil,
+    rawDetailTruncated: Bool? = nil,
+    rawDetailHandle: String? = nil,
+    rawDetailDigest: String? = nil,
+    fullRawAvailable: Bool? = nil,
+    detailDigest: String? = nil,
+    detailCharCount: Int? = nil,
+    chunkCount: Int? = nil,
+    isStreaming: Bool? = nil,
+    isTerminal: Bool? = nil,
+    stateLabel: String? = nil
+  ) {
+    self.id = id
+    self.runID = runID
+    self.stageID = stageID
+    self.agentID = agentID
+    self.provider = provider
+    self.eventKind = eventKind
+    self.title = title
+    self.detail = detail
+    self.surfaceLabel = surfaceLabel
+    self.sessionGenerationID = sessionGenerationID
+    self.timestamp = timestamp
+    self.rawDetail = rawDetail
+    self.rawDetailBytes = rawDetailBytes
+    self.rawDetailTruncated = rawDetailTruncated
+    self.rawDetailHandle = rawDetailHandle
+    self.rawDetailDigest = rawDetailDigest
+    self.fullRawAvailable = fullRawAvailable
+    self.detailDigest = detailDigest
+    self.detailCharCount = detailCharCount
+    self.chunkCount = chunkCount
+    self.isStreaming = isStreaming
+    self.isTerminal = isTerminal
+    self.stateLabel = stateLabel
+  }
+
+  nonisolated init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.id = try container.decodeIfPresent(String.self, forKey: .id)
+    self.runID = try container.decode(String.self, forKey: .runID)
+    self.stageID = try container.decode(String.self, forKey: .stageID)
+    self.agentID = try container.decode(String.self, forKey: .agentID)
+    self.provider = try container.decode(String.self, forKey: .provider)
+    self.eventKind = try container.decode(String.self, forKey: .eventKind)
+    self.title = try container.decodeIfPresent(String.self, forKey: .title)
+    self.detail = try container.decodeIfPresent(String.self, forKey: .detail)
+    self.surfaceLabel = try container.decodeIfPresent(String.self, forKey: .surfaceLabel)
+    self.sessionGenerationID = try container.decodeIfPresent(String.self, forKey: .sessionGenerationID)
+    self.timestamp = try container.decode(String.self, forKey: .timestamp)
+    self.rawDetail = try container.decodeIfPresent(String.self, forKey: .rawDetail)
+    self.rawDetailBytes = try container.decodeIfPresent(Int.self, forKey: .rawDetailBytes)
+    self.rawDetailTruncated = try container.decodeIfPresent(Bool.self, forKey: .rawDetailTruncated)
+    self.rawDetailHandle = try container.decodeIfPresent(String.self, forKey: .rawDetailHandle)
+    self.rawDetailDigest = try container.decodeIfPresent(String.self, forKey: .rawDetailDigest)
+    self.fullRawAvailable = try container.decodeIfPresent(Bool.self, forKey: .fullRawAvailable)
+    self.detailDigest = try container.decodeIfPresent(String.self, forKey: .detailDigest)
+    self.detailCharCount = try container.decodeIfPresent(Int.self, forKey: .detailCharCount)
+    self.chunkCount = try container.decodeIfPresent(Int.self, forKey: .chunkCount)
+    self.isStreaming = try container.decodeIfPresent(Bool.self, forKey: .isStreaming)
+    self.isTerminal = try container.decodeIfPresent(Bool.self, forKey: .isTerminal)
+    self.stateLabel = try container.decodeIfPresent(String.self, forKey: .stateLabel)
+  }
+}
+
+enum P031TimelineRawDetailStatus: String, Decodable, Equatable, Sendable {
+  case available
+  case missing
+  case stale
+  case unauthorized
+  case unavailable
+  case digestMismatch = "digest_mismatch"
+}
+
+enum P031TimelineRawDetailErrorReason: String, Decodable, Equatable, Sendable {
+  case handleNotFound = "handle_not_found"
+  case handleExpired = "handle_expired"
+  case runNotAuthorized = "run_not_authorized"
+  case eventNotAuthorized = "event_not_authorized"
+  case storageUnavailable = "storage_unavailable"
+  case digestValidationFailed = "digest_validation_failed"
+}
+
+struct P031TimelineRawDetailReadModel: Decodable, Equatable, Sendable {
+  let status: P031TimelineRawDetailStatus
+  let rawDetail: String?
+  let rawDetailBytes: Int?
+  let rawDetailDigest: String?
+  let errorReason: P031TimelineRawDetailErrorReason?
+}
+
 enum P031DaemonLifecycleState: String, CaseIterable, Equatable, Sendable {
   case notStarted = "not_started"
   case starting
@@ -2271,25 +2626,183 @@ struct P031ArtifactReadModel: Decodable, Equatable, Sendable {
   }
 }
 
+struct P031ActiveAgentExecutionReadModel: Decodable, Equatable, Sendable {
+  let id: String
+  let stageExecutionID: String
+  let agentID: String
+  let agentTitle: String?
+  let provider: String
+  let model: String?
+  let status: String
+  let startedAt: String?
+  let completedAt: String?
+  let stageLabel: String?
+  let taskLabel: String?
+  let lastEventAt: String?
+  let eventCount: Int?
+  let selectionOrder: Int?
+  let selectionUnavailableReason: String?
+  let sessionLineageID: String?
+  let sessionGenerationID: String?
+
+  nonisolated init(
+    id: String,
+    stageExecutionID: String,
+    agentID: String,
+    agentTitle: String? = nil,
+    provider: String,
+    model: String? = nil,
+    status: String,
+    startedAt: String? = nil,
+    completedAt: String? = nil,
+    stageLabel: String? = nil,
+    taskLabel: String? = nil,
+    lastEventAt: String? = nil,
+    eventCount: Int? = nil,
+    selectionOrder: Int? = nil,
+    selectionUnavailableReason: String? = nil,
+    sessionLineageID: String? = nil,
+    sessionGenerationID: String? = nil
+  ) {
+    self.id = id
+    self.stageExecutionID = stageExecutionID
+    self.agentID = agentID
+    self.agentTitle = agentTitle
+    self.provider = provider
+    self.model = model
+    self.status = status
+    self.startedAt = startedAt
+    self.completedAt = completedAt
+    self.stageLabel = stageLabel
+    self.taskLabel = taskLabel
+    self.lastEventAt = lastEventAt
+    self.eventCount = eventCount
+    self.selectionOrder = selectionOrder
+    self.selectionUnavailableReason = selectionUnavailableReason
+    self.sessionLineageID = sessionLineageID
+    self.sessionGenerationID = sessionGenerationID
+  }
+
+  enum CodingKeys: String, CodingKey {
+    case id
+    case stageExecutionID = "stageExecutionId"
+    case agentID = "agentId"
+    case agentTitle
+    case provider
+    case model
+    case status
+    case startedAt
+    case completedAt
+    case stageLabel
+    case taskLabel
+    case lastEventAt
+    case eventCount
+    case selectionOrder
+    case selectionUnavailableReason
+    case sessionLineageID = "sessionLineageId"
+    case sessionGenerationID = "sessionGenerationId"
+  }
+}
+
+struct P031RunStageTopologyOccurrenceReadModel: Decodable, Equatable, Sendable {
+  let agentID: String
+  let agentTitle: String
+  let taskName: String
+  let status: String
+  let provider: String
+  let model: String?
+  let effort: String?
+  let executionCount: Int
+
+  enum CodingKeys: String, CodingKey {
+    case agentID = "agentId"
+    case agentTitle
+    case taskName
+    case status
+    case provider
+    case model
+    case effort
+    case executionCount
+  }
+}
+
+struct P031RunStageTopologyTransitionReadModel: Decodable, Equatable, Sendable {
+  let toStageID: String
+  let toLabel: String?
+  let detail: String?
+
+  enum CodingKeys: String, CodingKey {
+    case toStageID = "toStageId"
+    case toLabel
+    case detail
+  }
+}
+
+struct P031RunStageTopologyReadModel: Decodable, Equatable, Sendable {
+  let stageID: String
+  let label: String
+  let order: Int
+  let ownerAgentID: String
+  let ownerAgentTitle: String
+  let status: String
+  let isCurrent: Bool
+  let iteration: Int?
+  let attemptNumber: Int?
+  let approvalRequired: Bool
+  let artifactCount: Int
+  let communicationCount: Int
+  let occurrences: [P031RunStageTopologyOccurrenceReadModel]
+  let transitions: [P031RunStageTopologyTransitionReadModel]
+
+  enum CodingKeys: String, CodingKey {
+    case stageID = "stageId"
+    case label
+    case order
+    case ownerAgentID = "ownerAgentId"
+    case ownerAgentTitle
+    case status
+    case isCurrent
+    case iteration
+    case attemptNumber
+    case approvalRequired
+    case artifactCount
+    case communicationCount
+    case occurrences
+    case transitions
+  }
+}
+
 struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
   let run: P031RunRowReadModel?
   let idea: P031IdeaReadModel?
   let stages: [P031StageReadModel]
   let artifacts: [P031ArtifactReadModel]
   let approvalInbox: [P031ApprovalReadModel]
+  let activeAgentExecutions: [P031ActiveAgentExecutionReadModel]
+  let runStageTopology: [P031RunStageTopologyReadModel]
+  let continuations: [P086ContinuationRecordReadModel]
+  let continuationMetricsSummary: P086ContinuationMetricsSummaryReadModel?
 
   nonisolated init(
     run: P031RunRowReadModel?,
     idea: P031IdeaReadModel? = nil,
     stages: [P031StageReadModel],
     artifacts: [P031ArtifactReadModel],
-    approvalInbox: [P031ApprovalReadModel] = []
+    approvalInbox: [P031ApprovalReadModel] = [],
+    activeAgentExecutions: [P031ActiveAgentExecutionReadModel] = [],
+    runStageTopology: [P031RunStageTopologyReadModel] = [],
+    continuations: [P086ContinuationRecordReadModel] = [],
+    continuationMetricsSummary: P086ContinuationMetricsSummaryReadModel? = nil
   ) {
     self.run = run
     self.idea = idea
     self.stages = stages
     self.artifacts = artifacts
     self.approvalInbox = approvalInbox
+    self.activeAgentExecutions = activeAgentExecutions
+    self.runStageTopology = runStageTopology
+    self.continuations = continuations
+    self.continuationMetricsSummary = continuationMetricsSummary
   }
 
   nonisolated var freshnessStates: [P031FreshnessState] {
@@ -2297,6 +2810,7 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
       + stages.map(\.freshnessState)
       + artifacts.map(\.freshnessState)
       + approvalInbox.map(\.freshnessState)
+      + continuations.map(\.freshnessState)
   }
 
   nonisolated var ordinaryArtifacts: [P031ArtifactReadModel] {
@@ -2320,6 +2834,10 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
     case stages
     case artifacts
     case approvalInbox
+    case activeAgentExecutions
+    case runStageTopology
+    case continuations
+    case continuationMetricsSummary
   }
 
   init(from decoder: Decoder) throws {
@@ -2332,6 +2850,166 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
       try container.decodeIfPresent([P031ArtifactReadModel].self, forKey: .artifacts) ?? []
     self.approvalInbox =
       try container.decodeIfPresent([P031ApprovalReadModel].self, forKey: .approvalInbox) ?? []
+    self.activeAgentExecutions =
+      try container.decodeIfPresent(
+        [P031ActiveAgentExecutionReadModel].self,
+        forKey: .activeAgentExecutions
+      ) ?? []
+    self.runStageTopology =
+      try container.decodeIfPresent(
+        [P031RunStageTopologyReadModel].self,
+        forKey: .runStageTopology
+      ) ?? []
+    self.continuations =
+      try container.decodeIfPresent([P086ContinuationRecordReadModel].self, forKey: .continuations)
+      ?? []
+    self.continuationMetricsSummary =
+      try container.decodeIfPresent(
+        P086ContinuationMetricsSummaryReadModel.self,
+        forKey: .continuationMetricsSummary
+      )
+  }
+}
+
+struct P086ContinuationRecordReadModel: Decodable, Equatable, Sendable {
+  let id: String
+  let runID: String
+  let stageExecutionID: String
+  let agentExecutionID: String
+  let modeRaw: String
+  let modeDisplay: String
+  let triggerKindRaw: String
+  let triggerKindDisplay: String
+  let statusRaw: String
+  let statusDisplay: String
+  let isTerminal: Bool
+  let failureReason: String?
+  let reconciliationStatus: String?
+  let requestFingerprintSHA256: String
+  let canonicalRequestArtifactID: String?
+  let attachReceiptArtifactID: String?
+  let evidenceBundleArtifactID: String?
+  let worktreeReadbackArtifactID: String?
+  let continuationReportArtifactID: String?
+  let responseFingerprintSHA256: String?
+  let responseArtifactID: String?
+  let resultOrNoProgressArtifactID: String?
+  let conflictCount: Int
+  let createdAt: String
+  let updatedAt: String
+  let freshnessState: P031FreshnessState
+  let projectionLagMS: Int?
+
+  enum CodingKeys: String, CodingKey {
+    case id
+    case runID = "runId"
+    case stageExecutionID = "stageExecutionId"
+    case agentExecutionID = "agentExecutionId"
+    case modeRaw
+    case modeDisplay
+    case triggerKindRaw
+    case triggerKindDisplay
+    case statusRaw
+    case statusDisplay
+    case isTerminal
+    case failureReason
+    case reconciliationStatus
+    case requestFingerprintSHA256 = "requestFingerprintSha256"
+    case canonicalRequestArtifactID = "canonicalRequestArtifactId"
+    case attachReceiptArtifactID = "attachReceiptArtifactId"
+    case evidenceBundleArtifactID = "evidenceBundleArtifactId"
+    case worktreeReadbackArtifactID = "worktreeReadbackArtifactId"
+    case continuationReportArtifactID = "continuationReportArtifactId"
+    case responseFingerprintSHA256 = "responseFingerprintSha256"
+    case responseArtifactID = "responseArtifactId"
+    case resultOrNoProgressArtifactID = "resultOrNoProgressArtifactId"
+    case conflictCount
+    case createdAt
+    case updatedAt
+    case freshnessState
+    case projectionLagMS = "projectionLagMs"
+  }
+}
+
+struct P086ContinuationMetricsSummaryReadModel: Decodable, Equatable, Sendable {
+  let runID: String
+  let admissionTotal: Int
+  let acceptedTotal: Int
+  let rejectedTotal: Int
+  let replayTotal: Int
+  let successTotal: Int
+  let noProgressTotal: Int
+  let failedTotal: Int
+  let cancelledTotal: Int
+  let freshSessionAvoidedTotal: Int
+  let leadAutoTotal: Int
+  let operatorMCPTotal: Int
+  let changedFilesTotal: Int
+  let testsOrGatesTotal: Int
+  let terminalTotal: Int
+  let usefulProgressTotal: Int
+  let usefulProgressRate: Double
+  let noProgressRate: Double
+  let testsPassedAfterContinuationTotal: Int
+  let followupValidationTotal: Int
+  let followupValidationSuccessTotal: Int
+  let followupValidationSuccessRate: Double
+  let leadAutoSuccessTotal: Int
+  let leadAutoSuccessRate: Double
+  let operatorMCPSuccessTotal: Int
+  let operatorMCPSuccessRate: Double
+  let timeSavedSecondsTotal: Int
+  let timeSavedSampleCount: Int
+  let averageTimeSavedSeconds: Double
+  let providerSessionBudgetInputTokensTotal: Int
+  let providerSessionBudgetOutputTokensTotal: Int
+  let providerSessionBudgetCachedInputTokensTotal: Int
+  let providerSessionBudgetCostCentsTotal: Int
+  let providerSessionResurrectionAttachSuccessTotal: Int
+  let providerSessionResurrectionAttachFailureTotal: Int
+  let orphanReapAttemptedTotal: Int
+  let orphanReapVerifiedTotal: Int
+  let resurrectionUnsupportedTotal: Int
+
+  enum CodingKeys: String, CodingKey {
+    case runID = "runId"
+    case admissionTotal
+    case acceptedTotal
+    case rejectedTotal
+    case replayTotal
+    case successTotal
+    case noProgressTotal
+    case failedTotal
+    case cancelledTotal
+    case freshSessionAvoidedTotal
+    case leadAutoTotal
+    case operatorMCPTotal = "operatorMcpTotal"
+    case changedFilesTotal
+    case testsOrGatesTotal
+    case terminalTotal
+    case usefulProgressTotal
+    case usefulProgressRate
+    case noProgressRate
+    case testsPassedAfterContinuationTotal
+    case followupValidationTotal
+    case followupValidationSuccessTotal
+    case followupValidationSuccessRate
+    case leadAutoSuccessTotal
+    case leadAutoSuccessRate
+    case operatorMCPSuccessTotal = "operatorMcpSuccessTotal"
+    case operatorMCPSuccessRate = "operatorMcpSuccessRate"
+    case timeSavedSecondsTotal
+    case timeSavedSampleCount
+    case averageTimeSavedSeconds
+    case providerSessionBudgetInputTokensTotal
+    case providerSessionBudgetOutputTokensTotal
+    case providerSessionBudgetCachedInputTokensTotal
+    case providerSessionBudgetCostCentsTotal
+    case providerSessionResurrectionAttachSuccessTotal
+    case providerSessionResurrectionAttachFailureTotal
+    case orphanReapAttemptedTotal
+    case orphanReapVerifiedTotal
+    case resurrectionUnsupportedTotal
   }
 }
 
@@ -2353,10 +3031,14 @@ protocol P031WorkflowReadStore: Sendable {
   func fetchApprovalInbox() async throws -> [P031ApprovalReadModel]
   func fetchArtifacts(runID: String) async throws -> [P031ArtifactReadModel]
   func fetchArtifactPayload(artifactID: String) async throws -> P031ArtifactReadModel
+  func fetchTimelineRawDetail(handle: String) async throws -> P031TimelineRawDetailReadModel
   func fetchReportMetadata(runID: String) async throws -> [P031ReportMetadataReadModel]
   func fetchDaemonStatus() async throws -> P031DaemonStatusReadModel
   nonisolated func subscribeToRunStatus(runID: String) throws -> AsyncThrowingStream<
     P031RunStatusChangedReadModel, Error
+  >
+  nonisolated func subscribeToRuntimeTimeline(runID: String) throws -> AsyncThrowingStream<
+    P031RuntimeTimelineEventReadModel, Error
   >
   nonisolated func subscribeToDaemonStatus() throws -> AsyncThrowingStream<P031DaemonStatusReadModel, Error>
 }
@@ -2370,10 +3052,12 @@ struct P031GraphQLDocumentSet: Equatable, Sendable {
   let approvalInbox: String
   let artifacts: String
   let artifactPayload: String
+  let timelineRawDetail: String
   let reportMetadata: String
   let daemonStatus: String
   let ideaTitle: String
   let runStatusChanged: String
+  let runtimeStatusChanged: String
   let daemonStatusChanged: String
 }
 
@@ -2519,6 +3203,123 @@ enum P031GraphQLDocuments {
         projectionLag
         freshnessState
       }
+      runStageTopology(runId: $runId) {
+        stageId
+        label
+        order
+        ownerAgentId
+        ownerAgentTitle
+        status
+        isCurrent
+        iteration
+        attemptNumber
+        approvalRequired
+        artifactCount
+        communicationCount
+        occurrences {
+          agentId
+          agentTitle
+          taskName
+          status
+          provider
+          model
+          effort
+          executionCount
+        }
+        transitions {
+          toStageId
+          toLabel
+          detail
+        }
+      }
+      activeAgentExecutions(runId: $runId) {
+        id
+        stageExecutionId
+        agentId
+        agentTitle
+        provider
+        model
+        status
+        startedAt
+        completedAt
+        stageLabel
+        taskLabel
+        lastEventAt
+        eventCount
+        selectionOrder
+        selectionUnavailableReason
+        sessionLineageId
+        sessionGenerationId
+      }
+      continuations(runId: $runId) {
+        id
+        runId
+        stageExecutionId
+        agentExecutionId
+        modeRaw
+        modeDisplay
+        triggerKindRaw
+        triggerKindDisplay
+        statusRaw
+        statusDisplay
+        isTerminal
+        failureReason
+        reconciliationStatus
+        requestFingerprintSha256
+        canonicalRequestArtifactId
+        attachReceiptArtifactId
+        evidenceBundleArtifactId
+        worktreeReadbackArtifactId
+        continuationReportArtifactId
+        responseFingerprintSha256
+        responseArtifactId
+        resultOrNoProgressArtifactId
+        conflictCount
+        createdAt
+        updatedAt
+        freshnessState
+        projectionLagMs
+      }
+      continuationMetricsSummary(runId: $runId) {
+        runId
+        admissionTotal
+        acceptedTotal
+        rejectedTotal
+        replayTotal
+        successTotal
+        noProgressTotal
+        failedTotal
+        cancelledTotal
+        freshSessionAvoidedTotal
+        leadAutoTotal
+        operatorMcpTotal
+        changedFilesTotal
+        testsOrGatesTotal
+        terminalTotal
+        usefulProgressTotal
+        usefulProgressRate
+        noProgressRate
+        testsPassedAfterContinuationTotal
+        followupValidationTotal
+        followupValidationSuccessTotal
+        followupValidationSuccessRate
+        leadAutoSuccessTotal
+        leadAutoSuccessRate
+        operatorMcpSuccessTotal
+        operatorMcpSuccessRate
+        timeSavedSecondsTotal
+        timeSavedSampleCount
+        averageTimeSavedSeconds
+        providerSessionBudgetInputTokensTotal
+        providerSessionBudgetOutputTokensTotal
+        providerSessionBudgetCachedInputTokensTotal
+        providerSessionBudgetCostCentsTotal
+        providerSessionResurrectionAttachSuccessTotal
+        providerSessionResurrectionAttachFailureTotal
+        orphanReapAttemptedTotal
+        orphanReapVerifiedTotal
+        resurrectionUnsupportedTotal
+      }
       artifacts(runId: $runId) {
         id
         runId
@@ -2623,8 +3424,8 @@ enum P031GraphQLDocuments {
     """
 
   static let approveApproval = """
-    mutation P072ApproveApproval($approvalId: ID!) {
-      approveApproval(approvalId: $approvalId) {
+    mutation P072ApproveApproval($approvalId: ID!, $idempotencyKey: String!) {
+      approveApproval(approvalId: $approvalId, idempotencyKey: $idempotencyKey) {
         approval {
           id
           runId
@@ -2645,8 +3446,8 @@ enum P031GraphQLDocuments {
     """
 
   static let rejectApproval = """
-    mutation P072RejectApproval($approvalId: ID!, $reason: String!) {
-      rejectApproval(approvalId: $approvalId, reason: $reason) {
+    mutation P072RejectApproval($approvalId: ID!, $reason: String!, $idempotencyKey: String!) {
+      rejectApproval(approvalId: $approvalId, reason: $reason, idempotencyKey: $idempotencyKey) {
         approval {
           id
           runId
@@ -2719,6 +3520,18 @@ enum P031GraphQLDocuments {
     }
     """
 
+  static let timelineRawDetail = """
+    query P031TimelineRawDetail($handle: ID!) {
+      timelineRawDetail(handle: $handle) {
+        status
+        rawDetail
+        rawDetailBytes
+        rawDetailDigest
+        errorReason
+      }
+    }
+    """
+
   static let reportMetadata = """
     query P031ReportMetadata($runId: ID!) {
       artifacts(runId: $runId) {
@@ -2744,6 +3557,36 @@ enum P031GraphQLDocuments {
         freshnessState
         projectionUpdatedAt
         projectionLag
+      }
+    }
+    """
+
+  static let runtimeStatusChanged = """
+    subscription P031RuntimeStatusChanged($runId: ID!) {
+      runtimeStatusChanged(runId: $runId) {
+        id
+        runId
+        stageId
+        agentId
+        provider
+        eventKind
+        title
+        detail
+        surfaceLabel
+        sessionGenerationId
+        timestamp
+        rawDetail
+        rawDetailBytes
+        rawDetailTruncated
+        rawDetailHandle
+        rawDetailDigest
+        fullRawAvailable
+        detailDigest
+        detailCharCount
+        chunkCount
+        isStreaming
+        isTerminal
+        stateLabel
       }
     }
     """
@@ -2788,10 +3631,12 @@ enum P031GraphQLDocuments {
     approvalInbox: approvalInbox,
     artifacts: artifacts,
     artifactPayload: artifactPayload,
+    timelineRawDetail: timelineRawDetail,
     reportMetadata: reportMetadata,
     daemonStatus: daemonStatus,
     ideaTitle: ideaTitle,
     runStatusChanged: runStatusChanged,
+    runtimeStatusChanged: runtimeStatusChanged,
     daemonStatusChanged: daemonStatusChanged
   )
 }
@@ -2849,7 +3694,11 @@ struct P031GraphQLWorkflowReadStore<
       idea: detail.idea,
       stages: detail.stages,
       artifacts: detail.artifacts,
-      approvalInbox: detail.approvalInbox
+      approvalInbox: detail.approvalInbox,
+      activeAgentExecutions: detail.activeAgentExecutions,
+      runStageTopology: detail.runStageTopology,
+      continuations: detail.continuations,
+      continuationMetricsSummary: detail.continuationMetricsSummary
     )
   }
 
@@ -2930,6 +3779,16 @@ struct P031GraphQLWorkflowReadStore<
     }
   }
 
+  func fetchTimelineRawDetail(handle: String) async throws -> P031TimelineRawDetailReadModel {
+    let payload = try await readClient.execute(
+      TimelineRawDetailPayload.self,
+      operationName: "P031TimelineRawDetail",
+      document: documents.timelineRawDetail,
+      variables: ["handle": .string(handle)]
+    )
+    return payload.timelineRawDetail
+  }
+
   func fetchReportMetadata(runID: String) async throws -> [P031ReportMetadataReadModel] {
     let payload = try await readClient.execute(
       ReportMetadataPayload.self,
@@ -2959,6 +3818,18 @@ struct P031GraphQLWorkflowReadStore<
       variables: ["runId": .string(runID)]
     )
     .map { payload in payload.runStatusChanged }
+  }
+
+  nonisolated func subscribeToRuntimeTimeline(runID: String) throws -> AsyncThrowingStream<
+    P031RuntimeTimelineEventReadModel, Error
+  > {
+    try subscriptionClient.subscribe(
+      RuntimeStatusChangedPayload.self,
+      operationName: "P031RuntimeStatusChanged",
+      document: documents.runtimeStatusChanged,
+      variables: ["runId": .string(runID)]
+    )
+    .map { payload in payload.runtimeStatusChanged }
   }
 
   nonisolated func subscribeToDaemonStatus() throws -> AsyncThrowingStream<P031DaemonStatusReadModel, Error> {
@@ -3048,6 +3919,10 @@ struct P031GraphQLWorkflowReadStore<
     let artifact: P031ArtifactReadModel?
   }
 
+  private struct TimelineRawDetailPayload: Decodable {
+    let timelineRawDetail: P031TimelineRawDetailReadModel
+  }
+
   private struct ReportMetadataPayload: Decodable {
     let artifacts: [P031ReportMetadataReadModel]
   }
@@ -3058,6 +3933,10 @@ struct P031GraphQLWorkflowReadStore<
 
   nonisolated private struct RunStatusChangedPayload: Decodable {
     let runStatusChanged: P031RunStatusChangedReadModel
+  }
+
+  nonisolated private struct RuntimeStatusChangedPayload: Decodable {
+    let runtimeStatusChanged: P031RuntimeTimelineEventReadModel
   }
 
   nonisolated private struct DaemonStatusChangedPayload: Decodable {
@@ -3077,9 +3956,11 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
   let stagesByRunID: [String: [P031StageReadModel]]
   let approvalInbox: [P031ApprovalReadModel]
   let artifactsByRunID: [String: [P031ArtifactReadModel]]
+  let timelineRawDetailsByHandle: [String: P031TimelineRawDetailReadModel]
   let reportsByRunID: [String: [P031ReportMetadataReadModel]]
   let daemonStatus: P031DaemonStatusReadModel?
   let runStatusEvents: [String: [P031RunStatusChangedReadModel]]
+  let runtimeTimelineEvents: [String: [P031RuntimeTimelineEventReadModel]]
   let daemonStatusEvents: [P031DaemonStatusReadModel]
 
   init(
@@ -3090,9 +3971,11 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
     stagesByRunID: [String: [P031StageReadModel]] = [:],
     approvalInbox: [P031ApprovalReadModel] = [],
     artifactsByRunID: [String: [P031ArtifactReadModel]] = [:],
+    timelineRawDetailsByHandle: [String: P031TimelineRawDetailReadModel] = [:],
     reportsByRunID: [String: [P031ReportMetadataReadModel]] = [:],
     daemonStatus: P031DaemonStatusReadModel? = nil,
     runStatusEvents: [String: [P031RunStatusChangedReadModel]] = [:],
+    runtimeTimelineEvents: [String: [P031RuntimeTimelineEventReadModel]] = [:],
     daemonStatusEvents: [P031DaemonStatusReadModel] = []
   ) {
     self.runs = runs
@@ -3102,9 +3985,11 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
     self.stagesByRunID = stagesByRunID
     self.approvalInbox = approvalInbox
     self.artifactsByRunID = artifactsByRunID
+    self.timelineRawDetailsByHandle = timelineRawDetailsByHandle
     self.reportsByRunID = reportsByRunID
     self.daemonStatus = daemonStatus
     self.runStatusEvents = runStatusEvents
+    self.runtimeTimelineEvents = runtimeTimelineEvents
     self.daemonStatusEvents = daemonStatusEvents
   }
 
@@ -3167,6 +4052,16 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
     throw P031GraphQLReadBoundaryError.missingData("P031ArtifactPayload")
   }
 
+  func fetchTimelineRawDetail(handle: String) async throws -> P031TimelineRawDetailReadModel {
+    timelineRawDetailsByHandle[handle] ?? P031TimelineRawDetailReadModel(
+      status: .missing,
+      rawDetail: nil,
+      rawDetailBytes: nil,
+      rawDetailDigest: nil,
+      errorReason: .handleNotFound
+    )
+  }
+
   func fetchReportMetadata(runID: String) async throws -> [P031ReportMetadataReadModel] {
     reportsByRunID[runID, default: []]
   }
@@ -3182,6 +4077,18 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
     P031RunStatusChangedReadModel, Error
   > {
     let events = runStatusEvents[runID, default: []]
+    return AsyncThrowingStream { continuation in
+      for event in events {
+        continuation.yield(event)
+      }
+      continuation.finish()
+    }
+  }
+
+  nonisolated func subscribeToRuntimeTimeline(runID: String) throws -> AsyncThrowingStream<
+    P031RuntimeTimelineEventReadModel, Error
+  > {
+    let events = runtimeTimelineEvents[runID, default: []]
     return AsyncThrowingStream { continuation in
       for event in events {
         continuation.yield(event)
@@ -3320,6 +4227,26 @@ extension AsyncThrowingStream {
         do {
           for try await element in self {
             continuation.yield(try transform(element))
+          }
+          continuation.finish()
+        } catch {
+          continuation.finish(throwing: error)
+        }
+      }
+      continuation.onTermination = { _ in task.cancel() }
+    }
+  }
+
+  nonisolated fileprivate func compactMap<Mapped>(
+    _ transform: @escaping @Sendable (Element) throws -> Mapped?
+  ) -> AsyncThrowingStream<Mapped, Error> {
+    AsyncThrowingStream<Mapped, Error> { continuation in
+      let task = Task {
+        do {
+          for try await element in self {
+            if let mapped = try transform(element) {
+              continuation.yield(mapped)
+            }
           }
           continuation.finish()
         } catch {
@@ -3956,6 +4883,14 @@ enum DisabledReasonPresenter {
       return "Duplicate"
     case .alreadyResolved:
       return "Already resolved"
+    case .approvalNotActionable:
+      return "Approval Not Actionable"
+    case .observerScope:
+      return "Read-Only Access"
+    case .nonApprovalMutation:
+      return "GraphQL Action Blocked"
+    case .capabilityOutOfScope:
+      return "Action Not Available"
     }
   }
 }
@@ -4203,7 +5138,7 @@ struct P031RunsHomeRowPresentation: Equatable, Sendable {
     self.rawStatus = rawStatus
     self.failedStages = failedStages
     self.pendingApprovals = pendingApprovals
-    
+
     // P036: Canonical lane mapping
     if pendingApprovals > 0 {
       self.lane = .waiting
@@ -4249,6 +5184,82 @@ struct P031RunStatusSubscriptionPresentation: Equatable, Sendable {
   let badgeLabels: [String]
   let freshness: P031FreshnessSnapshot
   let accessibilityLabel: String
+}
+
+struct P031RuntimeTimelineEventPresentation: Identifiable, Equatable, Sendable {
+  let id: String
+  let runID: String
+  let stageID: String?
+  let agentID: String
+  let provider: String
+  let eventKind: String
+  let title: String
+  let detail: String
+  let surfaceLabel: String
+  let sessionGenerationID: String?
+  let timestamp: Date
+  let rawDetail: String?
+  let rawDetailBytes: Int?
+  let rawDetailTruncated: Bool
+  let rawDetailHandle: String?
+  let rawDetailDigest: String?
+  let fullRawAvailable: Bool
+  let detailDigest: String?
+  let detailCharCount: Int?
+  let chunkCount: Int?
+  let isStreaming: Bool
+  let isTerminal: Bool
+  let stateLabel: String?
+
+  nonisolated init(
+    id: String,
+    runID: String,
+    stageID: String?,
+    agentID: String,
+    provider: String,
+    eventKind: String,
+    title: String,
+    detail: String,
+    surfaceLabel: String,
+    sessionGenerationID: String?,
+    timestamp: Date,
+    rawDetail: String? = nil,
+    rawDetailBytes: Int? = nil,
+    rawDetailTruncated: Bool = false,
+    rawDetailHandle: String? = nil,
+    rawDetailDigest: String? = nil,
+    fullRawAvailable: Bool = true,
+    detailDigest: String? = nil,
+    detailCharCount: Int? = nil,
+    chunkCount: Int? = nil,
+    isStreaming: Bool = false,
+    isTerminal: Bool = false,
+    stateLabel: String? = nil
+  ) {
+    self.id = id
+    self.runID = runID
+    self.stageID = stageID
+    self.agentID = agentID
+    self.provider = provider
+    self.eventKind = eventKind
+    self.title = title
+    self.detail = detail
+    self.surfaceLabel = surfaceLabel
+    self.sessionGenerationID = sessionGenerationID
+    self.timestamp = timestamp
+    self.rawDetail = rawDetail
+    self.rawDetailBytes = rawDetailBytes
+    self.rawDetailTruncated = rawDetailTruncated
+    self.rawDetailHandle = rawDetailHandle
+    self.rawDetailDigest = rawDetailDigest
+    self.fullRawAvailable = fullRawAvailable
+    self.detailDigest = detailDigest
+    self.detailCharCount = detailCharCount
+    self.chunkCount = chunkCount
+    self.isStreaming = isStreaming
+    self.isTerminal = isTerminal
+    self.stateLabel = stateLabel
+  }
 }
 
 struct P031ApprovalInboxRowPresentation: Equatable, Sendable {
@@ -4502,6 +5513,88 @@ enum P077CloseoutReadinessAnnouncementPolicy {
   }
 }
 
+struct P031ActiveAgentTimelinePresentation: Equatable, Sendable {
+  let id: String
+  let title: String
+  let detail: String
+  let timestamp: Date
+  let stageID: String?
+  let providerID: String?
+  let stageLabel: String?
+  let taskLabel: String?
+  let status: String
+  let eventCount: Int?
+  let selectionOrder: Int?
+  let selectionUnavailableReason: String?
+  let agentID: String
+  let sessionID: String?
+
+  nonisolated init(
+    id: String,
+    title: String,
+    detail: String,
+    timestamp: Date,
+    stageID: String?,
+    providerID: String? = nil,
+    stageLabel: String? = nil,
+    taskLabel: String? = nil,
+    status: String = "running",
+    eventCount: Int? = nil,
+    selectionOrder: Int? = nil,
+    selectionUnavailableReason: String? = nil,
+    agentID: String,
+    sessionID: String?
+  ) {
+    self.id = id
+    self.title = title
+    self.detail = detail
+    self.timestamp = timestamp
+    self.stageID = stageID
+    self.providerID = providerID
+    self.stageLabel = stageLabel
+    self.taskLabel = taskLabel
+    self.status = status
+    self.eventCount = eventCount
+    self.selectionOrder = selectionOrder
+    self.selectionUnavailableReason = selectionUnavailableReason
+    self.agentID = agentID
+    self.sessionID = sessionID
+  }
+}
+
+struct P031StageTopologyOccurrencePresentation: Equatable, Sendable {
+  let agentID: String
+  let agentTitle: String
+  let taskName: String
+  let statusText: String
+  let providerLabel: String
+  let executionCountLabel: String?
+}
+
+struct P031StageTopologyTransitionPresentation: Equatable, Sendable {
+  let toStageID: String
+  let toLabel: String
+  let detail: String?
+}
+
+struct P031StageTopologyPresentation: Equatable, Sendable {
+  let stageID: String
+  let ordinal: Int
+  let title: String
+  let ownerAgentID: String
+  let ownerAgentTitle: String
+  let status: String
+  let statusText: String
+  let isCurrent: Bool
+  let iterationText: String?
+  let attemptText: String?
+  let approvalRequired: Bool
+  let artifactCount: Int
+  let communicationCount: Int
+  let occurrences: [P031StageTopologyOccurrencePresentation]
+  let transitions: [P031StageTopologyTransitionPresentation]
+}
+
 struct P031RunDetailPresentation: Equatable, Sendable {
   let title: String
   let workflowLabel: String?
@@ -4511,14 +5604,17 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let rolloutDecisionSummary: RolloutDecisionSummary?
   let ideaContext: P031IdeaContextPresentation?
   let stageTransitions: [P031StageTransitionPresentation]
+  let stageTopology: [P031StageTopologyPresentation]
   let approvalRows: [P031ApprovalInboxRowPresentation]
   let artifactRows: [P031ArtifactSummaryPresentation]
   let artifactViewerRows: [P031ArtifactViewerPresentation]
   let reportRows: [P031ReportMetadataRowPresentation]
+  let activeAgentTimelineEntries: [P031ActiveAgentTimelinePresentation]
   let catalogContext: P031CatalogContextPresentation?
   let closeoutReadiness: P077CloseoutReadinessPresentation?
   let implementationCompletion: P088ImplementationCompletionPresentation?
   let sideEffectReadback: P078SideEffectReadbackPresentation?
+  let continuationReadback: P086ContinuationReadbackPresentation?
   let freshness: P031FreshnessSnapshot
   let refreshFeedbackText: String
   let emptyStateTitle: String?
@@ -4536,14 +5632,17 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     rolloutDecisionSummary: RolloutDecisionSummary? = nil,
     ideaContext: P031IdeaContextPresentation?,
     stageTransitions: [P031StageTransitionPresentation],
+    stageTopology: [P031StageTopologyPresentation] = [],
     approvalRows: [P031ApprovalInboxRowPresentation],
     artifactRows: [P031ArtifactSummaryPresentation],
     artifactViewerRows: [P031ArtifactViewerPresentation],
     reportRows: [P031ReportMetadataRowPresentation],
+    activeAgentTimelineEntries: [P031ActiveAgentTimelinePresentation] = [],
     catalogContext: P031CatalogContextPresentation?,
     closeoutReadiness: P077CloseoutReadinessPresentation? = nil,
     implementationCompletion: P088ImplementationCompletionPresentation? = nil,
     sideEffectReadback: P078SideEffectReadbackPresentation? = nil,
+    continuationReadback: P086ContinuationReadbackPresentation? = nil,
     freshness: P031FreshnessSnapshot,
     refreshFeedbackText: String,
     emptyStateTitle: String?,
@@ -4558,21 +5657,118 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.pendingApprovalsLabel = pendingApprovalsLabel
     self.ideaContext = ideaContext
     self.stageTransitions = stageTransitions
+    self.stageTopology = stageTopology
     self.approvalRows = approvalRows
     self.artifactRows = artifactRows
     self.artifactViewerRows = artifactViewerRows
     self.reportRows = reportRows
+    self.activeAgentTimelineEntries = activeAgentTimelineEntries
     self.catalogContext = catalogContext
     self.rolloutDecisionSummary = rolloutDecisionSummary
     self.closeoutReadiness = closeoutReadiness
     self.implementationCompletion = implementationCompletion
     self.sideEffectReadback = sideEffectReadback
+    self.continuationReadback = continuationReadback
     self.freshness = freshness
     self.refreshFeedbackText = refreshFeedbackText
     self.emptyStateTitle = emptyStateTitle
     self.errorDescription = errorDescription
     self.rawStatus = rawStatus
     self.failedStages = failedStages
+  }
+}
+
+struct P086ContinuationReadbackPresentation: Equatable, Sendable {
+  let title: String
+  let summary: String
+  let latestStatus: String
+  let latestMode: String
+  let latestTrigger: String
+  let latestContinuationID: String?
+  let latestAgentExecutionID: String?
+  let latestStageExecutionID: String?
+  let artifactSummary: String
+  let metricSummary: String
+  let accessibilityLabel: String
+}
+
+enum P086ContinuationReadbackPresenter {
+  nonisolated static func presentationIfPresent(
+    records: [P086ContinuationRecordReadModel],
+    metrics: P086ContinuationMetricsSummaryReadModel?
+  ) -> P086ContinuationReadbackPresentation? {
+    guard !records.isEmpty || metrics.map({ $0.admissionTotal > 0 }) == true else {
+      return nil
+    }
+
+    let latest = records.sorted { lhs, rhs in
+      lhs.updatedAt.localizedStandardCompare(rhs.updatedAt) == .orderedDescending
+    }.first
+    let artifactCount = latest.map { record in
+      [
+        record.canonicalRequestArtifactID,
+        record.attachReceiptArtifactID,
+        record.evidenceBundleArtifactID,
+        record.worktreeReadbackArtifactID,
+        record.continuationReportArtifactID,
+        record.responseArtifactID,
+        record.resultOrNoProgressArtifactID,
+      ].compactMap { $0 }.count
+    } ?? 0
+
+    let total = metrics?.admissionTotal ?? records.count
+    let succeeded = metrics?.successTotal ?? records.filter { $0.statusRaw == "succeeded" }.count
+    let noProgress = metrics?.noProgressTotal ?? records.filter { $0.statusRaw == "no_progress" }.count
+    let failed = metrics?.failedTotal ?? records.filter { $0.statusRaw == "failed" }.count
+    let cancelled = metrics?.cancelledTotal ?? records.filter { $0.statusRaw == "cancelled" }.count
+    let freshAvoided = metrics?.freshSessionAvoidedTotal ?? 0
+    let orphanReaped = metrics?.orphanReapVerifiedTotal ?? 0
+    let leadAuto = metrics?.leadAutoTotal ?? records.filter { $0.triggerKindRaw == "lead_auto" }.count
+    let usefulProgressPercent = metrics.map { Int(($0.usefulProgressRate * 100).rounded()) }
+    let followupValidationPercent = metrics.map {
+      Int(($0.followupValidationSuccessRate * 100).rounded())
+    }
+    let averageTimeSavedSeconds = metrics?.averageTimeSavedSeconds ?? 0
+    let providerBudgetTokens =
+      (metrics?.providerSessionBudgetInputTokensTotal ?? 0)
+      + (metrics?.providerSessionBudgetOutputTokensTotal ?? 0)
+    let resurrectionFailures = metrics?.providerSessionResurrectionAttachFailureTotal ?? 0
+
+    let status = latest?.statusDisplay ?? "No continuation history"
+    let mode = latest?.modeDisplay ?? "Unavailable"
+    let trigger = latest?.triggerKindDisplay ?? "Unavailable"
+    let summary = [
+      "\(total) admission\(total == 1 ? "" : "s")",
+      "\(succeeded) succeeded",
+      noProgress > 0 ? "\(noProgress) no progress" : nil,
+      failed > 0 ? "\(failed) failed" : nil,
+      cancelled > 0 ? "\(cancelled) cancelled" : nil,
+    ].compactMap { $0 }.joined(separator: " · ")
+    let metricSummary = [
+      freshAvoided > 0 ? "\(freshAvoided) fresh session avoided" : nil,
+      leadAuto > 0 ? "\(leadAuto) lead-auto" : nil,
+      usefulProgressPercent.map { "useful progress \($0)%" },
+      followupValidationPercent.map { "follow-up validation \($0)%" },
+      averageTimeSavedSeconds > 0
+        ? "avg \(Int(averageTimeSavedSeconds.rounded()))s saved" : nil,
+      providerBudgetTokens > 0 ? "\(providerBudgetTokens) provider tokens" : nil,
+      resurrectionFailures > 0 ? "\(resurrectionFailures) resurrection failed" : nil,
+      orphanReaped > 0 ? "\(orphanReaped) orphan reaped" : nil,
+    ].compactMap { $0 }.joined(separator: " · ")
+    let artifacts = artifactCount > 0 ? "\(artifactCount) evidence artifact\(artifactCount == 1 ? "" : "s")" : "No terminal evidence artifacts"
+    return P086ContinuationReadbackPresentation(
+      title: "Agent Continuation",
+      summary: summary.isEmpty ? status : summary,
+      latestStatus: status,
+      latestMode: mode,
+      latestTrigger: trigger,
+      latestContinuationID: latest?.id,
+      latestAgentExecutionID: latest?.agentExecutionID,
+      latestStageExecutionID: latest?.stageExecutionID,
+      artifactSummary: artifacts,
+      metricSummary: metricSummary.isEmpty ? "No rollout metrics yet" : metricSummary,
+      accessibilityLabel: "P086 continuation readback, latest status \(status), \(summary)"
+    )
   }
 }
 
@@ -5169,6 +6365,83 @@ enum P031RunStatusSubscriptionPresenter {
   }
 }
 
+enum P031RuntimeTimelineEventPresenter {
+  nonisolated static func presentation(
+    for event: P031RuntimeTimelineEventReadModel
+  ) -> P031RuntimeTimelineEventPresentation? {
+    guard let timestamp = P031ReadBoundaryDateParser.date(from: event.timestamp) else {
+      return nil
+    }
+    let title = normalized(event.title) ?? title(for: event.eventKind)
+    let detail = normalized(event.detail) ?? event.eventKind
+    let rawDetail = normalized(event.rawDetail) ?? detail
+    let surfaceLabel = normalized(event.surfaceLabel) ?? event.eventKind
+    return P031RuntimeTimelineEventPresentation(
+      id: normalized(event.id) ?? [
+        event.runID,
+        event.stageID,
+        event.agentID,
+        event.sessionGenerationID ?? "session",
+        event.eventKind,
+        event.timestamp,
+      ].joined(separator: ":"),
+      runID: event.runID,
+      stageID: normalized(event.stageID),
+      agentID: event.agentID,
+      provider: event.provider,
+      eventKind: event.eventKind,
+      title: title,
+      detail: detail,
+      surfaceLabel: surfaceLabel,
+      sessionGenerationID: normalized(event.sessionGenerationID),
+      timestamp: timestamp,
+      rawDetail: rawDetail,
+      rawDetailBytes: event.rawDetailBytes,
+      rawDetailTruncated: event.rawDetailTruncated ?? false,
+      rawDetailHandle: normalized(event.rawDetailHandle),
+      rawDetailDigest: normalized(event.rawDetailDigest),
+      fullRawAvailable: event.fullRawAvailable ?? false,
+      detailDigest: normalized(event.detailDigest),
+      detailCharCount: event.detailCharCount ?? detail.count,
+      chunkCount: event.chunkCount,
+      isStreaming: event.isStreaming ?? Self.isStreaming(eventKind: event.eventKind, surfaceLabel: surfaceLabel),
+      isTerminal: event.isTerminal ?? Self.isTerminal(eventKind: event.eventKind, surfaceLabel: surfaceLabel),
+      stateLabel: normalized(event.stateLabel)
+    )
+  }
+
+  nonisolated private static func isStreaming(eventKind: String, surfaceLabel: String) -> Bool {
+    surfaceLabel == "text_chunk"
+      || surfaceLabel == "agent_message_chunk"
+      || eventKind == "meaningful_progress"
+  }
+
+  nonisolated private static func isTerminal(eventKind: String, surfaceLabel: String) -> Bool {
+    surfaceLabel == "final_response"
+      || surfaceLabel == "agent_summary"
+      || eventKind == "session_completed"
+      || eventKind == "session_failed"
+  }
+
+  nonisolated private static func title(for eventKind: String) -> String {
+    switch eventKind {
+    case "prompt_sent": return "Prompt sent"
+    case "meaningful_progress": return "Runtime update"
+    case "session_completed": return "Session completed"
+    case "session_failed": return "Session failed"
+    default:
+      return eventKind
+        .replacingOccurrences(of: "_", with: " ")
+        .capitalized
+    }
+  }
+
+  nonisolated private static func normalized(_ value: String?) -> String? {
+    let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed?.isEmpty == false ? trimmed : nil
+  }
+}
+
 enum P031ApprovalInboxPresenter {
   nonisolated static func presentation(
     for approvals: [P031ApprovalReadModel],
@@ -5261,6 +6534,7 @@ enum P031RunDetailPresenter {
     let statusLabel =
       run.map { P031ThinPresentationFormatting.titleCase($0.status) } ?? "Unavailable"
     let stageTransitions = detail.stages.map { P031StageTransitionPresenter.presentation(for: $0) }
+    let stageTopology = detail.runStageTopology.map(P031StageTopologyPresenter.presentation)
     let approvalRows = detail.approvalsForRun.map {
       P031ApprovalInboxPresenter.rowPresentation(
         for: $0,
@@ -5278,6 +6552,10 @@ enum P031RunDetailPresenter {
       )
     }
     let reportRows = detail.reportMetadata.map(ReportMetadataRowPresenter.presentation)
+    let activeAgentTimelineEntries = activeAgentTimelineEntries(
+      from: detail.activeAgentExecutions,
+      stageByExecutionID: stageByExecutionID
+    )
     let progressLabel: String?
     if let completedStages = run?.completedStages, let totalStages = run?.totalStages {
       progressLabel = "\(completedStages)/\(totalStages) stages"
@@ -5294,6 +6572,10 @@ enum P031RunDetailPresenter {
     )
     let sideEffectReadback = P078SideEffectReadbackPresenter.presentationIfPresent(
       for: run?.sideEffectReadback
+    )
+    let continuationReadback = P086ContinuationReadbackPresenter.presentationIfPresent(
+      records: detail.continuations,
+      metrics: detail.continuationMetricsSummary
     )
     let emptyStateTitle: String?
     switch run {
@@ -5312,14 +6594,17 @@ enum P031RunDetailPresenter {
       rolloutDecisionSummary: run?.rolloutDecisionSummary,
       ideaContext: P031IdeaContextPresenter.presentation(for: detail.idea, fallbackRun: run),
       stageTransitions: stageTransitions,
+      stageTopology: stageTopology,
       approvalRows: approvalRows,
       artifactRows: artifactRows,
       artifactViewerRows: artifactViewerRows,
       reportRows: reportRows,
+      activeAgentTimelineEntries: activeAgentTimelineEntries,
       catalogContext: run.map(P031CatalogContextPresenter.presentation),
       closeoutReadiness: closeoutReadiness,
       implementationCompletion: implementationCompletion,
       sideEffectReadback: sideEffectReadback,
+      continuationReadback: continuationReadback,
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
         currentFreshness: currentFreshness,
         checkedAt: checkedAt,
@@ -5331,6 +6616,60 @@ enum P031RunDetailPresenter {
       rawStatus: run?.status ?? "unavailable",
       failedStages: run?.failedStages ?? 0
     )
+  }
+
+  nonisolated private static func activeAgentTimelineEntries(
+    from executions: [P031ActiveAgentExecutionReadModel],
+    stageByExecutionID: [String: P031StageReadModel]
+  ) -> [P031ActiveAgentTimelinePresentation] {
+    executions.compactMap { execution in
+      guard execution.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "running",
+        execution.completedAt == nil,
+        let startedAt = P031ReadBoundaryDateParser.date(from: execution.startedAt)
+      else {
+        return nil
+      }
+
+      let stage = stageByExecutionID[execution.stageExecutionID]
+      let providerModel = [execution.provider, execution.model]
+        .compactMap { value -> String? in
+          let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+          return trimmed.isEmpty ? nil : trimmed
+        }
+        .joined(separator: " ")
+      let stageLabel = execution.stageLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        ?? stage?.label.trimmingCharacters(in: .whitespacesAndNewlines)
+      let detail = [
+        providerModel.isEmpty ? nil : "Running via \(providerModel)",
+        stageLabel?.isEmpty == false ? "Active in \(stageLabel!)" : nil,
+      ]
+        .compactMap { $0 }
+        .joined(separator: " · ")
+      let derivedTitle = execution.agentID
+        .replacingOccurrences(of: "_", with: " ")
+        .split(separator: " ")
+        .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+        .joined(separator: " ")
+      let title = execution.agentTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+      let timestamp = P031ReadBoundaryDateParser.date(from: execution.lastEventAt) ?? startedAt
+
+      return P031ActiveAgentTimelinePresentation(
+        id: "active-agent-\(execution.id)",
+        title: title?.isEmpty == false ? title! : (derivedTitle.isEmpty ? execution.agentID : derivedTitle),
+        detail: detail.isEmpty ? "Agent is running" : detail,
+        timestamp: timestamp,
+        stageID: stage?.stageID,
+        providerID: execution.provider,
+        stageLabel: stageLabel?.isEmpty == false ? stageLabel : nil,
+        taskLabel: execution.taskLabel,
+        status: execution.status,
+        eventCount: execution.eventCount,
+        selectionOrder: execution.selectionOrder,
+        selectionUnavailableReason: execution.selectionUnavailableReason,
+        agentID: execution.agentID,
+        sessionID: execution.sessionGenerationID ?? execution.sessionLineageID
+      )
+    }
   }
 
   nonisolated static func errorPresentation(
@@ -5355,6 +6694,7 @@ enum P031RunDetailPresenter {
       closeoutReadiness: nil,
       implementationCompletion: nil,
       sideEffectReadback: nil,
+      continuationReadback: nil,
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
         event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))
@@ -5424,18 +6764,32 @@ private struct P031StageExecutionWindow: Equatable, Sendable {
 }
 
 private enum P031ReadBoundaryDateParser {
+  nonisolated private static let fractionalFormatterKey = "chainworks.p031.readBoundaryDateParser.fractional"
+  nonisolated private static let standardFormatterKey = "chainworks.p031.readBoundaryDateParser.standard"
+
   nonisolated static func date(from value: String?) -> Date? {
     guard let value, !value.isEmpty else {
       return nil
     }
-    let fractional = ISO8601DateFormatter()
-    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let date = fractional.date(from: value) {
+    if let date = formatter(for: fractionalFormatterKey, options: [.withInternetDateTime, .withFractionalSeconds])
+      .date(from: value)
+    {
       return date
     }
-    let standard = ISO8601DateFormatter()
-    standard.formatOptions = [.withInternetDateTime]
-    return standard.date(from: value)
+    return formatter(for: standardFormatterKey, options: [.withInternetDateTime]).date(from: value)
+  }
+
+  nonisolated private static func formatter(
+    for key: String,
+    options: ISO8601DateFormatter.Options
+  ) -> ISO8601DateFormatter {
+    if let cached = Thread.current.threadDictionary[key] as? ISO8601DateFormatter {
+      return cached
+    }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = options
+    Thread.current.threadDictionary[key] = formatter
+    return formatter
   }
 }
 
@@ -5664,6 +7018,55 @@ enum P031StageTransitionPresenter {
     }
     // P036: unknown/unrecognized statuses must not infer runtime state locally.
     return .unavailable
+  }
+}
+
+enum P031StageTopologyPresenter {
+  nonisolated static func presentation(
+    for node: P031RunStageTopologyReadModel
+  ) -> P031StageTopologyPresentation {
+    let iterationText: String? = node.iteration.map { "Iteration \($0)" }
+    let attemptText: String? = node.attemptNumber.map { "Attempt \($0)" }
+    return P031StageTopologyPresentation(
+      stageID: node.stageID,
+      ordinal: node.order,
+      title: node.label,
+      ownerAgentID: node.ownerAgentID,
+      ownerAgentTitle: node.ownerAgentTitle,
+      status: node.status,
+      statusText: P031ThinPresentationFormatting.titleCase(node.status),
+      isCurrent: node.isCurrent,
+      iterationText: iterationText,
+      attemptText: attemptText,
+      approvalRequired: node.approvalRequired,
+      artifactCount: node.artifactCount,
+      communicationCount: node.communicationCount,
+      occurrences: node.occurrences.map { occurrence in
+        let providerParts = [
+          occurrence.provider,
+          occurrence.model,
+          occurrence.effort,
+        ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+          .filter { !$0.isEmpty }
+        return P031StageTopologyOccurrencePresentation(
+          agentID: occurrence.agentID,
+          agentTitle: occurrence.agentTitle,
+          taskName: occurrence.taskName,
+          statusText: P031ThinPresentationFormatting.titleCase(occurrence.status),
+          providerLabel: providerParts.joined(separator: " · "),
+          executionCountLabel: occurrence.executionCount > 0
+            ? "\(occurrence.executionCount) attempt\(occurrence.executionCount == 1 ? "" : "s")"
+            : nil
+        )
+      },
+      transitions: node.transitions.map { transition in
+        P031StageTopologyTransitionPresentation(
+          toStageID: transition.toStageID,
+          toLabel: transition.toLabel ?? transition.toStageID,
+          detail: transition.detail
+        )
+      }
+    )
   }
 }
 
@@ -6126,7 +7529,9 @@ struct P031ThinWorkflowScreenCoordinator<Store: P031WorkflowReadStore>: Sendable
           idea: idea,
           stages: detail.stages,
           artifacts: detail.artifacts,
-          approvalInbox: detail.approvalInbox
+          approvalInbox: detail.approvalInbox,
+          activeAgentExecutions: detail.activeAgentExecutions,
+          runStageTopology: detail.runStageTopology
         )
       } else {
         hydratedDetail = detail
@@ -6226,6 +7631,20 @@ struct P031ThinWorkflowScreenCoordinator<Store: P031WorkflowReadStore>: Sendable
     }
   }
 
+  nonisolated func resolveTimelineRawDetail(handle: String) async -> P031TimelineRawDetailReadModel {
+    do {
+      return try await store.fetchTimelineRawDetail(handle: handle)
+    } catch {
+      return P031TimelineRawDetailReadModel(
+        status: .unavailable,
+        rawDetail: nil,
+        rawDetailBytes: nil,
+        rawDetailDigest: nil,
+        errorReason: .storageUnavailable
+      )
+    }
+  }
+
   nonisolated func loadReportMetadata(
     runID: String,
     currentFreshness: P031FreshnessSnapshot,
@@ -6283,6 +7702,15 @@ struct P031ThinWorkflowSubscriptionCoordinator<Store: P031WorkflowReadStore>: Se
         currentFreshness: currentFreshness,
         checkedAt: checkedAt
       )
+    }
+  }
+
+  nonisolated func runtimeTimelinePresentations(
+    runID: String
+  ) throws -> AsyncThrowingStream<P031RuntimeTimelineEventPresentation, Error> {
+    let stream = try store.subscribeToRuntimeTimeline(runID: runID)
+    return stream.compactMap { event in
+      P031RuntimeTimelineEventPresenter.presentation(for: event)
     }
   }
 

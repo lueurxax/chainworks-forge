@@ -1,0 +1,19 @@
+{
+  "fixture_description": "P076 observation where budget state was unavailable but a side-effecting retry was dispatched. Proves that budget_unavailable must force observe_only before any side-effect lane.",
+  "proves_budget_unavailable_should_block_retry": true,
+  "violation": "retry_dispatched_despite_budget_unavailable",
+  "expected_policy_decision": "budget_unavailable",
+  "actual_policy_decision": "observe_only",
+  "actual_retry_result": "accepted",
+  "budget_state_at_time_of_violation": "budget_unavailable",
+  "budget_unavailable_reason": "budget_file_unreadable: ENOENT /Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-budget.json",
+  "hold_condition_triggered": "Budget-store read, validation, reconciliation, or durable-write failure does not force observe_only or budget_unavailable",
+  "evidence": {
+    "observation_id": "ar_obs_20260523T090009Z_bad9bad9bad9",
+    "run_id": "run-budget-fail-retry-001",
+    "stage_id": "state_3_implementation_started",
+    "blocker_class": "substantive_output_contract",
+    "retry_result": "accepted",
+    "budget_status": "budget_unavailable"
+  }
+}

@@ -3,10 +3,11 @@
 //! The daemon calls `PrincipalTable::load_or_bootstrap` on startup:
 //!
 //! - If the principals file does not exist, a default operator principal
-//!   is generated, the file is written with mode `0o600`, and the bootstrap
-//!   token is logged **once** at `info` level on that start only.
+//!   is generated, the file is written with mode `0o600`. The bootstrap
+//!   token is written to disk only and is NOT emitted to logs (HIGH-002
+//!   redaction: tokens must never appear in log output).
 //! - If the file exists and is well-formed, it is loaded without touching
-//!   disk and no bootstrap log fires.
+//!   disk and no re-bootstrap occurs.
 //! - If the file exists but contains zero principals, the daemon fails
 //!   closed with a clear error (no silent "welcome, anyone can connect").
 //!
@@ -37,12 +38,10 @@ fn test_principals_file_created_with_owner_only_permissions() {
     );
 }
 
-/// AC-15: the bootstrap token is emitted only on the first start that
-/// created the file. We prove this by calling `load_or_bootstrap` twice
-/// on the same path and asserting the on-disk content is identical across
-/// calls — proof that no second bootstrap (and therefore no second token
-/// log) took place. A stable on-disk file means the `tracing::info!` call
-/// inside the bootstrap branch ran at most once.
+/// AC-15: bootstrap runs only once per file creation. We prove this by
+/// calling `load_or_bootstrap` twice on the same path and asserting the
+/// on-disk content is identical across calls — proof that no second
+/// bootstrap (and therefore no second token write to disk) took place.
 #[test]
 fn test_principals_bootstrap_token_logged_once_on_first_start() {
     let dir = tempfile::tempdir().expect("create tmp dir");
@@ -67,6 +66,74 @@ fn test_principals_bootstrap_token_logged_once_on_first_start() {
     assert!(content_after_first.contains("\"operator\""));
 }
 
+/// HIGH-002: an existing principals.json with permissions other than 0o600
+/// must be rejected before the content is read.
+#[test]
+#[cfg(unix)]
+fn test_high_002_principals_file_with_loose_permissions_is_rejected() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().expect("create tmp dir");
+    let path = dir.path().join("principals.json");
+
+    // Write a valid file with 0o644 (world-readable) permissions.
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(&path)
+            .expect("create principals.json with 0o644");
+        f.write_all(br#"{"principals":[{"token":"t","id":"op","class":"operator"}]}"#)
+            .expect("write");
+    }
+
+    let err = PrincipalTable::load_or_bootstrap(&path)
+        .expect_err("loose-permissions file must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("0600") || msg.contains("mode"),
+        "error must mention the mode requirement, got {msg:?}"
+    );
+}
+
+/// HIGH-002: a principals.json path that is a symlink must be rejected.
+#[test]
+#[cfg(unix)]
+fn test_high_002_symlinked_principals_file_is_rejected() {
+    let dir = tempfile::tempdir().expect("create tmp dir");
+    let real_path = dir.path().join("real_principals.json");
+    let link_path = dir.path().join("principals.json");
+
+    // Write a valid file with correct permissions at a different path.
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&real_path)
+            .expect("create real_principals.json");
+        f.write_all(br#"{"principals":[{"token":"t","id":"op","class":"operator"}]}"#)
+            .expect("write");
+    }
+
+    // Place a symlink at the expected path pointing to the real file.
+    std::os::unix::fs::symlink(&real_path, &link_path).expect("create symlink");
+
+    let err = PrincipalTable::load_or_bootstrap(&link_path)
+        .expect_err("symlinked principals file must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("symlink"),
+        "error must mention symlink rejection, got {msg:?}"
+    );
+}
+
 /// AC-15: an empty-principals file must fail closed, NOT silently allow
 /// every caller through. This protects against the "delete the file, get
 /// open access" failure mode.
@@ -74,8 +141,7 @@ fn test_principals_bootstrap_token_logged_once_on_first_start() {
 fn test_principals_daemon_refuses_empty_principals_file() {
     let dir = tempfile::tempdir().expect("create tmp dir");
     let path = dir.path().join("principals.json");
-    // Well-formed JSON, zero principals — must be written with 0600 so the
-    // HIGH-002 permission check does not fire before the empty-table check.
+    // Write with owner-only permissions so SEC-005 mode check passes.
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -86,14 +152,12 @@ fn test_principals_daemon_refuses_empty_principals_file() {
             .truncate(true)
             .mode(0o600)
             .open(&path)
-            .expect("create principals file with 0600");
+            .expect("create principals.json with 0o600");
         f.write_all(br#"{"principals":[]}"#)
             .expect("write empty principals file");
     }
     #[cfg(not(unix))]
-    {
-        std::fs::write(&path, r#"{"principals":[]}"#).expect("write empty principals file");
-    }
+    std::fs::write(&path, r#"{"principals":[]}"#).expect("write empty principals file");
 
     let err =
         PrincipalTable::load_or_bootstrap(&path).expect_err("zero-principal file must fail closed");
@@ -101,71 +165,5 @@ fn test_principals_daemon_refuses_empty_principals_file() {
     assert!(
         msg.contains("zero entries") || msg.contains("empty"),
         "error must clearly describe the empty-table failure, got {msg:?}"
-    );
-}
-
-/// HIGH-002 regression: principals.json with mode 0644 must be rejected.
-#[test]
-#[cfg(unix)]
-fn test_high_002_principals_file_with_loose_permissions_is_rejected() {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let dir = tempfile::tempdir().expect("create tmp dir");
-    let path = dir.path().join("principals.json");
-
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o644)
-        .open(&path)
-        .expect("create file with 0644");
-    // Write a valid-ish principals JSON so the rejection is purely about permissions.
-    f.write_all(br#"{"principals":[{"token":"t","id":"op","class":"operator"}]}"#)
-        .expect("write");
-    drop(f);
-
-    let err = PrincipalTable::load_or_bootstrap(&path)
-        .expect_err("0644 principals file must be rejected");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("unsafe permissions") || msg.contains("0600"),
-        "error must mention unsafe permissions, got {msg:?}"
-    );
-}
-
-/// HIGH-002 regression: a symlinked principals.json must be rejected.
-#[test]
-#[cfg(unix)]
-fn test_high_002_symlinked_principals_file_is_rejected() {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let dir = tempfile::tempdir().expect("create tmp dir");
-
-    // Write a real target file with 0600 permissions.
-    let target = dir.path().join("real_principals.json");
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&target)
-        .expect("create real file");
-    f.write_all(br#"{"principals":[{"token":"t","id":"op","class":"operator"}]}"#)
-        .expect("write");
-    drop(f);
-
-    // Create a symlink pointing to the real file.
-    let link = dir.path().join("principals.json");
-    std::os::unix::fs::symlink(&target, &link).expect("create symlink");
-
-    let err = PrincipalTable::load_or_bootstrap(&link)
-        .expect_err("symlinked principals file must be rejected");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("symlink"),
-        "error must mention symlink, got {msg:?}"
     );
 }

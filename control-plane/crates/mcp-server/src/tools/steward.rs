@@ -15,9 +15,11 @@ pub fn tool_specs() -> Vec<McpTool> {
             description: "Queue a Steward analysis work item".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
+                "required": ["idempotency_key"],
                 "properties": {
                     "reason": { "type": "string", "description": "manual, post_run_hook, or config_change" },
-                    "artifact_base": { "type": "string", "description": "Optional base directory for steward artifacts" }
+                    "artifact_base": { "type": "string", "description": "Optional base directory for steward artifacts" },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." }
                 }
             }),
         },
@@ -57,7 +59,7 @@ pub async fn execute(
     match tool_name {
         "steward.run_analysis" => {
             let reason = params["reason"].as_str().unwrap_or("manual").to_string();
-            let caller = mcp_caller(&principal.id, &principal.class, tool_name);
+            let caller = mcp_caller(&principal, tool_name);
             let commanded = cmd_handler
                 .handle(
                     Command::RunStewardAnalysis(RunStewardAnalysisCmd {
@@ -138,12 +140,10 @@ mod tests {
         let pool = create_pool("sqlite::memory:")
             .await
             .expect("in-memory pool failed");
-        db::writer::register_shared_writer(
-            &pool,
-            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
-        )
-        .await
-        .expect("register shared writer");
+        let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .expect("register shared DbWriter for test pool");
         pool
     }
 

@@ -1,0 +1,19 @@
+{
+  "fixture_description": "P076 poll that exceeded poll_deadline_seconds=300 but did not write a timeout observation record with policy_decision=poll_timeout. Proves deadline behavior requires a partial observation.",
+  "proves_missing_timeout_observation": true,
+  "violation": "poll_timeout_without_partial_observation_record",
+  "poll_deadline_seconds": 300,
+  "actual_poll_elapsed_ms": 301500,
+  "observation_record_written": false,
+  "hold_condition_triggered": "MCP readback exceeds configured deadline without timeout observation",
+  "required_behavior": "A deadline produces one partial observation with policy_decision=poll_timeout for unfinished items. The observation must be written even when the poll times out.",
+  "evidence": {
+    "poll_started_at": "2026-05-23T09:00:00Z",
+    "poll_elapsed_ms": 301500,
+    "timeout_observation_expected": {
+      "policy_decision": "poll_timeout",
+      "summary": {"partial": true}
+    },
+    "timeout_observation_found": false
+  }
+}

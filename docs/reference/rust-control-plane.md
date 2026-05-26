@@ -106,10 +106,29 @@ domain  <--  db  <--  workflow
 ## Boundary shape
 
 The daemon exposes two northbound surfaces on a single port (default `0.0.0.0:4000`).
-Both surfaces are authenticated with bearer tokens (P029) and filter their
-visible area by the caller's principal class. See
+Both surfaces are authenticated with bearer tokens (P029) and filter their visible
+area by the caller's principal class. See
 [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md)
-for the full authentication and capability filtering reference.
+for the implemented authentication and capability filtering reference.
+
+P081 implements a boundary-first authorization contract that routes decisions
+through a shared `BoundaryPolicy` keyed on a server-derived `CallerClass`. The
+boundary matrix, executable fixture, validator, audit-log storage, `CallerClass`
+enum, and principal-table `schema_version 3` reader have landed. The
+daemon-injected `BoundaryPolicy` is wired into the `CommandHandler`, GraphQL
+query/subscription/mutation paths, and MCP `initialize`/`tools/list`/`tools/call`
+paths with mode-aware semantics (`shadow`, `enforce`, `read_only_safe_mode`,
+`legacy_compat`), and `command_journal.caller_class` is populated by the shared
+decision path. `approval_mutation_idempotency` backs the
+`approveApproval`/`rejectApproval` retry contract, while
+`mcp_command_idempotency` plus dispatcher enforcement governs state-changing MCP
+tools (require `idempotency_key`, replay cached result on duplicate hash,
+`IDEMPOTENCY_CONFLICT` on hash mismatch, reject `idempotency_key` on read-only
+tools). Bounded readback includes `boundaryRuntime`, GraphQL `operatorAlerts`,
+MCP `boundary.runtime.get` / `operator.alerts.list`, principal-file hardening,
+typed Swift `extensions.redactions` preservation, and redaction accessibility
+state tests; production mode selection remains governed by the rollout-mode and
+fixture rules in [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md).
 
 ### GraphQL
 
@@ -122,7 +141,7 @@ Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`, `st
 **P046 session observability queries** (gated by `CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY`; absent from the schema when disabled): `sessionObservabilityAvailable`, `sessionLineages(runId)`, `sessionLineage(id)`, `sessionGenerations(lineageId)`, `sessionEvents(lineageId, generationId?)`, `sessionKpiSummary(runId)`, `sessionHealth(runId)`. Governed clients use `sessionObservabilityAvailable` as the lightweight capability probe before issuing the other P046 documents. All resolvers enforce operator-read authorization scoped to the owning run, use cursor pagination with deterministic ordering and bounded `first`, and return derived non-secret references in place of raw `providerSessionId`, `bindingFingerprint`, `invocationOwnerKey`, and absolute `workingDirectory`. Event details follow the `p046_event_details_redaction_v1` default-deny allowlist. P046 is read/subscription-only — no `resetSession` or equivalent session-control mutation is exposed; reset remains MCP-only (see [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md#operator-surfaces)).
 
 **Storage Health Readback:**
-The `storageHealth` query exposes the current health state of the storage subsystem, including `DbWriter`, WAL, projections, evidence spool, and freshness details, aligning with the P087 proposal for local storage tiering and read-path liveness. Specifically, it now exposes identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `projectionFreshness` and `projectionFreshnessBySource`.
+The `storageHealth` query exposes the current health state of the storage subsystem, including `DbWriter`, WAL, projections, evidence spool, and freshness details for the implemented local storage tiering and read-path liveness contract. It preserves the legacy `projections` field and exposes identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `projectionFreshness` and `projectionFreshnessBySource`.
 
 **Implementation self-assessment summary extension:**
 The `Run` type includes a nullable `implementationSelfAssessmentSummary` field that exposes structured assessment truth (status, verification, code tasks, handoff tasks) without requiring raw artifact parsing.
@@ -516,12 +535,10 @@ remaining byte budget is skipped without being read and truncates the pass.
 `storage.reconcile_evidence_orphans` exposes the sweep through MCP with camelCase
 `runId`, `dryRun`, and `maxFiles` parameters. `runId` is required for non-dry-run calls
 so recovered metadata is bound to a real run, and `artifact_root` is resolved
-server-side from `CHAINWORKS_META_ROOT` or the `DATABASE_URL` parent rather than from
-client-supplied paths.
-
-GraphQL `storageHealth` returns a typed `StorageHealth` SDL
+server-side from `CHAINWORKS_META_ROOT` or the `DATABASE_URL` parent rather than
+accepted from the client. GraphQL `storageHealth` returns a typed `StorageHealth` SDL
 object (`writer`, `wal`, `projections`, `evidenceSpool`, `killSwitches`, `thresholds`, `projectionFreshness`, `projectionFreshnessBySource`,
-  plus `updatedAt`/`staleAfterMs`/`isStale`) instead of an opaque JSON blob, with
+plus `updatedAt`/`staleAfterMs`/`isStale`) instead of an opaque JSON blob, with
 fail-closed defaults that map an absent or unrecognised `dbState` to `DEGRADED`,
 absent `writer.alive` to `false`, and no live writer heartbeat to stale/degraded
 readback. MCP storage diagnostics return typed error envelopes for `invalid_input`,
@@ -611,7 +628,7 @@ queue-wait latency.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`, `068_p081_audit_log.sql`, `069_p081_audit_log_checkpoints.sql`, `070_p081_caller_class.sql`, `071_p081_approval_idempotency.sql`, `072_p081_fix_payload_length_check.sql`, `073_p081_approval_idempotency_request_hash.sql`, `074_p081_mcp_command_idempotency.sql`, `075_p081_command_journal_idempotency.sql`):
 
 | Table | Purpose |
 |---|---|
@@ -640,6 +657,10 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `artifacts` | Artifact metadata (file path, format, checksum, provider, report kind) |
 | `work_items` | Internal work queue (kind, payload, status, attempts, errors) |
 | `command_journal` | Audit trail for mutating commands (type, payload, result, errors, caller metadata) |
+| `audit_log` | P081: Hash-chained durable audit evidence for boundary decisions (allow, deny, redaction, idempotency) |
+| `audit_log_checkpoints` | P081: Periodic checkpoint windows over `audit_log` for integrity verification and retention |
+| `approval_mutation_idempotency` | P081 Phase 5: Backing store for `approveApproval` / `rejectApproval` retry contract (one record per `idempotency_key` with 7-day retention) |
+| `mcp_command_idempotency` | P081: Backing store for state-changing MCP tool retry contract (one record per `idempotency_key` with 7-day retention; canonical request hash distinguishes replay from `IDEMPOTENCY_CONFLICT`) |
 
 **AgentExecution Owner Migration:**
 To support lead-mediated conflicts without synthetic stage states, `agent_executions`
@@ -675,6 +696,7 @@ migrated to a general owner model:
 | `session_lineages` | Session reuse/reset metadata per agent |
 | `agent_execution_runtime_facts` | Durable provider-independent execution truth |
 | `artifact_source_claims` | CAS-backed ownership for artifact generation |
+| `retry_payload_recovery_events` | Durable targeted-retry payload recovery diagnostics and repair evidence |
 
 ### Projection rebuild
 
@@ -740,6 +762,53 @@ Startup repair is controlled by two environment variables:
 - `CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR=1` disables mutation and records disabled readback.
 
 Each startup repair pass writes `p091_orphan_repair_passes` with mode, kill-switch state, candidate/exclusion/repair counts, and bounded samples. Public readback surfaces those counters through `p091_orphan_repair_readback`; the retained counter vocabulary includes `p091_orphan_repair_candidates_total`. The retained gate alias `./scripts/test-gate.sh proposal-091` proves the evidence fixture, typed payload parser, DB authority repository, work-item semantics, runtime settlement, recovery exclusions, GraphQL readback, and MCP `retryAuthorityHistory` readback.
+
+### Retry payload target invariants and recovery
+
+Targeted retry `InvokeAgent` payloads keep current routing and source provenance separate. Top-level routing fields describe the current run, stage, stage execution, target stage execution, and retry authority only. Older failed attempts remain provenance under `targeted_retry.source_stage_execution_id`, `targeted_retry.source_agent_execution_id`, and `targeted_retry.source_work_item_id`; those source fields never select the current target during completion.
+
+All targeted retry producers use the shared sanitizer in `domain::retry_authority::sanitize_targeted_retry_invoke_payload` before enqueueing an invoke. This covers auto-contract output retry and operator targeted retry. The sanitizer clears stale settlement/routing fields (`p058_claimed`, stale `target_stage_execution_id`, top-level source fields, and prior `retry_authority_id`) before writing the current target and authority.
+
+Post-invoke completion is authority/current-truth driven:
+
+- if `retry_authority_id` is present, the active authority row is loaded by id;
+- the authority target is the current target stage execution;
+- `stage_execution_id` and `target_stage_execution_id` must match the authority target or be backfilled from it;
+- `p058_claimed.agent_execution_id` is the current completed-agent truth when present;
+- `targeted_retry.source_*` is copied as diagnostics/provenance only.
+
+Contradictions fail closed with typed recovery events. A claimed agent on a different stage records `retry_authority_target_agent_stage_mismatch`; a targeted invoke with no active authority or no current completed-agent truth records `retry_authority_missing_for_targeted_invoke` and does not enqueue post-invoke advance.
+
+The recovery service handles the valid stranded retry shape directly. A candidate is a running `InvokeAgent` with active retry authority, a running authority target stage, a completed agent execution on that target, and runtime facts showing valid required outputs. Startup recovery runs this check before generic abandoned-invoke requeue so a valid completed retry is not converted into blind retry work. The daemon watchdog runs the same reconciliation after stale `AdvanceRun` inspection and before degraded-state reporting.
+
+Runtime controls:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE` | `diagnostic` | Retained historical alias name; `diagnostic` records candidates without mutation; `enforce` repairs through normal invoke completion. |
+| `CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED` | unset / false | Retained historical alias name; disables mutation while still recording readback diagnostics. |
+| `CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_BATCH_LIMIT` | `20` | Retained historical alias name; caps live recovery candidates per watchdog tick; accepted values are clamped to 1..100. |
+
+Recovery events are stored in `retry_payload_recovery_events` using an idempotency key derived from `(run_id, invoke_work_item_id, retry_authority_id, completed_agent_execution_id)`. Diagnostic rows can be promoted by enforce-mode repair without creating duplicate rows. Event JSON separates:
+
+- `current_json`: run, invoke work item, target stage execution, retry authority, completed agent;
+- `provenance_json`: source stage, source agent, and source work item;
+- `repaired_fields_json`: stale fields corrected or that would be corrected;
+- `diagnostic_json`: bounded counters such as `candidates_total`, `repaired_total`, `excluded_total`, disabled state, and fail-closed metadata.
+
+GraphQL attaches the latest durable event to `Run.retryAuthorityJson.retry_payload_recovery` and per-history rows in `Run.retryAuthorityHistoryJson[].retry_payload_recovery`. MCP `runs.get` exposes `retry_authority.retry_payload_recovery`; MCP `reports.get` and run report JSON expose both `retryPayloadRecovery` and `retry_payload_recovery` on current/history authority objects. Missing-authority hard mismatch rows are represented as history entries with `authority_state = missing_authority` rather than as an active current authority.
+
+Recognized retry payload recovery reason codes are:
+
+- `retry_payload_stale_target_stage_repaired`
+- `retry_payload_source_provenance_ignored_for_target`
+- `valid_retry_invoke_completion_recovered`
+- `retry_authority_target_agent_stage_mismatch`
+- `retry_authority_missing_for_targeted_invoke`
+
+Unknown reason codes round-trip in readback with `unknown_reason_code = true`.
+
+The retained historical alias `./scripts/test-gate.sh proposal-092` / `p092` proves the sanitizer, post-invoke fail-closed paths, recovery event storage, configurable live batch limit, disabled/excluded diagnostics, startup diagnostic/enforce behavior, GraphQL/MCP missing-authority readback, and daemon live-hook compilation. The retired proposal document is not the operational source of truth.
 
 ## Capacity-aware Scheduling
 

@@ -1,0 +1,15 @@
+{
+  "fixture_description": "P076 ledger append that completed without fsync before releasing the writer lock. Proves fsync-before-unlock is required for durability.",
+  "proves_ledger_append_not_fsynced": true,
+  "violation": "ledger_append_completed_without_fsync",
+  "hold_condition_triggered": "Ledger append does not prove write-all, trailing newline, fsync, lock scope, and cancellation shielding",
+  "required_behavior": "Write all bytes including the trailing newline, fsync the file descriptor, and only then release the writer lock. If append fails after partial bytes, readers ignore at most one trailing partial line and emit partial_trailing_record.",
+  "evidence": {
+    "operation": "ledger_append",
+    "bytes_written": 1024,
+    "trailing_newline_written": true,
+    "fsync_called": false,
+    "lock_released_before_fsync": true,
+    "partial_write_risk": "If the process crashes after lock release but before OS flush, the record may be incomplete without a partial_trailing_record diagnostic."
+  }
+}

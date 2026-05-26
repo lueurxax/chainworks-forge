@@ -46,6 +46,22 @@ use domain::risk_lineage::{risks_satisfy_enter_manual_release, RiskAcceptanceLin
 #[allow(dead_code)]
 const FINGERPRINT_LATENCY_BUDGET_MS: u64 = 5_000;
 
+/// Number of consecutive completed code_writer attempts with no current
+/// worktree diff after which refinement should stop and wait for an operator.
+pub const NO_DIFF_CONVERGENCE_THRESHOLD: usize = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NoDiffConvergence {
+    pub consecutive_attempts: usize,
+    pub threshold: usize,
+}
+
+impl NoDiffConvergence {
+    fn triggered(self) -> bool {
+        self.threshold > 0 && self.consecutive_attempts >= self.threshold
+    }
+}
+
 /// Inputs required by the synthesizer.
 pub struct SynthesizerInputs<'a> {
     pub run_id: &'a str,
@@ -198,6 +214,32 @@ pub fn synthesize_implementation_closeout_readiness_for_state9(
         readiness,
         current_blocker_digest,
     }
+}
+
+pub fn synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards(
+    inputs: SynthesizerInputs<'_>,
+    no_diff_convergence: Option<NoDiffConvergence>,
+) -> SynthesizerResult {
+    let mut result = synthesize_implementation_closeout_readiness_for_state9(inputs);
+    let Some(no_diff_convergence) = no_diff_convergence else {
+        return result;
+    };
+    if !no_diff_convergence.triggered()
+        || result.readiness.decision != CloseoutReadinessDecision::ReturnToCodeRefine
+    {
+        return result;
+    }
+
+    result.readiness.decision = CloseoutReadinessDecision::AwaitOperatorDecision;
+    result.readiness.diagnostic_reason = Some(format!(
+        "no_diff_convergence_checkpoint: {} consecutive code_writer completion(s) produced \
+         current_attempt_changed_path_count=0; operator decision required before spending more \
+         refinement budget",
+        no_diff_convergence.consecutive_attempts
+    ));
+    result.readiness.primary_unblock =
+        Some("Inspect no-diff code_writer attempts and adjust scope or instructions".into());
+    result
 }
 
 /// Advisory/legacy-fallback mode is diagnostic-only for manual release.
@@ -1491,6 +1533,83 @@ mod tests {
         assert!(
             reason.contains("soft_convergence_checkpoint"),
             "diagnostic_reason must mention soft_convergence_checkpoint: got {reason}"
+        );
+    }
+
+    #[test]
+    fn no_diff_convergence_guard_stops_refine_even_with_budget_remaining() {
+        let gate = passed_gate();
+        let mut assessment = complete_assessment();
+        assessment.blocking_remaining_code_task_count = Some(1);
+        assessment.status = ImplementationSelfAssessmentStatus::NeedsCodeFixes;
+        let mode = enforcement_mode();
+
+        let result = synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards(
+            SynthesizerInputs {
+                run_id: "run-1",
+                stage_id: "state_9",
+                gate_result: &gate,
+                mode_result: &mode,
+                implementation_review_status: None,
+                self_assessment: Some(&assessment),
+                accepted_risks: &[],
+                loop_budget_remaining: true,
+                fingerprint: None,
+                fingerprint_latency_exceeded: false,
+                controlled_reports_green: Some(true),
+                previous_blocker_digest: None,
+            },
+            Some(NoDiffConvergence {
+                consecutive_attempts: NO_DIFF_CONVERGENCE_THRESHOLD,
+                threshold: NO_DIFF_CONVERGENCE_THRESHOLD,
+            }),
+        );
+
+        assert_eq!(
+            result.readiness.decision,
+            CloseoutReadinessDecision::AwaitOperatorDecision,
+            "repeated no-diff code_writer completions must stop refinement before hard budget exhaustion"
+        );
+        let reason = result.readiness.diagnostic_reason.unwrap_or_default();
+        assert!(
+            reason.contains("no_diff_convergence_checkpoint"),
+            "diagnostic_reason must mention no_diff_convergence_checkpoint: got {reason}"
+        );
+    }
+
+    #[test]
+    fn no_diff_convergence_guard_does_not_fire_below_threshold() {
+        let gate = passed_gate();
+        let mut assessment = complete_assessment();
+        assessment.blocking_remaining_code_task_count = Some(1);
+        assessment.status = ImplementationSelfAssessmentStatus::NeedsCodeFixes;
+        let mode = enforcement_mode();
+
+        let result = synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards(
+            SynthesizerInputs {
+                run_id: "run-1",
+                stage_id: "state_9",
+                gate_result: &gate,
+                mode_result: &mode,
+                implementation_review_status: None,
+                self_assessment: Some(&assessment),
+                accepted_risks: &[],
+                loop_budget_remaining: true,
+                fingerprint: None,
+                fingerprint_latency_exceeded: false,
+                controlled_reports_green: Some(true),
+                previous_blocker_digest: None,
+            },
+            Some(NoDiffConvergence {
+                consecutive_attempts: NO_DIFF_CONVERGENCE_THRESHOLD - 1,
+                threshold: NO_DIFF_CONVERGENCE_THRESHOLD,
+            }),
+        );
+
+        assert_eq!(
+            result.readiness.decision,
+            CloseoutReadinessDecision::ReturnToCodeRefine,
+            "below-threshold no-diff history must still allow refinement"
         );
     }
 

@@ -1,128 +1,126 @@
 {
-  "fixture_purpose": "Engine materialized placeholder for a rollout_contract_v1 readback fixture declared by an approved proposal. Implementation must replace or update this fixture with concrete evidence before the proposal gate can be treated as release evidence.",
-  "parity_lanes": {
-    "graphql": {
-      "rolloutContractActionId": null,
-      "rolloutContractCutoverPolicyRevision": null,
-      "rolloutContractDecision": "hold",
-      "rolloutContractDiagnosticRedaction": "none",
-      "rolloutContractDisabledReasonCode": "placeholder_pending_implementation_evidence",
-      "rolloutContractEnabledState": "disabled",
-      "rolloutContractEnforcementMode": "enforce",
-      "rolloutContractEnforcementModeReason": "declared_fixture_placeholder",
-      "rolloutContractFailureReasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rolloutContractHoldConditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rolloutContractNextSteps": [
-        "Replace placeholder with concrete GraphQL readback evidence."
-      ],
-      "rolloutContractOperatorMessage": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rolloutContractProjectionIntegrity": "stale",
-      "rolloutContractRollbackDisposition": {
-        "dataLossRisk": "none",
-        "mode": "not_applicable"
-      },
-      "rolloutContractSourceLane": "graphql",
-      "rolloutContractStatus": "fail",
-      "rolloutContractWaiverExpiresAt": null,
-      "rolloutContractWaiverState": "none"
-    },
-    "mcp": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
-      "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete MCP readback evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
-      "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
-      },
-      "rollout_contract_source_lane": "mcp",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
-    },
-    "release_receipt": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
-      "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete release receipt evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
-      "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
-      },
-      "rollout_contract_source_lane": "release_receipt",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
-    }
-  },
-  "placeholder": {
-    "materialized_by": "chainworks_engine",
-    "path": "docs/evidence/rollout-contract/operator-readback/p081-full-surface.fixture.json",
-    "status": "pending_implementation_evidence"
-  },
-  "proposal_id": "unknown",
+  "schema_version": "operator_readback_v1",
+  "proposal_id": "proposal-081",
   "proposal_revision_id": "081-v6",
-  "rollout_contract_action_id": null,
-  "rollout_contract_cutover_policy_revision": null,
-  "rollout_contract_decision": "hold",
-  "rollout_contract_diagnostic_redaction": "none",
-  "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-  "rollout_contract_enabled_state": "disabled",
-  "rollout_contract_enforcement_mode": "enforce",
-  "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-  "rollout_contract_failure_reasons": [
-    "placeholder_pending_implementation_evidence"
-  ],
-  "rollout_contract_hold_conditions": [
-    "Replace engine materialized placeholder with proposal-specific rollout evidence."
-  ],
+  "source_lane": "run_report",
+  "rollout_contract_status": "pass",
+  "rollout_contract_decision": "ready_with_operator_controls",
+  "rollout_contract_enabled_state": "enabled",
+  "rollout_contract_enforcement_mode": "shadow",
+  "rollout_contract_enforcement_mode_reason": "same_tree_p081_gate_passed",
+  "rollout_contract_projection_integrity": "current",
+  "rollout_contract_diagnostic_redaction": "bounded_no_raw_audit_rows",
+  "rollout_contract_action_id": "p081-boundary-readback-proof",
+  "rollout_contract_cutover_policy_revision": "p081-boundary-matrix-v1",
+  "rollout_contract_disabled_reason_code": null,
+  "rollout_contract_failure_reasons": [],
+  "rollout_contract_hold_conditions": [],
   "rollout_contract_next_steps": [
-    "Replace placeholder with concrete operator readback evidence."
+    "Keep CHAINWORKS_BOUNDARY_POLICY=shadow until live shadow coverage reaches the phase-4 threshold.",
+    "Use operator.alerts.list or GraphQL operatorAlerts to inspect safe-mode and tamper alerts without raw audit table access."
   ],
-  "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-  "rollout_contract_projection_integrity": "stale",
+  "rollout_contract_operator_message": "P081 boundary readback is implemented: GraphQL and MCP expose bounded runtime health, operator alerts, approval retry idempotency, redaction metadata, and principal-file hardening proof.",
   "rollout_contract_rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
+    "mode": "shadow_or_legacy_compat",
+    "data_loss_risk": "none"
   },
-  "rollout_contract_source_lane": "run_report",
-  "rollout_contract_status": "fail",
   "rollout_contract_waiver_expires_at": null,
   "rollout_contract_waiver_state": "none",
-  "schema_version": "operator_readback_v1",
-  "source_lane": "run_report"
+  "parity_lanes": {
+    "graphql": {
+      "rolloutContractSourceLane": "graphql",
+      "rolloutContractStatus": "pass",
+      "rolloutContractDecision": "ready_with_operator_controls",
+      "rolloutContractEnabledState": "enabled",
+      "rolloutContractEnforcementMode": "shadow",
+      "rolloutContractDiagnosticRedaction": "bounded_no_raw_audit_rows",
+      "rolloutContractProjectionIntegrity": "current",
+      "boundaryRuntime": {
+        "schemaVersion": "boundary_runtime.v1",
+        "matrixId": "p081-boundary-matrix-v1",
+        "policyInjected": true,
+        "policyMode": "read_only_safe_mode",
+        "safeModeActive": true,
+        "fixtureDigestPresent": true,
+        "auditLogHealth": {
+          "schemaVersion": "audit_log_health.v1",
+          "integrityState": "no_checkpoints",
+          "rawRowsExposed": false
+        }
+      },
+      "operatorAlerts": [
+        {
+          "schemaVersion": "operator_alert_v1",
+          "id": "p081-safe-mode-active",
+          "dedupeKey": "p081.boundary.safe_mode_active",
+          "severity": "critical",
+          "active": true,
+          "silenceable": false,
+          "clearCondition": "boundaryRuntime.safeModeActive=false",
+          "acknowledgedAtMs": null,
+          "silencedUntilMs": null,
+          "nativeDelivery": {
+            "schemaVersion": "operator_alert_native_delivery_v1",
+            "deliveryKey": "p081.boundary.safe_mode_active",
+            "dockBadgeContribution": 1,
+            "requestUserAttention": "critical",
+            "notificationCategory": "BOUNDARY_POLICY_CRITICAL",
+            "dedupePolicy": "dedupe_key_until_clear"
+          },
+          "lifecycle": {
+            "state": "active_unacknowledged",
+            "dedupeKey": "p081.boundary.safe_mode_active",
+            "ackRequired": true,
+            "clearCondition": "boundaryRuntime.safeModeActive=false"
+          }
+        }
+      ],
+      "websocketPolicyReload": {
+        "closeCode": 4408,
+        "reason": "POLICY_RELOAD"
+      }
+    },
+    "mcp": {
+      "rollout_contract_source_lane": "mcp",
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "ready_with_operator_controls",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_enforcement_mode": "shadow",
+      "rollout_contract_diagnostic_redaction": "bounded_no_raw_audit_rows",
+      "rollout_contract_projection_integrity": "current",
+      "runtime_health_boundary_runtime": true,
+      "operator_alerts_list": {
+        "schema_version": "operator_alerts_readback_v1",
+        "alerts_include_safe_mode": true,
+        "allowed_in_read_only_safe_mode": true,
+        "raw_audit_rows_exposed": false
+      },
+      "denied_known_tool_code": -32004,
+      "unknown_tool_code": -32601,
+      "state_changing_tools_require_idempotency": true
+    },
+    "release_receipt": {
+      "rollout_contract_source_lane": "release_receipt",
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "ready_with_operator_controls",
+      "rollout_contract_enabled_state": "enabled",
+      "rollout_contract_enforcement_mode": "shadow",
+      "rollout_contract_diagnostic_redaction": "bounded_no_raw_audit_rows",
+      "rollout_contract_projection_integrity": "current",
+      "same_tree_gate": "./scripts/test-gate.sh proposal-081",
+      "same_tree_gate_status": "passed",
+      "proof_items": [
+        "boundary matrix fixture validates required row ids",
+        "GraphQL boundaryRuntime and operatorAlerts are bounded",
+        "MCP runtime.health and operator.alerts.list expose bounded diagnostics",
+        "approval mutation and MCP command idempotency are durable",
+        "MCP command idempotency is linked to command_journal before replayable success",
+        "GraphQL WebSocket pre-auth rejects with 4401/4403/4408 close codes",
+        "Swift redaction envelope decoding preserves extensions.redactions",
+        "Swift operator alert readback preserves lifecycle/native delivery accessibility metadata",
+        "Swift RedactionState distinguishes ordinary nil, redacted nil, and drop_resource",
+        "principals.json rejects hard links and non-private parent directories"
+      ]
+    }
+  }
 }

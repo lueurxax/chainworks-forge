@@ -18,6 +18,7 @@ Related stable docs:
 - [idea-lifecycle.md](idea-lifecycle.md)
 - [live-workflow-map.md](live-workflow-map.md)
 - [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md)
+- [macos-operator-navigation.md](macos-operator-navigation.md)
 - [run-control.md](run-control.md)
 - [provider-binding-truth.md](provider-binding-truth.md)
 - [ui-action-boundary.md](ui-action-boundary.md)
@@ -28,6 +29,7 @@ Related stable docs:
 This reference covers the primarily **read-side** and repo-agnostic operator layer (per the [UI action boundary](ui-action-boundary.md)):
 
 - The `Runs` tab as the primary landing surface (GraphQL-only reads)
+- the four-surface navigation shell: `Runs`, `Ideas`, `Definitions`, and `Settings`
 - idea/archive visibility truth across operator surfaces
 - immutable run reports plus mutable latest summaries (metadata inspection only)
 - diagnostic-only guidance for non-approval actions; in-app approval resolution directly within the Runs tab
@@ -42,10 +44,12 @@ It does **NOT** define broad in-app write/recovery. Recovery, retry, reset, comp
 
 The `Runs` tab is the operator landing surface, offering a single source of truth for the run lifecycle. It consumes workflow truth exclusively through GraphQL projections. It features an inline approval panel for resolving approvals directly within the run detail and an idea origin badge on each run row for quick traceability.
 
+Top-level operator navigation, legacy route compatibility, Ideas read-first behavior, Definitions segmentation, Settings System Readiness, Timeline batching, and retained proof aliases are owned by [macos-operator-navigation.md](macos-operator-navigation.md).
+
 Runs are grouped into:
 
 1. `Waiting Approval`
-2. `Blocked`
+2. `Blocked or Failed`
 3. `Running`
 4. `Recently Completed`
 

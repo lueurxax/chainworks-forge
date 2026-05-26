@@ -1,43 +1,32 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "schema_lint",
+  "fixture_purpose": "Demonstrates the MCP schema lint hold predicate: a schema without '$schema' (Draft 2020-12), without 'additionalProperties: false', or missing required fields would fail the p086-continuation-preflight gate. All six current MCP schemas pass this gate.",
+  "status": "pass",
+  "evidence_kind": "code_and_gate",
+  "evidence": {
+    "gate": "p086-continuation-preflight (proposal-086 alias in scripts/test-gate.sh)",
+    "gate_checks": [
+      "Each MCP schema file exists under docs/reference/p086/schemas/mcp/",
+      "Each file is valid JSON",
+      "Each file has $schema == 'https://json-schema.org/draft/2020-12/schema'",
+      "agents.continue_work.response.schema.json requires 'outcome' field"
+    ],
+    "non_conforming_example": {
+      "description": "A schema that would fail: no $schema, no additionalProperties=false, no required",
+      "example": {"type": "object", "properties": {"x": {"type": "string"}}},
+      "failure_mode": "gate raises SystemExit: proposal-086: missing MCP schema or invalid Draft 2020-12 $schema"
+    },
+    "current_schema_paths_passing": [
+      "docs/reference/p086/schemas/mcp/agents.continue_work.request.schema.json",
+      "docs/reference/p086/schemas/mcp/agents.continue_work.response.schema.json",
+      "docs/reference/p086/schemas/mcp/agents.continuation_status.request.schema.json",
+      "docs/reference/p086/schemas/mcp/agents.continuation_status.response.schema.json",
+      "docs/reference/p086/schemas/mcp/agents.continuation_candidates.request.schema.json",
+      "docs/reference/p086/schemas/mcp/agents.continuation_candidates.response.schema.json"
+    ]
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:mcp_schema_lint_failure",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "hold_prevented_by_gate"
 }

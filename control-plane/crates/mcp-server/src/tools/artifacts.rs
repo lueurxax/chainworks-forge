@@ -16,7 +16,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                 .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
-            "required": ["run_id", "contract_id", "override_type", "from_status", "to_status", "reason", "expires_at_stage"],
+            "required": ["run_id", "contract_id", "override_type", "from_status", "to_status", "reason", "expires_at_stage", "idempotency_key"],
             "properties": {
                 "run_id": { "type": "string" },
                 "contract_id": { "type": "string" },
@@ -25,7 +25,8 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "to_status": { "type": "string" },
                 "reason": { "type": "string" },
                 "source_artifacts": { "type": "array", "items": { "type": "string" } },
-                "expires_at_stage": { "type": "string" }
+                "expires_at_stage": { "type": "string" },
+                "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." }
             }
         }),
     }]
@@ -72,7 +73,7 @@ pub async fn execute(
             // `CallerContext::mcp(...)` directly, which drops the id
             // even when the inbound MCP HTTP request had one set via
             // `X-Request-ID`.
-            let caller = mcp_caller(&principal.id, &principal.class, tool_name);
+            let caller = mcp_caller(&principal, tool_name);
             let commanded = cmd_handler.handle(cmd, caller).await?;
             let override_id = match commanded.result {
                 CommandResult::ArtifactContractOverrideCreated { override_id } => override_id,

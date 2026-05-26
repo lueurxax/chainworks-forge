@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Error, Result};
 use serde::de::DeserializeOwned;
@@ -24,8 +25,8 @@ use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
     agent_execution_runtime_receipts, agent_executions, agent_retry_budget_ledger,
     artifact_contracts, artifacts, code_writer_completion_receipts, evidence_spool_refs, ideas,
-    legacy_discovery_overrides, projections, rollout_contract_checks, scheduler, sessions, stages,
-    storage_health, validation, work_items, workflow_conflicts,
+    legacy_discovery_overrides, projections, rollout_contract_checks, runs, scheduler, sessions,
+    stages, storage_health, validation, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::{WriteLane, WriteResult};
@@ -93,6 +94,7 @@ use domain::side_effect::{EffectKind, PrepareEffectIntent};
 
 const ACTIVE_PROMPT_CLOSE_AUTO_RECOVERY_MAX_ATTEMPTS: i64 = 3;
 const JUNIE_PROVIDER_CAPACITY_RETRY_DELAY_SECONDS: i64 = 15;
+const DEFAULT_PROVIDER_QUOTA_RETRY_DELAY_SECONDS: i64 = 30 * 60;
 const APPROVED_PROPOSAL_OUTPUT_NAME: &str = "approved_proposal";
 const IMPLEMENTATION_STARTED_STAGE_ID: &str = "state_7_implementation_started";
 const FREEZE_PROPOSAL_TASK_NAME: &str = "freeze_proposal_and_provision_worktree";
@@ -203,6 +205,23 @@ impl acp::AcpPromptProgressSink for DbAcpPromptProgressSink {
             return Ok(());
         };
         sessions::touch_generation_activity(&self.pool, generation_id, chrono::Utc::now()).await?;
+        if let Some(title) = update.title.as_deref() {
+            let _ = self
+                .events
+                .send(domain::events::DomainEvent::RuntimeTimelineEvent {
+                    run_id: update.run_id,
+                    stage_id: update.stage_id.clone(),
+                    agent_id: update.agent_id.clone(),
+                    provider: update.provider.clone(),
+                    event_kind: acp_prompt_progress_kind_label(&update.kind).to_string(),
+                    title: title.to_string(),
+                    detail: update.detail.clone(),
+                    surface_label: update.surface_label.clone().unwrap_or_else(|| {
+                        acp_prompt_progress_kind_label(&update.kind).to_string()
+                    }),
+                    session_generation_id: update.session_generation_id.clone(),
+                });
+        }
         if let Some(stage_execution_id) = update.stage_execution_id.as_deref() {
             match stage_execution_id.parse::<domain::ids::StageExecutionId>() {
                 Ok(stage_execution_id) => {
@@ -228,6 +247,15 @@ impl acp::AcpPromptProgressSink for DbAcpPromptProgressSink {
             }
         }
         Ok(())
+    }
+}
+
+fn acp_prompt_progress_kind_label(kind: &acp::AcpPromptProgressKind) -> &'static str {
+    match kind {
+        acp::AcpPromptProgressKind::PromptSent => "prompt_sent",
+        acp::AcpPromptProgressKind::MessageReceived => "message_received",
+        acp::AcpPromptProgressKind::MeaningfulProgress => "meaningful_progress",
+        acp::AcpPromptProgressKind::ProviderLocalActivity => "provider_local_activity",
     }
 }
 
@@ -445,6 +473,43 @@ async fn invoke_item_has_start_capacity(
     }
     let provider_family =
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
+    let model = payload.get("model").and_then(|value| value.as_str());
+    if let Some(wait) =
+        provider_quota_retry_wait_active(pool, &provider_family, model, chrono::Utc::now()).await?
+    {
+        let stage_execution_id = payload
+            .get("stage_execution_id")
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse().ok());
+        if let Some(stage_execution_id) = stage_execution_id {
+            if let Some(consumed) =
+                agent_retry_budget_ledger::consume_active_provider_family_quota_for_retry_target(
+                    pool,
+                    stage_execution_id,
+                    &provider_family,
+                    model,
+                    chrono::Utc::now(),
+                )
+                .await?
+            {
+                info!(
+                    work_item_id = %item.id,
+                    provider_family = %provider_family,
+                    target_stage_execution_id = %stage_execution_id,
+                    source_command_journal_id = %consumed.source_command_journal_id,
+                    consumed_count = consumed.consumed_count,
+                    "Operator retry consumed active provider-family quota wait"
+                );
+            } else {
+                record_provider_quota_wait_on_pending_item(pool, item, &provider_family, &wait)
+                    .await?;
+                return Ok(false);
+            }
+        } else {
+            record_provider_quota_wait_on_pending_item(pool, item, &provider_family, &wait).await?;
+            return Ok(false);
+        }
+    }
 
     let running_status = AgentStatus::Running.to_string();
     let total_active: i64 = sqlx::query_scalar(
@@ -509,6 +574,37 @@ async fn invoke_item_has_start_capacity(
     }
 
     Ok(true)
+}
+
+async fn provider_quota_retry_wait_active(
+    pool: &SqlitePool,
+    provider_family: &str,
+    model: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<agent_retry_budget_ledger::ProviderFamilyQuotaWait>> {
+    agent_retry_budget_ledger::active_provider_family_quota_wait(pool, provider_family, model, now)
+        .await
+}
+
+async fn record_provider_quota_wait_on_pending_item(
+    pool: &SqlitePool,
+    item: &WorkItem,
+    provider_family: &str,
+    wait: &agent_retry_budget_ledger::ProviderFamilyQuotaWait,
+) -> Result<()> {
+    let reason = format!(
+        "provider_quota_wait: provider_family={}; retry_after={}; blocking_ledger_id={}; blocking_run_id={}; blocking_agent_execution_id={}",
+        provider_family,
+        wait.retry_after.to_rfc3339(),
+        wait.ledger_id,
+        wait.run_id,
+        wait.agent_execution_id
+    );
+    if item.last_error.as_deref() == Some(reason.as_str()) {
+        return Ok(());
+    }
+    work_items::record_pending_invoke_agent_wait_reason(pool, &item.id, &reason).await?;
+    Ok(())
 }
 
 fn invoke_payload_requires_xcode_mcp(payload: &serde_json::Value) -> bool {
@@ -1072,6 +1168,20 @@ fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
     }
     std::fs::write(path_obj, content)?;
     Ok(())
+}
+
+fn p086_continuation_response_hash(
+    continuation_id: &str,
+    terminal_status: &str,
+    failure_reason: Option<&str>,
+) -> String {
+    let payload = serde_json::json!({
+        "schema_version": "continuation_response_snapshot_v1",
+        "continuation_id": continuation_id,
+        "terminal_status": terminal_status,
+        "failure_reason": failure_reason,
+    });
+    format!("{:x}", Sha256::digest(payload.to_string().as_bytes()))
 }
 
 #[derive(Clone)]
@@ -2221,6 +2331,56 @@ fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+fn sha256_hex_digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn p086_canonical_request_fingerprint(
+    agent_execution_id: &str,
+    run_id: &str,
+    stage_execution_id: &str,
+    caller_principal_id: &str,
+    mode: &str,
+    trigger_kind: &str,
+    idempotency_scope: &str,
+    idempotency_key: &str,
+    lead_decision_artifact_id: Option<&str>,
+    lead_decision_artifact_sha256: Option<&str>,
+    continuation_instruction_sha256: Option<&str>,
+    request_context: Option<&serde_json::Value>,
+) -> String {
+    let mut map: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+    map.insert("command", serde_json::json!("agents.continue_work"));
+    map.insert("agent_execution_id", serde_json::json!(agent_execution_id));
+    map.insert("run_id", serde_json::json!(run_id));
+    map.insert("stage_execution_id", serde_json::json!(stage_execution_id));
+    map.insert(
+        "caller_principal_id",
+        serde_json::json!(caller_principal_id),
+    );
+    map.insert("mode", serde_json::json!(mode));
+    map.insert("trigger_kind", serde_json::json!(trigger_kind));
+    map.insert("idempotency_scope", serde_json::json!(idempotency_scope));
+    map.insert("idempotency_key", serde_json::json!(idempotency_key));
+    if let Some(value) = lead_decision_artifact_id {
+        map.insert("lead_decision_artifact_id", serde_json::json!(value));
+    }
+    if let Some(value) = lead_decision_artifact_sha256 {
+        map.insert("lead_decision_artifact_sha256", serde_json::json!(value));
+    }
+    if let Some(value) = continuation_instruction_sha256 {
+        map.insert("continuation_instruction_sha256", serde_json::json!(value));
+    }
+    if let Some(value) = request_context {
+        map.insert("request_context", value.clone());
+    }
+    let canonical_json = serde_json::to_string(&map)
+        .expect("BTreeMap<&str, Value> always serializes")
+        .replace("\r\n", "\n");
+    sha256_hex_digest(canonical_json.as_bytes())
+}
+
 fn degraded_policy_allows_valid_failed_outputs(
     policy: &workflow::plan::DegradedOutputPolicy,
     validation: &TaskValidationSummary,
@@ -2262,9 +2422,9 @@ fn runtime_facts_for_acp_error(
     let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
     let message = error.to_string();
     let classification = classify_observation(observation_from_acp_error_message(&message));
+    facts.retry_after = retry_after_or_default_for_provider_quota(&classification, now);
     facts.failure_kind = Some(classification.failure_kind);
     facts.operator_action_hint = Some(classification.operator_action_hint);
-    facts.retry_after = classification.retry_after;
     facts.failure_kind_raw_debug = Some(redact_runtime_message(&format!("{error:#}")));
     facts.failure_message_redacted = Some(redact_runtime_message(&message));
     facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
@@ -2298,6 +2458,21 @@ fn runtime_receipt_record_from_receipt(
         created_at: now,
         updated_at: now,
     })
+}
+
+fn retry_after_or_default_for_provider_quota(
+    classification: &RuntimeFailureClassification,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if classification.failure_kind == AgentFailureKind::ProviderQuota {
+        Some(
+            classification.retry_after.unwrap_or(
+                now + chrono::Duration::seconds(DEFAULT_PROVIDER_QUOTA_RETRY_DELAY_SECONDS),
+            ),
+        )
+    } else {
+        classification.retry_after
+    }
 }
 
 fn runtime_prompt_receipt_record_from_receipt(
@@ -2567,7 +2742,7 @@ fn runtime_facts_for_execution_result(
             let classification = provider_quota_classification.expect("checked above");
             facts.failure_kind = Some(classification.failure_kind.clone());
             facts.operator_action_hint = Some(classification.operator_action_hint.clone());
-            facts.retry_after = classification.retry_after;
+            facts.retry_after = retry_after_or_default_for_provider_quota(classification, now);
             facts.transport_error_code = classification.transport_error_code.clone();
             facts.supervision_classification = classification.supervision_classification.clone();
             facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
@@ -2588,7 +2763,7 @@ fn runtime_facts_for_execution_result(
             if let Some(classification) = observed_failure_classification.as_ref() {
                 facts.failure_kind = Some(classification.failure_kind.clone());
                 facts.operator_action_hint = Some(classification.operator_action_hint.clone());
-                facts.retry_after = classification.retry_after;
+                facts.retry_after = retry_after_or_default_for_provider_quota(classification, now);
                 facts.transport_error_code = classification.transport_error_code.clone();
                 facts.supervision_classification =
                     classification.supervision_classification.clone();
@@ -2602,7 +2777,7 @@ fn runtime_facts_for_execution_result(
             if let Some(classification) = observed_failure_classification.as_ref() {
                 facts.failure_kind = Some(classification.failure_kind.clone());
                 facts.operator_action_hint = Some(classification.operator_action_hint.clone());
-                facts.retry_after = classification.retry_after;
+                facts.retry_after = retry_after_or_default_for_provider_quota(classification, now);
                 facts.transport_error_code = classification.transport_error_code.clone();
                 facts.supervision_classification =
                     classification.supervision_classification.clone();
@@ -3194,6 +3369,35 @@ fn observed_failure_classification_for_execution_result(
     transcript_text.map(|text| classify_observation(observation_from_acp_error_message(text)))
 }
 
+fn output_contract_repair_skip_classification(
+    result_status: &AgentStatus,
+    transcript_text: Option<&str>,
+    runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
+) -> Option<RuntimeFailureClassification> {
+    if *result_status != AgentStatus::Failed {
+        return None;
+    }
+    if runtime_receipt
+        .and_then(|receipt| receipt.failure_phase.as_deref())
+        .is_some_and(|phase| phase == "provider_quota")
+    {
+        return Some(classify_observation(
+            crate::failure_classifier::RuntimeFailureObservation::ProviderQuota {
+                retry_after: transcript_text
+                    .map(observation_from_acp_error_message)
+                    .and_then(|observation| match observation {
+                        crate::failure_classifier::RuntimeFailureObservation::ProviderQuota {
+                            retry_after,
+                        } => retry_after,
+                        _ => None,
+                    }),
+            },
+        ));
+    }
+    observed_failure_classification_for_execution_result(result_status, transcript_text)
+        .filter(|classification| classification.failure_kind == AgentFailureKind::ProviderQuota)
+}
+
 fn redact_runtime_message(message: &str) -> String {
     let mut scrubbed = message.to_string();
     for (name, value) in std::env::vars() {
@@ -3635,6 +3839,417 @@ impl BackgroundExecutor {
         .await;
     }
 
+    fn p086_lead_auto_json_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+        value.get(key).and_then(serde_json::Value::as_str)
+    }
+
+    fn p086_lead_auto_json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn p086_lead_auto_decision_targets_code_writer(
+        artifact_json: &serde_json::Value,
+    ) -> Option<(&serde_json::Value, &str)> {
+        if Self::p086_lead_auto_json_str(artifact_json, "schema_version")
+            != Some("lead_continuation_decision_v1")
+            || Self::p086_lead_auto_json_str(artifact_json, "artifact_kind")
+                != Some("lead_continuation_decision")
+        {
+            return None;
+        }
+        let payload = artifact_json.get("payload")?;
+        if Self::p086_lead_auto_json_str(payload, "schema_version")
+            != Some("lead_continuation_decision_v1")
+            || Self::p086_lead_auto_json_str(payload, "decision") != Some("continue")
+            || Self::p086_lead_auto_json_str(payload, "agent_id") != Some("code_writer")
+        {
+            return None;
+        }
+        let target_agent_execution_id =
+            Self::p086_lead_auto_json_str(payload, "agent_execution_id")?;
+        Some((payload, target_agent_execution_id))
+    }
+
+    fn p086_lead_auto_payload_valid_for_target(
+        artifact_json: &serde_json::Value,
+        payload: &serde_json::Value,
+        target: &db::repos::agent_work_continuations::ContinuationEligibilityInfo,
+        instruction_sha256: &str,
+    ) -> Option<&'static str> {
+        for (key, expected) in [
+            ("run_id", target.run_id.as_str()),
+            ("stage_execution_id", target.stage_execution_id.as_str()),
+            ("agent_execution_id", target.agent_execution_id.as_str()),
+        ] {
+            if Self::p086_lead_auto_json_str(artifact_json, key) != Some(expected)
+                || Self::p086_lead_auto_json_str(payload, key) != Some(expected)
+            {
+                return Some("lead_auto_artifact_target_mismatch");
+            }
+        }
+        if let Some(expected_session) = target.session_generation_id.as_deref() {
+            if Self::p086_lead_auto_json_str(payload, "session_generation_id")
+                != Some(expected_session)
+            {
+                return Some("lead_auto_session_generation_mismatch");
+            }
+        }
+        let Some(instruction) = Self::p086_lead_auto_json_str(payload, "continuation_instruction")
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Some("lead_auto_instruction_missing");
+        };
+        let computed = sha256_hex_digest(instruction.as_bytes());
+        if Self::p086_lead_auto_json_str(payload, "continuation_instruction_sha256")
+            != Some(instruction_sha256)
+            || computed != instruction_sha256
+        {
+            return Some("lead_auto_instruction_hash_mismatch");
+        }
+        let safety = payload.get("safety_checks");
+        for key in [
+            "no_release_side_effect",
+            "no_unresolved_effect_ledger",
+            "same_worktree_required",
+        ] {
+            if safety
+                .and_then(|value| value.get(key))
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return Some("lead_auto_safety_check_failed");
+            }
+        }
+        None
+    }
+
+    fn p086_lead_auto_capability_allows(
+        catalog_snapshot_json: Option<&str>,
+        trigger_kind: &str,
+        live_session_present: bool,
+    ) -> Result<bool> {
+        let Some(raw_catalog) = catalog_snapshot_json else {
+            return Ok(false);
+        };
+        let catalog: serde_json::Value = serde_json::from_str(raw_catalog)
+            .context("parse frozen catalog snapshot for P086 lead_auto")?;
+        let Some(agent) = catalog["agents"].as_array().and_then(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent["id"].as_str() == Some("code_writer"))
+        }) else {
+            return Ok(false);
+        };
+        let capability = &agent["continuation_capability"];
+        if capability["enabled"].as_bool() != Some(true) {
+            return Ok(false);
+        }
+        let trigger_allowed = capability["allowed_triggers"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(trigger_kind)));
+        if !trigger_allowed {
+            return Ok(false);
+        }
+        let live = &capability["live_handle_continuation"];
+        let live_enabled = live["enabled"].as_bool() == Some(true);
+        let require_live_session = live["require_live_session"].as_bool().unwrap_or(true);
+        Ok(live_enabled && (!require_live_session || live_session_present))
+    }
+
+    fn p086_forbidden_stage_kind(
+        logical_stage_id: Option<&str>,
+        stage_type: Option<&str>,
+    ) -> Option<&'static str> {
+        let stage = format!(
+            "{} {}",
+            logical_stage_id.unwrap_or_default(),
+            stage_type.unwrap_or_default()
+        )
+        .to_ascii_lowercase();
+        for (needle, reason) in [
+            ("release", "release"),
+            ("publish", "publish"),
+            ("git_push", "git_push"),
+            ("git-push", "git_push"),
+            ("upload", "upload"),
+            ("distribution", "distribution"),
+            ("distribute", "distribution"),
+            ("connect", "upload"),
+        ] {
+            if stage.contains(needle) {
+                return Some(reason);
+            }
+        }
+        None
+    }
+
+    async fn maybe_admit_p086_lead_auto_continuation(
+        &self,
+        run: &domain::run::Run,
+        producer_agent_execution_id: domain::ids::AgentExecutionId,
+        persisted_artifacts: &[Artifact],
+    ) -> Result<()> {
+        for artifact in persisted_artifacts {
+            let bytes = match tokio::fs::read(&artifact.file_path).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    warn!(
+                        artifact_id = %artifact.id,
+                        path = %artifact.file_path,
+                        error = %error,
+                        "P086 lead_auto skipped unreadable candidate artifact"
+                    );
+                    continue;
+                }
+            };
+            let artifact_sha256 = sha256_hex_digest(&bytes);
+            if let Some(recorded) = artifact.checksum_sha256.as_deref() {
+                let normalized = recorded.strip_prefix("sha256:").unwrap_or(recorded);
+                if normalized != artifact_sha256 {
+                    warn!(
+                        artifact_id = %artifact.id,
+                        "P086 lead_auto skipped artifact with mismatched checksum"
+                    );
+                    continue;
+                }
+            }
+            let artifact_json: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let Some((payload, target_agent_execution_id)) =
+                Self::p086_lead_auto_decision_targets_code_writer(&artifact_json)
+            else {
+                continue;
+            };
+
+            let Some(target) = db::repos::agent_work_continuations::check_eligibility(
+                &self.pool,
+                target_agent_execution_id,
+            )
+            .await?
+            else {
+                warn!(
+                    artifact_id = %artifact.id,
+                    target_agent_execution_id,
+                    "P086 lead_auto rejected ineligible target"
+                );
+                continue;
+            };
+            if !matches!(target.agent_status.as_str(), "completed" | "failed") {
+                continue;
+            }
+            let instruction = Self::p086_lead_auto_json_str(payload, "continuation_instruction")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let instruction_sha256 = sha256_hex_digest(instruction.as_bytes());
+            if let Some(reason) = Self::p086_lead_auto_payload_valid_for_target(
+                &artifact_json,
+                payload,
+                &target,
+                &instruction_sha256,
+            ) {
+                warn!(
+                    artifact_id = %artifact.id,
+                    target_agent_execution_id,
+                    failure_reason = reason,
+                    "P086 lead_auto decision failed validation"
+                );
+                continue;
+            }
+            if !Self::p086_lead_auto_capability_allows(
+                target.catalog_snapshot_json.as_deref(),
+                "lead_auto",
+                target.session_generation_id.is_some() && target.provider_session_id.is_some(),
+            )? {
+                continue;
+            }
+            if Self::p086_forbidden_stage_kind(
+                target.logical_stage_id.as_deref(),
+                target.stage_type.as_deref(),
+            )
+            .is_some()
+            {
+                continue;
+            }
+            if db::repos::agent_work_continuations::has_unresolved_side_effects_for_stage(
+                &self.pool,
+                &target.run_id,
+                &target.stage_execution_id,
+            )
+            .await?
+                || db::repos::agent_work_continuations::has_pending_approval_for_run(
+                    &self.pool,
+                    &target.run_id,
+                )
+                .await?
+            {
+                continue;
+            }
+
+            let blockers = Self::p086_lead_auto_json_string_array(payload, "known_blockers");
+            let max_turns = payload
+                .get("max_turns")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(1);
+            let max_wall_clock_seconds = payload
+                .get("max_wall_clock_seconds")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(900);
+            let request_context = serde_json::json!({
+                "run_id": target.run_id,
+                "stage_execution_id": target.stage_execution_id,
+                "session_generation_id": target.session_generation_id,
+                "provider_session_id": target.provider_session_id,
+                "operator_instruction": instruction,
+                "max_turns": max_turns,
+                "max_wall_clock_seconds": max_wall_clock_seconds,
+                "blockers": blockers,
+                "lead_reason": Self::p086_lead_auto_json_str(payload, "reason"),
+                "expected_next_work": Self::p086_lead_auto_json_string_array(payload, "expected_next_work"),
+                "known_completed_work": Self::p086_lead_auto_json_string_array(payload, "known_completed_work"),
+                "stop_conditions": Self::p086_lead_auto_json_string_array(payload, "stop_conditions"),
+                "continuation_capability_checked": true,
+                "no_release_side_effect_stage": true,
+                "no_unresolved_side_effects": true,
+                "caller_principal_id": format!("lead_auto_agent:{producer_agent_execution_id}"),
+                "caller_principal_class": "agent",
+                "lead_decision_artifact_id": artifact.id.to_string(),
+            });
+            let decision_id =
+                Self::p086_lead_auto_json_str(payload, "decision_id").unwrap_or("decision");
+            let idempotency_scope = target.agent_execution_id.clone();
+            let idempotency_key = format!(
+                "lead_auto:{}:{}:{}",
+                artifact.id, decision_id, instruction_sha256
+            );
+            let caller_principal_id = format!("lead_auto_agent:{producer_agent_execution_id}");
+            let fingerprint = p086_canonical_request_fingerprint(
+                &target.agent_execution_id,
+                &target.run_id,
+                &target.stage_execution_id,
+                &caller_principal_id,
+                "live_handle_continuation",
+                "lead_auto",
+                &idempotency_scope,
+                &idempotency_key,
+                Some(&artifact.id.to_string()),
+                Some(&artifact_sha256),
+                Some(&instruction_sha256),
+                Some(&request_context),
+            );
+            let continuation_id = uuid::Uuid::new_v4().to_string();
+            let command_journal_id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            let admission = db::repos::agent_work_continuations::ContinuationAdmission {
+                continuation_id: continuation_id.clone(),
+                command_journal_id,
+                run_id: target.run_id.clone(),
+                stage_execution_id: target.stage_execution_id.clone(),
+                agent_execution_id: target.agent_execution_id.clone(),
+                mode: "live_handle_continuation".to_string(),
+                trigger_kind: "lead_auto".to_string(),
+                idempotency_scope,
+                idempotency_key,
+                request_fingerprint_sha256: fingerprint,
+                lead_decision_artifact_id: Some(artifact.id.to_string()),
+                lead_decision_artifact_sha256: Some(artifact_sha256),
+                continuation_instruction_sha256: Some(instruction_sha256),
+                budget_json: Some(serde_json::to_string(&request_context)?),
+                caller_principal_id,
+                caller_surface: "engine".to_string(),
+                caller_principal_class: "agent".to_string(),
+                caller_tool: "lead_auto_orchestration".to_string(),
+                created_at: now,
+            };
+            let payload_json = serde_json::to_string(&serde_json::json!({
+                "command": "agents.continue_work",
+                "agent_execution_id": target.agent_execution_id,
+                "run_id": target.run_id,
+                "stage_execution_id": target.stage_execution_id,
+                "session_generation_id": request_context["session_generation_id"],
+                "provider_session_id": request_context["provider_session_id"],
+                "continuation_mode": "live_handle_continuation",
+                "mode": "live_handle_continuation",
+                "trigger_kind": "lead_auto",
+                "idempotency_key": admission.idempotency_key.as_str(),
+                "lead_decision_artifact_id": admission.lead_decision_artifact_id.as_deref(),
+                "operator_instruction": request_context["operator_instruction"],
+                "max_turns": max_turns,
+                "max_wall_clock_seconds": max_wall_clock_seconds,
+                "blockers": request_context["blockers"]
+            }))?;
+            match db::repos::agent_work_continuations::admit_continuation_atomic(
+                &self.pool,
+                &admission,
+                &payload_json,
+            )
+            .await?
+            {
+                db::repos::agent_work_continuations::AtomicAdmissionOutcome::Accepted => {
+                    let work_item = WorkItem {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        kind: WorkItemKind::ProcessContinuation,
+                        payload_json: serde_json::to_string(&serde_json::json!({
+                            "continuation_id": continuation_id,
+                            "agent_execution_id": target.agent_execution_id,
+                            "run_id": target.run_id,
+                            "mode": "live_handle_continuation"
+                        }))
+                        .unwrap_or_default(),
+                        status: WorkItemStatus::Pending,
+                        run_id: None,
+                        stage_id: None,
+                        created_at: chrono::Utc::now(),
+                        scheduled_at: chrono::Utc::now(),
+                        attempt_count: 0,
+                        last_error: None,
+                    };
+                    if let Err(error) = work_items::enqueue(&self.pool, &work_item).await {
+                        warn!(
+                            continuation_id = %continuation_id,
+                            error = %error,
+                            "P086 lead_auto admission succeeded but ProcessContinuation enqueue failed"
+                        );
+                    } else {
+                        info!(
+                            run_id = %run.id,
+                            continuation_id = %continuation_id,
+                            target_agent_execution_id,
+                            lead_decision_artifact_id = %artifact.id,
+                            "P086 lead_auto admitted and enqueued ProcessContinuation"
+                        );
+                    }
+                }
+                db::repos::agent_work_continuations::AtomicAdmissionOutcome::Replay(existing) => {
+                    debug!(
+                        continuation_id = %existing.id,
+                        target_agent_execution_id,
+                        "P086 lead_auto admission replayed existing continuation"
+                    );
+                }
+                db::repos::agent_work_continuations::AtomicAdmissionOutcome::IdempotencyConflict
+                | db::repos::agent_work_continuations::AtomicAdmissionOutcome::AlreadyRunning(_)
+                | db::repos::agent_work_continuations::AtomicAdmissionOutcome::LeadAutoLimitExceeded { .. }
+                | db::repos::agent_work_continuations::AtomicAdmissionOutcome::Saturated { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
     pub async fn persist_implementation_self_assessment_summary_if_applicable(
         &self,
         artifact: &domain::artifact::Artifact,
@@ -3704,9 +4319,2033 @@ impl BackgroundExecutor {
                 .await;
         });
 
+        let sweeper_executor = Arc::clone(&self);
+        tokio::spawn(async move {
+            sweeper_executor
+                .run_continuation_admission_timeout_sweeper()
+                .await;
+        });
+
         tokio::spawn(async move {
             self.run_loop().await;
         })
+    }
+
+    /// P086: Periodically sweep accepted/queued/starting continuation rows older than
+    /// MAX_ADMISSION_TO_START_SECONDS to failed with failure_reason=admission_timeout.
+    async fn run_continuation_admission_timeout_sweeper(self: Arc<Self>) {
+        use db::repos::agent_work_continuations::MAX_ADMISSION_TO_START_SECONDS;
+
+        let interval = Duration::from_secs(
+            std::env::var("P086_ADMISSION_TIMEOUT_SWEEP_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+        );
+
+        info!(
+            interval_secs = interval.as_secs(),
+            max_admission_secs = MAX_ADMISSION_TO_START_SECONDS,
+            "P086 continuation admission-timeout sweeper started"
+        );
+
+        loop {
+            sleep(interval).await;
+            match db::repos::agent_work_continuations::sweep_admission_timeouts(
+                &self.pool,
+                MAX_ADMISSION_TO_START_SECONDS,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(swept) => {
+                    tracing::warn!(swept, "P086 swept continuation rows to admission_timeout");
+                    match db::repos::agent_work_continuations::list_terminal_missing_artifacts(
+                        &self.pool, 100,
+                    )
+                    .await
+                    {
+                        Ok(rows) => {
+                            for row in rows {
+                                if let Err(err) =
+                                    self.repair_p086_terminal_continuation_artifacts(&row).await
+                                {
+                                    tracing::warn!(
+                                        continuation_id = %row.id,
+                                        error = %err,
+                                        "P086 failed to materialize terminal continuation artifacts after sweep"
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "P086 failed to list terminal continuations missing artifacts"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "P086 continuation admission-timeout sweep failed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// P086 Phase 2: Execute a single continuation row to completion.
+    ///
+    /// State machine: accepted → queued → starting → running → prompt_sent →
+    ///   observing → worktree_observed → finalizing → succeeded | no_progress | failed.
+    ///
+    /// If the live ACP session is absent the row settles to no_progress immediately
+    /// without any provider I/O, preserving the no-duplicate-send invariant.
+    async fn persist_p086_continuation_json_artifact(
+        &self,
+        run: &domain::run::Run,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        agent_execution_id: &str,
+        continuation_id: &str,
+        name: &str,
+        contract_id: &str,
+        value: &serde_json::Value,
+    ) -> anyhow::Result<(String, String)> {
+        self.persist_p086_continuation_json_artifact_with_id(
+            run,
+            stage_id,
+            agent_id,
+            provider,
+            model,
+            agent_execution_id,
+            continuation_id,
+            name,
+            contract_id,
+            value,
+            domain::ids::ArtifactId::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_p086_continuation_json_artifact_with_id(
+        &self,
+        run: &domain::run::Run,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        agent_execution_id: &str,
+        continuation_id: &str,
+        name: &str,
+        contract_id: &str,
+        value: &serde_json::Value,
+        artifact_id: domain::ids::ArtifactId,
+    ) -> anyhow::Result<(String, String)> {
+        let bytes = serde_json::to_vec_pretty(value)?;
+        let checksum = sha256_digest(&bytes);
+        let path = Path::new(&run.artifact_root)
+            .join("continuations")
+            .join(continuation_id)
+            .join(format!("{name}-{artifact_id}.json"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create P086 continuation artifact directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        std::fs::write(&path, &bytes)
+            .with_context(|| format!("write P086 continuation artifact {}", path.display()))?;
+
+        let artifact = Artifact {
+            id: artifact_id,
+            run_id: run.id,
+            stage_id: stage_id.to_string(),
+            agent_id: agent_id.to_string(),
+            name: name.to_string(),
+            contract_id: contract_id.to_string(),
+            format: ArtifactFormat::Json,
+            file_path: path.to_string_lossy().into_owned(),
+            checksum_sha256: Some(checksum),
+            size_bytes: Some(bytes.len() as i64),
+            provider: provider.to_string(),
+            model,
+            created_at: chrono::Utc::now(),
+            is_pinned: false,
+            report_kind: Some("p086_continuation".to_string()),
+            report_version: Some(1),
+            agent_execution_id: Some(agent_execution_id.to_string()),
+        };
+        artifacts::insert(&self.pool, &artifact).await?;
+        let _ = self
+            .events
+            .send(domain::events::DomainEvent::ArtifactCreated {
+                run_id: run.id,
+                artifact_id: artifact.id,
+            });
+        Ok((
+            artifact.id.to_string(),
+            artifact.checksum_sha256.unwrap_or_default(),
+        ))
+    }
+
+    fn p086_continuation_request_context(
+        continuation: &domain::continuation::ContinuationRecord,
+    ) -> serde_json::Value {
+        continuation
+            .budget_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    }
+
+    fn p086_continuation_prompt(
+        continuation: &domain::continuation::ContinuationRecord,
+        session_generation_id: &str,
+        provider_session_id: Option<&str>,
+        worktree_root: &str,
+    ) -> String {
+        let request_context = Self::p086_continuation_request_context(continuation);
+        let operator_instruction = request_context
+            .get("operator_instruction")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("Continue the existing implementation session. Preserve the current worktree and address only the remaining continuation blockers.");
+        let blockers: Vec<String> = request_context
+            .get("blockers")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let blockers_text = if blockers.is_empty() {
+            "- No explicit blocker list was supplied; inspect current artifacts and continue only if there is concrete remaining implementation work.".to_string()
+        } else {
+            blockers
+                .iter()
+                .map(|blocker| format!("- {blocker}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let max_turns = request_context
+            .get("max_turns")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(1);
+        let max_wall_clock_seconds = request_context
+            .get("max_wall_clock_seconds")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(900);
+        let provider_session_id = provider_session_id.unwrap_or("unknown");
+
+        format!(
+            "\
+# P086 Continuation Mode Reset
+
+You are continuing the same Chainworks agent execution through an existing live ACP session. This is not a retry, output-contract repair, or checkpoint rehydration.
+
+## Runtime identity
+- Run id: {run_id}
+- Stage execution id: {stage_execution_id}
+- Agent execution id: {agent_execution_id}
+- Continuation id: {continuation_id}
+- Session generation id: {session_generation_id}
+- Provider session id: {provider_session_id}
+- Worktree root: {worktree_root}
+
+## Operator instruction
+{operator_instruction}
+
+## Current blockers
+{blockers_text}
+
+## Bounds
+- Maximum turns: {max_turns}
+- Maximum wall-clock seconds: {max_wall_clock_seconds}
+
+## Safety rules
+- Continue from the current worktree state; do not restart the task from scratch.
+- Do not commit, push, release, publish, upload, or perform external side effects.
+- Do not overwrite settled output truth unless the current continuation explicitly produces fresher evidence.
+- If there is no concrete implementation progress to make, stop and report no progress with evidence.
+- Keep output scoped to the existing agent execution and current continuation contract.",
+            run_id = continuation.run_id,
+            stage_execution_id = continuation.stage_execution_id,
+            agent_execution_id = continuation.agent_execution_id,
+            continuation_id = continuation.id,
+            session_generation_id = session_generation_id,
+            provider_session_id = provider_session_id,
+            worktree_root = worktree_root,
+            operator_instruction = operator_instruction,
+            blockers_text = blockers_text,
+            max_turns = max_turns,
+            max_wall_clock_seconds = max_wall_clock_seconds,
+        )
+    }
+
+    async fn persist_p086_canonical_request_artifact(
+        &self,
+        run: &domain::run::Run,
+        stage_id: &str,
+        provider: &str,
+        model: Option<String>,
+        continuation: &domain::continuation::ContinuationRecord,
+        session_generation_id: &str,
+        worktree_root: &str,
+    ) -> anyhow::Result<String> {
+        let request_context = Self::p086_continuation_request_context(continuation);
+        let caller_principal_id = request_context
+            .get("caller_principal_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                if continuation.trigger_kind == "lead_auto" {
+                    "lead_auto_agent".to_string()
+                } else {
+                    "operator".to_string()
+                }
+            });
+        let caller_principal_class = request_context
+            .get("caller_principal_class")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                if continuation.trigger_kind == "lead_auto" {
+                    "agent".to_string()
+                } else {
+                    "operator".to_string()
+                }
+            });
+        let payload = serde_json::json!({
+            "command": "agents.continue_work",
+            "idempotency_scope": continuation.idempotency_scope,
+            "idempotency_key": continuation.idempotency_key,
+            "request_fingerprint_sha256": continuation.request_fingerprint_sha256,
+            "canonical_json_sha256": continuation.request_fingerprint_sha256,
+            "run_id": continuation.run_id,
+            "stage_execution_id": continuation.stage_execution_id,
+            "agent_execution_id": continuation.agent_execution_id,
+            "session_generation_id": session_generation_id,
+            "trigger_kind": continuation.trigger_kind,
+            "caller_principal_id": caller_principal_id,
+            "caller_principal_class": caller_principal_class,
+            "prompt_template_version": "p086_continuation_prompt_v1",
+            "operator_instruction": request_context
+                .get("operator_instruction")
+                .and_then(serde_json::Value::as_str),
+            "blockers": request_context
+                .get("blockers")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+            "max_turns": request_context
+                .get("max_turns")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(1),
+            "max_wall_clock_seconds": request_context
+                .get("max_wall_clock_seconds")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(900),
+            "provider_session_id": request_context
+                .get("provider_session_id")
+                .and_then(serde_json::Value::as_str),
+            "worktree_root": worktree_root,
+            "runtime_profile_id": provider,
+            "continuation_policy_version": "p086_phase2_worker_v1"
+        });
+        let artifact_json = serde_json::json!({
+            "schema_version": "continuation_canonical_request_v1",
+            "artifact_kind": "continuation_canonical_request",
+            "run_id": continuation.run_id,
+            "stage_execution_id": continuation.stage_execution_id,
+            "agent_execution_id": continuation.agent_execution_id,
+            "continuation_id": continuation.id,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "redaction_tier": "partial",
+            "retention_policy": "retain_with_run",
+            "payload": payload
+        });
+        let (artifact_id, _) = self
+            .persist_p086_continuation_json_artifact(
+                run,
+                stage_id,
+                "code_writer",
+                provider,
+                model.clone(),
+                &continuation.agent_execution_id,
+                &continuation.id,
+                "continuation_canonical_request",
+                "continuation_canonical_request_v1",
+                &artifact_json,
+            )
+            .await?;
+        db::repos::agent_work_continuations::set_canonical_request_artifact(
+            &self.pool,
+            &continuation.id,
+            &artifact_id,
+        )
+        .await?;
+        Ok(artifact_id)
+    }
+
+    async fn settle_p086_continuation_with_materialized_artifacts(
+        &self,
+        run: &domain::run::Run,
+        stage_id: &str,
+        provider: &str,
+        model: Option<String>,
+        continuation: &domain::continuation::ContinuationRecord,
+        terminal_status: &str,
+        failure_reason: Option<&str>,
+        provider_result: Option<&acp::ExecutionResult>,
+        worktree_root: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let transcript_text = provider_result
+            .and_then(|result| result.transcript_text.as_deref())
+            .unwrap_or_default();
+        let response_fingerprint = p086_continuation_response_hash(
+            &continuation.id,
+            terminal_status,
+            failure_reason.or_else(|| {
+                if transcript_text.is_empty() {
+                    None
+                } else {
+                    Some("provider_transcript_captured")
+                }
+            }),
+        );
+        let created_at = chrono::Utc::now().to_rfc3339();
+
+        let worktree_readback = Self::p086_worktree_readback(worktree_root);
+        let changed_files = worktree_readback["changed_files"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let tests_or_gates = Self::p086_extract_test_gate_lines(transcript_text);
+
+        let worktree_readback_json = serde_json::json!({
+            "schema_version": "worktree_continuation_readback_v1",
+            "artifact_kind": "worktree_continuation_readback",
+            "run_id": continuation.run_id,
+            "stage_execution_id": continuation.stage_execution_id,
+            "agent_execution_id": continuation.agent_execution_id,
+            "continuation_id": continuation.id,
+            "created_at": created_at,
+            "redaction_tier": "partial",
+            "retention_policy": "retain_with_run",
+            "payload": worktree_readback
+        });
+        let (worktree_readback_artifact_id, _) = self
+            .persist_p086_continuation_json_artifact(
+                run,
+                stage_id,
+                "code_writer",
+                provider,
+                model.clone(),
+                &continuation.agent_execution_id,
+                &continuation.id,
+                "worktree_continuation_readback",
+                "worktree_continuation_readback_v1",
+                &worktree_readback_json,
+            )
+            .await?;
+
+        let evidence_bundle_json = serde_json::json!({
+            "schema_version": "agent_continuation_evidence_bundle_v1",
+            "artifact_kind": "agent_continuation_evidence_bundle",
+            "run_id": continuation.run_id,
+            "stage_execution_id": continuation.stage_execution_id,
+            "agent_execution_id": continuation.agent_execution_id,
+            "continuation_id": continuation.id,
+            "created_at": created_at,
+            "redaction_tier": "partial",
+            "retention_policy": "retain_with_run",
+            "payload": {
+                "terminal_status": terminal_status,
+                "failure_reason": failure_reason,
+                "provider_status": provider_result.map(|result| result.status.to_string()),
+                "reused_existing_session": provider_result.map(|result| result.reused_existing_session).unwrap_or(false),
+                "session_generation_id": provider_result.and_then(|result| result.session_generation_id.clone()).or_else(|| continuation.budget_json.as_deref().and_then(|_| None)),
+                "provider_session_id": provider_result.and_then(|result| result.provider_session_id.clone()),
+                "changed_files": changed_files,
+                "tests_or_gates": tests_or_gates,
+                "transcript_bytes": transcript_text.as_bytes().len(),
+                "transcript_sha256": if transcript_text.is_empty() { None } else { Some(sha256_digest(transcript_text.as_bytes())) },
+                "worktree_readback_artifact_id": worktree_readback_artifact_id
+            }
+        });
+        let (evidence_bundle_artifact_id, _) = self
+            .persist_p086_continuation_json_artifact(
+                run,
+                stage_id,
+                "code_writer",
+                provider,
+                model.clone(),
+                &continuation.agent_execution_id,
+                &continuation.id,
+                "agent_continuation_evidence_bundle",
+                "agent_continuation_evidence_bundle_v1",
+                &evidence_bundle_json,
+            )
+            .await?;
+
+        let response_artifact_uuid = domain::ids::ArtifactId::new();
+        let response_artifact_id = response_artifact_uuid.to_string();
+        let response_payload = serde_json::json!({
+            "status": terminal_status,
+            "lifecycle_status": "terminal",
+            "response_fingerprint_sha256": response_fingerprint,
+            "response_artifact_id": response_artifact_id,
+            "request_fingerprint_sha256": continuation.request_fingerprint_sha256,
+            "provider_status": provider_result.map(|result| result.status.to_string()),
+            "reused_existing_session": provider_result.map(|result| result.reused_existing_session).unwrap_or(false),
+            "provider_session_id": provider_result.and_then(|result| result.provider_session_id.clone()),
+            "session_generation_id": provider_result.and_then(|result| result.session_generation_id.clone()),
+            "transcript_preview": if transcript_text.is_empty() { None } else { Some(transcript_text.chars().take(4096).collect::<String>()) },
+            "transcript_bytes": transcript_text.as_bytes().len(),
+            "transcript_sha256": if transcript_text.is_empty() { None } else { Some(sha256_digest(transcript_text.as_bytes())) }
+        });
+
+        let response_json = serde_json::json!({
+            "schema_version": "continuation_response_snapshot_v1",
+            "artifact_kind": "continuation_response_snapshot",
+            "run_id": continuation.run_id,
+            "stage_execution_id": continuation.stage_execution_id,
+            "agent_execution_id": continuation.agent_execution_id,
+            "continuation_id": continuation.id,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "redaction_tier": "partial",
+            "retention_policy": "retain_with_run",
+            "payload": response_payload
+        });
+        let (response_artifact_id, _) = self
+            .persist_p086_continuation_json_artifact_with_id(
+                run,
+                stage_id,
+                "code_writer",
+                provider,
+                model.clone(),
+                &continuation.agent_execution_id,
+                &continuation.id,
+                "continuation_response_snapshot",
+                "continuation_response_snapshot_v1",
+                &response_json,
+                response_artifact_uuid,
+            )
+            .await?;
+
+        let (result_name, result_contract, result_kind, result_payload) =
+            if terminal_status == "succeeded" {
+                (
+                    "continuation_result",
+                    "continuation_result_v1",
+                    "continuation_result",
+                    serde_json::json!({
+                        "summary": "P086 continuation settled as succeeded",
+                        "changed_files": changed_files,
+                        "tests_or_gates": Self::p086_extract_test_gate_lines(transcript_text),
+                        "response_fingerprint_sha256": response_fingerprint,
+                        "provider_transcript_artifact_ids": [response_artifact_id]
+                    }),
+                )
+            } else {
+                (
+                    "continuation_no_progress_report",
+                    "continuation_no_progress_report_v1",
+                    "continuation_no_progress_report",
+                    serde_json::json!({
+                        "no_progress_reason": "other",
+                        "evidence": [failure_reason.unwrap_or("provider_incomplete")],
+                        "budget_spent": {"wall_clock_seconds": 0},
+                        "response_fingerprint_sha256": response_fingerprint,
+                        "provider_transcript_artifact_ids": [response_artifact_id]
+                    }),
+                )
+            };
+        let result_json = serde_json::json!({
+            "schema_version": result_contract,
+            "artifact_kind": result_kind,
+            "run_id": continuation.run_id,
+            "stage_execution_id": continuation.stage_execution_id,
+            "agent_execution_id": continuation.agent_execution_id,
+            "continuation_id": continuation.id,
+            "created_at": created_at,
+            "redaction_tier": "partial",
+            "retention_policy": "retain_with_run",
+            "payload": result_payload
+        });
+        let (result_artifact_id, _) = self
+            .persist_p086_continuation_json_artifact(
+                run,
+                stage_id,
+                "code_writer",
+                provider,
+                model.clone(),
+                &continuation.agent_execution_id,
+                &continuation.id,
+                result_name,
+                result_contract,
+                &result_json,
+            )
+            .await?;
+
+        let continuation_report_json = serde_json::json!({
+            "schema_version": "agent_continuation_report_v1",
+            "artifact_kind": "agent_continuation_report",
+            "run_id": continuation.run_id,
+            "stage_execution_id": continuation.stage_execution_id,
+            "agent_execution_id": continuation.agent_execution_id,
+            "continuation_id": continuation.id,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "redaction_tier": "partial",
+            "retention_policy": "retain_with_run",
+            "payload": {
+                "status": terminal_status,
+                "failure_reason": failure_reason,
+                "mode": continuation.mode,
+                "trigger_kind": continuation.trigger_kind,
+                "canonical_request_artifact_id": continuation.canonical_request_artifact_id,
+                "response_artifact_id": response_artifact_id,
+                "result_or_no_progress_artifact_id": result_artifact_id,
+                "evidence_bundle_artifact_id": evidence_bundle_artifact_id,
+                "worktree_readback_artifact_id": worktree_readback_artifact_id,
+                "response_fingerprint_sha256": response_fingerprint
+            }
+        });
+        let (continuation_report_artifact_id, _) = self
+            .persist_p086_continuation_json_artifact(
+                run,
+                stage_id,
+                "code_writer",
+                provider,
+                model.clone(),
+                &continuation.agent_execution_id,
+                &continuation.id,
+                "agent_continuation_report",
+                "agent_continuation_report_v1",
+                &continuation_report_json,
+            )
+            .await?;
+
+        let settled = if terminal_status == "cancelled" {
+            db::repos::agent_work_continuations::settle_with_artifacts(
+                &self.pool,
+                &continuation.id,
+                terminal_status,
+                failure_reason,
+                &response_artifact_id,
+                &response_fingerprint,
+                &result_artifact_id,
+            )
+            .await?
+        } else {
+            db::repos::agent_work_continuations::settle_with_artifacts_unless_cancelling(
+                &self.pool,
+                &continuation.id,
+                terminal_status,
+                failure_reason,
+                &response_artifact_id,
+                &response_fingerprint,
+                &result_artifact_id,
+            )
+            .await?
+        };
+        let mut release_reason = if terminal_status == "cancelled" {
+            "cancelled"
+        } else {
+            "completed"
+        };
+        if settled == 0 && terminal_status != "cancelled" {
+            let latest =
+                db::repos::agent_work_continuations::find_by_id(&self.pool, &continuation.id)
+                    .await?;
+            if latest.as_ref().map(|row| row.status.as_str()) == Some("cancelling") {
+                db::repos::agent_work_continuations::insert_side_effect_ledger_row(
+                    &self.pool,
+                    &continuation.id,
+                    &continuation.idempotency_key,
+                    "provider_cancel",
+                    4,
+                    "committed",
+                    Some(&continuation.request_fingerprint_sha256),
+                    Some(
+                        &serde_json::json!({
+                            "schema_version": "p086_provider_cancel_observation_v1",
+                            "continuation_id": continuation.id,
+                            "reason": "cancelled_after_provider_send",
+                            "provider_returned_before_cancel_close": provider_result.is_some(),
+                            "observed_at": chrono::Utc::now().to_rfc3339()
+                        })
+                        .to_string(),
+                    ),
+                )
+                .await?;
+                db::repos::agent_work_continuations::settle_with_artifacts(
+                    &self.pool,
+                    &continuation.id,
+                    "cancelled",
+                    Some("cancelled_after_provider_send"),
+                    &response_artifact_id,
+                    &response_fingerprint,
+                    &result_artifact_id,
+                )
+                .await?;
+                release_reason = "cancelled";
+            } else {
+                anyhow::bail!(
+                    "P086 terminal settlement affected no rows for continuation {}",
+                    continuation.id
+                );
+            }
+        }
+        db::repos::agent_work_continuations::set_evidence_artifact_ids(
+            &self.pool,
+            &continuation.id,
+            None,
+            Some(&evidence_bundle_artifact_id),
+            Some(&worktree_readback_artifact_id),
+            Some(&continuation_report_artifact_id),
+        )
+        .await?;
+        db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+            &self.pool,
+            Some(&continuation.run_id),
+            Some(&continuation.stage_execution_id),
+            Some(&continuation.agent_execution_id),
+            Some(&continuation.id),
+            "continuation_settlement_total",
+            serde_json::json!({
+                "mode": continuation.mode,
+                "trigger_kind": continuation.trigger_kind,
+                "terminal_status": if release_reason == "cancelled" { "cancelled" } else { terminal_status },
+                "failure_reason": failure_reason.unwrap_or("none")
+            }),
+            1,
+        )
+        .await?;
+        if provider_result
+            .map(|result| result.reused_existing_session)
+            .unwrap_or(false)
+        {
+            db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                &self.pool,
+                Some(&continuation.run_id),
+                Some(&continuation.stage_execution_id),
+                Some(&continuation.agent_execution_id),
+                Some(&continuation.id),
+                "continuation_fresh_session_avoided_total",
+                serde_json::json!({
+                    "mode": continuation.mode,
+                    "trigger_kind": continuation.trigger_kind,
+                    "outcome": "reused_existing_session"
+                }),
+                1,
+            )
+            .await?;
+        }
+        db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+            &self.pool,
+            Some(&continuation.run_id),
+            Some(&continuation.stage_execution_id),
+            Some(&continuation.agent_execution_id),
+            Some(&continuation.id),
+            "continuation_changed_files_total",
+            serde_json::json!({
+                "mode": continuation.mode,
+                "trigger_kind": continuation.trigger_kind,
+                "terminal_status": terminal_status
+            }),
+            changed_files.len() as i64,
+        )
+        .await?;
+        db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+            &self.pool,
+            Some(&continuation.run_id),
+            Some(&continuation.stage_execution_id),
+            Some(&continuation.agent_execution_id),
+            Some(&continuation.id),
+            "continuation_tests_or_gates_total",
+            serde_json::json!({
+                "mode": continuation.mode,
+                "trigger_kind": continuation.trigger_kind,
+                "terminal_status": terminal_status
+            }),
+            tests_or_gates.len() as i64,
+        )
+        .await?;
+        let tests_passed_count = Self::p086_tests_passed_count(&tests_or_gates);
+        if tests_passed_count > 0 {
+            db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                &self.pool,
+                Some(&continuation.run_id),
+                Some(&continuation.stage_execution_id),
+                Some(&continuation.agent_execution_id),
+                Some(&continuation.id),
+                "continuation_tests_passed_total",
+                serde_json::json!({
+                    "mode": continuation.mode,
+                    "trigger_kind": continuation.trigger_kind,
+                    "terminal_status": terminal_status
+                }),
+                tests_passed_count,
+            )
+            .await?;
+        }
+        if terminal_status == "succeeded"
+            && (!changed_files.is_empty() || tests_passed_count > 0 || !tests_or_gates.is_empty())
+        {
+            db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                &self.pool,
+                Some(&continuation.run_id),
+                Some(&continuation.stage_execution_id),
+                Some(&continuation.agent_execution_id),
+                Some(&continuation.id),
+                "continuation_useful_progress_total",
+                serde_json::json!({
+                    "mode": continuation.mode,
+                    "trigger_kind": continuation.trigger_kind,
+                    "terminal_status": terminal_status
+                }),
+                1,
+            )
+            .await?;
+        }
+        if let Some(validation_outcome) =
+            Self::p086_followup_validation_outcome(terminal_status, &tests_or_gates)
+        {
+            db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                &self.pool,
+                Some(&continuation.run_id),
+                Some(&continuation.stage_execution_id),
+                Some(&continuation.agent_execution_id),
+                Some(&continuation.id),
+                "continuation_followup_validation_total",
+                serde_json::json!({
+                    "mode": continuation.mode,
+                    "trigger_kind": continuation.trigger_kind,
+                    "terminal_status": terminal_status,
+                    "validation_outcome": validation_outcome
+                }),
+                1,
+            )
+            .await?;
+        }
+        if provider_result
+            .map(|result| result.reused_existing_session)
+            .unwrap_or(false)
+        {
+            let request_context = Self::p086_continuation_request_context(continuation);
+            let (estimate_seconds, estimate_source) =
+                Self::p086_fresh_retry_estimate_seconds(&request_context);
+            if let Some(actual_seconds) =
+                Self::p086_continuation_duration_seconds(&continuation.created_at, &created_at)
+            {
+                let saved_seconds = (estimate_seconds - actual_seconds).max(0);
+                db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                    &self.pool,
+                    Some(&continuation.run_id),
+                    Some(&continuation.stage_execution_id),
+                    Some(&continuation.agent_execution_id),
+                    Some(&continuation.id),
+                    "continuation_time_saved_seconds",
+                    serde_json::json!({
+                        "mode": continuation.mode,
+                        "trigger_kind": continuation.trigger_kind,
+                        "estimate_source": estimate_source
+                    }),
+                    saved_seconds,
+                )
+                .await?;
+            }
+        }
+        if let Some(result) = provider_result {
+            if let Some(input_tokens) = result.usage.as_ref().and_then(|usage| usage.input_tokens) {
+                db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                    &self.pool,
+                    Some(&continuation.run_id),
+                    Some(&continuation.stage_execution_id),
+                    Some(&continuation.agent_execution_id),
+                    Some(&continuation.id),
+                    "continuation_provider_session_budget_input_tokens_total",
+                    serde_json::json!({
+                        "mode": continuation.mode,
+                        "trigger_kind": continuation.trigger_kind,
+                        "budget_dimension": "input_tokens"
+                    }),
+                    input_tokens,
+                )
+                .await?;
+            }
+            if let Some(output_tokens) = result.usage.as_ref().and_then(|usage| usage.output_tokens)
+            {
+                db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                    &self.pool,
+                    Some(&continuation.run_id),
+                    Some(&continuation.stage_execution_id),
+                    Some(&continuation.agent_execution_id),
+                    Some(&continuation.id),
+                    "continuation_provider_session_budget_output_tokens_total",
+                    serde_json::json!({
+                        "mode": continuation.mode,
+                        "trigger_kind": continuation.trigger_kind,
+                        "budget_dimension": "output_tokens"
+                    }),
+                    output_tokens,
+                )
+                .await?;
+            }
+            if let Some(cached_input_tokens) = result
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.cached_input_tokens)
+            {
+                db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                    &self.pool,
+                    Some(&continuation.run_id),
+                    Some(&continuation.stage_execution_id),
+                    Some(&continuation.agent_execution_id),
+                    Some(&continuation.id),
+                    "continuation_provider_session_budget_cached_input_tokens_total",
+                    serde_json::json!({
+                        "mode": continuation.mode,
+                        "trigger_kind": continuation.trigger_kind,
+                        "budget_dimension": "cached_input_tokens"
+                    }),
+                    cached_input_tokens,
+                )
+                .await?;
+            }
+            if let Some(cost_cents) = result
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.cost_cents)
+                .or(result.cost_cents)
+            {
+                db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+                    &self.pool,
+                    Some(&continuation.run_id),
+                    Some(&continuation.stage_execution_id),
+                    Some(&continuation.agent_execution_id),
+                    Some(&continuation.id),
+                    "continuation_provider_session_budget_cost_cents_total",
+                    serde_json::json!({
+                        "mode": continuation.mode,
+                        "trigger_kind": continuation.trigger_kind,
+                        "budget_dimension": "cost_cents"
+                    }),
+                    cost_cents,
+                )
+                .await?;
+            }
+        }
+        let _ = db::repos::agent_work_continuations::release_supervised_worker(
+            &self.pool,
+            &continuation.id,
+            release_reason,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn settle_p086_cancelled_after_provider_return(
+        &self,
+        run: &domain::run::Run,
+        stage_id: &str,
+        provider: &str,
+        model: Option<String>,
+        continuation: &domain::continuation::ContinuationRecord,
+        provider_result: Option<&acp::ExecutionResult>,
+        worktree_root: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let latest =
+            match db::repos::agent_work_continuations::find_by_id(&self.pool, &continuation.id)
+                .await?
+            {
+                Some(row) => row,
+                None => return Ok(false),
+            };
+        if latest.status != "cancelling" {
+            return Ok(false);
+        }
+
+        db::repos::agent_work_continuations::insert_side_effect_ledger_row(
+            &self.pool,
+            &latest.id,
+            &latest.idempotency_key,
+            "provider_cancel",
+            4,
+            "committed",
+            Some(&latest.request_fingerprint_sha256),
+            Some(
+                &serde_json::json!({
+                    "schema_version": "p086_provider_cancel_observation_v1",
+                    "continuation_id": latest.id,
+                    "reason": "cancelled_after_provider_send",
+                    "provider_returned_before_cancel_close": provider_result.is_some(),
+                    "observed_at": chrono::Utc::now().to_rfc3339()
+                })
+                .to_string(),
+            ),
+        )
+        .await?;
+
+        self.settle_p086_continuation_with_materialized_artifacts(
+            run,
+            stage_id,
+            provider,
+            model,
+            &latest,
+            "cancelled",
+            Some("cancelled_after_provider_send"),
+            provider_result,
+            worktree_root,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    fn p086_worktree_readback(worktree_root: Option<&str>) -> serde_json::Value {
+        let Some(root) = worktree_root else {
+            return serde_json::json!({
+                "worktree_root": null,
+                "git_status_available": false,
+                "changed_files": [],
+                "status_entries": [],
+                "readback_failure": "worktree_root_missing"
+            });
+        };
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("status")
+            .arg("--short")
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let status_entries: Vec<_> = text
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| line.to_string())
+                    .collect();
+                let changed_files: Vec<_> = status_entries
+                    .iter()
+                    .filter_map(|line| line.get(3..).map(str::trim))
+                    .filter(|path| !path.is_empty())
+                    .map(|path| serde_json::Value::String(path.to_string()))
+                    .collect();
+                serde_json::json!({
+                    "worktree_root": root,
+                    "git_status_available": true,
+                    "changed_files": changed_files,
+                    "status_entries": status_entries
+                })
+            }
+            Ok(output) => serde_json::json!({
+                "worktree_root": root,
+                "git_status_available": false,
+                "changed_files": [],
+                "status_entries": [],
+                "readback_failure": String::from_utf8_lossy(&output.stderr).chars().take(2048).collect::<String>()
+            }),
+            Err(error) => serde_json::json!({
+                "worktree_root": root,
+                "git_status_available": false,
+                "changed_files": [],
+                "status_entries": [],
+                "readback_failure": error.to_string()
+            }),
+        }
+    }
+
+    fn p086_worktree_has_post_continuation_change(
+        readback: &serde_json::Value,
+        worktree_root: Option<&str>,
+        continuation_created_at: &str,
+    ) -> bool {
+        let Some(root) = worktree_root else {
+            return false;
+        };
+        let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(continuation_created_at) else {
+            return false;
+        };
+        let created_epoch = created_at.timestamp();
+        readback["changed_files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.as_str())
+            .any(|relative_path| {
+                let path = Path::new(root).join(relative_path);
+                let Ok(metadata) = std::fs::metadata(path) else {
+                    return false;
+                };
+                let Ok(modified) = metadata.modified() else {
+                    return false;
+                };
+                let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
+                    return false;
+                };
+                duration.as_secs() as i64 >= created_epoch
+            })
+    }
+
+    async fn p086_reconciliation_transcript_evidence(
+        &self,
+        continuation: &domain::continuation::ContinuationRecord,
+    ) -> anyhow::Result<(String, Option<String>, Option<u64>)> {
+        let Some(response_artifact_id) = continuation.response_artifact_id.as_deref() else {
+            return Ok((
+                "explicit_absence".to_string(),
+                Some("no_response_artifact_before_reconciliation".to_string()),
+                None,
+            ));
+        };
+        let artifact_id = match response_artifact_id.parse::<domain::ids::ArtifactId>() {
+            Ok(id) => id,
+            Err(_) => {
+                return Ok((
+                    "explicit_absence".to_string(),
+                    Some("invalid_response_artifact_id".to_string()),
+                    None,
+                ));
+            }
+        };
+        let Some(artifact) = db::repos::artifacts::find_by_id(&self.pool, artifact_id).await?
+        else {
+            return Ok((
+                "explicit_absence".to_string(),
+                Some("response_artifact_row_missing".to_string()),
+                None,
+            ));
+        };
+        let bytes = match tokio::fs::read(&artifact.file_path).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Ok((
+                    "explicit_absence".to_string(),
+                    Some("response_artifact_unreadable".to_string()),
+                    None,
+                ));
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok((
+                    "explicit_absence".to_string(),
+                    Some("response_artifact_invalid_json".to_string()),
+                    None,
+                ));
+            }
+        };
+        let transcript_bytes = value["payload"]["transcript_bytes"].as_u64();
+        if transcript_bytes.unwrap_or(0) > 0 {
+            Ok(("captured".to_string(), None, transcript_bytes))
+        } else {
+            Ok((
+                "explicit_absence".to_string(),
+                Some("response_artifact_declares_empty_transcript".to_string()),
+                transcript_bytes,
+            ))
+        }
+    }
+
+    fn p086_extract_test_gate_lines(transcript_text: &str) -> Vec<serde_json::Value> {
+        transcript_text
+            .lines()
+            .filter(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.contains("test-gate")
+                    || lower.contains("cargo test")
+                    || lower.contains("xcodebuild")
+                    || lower.contains("passed")
+                    || lower.contains("failed")
+            })
+            .take(20)
+            .map(|line| {
+                let detail: String = line.chars().take(500).collect();
+                let lower = detail.to_ascii_lowercase();
+                let status = if lower.contains("failed") || lower.contains("failure") {
+                    "failed"
+                } else if lower.contains("passed") || lower.contains("ok") {
+                    "passed"
+                } else {
+                    "observed"
+                };
+                let name = if lower.contains("test-gate") {
+                    "test-gate"
+                } else if lower.contains("cargo test") {
+                    "cargo test"
+                } else if lower.contains("xcodebuild") {
+                    "xcodebuild"
+                } else {
+                    "provider transcript"
+                };
+                serde_json::json!({
+                    "name": name,
+                    "status": status,
+                    "detail": detail
+                })
+            })
+            .collect()
+    }
+
+    fn p086_tests_passed_count(tests_or_gates: &[serde_json::Value]) -> i64 {
+        tests_or_gates
+            .iter()
+            .filter(|row| row.get("status").and_then(serde_json::Value::as_str) == Some("passed"))
+            .count() as i64
+    }
+
+    fn p086_followup_validation_outcome(
+        terminal_status: &str,
+        tests_or_gates: &[serde_json::Value],
+    ) -> Option<&'static str> {
+        if tests_or_gates.is_empty() {
+            return None;
+        }
+        if tests_or_gates
+            .iter()
+            .any(|row| row.get("status").and_then(serde_json::Value::as_str) == Some("failed"))
+        {
+            return Some("failed");
+        }
+        (terminal_status == "succeeded").then_some("success")
+    }
+
+    fn p086_fresh_retry_estimate_seconds(
+        request_context: &serde_json::Value,
+    ) -> (i64, &'static str) {
+        if let Some(value) = request_context
+            .get("fresh_retry_estimate_seconds")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|value| *value > 0)
+        {
+            return (value, "fresh_retry_estimate_seconds");
+        }
+        if let Some(value) = request_context
+            .get("max_wall_clock_seconds")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|value| *value > 0)
+        {
+            return (value, "max_wall_clock_seconds");
+        }
+        (900, "default")
+    }
+
+    fn p086_continuation_duration_seconds(started_at: &str, completed_at: &str) -> Option<i64> {
+        let started = chrono::DateTime::parse_from_rfc3339(started_at)
+            .ok()?
+            .with_timezone(&chrono::Utc);
+        let completed = chrono::DateTime::parse_from_rfc3339(completed_at)
+            .ok()?
+            .with_timezone(&chrono::Utc);
+        Some((completed - started).num_seconds().max(0))
+    }
+
+    async fn repair_p086_terminal_continuation_artifacts(
+        &self,
+        continuation: &domain::continuation::ContinuationRecord,
+    ) -> anyhow::Result<()> {
+        let ctx = db::repos::agent_work_continuations::find_continuation_execution_context(
+            &self.pool,
+            continuation,
+        )
+        .await?;
+        let run_id = continuation.run_id.parse::<RunId>().with_context(|| {
+            format!(
+                "parse P086 terminal continuation run_id {}",
+                continuation.run_id
+            )
+        })?;
+        let run = runs::find_by_id(&self.pool, run_id).await?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "P086 terminal continuation run not found: {}",
+                continuation.run_id
+            )
+        })?;
+        let stage_id = ctx
+            .stage_id
+            .unwrap_or_else(|| continuation.stage_execution_id.clone());
+        let provider = ctx
+            .runtime_provider
+            .unwrap_or_else(|| "unknown".to_string());
+        let model = ctx.runtime_model;
+        let failure_reason = continuation
+            .failure_reason
+            .as_deref()
+            .or(Some("terminal_artifact_repair"));
+
+        self.settle_p086_continuation_with_materialized_artifacts(
+            &run,
+            &stage_id,
+            &provider,
+            model,
+            continuation,
+            &continuation.status,
+            failure_reason,
+            None,
+            ctx.worktree_root
+                .as_deref()
+                .or(ctx.workspace_root.as_deref()),
+        )
+        .await
+    }
+
+    async fn reconcile_p086_continuation_from_evidence(
+        &self,
+        continuation: &domain::continuation::ContinuationRecord,
+        failure_reason: &str,
+    ) -> anyhow::Result<()> {
+        let ctx = db::repos::agent_work_continuations::find_continuation_execution_context(
+            &self.pool,
+            continuation,
+        )
+        .await?;
+        let run_id = continuation.run_id.parse::<RunId>().with_context(|| {
+            format!(
+                "parse P086 reconciliation continuation run_id {}",
+                continuation.run_id
+            )
+        })?;
+        let run = runs::find_by_id(&self.pool, run_id).await?.ok_or_else(|| {
+            anyhow::anyhow!("P086 reconciliation run not found: {}", continuation.run_id)
+        })?;
+        let stage_id = ctx
+            .stage_id
+            .clone()
+            .unwrap_or_else(|| continuation.stage_execution_id.clone());
+        let provider = ctx
+            .runtime_provider
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let model = ctx.runtime_model.clone();
+        let worktree_root_owned = ctx.worktree_root.clone().or(ctx.workspace_root.clone());
+        let worktree_root = worktree_root_owned.as_deref();
+        let readback = Self::p086_worktree_readback(worktree_root);
+        let post_continuation_change = Self::p086_worktree_has_post_continuation_change(
+            &readback,
+            worktree_root,
+            &continuation.created_at,
+        );
+        let provider_send_recorded =
+            db::repos::agent_work_continuations::has_side_effect_ledger_row(
+                &self.pool,
+                &continuation.id,
+                "provider_send",
+            )
+            .await?;
+        let (transcript_evidence_status, transcript_absence_reason, transcript_bytes) = self
+            .p086_reconciliation_transcript_evidence(continuation)
+            .await?;
+        db::repos::agent_work_continuations::record_p086_continuation_metric_event(
+            &self.pool,
+            Some(&continuation.run_id),
+            Some(&continuation.stage_execution_id),
+            Some(&continuation.agent_execution_id),
+            Some(&continuation.id),
+            "continuation_reconciliation_transcript_evidence_total",
+            serde_json::json!({
+                "evidence_source": transcript_evidence_status.clone(),
+                "outcome": transcript_absence_reason.as_deref().unwrap_or("captured")
+            }),
+            1,
+        )
+        .await?;
+        let terminal_status = if post_continuation_change && provider_send_recorded {
+            "succeeded"
+        } else {
+            "no_progress"
+        };
+        let terminal_reason = if post_continuation_change && provider_send_recorded {
+            if transcript_absence_reason.is_some() {
+                Some("reconciled_from_post_continuation_worktree_evidence_with_explicit_transcript_absence")
+            } else {
+                Some("reconciled_from_post_continuation_worktree_and_transcript_evidence")
+            }
+        } else if post_continuation_change {
+            Some("post_continuation_change_without_provider_send_evidence")
+        } else {
+            Some(failure_reason)
+        };
+        debug!(
+            continuation_id = %continuation.id,
+            transcript_evidence_status = %transcript_evidence_status,
+            transcript_absence_reason = ?transcript_absence_reason,
+            transcript_bytes = ?transcript_bytes,
+            "P086 reconciliation read transcript evidence before terminal settlement"
+        );
+        self.settle_p086_continuation_with_materialized_artifacts(
+            &run,
+            &stage_id,
+            &provider,
+            model,
+            continuation,
+            terminal_status,
+            terminal_reason,
+            None,
+            worktree_root,
+        )
+        .await
+    }
+
+    async fn run_continuation_worker(&self, continuation_id: &str) -> anyhow::Result<()> {
+        use db::repos::agent_work_continuations::{
+            claim_for_continuation_worker, find_by_id, find_continuation_execution_context,
+            insert_side_effect_ledger_row, update_continuation_session, update_continuation_status,
+            ContinuationClaimOutcome,
+        };
+
+        // 1. Load the continuation row.
+        let Some(cont) = find_by_id(&self.pool, continuation_id).await? else {
+            warn!(
+                continuation_id,
+                "ProcessContinuation: row not found; may have been swept"
+            );
+            return Ok(());
+        };
+
+        // 2. Skip rows already at terminal status or prompt-sent-or-later
+        // replay rows.  A duplicate ProcessContinuation work item must never
+        // rewind a row to queued or send a second provider prompt.
+        if matches!(
+            cont.status.as_str(),
+            "succeeded" | "no_progress" | "failed" | "cancelled"
+        ) {
+            info!(
+                continuation_id,
+                status = cont.status,
+                "ProcessContinuation: row already terminal; skipping"
+            );
+            return Ok(());
+        }
+
+        if matches!(
+            cont.status.as_str(),
+            "prompt_sent"
+                | "observing"
+                | "worktree_observed"
+                | "needs_continuation_reconciliation"
+                | "finalizing"
+        ) {
+            warn!(
+                continuation_id,
+                status = cont.status,
+                "ProcessContinuation: prompt already sent; refusing duplicate provider send"
+            );
+            update_continuation_status(
+                &self.pool,
+                continuation_id,
+                "needs_continuation_reconciliation",
+                Some("duplicate_prompt_prevented"),
+            )
+            .await?;
+            self.reconcile_p086_continuation_from_evidence(&cont, "duplicate_prompt_prevented")
+                .await?;
+            return Ok(());
+        }
+
+        // 3. Load execution context: session ids, provider name, workspace paths.
+        let ctx = find_continuation_execution_context(&self.pool, &cont).await?;
+        let run_id = cont
+            .run_id
+            .parse::<RunId>()
+            .with_context(|| format!("parse P086 continuation run_id {}", cont.run_id))?;
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("P086 continuation run not found: {}", cont.run_id))?;
+        let stage_id = ctx
+            .stage_id
+            .clone()
+            .unwrap_or_else(|| cont.stage_execution_id.clone());
+        let provider = ctx
+            .runtime_provider
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let model = ctx.runtime_model.clone();
+        let workspace_root = ctx
+            .workspace_root
+            .clone()
+            .unwrap_or_else(|| ".".to_string());
+        let worktree_root = ctx.worktree_root.clone();
+        let daemon_generation_id = format!("daemon-{}", std::process::id());
+        let worker_pid = std::process::id() as i64;
+        info!(
+            run_id = %cont.run_id,
+            stage_execution_id = %cont.stage_execution_id,
+            agent_execution_id = %cont.agent_execution_id,
+            continuation_id = %cont.id,
+            continuation_mode = %cont.mode,
+            trigger_kind = %cont.trigger_kind,
+            idempotency_scope = %cont.idempotency_scope,
+            idempotency_key = %cont.idempotency_key,
+            request_fingerprint_sha256 = %cont.request_fingerprint_sha256,
+            command_journal_id = "unknown",
+            provider_family = %provider,
+            runtime_profile_id = %provider,
+            daemon_generation_id = %daemon_generation_id,
+            session_generation_id = ?ctx.session_generation_id,
+            worker_pid = worker_pid,
+            lifecycle_status = %cont.status,
+            failure_reason = ?cont.failure_reason,
+            reconciliation_status = ?cont.reconciliation_status,
+            "P086 continuation worker correlation event"
+        );
+
+        if cont.status == "cancelling" {
+            let provider_send_recorded =
+                db::repos::agent_work_continuations::has_side_effect_ledger_row(
+                    &self.pool,
+                    continuation_id,
+                    "provider_send",
+                )
+                .await?;
+            if provider_send_recorded {
+                insert_side_effect_ledger_row(
+                    &self.pool,
+                    continuation_id,
+                    &cont.idempotency_key,
+                    "provider_cancel",
+                    4,
+                    "failed",
+                    Some(&cont.request_fingerprint_sha256),
+                    None,
+                )
+                .await?;
+                update_continuation_status(
+                    &self.pool,
+                    continuation_id,
+                    "needs_continuation_reconciliation",
+                    Some("cancel_termination_unverified"),
+                )
+                .await?;
+                self.reconcile_p086_continuation_from_evidence(
+                    &cont,
+                    "cancel_termination_unverified",
+                )
+                .await?;
+            } else {
+                self.settle_p086_continuation_with_materialized_artifacts(
+                    &run,
+                    &stage_id,
+                    &provider,
+                    model,
+                    &cont,
+                    "cancelled",
+                    Some("cancelled_before_provider_send"),
+                    None,
+                    worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+
+        // 4. If the agent execution has no recorded session, we cannot continue.
+        let Some(session_generation_id) = ctx.session_generation_id else {
+            info!(
+                continuation_id,
+                "ProcessContinuation: no session_generation_id; settling no_progress"
+            );
+            self.settle_p086_continuation_with_materialized_artifacts(
+                &run,
+                &stage_id,
+                &provider,
+                model,
+                &cont,
+                "no_progress",
+                Some("no_session_generation_id"),
+                None,
+                worktree_root.as_deref().or(Some(workspace_root.as_str())),
+            )
+            .await?;
+            return Ok(());
+        };
+
+        // 5. Atomically claim the row and register supervised-worker
+        // ownership.  This is the CAS boundary before live session checks and
+        // side-effect ledger writes.
+        match claim_for_continuation_worker(
+            &self.pool,
+            continuation_id,
+            worker_pid,
+            &daemon_generation_id,
+            &session_generation_id,
+        )
+        .await?
+        {
+            ContinuationClaimOutcome::Claimed(_) => {}
+            ContinuationClaimOutcome::Missing => {
+                warn!(
+                    continuation_id,
+                    "ProcessContinuation: row disappeared before claim"
+                );
+                return Ok(());
+            }
+            ContinuationClaimOutcome::Terminal(row) => {
+                info!(
+                    continuation_id,
+                    status = row.status,
+                    "ProcessContinuation: row terminal before claim; skipping"
+                );
+                return Ok(());
+            }
+            ContinuationClaimOutcome::PromptAlreadySent(row) => {
+                warn!(
+                    continuation_id,
+                    status = row.status,
+                    "ProcessContinuation: prompt already sent before claim; refusing duplicate provider send"
+                );
+                update_continuation_status(
+                    &self.pool,
+                    continuation_id,
+                    "needs_continuation_reconciliation",
+                    Some("duplicate_prompt_prevented"),
+                )
+                .await?;
+                self.reconcile_p086_continuation_from_evidence(
+                    row.as_ref(),
+                    "duplicate_prompt_prevented",
+                )
+                .await?;
+                return Ok(());
+            }
+            ContinuationClaimOutcome::AlreadyActive(row) => {
+                info!(
+                    continuation_id,
+                    status = row.status,
+                    "ProcessContinuation: continuation already active; skipping duplicate work item"
+                );
+                return Ok(());
+            }
+        }
+
+        // 6. Stamp session ids onto the continuation row for provenance / recovery.
+        update_continuation_session(
+            &self.pool,
+            continuation_id,
+            &session_generation_id,
+            ctx.provider_session_id.as_deref(),
+        )
+        .await?;
+        db::repos::agent_work_continuations::refresh_supervised_worker_heartbeat(
+            &self.pool,
+            continuation_id,
+            worker_pid,
+            &daemon_generation_id,
+        )
+        .await?;
+
+        // 7. Check live session — live_handle_continuation requires the session handle to exist.
+        let has_live = self
+            .acp
+            .has_live_session(&session_generation_id, ctx.provider_session_id.as_deref())
+            .await;
+
+        if !has_live {
+            info!(
+                continuation_id,
+                session_generation_id,
+                "ProcessContinuation: no live ACP session; settling no_progress"
+            );
+            self.settle_p086_continuation_with_materialized_artifacts(
+                &run,
+                &stage_id,
+                &provider,
+                model,
+                &cont,
+                "no_progress",
+                Some("live_handle_not_found"),
+                None,
+                worktree_root.as_deref().or(Some(workspace_root.as_str())),
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(binding) = self
+            .acp
+            .live_session_process_binding(&session_generation_id)
+            .await
+        {
+            let process_uid = unsafe { libc::getuid() } as i64;
+            db::repos::agent_work_continuations::set_supervised_worker_provider_process(
+                &self.pool,
+                continuation_id,
+                worker_pid,
+                &daemon_generation_id,
+                binding.child_pid as i64,
+                binding.process_group_id as i64,
+                process_uid,
+            )
+            .await?;
+        } else {
+            warn!(
+                continuation_id,
+                session_generation_id,
+                "ProcessContinuation: live ACP session had no provider process binding"
+            );
+        }
+
+        insert_side_effect_ledger_row(
+            &self.pool,
+            continuation_id,
+            &cont.idempotency_key,
+            "provider_session_attach",
+            0,
+            "committed",
+            Some(&cont.request_fingerprint_sha256),
+            None,
+        )
+        .await?;
+        let attach_receipt_json = serde_json::json!({
+            "schema_version": "provider_session_attach_receipt_v1",
+            "artifact_kind": "provider_session_attach_receipt",
+            "run_id": cont.run_id,
+            "stage_execution_id": cont.stage_execution_id,
+            "agent_execution_id": cont.agent_execution_id,
+            "continuation_id": cont.id,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "redaction_tier": "partial",
+            "retention_policy": "retain_with_run",
+            "payload": {
+                "mode": cont.mode,
+                "attach_kind": "live_handle_continuation",
+                "session_generation_id": session_generation_id,
+                "provider_session_id": ctx.provider_session_id.as_deref(),
+                "runtime_profile_id": provider,
+                "orphan_reap_required": false,
+                "orphan_reap_verified": true,
+                "managed_process_reused": true
+            }
+        });
+        let (attach_receipt_artifact_id, attach_receipt_sha256) = self
+            .persist_p086_continuation_json_artifact(
+                &run,
+                &stage_id,
+                "code_writer",
+                &provider,
+                model.clone(),
+                &cont.agent_execution_id,
+                &cont.id,
+                "provider_session_attach_receipt",
+                "provider_session_attach_receipt_v1",
+                &attach_receipt_json,
+            )
+            .await?;
+        db::repos::agent_work_continuations::set_evidence_artifact_ids(
+            &self.pool,
+            continuation_id,
+            Some(&attach_receipt_artifact_id),
+            None,
+            None,
+            None,
+        )
+        .await?;
+        info!(
+            continuation_id,
+            attach_receipt_artifact_id,
+            attach_receipt_sha256,
+            "P086 live-handle attach receipt persisted"
+        );
+
+        // 8. Pre-prompt approval gate.
+        let has_pending = db::repos::agent_work_continuations::has_pending_approval_for_run(
+            &self.pool,
+            &cont.run_id,
+        )
+        .await?;
+        if has_pending {
+            self.settle_p086_continuation_with_materialized_artifacts(
+                &run,
+                &stage_id,
+                &provider,
+                model,
+                &cont,
+                "failed",
+                Some("approval_required"),
+                None,
+                worktree_root.as_deref().or(Some(workspace_root.as_str())),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // 9. Acquire ordered runtime/worktree side-effect leases before provider send.
+        insert_side_effect_ledger_row(
+            &self.pool,
+            continuation_id,
+            &cont.idempotency_key,
+            "runtime_lease",
+            1,
+            "committed",
+            Some(&cont.request_fingerprint_sha256),
+            None,
+        )
+        .await?;
+        insert_side_effect_ledger_row(
+            &self.pool,
+            continuation_id,
+            &cont.idempotency_key,
+            "worktree_lease",
+            2,
+            "committed",
+            Some(&cont.request_fingerprint_sha256),
+            None,
+        )
+        .await?;
+
+        // 10. Transition starting → running.
+        update_continuation_status(&self.pool, continuation_id, "running", None).await?;
+        db::repos::agent_work_continuations::refresh_supervised_worker_heartbeat(
+            &self.pool,
+            continuation_id,
+            worker_pid,
+            &daemon_generation_id,
+        )
+        .await?;
+
+        // 11. Record provider_send side-effect ledger row before prompt (idempotent guard).
+        let inserted = insert_side_effect_ledger_row(
+            &self.pool,
+            continuation_id,
+            &cont.idempotency_key,
+            "provider_send",
+            3,
+            "committed",
+            Some(&cont.request_fingerprint_sha256),
+            None,
+        )
+        .await?;
+        if inserted == 0 {
+            warn!(
+                continuation_id,
+                "ProcessContinuation: provider_send ledger row already exists; refusing duplicate provider send"
+            );
+            update_continuation_status(
+                &self.pool,
+                continuation_id,
+                "needs_continuation_reconciliation",
+                Some("duplicate_prompt_prevented"),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let canonical_worktree_root = worktree_root.as_deref().unwrap_or(workspace_root.as_str());
+        self.persist_p086_canonical_request_artifact(
+            &run,
+            &stage_id,
+            &provider,
+            model.clone(),
+            &cont,
+            &session_generation_id,
+            canonical_worktree_root,
+        )
+        .await?;
+
+        // 12. Durable prompt_sent transition before ACP call — prevents duplicate sends on replay.
+        update_continuation_status(&self.pool, continuation_id, "prompt_sent", None).await?;
+        db::repos::agent_work_continuations::refresh_supervised_worker_heartbeat(
+            &self.pool,
+            continuation_id,
+            worker_pid,
+            &daemon_generation_id,
+        )
+        .await?;
+
+        // 13. Build the canonical P086 mode-reset continuation prompt.
+        let continuation_prompt = Self::p086_continuation_prompt(
+            &cont,
+            &session_generation_id,
+            ctx.provider_session_id.as_deref(),
+            canonical_worktree_root,
+        );
+
+        // 14. Send the continuation prompt via the existing live ACP session.
+        let run_id = cont
+            .run_id
+            .parse::<RunId>()
+            .unwrap_or_else(|_| RunId::new());
+
+        let exec_result = self
+            .acp
+            .execute(acp::ExecutionRequest {
+                agent_execution_id: None,
+                run_id,
+                stage_execution_id: Some(cont.stage_execution_id.clone()),
+                stage_id: format!(
+                    "continuation_{}",
+                    &continuation_id[..8.min(continuation_id.len())]
+                ),
+                attempt_number: 1,
+                agent_id: "code_writer".to_string(),
+                provider: provider.clone(),
+                model: model.clone(),
+                effort: None,
+                workspace_root: workspace_root.clone(),
+                prompt: continuation_prompt,
+                worktree_root: worktree_root.clone(),
+                worktree_write_enabled: worktree_root.is_some(),
+                worktree_strategy: None,
+                expected_output_paths: Vec::new(),
+                expected_outputs: Vec::new(),
+                keep_session_alive: true,
+                reuse_existing_session: true,
+                session_generation_id: Some(session_generation_id.clone()),
+                provider_session_id: ctx.provider_session_id.clone(),
+                mcp_servers: Vec::new(),
+                chainworks_meta_root: ctx.chainworks_meta_root,
+                legacy_broad_discovery_policy:
+                    domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+                xcode_shim_injection_signal: false,
+                requires_xcode_host_execution: false,
+                owner_kind: "stage_execution".to_string(),
+                owner_id: Some(cont.stage_execution_id.clone()),
+                origin_stage_id: None,
+                origin_stage_execution_id: None,
+                mediation_record_id: None,
+                toolchain_home: None,
+                toolchain_go_scope_enabled: false,
+            })
+            .await;
+
+        // 15. Settle the continuation based on the ACP outcome.
+        match exec_result {
+            Ok(result) => {
+                if self
+                    .settle_p086_cancelled_after_provider_return(
+                        &run,
+                        &stage_id,
+                        &provider,
+                        model.clone(),
+                        &cont,
+                        Some(&result),
+                        worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    )
+                    .await?
+                {
+                    info!(
+                        continuation_id,
+                        provider = provider,
+                        "P086 continuation preserved cancellation after provider return"
+                    );
+                    return Ok(());
+                }
+
+                for next_status in ["observing", "worktree_observed", "finalizing"] {
+                    let changed =
+                        db::repos::agent_work_continuations::update_continuation_status_unless_cancelling(
+                            &self.pool,
+                            continuation_id,
+                            next_status,
+                            None,
+                        )
+                        .await?;
+                    if changed == 0
+                        && self
+                            .settle_p086_cancelled_after_provider_return(
+                                &run,
+                                &stage_id,
+                                &provider,
+                                model.clone(),
+                                &cont,
+                                Some(&result),
+                                worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                            )
+                            .await?
+                    {
+                        info!(
+                            continuation_id,
+                            provider = provider,
+                            next_status,
+                            "P086 continuation preserved cancellation during post-provider finalization"
+                        );
+                        return Ok(());
+                    }
+                }
+
+                let (final_status, failure_reason) = if result.status == AgentStatus::Completed {
+                    ("succeeded", None)
+                } else {
+                    ("no_progress", Some("provider_incomplete"))
+                };
+                self.settle_p086_continuation_with_materialized_artifacts(
+                    &run,
+                    &stage_id,
+                    &provider,
+                    model.clone(),
+                    &cont,
+                    final_status,
+                    failure_reason,
+                    Some(&result),
+                    worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                )
+                .await?;
+                info!(
+                    continuation_id,
+                    final_status,
+                    provider = provider,
+                    "P086 continuation settled"
+                );
+            }
+            Err(err) => {
+                if self
+                    .settle_p086_cancelled_after_provider_return(
+                        &run,
+                        &stage_id,
+                        &provider,
+                        model.clone(),
+                        &cont,
+                        None,
+                        worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                    )
+                    .await?
+                {
+                    info!(
+                        continuation_id,
+                        provider = provider,
+                        "P086 continuation preserved cancellation after provider error"
+                    );
+                    return Ok(());
+                }
+
+                warn!(
+                    continuation_id,
+                    provider = provider,
+                    error = %err,
+                    "P086 continuation ACP call failed; settling to failed"
+                );
+                self.settle_p086_continuation_with_materialized_artifacts(
+                    &run,
+                    &stage_id,
+                    &provider,
+                    model,
+                    &cont,
+                    "failed",
+                    Some("provider_error"),
+                    None,
+                    worktree_root.as_deref().or(Some(workspace_root.as_str())),
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
     }
 
     async fn run_generated_state_housekeeping_loop(self: Arc<Self>) {
@@ -5992,22 +8631,54 @@ impl BackgroundExecutor {
                         )
                         .await?;
                     if validation_summary_requires_output_contract_repair(&validation) {
-                        let p088_work_change_kind = p088_post_original_fingerprint
-                            .as_ref()
-                            .map(|fingerprint| fingerprint.summary.work_change_kind);
-                        let p088_completion_eligible = p088_code_writer_completion_candidate
-                            && (matches!(
-                                p088_work_change_kind,
-                                Some(WorkChangeKind::CurrentAttemptDiff)
-                            ) || p088_operator_retry_completion_recovery);
-                        if let Some(session_generation_id) =
-                            result.session_generation_id.clone().or_else(|| {
-                                policy_decision
-                                    .as_ref()
-                                    .map(|decision| decision.generation.id.clone())
-                            })
+                        if let Some(skip_classification) =
+                            output_contract_repair_skip_classification(
+                                &result.status,
+                                result.transcript_text.as_deref(),
+                                result.runtime_receipt.as_ref(),
+                            )
                         {
-                            let failed_generic_repair_count =
+                            warn!(
+                                run_id = %run_id,
+                                stage_id = %stage_id,
+                                agent_id = %agent_id,
+                                agent_execution_id = %agent_exec_id,
+                                failure_kind = %skip_classification.failure_kind,
+                                "Output contract repair skipped because provider failed before producing assistant output"
+                            );
+                            self.record_output_contract_repair_event(
+                                policy_decision.as_ref(),
+                                domain::session::SessionEventType::OutputContractRepairSkipped,
+                                serde_json::json!({
+                                    "agent_execution_id": agent_exec_id.to_string(),
+                                    "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
+                                    "failure_kind": skip_classification.failure_kind.to_string(),
+                                    "operator_action_hint": skip_classification.operator_action_hint.to_string(),
+                                    "retry_after": skip_classification.retry_after.map(|dt| dt.to_rfc3339()),
+                                    "reason": "provider_failed_before_assistant_output",
+                                }),
+                                run_id,
+                                &stage_id,
+                                &agent_id,
+                            )
+                            .await;
+                        } else {
+                            let p088_work_change_kind = p088_post_original_fingerprint
+                                .as_ref()
+                                .map(|fingerprint| fingerprint.summary.work_change_kind);
+                            let p088_completion_eligible = p088_code_writer_completion_candidate
+                                && (matches!(
+                                    p088_work_change_kind,
+                                    Some(WorkChangeKind::CurrentAttemptDiff)
+                                ) || p088_operator_retry_completion_recovery);
+                            if let Some(session_generation_id) =
+                                result.session_generation_id.clone().or_else(|| {
+                                    policy_decision
+                                        .as_ref()
+                                        .map(|decision| decision.generation.id.clone())
+                                })
+                            {
+                                let failed_generic_repair_count =
                                 sessions::count_generation_events_for_agent_execution(
                                     &self.pool,
                                     &session_generation_id,
@@ -6016,26 +8687,26 @@ impl BackgroundExecutor {
                                 )
                                 .await
                                 .unwrap_or(0);
-                            let generic_repair_already_failed =
-                                p088_should_block_after_generic_repair_failed(
-                                    p088_code_writer_completion_candidate,
-                                    p088_completion_eligible,
-                                    failed_generic_repair_count,
-                                );
-                            if generic_repair_already_failed {
-                                p088_completion_turn_result = Some(
+                                let generic_repair_already_failed =
+                                    p088_should_block_after_generic_repair_failed(
+                                        p088_code_writer_completion_candidate,
+                                        p088_completion_eligible,
+                                        failed_generic_repair_count,
+                                    );
+                                if generic_repair_already_failed {
+                                    p088_completion_turn_result = Some(
                                     "generic_repair_already_failed_completion_contract_required"
                                         .to_string(),
                                 );
-                                warn!(
-                                    run_id = %run_id,
-                                    stage_id = %stage_id,
-                                    agent_id = %agent_id,
-                                    agent_execution_id = %agent_exec_id,
-                                    session_generation_id = %session_generation_id,
-                                    "P088 blocked ineligible code_writer completion attempt after failed generic repair"
-                                );
-                                self.record_output_contract_repair_event(
+                                    warn!(
+                                        run_id = %run_id,
+                                        stage_id = %stage_id,
+                                        agent_id = %agent_id,
+                                        agent_execution_id = %agent_exec_id,
+                                        session_generation_id = %session_generation_id,
+                                        "P088 blocked ineligible code_writer completion attempt after failed generic repair"
+                                    );
+                                    self.record_output_contract_repair_event(
                                     policy_decision.as_ref(),
                                     domain::session::SessionEventType::OutputContractRepairSkipped,
                                     serde_json::json!({
@@ -6048,7 +8719,7 @@ impl BackgroundExecutor {
                                     &agent_id,
                                 )
                                 .await;
-                                self.record_code_writer_completion_event(
+                                    self.record_code_writer_completion_event(
                                     policy_decision.as_ref(),
                                     domain::session::SessionEventType::CodeWriterCompletionFailed,
                                     serde_json::json!({
@@ -6062,67 +8733,73 @@ impl BackgroundExecutor {
                                     &agent_id,
                                 )
                                 .await;
-                            } else {
-                                let mut repair_req = req.clone();
-                                repair_req.prompt = if p088_completion_eligible {
-                                    code_writer_completion_repair_prompt(
-                                        &validation,
-                                        &declared_outputs,
-                                    )
                                 } else {
-                                    output_contract_repair_prompt(&validation, &declared_outputs)
-                                };
-                                repair_req.reuse_existing_session = true;
-                                repair_req.keep_session_alive = true;
-                                repair_req.session_generation_id =
-                                    Some(session_generation_id.clone());
-                                repair_req.provider_session_id = result
-                                    .provider_session_id
-                                    .clone()
-                                    .or_else(|| repair_req.provider_session_id.clone());
-                                let repair_prompt_text = repair_req.prompt.clone();
-                                let repair_prompt_bytes = repair_req.prompt.len();
-                                let failed_outputs = failed_output_validation_details(&validation);
-                                let p088_repair_prompt_artifact_path = if p088_completion_eligible {
-                                    persist_p088_prompt_artifact(
-                                        &run.artifact_root,
-                                        agent_exec_id,
-                                        "code_writer_completion_repair",
-                                        1,
-                                        &repair_prompt_text,
-                                    )
-                                    .await
-                                    .ok()
-                                } else {
-                                    None
-                                };
-                                let p088_expected_output_snapshot = if p088_completion_eligible {
-                                    persist_p088_expected_output_snapshot(
-                                        &run.artifact_root,
-                                        agent_exec_id,
-                                        "code_writer_completion_repair",
-                                        1,
-                                        &declared_outputs,
-                                    )
-                                    .await
-                                    .ok()
-                                } else {
-                                    None
-                                };
-                                if p088_completion_eligible {
-                                    p088_completion_turn_attempted = true;
-                                }
-                                info!(
-                                    run_id = %run_id,
-                                    stage_id = %stage_id,
-                                    agent_id = %agent_id,
-                                    agent_execution_id = %agent_exec_id,
-                                    session_generation_id = %session_generation_id,
-                                    failed_output_count = failed_outputs.len(),
-                                    repair_prompt_bytes,
-                                    "Output contract repair turn starting"
-                                );
-                                self.record_output_contract_repair_event(
+                                    let mut repair_req = req.clone();
+                                    repair_req.prompt = if p088_completion_eligible {
+                                        code_writer_completion_repair_prompt(
+                                            &validation,
+                                            &declared_outputs,
+                                        )
+                                    } else {
+                                        output_contract_repair_prompt(
+                                            &validation,
+                                            &declared_outputs,
+                                        )
+                                    };
+                                    repair_req.reuse_existing_session = true;
+                                    repair_req.keep_session_alive = true;
+                                    repair_req.session_generation_id =
+                                        Some(session_generation_id.clone());
+                                    repair_req.provider_session_id = result
+                                        .provider_session_id
+                                        .clone()
+                                        .or_else(|| repair_req.provider_session_id.clone());
+                                    let repair_prompt_text = repair_req.prompt.clone();
+                                    let repair_prompt_bytes = repair_req.prompt.len();
+                                    let failed_outputs =
+                                        failed_output_validation_details(&validation);
+                                    let p088_repair_prompt_artifact_path =
+                                        if p088_completion_eligible {
+                                            persist_p088_prompt_artifact(
+                                                &run.artifact_root,
+                                                agent_exec_id,
+                                                "code_writer_completion_repair",
+                                                1,
+                                                &repair_prompt_text,
+                                            )
+                                            .await
+                                            .ok()
+                                        } else {
+                                            None
+                                        };
+                                    let p088_expected_output_snapshot = if p088_completion_eligible
+                                    {
+                                        persist_p088_expected_output_snapshot(
+                                            &run.artifact_root,
+                                            agent_exec_id,
+                                            "code_writer_completion_repair",
+                                            1,
+                                            &declared_outputs,
+                                        )
+                                        .await
+                                        .ok()
+                                    } else {
+                                        None
+                                    };
+                                    if p088_completion_eligible {
+                                        p088_completion_turn_attempted = true;
+                                    }
+                                    info!(
+                                        run_id = %run_id,
+                                        stage_id = %stage_id,
+                                        agent_id = %agent_id,
+                                        agent_execution_id = %agent_exec_id,
+                                        session_generation_id = %session_generation_id,
+                                        failed_output_count = failed_outputs.len(),
+                                        repair_prompt_bytes,
+                                        "Output contract repair turn starting"
+                                    );
+                                    self.record_output_contract_repair_event(
                                 policy_decision.as_ref(),
                                 domain::session::SessionEventType::OutputContractRepairStarted,
                                 serde_json::json!({
@@ -6136,8 +8813,8 @@ impl BackgroundExecutor {
                                 &agent_id,
                             )
                             .await;
-                                if p088_completion_eligible {
-                                    self.record_code_writer_completion_event(
+                                    if p088_completion_eligible {
+                                        self.record_code_writer_completion_event(
                                     policy_decision.as_ref(),
                                     domain::session::SessionEventType::CodeWriterCompletionStarted,
                                     serde_json::json!({
@@ -6151,92 +8828,100 @@ impl BackgroundExecutor {
                                     &agent_id,
                                 )
                                 .await;
-                                }
+                                    }
 
-                                let p088_pre_completion_repair_fingerprint =
-                                    if p088_completion_eligible && worktree_write_enabled {
-                                        match capture_worktree_fingerprint_v1(
-                                            WorktreeFingerprintInput {
-                                                worktree_root: PathBuf::from(
-                                                    &effective_working_directory,
-                                                ),
-                                                run_id: run_id.to_string(),
-                                                stage_execution_id: stage_execution_id
-                                                    .map(|id| id.to_string())
-                                                    .unwrap_or_else(|| stage_id.clone()),
-                                                agent_execution_id: agent_exec_id.to_string(),
-                                                session_generation_id: session_generation_id
-                                                    .clone(),
-                                                capture_phase: CapturePhase::PreCompletionRepair,
-                                                active_proposal_id: Some("088".to_string()),
-                                                baseline: p088_post_original_fingerprint.as_ref(),
-                                            },
-                                        )
-                                        .await
-                                        {
-                                            Ok(fingerprint) => {
-                                                let _ = persist_p088_worktree_fingerprint(
-                                                    &run.artifact_root,
-                                                    agent_exec_id,
-                                                    &fingerprint,
-                                                )
-                                                .await;
-                                                Some(fingerprint)
-                                            }
-                                            Err(error) => {
-                                                warn!(
-                                                    run_id = %run_id,
-                                                    stage_id = %stage_id,
-                                                    agent_id = %agent_id,
-                                                    agent_execution_id = %agent_exec_id,
-                                                    error = %error,
-                                                    "P088 pre-completion repair worktree fingerprint capture failed"
-                                                );
-                                                None
-                                            }
-                                        }
-                                    } else {
-                                        None
-                                    };
-
-                                match self
-                                    .acp
-                                    .prompt_session(&session_generation_id, repair_req)
-                                    .await
-                                {
-                                    Ok(repair_result) => {
-                                        output_contract_repair_turn_count += 1;
-                                        if p088_completion_eligible {
-                                            p088_completion_repair_text_capture =
-                                                Some(repair_result.completion_text_capture.clone());
-                                            p088_completion_repair_runtime_receipt =
-                                                repair_result.runtime_receipt.clone();
-                                            if let Some(runtime_receipt) =
-                                                repair_result.runtime_receipt.as_ref()
+                                    let p088_pre_completion_repair_fingerprint =
+                                        if p088_completion_eligible && worktree_write_enabled {
+                                            match capture_worktree_fingerprint_v1(
+                                                WorktreeFingerprintInput {
+                                                    worktree_root: PathBuf::from(
+                                                        &effective_working_directory,
+                                                    ),
+                                                    run_id: run_id.to_string(),
+                                                    stage_execution_id: stage_execution_id
+                                                        .map(|id| id.to_string())
+                                                        .unwrap_or_else(|| stage_id.clone()),
+                                                    agent_execution_id: agent_exec_id.to_string(),
+                                                    session_generation_id: session_generation_id
+                                                        .clone(),
+                                                    capture_phase:
+                                                        CapturePhase::PreCompletionRepair,
+                                                    active_proposal_id: Some("088".to_string()),
+                                                    baseline: p088_post_original_fingerprint
+                                                        .as_ref(),
+                                                },
+                                            )
+                                            .await
                                             {
-                                                if let Ok(receipt_record) =
-                                                    runtime_prompt_receipt_record_from_receipt(
+                                                Ok(fingerprint) => {
+                                                    let _ = persist_p088_worktree_fingerprint(
+                                                        &run.artifact_root,
                                                         agent_exec_id,
-                                                        runtime_receipt,
-                                                        chrono::Utc::now(),
-                                                        "code_writer_completion_repair",
-                                                        output_contract_repair_turn_count,
-                                                        "code_writer_completion_repair_v1",
-                                                        "1",
-                                                        &repair_prompt_text,
-                                                        "missing_required_outputs",
-                                                        p088_repair_prompt_artifact_path.as_deref(),
-                                                        p088_expected_output_snapshot
-                                                            .as_ref()
-                                                            .map(|snapshot| snapshot.0.as_str()),
-                                                        p088_expected_output_snapshot
-                                                            .as_ref()
-                                                            .map(|snapshot| snapshot.1.as_str()),
+                                                        &fingerprint,
                                                     )
+                                                    .await;
+                                                    Some(fingerprint)
+                                                }
+                                                Err(error) => {
+                                                    warn!(
+                                                        run_id = %run_id,
+                                                        stage_id = %stage_id,
+                                                        agent_id = %agent_id,
+                                                        agent_execution_id = %agent_exec_id,
+                                                        error = %error,
+                                                        "P088 pre-completion repair worktree fingerprint capture failed"
+                                                    );
+                                                    None
+                                                }
+                                            }
+                                        } else {
+                                            None
+                                        };
+
+                                    match self
+                                        .acp
+                                        .prompt_session(&session_generation_id, repair_req)
+                                        .await
+                                    {
+                                        Ok(repair_result) => {
+                                            output_contract_repair_turn_count += 1;
+                                            if p088_completion_eligible {
+                                                p088_completion_repair_text_capture = Some(
+                                                    repair_result.completion_text_capture.clone(),
+                                                );
+                                                p088_completion_repair_runtime_receipt =
+                                                    repair_result.runtime_receipt.clone();
+                                                if let Some(runtime_receipt) =
+                                                    repair_result.runtime_receipt.as_ref()
                                                 {
-                                                    p088_completion_repair_runtime_prompt_receipt =
+                                                    if let Ok(receipt_record) =
+                                                        runtime_prompt_receipt_record_from_receipt(
+                                                            agent_exec_id,
+                                                            runtime_receipt,
+                                                            chrono::Utc::now(),
+                                                            "code_writer_completion_repair",
+                                                            output_contract_repair_turn_count,
+                                                            "code_writer_completion_repair_v1",
+                                                            "1",
+                                                            &repair_prompt_text,
+                                                            "missing_required_outputs",
+                                                            p088_repair_prompt_artifact_path
+                                                                .as_deref(),
+                                                            p088_expected_output_snapshot
+                                                                .as_ref()
+                                                                .map(|snapshot| {
+                                                                    snapshot.0.as_str()
+                                                                }),
+                                                            p088_expected_output_snapshot
+                                                                .as_ref()
+                                                                .map(|snapshot| {
+                                                                    snapshot.1.as_str()
+                                                                }),
+                                                        )
+                                                    {
+                                                        p088_completion_repair_runtime_prompt_receipt =
                                                         Some(receipt_record.clone());
-                                                    if let Err(error) =
+                                                        if let Err(error) =
                                                     agent_execution_runtime_receipts::upsert_prompt_receipt(
                                                         &self.pool,
                                                         &receipt_record,
@@ -6252,12 +8937,53 @@ impl BackgroundExecutor {
                                                         "Failed to persist P088 completion repair runtime receipt"
                                                     );
                                                 }
+                                                    }
                                                 }
                                             }
-                                        }
-                                        let p088_completion_repair_mutation_failure =
-                                            if p088_completion_eligible && worktree_write_enabled {
-                                                match capture_worktree_fingerprint_v1(
+                                            if !p088_completion_eligible {
+                                                if let Some(runtime_receipt) =
+                                                    repair_result.runtime_receipt.as_ref()
+                                                {
+                                                    if let Ok(receipt_record) =
+                                                        runtime_prompt_receipt_record_from_receipt(
+                                                            agent_exec_id,
+                                                            runtime_receipt,
+                                                            chrono::Utc::now(),
+                                                            "output_contract_repair",
+                                                            output_contract_repair_turn_count,
+                                                            "output_contract_repair_v1",
+                                                            "1",
+                                                            &repair_prompt_text,
+                                                            "missing_required_outputs",
+                                                            None,
+                                                            None,
+                                                            None,
+                                                        )
+                                                    {
+                                                        if let Err(error) =
+                                                        agent_execution_runtime_receipts::upsert_prompt_receipt(
+                                                            &self.pool,
+                                                            &receipt_record,
+                                                        )
+                                                        .await
+                                                    {
+                                                        warn!(
+                                                            run_id = %run_id,
+                                                            stage_id = %stage_id,
+                                                            agent_id = %agent_id,
+                                                            agent_execution_id = %agent_exec_id,
+                                                            error = %error,
+                                                            "Failed to persist output contract repair runtime receipt"
+                                                        );
+                                                    }
+                                                    }
+                                                }
+                                            }
+                                            let p088_completion_repair_mutation_failure =
+                                                if p088_completion_eligible
+                                                    && worktree_write_enabled
+                                                {
+                                                    match capture_worktree_fingerprint_v1(
                                                     WorktreeFingerprintInput {
                                                         worktree_root: PathBuf::from(
                                                             &effective_working_directory,
@@ -6307,24 +9033,24 @@ impl BackgroundExecutor {
                                                         Some("completion_repair_mutation_guard_unavailable")
                                                     }
                                                 }
-                                            } else {
-                                                None
-                                            };
-                                        if let Some(failure_kind) =
-                                            p088_completion_repair_mutation_failure
-                                        {
-                                            p088_completion_turn_result =
-                                                Some(failure_kind.to_string());
-                                            warn!(
-                                                run_id = %run_id,
-                                                stage_id = %stage_id,
-                                                agent_id = %agent_id,
-                                                agent_execution_id = %agent_exec_id,
-                                                session_generation_id = %session_generation_id,
-                                                failure_kind,
-                                                "P088 completion repair rejected by mutation guard"
-                                            );
-                                            self.record_output_contract_repair_event(
+                                                } else {
+                                                    None
+                                                };
+                                            if let Some(failure_kind) =
+                                                p088_completion_repair_mutation_failure
+                                            {
+                                                p088_completion_turn_result =
+                                                    Some(failure_kind.to_string());
+                                                warn!(
+                                                    run_id = %run_id,
+                                                    stage_id = %stage_id,
+                                                    agent_id = %agent_id,
+                                                    agent_execution_id = %agent_exec_id,
+                                                    session_generation_id = %session_generation_id,
+                                                    failure_kind,
+                                                    "P088 completion repair rejected by mutation guard"
+                                                );
+                                                self.record_output_contract_repair_event(
                                             policy_decision.as_ref(),
                                             domain::session::SessionEventType::OutputContractRepairFailed,
                                             serde_json::json!({
@@ -6337,8 +9063,8 @@ impl BackgroundExecutor {
                                             &agent_id,
                                         )
                                         .await;
-                                            if p088_completion_eligible {
-                                                self.record_code_writer_completion_event(
+                                                if p088_completion_eligible {
+                                                    self.record_code_writer_completion_event(
                                                 policy_decision.as_ref(),
                                                 domain::session::SessionEventType::CodeWriterCompletionFailed,
                                                 serde_json::json!({
@@ -6353,23 +9079,23 @@ impl BackgroundExecutor {
                                                 &agent_id,
                                             )
                                             .await;
-                                            }
-                                        } else {
-                                            match Ok::<_, anyhow::Error>(
-                                                build_declared_output_discovery_settlement(
-                                                    &expected_outputs,
-                                                    &repair_result.discovered_artifacts,
-                                                    &repair_result.pre_prompt_expected_outputs,
-                                                ),
-                                            ) {
-                                                Ok(repair_settlement) => {
-                                                    let repair_captured =
+                                                }
+                                            } else {
+                                                match Ok::<_, anyhow::Error>(
+                                                    build_declared_output_discovery_settlement(
+                                                        &expected_outputs,
+                                                        &repair_result.discovered_artifacts,
+                                                        &repair_result.pre_prompt_expected_outputs,
+                                                    ),
+                                                ) {
+                                                    Ok(repair_settlement) => {
+                                                        let repair_captured =
                                                     build_captured_outputs_from_discovery_decisions(
                                                         &declared_outputs,
                                                         &repair_settlement.decisions,
                                                         &repair_settlement.accepted_payloads,
                                                     );
-                                                    let merged_repair_settlement =
+                                                        let merged_repair_settlement =
                                                         declared_output_settlement
                                                             .as_ref()
                                                             .map(|original_settlement| {
@@ -6381,20 +9107,20 @@ impl BackgroundExecutor {
                                                             .unwrap_or_else(|| {
                                                                 repair_settlement.clone()
                                                             });
-                                                    let merged_repair_captured =
-                                                        merge_repair_captured_outputs(
-                                                            &captured,
-                                                            &repair_captured,
+                                                        let merged_repair_captured =
+                                                            merge_repair_captured_outputs(
+                                                                &captured,
+                                                                &repair_captured,
+                                                            );
+                                                        let (
+                                                            repair_found_count,
+                                                            repair_missing_count,
+                                                            repair_stale_count,
+                                                            repair_rejected_count,
+                                                        ) = output_discovery_decision_counts(
+                                                            &repair_settlement.decisions,
                                                         );
-                                                    let (
-                                                        repair_found_count,
-                                                        repair_missing_count,
-                                                        repair_stale_count,
-                                                        repair_rejected_count,
-                                                    ) = output_discovery_decision_counts(
-                                                        &repair_settlement.decisions,
-                                                    );
-                                                    let repair_validation = self
+                                                        let repair_validation = self
                                                 .validate_task_outputs_with_conflict_resolution_context(
                                                     run_id,
                                                     &stage_id,
@@ -6402,12 +9128,12 @@ impl BackgroundExecutor {
                                                     &merged_repair_captured,
                                                 )
                                                 .await?;
-                                                    let staged_repair_materialization =
-                                                        if p090_staged_repair_settlement_enabled(
-                                                            &provider,
-                                                        ) && stage_execution_id.is_some()
-                                                        {
-                                                            Some(stage_p090_repair_materialization(
+                                                        let staged_repair_materialization =
+                                                            if p090_staged_repair_settlement_enabled(
+                                                                &provider,
+                                                            ) && stage_execution_id.is_some()
+                                                            {
+                                                                Some(stage_p090_repair_materialization(
                                                                 &run.artifact_root,
                                                                 run_id,
                                                                 &stage_id,
@@ -6431,48 +9157,51 @@ impl BackgroundExecutor {
                                                                 &repair_validation,
                                                                 chrono::Utc::now(),
                                                             )?)
-                                                        } else if repair_validation
-                                                            .failure_class
-                                                            .is_none()
-                                                        {
-                                                            materialize_validated_discovery_decisions(
+                                                            } else if repair_validation
+                                                                .failure_class
+                                                                .is_none()
+                                                            {
+                                                                materialize_validated_discovery_decisions(
                                                                 &declared_outputs,
                                                                 &repair_settlement,
                                                                 &repair_validation,
                                                             )?;
-                                                            None
-                                                        } else {
-                                                            None
-                                                        };
-                                                    let repair_materialized_partially =
-                                                        repair_validation.failure_class.is_some()
-                                                            && repair_found_count > 0;
-                                                    p090_staged_repair_materialization =
-                                                        staged_repair_materialization;
-                                                    declared_output_settlement =
-                                                        Some(merged_repair_settlement);
-                                                    if repair_validation.failure_class.is_none() {
-                                                        if p088_completion_eligible {
-                                                            p088_completion_turn_result =
-                                                                Some("succeeded".to_string());
-                                                        }
-                                                        merge_contract_repair_result(
-                                                            &mut result,
-                                                            repair_result,
-                                                        );
-                                                        info!(
-                                                            run_id = %run_id,
-                                                            stage_id = %stage_id,
-                                                            agent_id = %agent_id,
-                                                            agent_execution_id = %agent_exec_id,
-                                                            session_generation_id = %session_generation_id,
-                                                            repair_found_count,
-                                                            repair_missing_count,
-                                                            repair_stale_count,
-                                                            repair_rejected_count,
-                                                            "Output contract repair turn produced valid declared outputs"
-                                                        );
-                                                        self.record_output_contract_repair_event(
+                                                                None
+                                                            } else {
+                                                                None
+                                                            };
+                                                        let repair_materialized_partially =
+                                                            repair_validation
+                                                                .failure_class
+                                                                .is_some()
+                                                                && repair_found_count > 0;
+                                                        p090_staged_repair_materialization =
+                                                            staged_repair_materialization;
+                                                        declared_output_settlement =
+                                                            Some(merged_repair_settlement);
+                                                        if repair_validation.failure_class.is_none()
+                                                        {
+                                                            if p088_completion_eligible {
+                                                                p088_completion_turn_result =
+                                                                    Some("succeeded".to_string());
+                                                            }
+                                                            merge_contract_repair_result(
+                                                                &mut result,
+                                                                repair_result,
+                                                            );
+                                                            info!(
+                                                                run_id = %run_id,
+                                                                stage_id = %stage_id,
+                                                                agent_id = %agent_id,
+                                                                agent_execution_id = %agent_exec_id,
+                                                                session_generation_id = %session_generation_id,
+                                                                repair_found_count,
+                                                                repair_missing_count,
+                                                                repair_stale_count,
+                                                                repair_rejected_count,
+                                                                "Output contract repair turn produced valid declared outputs"
+                                                            );
+                                                            self.record_output_contract_repair_event(
                                                         policy_decision.as_ref(),
                                                         domain::session::SessionEventType::OutputContractRepairSucceeded,
                                                         serde_json::json!({
@@ -6488,8 +9217,8 @@ impl BackgroundExecutor {
                                                         &agent_id,
                                                     )
                                                     .await;
-                                                        if p088_completion_eligible {
-                                                            self.record_code_writer_completion_event(
+                                                            if p088_completion_eligible {
+                                                                self.record_code_writer_completion_event(
                                                             policy_decision.as_ref(),
                                                             domain::session::SessionEventType::CodeWriterCompletionSucceeded,
                                                             serde_json::json!({
@@ -6507,37 +9236,38 @@ impl BackgroundExecutor {
                                                             &agent_id,
                                                         )
                                                         .await;
-                                                        }
-                                                    } else {
-                                                        if p088_completion_eligible {
-                                                            p088_completion_turn_result = Some(
-                                                                if repair_materialized_partially {
-                                                                    "partial_outputs_materialized_missing_outputs".to_string()
-                                                                } else {
-                                                                    "failed_missing_outputs"
-                                                                        .to_string()
-                                                                },
+                                                            }
+                                                        } else {
+                                                            if p088_completion_eligible {
+                                                                p088_completion_turn_result = Some(
+                                                                    if repair_materialized_partially
+                                                                    {
+                                                                        "partial_outputs_materialized_missing_outputs".to_string()
+                                                                    } else {
+                                                                        "failed_missing_outputs"
+                                                                            .to_string()
+                                                                    },
+                                                                );
+                                                            }
+                                                            let repair_failed_outputs =
+                                                                failed_output_validation_details(
+                                                                    &repair_validation,
+                                                                );
+                                                            warn!(
+                                                                run_id = %run_id,
+                                                                stage_id = %stage_id,
+                                                                agent_id = %agent_id,
+                                                                agent_execution_id = %agent_exec_id,
+                                                                session_generation_id = %session_generation_id,
+                                                                repair_found_count,
+                                                                repair_missing_count,
+                                                                repair_stale_count,
+                                                                repair_rejected_count,
+                                                                failed_output_count = repair_failed_outputs.len(),
+                                                                failure = ?repair_validation.failure_summary,
+                                                                "Output contract repair turn did not produce valid declared outputs"
                                                             );
-                                                        }
-                                                        let repair_failed_outputs =
-                                                            failed_output_validation_details(
-                                                                &repair_validation,
-                                                            );
-                                                        warn!(
-                                                            run_id = %run_id,
-                                                            stage_id = %stage_id,
-                                                            agent_id = %agent_id,
-                                                            agent_execution_id = %agent_exec_id,
-                                                            session_generation_id = %session_generation_id,
-                                                            repair_found_count,
-                                                            repair_missing_count,
-                                                            repair_stale_count,
-                                                            repair_rejected_count,
-                                                            failed_output_count = repair_failed_outputs.len(),
-                                                            failure = ?repair_validation.failure_summary,
-                                                            "Output contract repair turn did not produce valid declared outputs"
-                                                        );
-                                                        self.record_output_contract_repair_event(
+                                                            self.record_output_contract_repair_event(
                                                         policy_decision.as_ref(),
                                                         domain::session::SessionEventType::OutputContractRepairFailed,
                                                         serde_json::json!({
@@ -6556,8 +9286,8 @@ impl BackgroundExecutor {
                                                         &agent_id,
                                                     )
                                                     .await;
-                                                        if p088_completion_eligible {
-                                                            self.record_code_writer_completion_event(
+                                                            if p088_completion_eligible {
+                                                                self.record_code_writer_completion_event(
                                                             policy_decision.as_ref(),
                                                             domain::session::SessionEventType::CodeWriterCompletionFailed,
                                                             serde_json::json!({
@@ -6578,25 +9308,26 @@ impl BackgroundExecutor {
                                                             &agent_id,
                                                         )
                                                         .await;
+                                                            }
                                                         }
                                                     }
-                                                }
-                                                Err(error) => {
-                                                    if p088_completion_eligible {
-                                                        p088_completion_turn_result = Some(
-                                                            "failed_missing_outputs".to_string(),
+                                                    Err(error) => {
+                                                        if p088_completion_eligible {
+                                                            p088_completion_turn_result = Some(
+                                                                "failed_missing_outputs"
+                                                                    .to_string(),
+                                                            );
+                                                        }
+                                                        warn!(
+                                                            run_id = %run_id,
+                                                            stage_id = %stage_id,
+                                                            agent_id = %agent_id,
+                                                            agent_execution_id = %agent_exec_id,
+                                                            session_generation_id = %session_generation_id,
+                                                            error = %error,
+                                                            "Output contract repair settlement failed"
                                                         );
-                                                    }
-                                                    warn!(
-                                                        run_id = %run_id,
-                                                        stage_id = %stage_id,
-                                                        agent_id = %agent_id,
-                                                        agent_execution_id = %agent_exec_id,
-                                                        session_generation_id = %session_generation_id,
-                                                        error = %error,
-                                                        "Output contract repair settlement failed"
-                                                    );
-                                                    self.record_output_contract_repair_event(
+                                                        self.record_output_contract_repair_event(
                                                     policy_decision.as_ref(),
                                                     domain::session::SessionEventType::OutputContractRepairFailed,
                                                     serde_json::json!({
@@ -6610,8 +9341,8 @@ impl BackgroundExecutor {
                                                     &agent_id,
                                                 )
                                                 .await;
-                                                    if p088_completion_eligible {
-                                                        self.record_code_writer_completion_event(
+                                                        if p088_completion_eligible {
+                                                            self.record_code_writer_completion_event(
                                                         policy_decision.as_ref(),
                                                         domain::session::SessionEventType::CodeWriterCompletionFailed,
                                                         serde_json::json!({
@@ -6627,26 +9358,26 @@ impl BackgroundExecutor {
                                                         &agent_id,
                                                     )
                                                     .await;
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
-                                    }
-                                    Err(error) => {
-                                        if p088_completion_eligible {
-                                            p088_completion_turn_result =
-                                                Some("failed_missing_outputs".to_string());
-                                        }
-                                        warn!(
-                                            run_id = %run_id,
-                                            stage_id = %stage_id,
-                                            agent_id = %agent_id,
-                                            agent_execution_id = %agent_exec_id,
-                                            session_generation_id = %session_generation_id,
-                                            error = %error,
-                                            "Output contract repair turn failed"
-                                        );
-                                        self.record_output_contract_repair_event(
+                                        Err(error) => {
+                                            if p088_completion_eligible {
+                                                p088_completion_turn_result =
+                                                    Some("failed_missing_outputs".to_string());
+                                            }
+                                            warn!(
+                                                run_id = %run_id,
+                                                stage_id = %stage_id,
+                                                agent_id = %agent_id,
+                                                agent_execution_id = %agent_exec_id,
+                                                session_generation_id = %session_generation_id,
+                                                error = %error,
+                                                "Output contract repair turn failed"
+                                            );
+                                            self.record_output_contract_repair_event(
                                         policy_decision.as_ref(),
                                         domain::session::SessionEventType::OutputContractRepairFailed,
                                         serde_json::json!({
@@ -6660,8 +9391,8 @@ impl BackgroundExecutor {
                                         &agent_id,
                                     )
                                     .await;
-                                        if p088_completion_eligible {
-                                            self.record_code_writer_completion_event(
+                                            if p088_completion_eligible {
+                                                self.record_code_writer_completion_event(
                                             policy_decision.as_ref(),
                                             domain::session::SessionEventType::CodeWriterCompletionFailed,
                                             serde_json::json!({
@@ -6677,22 +9408,22 @@ impl BackgroundExecutor {
                                             &agent_id,
                                         )
                                         .await;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        } else {
-                            if p088_code_writer_completion_candidate {
-                                p088_completion_turn_result =
-                                    Some("skipped_no_live_session".to_string());
-                            }
-                            warn!(
-                                run_id = %run_id,
-                                stage_id = %stage_id,
-                                agent_id = %agent_id,
-                                "Output contract repair skipped because no live session generation is available"
-                            );
-                            self.record_output_contract_repair_event(
+                            } else {
+                                if p088_code_writer_completion_candidate {
+                                    p088_completion_turn_result =
+                                        Some("skipped_no_live_session".to_string());
+                                }
+                                warn!(
+                                    run_id = %run_id,
+                                    stage_id = %stage_id,
+                                    agent_id = %agent_id,
+                                    "Output contract repair skipped because no live session generation is available"
+                                );
+                                self.record_output_contract_repair_event(
                                 policy_decision.as_ref(),
                                 domain::session::SessionEventType::OutputContractRepairSkipped,
                                 serde_json::json!({
@@ -6705,6 +9436,7 @@ impl BackgroundExecutor {
                                 &agent_id,
                             )
                             .await;
+                            }
                         }
                     }
                 }
@@ -7429,6 +10161,13 @@ impl BackgroundExecutor {
                 )
                 .await?;
 
+                self.maybe_admit_p086_lead_auto_continuation(
+                    &run,
+                    agent_exec_id,
+                    &persisted_artifacts,
+                )
+                .await?;
+
                 self.close_transient_invocation_session_after_settlement(
                     policy_decision.as_ref(),
                     completed_at,
@@ -7563,11 +10302,12 @@ impl BackgroundExecutor {
                         "P078 startup repair moved expired side effects to needs_reconciliation"
                     );
                 }
-                let recovery = RecoveryService::new_with_db_writer(
+                let recovery = RecoveryService::new_with_db_writer_and_acp(
                     self.pool.clone(),
                     self.work_queue.clone(),
                     self.events.clone(),
                     self.db_writer.clone(),
+                    self.acp.clone(),
                 );
                 recovery.run_startup_repair().await?;
             }
@@ -7622,6 +10362,33 @@ impl BackgroundExecutor {
                     Some(&steward_agent_executor),
                 )
                 .await?;
+            }
+
+            WorkItemKind::ProcessContinuation => {
+                let continuation_id = {
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&item.payload_json).unwrap_or_default();
+                    payload["continuation_id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string()
+                };
+                if continuation_id.is_empty() {
+                    warn!(work_item_id = %item.id, "ProcessContinuation: missing continuation_id");
+                } else if let Err(err) = self.run_continuation_worker(&continuation_id).await {
+                    warn!(
+                        continuation_id = %continuation_id,
+                        error = %err,
+                        "P086 continuation worker failed; settling row to failed"
+                    );
+                    let _ = db::repos::agent_work_continuations::update_continuation_status(
+                        &self.pool,
+                        &continuation_id,
+                        "failed",
+                        Some("worker_error"),
+                    )
+                    .await;
+                }
             }
         }
 
@@ -13178,6 +15945,190 @@ mod tests {
     }
 
     #[test]
+    fn p086_continuation_prompt_uses_mode_reset_contract() {
+        let record = domain::continuation::ContinuationRecord {
+            id: "cont-1".to_string(),
+            run_id: "run-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            agent_execution_id: "agent-exec-1".to_string(),
+            mode: "live_handle_continuation".to_string(),
+            trigger_kind: "operator_mcp".to_string(),
+            status: "accepted".to_string(),
+            failure_reason: None,
+            reconciliation_status: None,
+            idempotency_scope: "agent-exec-1".to_string(),
+            idempotency_key: "key-1".to_string(),
+            request_fingerprint_sha256: "a".repeat(64),
+            canonical_request_artifact_id: None,
+            attach_receipt_artifact_id: None,
+            evidence_bundle_artifact_id: None,
+            worktree_readback_artifact_id: None,
+            continuation_report_artifact_id: None,
+            response_fingerprint_sha256: None,
+            response_artifact_id: None,
+            result_or_no_progress_artifact_id: None,
+            conflict_count: 0,
+            lead_decision_artifact_id: None,
+            lead_decision_artifact_sha256: None,
+            continuation_instruction_sha256: None,
+            budget_json: Some(
+                serde_json::json!({
+                    "operator_instruction": "Fix only the observed blocker.",
+                    "blockers": ["missing live reuse proof"],
+                    "max_turns": 2,
+                    "max_wall_clock_seconds": 1200
+                })
+                .to_string(),
+            ),
+            created_at: "2026-05-22T00:00:00Z".to_string(),
+            updated_at: "2026-05-22T00:00:00Z".to_string(),
+        };
+
+        let prompt = BackgroundExecutor::p086_continuation_prompt(
+            &record,
+            "session-gen-1",
+            Some("provider-session-1"),
+            "/tmp/worktree",
+        );
+
+        assert!(prompt.contains("# P086 Continuation Mode Reset"));
+        assert!(prompt.contains("not a retry"));
+        assert!(prompt.contains("Fix only the observed blocker."));
+        assert!(prompt.contains("- missing live reuse proof"));
+        assert!(prompt.contains("Session generation id: session-gen-1"));
+        assert!(prompt.contains("Provider session id: provider-session-1"));
+        assert!(prompt.contains("Do not commit, push, release, publish, upload"));
+    }
+
+    #[test]
+    fn p086_lead_auto_decision_requires_instruction_hash_of_artifact_text() {
+        let instruction = "Continue the blocked implementation in the same live session.";
+        let instruction_sha256 = sha256_hex_digest(instruction.as_bytes());
+        let artifact_json = serde_json::json!({
+            "schema_version": "lead_continuation_decision_v1",
+            "artifact_kind": "lead_continuation_decision",
+            "run_id": "run-1",
+            "stage_execution_id": "stage-exec-1",
+            "agent_execution_id": "agent-exec-1",
+            "continuation_id": "cont-1",
+            "created_at": "2026-05-22T00:00:00Z",
+            "redaction_tier": "partial",
+            "retention_policy": "retain_with_run",
+            "payload": {
+                "schema_version": "lead_continuation_decision_v1",
+                "decision_id": "decision-1",
+                "run_id": "run-1",
+                "stage_execution_id": "stage-exec-1",
+                "agent_execution_id": "agent-exec-1",
+                "agent_id": "code_writer",
+                "session_generation_id": "session-1",
+                "decision": "continue",
+                "reason": "lead found remaining implementation work",
+                "created_at": "2026-05-22T00:00:00Z",
+                "continuation_instruction": instruction,
+                "continuation_instruction_sha256": instruction_sha256,
+                "expected_next_work": ["fix the blocker"],
+                "known_completed_work": ["first pass"],
+                "known_blockers": [],
+                "safety_checks": {
+                    "no_release_side_effect": true,
+                    "no_unresolved_effect_ledger": true,
+                    "same_worktree_required": true
+                },
+                "stop_conditions": ["new blocker"],
+                "max_turns": 1,
+                "max_wall_clock_seconds": 900
+            }
+        });
+        let (payload, target_id) =
+            BackgroundExecutor::p086_lead_auto_decision_targets_code_writer(&artifact_json)
+                .expect("valid lead decision should target code_writer");
+        assert_eq!(target_id, "agent-exec-1");
+
+        let target = db::repos::agent_work_continuations::ContinuationEligibilityInfo {
+            agent_execution_id: "agent-exec-1".into(),
+            stage_execution_id: "stage-exec-1".into(),
+            run_id: "run-1".into(),
+            logical_stage_id: Some("state_implementation".into()),
+            stage_type: Some("implementation".into()),
+            agent_status: "completed".into(),
+            session_generation_id: Some("session-1".into()),
+            provider_session_id: Some("provider-session-1".into()),
+            catalog_snapshot_json: None,
+        };
+        assert_eq!(
+            BackgroundExecutor::p086_lead_auto_payload_valid_for_target(
+                &artifact_json,
+                payload,
+                &target,
+                &sha256_hex_digest(instruction.as_bytes())
+            ),
+            None
+        );
+
+        let mut tampered = artifact_json.clone();
+        tampered["payload"]["continuation_instruction"] =
+            serde_json::json!("Different instruction");
+        let payload = tampered.get("payload").unwrap();
+        assert_eq!(
+            BackgroundExecutor::p086_lead_auto_payload_valid_for_target(
+                &tampered,
+                payload,
+                &target,
+                &sha256_hex_digest(instruction.as_bytes())
+            ),
+            Some("lead_auto_instruction_hash_mismatch")
+        );
+    }
+
+    #[test]
+    fn p086_test_gate_extraction_emits_schema_compatible_rows() {
+        let transcript = "\
+running cargo test -p engine p086
+./scripts/test-gate.sh proposal-086 passed
+xcodebuild failed in unrelated UI lane
+plain progress line without gate evidence";
+
+        let rows = BackgroundExecutor::p086_extract_test_gate_lines(transcript);
+
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.is_object()));
+        assert_eq!(rows[0]["name"], "cargo test");
+        assert_eq!(rows[0]["status"], "observed");
+        assert_eq!(rows[1]["name"], "test-gate");
+        assert_eq!(rows[1]["status"], "passed");
+        assert_eq!(rows[2]["name"], "xcodebuild");
+        assert_eq!(rows[2]["status"], "failed");
+        assert!(rows[0]["detail"].as_str().is_some());
+    }
+
+    #[test]
+    fn p086_reconciliation_requires_post_continuation_worktree_change() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("changed.txt"), "changed").unwrap();
+        let readback = serde_json::json!({
+            "changed_files": ["changed.txt"]
+        });
+        let before = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let after = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
+
+        assert!(
+            BackgroundExecutor::p086_worktree_has_post_continuation_change(
+                &readback,
+                Some(temp.path().to_str().unwrap()),
+                &before,
+            )
+        );
+        assert!(
+            !BackgroundExecutor::p086_worktree_has_post_continuation_change(
+                &readback,
+                Some(temp.path().to_str().unwrap()),
+                &after,
+            )
+        );
+    }
+
+    #[test]
     fn retry_state_7_reuses_existing_approved_proposal_instead_of_reemitting_it() {
         let mut declared_outputs = vec![
             DeclaredOutput {
@@ -14884,6 +17835,43 @@ mod tests {
     }
 
     #[test]
+    fn provider_quota_prompt_error_skips_output_contract_repair() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 1,
+                session_update_count: 0,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 0,
+                unknown_notification_count: 0,
+            },
+            Some("provider_quota"),
+        );
+        receipt.provider = "gemini".into();
+        receipt.provider_error_message_redacted =
+            Some("You have exhausted your capacity on this model.".into());
+
+        let classification = output_contract_repair_skip_classification(
+            &AgentStatus::Failed,
+            Some("ACP session/prompt error: You have exhausted your capacity on this model."),
+            Some(&receipt),
+        )
+        .expect("provider quota should skip output contract repair");
+
+        assert_eq!(classification.failure_kind, AgentFailureKind::ProviderQuota);
+        assert_eq!(
+            classification.operator_action_hint,
+            OperatorActionHint::WaitUntilRetryAfter
+        );
+    }
+
+    #[test]
     fn acp_initialize_runtime_facts_keep_redacted_error_chain_detail() {
         let error = anyhow::anyhow!(
             "JsonRpc error -32000: Directory does not exist: /workspace/.chainworks/runs/run-1 token=abc123"
@@ -14923,6 +17911,8 @@ mod tests {
             session_generation_id: Some("generation-1".into()),
             status: "failed".into(),
             failure_phase: failure_phase.map(str::to_string),
+            jsonrpc_error_code: None,
+            provider_error_message_redacted: None,
             started_at: "2026-05-10T04:35:44Z".into(),
             completed_at: Some("2026-05-10T04:41:06Z".into()),
             xcode_shim_injected: false,

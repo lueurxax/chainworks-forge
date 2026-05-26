@@ -826,14 +826,16 @@ fn test_compile_full_mvp_live_plan() {
     let s1 = &plan.states["state_1_idea_received"];
     assert_eq!(s1.owner.agent_id, "lead_orchestrator");
     assert_eq!(
-        s1.owner.provider, "gemini",
-        "lead_orchestrator uses strict structured-output Gemini profile"
+        s1.owner.provider, "codex",
+        "lead_orchestrator uses strict structured-output Codex profile"
     );
+    assert_eq!(s1.owner.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(s1.owner.effort.as_deref(), Some("high"));
 
     let s4 = &plan.states["state_4_proposal_reviewed"];
     assert_eq!(
-        s4.owner.provider, "gemini",
-        "state_4 owner=lead_orchestrator uses strict structured-output Gemini profile"
+        s4.owner.provider, "codex",
+        "state_4 owner=lead_orchestrator uses strict structured-output Codex profile"
     );
     assert_eq!(
         s4.system_task
@@ -850,15 +852,15 @@ fn test_compile_full_mvp_live_plan() {
         "agent_selection_plan_v1"
     );
 
-    // Verify code_writer -> Junie ACP
+    // Verify code_writer -> Claude ACP
     let s7 = &plan.states["state_7_implementation_started"];
     let cw_task = s7.tasks.iter().find(|t| t.agent.agent_id == "code_writer");
     assert!(cw_task.is_some(), "state_7 should have code_writer task");
-    assert_eq!(cw_task.unwrap().agent.provider, "junie");
+    assert_eq!(cw_task.unwrap().agent.provider, "claude");
     assert_eq!(
         cw_task.unwrap().agent.requested_mcp_server_ids,
-        Vec::<String>::new(),
-        "code_writer MCP intent comes from junie_code_editor_acp backend_profile"
+        vec!["xcode".to_string()],
+        "code_writer MCP intent comes from claude_builder_high backend_profile"
     );
 
     let proposal_writer = &plan.states["state_2_proposal_drafted"].owner;

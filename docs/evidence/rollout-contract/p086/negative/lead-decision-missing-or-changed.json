@@ -1,43 +1,20 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "lead_auto_artifact_identity",
+  "fixture_purpose": "Demonstrates that lead_auto is no longer phase-gated; it reaches server-side decision artifact verification and fails closed when the decision artifact is missing, stale, hash-mismatched, wrong-target, or instruction-mismatched.",
+  "status": "pass",
+  "evidence_kind": "code",
+  "evidence": {
+    "location": "control-plane/crates/mcp-server/src/tools/agents.rs",
+    "function": "handle_continue_work",
+    "mechanism": "trigger_kind == 'lead_auto' validates lead_decision_artifact_id, lead_decision_artifact_sha256, continuation_instruction_sha256, current run/stage/agent/session identity, required safety checks, and requested budget before any admission row or ProcessContinuation work item is created.",
+    "mcp_error_code": -32022,
+    "failure_reason": "lead_auto_missing_artifact_id",
+    "verification_code_location": "verify_lead_auto_artifacts plus validate_lead_auto_decision_payload in control-plane/crates/mcp-server/src/tools/agents.rs",
+    "hold_predicate_prevented": "Missing, changed, stale, wrong-target, unsafe, over-budget, unreadable, invalid-JSON, and hash-mismatched lead decisions are rejected before admission.",
+    "deferred_evidence": null
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:lead_decision_missing_or_changed",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "lead_auto_rejected_before_admission"
 }

@@ -761,6 +761,15 @@ backend_profiles:
     structured_output: preferred
     mcp: []
     runtime_profile: codex_acp
+  codex_orchestrator_high:
+    provider: codex_acp
+    model: gpt-5.5
+    effort: high
+    temperature: 0.1
+    max_turns: 16
+    structured_output: required
+    mcp: []
+    runtime_profile: codex_acp
   auggie_orchestrator_acp:
     provider: auggie
     model: auggie-default
@@ -1655,6 +1664,31 @@ agents:
       path: ${CHAINWORKS_IMPLEMENTATION_WORKTREE:-.chainworks/worktrees/implementation}
       base_branch: ${CHAINWORKS_BASE_BRANCH:-main}
       write_enabled: true
+    continuation_capability:
+      enabled: true
+      allowed_triggers:
+        - operator_mcp
+        - lead_auto
+      allowed_session_scope:
+        - same_agent
+        - same_agent_family_within_run
+      forbidden_stage_kinds:
+        - release
+        - publish
+        - git_push
+        - upload
+        - distribution
+      live_handle_continuation:
+        enabled: true
+        require_live_session: true
+      provider_session_resurrection:
+        enabled: false
+        allowed_triggers:
+          - operator_mcp
+        require_recorded_provider_session_id: true
+        fail_closed_when_unsupported: true
+      require_same_worktree: true
+      require_no_unresolved_side_effects: true
     required_tools:
       - git status
       - git diff --stat

@@ -215,10 +215,13 @@ name = "auth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "domain",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
@@ -716,6 +719,7 @@ dependencies = [
  "acp",
  "anyhow",
  "async-trait",
+ "auth",
  "chrono",
  "db",
  "dirs",
@@ -1001,6 +1005,7 @@ dependencies = [
  "db",
  "domain",
  "engine",
+ "futures-util",
  "serde",
  "serde_json",
  "sha2",
@@ -1012,6 +1017,7 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+ "workflow",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@
 | Status | Draft |
 | Author | Codex |
 | Depends on | P037 ACP supervision and idle-hang watchdog, P058 output settlement and strict contract authority, P079 contract-aware output repair and provider fallback, P083 execution-truth ownership invariants |
-| Related | P036 UX consolidation, P086 continuation implementation, P087 storage tiering, `docs/reference/output-contracts-failure-evidence-and-recovery.md`, `docs/reference/rust-control-plane.md` |
+| Related | macOS operator navigation in `docs/reference/macos-operator-navigation.md`, agent work continuation in `docs/reference/agent-work-continuation.md`, storage tiering/read-path liveness in `docs/reference/query-projections-and-client-consumption-contract.md` and `docs/reference/rust-control-plane.md`, `docs/reference/output-contracts-failure-evidence-and-recovery.md` |
 | Scope | Contain and diagnose the `code_writer` completion-handoff class where substantive implementation work exists but fresh structured outputs for the current attempt do not settle. |
 | Non-goal | No weakening of output contracts, no acceptance of stale files as fresh truth, no provider-specific hotfixes as the main contract, no global missing-output fix for all agents, and no retroactive silent repair of historical blocked runs. |
 
@@ -55,14 +55,14 @@ Recent blocked attempts show a repeatable signature:
 Three concrete examples reached related parts of this boundary:
 
 - `P087` is the direct fixture family for this proposal, not a live-state claim: its evidence must be split between terminal-completed missing-output attempts and a later dirty-worktree provider-timeout attempt;
-- `P036` and `P086` are evidence seeds for related handoff/readback gaps, but their current local directories are no longer clean missing-output examples because structured outputs now exist and the blockers are different.
+- The macOS operator navigation evidence seed and the agent work continuation evidence seed are related handoff/readback gaps, but their current local directories are no longer clean missing-output examples because structured outputs now exist and the blockers are different.
 
 Evidence seeds for implementation fixtures:
 
 | Proposal | Run ID | Evidence to fixture before implementation |
 |---|---|---|
-| P036 | `8456e930-8a67-42f1-a5fe-83e34597857b` | Related seed only. Current local `implementation/self-assessment.json` and `tests.json` exist, so implementation must extract or recreate the older failed-stage evidence where useful work and output settlement diverged rather than treating the live directory as direct proof. |
-| P086 | `976f3d1b-31d8-43ef-a3d7-c9940c7086ab` | Related seed only. Current local structured outputs exist and the visible blocker includes handoff/evidence tasks and Phase 2 worker gaps, so implementation must materialize a deterministic fixture from the relevant run-report evidence or capture a fresh equivalent. |
+| macOS operator navigation (`p036` proof alias) | `8456e930-8a67-42f1-a5fe-83e34597857b` | Related seed only. Current local `implementation/self-assessment.json` and `tests.json` exist, so implementation must extract or recreate the older failed-stage evidence where useful work and output settlement diverged rather than treating the live directory as direct proof. |
+| Agent work continuation (retained P086 proof alias) | `976f3d1b-31d8-43ef-a3d7-c9940c7086ab` | Related seed only. Current local structured outputs exist and the visible blocker includes handoff/evidence tasks and continuation worker gaps, so implementation must materialize a deterministic fixture from the relevant run-report evidence or capture a fresh equivalent. |
 | P087 terminal-completed missing-output attempts | `b4edcf82-0d3f-4281-83b7-f8fe94721721` | Deterministic fixtures for terminal-completed attempts where `changed_files_manifest` passed while `implementation_progress`, `implementation_self_assessment_v2`, and `tests_result` were missing. Seed paths: `artifact_root/validation_failure_code_writer_70260330-a45f-4dbc-a8d2-6f8f5cd219ea.json` and `artifact_root/evidence/runs/b4edcf82-0d3f-4281-83b7-f8fe94721721/stages/2c7b5ea6-88c6-422b-8195-99eccfa2b9b2/agents/bb0d5f53-e74a-4e5c-a48e-8fcb2bfeda7e/runtime_event/failed-stage-evidence-9ffd066d-573b-43cf-93a1-53204b07c036.json`. |
 | P087 dirty-worktree timeout attempt | `b4edcf82-0d3f-4281-83b7-f8fe94721721` / attempt prefix `70c9b120` | Negative fixture for pre-existing P087 dirty work followed by provider timeout/no terminal text/no new implementation-owned changes after prompt. It must prove P088 does not classify inherited dirty work as current-attempt completion. |
 
@@ -874,7 +874,7 @@ Behavior for historical runs:
 
 Rollout order:
 
-1. create fixtures from the P036/P086/P087 evidence seeds;
+1. create fixtures from the macOS operator navigation (`p036`), agent work continuation (retained `P086` proof alias), and P087 evidence seeds;
 2. add SQLite receipt tables, artifact contract, transcript/runtime diagnostics, and readback fields;
 3. add current-attempt freshness classification using engine pre/post digests and provider-envelope settlement;
 4. wire P037 idle/terminalization into P088 for P087-like stale `implementation_active` attempts;
@@ -916,7 +916,7 @@ Rollout order:
 
 ### 11.2 Integration tests
 
-- `P036`-shaped attempt:
+- macOS operator navigation (`p036`)-shaped attempt:
   - diff exists,
   - stale prior structured outputs exist,
   - completion receipt records stale outputs,
@@ -928,7 +928,7 @@ Rollout order:
   - P088 receipt records `activation_source=p037_idle_terminalization`,
   - completion turn is attempted only if normal final-text extraction cannot materialize outputs,
   - failure records `missing_after_completion_turn` or successful recovery records `completion_turn_result=succeeded`.
-- `P086`-shaped attempt:
+- Agent work continuation-shaped attempt:
   - provider reused session,
   - dedicated completion turn succeeds and the run advances.
 
@@ -1022,7 +1022,7 @@ P088 is complete when:
 
 ## 14. Recommendation
 
-Implement P088 as the next containment and diagnostics fix for the `code_writer` completion-handoff class, with P087 as the direct canary and P036/P086 as related fixture seeds.
+Implement P088 as the next containment and diagnostics fix for the `code_writer` completion-handoff class, with P087 as the direct canary and macOS operator navigation plus agent work continuation as related fixture seeds.
 
 It addresses the real failure boundary:
 

@@ -1,0 +1,25 @@
+{
+  "fixture_description": "P076 scenario where a retry dispatch timed out with ambiguous result (attempt_result=unknown) but a duplicate retry was dispatched in the next poll before reconciliation. Proves timeout ambiguity must suppress duplicate retry.",
+  "proves_retry_timeout_duplicate_not_suppressed": true,
+  "violation": "duplicate_retry_dispatched_after_timeout_ambiguity_without_reconciliation",
+  "hold_condition_triggered": "retry_timeout_duplicate_not_suppressed",
+  "required_behavior": "A future retry-call timeout after possible dispatch is ambiguous, not skipped. The reserved attempt remains consumed or unknown until reconciliation and suppresses duplicate retry for the same run/signature.",
+  "ambiguous_attempt": {
+    "run_id": "run-timeout-dup-001",
+    "blocker_signature_id": "sig-timeout-dup-001",
+    "attempt_id": "attempt-timeout-001",
+    "attempt_result": "unknown",
+    "status": "unknown",
+    "created_at": "2026-05-23T09:00:00Z",
+    "requires_reconciliation": true
+  },
+  "duplicate_attempt": {
+    "run_id": "run-timeout-dup-001",
+    "blocker_signature_id": "sig-timeout-dup-001",
+    "attempt_id": "attempt-timeout-dup-001",
+    "attempt_result": "accepted",
+    "status": "accepted",
+    "created_at": "2026-05-23T09:10:00Z",
+    "dispatched_without_reconciliation_of_prior_unknown": true
+  }
+}

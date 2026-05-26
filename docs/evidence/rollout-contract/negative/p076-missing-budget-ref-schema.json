@@ -1,0 +1,35 @@
+{
+  "fixture_description": "P076 readback that omits budget_ref_v1 shape from blocked_run records. In strict mode this proves the budget_ref_v1 schema is required.",
+  "proves_missing_budget_ref_schema": true,
+  "schema_version": "auto_retry_readback.v1",
+  "generated_at": "2026-05-23T09:00:05Z",
+  "version_negotiation": {
+    "selected_version": "auto_retry_readback.v1",
+    "supported_versions": ["auto_retry_readback.v1"],
+    "unsupported_versions": []
+  },
+  "ledger_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-observations.jsonl",
+  "budget_state_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-budget.json",
+  "known_issue_catalog_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-known-issues.json",
+  "generated_markdown_catalog_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-known-issues.md",
+  "lock_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry.lock",
+  "rollup_report_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-rollup.json",
+  "diagnostics": [],
+  "observations": [
+    {
+      "observation_id": "ar_obs_20260523T090005Z_bad5bad5bad5",
+      "observed_at": "2026-05-23T09:00:05Z",
+      "run_id": "run-missing-budget-ref-001",
+      "stage_id": "state_3_implementation_started",
+      "blocker_signature_id": "sig-missing-budget-ref-001",
+      "blocker_class": "substantive_output_contract",
+      "policy_decision": "observe_only",
+      "retry_action": "none",
+      "retry_result": "not_attempted",
+      "known_issue_status": "observed",
+      "observation_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-observations.jsonl",
+      "MISSING_FIELD_NOTE": "retry_budget field (budget_ref_v1) is absent here — this proves the schema is required"
+    }
+  ],
+  "latest_by_run": []
+}

@@ -1,0 +1,18 @@
+{
+  "fixture_description": "P076 poll that considered more than max_runs_considered_per_poll=25 runs without recording skipped_backpressure work items. Proves backpressure skip records are required.",
+  "proves_missing_skipped_work_record": true,
+  "violation": "runs_considered_exceeded_cap_without_skipped_work_record",
+  "max_runs_considered_per_poll": 25,
+  "actual_runs_considered": 31,
+  "skipped_backpressure_count_recorded": 0,
+  "expected_skipped_backpressure_count": 6,
+  "hold_condition_triggered": "Poll backpressure cap is missing or exceeded",
+  "evidence": {
+    "observation_id": "ar_obs_20260523T090010Z_badabadabadc",
+    "poll_summary": {
+      "active_total_before": 31,
+      "skipped_backpressure_count": 0,
+      "note": "6 runs were processed beyond the cap without recording skipped_backpressure reason"
+    }
+  }
+}

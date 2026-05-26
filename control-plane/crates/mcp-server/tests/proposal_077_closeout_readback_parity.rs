@@ -181,6 +181,11 @@ async fn runs_get_and_list_expose_p077_documented_and_legacy_closeout_summary_na
         &fingerprint_hash,
     );
 
+    // runs.list is projection-based (P087): rebuild projections so closeout summary is baked in.
+    db::repos::projections::rebuild_all_for_run(&pool, run_id)
+        .await
+        .unwrap();
+
     let list_payload = mcp_server::tools::runs::execute(
         "runs.list",
         serde_json::json!({}),

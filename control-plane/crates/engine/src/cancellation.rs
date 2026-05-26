@@ -8,8 +8,8 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::sync::Arc;
 
 use db::repos::{
-    agent_executions, lead_conflict_mediations, projections, runs, scheduler, sessions, stages,
-    work_items,
+    agent_executions, agent_work_continuations, lead_conflict_mediations, projections, runs,
+    scheduler, sessions, stages, work_items,
 };
 use db::write_class::WriteLane;
 use db::writer::class_a_operation;
@@ -111,6 +111,19 @@ pub async fn begin_settlement_tx(
 
     agent_executions::cancel_running_by_run_tx(tx, run_id, requested_at).await?;
     work_items::cancel_running_by_run_tx(tx, run_id, requested_at).await?;
+    let cancelled_continuations = agent_work_continuations::mark_active_for_run_cancelling_tx(
+        tx,
+        &run_id.to_string(),
+        &requested_at.to_rfc3339(),
+    )
+    .await?;
+    if cancelled_continuations > 0 {
+        tracing::info!(
+            run_id = %run_id,
+            cancelled_continuations = cancelled_continuations,
+            "Marked active P086 continuations as cancelling during run cancellation cascade"
+        );
+    }
 
     // REL-001 (P017 R2 audit): cascade-cancel any active lead-mediation
     // records for this run so `lead_conflict_mediations` stays consistent

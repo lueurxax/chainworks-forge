@@ -154,7 +154,12 @@ pub fn observation_from_acp_error_message(message: &str) -> RuntimeFailureObserv
     }
 
     let lower = message.to_ascii_lowercase();
-    if lower.contains("quota") || lower.contains("limit") || lower.contains("retry_after") {
+    if lower.contains("quota")
+        || lower.contains("limit")
+        || lower.contains("retry_after")
+        || lower.contains("exhausted your capacity")
+        || lower.contains("capacity on this model")
+    {
         return RuntimeFailureObservation::ProviderQuota {
             retry_after: extract_retry_after_from_message(message),
         };
@@ -574,6 +579,12 @@ mod tests {
             RuntimeFailureObservation::ProviderQuota {
                 retry_after: Some(_)
             }
+        ));
+        assert!(matches!(
+            observation_from_acp_error_message(
+                "ACP session/prompt error: You have exhausted your capacity on this model."
+            ),
+            RuntimeFailureObservation::ProviderQuota { retry_after: None }
         ));
         assert_eq!(
             observation_from_acp_error_message("ACP session idle timeout: no message"),

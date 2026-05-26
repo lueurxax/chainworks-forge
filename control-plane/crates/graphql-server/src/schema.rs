@@ -1,17 +1,20 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use async_graphql::futures_util::StreamExt;
+use async_graphql::futures_util::{stream, StreamExt};
 use async_graphql::*;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tracing::{debug, info, warn};
 
 use db::repos::{
-    approvals, artifact_contracts, artifacts, closeout, code_writer_completion_receipts, ideas,
-    projections, rollout_contract_checks, runs, sessions as session_repo, steward as steward_repo,
-    workflow_conflicts,
+    agent_work_continuations, approvals, artifact_contracts, artifacts, audit_log, closeout,
+    code_writer_completion_receipts, ideas, projections, rollout_contract_checks, runs,
+    sessions as session_repo, steward as steward_repo, workflow_conflicts,
 };
 use db::writer::DbWriterHeartbeat;
 use domain::commands::{ApprovalResolutionDecision, CallerContext, Command, ResolveApprovalCmd};
@@ -24,6 +27,10 @@ use engine::lifecycle_reporter::LifecycleReporter;
 
 use crate::types::approval::GqlApproval;
 use crate::types::artifact::{GqlArtifact, P085_NO_DEADLINE_JUSTIFICATION};
+use crate::types::continuation::{
+    GqlContinuationCandidatesResult, GqlContinuationMetricsSummary, GqlContinuationRecord,
+    GqlContinuationStatus,
+};
 use crate::types::idea::GqlIdea;
 use crate::types::p031::{
     GqlMutationConflictResultCode, GqlPayloadAvailabilityState, GqlPayloadUnavailableReasonCode,
@@ -36,12 +43,104 @@ use crate::types::session::{
     GqlSessionStatusChangedEvent, P046Config, P046LiveCredential, P046LivePrincipalHandle,
     SESSION_EVENTS_MAX_FIRST, SESSION_GENERATIONS_MAX_FIRST, SESSION_LINEAGES_MAX_FIRST,
 };
-use crate::types::stage::{GqlAgentExecution, GqlStageExecution};
+use crate::types::stage::{
+    GqlAgentExecution, GqlRunStageTopologyNode, GqlRunStageTopologyOccurrence,
+    GqlRunStageTopologyTransition, GqlStageExecution,
+};
 use crate::types::steward::{
     GqlStewardAnalysis, GqlStewardAnalysisRunLink, GqlStewardRecommendation,
 };
 
 pub type AppSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
+
+static P081_SUBSCRIPTION_SEQUENCE: AtomicI64 = AtomicI64::new(0);
+static P081_GRAPHQL_SAFE_MODE_ALERT_OPENED_AT_MS: OnceLock<Mutex<Option<i64>>> = OnceLock::new();
+
+/// P081 server-side field redaction collector.
+///
+/// Resolver code records field-level redactions here without raising GraphQL
+/// errors. The HTTP handler attaches the collected entries to
+/// `extensions.redactions`, preserving the distinction between ordinary nulls
+/// and policy-redacted nulls for Swift clients.
+#[derive(Clone, Default)]
+pub struct P081GraphqlRedactionCollector {
+    redactions: Arc<Mutex<Vec<async_graphql::Value>>>,
+}
+
+impl P081GraphqlRedactionCollector {
+    pub fn push_field_null_redaction(
+        &self,
+        path: Vec<&str>,
+        row_id: Option<&str>,
+        caller_class: &str,
+    ) {
+        let mut object = async_graphql::indexmap::IndexMap::new();
+        object.insert(
+            async_graphql::Name::new("path"),
+            async_graphql::Value::List(
+                path.into_iter()
+                    .map(|segment| async_graphql::Value::String(segment.to_string()))
+                    .collect(),
+            ),
+        );
+        object.insert(
+            async_graphql::Name::new("reasonCode"),
+            async_graphql::Value::String("OBSERVER_SCOPE".to_string()),
+        );
+        if let Some(row_id) = row_id {
+            object.insert(
+                async_graphql::Name::new("rowId"),
+                async_graphql::Value::String(row_id.to_string()),
+            );
+        }
+        object.insert(
+            async_graphql::Name::new("redactionMode"),
+            async_graphql::Value::String("field_null_redacted".to_string()),
+        );
+        object.insert(
+            async_graphql::Name::new("callerClass"),
+            async_graphql::Value::String(caller_class.to_string()),
+        );
+        object.insert(
+            async_graphql::Name::new("redactionId"),
+            async_graphql::Value::String(format!(
+                "p081:{}:{}",
+                caller_class,
+                row_id.unwrap_or("unknown")
+            )),
+        );
+        db::metrics::increment_counter("graphql_redaction_extensions_total");
+        self.redactions
+            .lock()
+            .expect("p081 redaction collector poisoned")
+            .push(async_graphql::Value::Object(object));
+    }
+
+    pub fn snapshot(&self) -> Vec<async_graphql::Value> {
+        self.redactions
+            .lock()
+            .expect("p081 redaction collector poisoned")
+            .clone()
+    }
+}
+
+pub fn attach_p081_collected_redactions(
+    response: &mut async_graphql::Response,
+    collector: &P081GraphqlRedactionCollector,
+) {
+    let collected = collector.snapshot();
+    if collected.is_empty() {
+        return;
+    }
+    match response.extensions.get_mut("redactions") {
+        Some(async_graphql::Value::List(existing)) => existing.extend(collected),
+        _ => {
+            response
+                .extensions
+                .insert("redactions".into(), async_graphql::Value::List(collected));
+        }
+    }
+}
 
 pub fn build_schema(
     pool: SqlitePool,
@@ -50,7 +149,15 @@ pub fn build_schema(
     principal_table: auth::PrincipalTable,
     reporter: LifecycleReporter,
 ) -> AppSchema {
-    build_schema_inner(pool, cmd_handler, events, principal_table, reporter, None)
+    build_schema_inner(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        None,
+        Some(embedded_shadow_boundary_policy()),
+    )
 }
 
 pub fn build_schema_with_storage_writer(
@@ -68,6 +175,29 @@ pub fn build_schema_with_storage_writer(
         principal_table,
         reporter,
         Some(storage_writer_heartbeat),
+        Some(embedded_shadow_boundary_policy()),
+    )
+}
+
+/// P081 Phase 3: build the schema with a shared BoundaryPolicy service injected so
+/// mutation_allowed and query guards can consult the daemon-level policy decision.
+pub fn build_schema_with_storage_writer_and_boundary_policy(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
+    boundary_policy: Arc<auth::boundary::BoundaryPolicy>,
+) -> AppSchema {
+    build_schema_inner(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        Some(storage_writer_heartbeat),
+        Some(boundary_policy),
     )
 }
 
@@ -100,6 +230,41 @@ pub fn build_schema_with_storage_writer_and_handle(
         principal_table,
         reporter,
         Some(storage_writer_heartbeat),
+        Some(embedded_shadow_boundary_policy()),
+        p046,
+        live_handle.clone(),
+    );
+    (schema, live_handle)
+}
+
+pub fn build_schema_with_storage_writer_boundary_policy_and_handle(
+    pool: SqlitePool,
+    cmd_handler: Arc<CommandHandler>,
+    events: EventSender,
+    principal_table: auth::PrincipalTable,
+    reporter: LifecycleReporter,
+    storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
+    boundary_policy: Arc<auth::boundary::BoundaryPolicy>,
+) -> (AppSchema, P046LivePrincipalHandle) {
+    let p046 = P046Config {
+        enabled: matches!(
+            std::env::var("CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY")
+                .unwrap_or_default()
+                .to_lowercase()
+                .as_str(),
+            "1" | "true" | "yes"
+        ),
+        subscription_channel_capacity: 64,
+    };
+    let live_handle = P046LivePrincipalHandle::new(principal_table.clone());
+    let schema = build_schema_inner_with_p046_and_handle(
+        pool,
+        cmd_handler,
+        events,
+        principal_table,
+        reporter,
+        Some(storage_writer_heartbeat),
+        Some(boundary_policy),
         p046,
         live_handle.clone(),
     );
@@ -113,6 +278,7 @@ fn build_schema_inner(
     principal_table: auth::PrincipalTable,
     reporter: LifecycleReporter,
     storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
+    boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
 ) -> AppSchema {
     let p046 = P046Config {
         enabled: matches!(
@@ -131,6 +297,7 @@ fn build_schema_inner(
         principal_table,
         reporter,
         storage_writer_heartbeat,
+        boundary_policy,
         p046,
     )
 }
@@ -142,6 +309,7 @@ fn build_schema_inner_with_p046(
     principal_table: auth::PrincipalTable,
     reporter: LifecycleReporter,
     storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
+    boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
     p046: P046Config,
 ) -> AppSchema {
     let live_handle = P046LivePrincipalHandle::new(principal_table.clone());
@@ -152,6 +320,7 @@ fn build_schema_inner_with_p046(
         principal_table,
         reporter,
         storage_writer_heartbeat,
+        boundary_policy,
         p046,
         live_handle,
     )
@@ -164,6 +333,7 @@ fn build_schema_inner_with_p046_and_handle(
     principal_table: auth::PrincipalTable,
     reporter: LifecycleReporter,
     storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
+    boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
     p046: P046Config,
     live_handle: P046LivePrincipalHandle,
 ) -> AppSchema {
@@ -187,6 +357,9 @@ fn build_schema_inner_with_p046_and_handle(
     if let Some(heartbeat) = storage_writer_heartbeat {
         builder = builder.data(heartbeat);
     }
+    if let Some(policy) = boundary_policy {
+        builder = builder.data(policy);
+    }
     builder.finish()
 }
 
@@ -204,6 +377,7 @@ pub fn build_schema_with_session_observability(
         principal_table,
         reporter,
         None,
+        Some(embedded_shadow_boundary_policy()),
         P046Config {
             enabled: true,
             subscription_channel_capacity: 64,
@@ -228,6 +402,7 @@ pub fn build_schema_with_session_observability_and_live_handle(
         principal_table,
         reporter,
         None,
+        Some(embedded_shadow_boundary_policy()),
         P046Config {
             enabled: true,
             subscription_channel_capacity: 64,
@@ -254,7 +429,15 @@ pub fn build_schema_with_p046_config(
         principal_table,
         reporter,
         None,
+        Some(embedded_shadow_boundary_policy()),
         p046,
+    )
+}
+
+fn embedded_shadow_boundary_policy() -> Arc<auth::boundary::BoundaryPolicy> {
+    Arc::new(
+        auth::boundary::BoundaryPolicy::from_embedded_with_mode(auth::boundary::PolicyMode::Shadow)
+            .expect("embedded P081 boundary fixture must be valid"),
     )
 }
 
@@ -293,18 +476,859 @@ fn p046_resolver_deadline() -> tokio::time::Instant {
     tokio::time::Instant::now() + std::time::Duration::from_secs(2)
 }
 
-fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
+fn boundary_denial_error(
+    reason_code: &str,
+    row_id: Option<&str>,
+    caller_class: Option<&str>,
+) -> async_graphql::Error {
+    async_graphql::Error::new("forbidden").extend_with(|_, e| {
+        e.set("code", "FORBIDDEN");
+        e.set("reasonCode", reason_code);
+        if let Some(rid) = row_id {
+            e.set("rowId", rid);
+        }
+        if let Some(cc) = caller_class {
+            e.set("callerClass", cc);
+        }
+    })
+}
+
+fn record_p081_caller_class_diagnostics(
+    principal: &auth::Principal,
+    caller_class: &auth::CallerClass,
+    transport: &str,
+) {
+    let default = auth::derive_caller_class_from_principal_class(&principal.class);
+    if principal.caller_class_override.is_some() && default != *caller_class {
+        let principal_class = format!("{:?}", principal.class).to_lowercase();
+        db::metrics::record_p081_auth_ambiguous_caller_warn(
+            &principal_class,
+            "principal_override",
+            transport,
+        );
+    }
+}
+
+/// P081 MEDIUM-001: Write a best-effort audit row for legacy/shadow deny paths.
+/// Unlike write_graphql_deny_audit, audit failure here only produces a warning log
+/// rather than failing the request, because these are legacy guard denials where
+/// the audit path does not yet have full bounded-seam status.
+async fn write_graphql_legacy_deny_audit(
+    ctx: &Context<'_>,
+    principal: &auth::Principal,
+    transport: &str,
+    action_attempted: &str,
+    reason_code: &str,
+    row_id: Option<&str>,
+    caller_class_str: &str,
+    policy: &auth::boundary::BoundaryPolicy,
+) {
+    let Ok(pool) = ctx.data::<SqlitePool>() else {
+        return;
+    };
+    let id = uuid::Uuid::now_v7().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let request_id_buf = ctx
+        .data::<crate::request_id::RequestId>()
+        .ok()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let token_id_buf = ctx
+        .data::<crate::auth_layer::GraphqlTokenId>()
+        .ok()
+        .map(|t| t.0.clone());
+    let principal_id_str = principal.id.to_string();
+    let principal_class_str = principal.class.to_string();
+    let mode_str = policy.mode().as_str().to_string();
+    let raw_payload = serde_json::json!({
+        "event": "boundary_decision_legacy_deny",
+        "decision": "deny",
+        "transport": transport,
+        "action_attempted": action_attempted,
+        "reason_code": reason_code,
+        "row_id": row_id,
+    })
+    .to_string();
+    let (stored_payload, _, truncated) = audit_log::build_envelope(&raw_payload);
+    let entry = audit_log::AuditEntry {
+        id: &id,
+        request_id: &request_id_buf,
+        timestamp_ms: now_ms,
+        event_type: "boundary_decision_deny",
+        principal_id: Some(&principal_id_str),
+        principal_class: Some(&principal_class_str),
+        caller_class: Some(caller_class_str),
+        token_id: token_id_buf.as_deref(),
+        transport,
+        action_attempted,
+        decision: "deny",
+        denial_reason_code: Some(reason_code),
+        row_id,
+        env_gate_state: None,
+        source_ip_hash_or_local_process_id: None,
+        boundary_policy_mode: &mode_str,
+        fixture_version: "p081-boundary-matrix-v1",
+        payload: &stored_payload,
+        original_payload_bytes: if truncated { Some(&raw_payload) } else { None },
+        diagnostic_truncated: truncated,
+        checkpoint_id: None,
+        created_at_ms: now_ms,
+    };
+    if let Err(e) = audit_log::append(pool, &entry).await {
+        db::metrics::record_p081_audit_log_append_failure(
+            "boundary_decision_deny",
+            transport,
+            &mode_str,
+        );
+        tracing::warn!(
+            error = %e,
+            transport,
+            reason_code,
+            "P081: legacy/shadow GraphQL deny audit write failed (best-effort)"
+        );
+    }
+}
+
+/// P081: Write a durable deny audit row to audit_log.
+/// Fail-closed: if the audit write fails, the caller receives E_AUDIT_UNAVAILABLE
+/// rather than the original denial reason. This ensures no boundary denial is
+/// returned without a committed audit row.
+/// Uses a standalone bounded append (not a write-unit transaction) because the
+/// deny path has not opened a command transaction.
+async fn write_graphql_deny_audit(
+    pool: &SqlitePool,
+    ctx: &Context<'_>,
+    principal: &auth::Principal,
+    transport: &str,
+    action_attempted: &str,
+    reason_code: &str,
+    row_id: Option<&str>,
+    caller_class_str: &str,
+    policy: &auth::boundary::BoundaryPolicy,
+) -> async_graphql::Result<()> {
+    let id = uuid::Uuid::now_v7().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let request_id_buf = ctx
+        .data::<crate::request_id::RequestId>()
+        .ok()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // SEC-P081-M002: extract derived token_id for audit correlation. Not the raw token.
+    let token_id_buf = ctx
+        .data::<crate::auth_layer::GraphqlTokenId>()
+        .ok()
+        .map(|t| t.0.clone());
+    let principal_id_str = principal.id.to_string();
+    let principal_class_str = principal.class.to_string();
+    let mode_str = policy.mode().as_str().to_string();
+    let raw_payload = serde_json::json!({
+        "event": "boundary_decision",
+        "decision": "deny",
+        "transport": transport,
+        "action_attempted": action_attempted,
+        "reason_code": reason_code,
+        "row_id": row_id,
+    })
+    .to_string();
+    let (stored_payload, _, truncated) = audit_log::build_envelope(&raw_payload);
+    let entry = audit_log::AuditEntry {
+        id: &id,
+        request_id: &request_id_buf,
+        timestamp_ms: now_ms,
+        event_type: "boundary_decision_deny",
+        principal_id: Some(&principal_id_str),
+        principal_class: Some(&principal_class_str),
+        caller_class: Some(caller_class_str),
+        token_id: token_id_buf.as_deref(),
+        transport,
+        action_attempted,
+        decision: "deny",
+        denial_reason_code: Some(reason_code),
+        row_id,
+        env_gate_state: None,
+        source_ip_hash_or_local_process_id: None,
+        boundary_policy_mode: &mode_str,
+        fixture_version: "p081-boundary-matrix-v1",
+        payload: &stored_payload,
+        original_payload_bytes: if truncated { Some(&raw_payload) } else { None },
+        diagnostic_truncated: truncated,
+        checkpoint_id: None,
+        created_at_ms: now_ms,
+    };
+    audit_log::append(pool, &entry).await.map_err(|e| {
+        db::metrics::record_p081_audit_log_append_failure(
+            "boundary_decision_deny",
+            transport,
+            &mode_str,
+        );
+        tracing::error!(
+            error = %e,
+            transport,
+            reason_code,
+            "P081: GraphQL deny audit write failed; failing closed with E_AUDIT_UNAVAILABLE"
+        );
+        async_graphql::Error::new("audit unavailable").extend_with(|_, ext| {
+            ext.set("code", "E_AUDIT_UNAVAILABLE");
+            ext.set("requestId", request_id_buf.as_str());
+        })
+    })
+}
+
+async fn boundary_runtime_readback_json(
+    pool: &SqlitePool,
+    boundary_policy: Option<&auth::boundary::BoundaryPolicy>,
+) -> Result<serde_json::Value> {
+    let audit_health = audit_log::health_snapshot(pool)
+        .await
+        .map_err(|e| Error::new(e.to_string()))?;
+    let integrity_state = audit_log::verify_latest_checkpoint(pool).await;
+    let safe_mode_active = boundary_policy
+        .map(|policy| matches!(policy.mode(), auth::boundary::PolicyMode::ReadOnlySafeMode))
+        .unwrap_or(false)
+        || audit_health.payload_budget_state == "read_only_safe_mode";
+    let latest_sequence = P081_SUBSCRIPTION_SEQUENCE.load(Ordering::SeqCst);
+    let oldest_retained_sequence = p081_oldest_retained_sequence(latest_sequence);
+
+    Ok(serde_json::json!({
+        "schemaVersion": "boundary_runtime.v1",
+        "matrixId": boundary_policy.map(|_| "p081-boundary-matrix-v1"),
+        "policyInjected": boundary_policy.is_some(),
+        "policyMode": boundary_policy.map(|policy| policy.mode().as_str()),
+        "safeModeActive": safe_mode_active,
+        "safeModeReason": if audit_health.payload_budget_state == "read_only_safe_mode" {
+            Some("AUDIT_BUDGET_EXHAUSTED")
+        } else if safe_mode_active {
+            Some("BOUNDARY_POLICY_SAFE_MODE")
+        } else {
+            None
+        },
+        "fixtureDigest": boundary_policy.map(|policy| policy.fixture_digest()),
+        "subscriptionReplay": p081_subscription_replay_readback(
+            None,
+            oldest_retained_sequence,
+            latest_sequence,
+            latest_sequence
+        ),
+        "auditLogHealth": {
+            "schemaVersion": "audit_log_health.v1",
+            "rowCount": audit_health.row_count,
+            "latestRowId": audit_health.latest_row_id,
+            "latestCheckpointSeq": audit_health.latest_checkpoint_seq,
+            "latestCheckpointHash": audit_health.latest_checkpoint_hash,
+            "integrityState": integrity_state.as_str(),
+            "writable": audit_health.writable,
+            "lastWriteOkAtMs": audit_health.last_write_ok_at_ms,
+            "consecutiveFailures": audit_health.consecutive_failures,
+            "cumulativeFailures": audit_health.cumulative_failures,
+            "retentionMinDays": audit_health.retention_min_days,
+            "cleanupState": audit_health.cleanup_state,
+            "cleanupEligibleRowCount": audit_health.cleanup_eligible_row_count,
+            "cleanupProtectedRowCount": audit_health.cleanup_protected_row_count,
+            "budgetBytes": audit_health.budget_bytes,
+            "usedBytes": audit_health.used_bytes,
+            "payloadBudgetBytes": audit_health.payload_budget_bytes,
+            "payloadUsedBytes": audit_health.payload_used_bytes,
+            "payloadBudgetState": audit_health.payload_budget_state,
+            "payloadBudgetUsedPercent": audit_health.payload_budget_used_percent,
+            "halfOpenProbeSuccessCount": audit_health.half_open_probe_success_count,
+            "shadowCoverageReportRef": audit_health.shadow_coverage_report_ref,
+        }
+    }))
+}
+
+fn p081_subscription_replay_readback(
+    requested_cursor: Option<&str>,
+    oldest_retained_sequence: i64,
+    latest_sequence: i64,
+    projection_generation: i64,
+) -> serde_json::Value {
+    let requested_sequence =
+        requested_cursor.and_then(|cursor| cursor.strip_prefix("seq-")?.parse::<i64>().ok());
+    let gap_detected = requested_sequence
+        .map(|sequence| sequence < oldest_retained_sequence || sequence > latest_sequence)
+        .unwrap_or(false);
+    serde_json::json!({
+        "schemaVersion": "subscription_replay_runtime_v1",
+        "sequenceCursor": format!("seq-{latest_sequence}"),
+        "projectionGeneration": projection_generation,
+        "gapDetected": gap_detected,
+        "requestedCursor": requested_cursor,
+        "oldestRetainedCursor": format!("seq-{oldest_retained_sequence}"),
+        "retentionMinutes": 15,
+        "retentionEventCount": 10000,
+        "requiresFullRefetch": gap_detected
+    })
+}
+
+fn p081_oldest_retained_sequence(latest_sequence: i64) -> i64 {
+    latest_sequence.saturating_sub(9_999).max(0)
+}
+
+fn p081_next_subscription_sequence() -> i64 {
+    P081_SUBSCRIPTION_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn p081_record_safe_mode_alert_lifecycle(active: bool, now_ms: i64) {
+    let slot = P081_GRAPHQL_SAFE_MODE_ALERT_OPENED_AT_MS.get_or_init(|| Mutex::new(None));
+    let mut opened = slot.lock().expect("p081 safe-mode alert lifecycle poisoned");
+    match (active, *opened) {
+        (true, None) => *opened = Some(now_ms),
+        (false, Some(opened_at)) => {
+            *opened = None;
+            let elapsed_ms = now_ms.saturating_sub(opened_at).max(0);
+            db::metrics::record_p081_operator_alert_clear_latency(
+                "p081-boundary-safe-mode-active",
+                "critical",
+                std::time::Duration::from_millis(elapsed_ms as u64),
+            );
+        }
+        _ => {}
+    }
+}
+
+async fn p081_operator_alerts_json(
+    pool: &SqlitePool,
+    boundary_policy: Option<&auth::boundary::BoundaryPolicy>,
+) -> Result<serde_json::Value> {
+    let runtime = boundary_runtime_readback_json(pool, boundary_policy).await?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut alerts = Vec::new();
+
+    let safe_mode_active = runtime["safeModeActive"].as_bool().unwrap_or(false);
+    p081_record_safe_mode_alert_lifecycle(safe_mode_active, now_ms);
+
+    if safe_mode_active {
+        alerts.push(serde_json::json!({
+            "schemaVersion": "operator_alert_v1",
+            "id": "p081-safe-mode-active",
+            "dedupeKey": "p081.boundary.safe_mode_active",
+            "severity": "critical",
+            "title": "Boundary policy is in safe mode",
+            "message": "State-changing GraphQL and MCP operations are denied until boundary policy health is restored.",
+            "source": "boundaryRuntime",
+            "active": true,
+            "silenceable": false,
+            "acknowledgedAtMs": null,
+            "silencedUntilMs": null,
+            "nativeDelivery": {
+                "schemaVersion": "operator_alert_native_delivery_v1",
+                "deliveryKey": "p081.boundary.safe_mode_active",
+                "dockBadgeContribution": 1,
+                "requestUserAttention": "critical",
+                "notificationCategory": "BOUNDARY_POLICY_CRITICAL",
+                "dedupePolicy": "dedupe_key_until_clear"
+            },
+            "lifecycle": {
+                "state": "active_unacknowledged",
+                "dedupeKey": "p081.boundary.safe_mode_active",
+                "ackRequired": true,
+                "clearCondition": "boundaryRuntime.safeModeActive=false"
+            },
+            "createdAtMs": now_ms,
+            "clearCondition": "boundaryRuntime.safeModeActive=false",
+            "boundaryRuntime": runtime,
+        }));
+    }
+
+    if runtime["auditLogHealth"]["integrityState"] == "tamper_suspected" {
+        alerts.push(serde_json::json!({
+            "schemaVersion": "operator_alert_v1",
+            "id": "p081-audit-tamper-suspected",
+            "dedupeKey": "p081.audit.integrity.tamper_suspected",
+            "severity": "critical",
+            "title": "Audit log integrity requires operator review",
+            "message": "Boundary audit checkpoint verification reported tamper_suspected. Writes remain fail-closed until repaired.",
+            "source": "auditLogHealth",
+            "active": true,
+            "silenceable": false,
+            "acknowledgedAtMs": null,
+            "silencedUntilMs": null,
+            "nativeDelivery": {
+                "schemaVersion": "operator_alert_native_delivery_v1",
+                "deliveryKey": "p081.audit.integrity.tamper_suspected",
+                "dockBadgeContribution": 1,
+                "requestUserAttention": "critical",
+                "notificationCategory": "BOUNDARY_POLICY_CRITICAL",
+                "dedupePolicy": "dedupe_key_until_clear"
+            },
+            "lifecycle": {
+                "state": "active_unacknowledged",
+                "dedupeKey": "p081.audit.integrity.tamper_suspected",
+                "ackRequired": true,
+                "clearCondition": "auditLogHealth.integrityState=verified"
+            },
+            "createdAtMs": now_ms,
+            "clearCondition": "auditLogHealth.integrityState=verified",
+            "boundaryRuntime": runtime,
+        }));
+    }
+
+    Ok(serde_json::Value::Array(alerts))
+}
+
+fn redact_p081_operator_alerts_for_observer(
+    alerts: &mut serde_json::Value,
+    authorization: &GraphqlReadAuthorization,
+    collector: Option<&P081GraphqlRedactionCollector>,
+) {
+    if authorization.caller_class != "observer" {
+        return;
+    }
+    let Some(alerts_array) = alerts.as_array_mut() else {
+        return;
+    };
+    for (idx, alert) in alerts_array.iter_mut().enumerate() {
+        if let Some(object) = alert.as_object_mut() {
+            if object.contains_key("message") {
+                object.insert("message".to_string(), serde_json::Value::Null);
+                if let Some(collector) = collector {
+                    collector.push_field_null_redaction(
+                        vec!["operatorAlerts", &idx.to_string(), "message"],
+                        authorization.row_id.as_deref(),
+                        authorization.caller_class.as_str(),
+                    );
+                }
+            }
+            if object.contains_key("nativeDelivery") {
+                object.insert("nativeDelivery".to_string(), serde_json::Value::Null);
+                if let Some(collector) = collector {
+                    collector.push_field_null_redaction(
+                        vec!["operatorAlerts", &idx.to_string(), "nativeDelivery"],
+                        authorization.row_id.as_deref(),
+                        authorization.caller_class.as_str(),
+                    );
+                }
+            }
+            if let Some(lifecycle) = object.get_mut("lifecycle").and_then(|v| v.as_object_mut()) {
+                if lifecycle.contains_key("clearCondition") {
+                    lifecycle.insert("clearCondition".to_string(), serde_json::Value::Null);
+                    if let Some(collector) = collector {
+                        collector.push_field_null_redaction(
+                            vec![
+                                "operatorAlerts",
+                                &idx.to_string(),
+                                "lifecycle",
+                                "clearCondition",
+                            ],
+                            authorization.row_id.as_deref(),
+                            authorization.caller_class.as_str(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GraphqlReadAuthorization {
+    caller_class: String,
+    row_id: Option<String>,
+}
+
+async fn require_operator_read(ctx: &Context<'_>) -> Result<()> {
+    require_graphql_read(ctx, None).await.map(|_| ())
+}
+
+async fn require_observer_opt_in_read(ctx: &Context<'_>) -> Result<GraphqlReadAuthorization> {
     let principal = ctx
         .data::<auth::Principal>()
         .map_err(|_| Error::new("unauthorized"))?;
-    if principal.class != auth::PrincipalClass::Operator {
-        return Err(Error::new("forbidden"));
+    let caller_class = auth::derive_caller_class(principal);
+    record_p081_caller_class_diagnostics(principal, &caller_class, "graphql_query");
+    let action = if caller_class.as_str() == "observer" {
+        Some("graphql.read_only")
+    } else {
+        None
+    };
+    require_graphql_read(ctx, action).await
+}
+
+async fn require_graphql_read(
+    ctx: &Context<'_>,
+    action: Option<&str>,
+) -> Result<GraphqlReadAuthorization> {
+    let principal = ctx
+        .data::<auth::Principal>()
+        .map_err(|_| Error::new("unauthorized"))?;
+    let caller_class = auth::derive_caller_class(principal);
+
+    // P081 Phase 3: evaluate BoundaryPolicy for ALL callers including Operators.
+    // In shadow mode decisions are logged but not enforced; in legacy_compat mode
+    // the legacy P072 guards below remain authoritative.
+    if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+        let started = std::time::Instant::now();
+        let decision = policy.evaluate(caller_class.as_str(), "graphql_query", action);
+        let elapsed = started.elapsed();
+        db::metrics::record_p081_boundary_decision_latency(
+            "graphql_query",
+            caller_class.as_str(),
+            policy.mode().as_str(),
+            elapsed,
+        );
+        match decision {
+            auth::boundary::PolicyDecision::Allow { row_id } => {
+                db::metrics::record_p081_boundary_decision(
+                    "graphql_query",
+                    row_id.as_deref(),
+                    caller_class.as_str(),
+                    action.unwrap_or("query"),
+                    "allow",
+                    None,
+                    policy.mode().as_str(),
+                );
+                return Ok(GraphqlReadAuthorization {
+                    caller_class: caller_class.as_str().to_string(),
+                    row_id,
+                });
+            }
+            auth::boundary::PolicyDecision::Deny {
+                reason_code,
+                row_id,
+                ..
+            } => {
+                db::metrics::record_p081_boundary_decision(
+                    "graphql_query",
+                    row_id.as_deref(),
+                    caller_class.as_str(),
+                    action.unwrap_or("query"),
+                    "deny",
+                    Some(reason_code.as_str()),
+                    policy.mode().as_str(),
+                );
+                // P081: write durable deny audit before returning the denial.
+                // Fail-closed: if the audit write fails, return E_AUDIT_UNAVAILABLE.
+                if let Ok(pool) = ctx.data::<SqlitePool>() {
+                    write_graphql_deny_audit(
+                        pool,
+                        ctx,
+                        principal,
+                        "graphql_query",
+                        "query",
+                        &reason_code,
+                        row_id.as_deref(),
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await?;
+                }
+                return Err(boundary_denial_error(
+                    &reason_code,
+                    row_id.as_deref(),
+                    Some(caller_class.as_str()),
+                ));
+            }
+            auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                // Shadow mode: log the matrix decision but retain the pre-P081
+                // legacy Operator-only guard for non-operators so that shadow
+                // mode cannot weaken pre-P081 authorization (P081-SEC-M1).
+                match *matched_decision {
+                    auth::boundary::PolicyDecision::Deny {
+                        reason_code,
+                        row_id,
+                        ..
+                    } => {
+                        db::metrics::record_p081_boundary_decision(
+                            "graphql_query",
+                            row_id.as_deref(),
+                            caller_class.as_str(),
+                            action.unwrap_or("query"),
+                            "shadow_deny",
+                            Some(reason_code.as_str()),
+                            policy.mode().as_str(),
+                        );
+                        tracing::debug!(
+                            caller_class = caller_class.as_str(),
+                            transport = "graphql_query",
+                            reason_code = %reason_code,
+                            row_id = ?row_id,
+                            "BoundaryPolicy shadow: matrix would deny this graphql_query request"
+                        );
+                        if principal.class == auth::PrincipalClass::Operator {
+                            db::metrics::record_p081_boundary_policy_enforcement_parity(
+                                "allow",
+                                "deny",
+                            );
+                            db::metrics::record_p081_boundary_shadow_disagreement(
+                                "graphql_query",
+                                row_id.as_deref(),
+                                caller_class.as_str(),
+                                action.unwrap_or("query"),
+                                "allow",
+                                "deny",
+                                Some(reason_code.as_str()),
+                            );
+                        }
+                        // Preserve legacy fail-closed: non-Operator callers that the
+                        // matrix would deny must still be denied in shadow mode.
+                        if principal.class != auth::PrincipalClass::Operator {
+                            db::metrics::record_p081_boundary_policy_enforcement_parity(
+                                "deny",
+                                "deny",
+                            );
+                            // MEDIUM-001: best-effort audit for shadow-mode denials.
+                            write_graphql_legacy_deny_audit(
+                                ctx,
+                                principal,
+                                "graphql_query",
+                                "query",
+                                &reason_code,
+                                row_id.as_deref(),
+                                caller_class.as_str(),
+                                &policy,
+                            )
+                            .await;
+                            return Err(boundary_denial_error(
+                                &reason_code,
+                                row_id.as_deref(),
+                                Some(caller_class.as_str()),
+                            ));
+                        }
+                    }
+                    auth::boundary::PolicyDecision::Allow { row_id } => {
+                        db::metrics::record_p081_boundary_policy_enforcement_parity(
+                            if principal.class == auth::PrincipalClass::Operator {
+                                "allow"
+                            } else {
+                                "deny"
+                            },
+                            "allow",
+                        );
+                        db::metrics::record_p081_boundary_decision(
+                            "graphql_query",
+                            row_id.as_deref(),
+                            caller_class.as_str(),
+                            action.unwrap_or("query"),
+                            "shadow_allow",
+                            None,
+                            policy.mode().as_str(),
+                        );
+                        return Ok(GraphqlReadAuthorization {
+                            caller_class: caller_class.as_str().to_string(),
+                            row_id,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            auth::boundary::PolicyDecision::LegacyPassthrough => {
+                db::metrics::record_p081_boundary_no_op_label(
+                    "chainworks-forge",
+                    &chrono::Utc::now().format("%Y-%m").to_string(),
+                );
+                // Legacy compat: operator-only, matching the pre-P081 P072 guard.
+                // Observer and Agent principals are denied; only Operators may pass through
+                // to the P072 surface policy check below. Exempting observer here would allow
+                // observer queries when no surface_policy is configured (fail-open gap).
+                if principal.class != auth::PrincipalClass::Operator {
+                    // MEDIUM-001: best-effort audit for legacy-passthrough denials.
+                    write_graphql_legacy_deny_audit(
+                        ctx,
+                        principal,
+                        "graphql_query",
+                        "query",
+                        "CAPABILITY_OUT_OF_SCOPE",
+                        None,
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await;
+                    return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
+                }
+            }
+        }
+    } else if principal.class != auth::PrincipalClass::Operator {
+        db::metrics::record_p081_boundary_policy_evaluation_error("graphql_query", "policy_missing");
+        // No BoundaryPolicy available — fall back to operator-only guard.
+        // No audit written here: this seam does not yet have bounded DB access.
+        return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
     }
+
     // P072: enforce allow_queries surface policy when present.
     if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
         if let Some(allowed) = auth::is_query_allowed_by_surface_policy(table, &principal.id) {
             if !allowed {
-                return Err(Error::new("forbidden"));
+                // MEDIUM-001: best-effort audit for P072 surface-policy denials.
+                if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+                    let caller_class = auth::derive_caller_class(principal);
+                    write_graphql_legacy_deny_audit(
+                        ctx,
+                        principal,
+                        "graphql_query",
+                        "query",
+                        "CAPABILITY_OUT_OF_SCOPE",
+                        None,
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await;
+                }
+                return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
+            }
+        }
+    }
+    Ok(GraphqlReadAuthorization {
+        caller_class: caller_class.as_str().to_string(),
+        row_id: None,
+    })
+}
+
+/// P081 Phase 3: Evaluate BoundaryPolicy for graphql_subscription transport.
+/// Subscriptions use a separate transport so the matrix can apply
+/// different allow/deny rows from graphql_query.
+async fn require_subscription_read(ctx: &Context<'_>) -> Result<()> {
+    let principal = ctx
+        .data::<auth::Principal>()
+        .map_err(|_| Error::new("unauthorized"))?;
+
+    if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+        let caller_class = auth::derive_caller_class(principal);
+        record_p081_caller_class_diagnostics(principal, &caller_class, "graphql_subscription");
+        let started = std::time::Instant::now();
+        let decision = policy.evaluate(caller_class.as_str(), "graphql_subscription", None);
+        let elapsed = started.elapsed();
+        db::metrics::record_p081_boundary_decision_latency(
+            "graphql_subscription",
+            caller_class.as_str(),
+            policy.mode().as_str(),
+            elapsed,
+        );
+        match decision {
+            auth::boundary::PolicyDecision::Allow { .. } => {}
+            auth::boundary::PolicyDecision::Deny {
+                reason_code,
+                row_id,
+                ..
+            } => {
+                // P081: write durable deny audit before returning the denial.
+                // Fail-closed: if the audit write fails, return E_AUDIT_UNAVAILABLE.
+                if let Ok(pool) = ctx.data::<SqlitePool>() {
+                    write_graphql_deny_audit(
+                        pool,
+                        ctx,
+                        principal,
+                        "graphql_subscription",
+                        "subscription",
+                        &reason_code,
+                        row_id.as_deref(),
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await?;
+                }
+                return Err(boundary_denial_error(
+                    &reason_code,
+                    row_id.as_deref(),
+                    Some(caller_class.as_str()),
+                ));
+            }
+            auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                if let auth::boundary::PolicyDecision::Deny {
+                    reason_code,
+                    row_id,
+                    ..
+                } = *matched_decision
+                {
+                    tracing::debug!(
+                        caller_class = caller_class.as_str(),
+                        transport = "graphql_subscription",
+                        reason_code = %reason_code,
+                        row_id = ?row_id,
+                        "BoundaryPolicy shadow: matrix would deny this graphql_subscription"
+                    );
+                    if principal.class == auth::PrincipalClass::Operator {
+                        db::metrics::record_p081_boundary_policy_enforcement_parity(
+                            "allow",
+                            "deny",
+                        );
+                        db::metrics::record_p081_boundary_shadow_disagreement(
+                            "graphql_subscription",
+                            row_id.as_deref(),
+                            caller_class.as_str(),
+                            "subscription",
+                            "allow",
+                            "deny",
+                            Some(reason_code.as_str()),
+                        );
+                    }
+                    if principal.class != auth::PrincipalClass::Operator {
+                        db::metrics::record_p081_boundary_policy_enforcement_parity(
+                            "deny",
+                            "deny",
+                        );
+                        // MEDIUM-001: best-effort audit for shadow-mode subscription denials.
+                        write_graphql_legacy_deny_audit(
+                            ctx,
+                            principal,
+                            "graphql_subscription",
+                            "subscription",
+                            &reason_code,
+                            row_id.as_deref(),
+                            caller_class.as_str(),
+                            &policy,
+                        )
+                        .await;
+                        return Err(boundary_denial_error(
+                            &reason_code,
+                            row_id.as_deref(),
+                            Some(caller_class.as_str()),
+                        ));
+                    }
+                }
+            }
+            auth::boundary::PolicyDecision::LegacyPassthrough => {
+                db::metrics::record_p081_boundary_no_op_label(
+                    "chainworks-forge",
+                    &chrono::Utc::now().format("%Y-%m").to_string(),
+                );
+                if principal.class != auth::PrincipalClass::Operator {
+                    // MEDIUM-001: best-effort audit for legacy-passthrough subscription denials.
+                    write_graphql_legacy_deny_audit(
+                        ctx,
+                        principal,
+                        "graphql_subscription",
+                        "subscription",
+                        "CAPABILITY_OUT_OF_SCOPE",
+                        None,
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await;
+                    return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
+                }
+            }
+        }
+    } else if principal.class != auth::PrincipalClass::Operator {
+        db::metrics::record_p081_boundary_policy_evaluation_error(
+            "graphql_subscription",
+            "policy_missing",
+        );
+        // No BoundaryPolicy available — fall back to operator-only guard.
+        // No audit written here: this seam does not yet have bounded DB access.
+        return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
+    }
+
+    // P081 fix: subscriptions must check allow_subscriptions, not allow_queries.
+    if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
+        if let Some(allowed) = auth::is_subscription_allowed_by_surface_policy(table, &principal.id)
+        {
+            if !allowed {
+                // MEDIUM-001: best-effort audit for P072 surface-policy subscription denials.
+                if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+                    let caller_class = auth::derive_caller_class(principal);
+                    write_graphql_legacy_deny_audit(
+                        ctx,
+                        principal,
+                        "graphql_subscription",
+                        "subscription",
+                        "CAPABILITY_OUT_OF_SCOPE",
+                        None,
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await;
+                }
+                return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
             }
         }
     }
@@ -489,6 +1513,341 @@ async fn stage_from_projection_or_canonical(
     }
 }
 
+fn p036_stage_topology_order(plan: &workflow::plan::RunPlan) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+    let mut queue = VecDeque::from([plan.initial_state.clone()]);
+
+    while let Some(stage_id) = queue.pop_front() {
+        if !seen.insert(stage_id.clone()) {
+            continue;
+        }
+        let Some(state) = plan.states.get(&stage_id) else {
+            continue;
+        };
+        ordered.push(stage_id.clone());
+        for transition in &state.transitions {
+            if !seen.contains(&transition.to) {
+                queue.push_back(transition.to.clone());
+            }
+        }
+    }
+
+    let mut remaining: Vec<_> = plan
+        .states
+        .keys()
+        .filter(|stage_id| !seen.contains(*stage_id))
+        .cloned()
+        .collect();
+    remaining.sort();
+    ordered.extend(remaining);
+    ordered
+}
+
+fn p036_agent_title(agent_id: &str) -> String {
+    let words: Vec<String> = agent_id
+        .split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        agent_id.to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
+fn p036_latest_stage_rows_by_stage_id(
+    rows: Vec<projections::StageSummaryRow>,
+) -> HashMap<String, projections::StageSummaryRow> {
+    let mut latest = HashMap::new();
+    for row in rows {
+        latest
+            .entry(row.stage_id.clone())
+            .and_modify(|existing: &mut projections::StageSummaryRow| {
+                if row.started_at >= existing.started_at {
+                    *existing = row.clone();
+                }
+            })
+            .or_insert(row);
+    }
+    latest
+}
+
+fn p036_status_for_topology(row: Option<&projections::StageSummaryRow>) -> String {
+    match row {
+        Some(row) if row.projection_lag || !row.projection_present => "unavailable".into(),
+        Some(row) => row.status.clone(),
+        None => "pending".into(),
+    }
+}
+
+fn p036_is_current_stage(
+    run: &domain::run::Run,
+    stage_id: &str,
+    row: Option<&projections::StageSummaryRow>,
+) -> bool {
+    if let Some(current_state) = run.current_state.as_deref() {
+        return current_state == stage_id;
+    }
+    matches!(
+        row.map(|row| row.status.as_str()),
+        Some("running" | "blocked" | "waiting_approval" | "pending_approval")
+    )
+}
+
+fn p036_topology_nodes(
+    run: &domain::run::Run,
+    plan: &workflow::plan::RunPlan,
+    stage_rows: Vec<projections::StageSummaryRow>,
+    artifacts: Vec<domain::artifact::Artifact>,
+    agent_executions: Vec<domain::agent::AgentExecution>,
+) -> Vec<GqlRunStageTopologyNode> {
+    let latest_by_stage_id = p036_latest_stage_rows_by_stage_id(stage_rows);
+    let stage_execution_to_stage_id: HashMap<String, String> = latest_by_stage_id
+        .values()
+        .map(|row| (row.id.clone(), row.stage_id.clone()))
+        .collect();
+
+    let mut artifacts_by_stage_id: HashMap<String, i64> = HashMap::new();
+    for artifact in artifacts {
+        *artifacts_by_stage_id.entry(artifact.stage_id).or_default() += 1;
+    }
+
+    let mut executions_by_stage_id: HashMap<String, Vec<domain::agent::AgentExecution>> =
+        HashMap::new();
+    for execution in agent_executions {
+        let Some(stage_execution_id) = execution.stage_execution_id else {
+            continue;
+        };
+        if let Some(stage_id) = stage_execution_to_stage_id.get(&stage_execution_id.to_string()) {
+            executions_by_stage_id
+                .entry(stage_id.clone())
+                .or_default()
+                .push(execution);
+        }
+    }
+
+    p036_stage_topology_order(plan)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, stage_id)| {
+            let state = plan.states.get(&stage_id)?;
+            let latest = latest_by_stage_id.get(&stage_id);
+            let executions = executions_by_stage_id
+                .get(&stage_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+
+            let occurrences: Vec<GqlRunStageTopologyOccurrence> = state
+                .tasks
+                .iter()
+                .chain(state.post_approval_tasks.iter())
+                .map(|task| {
+                    let matching: Vec<_> = executions
+                        .iter()
+                        .filter(|execution| execution.agent_id == task.agent.agent_id)
+                        .collect();
+                    let status = matching
+                        .iter()
+                        .max_by_key(|execution| execution.started_at)
+                        .map(|execution| execution.status.to_string())
+                        .unwrap_or_else(|| "pending".into());
+                    GqlRunStageTopologyOccurrence {
+                        agent_id: task.agent.agent_id.clone(),
+                        agent_title: p036_agent_title(&task.agent.agent_id),
+                        task_name: task.task_name.clone(),
+                        status,
+                        provider: task.agent.provider.clone(),
+                        model: task.agent.model.clone(),
+                        effort: task.agent.effort.clone(),
+                        execution_count: matching.len() as i64,
+                    }
+                })
+                .collect();
+
+            let transitions: Vec<GqlRunStageTopologyTransition> = state
+                .transitions
+                .iter()
+                .map(|transition| GqlRunStageTopologyTransition {
+                    to_stage_id: transition.to.clone(),
+                    to_label: plan
+                        .states
+                        .get(&transition.to)
+                        .map(|target| target.label.clone()),
+                    detail: match transition.condition.trim() {
+                        "" | "true" => None,
+                        condition => Some(condition.to_string()),
+                    },
+                })
+                .collect();
+
+            Some(GqlRunStageTopologyNode {
+                stage_id: stage_id.clone(),
+                label: state.label.clone(),
+                order: index as i64 + 1,
+                owner_agent_id: state.owner.agent_id.clone(),
+                owner_agent_title: p036_agent_title(&state.owner.agent_id),
+                status: p036_status_for_topology(latest),
+                is_current: p036_is_current_stage(run, &stage_id, latest),
+                iteration: latest.map(|row| row.iteration),
+                attempt_number: latest.map(|row| row.attempt_number),
+                approval_required: state.is_manual_gate
+                    || latest.is_some_and(|row| row.has_pending_approval),
+                artifact_count: artifacts_by_stage_id.get(&stage_id).copied().unwrap_or(0),
+                communication_count: occurrences.len() as i64 + transitions.len() as i64,
+                occurrences,
+                transitions,
+            })
+        })
+        .collect()
+}
+
+async fn p093_active_agent_executions(
+    pool: &SqlitePool,
+    run_id: RunId,
+    items: Vec<domain::agent::AgentExecution>,
+) -> Result<Vec<GqlAgentExecution>> {
+    let runtime_evidence = p093_runtime_evidence_by_agent(
+        pool,
+        items.iter().map(|item| item.id.to_string()).collect(),
+    )
+    .await?;
+
+    let plan = match runs::find_by_id(pool, run_id).await? {
+        Some(run) => {
+            let workflow = run.workflow_snapshot_json.as_deref().unwrap_or_default();
+            let catalog = run.catalog_snapshot_json.as_deref().unwrap_or_default();
+            if workflow.trim().is_empty() || catalog.trim().is_empty() {
+                None
+            } else {
+                let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or(".");
+                workflow::compiler::compile_from_snapshot_json(workflow, catalog, catalog_path).ok()
+            }
+        }
+        None => None,
+    };
+
+    let stage_rows = projections::list_stages_projection(pool, &run_id.to_string()).await?;
+    let stage_by_execution_id: HashMap<String, projections::StageSummaryRow> = stage_rows
+        .into_iter()
+        .map(|row| (row.id.clone(), row))
+        .collect();
+
+    let mut stage_order_by_id: HashMap<String, i64> = HashMap::new();
+    let mut task_label_by_stage_agent: HashMap<(String, String), String> = HashMap::new();
+    if let Some(plan) = plan.as_ref() {
+        for (index, stage_id) in p036_stage_topology_order(plan).into_iter().enumerate() {
+            stage_order_by_id.insert(stage_id.clone(), index as i64);
+            if let Some(state) = plan.states.get(&stage_id) {
+                for task in state.tasks.iter().chain(state.post_approval_tasks.iter()) {
+                    task_label_by_stage_agent
+                        .entry((stage_id.clone(), task.agent.agent_id.clone()))
+                        .or_insert_with(|| task.task_name.clone());
+                }
+            }
+        }
+    }
+
+    let mut gql_items: Vec<GqlAgentExecution> = items
+        .into_iter()
+        .map(|execution| {
+            let started_at = execution.started_at;
+            let execution_id = execution.id.to_string();
+            let stage_execution_id = execution
+                .stage_execution_id
+                .map(|id| id.to_string())
+                .unwrap_or_default();
+            let stage_row = stage_by_execution_id.get(&stage_execution_id);
+            let stage_id = stage_row.map(|row| row.stage_id.clone());
+            let selection_order = stage_id
+                .as_ref()
+                .and_then(|stage_id| stage_order_by_id.get(stage_id).copied());
+            let task_label = stage_id
+                .as_ref()
+                .and_then(|stage_id| {
+                    task_label_by_stage_agent.get(&(stage_id.clone(), execution.agent_id.clone()))
+                })
+                .cloned();
+            let mut gql = GqlAgentExecution::from(execution);
+            gql.agent_title = Some(p036_agent_title(&gql.agent_id));
+            gql.stage_label = stage_row.map(|row| row.label.clone());
+            gql.task_label = task_label;
+            if let Some((event_count, last_event_at)) = runtime_evidence.get(&execution_id) {
+                gql.event_count = Some(*event_count);
+                gql.last_event_at = last_event_at
+                    .clone()
+                    .or_else(|| Some(started_at.to_rfc3339()));
+            } else {
+                gql.event_count = Some(0);
+                gql.last_event_at = Some(started_at.to_rfc3339());
+            }
+            gql.selection_order = selection_order;
+            gql.selection_unavailable_reason = if selection_order.is_some() {
+                None
+            } else {
+                Some("snapshot_unavailable".into())
+            };
+            gql
+        })
+        .collect();
+
+    gql_items.sort_by(
+        |lhs, rhs| match (lhs.selection_order, rhs.selection_order) {
+            (Some(left), Some(right)) if left != right => left.cmp(&right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            _ => lhs
+                .started_at
+                .cmp(&rhs.started_at)
+                .then_with(|| lhs.agent_id.cmp(&rhs.agent_id)),
+        },
+    );
+
+    for (index, item) in gql_items.iter_mut().enumerate() {
+        if item.selection_order.is_some() {
+            item.selection_order = Some(index as i64);
+        }
+    }
+
+    Ok(gql_items)
+}
+
+async fn p093_runtime_evidence_by_agent(
+    pool: &SqlitePool,
+    agent_execution_ids: Vec<String>,
+) -> Result<HashMap<String, (i64, Option<String>)>> {
+    let mut evidence = HashMap::new();
+    for agent_execution_id in agent_execution_ids {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COALESCE(SUM(event_count), 0) AS event_count,
+                MAX(last_event_at_ms) AS last_event_at_ms
+            FROM agent_execution_runtime_receipts
+            WHERE agent_execution_id = ?1
+            "#,
+        )
+        .bind(&agent_execution_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| Error::new(e.to_string()))?;
+        let event_count: i64 = row.get("event_count");
+        let last_event_at_ms: Option<i64> = row.get("last_event_at_ms");
+        let last_event_at = last_event_at_ms.and_then(|ms| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|ts| ts.to_rfc3339())
+        });
+        evidence.insert(agent_execution_id, (event_count, last_event_at));
+    }
+    Ok(evidence)
+}
+
 #[Object]
 impl QueryRoot {
     async fn ideas(
@@ -496,7 +1855,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         include_archived: Option<bool>,
     ) -> Result<Vec<GqlIdea>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let include = include_archived.unwrap_or(false);
         let items = ideas::list(pool, include).await?;
@@ -504,7 +1863,7 @@ impl QueryRoot {
     }
 
     async fn idea(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlIdea>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let idea_id: IdeaId = id
             .parse()
@@ -514,19 +1873,31 @@ impl QueryRoot {
     }
 
     async fn runs(&self, ctx: &Context<'_>, idea_id: Option<ID>) -> Result<Vec<GqlRun>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
-        if let Some(id) = idea_id {
+        let mut runs: Vec<GqlRun> = if let Some(id) = idea_id {
             let items = projections::list_by_idea_projection(pool, id.as_str()).await?;
-            Ok(items.into_iter().map(GqlRun::from).collect())
+            items.into_iter().map(GqlRun::from).collect()
         } else {
             let items = projections::list_active_projection(pool).await?;
-            Ok(items.into_iter().map(GqlRun::from).collect())
+            items.into_iter().map(GqlRun::from).collect()
+        };
+        // Batch-fetch blocking workflow conflicts to avoid N+1 per-run lookups.
+        let run_ids: Vec<String> = runs.iter().map(|r| r.id.to_string()).collect();
+        if !run_ids.is_empty() {
+            let conflicts =
+                workflow_conflicts::get_blocking_conflicts_for_runs(pool, &run_ids).await?;
+            for run in &mut runs {
+                if let Some(conflict) = conflicts.get(run.id.as_str()) {
+                    run.workflow_conflict = Some(conflict.clone().into());
+                }
+            }
         }
+        Ok(runs)
     }
 
     async fn run(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlRun>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let run_id: RunId = id
             .parse()
@@ -539,9 +1910,25 @@ impl QueryRoot {
         ctx: &Context<'_>,
         run_id: Option<ID>,
     ) -> Result<Vec<GqlApproval>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = projections::list_pending_inbox_projection(pool).await?;
+
+        // P081 Phase 4: compute BoundaryPolicy actionability for this caller once
+        // and apply it to every approval in the list.
+        let boundary_decision: Option<(auth::CallerClass, auth::boundary::PolicyDecision)> =
+            if let Ok(principal) = ctx.data::<auth::Principal>() {
+                if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+                    let caller_class = auth::derive_caller_class(principal);
+                    let decision = policy.evaluate(caller_class.as_str(), "graphql_mutation", None);
+                    Some((caller_class, decision))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         Ok(items
             .into_iter()
             .filter(|row| {
@@ -549,12 +1936,19 @@ impl QueryRoot {
                     row.run_id == requested_run_id.as_str()
                 })
             })
-            .map(GqlApproval::from)
+            .map(|row| {
+                let approval = GqlApproval::from(row);
+                if let Some((ref caller_class, ref decision)) = boundary_decision {
+                    approval.with_boundary_actionability(caller_class.as_str(), decision)
+                } else {
+                    approval
+                }
+            })
             .collect())
     }
 
     async fn artifacts(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlArtifact>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let parsed_run_id: RunId = run_id
             .as_str()
@@ -595,7 +1989,7 @@ impl QueryRoot {
     }
 
     async fn artifact(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlArtifact>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let artifact_id: ArtifactId = id
             .as_str()
@@ -637,15 +2031,96 @@ impl QueryRoot {
     }
 
     async fn stages(&self, ctx: &Context<'_>, run_id: ID) -> Result<Vec<GqlStageExecution>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = projections::list_stages_projection(pool, run_id.as_str()).await?;
         Ok(items.into_iter().map(GqlStageExecution::from).collect())
     }
 
+    async fn run_stage_topology(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<Vec<GqlRunStageTopologyNode>> {
+        require_operator_read(ctx).await?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let run_id: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let Some(run) = runs::find_by_id(pool, run_id).await? else {
+            return Ok(vec![]);
+        };
+        let Some(workflow_snapshot_json) = run.workflow_snapshot_json.as_deref() else {
+            return Ok(vec![]);
+        };
+        let Some(catalog_snapshot_json) = run.catalog_snapshot_json.as_deref() else {
+            return Ok(vec![]);
+        };
+        if workflow_snapshot_json.trim().is_empty() || catalog_snapshot_json.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or(".");
+        let plan = match workflow::compiler::compile_from_snapshot_json(
+            workflow_snapshot_json,
+            catalog_snapshot_json,
+            catalog_path,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                warn!(
+                    run_id = %run.id,
+                    error = %error,
+                    "P036 runStageTopology failed closed because frozen snapshots did not compile"
+                );
+                return Ok(vec![]);
+            }
+        };
+
+        let stage_rows = projections::list_stages_projection(pool, &run_id.to_string()).await?;
+        let artifact_rows = artifacts::list_by_run(pool, run_id).await?;
+        let agent_execution_rows = db::repos::agent_executions::list_by_run(pool, run_id).await?;
+        Ok(p036_topology_nodes(
+            &run,
+            &plan,
+            stage_rows,
+            artifact_rows,
+            agent_execution_rows,
+        ))
+    }
+
+    async fn active_agent_executions(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<Vec<GqlAgentExecution>> {
+        require_operator_read(ctx).await?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let run_id: RunId = run_id
+            .parse()
+            .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+        let items = db::repos::agent_executions::list_running_by_run(pool, run_id).await?;
+        p093_active_agent_executions(pool, run_id, items).await
+    }
+
+    async fn timeline_raw_detail(
+        &self,
+        ctx: &Context<'_>,
+        handle: ID,
+    ) -> Result<GqlTimelineRawDetailResult> {
+        require_operator_read(ctx).await?;
+        let handle = handle.to_string();
+        if handle.trim().is_empty() {
+            return Ok(GqlTimelineRawDetailResult::missing(
+                TimelineRawDetailErrorReason::HandleNotFound,
+            ));
+        }
+        p093_resolve_timeline_raw_detail(ctx.data::<SqlitePool>()?, &handle).await
+    }
+
     /// Work-queue counts for all items associated with a run.
     async fn run_queue_summary(&self, ctx: &Context<'_>, run_id: ID) -> Result<GqlRunQueueSummary> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let run_id_str = run_id.as_str();
         let rows = sqlx::query(
@@ -689,7 +2164,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         stage_execution_id: ID,
     ) -> Result<GqlStageQueueSummary> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let stage_id_str = stage_execution_id.as_str();
         let rows = sqlx::query(
@@ -728,7 +2203,7 @@ impl QueryRoot {
     }
 
     async fn stage(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlStageExecution>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let stage_execution_id: domain::ids::StageExecutionId = id
             .parse()
@@ -741,7 +2216,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         stage_execution_id: ID,
     ) -> Result<Vec<GqlAgentExecution>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let stage_execution_id: domain::ids::StageExecutionId = stage_execution_id
             .parse()
@@ -756,7 +2231,7 @@ impl QueryRoot {
         limit: Option<i32>,
         status: Option<String>,
     ) -> Result<Vec<GqlStewardAnalysis>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let parsed_status = status
             .as_deref()
@@ -780,7 +2255,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         id: ID,
     ) -> Result<Option<GqlStewardAnalysis>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let item = steward_repo::find_analysis(pool, id.as_str()).await?;
         if let Some(item) = item {
@@ -801,7 +2276,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         analysis_id: ID,
     ) -> Result<Vec<GqlStewardAnalysisRunLink>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = steward_repo::list_run_links(pool, analysis_id.as_str()).await?;
         Ok(items
@@ -815,7 +2290,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         analysis_id: ID,
     ) -> Result<Vec<GqlStewardRecommendation>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let items = steward_repo::list_recommendations(pool, analysis_id.as_str()).await?;
         Ok(items
@@ -830,9 +2305,36 @@ impl QueryRoot {
     /// split: any authenticated operator can read the full typed status,
     /// unauthenticated loopback probes get the JSON snapshot at `/health`.
     async fn daemon_status(&self, ctx: &Context<'_>) -> Result<GqlDaemonStatus> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let reporter = ctx.data::<LifecycleReporter>()?;
         Ok(GqlDaemonStatus::from(reporter.snapshot()))
+    }
+
+    /// P081: bounded operator diagnostic readback for the active boundary policy
+    /// and audit-log integrity state. This never exposes raw audit rows.
+    async fn boundary_runtime(&self, ctx: &Context<'_>) -> Result<Json<serde_json::Value>> {
+        require_observer_opt_in_read(ctx).await?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let boundary_policy = ctx
+            .data_opt::<Arc<auth::boundary::BoundaryPolicy>>()
+            .map(|policy| policy.as_ref());
+        Ok(Json(
+            boundary_runtime_readback_json(pool, boundary_policy).await?,
+        ))
+    }
+
+    /// P081: bounded operator alert inbox derived from the same BoundaryPolicy
+    /// and audit health readback as `boundaryRuntime`.
+    async fn operator_alerts(&self, ctx: &Context<'_>) -> Result<Json<serde_json::Value>> {
+        let authorization = require_observer_opt_in_read(ctx).await?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let boundary_policy = ctx
+            .data_opt::<Arc<auth::boundary::BoundaryPolicy>>()
+            .map(|policy| policy.as_ref());
+        let mut alerts = p081_operator_alerts_json(pool, boundary_policy).await?;
+        let collector = ctx.data_opt::<P081GraphqlRedactionCollector>();
+        redact_p081_operator_alerts_for_observer(&mut alerts, &authorization, collector);
+        Ok(Json(alerts))
     }
 
     /// P075: Storage health readback for write pressure, evidence spooling,
@@ -841,7 +2343,7 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<crate::types::storage::GqlStorageHealth> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let heartbeat = ctx.data_opt::<Arc<DbWriterHeartbeat>>();
 
@@ -941,7 +2443,7 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<Option<GqlStartupRecoverySummary>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let readback = db::repos::startup_repairs::latest_startup_recovery_readback(pool).await?;
         Ok(readback.map(GqlStartupRecoverySummary::from))
@@ -953,7 +2455,7 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<Option<GqlToolchainCacheHousekeepingSummary>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let readback = db::repos::toolchain_cache_housekeeping::latest(pool).await?;
         Ok(readback.map(GqlToolchainCacheHousekeepingSummary::from))
@@ -967,7 +2469,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         first: Option<i32>,
     ) -> Result<Vec<GqlSideEffectSummary>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let pool = ctx.data::<SqlitePool>()?;
         let limit = first.unwrap_or(50).clamp(1, 100) as u32;
         let effects = db::repos::side_effects::list_unresolved(pool, limit).await?;
@@ -987,7 +2489,7 @@ impl QueryRoot {
         #[graphql(default = 100)] first: i32,
         after: Option<String>,
     ) -> Result<GqlSessionLineageConnection> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let p046 = ctx.data::<P046Config>()?;
         if !p046.enabled {
             db::metrics::increment_counter_with_label(
@@ -1076,7 +2578,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         id: ID,
     ) -> Result<Option<GqlSessionLineage>> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let p046 = ctx.data::<P046Config>()?;
         if !p046.enabled {
             db::metrics::increment_counter_with_label(
@@ -1178,7 +2680,7 @@ impl QueryRoot {
         #[graphql(default = 100)] first: i32,
         after: Option<String>,
     ) -> Result<GqlSessionGenerationConnection> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let p046 = ctx.data::<P046Config>()?;
         if !p046.enabled {
             db::metrics::increment_counter_with_label(
@@ -1285,7 +2787,7 @@ impl QueryRoot {
         #[graphql(default = 200)] first: i32,
         after: Option<String>,
     ) -> Result<GqlSessionEventConnection> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let p046 = ctx.data::<P046Config>()?;
         if !p046.enabled {
             db::metrics::increment_counter_with_label(
@@ -1415,7 +2917,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         run_id: ID,
     ) -> Result<GqlSessionKpiSummary> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let p046 = ctx.data::<P046Config>()?;
         if !p046.enabled {
             db::metrics::increment_counter_with_label(
@@ -1475,7 +2977,7 @@ impl QueryRoot {
         ctx: &Context<'_>,
         run_id: ID,
     ) -> Result<GqlSessionHealthReport> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let p046 = ctx.data::<P046Config>()?;
         if !p046.enabled {
             db::metrics::increment_counter_with_label(
@@ -1561,7 +3063,7 @@ impl QueryRoot {
     // daemon capability (holds_conditions: every P046 query/subscription requires operator-read).
     #[graphql(visible = "crate::types::session::p046_visible")]
     async fn session_observability_available(&self, ctx: &Context<'_>) -> Result<bool> {
-        require_operator_read(ctx)?;
+        require_operator_read(ctx).await?;
         let p046 = ctx.data::<P046Config>()?;
         if !p046.enabled {
             db::metrics::increment_counter_with_label(
@@ -1571,6 +3073,95 @@ impl QueryRoot {
             return Err(Error::new("session observability is not enabled"));
         }
         Ok(true)
+    }
+
+    /// P086: Read-only continuation history and current status for an agent execution.
+    /// Returns raw + display status, freshness/projection-lag, and UNKNOWN display states
+    /// for unrecognised daemon values. Operator-only; no continuation mutation surface.
+    async fn continuation_status(
+        &self,
+        ctx: &Context<'_>,
+        agent_execution_id: ID,
+    ) -> Result<GqlContinuationStatus> {
+        require_operator_read(ctx).await?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let ae_id = agent_execution_id.as_str();
+        let records = agent_work_continuations::list_for_agent_execution(pool, ae_id).await?;
+        let active = agent_work_continuations::find_active_for_agent_execution(pool, ae_id).await?;
+        let freshness_state = if records.is_empty() {
+            crate::types::p031::GqlFreshnessState::Unavailable
+        } else {
+            crate::types::p031::GqlFreshnessState::Live
+        };
+        let history: Vec<GqlContinuationRecord> = records
+            .into_iter()
+            .map(GqlContinuationRecord::from)
+            .collect();
+        let active_gql = active.map(GqlContinuationRecord::from);
+        Ok(GqlContinuationStatus {
+            agent_execution_id: agent_execution_id.clone(),
+            active: active_gql,
+            history,
+            freshness_state,
+        })
+    }
+
+    /// P086: Read-only list of eligible continuation candidates for a run.
+    /// Returns eligibility, raw/display status, and disabled reason for each
+    /// code_writer stage-owned AgentExecution. Operator-only.
+    async fn continuation_candidates(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<GqlContinuationCandidatesResult> {
+        require_operator_read(ctx).await?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let candidates =
+            agent_work_continuations::list_candidates_for_run(pool, run_id.as_str()).await?;
+        let freshness_state = if candidates.is_empty() {
+            crate::types::p031::GqlFreshnessState::Unavailable
+        } else {
+            crate::types::p031::GqlFreshnessState::Live
+        };
+        Ok(GqlContinuationCandidatesResult {
+            run_id: run_id.clone(),
+            candidates: candidates
+                .into_iter()
+                .map(crate::types::continuation::GqlContinuationCandidate::from)
+                .collect(),
+            freshness_state,
+        })
+    }
+
+    /// P086: Read-only run-level continuation history for SwiftUI/operator readback.
+    async fn continuations(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<Vec<GqlContinuationRecord>> {
+        require_operator_read(ctx).await?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let records = agent_work_continuations::list_for_run(pool, run_id.as_str()).await?;
+        Ok(records
+            .into_iter()
+            .map(GqlContinuationRecord::from)
+            .collect())
+    }
+
+    /// P086: Durable read-only rollout metric summary for continuation behavior.
+    async fn continuation_metrics_summary(
+        &self,
+        ctx: &Context<'_>,
+        run_id: ID,
+    ) -> Result<GqlContinuationMetricsSummary> {
+        require_operator_read(ctx).await?;
+        let pool = ctx.data::<SqlitePool>()?;
+        let summary = agent_work_continuations::p086_continuation_metrics_summary_for_run(
+            pool,
+            run_id.as_str(),
+        )
+        .await?;
+        Ok(GqlContinuationMetricsSummary::from(summary))
     }
 }
 
@@ -1948,10 +3539,12 @@ async fn enrich_run_with_p091_retry_authority(
     run: &mut GqlRun,
 ) -> Result<()> {
     let history = db::repos::retry_stage_execution_authorities::list_by_run(pool, run_id).await?;
-    let history_json: Vec<_> = history
+    let p092_events =
+        db::repos::retry_payload_recovery_events::latest_by_authority_for_run(pool, run_id).await?;
+    let mut history_json: Vec<_> = history
         .iter()
         .map(|authority| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "id": authority.id,
                 "run_id": authority.run_id.to_string(),
                 "stage_id": authority.stage_id,
@@ -1965,21 +3558,40 @@ async fn enrich_run_with_p091_retry_authority(
                 "created_at": authority.created_at.to_rfc3339(),
                 "updated_at": authority.updated_at.to_rfc3339(),
                 "terminal_reason": authority.terminal_reason,
-            })
+            });
+            if let Some(event) = p092_events.get(&authority.id) {
+                value["retry_payload_recovery"] = event.readback_json();
+            }
+            value
         })
         .collect();
+    for event in db::repos::retry_payload_recovery_events::list_by_run(pool, run_id).await? {
+        if event.retry_authority_id.is_none() {
+            history_json.push(serde_json::json!({
+                "schema_version": "retry_payload_recovery_history_v1",
+                "authority_state": "missing_authority",
+                "run_id": event.run_id.to_string(),
+                "source_invoke_work_item_id": event.invoke_work_item_id,
+                "retry_payload_recovery": event.readback_json(),
+            }));
+        }
+    }
     run.retry_authority_json = history
         .iter()
         .find(|authority| authority.authority_state.to_string() == "active")
         .map(|authority| {
-            Json(serde_json::json!({
+            let mut value = serde_json::json!({
                 "id": authority.id,
                 "stage_id": authority.stage_id,
                 "target_stage_execution_id": authority.target_stage_execution_id.to_string(),
                 "entry_kind": authority.entry_kind.to_string(),
                 "authority_state": authority.authority_state.to_string(),
                 "terminal_reason": authority.terminal_reason,
-            }))
+            });
+            if let Some(event) = p092_events.get(&authority.id) {
+                value["retry_payload_recovery"] = event.readback_json();
+            }
+            Json(value)
         });
     run.retry_authority_history_json = Some(Json(serde_json::Value::Array(history_json)));
     run.p091_orphan_repair_readback_json =
@@ -2496,25 +4108,127 @@ pub fn capability_id_for(mutation: MutationName) -> domain::CapabilityToolId {
     }
 }
 
-fn mutation_allowed(
+async fn mutation_allowed(
     ctx: &Context<'_>,
     principal: &auth::Principal,
     mutation: MutationName,
-) -> bool {
+) -> Result<(), async_graphql::Error> {
+    let caller_class = auth::derive_caller_class(principal);
+    // P081 Phase 3: consult the shared BoundaryPolicy when it is injected.
+    // ui_operator on graphql_mutation is allowed by the matrix (approval actions).
+    // Any other caller_class that lacks a matching row returns MATRIX_NO_ROW → denied.
+    if let Ok(policy) = ctx.data::<Arc<auth::boundary::BoundaryPolicy>>() {
+        match policy.evaluate(
+            caller_class.as_str(),
+            "graphql_mutation",
+            Some(mutation.graphql_name()),
+        ) {
+            auth::boundary::PolicyDecision::Deny {
+                reason_code,
+                row_id,
+                ..
+            } => {
+                // P081: write durable deny audit before returning the denial.
+                // Fail-closed: if the audit write fails, return E_AUDIT_UNAVAILABLE.
+                if let Ok(pool) = ctx.data::<SqlitePool>() {
+                    write_graphql_deny_audit(
+                        pool,
+                        ctx,
+                        principal,
+                        "graphql_mutation",
+                        mutation.graphql_name(),
+                        &reason_code,
+                        row_id.as_deref(),
+                        caller_class.as_str(),
+                        &policy,
+                    )
+                    .await?;
+                }
+                return Err(boundary_denial_error(
+                    &reason_code,
+                    row_id.as_deref(),
+                    Some(caller_class.as_str()),
+                ));
+            }
+            auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                if let auth::boundary::PolicyDecision::Deny {
+                    reason_code,
+                    row_id,
+                    ..
+                } = *matched_decision
+                {
+                    tracing::debug!(
+                        caller_class = caller_class.as_str(),
+                        transport = "graphql_mutation",
+                        reason_code = %reason_code,
+                        row_id = ?row_id,
+                        "BoundaryPolicy shadow: matrix would deny this graphql_mutation"
+                    );
+                    if principal.class == auth::PrincipalClass::Operator {
+                        db::metrics::record_p081_boundary_policy_enforcement_parity(
+                            "allow",
+                            "deny",
+                        );
+                        db::metrics::record_p081_boundary_shadow_disagreement(
+                            "graphql_mutation",
+                            row_id.as_deref(),
+                            caller_class.as_str(),
+                            mutation.graphql_name(),
+                            "allow",
+                            "deny",
+                            Some(reason_code.as_str()),
+                        );
+                    }
+                }
+            }
+            auth::boundary::PolicyDecision::Allow { .. }
+            | auth::boundary::PolicyDecision::LegacyPassthrough => {}
+        }
+    } else {
+        db::metrics::record_p081_boundary_policy_evaluation_error(
+            "graphql_mutation",
+            "policy_missing",
+        );
+    }
+
+    if let Ok(pool) = ctx.data::<SqlitePool>() {
+        if audit_log::audit_budget_requires_safe_mode(pool)
+            .await
+            .map_err(|e| Error::new(e.to_string()))?
+        {
+            db::metrics::record_p081_audit_log_rate_limited(
+                "graphql_mutation",
+                "AUDIT_BUDGET_EXHAUSTED",
+            );
+            return Err(boundary_denial_error(
+                "AUDIT_BUDGET_EXHAUSTED",
+                Some("p081.audit_budget.safe_mode"),
+                Some(caller_class.as_str()),
+            ));
+        }
+    }
+
     if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
         if let Some(allowed) = auth::is_mutation_allowed_by_surface_policy(
             table,
             &principal.id,
             mutation.graphql_name(),
         ) {
-            return allowed && principal.class == auth::PrincipalClass::Operator;
+            if !(allowed && principal.class == auth::PrincipalClass::Operator) {
+                return Err(boundary_denial_error("NON_APPROVAL_MUTATION", None, None));
+            }
+            return Ok(());
         }
         if auth::find_principal_by_id(table, &principal.id).is_some() {
-            return false;
+            return Err(boundary_denial_error("NON_APPROVAL_MUTATION", None, None));
         }
     }
 
-    auth::filter_tools(principal, &[capability_id_for(mutation)]).len() == 1
+    if auth::filter_tools(principal, &[capability_id_for(mutation)]).len() == 1 {
+        Ok(())
+    } else {
+        Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None))
+    }
 }
 
 /// Build the GraphQL caller context for a mutation and attach the
@@ -2526,9 +4240,15 @@ fn graphql_caller_with_request_id(
     principal: &auth::Principal,
     mutation_name: &str,
 ) -> CallerContext {
-    let mut caller = CallerContext::graphql(&principal.id, &principal.class, mutation_name);
+    let caller_class = auth::derive_caller_class(principal);
+    let mut caller = CallerContext::graphql(&principal.id, &principal.class, mutation_name)
+        .with_caller_class(caller_class.as_str());
     if let Ok(rid) = ctx.data::<crate::request_id::RequestId>() {
         caller = caller.with_request_id(&rid.0);
+    }
+    // SEC-P081-M002: propagate derived token_id for audit correlation.
+    if let Ok(tid) = ctx.data::<crate::auth_layer::GraphqlTokenId>() {
+        caller = caller.with_token_id(&tid.0);
     }
     caller
 }
@@ -2553,6 +4273,32 @@ pub struct RejectApprovalPayload {
     pub conflict_result_code: Option<GqlMutationConflictResultCode>,
 }
 
+/// SEC-M-001: Validate that an idempotency key is a well-formed UUIDv7.
+/// UUIDv7 format: 8-4-4-4-12 hex groups where the version nibble (13th char) is '7'
+/// and the variant nibble (17th char) is '8', '9', 'a', or 'b' (RFC 4122 variant).
+/// Returns a typed, non-disclosing error on validation failure.
+fn validate_idempotency_key_uuidv7(key: &str) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(key).map_err(|_| {
+        let mut e = async_graphql::Error::new("INVALID_IDEMPOTENCY_KEY");
+        e = e.extend_with(|_, ext| ext.set("code", "INVALID_IDEMPOTENCY_KEY"));
+        e
+    })?;
+    // Version check: UUIDv7 has version nibble == 7
+    if uuid.get_version_num() != 7 {
+        let mut e = async_graphql::Error::new("INVALID_IDEMPOTENCY_KEY");
+        e = e.extend_with(|_, ext| ext.set("code", "INVALID_IDEMPOTENCY_KEY"));
+        return Err(e.into());
+    }
+    // SEC-M-001b: Variant check — must be RFC 4122 (high bits 10xx).
+    // Rejects malformed UUIDs that parse with version=7 but use a non-standard variant byte.
+    if uuid.get_variant() != uuid::Variant::RFC4122 {
+        let mut e = async_graphql::Error::new("INVALID_IDEMPOTENCY_KEY");
+        e = e.extend_with(|_, ext| ext.set("code", "INVALID_IDEMPOTENCY_KEY"));
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 fn approval_resolution_conflict_code(
     error: &anyhow::Error,
 ) -> Option<(ID, GqlMutationConflictResultCode)> {
@@ -2562,19 +4308,42 @@ fn approval_resolution_conflict_code(
             ID::from(conflict.journal_id().to_owned()),
             GqlMutationConflictResultCode::AlreadyResolved,
         )),
+        // P081: terminal approval retried with a different key → APPROVAL_NOT_ACTIONABLE.
+        // Zero settlement side effects (no command_journal row was written).
+        ApprovalResolutionConflict::ApprovalNotActionable { .. } => Some((
+            ID::from(conflict.journal_id().to_owned()),
+            GqlMutationConflictResultCode::ApprovalNotActionable,
+        )),
     }
+}
+
+/// Build a deterministic IDEMPOTENCY_CONFLICT GraphQL error.
+/// Called when the command handler returns an IDEMPOTENCY_CONFLICT string error
+/// (same key, different canonical request hash) which is not an ApprovalResolutionConflict
+/// typed error and must not fall through to the opaque INTERNAL path.
+fn idempotency_conflict_gql_error(request_id: &Option<String>) -> Error {
+    let mut gql_err = Error::new("IDEMPOTENCY_CONFLICT");
+    gql_err = gql_err.extend_with(|_, ext| ext.set("code", "IDEMPOTENCY_CONFLICT"));
+    gql_err = gql_err.extend_with(|_, ext| ext.set("reasonCode", "IDEMPOTENCY_CONFLICT"));
+    if let Some(ref rid) = request_id {
+        gql_err = gql_err.extend_with(|_, ext| ext.set("requestId", rid.clone()));
+    }
+    gql_err
 }
 
 #[Object]
 impl MutationRoot {
-    /// P072: Approve a stage approval by approval_id. The resolver
+    /// P072/P081: Approve a stage approval by approval_id. The resolver
     /// server-resolves run_id and stage_id from the approval record
     /// before constructing ResolveApprovalCmd.
+    /// P081: idempotency_key is a required UUIDv7 per ApprovalActionAttemptStore attempt.
+    /// SEC-P081-HIGH-001: Required to enforce committed-unack replay contract.
     async fn approve_approval(
         &self,
         ctx: &Context<'_>,
         approval_id: ID,
         comment: Option<String>,
+        idempotency_key: String,
     ) -> Result<ApproveApprovalPayload> {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
@@ -2584,11 +4353,25 @@ impl MutationRoot {
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !mutation_allowed(ctx, &principal, MutationName::ApproveApproval) {
-            return Err(Error::new("forbidden"));
-        }
+        mutation_allowed(ctx, &principal, MutationName::ApproveApproval).await?;
+
+        // SEC-M-001: Validate idempotencyKey as UUIDv7 before command handling or storage.
+        validate_idempotency_key_uuidv7(&idempotency_key)?;
 
         let caller = graphql_caller_with_request_id(ctx, &principal, "approveApproval");
+        // SEC-P081-002: Capture request_id before caller is consumed so internal errors
+        // can include it without disclosing the raw error chain to the client.
+        let request_id = caller.request_id.clone();
+
+        // P081: Log a SHA-256 digest of the key — raw replay handles must not appear in logs.
+        {
+            let key_digest = {
+                use sha2::{Digest, Sha256};
+                let h = Sha256::digest(idempotency_key.as_bytes());
+                format!("{:x}", h)[..16].to_string()
+            };
+            tracing::debug!(idempotency_key_digest = %key_digest, approval_id = %*approval_id, "approveApproval idempotency_key received");
+        }
 
         let aid: domain::ids::ApprovalId = approval_id
             .parse()
@@ -2605,6 +4388,7 @@ impl MutationRoot {
             rationale: comment,
             run_id: approval.run_id,
             stage_id: approval.stage_id.clone(),
+            idempotency_key: Some(idempotency_key),
         });
 
         let result = cmd_handler.handle(cmd, caller).await;
@@ -2633,19 +4417,33 @@ impl MutationRoot {
                         journal_id,
                         conflict_result_code: Some(conflict_result_code),
                     })
+                } else if e.to_string().contains("IDEMPOTENCY_CONFLICT") {
+                    // P081: same idempotency key with a different canonical request hash.
+                    // Return a deterministic IDEMPOTENCY_CONFLICT code, not an opaque INTERNAL.
+                    Err(idempotency_conflict_gql_error(&request_id))
                 } else {
-                    Err(Error::new(e.to_string()))
+                    // SEC-P081-002: Log full error chain server-side; expose only INTERNAL + request_id.
+                    tracing::error!(error = %e, request_id = ?request_id, "approveApproval: internal command error");
+                    let mut gql_err = Error::new("INTERNAL");
+                    gql_err = gql_err.extend_with(|_, ext| ext.set("code", "INTERNAL"));
+                    if let Some(ref rid) = request_id {
+                        gql_err = gql_err.extend_with(|_, ext| ext.set("requestId", rid.clone()));
+                    }
+                    Err(gql_err)
                 }
             }
         }
     }
 
-    /// P072: Reject a stage approval by approval_id with a required reason.
+    /// P072/P081: Reject a stage approval by approval_id with a required reason.
+    /// P081: idempotency_key is a required UUIDv7 per ApprovalActionAttemptStore attempt.
+    /// SEC-P081-HIGH-001: Required to enforce committed-unack replay contract.
     async fn reject_approval(
         &self,
         ctx: &Context<'_>,
         approval_id: ID,
         reason: String,
+        idempotency_key: String,
     ) -> Result<RejectApprovalPayload> {
         let pool = ctx.data::<SqlitePool>()?;
         let cmd_handler = ctx.data::<Arc<CommandHandler>>()?;
@@ -2655,11 +4453,24 @@ impl MutationRoot {
             .map_err(|_| async_graphql::Error::new("unauthorized: no principal in context"))?
             .clone();
 
-        if !mutation_allowed(ctx, &principal, MutationName::RejectApproval) {
-            return Err(Error::new("forbidden"));
+        mutation_allowed(ctx, &principal, MutationName::RejectApproval).await?;
+
+        // SEC-M-001: Validate idempotencyKey as UUIDv7 before command handling or storage.
+        validate_idempotency_key_uuidv7(&idempotency_key)?;
+
+        // P081: Log a SHA-256 digest of the key — raw replay handles must not appear in logs.
+        {
+            let key_digest = {
+                use sha2::{Digest, Sha256};
+                let h = Sha256::digest(idempotency_key.as_bytes());
+                format!("{:x}", h)[..16].to_string()
+            };
+            tracing::debug!(idempotency_key_digest = %key_digest, approval_id = %*approval_id, "rejectApproval idempotency_key received");
         }
 
         let caller = graphql_caller_with_request_id(ctx, &principal, "rejectApproval");
+        // SEC-P081-002: Capture request_id before caller is consumed.
+        let request_id = caller.request_id.clone();
 
         let aid: domain::ids::ApprovalId = approval_id
             .parse()
@@ -2676,6 +4487,7 @@ impl MutationRoot {
             rationale: Some(reason),
             run_id: approval.run_id,
             stage_id: approval.stage_id.clone(),
+            idempotency_key: Some(idempotency_key),
         });
 
         let result = cmd_handler.handle(cmd, caller).await;
@@ -2703,8 +4515,19 @@ impl MutationRoot {
                         journal_id,
                         conflict_result_code: Some(conflict_result_code),
                     })
+                } else if e.to_string().contains("IDEMPOTENCY_CONFLICT") {
+                    // P081: same idempotency key with a different canonical request hash.
+                    // Return a deterministic IDEMPOTENCY_CONFLICT code, not an opaque INTERNAL.
+                    Err(idempotency_conflict_gql_error(&request_id))
                 } else {
-                    Err(Error::new(e.to_string()))
+                    // SEC-P081-002: Log full error chain server-side; expose only INTERNAL + request_id.
+                    tracing::error!(error = %e, request_id = ?request_id, "rejectApproval: internal command error");
+                    let mut gql_err = Error::new("INTERNAL");
+                    gql_err = gql_err.extend_with(|_, ext| ext.set("code", "INTERNAL"));
+                    if let Some(ref rid) = request_id {
+                        gql_err = gql_err.extend_with(|_, ext| ext.set("requestId", rid.clone()));
+                    }
+                    Err(gql_err)
                 }
             }
         }
@@ -2721,7 +4544,8 @@ impl SubscriptionRoot {
         run_id: Option<ID>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRun>>>> {
         // P029 §4.1.c: principal is injected by on_connection_init during WS handshake.
-        require_operator_read(ctx)?;
+        // P081 Phase 3: evaluate graphql_subscription transport (not graphql_query).
+        require_subscription_read(ctx).await?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -2739,6 +4563,7 @@ impl SubscriptionRoot {
                     | DomainEvent::ApprovalRequested { run_id, .. }
                     | DomainEvent::ArtifactCreated { run_id, .. }
                     | DomainEvent::RuntimeStatusChanged { run_id, .. }
+                    | DomainEvent::RuntimeTimelineEvent { run_id, .. }
                     | DomainEvent::MediationConfirmationResolved { run_id, .. }
                     | DomainEvent::RoutingCompleted { run_id, .. } => Some(run_id),
                     DomainEvent::ApprovalResolved { approval_id, .. } => {
@@ -2775,7 +4600,7 @@ impl SubscriptionRoot {
         run_id: ID,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlStageExecution>>>>
     {
-        require_operator_read(ctx)?;
+        require_subscription_read(ctx).await?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -2813,7 +4638,7 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlApproval>>>> {
-        require_operator_read(ctx)?;
+        require_subscription_read(ctx).await?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -2839,7 +4664,7 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlApproval>>>> {
-        require_operator_read(ctx)?;
+        require_subscription_read(ctx).await?;
 
         let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
@@ -2868,15 +4693,65 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
         run_id: Option<ID>,
+        replay_cursor: Option<String>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<Option<GqlRuntimeEvent>>>>
     {
-        require_operator_read(ctx)?;
+        require_subscription_read(ctx).await?;
 
+        let pool = ctx.data::<SqlitePool>()?.clone();
         let events = ctx.data::<EventSender>()?.clone();
         let filter_run_id: Option<RunId> = run_id.and_then(|id| id.parse().ok());
+        let latest_sequence = P081_SUBSCRIPTION_SEQUENCE.load(Ordering::SeqCst);
+        let replay = p081_subscription_replay_readback(
+            replay_cursor.as_deref(),
+            p081_oldest_retained_sequence(latest_sequence),
+            latest_sequence,
+            latest_sequence,
+        );
+        let bootstrap_frames = if replay["gapDetected"].as_bool().unwrap_or(false) {
+            vec![Ok(Some(GqlRuntimeEvent {
+                id: ID(format!("rte_subscription_gap_{}", replay["sequenceCursor"].as_str().unwrap_or("seq-0"))),
+                run_id: ID(
+                    filter_run_id
+                        .unwrap_or_else(|| RunId::from(uuid::Uuid::nil()))
+                        .to_string(),
+                ),
+                stage_id: "boundary_subscription_replay".to_string(),
+                agent_id: "control_plane".to_string(),
+                provider: "control_plane".to_string(),
+                event_kind: "subscription_gap_detected".to_string(),
+                title: None,
+                detail: None,
+                surface_label: None,
+                session_generation_id: None,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                raw_detail: None,
+                raw_detail_bytes: None,
+                raw_detail_truncated: false,
+                raw_detail_handle: None,
+                raw_detail_digest: None,
+                full_raw_available: true,
+                detail_digest: None,
+                detail_char_count: None,
+                chunk_count: None,
+                is_streaming: false,
+                is_terminal: true,
+                state_label: Some("boundary_subscription_replay".to_string()),
+                sequence_cursor: replay["sequenceCursor"]
+                    .as_str()
+                    .unwrap_or("seq-0")
+                    .to_string(),
+                projection_generation: replay["projectionGeneration"].as_i64().unwrap_or(0),
+                gap_detected: true,
+                requires_full_refetch: true,
+            }))]
+        } else {
+            Vec::new()
+        };
 
         let rx = events.subscribe();
-        Ok(BroadcastStream::new(rx).filter_map(move |msg| {
+        let live = BroadcastStream::new(rx).filter_map(move |msg| {
+            let pool = pool.clone();
             let fut = async move {
                 let event = msg.ok()?;
                 match event {
@@ -2887,25 +4762,73 @@ impl SubscriptionRoot {
                         provider,
                         event_kind,
                     } => {
+                        let sequence = p081_next_subscription_sequence();
                         if let Some(fid) = filter_run_id {
                             if run_id != fid {
                                 return None;
                             }
                         }
-                        Some(Ok(Some(GqlRuntimeEvent {
-                            run_id: ID(run_id.to_string()),
+                        let mut event = GqlRuntimeEvent::from_parts(
+                            ID(run_id.to_string()),
                             stage_id,
                             agent_id,
                             provider,
                             event_kind,
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                        })))
+                            None,
+                            None,
+                            None,
+                            None,
+                            chrono::Utc::now().to_rfc3339(),
+                        );
+                        event.sequence_cursor = format!("seq-{sequence}");
+                        event.projection_generation = sequence;
+                        event.gap_detected = false;
+                        event.requires_full_refetch = false;
+                        Some(Ok(Some(event)))
+                    }
+                    DomainEvent::RuntimeTimelineEvent {
+                        run_id,
+                        stage_id,
+                        agent_id,
+                        provider,
+                        event_kind,
+                        title,
+                        detail,
+                        surface_label,
+                        session_generation_id,
+                    } => {
+                        if let Some(fid) = filter_run_id {
+                            if run_id != fid {
+                                return None;
+                            }
+                        }
+                        let sequence = p081_next_subscription_sequence();
+                        let mut event = GqlRuntimeEvent::from_live_timeline_parts(
+                            &pool,
+                            run_id,
+                            stage_id,
+                            agent_id,
+                            provider,
+                            event_kind,
+                            Some(title),
+                            detail,
+                            Some(surface_label),
+                            session_generation_id,
+                            chrono::Utc::now().to_rfc3339(),
+                        )
+                        .await;
+                        event.sequence_cursor = format!("seq-{sequence}");
+                        event.projection_generation = sequence;
+                        event.gap_detected = false;
+                        event.requires_full_refetch = false;
+                        Some(Ok(Some(event)))
                     }
                     _ => None,
                 }
             };
             fut
-        }))
+        });
+        Ok(stream::iter(bootstrap_frames).chain(live))
     }
 
     /// P042 §5.2 push surface. Emits a `GqlDaemonStatus` frame on every
@@ -2921,22 +4844,8 @@ impl SubscriptionRoot {
         &self,
         ctx: &Context<'_>,
     ) -> Result<impl async_graphql::futures_util::Stream<Item = Result<GqlDaemonStatus>>> {
-        let principal = ctx
-            .data::<auth::Principal>()
-            .map_err(|_| Error::new("unauthorized: no principal in subscription context"))?;
-        if principal.class != auth::PrincipalClass::Operator {
-            return Err(Error::new("forbidden"));
-        }
-        // P072: enforce allow_subscriptions surface policy when present.
-        if let Ok(table) = ctx.data::<auth::PrincipalTable>() {
-            if let Some(allowed) =
-                auth::is_subscription_allowed_by_surface_policy(table, &principal.id)
-            {
-                if !allowed {
-                    return Err(Error::new("forbidden"));
-                }
-            }
-        }
+        // P081 Phase 3: use shared graphql_subscription BoundaryPolicy evaluation.
+        require_subscription_read(ctx).await?;
         let events = ctx.data::<EventSender>()?.clone();
         let rx = events.subscribe();
         Ok(BroadcastStream::new(rx).filter_map(move |msg| async move {
@@ -3292,16 +5201,612 @@ impl SubscriptionRoot {
     }
 }
 
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(rename_items = "snake_case")]
+pub enum TimelineRawDetailStatus {
+    Available,
+    Missing,
+    Stale,
+    Unauthorized,
+    Unavailable,
+    DigestMismatch,
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+#[graphql(rename_items = "snake_case")]
+pub enum TimelineRawDetailErrorReason {
+    HandleNotFound,
+    HandleExpired,
+    RunNotAuthorized,
+    EventNotAuthorized,
+    StorageUnavailable,
+    DigestValidationFailed,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlTimelineRawDetailResult {
+    pub status: TimelineRawDetailStatus,
+    pub raw_detail: Option<String>,
+    pub raw_detail_bytes: Option<i32>,
+    pub raw_detail_digest: Option<String>,
+    pub error_reason: Option<TimelineRawDetailErrorReason>,
+}
+
+impl GqlTimelineRawDetailResult {
+    fn available(raw_detail: String, raw_detail_digest: String) -> Self {
+        let raw_detail_bytes = raw_detail.len() as i32;
+        Self {
+            status: TimelineRawDetailStatus::Available,
+            raw_detail: Some(raw_detail),
+            raw_detail_bytes: Some(raw_detail_bytes),
+            raw_detail_digest: Some(raw_detail_digest),
+            error_reason: None,
+        }
+    }
+
+    fn missing(error_reason: TimelineRawDetailErrorReason) -> Self {
+        Self {
+            status: TimelineRawDetailStatus::Missing,
+            raw_detail: None,
+            raw_detail_bytes: None,
+            raw_detail_digest: None,
+            error_reason: Some(error_reason),
+        }
+    }
+
+    fn failed(status: TimelineRawDetailStatus, error_reason: TimelineRawDetailErrorReason) -> Self {
+        Self {
+            status,
+            raw_detail: None,
+            raw_detail_bytes: None,
+            raw_detail_digest: None,
+            error_reason: Some(error_reason),
+        }
+    }
+}
+
+async fn p093_resolve_timeline_raw_detail(
+    pool: &SqlitePool,
+    handle: &str,
+) -> Result<GqlTimelineRawDetailResult> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            trd.run_id,
+            trd.agent_execution_id,
+            trd.session_generation_id,
+            trd.timeline_event_id,
+            trd.raw_detail,
+            trd.raw_detail_bytes,
+            trd.raw_detail_digest,
+            trd.status,
+            trd.expires_at,
+            r.id AS existing_run_id,
+            ae.id AS existing_agent_execution_id,
+            ae.session_generation_id AS execution_session_generation_id,
+            se.run_id AS execution_run_id
+        FROM timeline_raw_details trd
+        LEFT JOIN runs r ON r.id = trd.run_id
+        LEFT JOIN agent_executions ae ON ae.id = trd.agent_execution_id
+        LEFT JOIN stage_executions se ON se.id = ae.stage_execution_id
+        WHERE trd.handle = ?1
+        "#,
+    )
+    .bind(handle)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| Error::new(e.to_string()))?;
+
+    let Some(row) = row else {
+        return Ok(GqlTimelineRawDetailResult::missing(
+            TimelineRawDetailErrorReason::HandleNotFound,
+        ));
+    };
+
+    let status: String = row.get("status");
+    match status.as_str() {
+        "available" => {}
+        "stale" => {
+            return Ok(GqlTimelineRawDetailResult::failed(
+                TimelineRawDetailStatus::Stale,
+                TimelineRawDetailErrorReason::HandleExpired,
+            ));
+        }
+        "unauthorized" => {
+            return Ok(GqlTimelineRawDetailResult::failed(
+                TimelineRawDetailStatus::Unauthorized,
+                TimelineRawDetailErrorReason::EventNotAuthorized,
+            ));
+        }
+        "unavailable" => {
+            return Ok(GqlTimelineRawDetailResult::failed(
+                TimelineRawDetailStatus::Unavailable,
+                TimelineRawDetailErrorReason::StorageUnavailable,
+            ));
+        }
+        "digest_mismatch" => {
+            return Ok(GqlTimelineRawDetailResult::failed(
+                TimelineRawDetailStatus::DigestMismatch,
+                TimelineRawDetailErrorReason::DigestValidationFailed,
+            ));
+        }
+        _ => {
+            return Ok(GqlTimelineRawDetailResult::failed(
+                TimelineRawDetailStatus::Unavailable,
+                TimelineRawDetailErrorReason::StorageUnavailable,
+            ));
+        }
+    }
+
+    let expires_at: Option<String> = row.get("expires_at");
+    if let Some(expires_at) = expires_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let parsed = chrono::DateTime::parse_from_rfc3339(expires_at)
+            .map(|value| value.with_timezone(&chrono::Utc))
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%dT%H:%M:%S%.fZ")
+                    .map(|value| value.and_utc())
+            });
+        match parsed {
+            Ok(expires_at) if expires_at <= chrono::Utc::now() => {
+                return Ok(GqlTimelineRawDetailResult::failed(
+                    TimelineRawDetailStatus::Stale,
+                    TimelineRawDetailErrorReason::HandleExpired,
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => {
+                return Ok(GqlTimelineRawDetailResult::failed(
+                    TimelineRawDetailStatus::Stale,
+                    TimelineRawDetailErrorReason::HandleExpired,
+                ));
+            }
+        }
+    }
+
+    let existing_run_id: Option<String> = row.get("existing_run_id");
+    if existing_run_id.is_none() {
+        return Ok(GqlTimelineRawDetailResult::failed(
+            TimelineRawDetailStatus::Unauthorized,
+            TimelineRawDetailErrorReason::RunNotAuthorized,
+        ));
+    }
+
+    let agent_execution_id: Option<String> = row.get("agent_execution_id");
+    let existing_agent_execution_id: Option<String> = row.get("existing_agent_execution_id");
+    if agent_execution_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+        || existing_agent_execution_id.is_none()
+    {
+        return Ok(GqlTimelineRawDetailResult::failed(
+            TimelineRawDetailStatus::Unauthorized,
+            TimelineRawDetailErrorReason::EventNotAuthorized,
+        ));
+    }
+
+    let run_id: String = row.get("run_id");
+    let execution_run_id: Option<String> = row.get("execution_run_id");
+    if execution_run_id.as_deref() != Some(run_id.as_str()) {
+        return Ok(GqlTimelineRawDetailResult::failed(
+            TimelineRawDetailStatus::Unauthorized,
+            TimelineRawDetailErrorReason::RunNotAuthorized,
+        ));
+    }
+
+    let timeline_event_id: String = row.get("timeline_event_id");
+    if timeline_event_id.trim().is_empty() {
+        return Ok(GqlTimelineRawDetailResult::failed(
+            TimelineRawDetailStatus::Unauthorized,
+            TimelineRawDetailErrorReason::EventNotAuthorized,
+        ));
+    }
+
+    let scoped_session_generation_id: Option<String> = row.get("session_generation_id");
+    if let Some(scoped_session_generation_id) = scoped_session_generation_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let execution_session_generation_id: Option<String> =
+            row.get("execution_session_generation_id");
+        if execution_session_generation_id.as_deref() != Some(scoped_session_generation_id) {
+            return Ok(GqlTimelineRawDetailResult::failed(
+                TimelineRawDetailStatus::Unauthorized,
+                TimelineRawDetailErrorReason::EventNotAuthorized,
+            ));
+        }
+    }
+
+    let raw_detail: String = row.get("raw_detail");
+    let raw_detail_digest: String = row.get("raw_detail_digest");
+    let computed = sha256_digest(&raw_detail);
+    if raw_detail_digest != computed {
+        return Ok(GqlTimelineRawDetailResult::failed(
+            TimelineRawDetailStatus::DigestMismatch,
+            TimelineRawDetailErrorReason::DigestValidationFailed,
+        ));
+    }
+
+    Ok(GqlTimelineRawDetailResult::available(
+        raw_detail,
+        raw_detail_digest,
+    ))
+}
+
 /// Runtime lifecycle event surfaced to GraphQL subscribers.
 #[derive(SimpleObject, Clone, Debug)]
 pub struct GqlRuntimeEvent {
+    pub id: ID,
     pub run_id: ID,
     pub stage_id: String,
     pub agent_id: String,
     pub provider: String,
     /// "session_started" | "session_completed" | "session_failed"
     pub event_kind: String,
+    pub title: Option<String>,
+    pub detail: Option<String>,
+    pub surface_label: Option<String>,
+    pub session_generation_id: Option<String>,
     pub timestamp: String,
+    pub raw_detail: Option<String>,
+    pub raw_detail_bytes: Option<i32>,
+    pub raw_detail_truncated: bool,
+    pub raw_detail_handle: Option<ID>,
+    pub raw_detail_digest: Option<String>,
+    pub full_raw_available: bool,
+    pub detail_digest: Option<String>,
+    pub detail_char_count: Option<i32>,
+    pub chunk_count: Option<i32>,
+    pub is_streaming: bool,
+    pub is_terminal: bool,
+    pub state_label: Option<String>,
+    pub sequence_cursor: String,
+    pub projection_generation: i64,
+    pub gap_detected: bool,
+    pub requires_full_refetch: bool,
+}
+
+struct P093RuntimeRawDetailReadback {
+    detail: Option<String>,
+    raw_detail: Option<String>,
+    raw_detail_bytes: Option<i32>,
+    raw_detail_truncated: bool,
+    raw_detail_handle: Option<ID>,
+    raw_detail_digest: Option<String>,
+    full_raw_available: bool,
+    detail_digest: Option<String>,
+    detail_char_count: Option<i32>,
+}
+
+impl GqlRuntimeEvent {
+    const RETAINED_INLINE_RAW_DETAIL_LIMIT: usize = 512 * 1024;
+
+    fn from_parts(
+        run_id: ID,
+        stage_id: String,
+        agent_id: String,
+        provider: String,
+        event_kind: String,
+        title: Option<String>,
+        detail: Option<String>,
+        surface_label: Option<String>,
+        session_generation_id: Option<String>,
+        timestamp: String,
+    ) -> Self {
+        let raw = Self::inline_raw_detail_readback(detail, None);
+        Self::from_readback_parts(
+            run_id,
+            stage_id,
+            agent_id,
+            provider,
+            event_kind,
+            title,
+            surface_label,
+            session_generation_id,
+            timestamp,
+            raw,
+        )
+    }
+
+    async fn from_live_timeline_parts(
+        pool: &SqlitePool,
+        run_id: RunId,
+        stage_id: String,
+        agent_id: String,
+        provider: String,
+        event_kind: String,
+        title: Option<String>,
+        detail: Option<String>,
+        surface_label: Option<String>,
+        session_generation_id: Option<String>,
+        timestamp: String,
+    ) -> Self {
+        let full_detail = detail.clone();
+        let mut raw = Self::inline_raw_detail_readback(detail, None);
+        if raw.raw_detail_truncated {
+            let event_id = runtime_event_id(
+                &run_id.to_string(),
+                &stage_id,
+                &agent_id,
+                &event_kind,
+                surface_label.as_deref(),
+                session_generation_id.as_deref(),
+                &timestamp,
+                raw.detail_digest.as_deref(),
+            );
+            if let Some(full_detail) = full_detail {
+                match p093_persist_live_timeline_raw_detail(
+                    pool,
+                    run_id,
+                    &stage_id,
+                    &agent_id,
+                    &provider,
+                    session_generation_id.as_deref(),
+                    &event_id,
+                    &full_detail,
+                    raw.raw_detail_digest.as_deref().unwrap_or_default(),
+                )
+                .await
+                {
+                    Ok(Some(handle)) => {
+                        raw.raw_detail_handle = Some(ID(handle));
+                        raw.full_raw_available = true;
+                    }
+                    Ok(None) => {
+                        raw.full_raw_available = false;
+                    }
+                    Err(error) => {
+                        warn!(
+                            run_id = %run_id,
+                            stage_id = %stage_id,
+                            agent_id = %agent_id,
+                            error = ?error,
+                            "P093 live timeline raw detail retention failed closed"
+                        );
+                        raw.full_raw_available = false;
+                    }
+                }
+            }
+        }
+        Self::from_readback_parts(
+            ID(run_id.to_string()),
+            stage_id,
+            agent_id,
+            provider,
+            event_kind,
+            title,
+            surface_label,
+            session_generation_id,
+            timestamp,
+            raw,
+        )
+    }
+
+    fn from_readback_parts(
+        run_id: ID,
+        stage_id: String,
+        agent_id: String,
+        provider: String,
+        event_kind: String,
+        title: Option<String>,
+        surface_label: Option<String>,
+        session_generation_id: Option<String>,
+        timestamp: String,
+        raw: P093RuntimeRawDetailReadback,
+    ) -> Self {
+        let is_terminal = matches!(
+            event_kind.as_str(),
+            "session_completed" | "session_failed" | "agent_summary"
+        ) || matches!(surface_label.as_deref(), Some("agent_summary"));
+        let is_streaming = !is_terminal
+            && matches!(
+                surface_label.as_deref(),
+                Some("text_chunk") | Some("agent_message_chunk")
+            );
+        let id = runtime_event_id(
+            run_id.as_str(),
+            &stage_id,
+            &agent_id,
+            &event_kind,
+            surface_label.as_deref(),
+            session_generation_id.as_deref(),
+            &timestamp,
+            raw.detail_digest.as_deref(),
+        );
+        Self {
+            id: ID(id),
+            run_id,
+            stage_id: stage_id.clone(),
+            agent_id,
+            provider,
+            event_kind,
+            title,
+            detail: raw.detail,
+            surface_label,
+            session_generation_id,
+            timestamp,
+            raw_detail: raw.raw_detail,
+            raw_detail_bytes: raw.raw_detail_bytes,
+            raw_detail_truncated: raw.raw_detail_truncated,
+            raw_detail_handle: raw.raw_detail_handle,
+            raw_detail_digest: raw.raw_detail_digest,
+            full_raw_available: raw.full_raw_available,
+            detail_digest: raw.detail_digest,
+            detail_char_count: raw.detail_char_count,
+            chunk_count: Some(1),
+            is_streaming,
+            is_terminal,
+            state_label: Some(stage_id),
+            sequence_cursor: "seq-0".to_string(),
+            projection_generation: 0,
+            gap_detected: false,
+            requires_full_refetch: false,
+        }
+    }
+
+    fn inline_raw_detail_readback(
+        detail: Option<String>,
+        raw_detail_handle: Option<ID>,
+    ) -> P093RuntimeRawDetailReadback {
+        let Some(full_detail) = detail else {
+            return P093RuntimeRawDetailReadback {
+                detail: None,
+                raw_detail: None,
+                raw_detail_bytes: None,
+                raw_detail_truncated: false,
+                raw_detail_handle,
+                raw_detail_digest: None,
+                full_raw_available: true,
+                detail_digest: None,
+                detail_char_count: None,
+            };
+        };
+
+        let raw_detail_digest = sha256_digest(&full_detail);
+        let capped = cap_utf8_suffix(&full_detail, Self::RETAINED_INLINE_RAW_DETAIL_LIMIT);
+        let detail_digest = sha256_digest(&capped.text);
+        let raw_detail_bytes = Some(i32::try_from(capped.text.len()).unwrap_or(i32::MAX));
+        let detail_char_count =
+            Some(i32::try_from(capped.text.chars().count()).unwrap_or(i32::MAX));
+        P093RuntimeRawDetailReadback {
+            detail: Some(capped.text.clone()),
+            raw_detail: Some(capped.text),
+            raw_detail_bytes,
+            raw_detail_truncated: capped.truncated,
+            raw_detail_handle,
+            raw_detail_digest: Some(raw_detail_digest),
+            full_raw_available: !capped.truncated,
+            detail_digest: Some(detail_digest),
+            detail_char_count,
+        }
+    }
+}
+
+async fn p093_persist_live_timeline_raw_detail(
+    pool: &SqlitePool,
+    run_id: RunId,
+    stage_id: &str,
+    agent_id: &str,
+    provider: &str,
+    session_generation_id: Option<&str>,
+    timeline_event_id: &str,
+    raw_detail: &str,
+    raw_detail_digest: &str,
+) -> Result<Option<String>> {
+    let mut query = String::from(
+        r#"
+        SELECT ae.id
+        FROM agent_executions ae
+        INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
+        WHERE se.run_id = ?1
+          AND se.stage_id = ?2
+          AND ae.agent_id = ?3
+          AND ae.provider = ?4
+        "#,
+    );
+    if session_generation_id.is_some() {
+        query.push_str(" AND ae.session_generation_id = ?5");
+    }
+    query.push_str(" ORDER BY ae.started_at DESC LIMIT 1");
+
+    let mut sql = sqlx::query(&query)
+        .bind(run_id.to_string())
+        .bind(stage_id)
+        .bind(agent_id)
+        .bind(provider);
+    if let Some(session_generation_id) = session_generation_id {
+        sql = sql.bind(session_generation_id);
+    }
+    let row = sql
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| Error::new(e.to_string()))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let agent_execution_id: String = row.get("id");
+    let handle = format!("trd_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        r#"
+        INSERT INTO timeline_raw_details
+            (handle, run_id, agent_execution_id, session_generation_id, timeline_event_id,
+             raw_detail, raw_detail_bytes, raw_detail_digest, status)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available')
+        "#,
+    )
+    .bind(&handle)
+    .bind(run_id.to_string())
+    .bind(agent_execution_id)
+    .bind(session_generation_id)
+    .bind(timeline_event_id)
+    .bind(raw_detail)
+    .bind(i64::try_from(raw_detail.len()).unwrap_or(i64::MAX))
+    .bind(raw_detail_digest)
+    .execute(pool)
+    .await
+    .map_err(|e| Error::new(e.to_string()))?;
+
+    Ok(Some(handle))
+}
+
+fn cap_utf8_suffix(text: &str, utf8_limit: usize) -> P093CappedText {
+    if text.len() <= utf8_limit {
+        return P093CappedText {
+            text: text.to_string(),
+            truncated: false,
+        };
+    }
+    let mut start = text.len().saturating_sub(utf8_limit);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    P093CappedText {
+        text: text[start..].to_string(),
+        truncated: true,
+    }
+}
+
+struct P093CappedText {
+    text: String,
+    truncated: bool,
+}
+
+fn sha256_digest(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn runtime_event_id(
+    run_id: &str,
+    stage_id: &str,
+    agent_id: &str,
+    event_kind: &str,
+    surface_label: Option<&str>,
+    session_generation_id: Option<&str>,
+    timestamp: &str,
+    detail_digest: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        run_id,
+        stage_id,
+        agent_id,
+        event_kind,
+        surface_label.unwrap_or(""),
+        session_generation_id.unwrap_or(""),
+        timestamp,
+        detail_digest.unwrap_or(""),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("rte_{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -3312,8 +5817,8 @@ mod tests {
     use chrono::Utc;
     use db::pool::create_pool;
     use db::repos::{
-        artifact_contracts, artifacts, ideas, projections, rollout_contract_checks, runs, stages,
-        steward, workflow_conflicts,
+        artifact_contracts, artifacts, audit_log, ideas, projections, rollout_contract_checks,
+        runs, stages, steward, workflow_conflicts,
     };
     use db::write_class::{ReplayPolicy, WriteClass, WriteLane, WriteOperation, WriteResult};
     use domain::artifact::{Artifact, ArtifactFormat};
@@ -3419,6 +5924,702 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn runtime_timeline_p093_readback_fields_are_in_schema() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let sdl = schema.sdl();
+
+        for field in [
+            "timelineRawDetail(",
+            "rawDetail",
+            "rawDetailBytes",
+            "rawDetailTruncated",
+            "rawDetailHandle",
+            "rawDetailDigest",
+            "fullRawAvailable",
+            "detailDigest",
+            "detailCharCount",
+            "chunkCount",
+            "isStreaming",
+            "isTerminal",
+            "stateLabel",
+        ] {
+            assert!(sdl.contains(field), "schema should expose {field}");
+        }
+    }
+
+    #[test]
+    fn runtime_timeline_p093_event_synthesizes_metadata_without_swift_inference() {
+        let event = GqlRuntimeEvent::from_parts(
+            ID("run-1".into()),
+            "state_10".into(),
+            "code_writer".into(),
+            "claude".into(),
+            "meaningful_progress".into(),
+            Some("Agent response".into()),
+            Some("chunk".into()),
+            Some("text_chunk".into()),
+            Some("session-1".into()),
+            "2026-05-21T08:44:47Z".into(),
+        );
+
+        assert!(event.id.as_str().starts_with("rte_"));
+        assert_eq!(event.raw_detail.as_deref(), Some("chunk"));
+        assert_eq!(event.raw_detail_bytes, Some(5));
+        assert_eq!(event.detail_char_count, Some(5));
+        assert_eq!(event.chunk_count, Some(1));
+        assert!(event.is_streaming);
+        assert!(!event.is_terminal);
+        assert_eq!(event.state_label.as_deref(), Some("state_10"));
+        assert!(event.full_raw_available);
+        assert!(!event.raw_detail_truncated);
+        assert!(event
+            .raw_detail_digest
+            .as_deref()
+            .unwrap()
+            .starts_with("sha256:"));
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_p093_live_over_budget_event_persists_resolvable_raw_detail() {
+        use async_graphql::futures_util::StreamExt;
+
+        let pool = test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        runs::insert(&pool, &run).await.unwrap();
+        let stage = make_stage_execution(run_id, "state_10", "Implementation", Utc::now());
+        let stage_execution_id = stage.id;
+        stages::insert(&pool, &stage).await.unwrap();
+        let execution =
+            make_agent_execution(stage_execution_id, "code_writer", "claude", Utc::now());
+        db::repos::agent_executions::insert(&pool, &execution)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            bus.clone(),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let raw = format!("{}{}", "a".repeat(530_000), "tail-marker");
+        let expected_digest = sha256_digest(&raw);
+        let mut stream = schema.execute_stream(
+            Request::new(
+                r#"
+                subscription($runId: ID!) {
+                  runtimeStatusChanged(runId: $runId) {
+                    rawDetail
+                    rawDetailBytes
+                    rawDetailTruncated
+                    rawDetailHandle
+                    rawDetailDigest
+                    fullRawAvailable
+                  }
+                }
+                "#,
+            )
+            .variables(Variables::from_json(
+                serde_json::json!({ "runId": run_id.to_string() }),
+            ))
+            .data(test_principal()),
+        );
+        let bus_for_event = bus.clone();
+        let raw_for_event = raw.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = bus_for_event.send(DomainEvent::RuntimeTimelineEvent {
+                run_id,
+                stage_id: "state_10".into(),
+                agent_id: "code_writer".into(),
+                provider: "claude".into(),
+                event_kind: "meaningful_progress".into(),
+                title: "Agent response".into(),
+                detail: Some(raw_for_event),
+                surface_label: "text_chunk".into(),
+                session_generation_id: Some("session-code_writer".into()),
+            });
+        });
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("runtime timeline subscription frame timed out")
+            .expect("runtime timeline subscription ended");
+        assert!(
+            frame.errors.is_empty(),
+            "runtime timeline over-budget event should stream without errors: {frame:?}"
+        );
+        let json = frame.data.into_json().unwrap();
+        let event = &json["runtimeStatusChanged"];
+        assert_eq!(event["rawDetailTruncated"], serde_json::json!(true));
+        assert_eq!(event["rawDetailBytes"], serde_json::json!(524_288));
+        assert_eq!(event["rawDetailDigest"], serde_json::json!(expected_digest));
+        assert_eq!(event["fullRawAvailable"], serde_json::json!(true));
+        let retained = event["rawDetail"].as_str().unwrap();
+        assert_eq!(retained.len(), 524_288);
+        assert!(retained.ends_with("tail-marker"));
+        let handle = event["rawDetailHandle"]
+            .as_str()
+            .expect("over-budget live event should expose daemon raw-detail handle");
+
+        let resolver_response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query {{
+                      timelineRawDetail(handle: "{handle}") {{
+                        status rawDetail rawDetailBytes rawDetailDigest errorReason
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+        assert!(
+            resolver_response.errors.is_empty(),
+            "stored live raw detail handle should resolve: {resolver_response:?}"
+        );
+        let resolver_json = resolver_response.data.into_json().unwrap();
+        let resolved = &resolver_json["timelineRawDetail"];
+        assert_eq!(resolved["status"], serde_json::json!("available"));
+        assert_eq!(resolved["rawDetailBytes"], serde_json::json!(raw.len()));
+        assert_eq!(
+            resolved["rawDetailDigest"],
+            serde_json::json!(expected_digest)
+        );
+        assert_eq!(resolved["rawDetail"], serde_json::json!(raw));
+        assert!(resolved["errorReason"].is_null());
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_p093_raw_detail_resolver_covers_status_matrix() {
+        let pool = test_pool().await;
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let raw = "full retained raw response";
+        let digest = sha256_digest(raw);
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        runs::insert(&pool, &run).await.unwrap();
+        let stage = make_stage_execution(run_id, "state_10", "Implementation", Utc::now());
+        let stage_id = stage.id;
+        stages::insert(&pool, &stage).await.unwrap();
+        let execution = make_agent_execution(stage_id, "code_writer", "claude", Utc::now());
+        let agent_execution_id = execution.id.to_string();
+        db::repos::agent_executions::insert(&pool, &execution)
+            .await
+            .unwrap();
+        for (handle, status, detail, digest_override) in [
+            ("trd_available", "available", raw, digest.as_str()),
+            ("trd_stale", "stale", "", "sha256:empty"),
+            ("trd_unauthorized", "unauthorized", "", "sha256:empty"),
+            ("trd_unavailable", "unavailable", "", "sha256:empty"),
+            (
+                "trd_status_mismatch",
+                "digest_mismatch",
+                raw,
+                digest.as_str(),
+            ),
+            (
+                "trd_digest_mismatch",
+                "available",
+                raw,
+                "sha256:not-the-content",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO timeline_raw_details
+                    (handle, run_id, agent_execution_id, session_generation_id, timeline_event_id,
+                     raw_detail, raw_detail_bytes, raw_detail_digest, status)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+            )
+            .bind(handle)
+            .bind(run_id.to_string())
+            .bind(&agent_execution_id)
+            .bind("session-code_writer")
+            .bind(format!("rte_{handle}"))
+            .bind(detail)
+            .bind(detail.len() as i64)
+            .bind(digest_override)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query {
+                      available: timelineRawDetail(handle: "trd_available") {
+                        status rawDetail rawDetailBytes rawDetailDigest errorReason
+                      }
+                      missing: timelineRawDetail(handle: "trd_missing") {
+                        status errorReason
+                      }
+                      stale: timelineRawDetail(handle: "trd_stale") {
+                        status errorReason
+                      }
+                      unauthorized: timelineRawDetail(handle: "trd_unauthorized") {
+                        status errorReason
+                      }
+                      unavailable: timelineRawDetail(handle: "trd_unavailable") {
+                        status errorReason
+                      }
+                      statusMismatch: timelineRawDetail(handle: "trd_status_mismatch") {
+                        status errorReason
+                      }
+                      digestMismatch: timelineRawDetail(handle: "trd_digest_mismatch") {
+                        status errorReason
+                      }
+                    }
+                    "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "raw detail resolver should fail closed through result statuses: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["available"]["status"], serde_json::json!("available"));
+        assert_eq!(json["available"]["rawDetail"], serde_json::json!(raw));
+        assert_eq!(
+            json["available"]["rawDetailDigest"],
+            serde_json::json!(digest)
+        );
+        assert_eq!(
+            json["missing"]["errorReason"],
+            serde_json::json!("handle_not_found")
+        );
+        assert_eq!(json["stale"]["status"], serde_json::json!("stale"));
+        assert_eq!(
+            json["stale"]["errorReason"],
+            serde_json::json!("handle_expired")
+        );
+        assert_eq!(
+            json["unauthorized"]["status"],
+            serde_json::json!("unauthorized")
+        );
+        assert_eq!(
+            json["unauthorized"]["errorReason"],
+            serde_json::json!("event_not_authorized")
+        );
+        assert_eq!(
+            json["unavailable"]["status"],
+            serde_json::json!("unavailable")
+        );
+        assert_eq!(
+            json["unavailable"]["errorReason"],
+            serde_json::json!("storage_unavailable")
+        );
+        assert_eq!(
+            json["statusMismatch"]["status"],
+            serde_json::json!("digest_mismatch")
+        );
+        assert_eq!(
+            json["digestMismatch"]["errorReason"],
+            serde_json::json!("digest_validation_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_p093_raw_detail_resolver_enforces_expiry_and_scope() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        runs::insert(&pool, &run).await.unwrap();
+        let stage = make_stage_execution(run_id, "state_10", "Implementation", Utc::now());
+        let stage_id = stage.id;
+        stages::insert(&pool, &stage).await.unwrap();
+        let execution = make_agent_execution(stage_id, "code_writer", "claude", Utc::now());
+        let agent_execution_id = execution.id.to_string();
+        db::repos::agent_executions::insert(&pool, &execution)
+            .await
+            .unwrap();
+
+        let raw = "full scoped raw detail";
+        let digest = sha256_digest(raw);
+        sqlx::query(
+            r#"
+            INSERT INTO timeline_raw_details
+                (handle, run_id, agent_execution_id, session_generation_id, timeline_event_id,
+                 raw_detail, raw_detail_bytes, raw_detail_digest, status, expires_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available', ?9)
+            "#,
+        )
+        .bind("trd_scoped")
+        .bind(run_id.to_string())
+        .bind(&agent_execution_id)
+        .bind("session-code_writer")
+        .bind("rte_scoped")
+        .bind(raw)
+        .bind(raw.len() as i64)
+        .bind(&digest)
+        .bind((Utc::now() + chrono::Duration::minutes(5)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO timeline_raw_details
+                (handle, run_id, agent_execution_id, session_generation_id, timeline_event_id,
+                 raw_detail, raw_detail_bytes, raw_detail_digest, status, expires_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available', ?9)
+            "#,
+        )
+        .bind("trd_expired")
+        .bind(run_id.to_string())
+        .bind(&agent_execution_id)
+        .bind("session-code_writer")
+        .bind("rte_expired")
+        .bind(raw)
+        .bind(raw.len() as i64)
+        .bind(&digest)
+        .bind((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO timeline_raw_details
+                (handle, run_id, agent_execution_id, session_generation_id, timeline_event_id,
+                 raw_detail, raw_detail_bytes, raw_detail_digest, status)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available')
+            "#,
+        )
+        .bind("trd_wrong_session")
+        .bind(run_id.to_string())
+        .bind(&agent_execution_id)
+        .bind("session-other")
+        .bind("rte_wrong_session")
+        .bind(raw)
+        .bind(raw.len() as i64)
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO timeline_raw_details
+                (handle, run_id, agent_execution_id, session_generation_id, timeline_event_id,
+                 raw_detail, raw_detail_bytes, raw_detail_digest, status)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available')
+            "#,
+        )
+        .bind("trd_wrong_run")
+        .bind(RunId::new().to_string())
+        .bind(&agent_execution_id)
+        .bind("session-code_writer")
+        .bind("rte_wrong_run")
+        .bind(raw)
+        .bind(raw.len() as i64)
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(
+                    r#"
+                    query {
+                      scoped: timelineRawDetail(handle: "trd_scoped") { status rawDetail errorReason }
+                      expired: timelineRawDetail(handle: "trd_expired") { status rawDetail errorReason }
+                      wrongSession: timelineRawDetail(handle: "trd_wrong_session") { status rawDetail errorReason }
+                      wrongRun: timelineRawDetail(handle: "trd_wrong_run") { status rawDetail errorReason }
+                    }
+                    "#,
+                )
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "raw detail scope checks should fail closed through result statuses: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        assert_eq!(json["scoped"]["status"], serde_json::json!("available"));
+        assert_eq!(json["scoped"]["rawDetail"], serde_json::json!(raw));
+        assert_eq!(json["expired"]["status"], serde_json::json!("stale"));
+        assert_eq!(
+            json["expired"]["errorReason"],
+            serde_json::json!("handle_expired")
+        );
+        assert_eq!(
+            json["wrongSession"]["status"],
+            serde_json::json!("unauthorized")
+        );
+        assert_eq!(
+            json["wrongSession"]["errorReason"],
+            serde_json::json!("event_not_authorized")
+        );
+        assert_eq!(
+            json["wrongRun"]["status"],
+            serde_json::json!("unauthorized")
+        );
+        assert_eq!(
+            json["wrongRun"]["errorReason"],
+            serde_json::json!("run_not_authorized")
+        );
+        assert!(json["wrongRun"]["rawDetail"].is_null());
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_p093_active_agent_selector_uses_backend_stage_order() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
+        let catalog_path = "../../../examples/agents/agents.yaml";
+        let workflow_snapshot = workflow::definition::load(workflow_path).unwrap();
+        let catalog_snapshot = workflow::catalog::load(catalog_path).unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        run.workflow_yaml_path = Some(workflow_path.into());
+        run.agent_catalog_yaml_path = Some(catalog_path.into());
+        run.workflow_snapshot_json = Some(serde_json::to_string(&workflow_snapshot).unwrap());
+        run.catalog_snapshot_json = Some(serde_json::to_string(&catalog_snapshot).unwrap());
+        runs::insert(&pool, &run).await.unwrap();
+
+        let later = Utc::now() + chrono::Duration::seconds(30);
+        let earlier = Utc::now();
+        let proposal_stage = make_stage_execution(
+            run_id,
+            "state_2_proposal_drafted",
+            "Proposal drafted",
+            later,
+        );
+        let implementation_stage = make_stage_execution(
+            run_id,
+            "state_10_implementation_refined",
+            "Implementation refined",
+            earlier,
+        );
+        let proposal_stage_id = proposal_stage.id;
+        let implementation_stage_id = implementation_stage.id;
+        stages::insert(&pool, &proposal_stage).await.unwrap();
+        stages::insert(&pool, &implementation_stage).await.unwrap();
+        db::repos::agent_executions::insert(
+            &pool,
+            &make_agent_execution(proposal_stage_id, "proposal_writer", "codex", later),
+        )
+        .await
+        .unwrap();
+        db::repos::agent_executions::insert(
+            &pool,
+            &make_agent_execution(implementation_stage_id, "code_writer", "claude", earlier),
+        )
+        .await
+        .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query {{
+                      activeAgentExecutions(runId: "{run_id}") {{
+                        agentId
+                        agentTitle
+                        stageLabel
+                        taskLabel
+                        selectionOrder
+                        selectionUnavailableReason
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "active agent selector order should be daemon-owned: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let agents = json["activeAgentExecutions"].as_array().unwrap();
+        assert_eq!(agents[0]["agentId"], serde_json::json!("proposal_writer"));
+        assert_eq!(
+            agents[0]["agentTitle"],
+            serde_json::json!("Proposal Writer")
+        );
+        assert_eq!(
+            agents[0]["stageLabel"],
+            serde_json::json!("Proposal drafted")
+        );
+        assert_eq!(agents[0]["selectionOrder"], serde_json::json!(0));
+        assert_eq!(
+            agents[0]["selectionUnavailableReason"],
+            serde_json::Value::Null
+        );
+        assert_eq!(agents[1]["agentId"], serde_json::json!("code_writer"));
+        assert_eq!(agents[1]["selectionOrder"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_p093_active_agent_selector_uses_receipts_start_time_and_agent_id_tiebreak(
+    ) {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
+        let catalog_path = "../../../examples/agents/agents.yaml";
+        let workflow_snapshot = workflow::definition::load(workflow_path).unwrap();
+        let catalog_snapshot = workflow::catalog::load(catalog_path).unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        run.workflow_yaml_path = Some(workflow_path.into());
+        run.agent_catalog_yaml_path = Some(catalog_path.into());
+        run.workflow_snapshot_json = Some(serde_json::to_string(&workflow_snapshot).unwrap());
+        run.catalog_snapshot_json = Some(serde_json::to_string(&catalog_snapshot).unwrap());
+        runs::insert(&pool, &run).await.unwrap();
+
+        let started = Utc::now();
+        let stage = make_stage_execution(
+            run_id,
+            "state_10_implementation_refined",
+            "Implementation refined",
+            started,
+        );
+        let stage_id = stage.id;
+        stages::insert(&pool, &stage).await.unwrap();
+        let earlier_started = started - chrono::Duration::seconds(30);
+        let zeta = make_agent_execution(stage_id, "zeta_writer", "claude", started);
+        let alpha = make_agent_execution(stage_id, "alpha_writer", "codex", started);
+        let beta = make_agent_execution(stage_id, "beta_writer", "gemini", earlier_started);
+        db::repos::agent_executions::insert(&pool, &zeta)
+            .await
+            .unwrap();
+        db::repos::agent_executions::insert(&pool, &alpha)
+            .await
+            .unwrap();
+        db::repos::agent_executions::insert(&pool, &beta)
+            .await
+            .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let last_event_at_ms = 1_777_000_123_000_i64;
+        insert_runtime_receipt(
+            &pool,
+            zeta.id.to_string(),
+            "claude",
+            2,
+            last_event_at_ms - 5_000,
+        )
+        .await;
+        insert_runtime_receipt(&pool, alpha.id.to_string(), "codex", 7, last_event_at_ms).await;
+        insert_runtime_receipt(
+            &pool,
+            beta.id.to_string(),
+            "gemini",
+            3,
+            last_event_at_ms - 10_000,
+        )
+        .await;
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                    query {{
+                      activeAgentExecutions(runId: "{run_id}") {{
+                        agentId
+                        eventCount
+                        lastEventAt
+                        selectionOrder
+                      }}
+                    }}
+                    "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "active agent selector should use daemon runtime evidence: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let agents = json["activeAgentExecutions"].as_array().unwrap();
+        assert_eq!(agents[0]["agentId"], serde_json::json!("beta_writer"));
+        assert_eq!(agents[0]["eventCount"], serde_json::json!(3));
+        assert_eq!(agents[1]["agentId"], serde_json::json!("alpha_writer"));
+        assert_eq!(agents[1]["eventCount"], serde_json::json!(7));
+        assert_eq!(
+            agents[1]["lastEventAt"],
+            serde_json::json!(
+                chrono::DateTime::<Utc>::from_timestamp_millis(last_event_at_ms)
+                    .unwrap()
+                    .to_rfc3339()
+            )
+        );
+        assert_eq!(agents[2]["agentId"], serde_json::json!("zeta_writer"));
+        assert_eq!(agents[2]["eventCount"], serde_json::json!(2));
+    }
+
     fn test_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
     }
@@ -3476,6 +6677,111 @@ mod tests {
             review_routing_json: None,
             closeout_readiness_mode: None,
         }
+    }
+
+    fn make_stage_execution(
+        run_id: RunId,
+        stage_id: &str,
+        label: &str,
+        started_at: chrono::DateTime<Utc>,
+    ) -> domain::stage::StageExecution {
+        domain::stage::StageExecution {
+            id: domain::ids::StageExecutionId::new(),
+            run_id,
+            stage_id: stage_id.into(),
+            label: label.into(),
+            status: domain::stage::StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at,
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        }
+    }
+
+    fn make_agent_execution(
+        stage_execution_id: domain::ids::StageExecutionId,
+        agent_id: &str,
+        provider: &str,
+        started_at: chrono::DateTime<Utc>,
+    ) -> domain::agent::AgentExecution {
+        domain::agent::AgentExecution {
+            id: domain::ids::AgentExecutionId::new(),
+            stage_execution_id: Some(stage_execution_id),
+            agent_id: agent_id.into(),
+            provider: provider.into(),
+            model: Some("test-model".into()),
+            started_at,
+            completed_at: None,
+            status: domain::agent::AgentStatus::Running,
+            owner_execution_lineage_id: None,
+            session_lineage_id: None,
+            session_generation_id: Some(format!("session-{agent_id}")),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: None,
+            session_reuse_scope: None,
+            session_family_id: None,
+            session_reuse_disposition: None,
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+        }
+    }
+
+    async fn insert_runtime_receipt(
+        pool: &SqlitePool,
+        agent_execution_id: String,
+        provider: &str,
+        event_count: i64,
+        last_event_at_ms: i64,
+    ) {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO agent_execution_runtime_receipts
+                (runtime_receipt_id, agent_execution_id, prompt_kind, turn_index,
+                 provider, transport_family, status, event_count, last_event_kind,
+                 last_event_at_ms, receipt_json, created_at, updated_at)
+            VALUES (?1, ?2, 'original', 0, ?3, 'acp', 'running', ?4, 'text_chunk', ?5, '{}', ?6, ?7)
+            "#,
+        )
+        .bind(format!("{agent_execution_id}:original:0"))
+        .bind(agent_execution_id)
+        .bind(provider)
+        .bind(event_count)
+        .bind(last_event_at_ms)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn persist_rollout_contract_readback(pool: &SqlitePool, run_id: RunId) {
@@ -3612,12 +6918,10 @@ mod tests {
         let pool = create_pool("sqlite::memory:")
             .await
             .expect("in-memory pool failed");
-        db::writer::register_shared_writer(
-            &pool,
-            Arc::new(db::writer::DbWriter::new(pool.clone())),
-        )
-        .await
-        .expect("register shared writer");
+        let writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .expect("register shared DbWriter for test pool");
         pool
     }
 
@@ -3627,12 +6931,10 @@ mod tests {
         let pool = create_pool(&format!("sqlite://{}", path.to_string_lossy()))
             .await
             .expect("P043 file-backed pool failed");
-        db::writer::register_shared_writer(
-            &pool,
-            Arc::new(db::writer::DbWriter::new(pool.clone())),
-        )
-        .await
-        .expect("register shared writer");
+        let writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .expect("P043 register shared DbWriter");
         pool
     }
 
@@ -3929,6 +7231,9 @@ mod tests {
             Some("operator"),
             Some("operator"),
             Some("runs.main_sync.request"),
+            None,
+            None,
+            None,
             None,
         )
         .await
@@ -4834,6 +8139,243 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn p036_run_stage_topology_query_is_available() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        let workflow_path = "../../../examples/workflows/full-mvp-live.yaml";
+        let catalog_path = "../../../examples/agents/agents.yaml";
+        let workflow_snapshot = workflow::definition::load(workflow_path).unwrap();
+        let catalog_snapshot = workflow::catalog::load(catalog_path).unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.status = domain::run::RunStatus::Running;
+        run.current_state = Some("state_2_proposal_drafted".into());
+        run.workflow_yaml_path = Some(workflow_path.into());
+        run.agent_catalog_yaml_path = Some(catalog_path.into());
+        run.workflow_snapshot_json = Some(serde_json::to_string(&workflow_snapshot).unwrap());
+        run.catalog_snapshot_json = Some(serde_json::to_string(&catalog_snapshot).unwrap());
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage_execution_id = domain::ids::StageExecutionId::new();
+        db::repos::stages::insert(
+            &pool,
+            &domain::stage::StageExecution {
+                id: stage_execution_id,
+                run_id,
+                stage_id: "state_2_proposal_drafted".into(),
+                label: "Proposal drafted".into(),
+                status: domain::stage::StageStatus::Running,
+                iteration: 1,
+                attempt_number: 2,
+                settlement_kind: None,
+                started_at: Utc::now(),
+                completed_at: None,
+                owner_agent: Some("proposal_writer".into()),
+                provider: Some("codex".into()),
+                model: Some("gpt-5.5".into()),
+                stage_type: None,
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::repos::agent_executions::insert(
+            &pool,
+            &domain::agent::AgentExecution {
+                id: domain::ids::AgentExecutionId::new(),
+                stage_execution_id: Some(stage_execution_id),
+                agent_id: "proposal_writer".into(),
+                provider: "codex".into(),
+                model: Some("gpt-5.5".into()),
+                started_at: Utc::now(),
+                completed_at: None,
+                status: domain::agent::AgentStatus::Running,
+                owner_execution_lineage_id: None,
+                session_lineage_id: None,
+                session_generation_id: None,
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: None,
+                session_reuse_scope: None,
+                session_family_id: None,
+                session_reuse_disposition: None,
+                session_reset_reason: None,
+                backend_profile_id: Some("codex".into()),
+                requested_mcp_extensions_json: None,
+                predicted_mcp_extensions_json: None,
+                predicted_mcp_runtime_ids_json: None,
+                actual_mcp_extensions_json: None,
+                actual_mcp_runtime_ids_json: None,
+                denied_mcp_extensions_json: None,
+                mcp_blocking_issues_json: None,
+                actual_mcp_observation_json: None,
+                actual_xcode_runtime_observation_json: None,
+                mcp_session_startup_latency_ms: None,
+                owner_kind: None,
+                owner_id: None,
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
+                total_cost_cents: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: ArtifactId::new(),
+                run_id,
+                stage_id: "state_2_proposal_drafted".into(),
+                agent_id: "proposal_writer".into(),
+                name: "proposal.md".into(),
+                contract_id: "proposal_markdown_v1".into(),
+                format: ArtifactFormat::Markdown,
+                file_path: "/tmp/proposal.md".into(),
+                checksum_sha256: None,
+                size_bytes: Some(42),
+                provider: "codex".into(),
+                model: Some("gpt-5.5".into()),
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: None,
+                report_version: None,
+                agent_execution_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"
+                query P036StageTopology {{
+                  runStageTopology(runId: "{run_id}") {{
+                    stageId
+                    label
+                    ownerAgentTitle
+                    status
+                    isCurrent
+                    artifactCount
+                    transitions {{ toStageId toLabel detail }}
+                    occurrences {{ agentId agentTitle taskName status provider model }}
+                  }}
+                }}
+                "#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "runStageTopology should be part of the GraphQL read contract: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let topology = json["runStageTopology"].as_array().unwrap();
+        assert!(
+            topology.len() > 2,
+            "topology should come from the frozen workflow snapshot"
+        );
+        assert_eq!(
+            topology[0]["stageId"],
+            serde_json::json!("state_1_idea_received")
+        );
+        let proposal = topology
+            .iter()
+            .find(|stage| stage["stageId"] == serde_json::json!("state_2_proposal_drafted"))
+            .expect("proposal stage should be present");
+        assert_eq!(proposal["label"], serde_json::json!("Proposal drafted"));
+        assert_eq!(
+            proposal["ownerAgentTitle"],
+            serde_json::json!("Proposal Writer")
+        );
+        assert_eq!(proposal["status"], serde_json::json!("running"));
+        assert_eq!(proposal["isCurrent"], serde_json::json!(true));
+        assert_eq!(proposal["artifactCount"], serde_json::json!(1));
+        assert_eq!(
+            proposal["occurrences"][0]["agentId"],
+            serde_json::json!("proposal_writer")
+        );
+        assert_eq!(
+            proposal["occurrences"][0]["status"],
+            serde_json::json!("running")
+        );
+        assert_eq!(
+            proposal["transitions"][0]["toStageId"],
+            serde_json::json!("state_3_initial_proposal_approval")
+        );
+        let refined_index = topology
+            .iter()
+            .position(|stage| {
+                stage["stageId"] == serde_json::json!("state_10_implementation_refined")
+            })
+            .expect("implementation refined stage should be present");
+        let complete_index = topology
+            .iter()
+            .position(|stage| stage["stageId"] == serde_json::json!("state_12_workflow_complete"))
+            .expect("workflow complete stage should be present");
+        assert!(
+            refined_index < complete_index,
+            "topology order should not place Workflow complete before the refinement branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn p036_run_stage_topology_fails_closed_without_frozen_snapshots() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"query {{ runStageTopology(runId: "{run_id}") {{ stageId label }} }}"#
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "missing snapshots should fail closed as empty readback, not an API error: {response:?}"
+        );
+        assert_eq!(
+            response.data.into_json().unwrap()["runStageTopology"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
     async fn proposal_043_run_query_uses_projection_summary_fields() {
         let pool = p043_test_pool().await;
         let idea_id = IdeaId::new();
@@ -5226,6 +8768,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_081_runtime_subscription_payload_carries_cursor_generation_and_gap() {
+        use async_graphql::futures_util::StreamExt;
+
+        let pool = p043_test_pool().await;
+        let bus = event_bus::new_bus(16);
+        let run_id = RunId::new();
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            bus.clone(),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        let mut live_stream = schema.execute_stream(
+            Request::new(format!(
+                r#"
+                subscription {{
+                  runtimeStatusChanged(runId: "{run_id}") {{
+                    eventKind
+                    sequenceCursor
+                    projectionGeneration
+                    gapDetected
+                    requiresFullRefetch
+                  }}
+                }}
+                "#
+            ))
+            .data(test_principal()),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = bus.send(DomainEvent::RuntimeStatusChanged {
+                run_id,
+                stage_id: "state_9".into(),
+                agent_id: "code_writer".into(),
+                provider: "codex".into(),
+                event_kind: "session_started".into(),
+            });
+        });
+
+        let live_frame = tokio::time::timeout(std::time::Duration::from_secs(5), live_stream.next())
+            .await
+            .expect("runtime status subscription frame timed out")
+            .expect("runtime status subscription ended");
+        assert!(live_frame.errors.is_empty(), "{live_frame:?}");
+        let live_json = live_frame.data.into_json().unwrap();
+        let live = &live_json["runtimeStatusChanged"];
+        assert_eq!(live["eventKind"], "session_started");
+        assert!(
+            live["sequenceCursor"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("seq-"),
+            "live subscription payload must carry sequenceCursor"
+        );
+        assert!(live["projectionGeneration"].as_i64().unwrap_or(0) > 0);
+        assert_eq!(live["gapDetected"], false);
+        assert_eq!(live["requiresFullRefetch"], false);
+
+        let mut gap_stream = schema.execute_stream(
+            Request::new(
+                r#"
+                subscription {
+                  runtimeStatusChanged(replayCursor: "seq-999999999") {
+                    eventKind
+                    sequenceCursor
+                    projectionGeneration
+                    gapDetected
+                    requiresFullRefetch
+                  }
+                }
+                "#,
+            )
+            .data(test_principal()),
+        );
+        let gap_frame = tokio::time::timeout(std::time::Duration::from_secs(1), gap_stream.next())
+            .await
+            .expect("gap frame timed out")
+            .expect("gap stream ended");
+        assert!(gap_frame.errors.is_empty(), "{gap_frame:?}");
+        let gap_json = gap_frame.data.into_json().unwrap();
+        let gap = &gap_json["runtimeStatusChanged"];
+        assert_eq!(gap["eventKind"], "subscription_gap_detected");
+        assert_eq!(gap["gapDetected"], true);
+        assert_eq!(gap["requiresFullRefetch"], true);
+    }
+
+    #[tokio::test]
     async fn proposal_043_stage_subscription_uses_projection_decision_flags() {
         use async_graphql::futures_util::StreamExt;
 
@@ -5568,6 +9199,11 @@ mod tests {
                 "PROJECTION_LAG",
                 "UNAUTHORIZED",
                 "UNSUPPORTED_ACTION",
+                // P081 boundary policy reason codes
+                "APPROVAL_NOT_ACTIONABLE",
+                "OBSERVER_SCOPE",
+                "NON_APPROVAL_MUTATION",
+                "CAPABILITY_OUT_OF_SCOPE",
             ],
         );
         assert_enum_values(
@@ -6851,6 +10487,65 @@ mod tests {
         )
         .await
         .unwrap();
+        db::repos::retry_payload_recovery_events::upsert(
+            &pool,
+            &domain::retry_authority::RetryPayloadRecoveryEvent {
+                idempotency_key: "p092:graphql".to_string(),
+                run_id,
+                invoke_work_item_id: "invoke-p092".to_string(),
+                retry_authority_id: Some("p091-auth-test".to_string()),
+                target_stage_execution_id: Some(stage_execution_id),
+                completed_agent_execution_id: Some("agent-p092".to_string()),
+                reason_code: "valid_retry_invoke_completion_recovered".to_string(),
+                mode: "diagnostic".to_string(),
+                repaired: false,
+                current_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "target_stage_execution_id": stage_execution_id.to_string(),
+                    "retry_authority_id": "p091-auth-test",
+                    "completed_agent_execution_id": "agent-p092",
+                    "invoke_work_item_id": "invoke-p092"
+                }),
+                provenance_json: Some(serde_json::json!({
+                    "source_agent_execution_id": "old-agent"
+                })),
+                repaired_fields_json: Some(serde_json::json!(["target_stage_execution_id"])),
+                diagnostic_json: Some(serde_json::json!({"would_repair": true})),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        db::repos::retry_payload_recovery_events::upsert(
+            &pool,
+            &domain::retry_authority::RetryPayloadRecoveryEvent {
+                idempotency_key: "p092:graphql-missing-authority".to_string(),
+                run_id,
+                invoke_work_item_id: "invoke-p092-missing-authority".to_string(),
+                retry_authority_id: None,
+                target_stage_execution_id: Some(stage_execution_id),
+                completed_agent_execution_id: None,
+                reason_code: "retry_authority_missing_for_targeted_invoke".to_string(),
+                mode: "enforce".to_string(),
+                repaired: false,
+                current_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "target_stage_execution_id": stage_execution_id.to_string(),
+                    "retry_authority_id": null,
+                    "invoke_work_item_id": "invoke-p092-missing-authority"
+                }),
+                provenance_json: Some(serde_json::json!({
+                    "payload_retry_authority_id": "stale-auth"
+                })),
+                repaired_fields_json: Some(serde_json::json!([])),
+                diagnostic_json: Some(serde_json::json!({"fail_closed": true})),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
         sqlx::query(
             r#"INSERT INTO p091_orphan_repair_passes
                (id, mode, disabled, run_id, candidates_total, excluded_total,
@@ -6906,6 +10601,28 @@ mod tests {
         assert_eq!(
             json["run"]["retryAuthorityHistoryJson"][0]["target_stage_execution_id"],
             serde_json::json!(stage_execution_id.to_string())
+        );
+        assert_eq!(
+            json["run"]["retryAuthorityJson"]["retry_payload_recovery"]["reason_code"],
+            serde_json::json!("valid_retry_invoke_completion_recovered")
+        );
+        assert_eq!(
+            json["run"]["retryAuthorityHistoryJson"][0]["retry_payload_recovery"]["current"]
+                ["invoke_work_item_id"],
+            serde_json::json!("invoke-p092")
+        );
+        let history = json["run"]["retryAuthorityHistoryJson"].as_array().unwrap();
+        let missing_authority = history
+            .iter()
+            .find(|entry| entry["authority_state"] == serde_json::json!("missing_authority"))
+            .expect("missing-authority P092 history row");
+        assert_eq!(
+            missing_authority["retry_payload_recovery"]["reason_code"],
+            serde_json::json!("retry_authority_missing_for_targeted_invoke")
+        );
+        assert_eq!(
+            missing_authority["retry_payload_recovery"]["current"]["retry_authority_id"],
+            serde_json::Value::Null
         );
         assert_eq!(
             json["run"]["p091OrphanRepairReadbackJson"]["latest_pass"]["excluded_total"],
@@ -7793,6 +11510,279 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_081_boundary_runtime_graphql_readback_is_bounded() {
+        let pool = test_pool().await;
+        let policy = Arc::new(
+            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                auth::boundary::PolicyMode::ReadOnlySafeMode,
+            )
+            .unwrap(),
+        );
+        let schema = build_schema_inner(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+            None,
+            Some(policy),
+        );
+
+        let response = schema
+            .execute(Request::new("{ boundaryRuntime }").data(test_principal()))
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "boundaryRuntime readback must be available to operator reads: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let readback = &json["boundaryRuntime"];
+        assert_eq!(readback["schemaVersion"], "boundary_runtime.v1");
+        assert_eq!(readback["matrixId"], "p081-boundary-matrix-v1");
+        assert_eq!(readback["policyInjected"], true);
+        assert_eq!(readback["policyMode"], "read_only_safe_mode");
+        assert_eq!(readback["safeModeActive"], true);
+        assert_eq!(
+            readback["auditLogHealth"]["schemaVersion"],
+            "audit_log_health.v1"
+        );
+        assert!(readback["auditLogHealth"]["rowCount"].as_i64().is_some());
+        assert_eq!(readback["auditLogHealth"]["writable"], true);
+        assert_eq!(readback["auditLogHealth"]["retentionMinDays"], 90);
+        assert!(readback["auditLogHealth"]["cleanupState"]
+            .as_str()
+            .is_some());
+        assert!(readback["auditLogHealth"]["cleanupEligibleRowCount"]
+            .as_i64()
+            .is_some());
+        assert!(readback["auditLogHealth"]["cleanupProtectedRowCount"]
+            .as_i64()
+            .is_some());
+        assert!(readback["auditLogHealth"]["payloadBudgetBytes"]
+            .as_i64()
+            .is_some());
+        assert!(readback["auditLogHealth"]["payloadUsedBytes"]
+            .as_i64()
+            .is_some());
+        let audit_health = readback["auditLogHealth"]
+            .as_object()
+            .expect("audit health object");
+        assert!(audit_health.contains_key("lastWriteOkAtMs"));
+        assert!(audit_health.contains_key("consecutiveFailures"));
+        assert!(audit_health.contains_key("cumulativeFailures"));
+        assert!(audit_health.contains_key("budgetBytes"));
+        assert!(audit_health.contains_key("usedBytes"));
+        assert!(audit_health.contains_key("payloadBudgetState"));
+        assert!(audit_health.contains_key("payloadBudgetUsedPercent"));
+        assert!(audit_health.contains_key("halfOpenProbeSuccessCount"));
+        assert!(readback["auditLogHealth"]["consecutiveFailures"]
+            .as_i64()
+            .is_some());
+        assert!(readback["auditLogHealth"]["cumulativeFailures"]
+            .as_i64()
+            .is_some());
+        assert!(readback["auditLogHealth"]["budgetBytes"].as_i64().is_some());
+        assert!(readback["auditLogHealth"]["usedBytes"].as_i64().is_some());
+        assert!(readback["auditLogHealth"]["payloadBudgetState"]
+            .as_str()
+            .is_some());
+        assert!(readback["auditLogHealth"]["payloadBudgetUsedPercent"]
+            .as_i64()
+            .is_some());
+        assert!(readback["auditLogHealth"]["halfOpenProbeSuccessCount"]
+            .as_i64()
+            .is_some());
+        assert_eq!(
+            readback["auditLogHealth"]["shadowCoverageReportRef"],
+            "docs/evidence/boundary-policy-shadow-coverage/report.json"
+        );
+        assert!(
+            readback["auditLogHealth"]["integrityState"]
+                .as_str()
+                .is_some(),
+            "auditLogHealth must expose bounded integrity state, not raw rows"
+        );
+        assert!(
+            readback.get("rows").is_none(),
+            "boundaryRuntime must not expose raw audit rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_081_operator_alerts_surface_safe_mode_without_raw_audit_rows() {
+        let pool = test_pool().await;
+        let policy = Arc::new(
+            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                auth::boundary::PolicyMode::ReadOnlySafeMode,
+            )
+            .unwrap(),
+        );
+        let schema = build_schema_inner(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+            None,
+            Some(policy),
+        );
+
+        let response = schema
+            .execute(Request::new(r#"{ operatorAlerts }"#).data(test_principal()))
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "operatorAlerts readback must be available to operator reads: {response:?}"
+        );
+        let json = response.data.into_json().unwrap();
+        let alerts = json["operatorAlerts"].as_array().expect("alerts array");
+        let safe_mode = alerts
+            .iter()
+            .find(|alert| alert["dedupeKey"] == "p081.boundary.safe_mode_active")
+            .expect("safe-mode alert must be present");
+        assert_eq!(safe_mode["schemaVersion"], "operator_alert_v1");
+        assert_eq!(safe_mode["severity"], "critical");
+        assert_eq!(safe_mode["active"], true);
+        assert_eq!(safe_mode["silenceable"], false);
+        assert_eq!(safe_mode["lifecycle"]["state"], "active_unacknowledged");
+        assert_eq!(
+            safe_mode["nativeDelivery"]["dedupePolicy"],
+            "dedupe_key_until_clear"
+        );
+        assert_eq!(
+            safe_mode["boundaryRuntime"]["safeModeActive"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(
+            !safe_mode.to_string().contains("\"rows\""),
+            "operatorAlerts must not expose raw audit rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_081_subscription_runtime_readback_exposes_cursor_gap_contract() {
+        let pool = test_pool().await;
+        let schema = build_schema_inner(
+            pool,
+            make_command_handler(test_pool().await),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+            None,
+            Some(Arc::new(
+                auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                    auth::boundary::PolicyMode::Enforce,
+                )
+                .unwrap(),
+            )),
+        );
+
+        let response = schema
+            .execute(Request::new("{ boundaryRuntime }").data(test_principal()))
+            .await;
+        assert!(response.errors.is_empty(), "{response:?}");
+        let json = response.data.into_json().unwrap();
+        let subscription = &json["boundaryRuntime"]["subscriptionReplay"];
+        assert_eq!(
+            subscription["schemaVersion"],
+            "subscription_replay_runtime_v1"
+        );
+        assert!(subscription["sequenceCursor"].as_str().is_some());
+        assert!(subscription["projectionGeneration"].as_i64().is_some());
+        assert_eq!(subscription["gapDetected"], serde_json::Value::Bool(false));
+        assert_eq!(
+            subscription["requiresFullRefetch"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(subscription["retentionMinutes"], 15);
+        assert_eq!(subscription["retentionEventCount"], 10_000);
+
+        let inside_window = p081_subscription_replay_readback(Some("seq-95"), 90, 100, 7);
+        assert_eq!(inside_window["gapDetected"], serde_json::Value::Bool(false));
+        assert_eq!(
+            inside_window["requiresFullRefetch"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(inside_window["projectionGeneration"], 7);
+
+        let outside_window = p081_subscription_replay_readback(Some("seq-89"), 90, 100, 7);
+        assert_eq!(outside_window["gapDetected"], serde_json::Value::Bool(true));
+        assert_eq!(
+            outside_window["requiresFullRefetch"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_081_observer_operator_alerts_redact_fields_without_graphql_errors() {
+        let pool = test_pool().await;
+        let policy = Arc::new(
+            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                auth::boundary::PolicyMode::ReadOnlySafeMode,
+            )
+            .unwrap(),
+        );
+        let schema = build_schema_inner(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+            None,
+            Some(policy),
+        );
+        let redactions = P081GraphqlRedactionCollector::default();
+
+        let mut response = schema
+            .execute(
+                Request::new(r#"{ operatorAlerts }"#)
+                    .data(observer_principal())
+                    .data(redactions.clone()),
+            )
+            .await;
+        attach_p081_collected_redactions(&mut response, &redactions);
+
+        assert!(
+            response.errors.is_empty(),
+            "observer opt-in read must redact fields without a response-level GraphQL error: {response:?}"
+        );
+        let data = response.data.into_json().unwrap();
+        let alerts = data["operatorAlerts"].as_array().expect("alerts array");
+        let safe_mode = alerts
+            .iter()
+            .find(|alert| alert["dedupeKey"] == "p081.boundary.safe_mode_active")
+            .expect("safe-mode alert must be present");
+        assert_eq!(
+            safe_mode["message"],
+            serde_json::Value::Null,
+            "observer-sensitive alert message must be field-null redacted"
+        );
+        assert_eq!(
+            safe_mode["nativeDelivery"],
+            serde_json::Value::Null,
+            "observer-sensitive native delivery metadata must be redacted"
+        );
+        let extension_redactions = match response.extensions.get("redactions") {
+            Some(async_graphql::Value::List(redactions)) => redactions,
+            other => panic!("extensions.redactions must be present, got {other:?}"),
+        };
+        assert!(
+            extension_redactions.iter().any(|redaction| {
+                let async_graphql::Value::Object(object) = redaction else {
+                    return false;
+                };
+                matches!(
+                    object.get("redactionMode"),
+                    Some(async_graphql::Value::String(value)) if value == "field_null_redacted"
+                )
+            }),
+            "observer redaction must use camelCase field_null_redacted extension metadata"
+        );
+    }
+
+    #[tokio::test]
     async fn test_graphql_approve_approval_uses_p072_ui_operator_policy() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
@@ -7819,7 +11809,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}") {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8000-000000000001") {{
                         approval {{ id }}
                         journalId
                       }}
@@ -7842,7 +11832,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}") {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8000-000000000002") {{
                         approval {{
                           id
                           decision
@@ -7881,6 +11871,61 @@ mod tests {
         assert!(
             data["approveApproval"]["journalId"].is_string(),
             "approveApproval must return journalId"
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_081_audit_budget_safe_mode_denies_approval_mutation() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let stage = make_manual_gate_stage(run_id, "state_6");
+        stages::insert(&pool, &stage).await.unwrap();
+        let approval = make_approval(run_id, "state_6");
+        approvals::insert(&pool, &approval).await.unwrap();
+        force_p081_audit_budget_safe_mode(&pool).await;
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+
+        let denied = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8081-000000000002") {{
+                        approval {{ id decision }}
+                        journalId
+                      }}
+                    }}"#,
+                    approval.id
+                ))
+                .data(test_principal()),
+            )
+            .await;
+        assert!(
+            denied
+                .errors
+                .iter()
+                .any(|error| format!("{error:?}").contains("AUDIT_BUDGET_EXHAUSTED")),
+            "audit budget safe mode must deny approval mutation: {denied:?}"
+        );
+        let current = approvals::find_by_id(&pool, approval.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.decision,
+            ApprovalDecision::Pending,
+            "denied approval mutation must not mutate approval state"
         );
     }
 
@@ -8023,7 +12068,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}") {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8aaa-000000000001") {{
                         approval {{ id }}
                         journalId
                       }}
@@ -8042,7 +12087,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}") {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8aaa-000000000002") {{
                         approval {{ id decision }}
                         journalId
                       }}
@@ -8057,11 +12102,13 @@ mod tests {
             "first approveApproval must succeed: {first:?}"
         );
 
+        // P081: second attempt with a DIFFERENT idempotency key on an already-resolved approval
+        // returns approval_not_actionable (not already_resolved) per P081 conflict contract.
         let second = schema
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}") {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8aaa-000000000003") {{
                         approval {{ id decision }}
                         journalId
                         conflictResultCode
@@ -8074,12 +12121,12 @@ mod tests {
             .await;
         assert!(
             second.errors.is_empty(),
-            "already-resolved approval must return a typed conflict code, not a GraphQL error: {second:?}"
+            "terminal approval with different key must return typed conflict code, not a GraphQL error: {second:?}"
         );
         assert_eq!(
             second.data.into_json().unwrap()["approveApproval"]["conflictResultCode"],
-            serde_json::json!("already_resolved"),
-            "already-resolved approval must return already_resolved conflict code"
+            serde_json::json!("approval_not_actionable"),
+            "terminal approval with different key must return approval_not_actionable"
         );
     }
 
@@ -8106,10 +12153,11 @@ mod tests {
             test_reporter(),
         );
 
-        let approve = |fields: &str| {
+        // P081: each attempt uses a distinct idempotency key.
+        let approve = |fields: &str, key: &str| {
             Request::new(format!(
                 r#"mutation {{
-                  approveApproval(approvalId: "{}") {{
+                  approveApproval(approvalId: "{}", idempotencyKey: "{key}") {{
                     {fields}
                   }}
                 }}"#,
@@ -8121,6 +12169,7 @@ mod tests {
         let first = schema
             .execute(approve(
                 "approval { id decision } journalId conflictResultCode",
+                "01900000-0000-7000-8001-000000000001",
             ))
             .await;
         assert!(
@@ -8133,42 +12182,53 @@ mod tests {
             serde_json::Value::Null
         );
 
+        // P081: second attempt with a DIFFERENT idempotency key returns approval_not_actionable.
+        // (Per P081 contract: terminal approval + different key = APPROVAL_NOT_ACTIONABLE, not AlreadyResolved)
+        // P081 AC17: already-terminal denials produce zero new command_journal rows.
+        let journal_count_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM command_journal")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let second = schema
             .execute(approve(
                 "approval { id decision } journalId conflictResultCode",
+                "01900000-0000-7000-8001-000000000002",
             ))
             .await;
         assert!(
             second.errors.is_empty(),
-            "already-resolved approval must return typed conflict payload: {second:?}"
+            "terminal approval with different key must return typed conflict payload: {second:?}"
         );
         let second_json = second.data.into_json().unwrap();
         let payload = &second_json["approveApproval"];
         assert_eq!(
             payload["conflictResultCode"],
-            serde_json::json!("already_resolved")
+            serde_json::json!("approval_not_actionable"),
+            "different-key terminal retry must return approval_not_actionable (not already_resolved)"
         );
         assert_eq!(
             payload["approval"]["decision"],
             serde_json::json!("granted")
         );
+        // P081 AC17: The returned journalId for a conflict is a valid UUID (non-zero) but
+        // is not persisted to command_journal — it is a correlation handle only.
         let journal_id = payload["journalId"]
             .as_str()
             .expect("conflict payload must include journalId");
         assert_ne!(
             journal_id, "00000000-0000-0000-0000-000000000000",
-            "conflict journalId must be the real failed command journal row"
+            "conflict journalId must be a non-zero UUID correlation handle"
         );
-        uuid::Uuid::parse_str(journal_id).expect("conflict journalId must be a UUID");
-
-        let row: (String, String) =
-            sqlx::query_as("SELECT result_status, command_type FROM command_journal WHERE id = ?1")
-                .bind(journal_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(row.0, "failed");
-        assert_eq!(row.1, "ResolveApproval");
+        uuid::Uuid::parse_str(journal_id).expect("conflict journalId must be a valid UUID");
+        // P081 AC17: zero new command_journal rows for the already-resolved conflict attempt.
+        let journal_count_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM command_journal")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            journal_count_before.0, journal_count_after.0,
+            "P081 AC17: already-resolved conflict must produce zero new command_journal rows"
+        );
     }
 
     #[tokio::test]
@@ -8201,7 +12261,11 @@ mod tests {
             "P085 mutation conflict enum introspection must succeed: {response:?}"
         );
         let json = response.data.into_json().unwrap();
-        assert_enum_values(&json, "conflict", &["already_resolved"]);
+        assert_enum_values(
+            &json,
+            "conflict",
+            &["already_resolved", "approval_not_actionable"],
+        );
     }
 
     #[tokio::test]
@@ -8232,7 +12296,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      approveApproval(approvalId: "{}") {{
+                      approveApproval(approvalId: "{}", idempotencyKey: "01900000-0000-7000-8002-000000000001") {{
                         approval {{ id decision }}
                         journalId
                         conflictResultCode
@@ -8248,11 +12312,16 @@ mod tests {
             "initial approveApproval must succeed before reject conflict proof: {approve:?}"
         );
 
+        // P081 AC17: zero new journal rows for the already-resolved reject conflict attempt.
+        let journal_count_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM command_journal")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let reject = schema
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      rejectApproval(approvalId: "{}", reason: "stale reject") {{
+                      rejectApproval(approvalId: "{}", reason: "stale reject", idempotencyKey: "01900000-0000-7000-8002-000000000002") {{
                         approval {{ id decision availableActions disabledReasonCode writePathState }}
                         journalId
                         conflictResultCode
@@ -8269,9 +12338,11 @@ mod tests {
         );
         let json = reject.data.into_json().unwrap();
         let payload = &json["rejectApproval"];
+        // P081: reject with a DIFFERENT key than the approve → approval_not_actionable
         assert_eq!(
             payload["conflictResultCode"],
-            serde_json::json!("already_resolved")
+            serde_json::json!("approval_not_actionable"),
+            "terminal approval retried with different key must return approval_not_actionable"
         );
         assert_eq!(
             payload["approval"]["decision"],
@@ -8289,19 +12360,21 @@ mod tests {
             payload["approval"]["writePathState"],
             serde_json::json!("write_path_not_available")
         );
+        // P081: journalId in the conflict response is a valid non-zero UUID correlation handle.
         let journal_id = payload["journalId"]
             .as_str()
             .expect("reject conflict payload must include journalId");
         assert_ne!(journal_id, "00000000-0000-0000-0000-000000000000");
-
-        let row: (String, String) =
-            sqlx::query_as("SELECT result_status, command_type FROM command_journal WHERE id = ?1")
-                .bind(journal_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(row.0, "failed");
-        assert_eq!(row.1, "ResolveApproval");
+        uuid::Uuid::parse_str(journal_id).expect("reject conflict journalId must be a valid UUID");
+        // P081 AC17: zero new command_journal rows for the already-resolved conflict attempt.
+        let journal_count_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM command_journal")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            journal_count_before.0, journal_count_after.0,
+            "P081 AC17: already-resolved conflict must produce zero new command_journal rows"
+        );
     }
 
     #[tokio::test]
@@ -8685,7 +12758,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      rejectApproval(approvalId: "{}", reason: "needs more work") {{
+                      rejectApproval(approvalId: "{}", reason: "needs more work", idempotencyKey: "01900000-0000-7000-8003-000000000001") {{
                         approval {{ id }}
                         journalId
                       }}
@@ -8707,7 +12780,7 @@ mod tests {
             .execute(
                 Request::new(format!(
                     r#"mutation {{
-                      rejectApproval(approvalId: "{}", reason: "needs more work") {{
+                      rejectApproval(approvalId: "{}", reason: "needs more work", idempotencyKey: "01900000-0000-7000-8003-000000000002") {{
                         approval {{ id decision }}
                         journalId
                       }}
@@ -8781,6 +12854,38 @@ mod tests {
 
     fn operator_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    async fn force_p081_audit_budget_safe_mode(pool: &SqlitePool) {
+        let now_ms = Utc::now().timestamp_millis();
+        let payload = "x".repeat(16_100);
+        let entry = audit_log::AuditEntry {
+            id: "p081-graphql-budget-safe-mode",
+            request_id: "p081-graphql-budget-safe-mode",
+            timestamp_ms: now_ms,
+            event_type: "policy_denied",
+            principal_id: Some("test-operator"),
+            principal_class: Some("operator"),
+            caller_class: Some("ui_operator"),
+            token_id: None,
+            transport: "graphql_mutation",
+            action_attempted: "approveApproval",
+            decision: "deny",
+            denial_reason_code: None,
+            row_id: Some("p081.audit_budget.safe_mode"),
+            env_gate_state: None,
+            source_ip_hash_or_local_process_id: None,
+            boundary_policy_mode: "enforce",
+            fixture_version: "p081-boundary-matrix-v1",
+            payload: &payload,
+            original_payload_bytes: None,
+            diagnostic_truncated: false,
+            checkpoint_id: None,
+            created_at_ms: now_ms,
+        };
+        audit_log::append(pool, &entry).await.unwrap();
+        let health = audit_log::health_snapshot(pool).await.unwrap();
+        assert_eq!(health.payload_budget_state, "read_only_safe_mode");
     }
 
     #[tokio::test]

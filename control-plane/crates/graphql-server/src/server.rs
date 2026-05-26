@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_graphql::http::ALL_WEBSOCKET_PROTOCOLS;
 use async_graphql_axum::{GraphQLProtocol, GraphQLRequest, GraphQLResponse, GraphQLWebSocket};
 use axum::{
+    extract::ws::{CloseFrame, Message},
     extract::{Extension, WebSocketUpgrade},
     http::StatusCode,
     middleware,
@@ -11,9 +12,11 @@ use axum::{
 };
 use domain::lifecycle::DaemonLifecycleState;
 use engine::lifecycle_reporter::LifecycleReporter;
+use futures_util::{SinkExt, StreamExt};
+use std::time::Duration;
 use tracing::info;
 
-use crate::schema::AppSchema;
+use crate::schema::{attach_p081_collected_redactions, AppSchema, P081GraphqlRedactionCollector};
 use crate::types::session::P046LiveCredential;
 
 async fn graphql_playground() -> impl IntoResponse {
@@ -58,8 +61,14 @@ pub(crate) async fn ready_handler(
     (code, Json(status))
 }
 
-#[cfg(test)]
-const GRAPHQL_WS_UNAUTHORIZED_CLOSE_CODE: u16 = 1002;
+pub(crate) const GRAPHQL_WS_UNAUTHORIZED_CLOSE_CODE: u16 = 4401;
+pub(crate) const GRAPHQL_WS_FORBIDDEN_CLOSE_CODE: u16 = 4403;
+pub(crate) const GRAPHQL_WS_INIT_TIMEOUT_CLOSE_CODE: u16 = 4408;
+#[allow(dead_code)]
+pub(crate) const GRAPHQL_WS_POLICY_RELOAD_CLOSE_CODE: u16 = 4408;
+#[allow(dead_code)]
+pub(crate) const GRAPHQL_WS_POLICY_RELOAD_CLOSE_REASON: &str = "POLICY_RELOAD";
+const GRAPHQL_WS_INIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn graphql_http_handler(
     Extension(schema): Extension<AppSchema>,
@@ -69,10 +78,17 @@ async fn graphql_http_handler(
     // data so mutation resolvers can stamp `CallerContext.request_id`
     // and the command journal picks it up in the same transaction.
     request_id: Option<Extension<crate::request_id::RequestId>>,
+    // SEC-P081-M002: derived token_id for audit correlation, inserted by auth middleware.
+    token_id: Option<Extension<crate::auth_layer::GraphqlTokenId>>,
     request: GraphQLRequest,
 ) -> GraphQLResponse {
     let mut request = request.into_inner();
     request = request.data(principal);
+    let p081_redactions = P081GraphqlRedactionCollector::default();
+    request = request.data(p081_redactions.clone());
+    if let Some(Extension(tid)) = token_id {
+        request = request.data(tid);
+    }
     // Keep a copy of the id around so we can stamp every outbound
     // error with it even after we move the `RequestId` into request
     // data (R12 API-001 / AC-15: "GraphQL errors must include the
@@ -89,37 +105,198 @@ async fn graphql_http_handler(
             // carry the id independently.
             err.extensions
                 .get_or_insert_with(async_graphql::ErrorExtensionValues::default)
-                .set("request_id", rid.clone());
+                .set("requestId", rid.clone());
         }
     }
+    add_p081_response_redactions(&mut response);
+    attach_p081_collected_redactions(&mut response, &p081_redactions);
     response.into()
+}
+
+fn add_p081_response_redactions(response: &mut async_graphql::Response) {
+    let redactions: Vec<_> = response
+        .errors
+        .iter()
+        .filter_map(p081_redaction_from_error)
+        .collect();
+    if redactions.is_empty() {
+        return;
+    }
+    response
+        .extensions
+        .insert("redactions".into(), async_graphql::Value::List(redactions));
+}
+
+fn p081_redaction_from_error(err: &async_graphql::ServerError) -> Option<async_graphql::Value> {
+    let extensions = err.extensions.as_ref()?;
+    let reason_code = graphql_value_string(extensions.get("reasonCode"))?;
+    let row_id = graphql_value_string(extensions.get("rowId"));
+    let caller_class = graphql_value_string(extensions.get("callerClass"));
+    let mut object = async_graphql::indexmap::IndexMap::new();
+    object.insert(
+        async_graphql::Name::new("path"),
+        async_graphql::Value::List(
+            err.path
+                .iter()
+                .map(|segment| async_graphql::Value::String(path_segment_string(segment)))
+                .collect(),
+        ),
+    );
+    object.insert(
+        async_graphql::Name::new("reasonCode"),
+        async_graphql::Value::String(reason_code.clone()),
+    );
+    if let Some(row_id) = row_id.clone() {
+        object.insert(
+            async_graphql::Name::new("rowId"),
+            async_graphql::Value::String(row_id),
+        );
+    }
+    object.insert(
+        async_graphql::Name::new("redactionMode"),
+        async_graphql::Value::String("drop_resource".into()),
+    );
+    if let Some(caller_class) = caller_class.clone() {
+        object.insert(
+            async_graphql::Name::new("callerClass"),
+            async_graphql::Value::String(caller_class),
+        );
+    }
+    object.insert(
+        async_graphql::Name::new("redactionId"),
+        async_graphql::Value::String(p081_redaction_id(
+            err.path
+                .iter()
+                .map(path_segment_string)
+                .collect::<Vec<_>>()
+                .join(".")
+                .as_str(),
+            &reason_code,
+            row_id.as_deref(),
+        )),
+    );
+    Some(async_graphql::Value::Object(object))
+}
+
+fn path_segment_string(segment: &async_graphql::PathSegment) -> String {
+    match segment {
+        async_graphql::PathSegment::Field(field) => field.clone(),
+        async_graphql::PathSegment::Index(index) => index.to_string(),
+    }
+}
+
+fn graphql_value_string(value: Option<&async_graphql::Value>) -> Option<String> {
+    match value {
+        Some(async_graphql::Value::String(s)) => Some(s.clone()),
+        Some(async_graphql::Value::Enum(name)) => Some(name.to_string()),
+        _ => None,
+    }
+}
+
+fn p081_redaction_id(path: &str, reason_code: &str, row_id: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(reason_code.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(row_id.unwrap_or("").as_bytes());
+    format!("p081_redaction_{:x}", hasher.finalize())[..29].to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct P081WsClose {
+    code: u16,
+    reason: &'static str,
+}
+
+impl P081WsClose {
+    const UNAUTHORIZED: Self = Self {
+        code: GRAPHQL_WS_UNAUTHORIZED_CLOSE_CODE,
+        reason: "UNAUTHORIZED",
+    };
+    const FORBIDDEN: Self = Self {
+        code: GRAPHQL_WS_FORBIDDEN_CLOSE_CODE,
+        reason: "FORBIDDEN",
+    };
+    const INIT_TIMEOUT: Self = Self {
+        code: GRAPHQL_WS_INIT_TIMEOUT_CLOSE_CODE,
+        reason: "CONNECTION_INIT_TIMEOUT",
+    };
+}
+
+async fn p081_connection_init_data(
+    value: serde_json::Value,
+    table: auth::PrincipalTable,
+) -> std::result::Result<async_graphql::Data, P081WsClose> {
+    // Strict bearer grammar via auth::extract_bearer_token (exactly "Bearer <token>",
+    // one SP, no surrounding whitespace, visible ASCII, non-empty token).
+    let header = value
+        .get("Authorization")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    match auth::extract_bearer_token(header) {
+        Ok(token) => match auth::resolve_bearer(token, &table) {
+            Ok(principal) => {
+                if auth::derive_caller_class(&principal) != auth::CallerClass::UiOperator {
+                    return Err(P081WsClose::FORBIDDEN);
+                }
+                // SEC-P081-M002: derive token_id for WS subscription audit correlation.
+                let token_id = auth::derive_token_id(token, &principal.id);
+                let mut data = async_graphql::Data::default();
+                data.insert(crate::auth_layer::GraphqlTokenId(token_id));
+                data.insert(P046LiveCredential {
+                    principal_id: principal.id.clone(),
+                    token_fingerprint: auth::token_fingerprint(token),
+                });
+                data.insert(principal);
+                Ok(data)
+            }
+            Err(_) => Err(P081WsClose::UNAUTHORIZED),
+        },
+        Err(_) => Err(P081WsClose::UNAUTHORIZED),
+    }
 }
 
 async fn connection_init_data(
     value: serde_json::Value,
     table: auth::PrincipalTable,
 ) -> std::result::Result<async_graphql::Data, async_graphql::Error> {
-    let token = value
-        .get("Authorization")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|t| t.trim());
+    p081_connection_init_data(value, table)
+        .await
+        .map_err(|close| async_graphql::Error::new(close.reason))
+}
 
-    match token {
-        Some(t) => match auth::resolve_bearer(t, &table) {
-            Ok(principal) => {
-                let mut data = async_graphql::Data::default();
-                data.insert(P046LiveCredential {
-                    principal_id: principal.id.clone(),
-                    token_fingerprint: auth::token_fingerprint(t),
-                });
-                data.insert(principal);
-                Ok(data)
-            }
-            Err(_) => Err(async_graphql::Error::new("unauthorized")),
-        },
-        None => Err(async_graphql::Error::new("unauthorized")),
+fn connection_init_payload_from_message(
+    message: &Message,
+) -> std::result::Result<serde_json::Value, P081WsClose> {
+    let bytes: Vec<u8> = match message {
+        Message::Text(text) => text.as_str().as_bytes().to_vec(),
+        Message::Binary(bytes) => bytes.to_vec(),
+        _ => return Err(P081WsClose::INIT_TIMEOUT),
+    };
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| P081WsClose::INIT_TIMEOUT)?;
+    if value.get("type").and_then(|v| v.as_str()) != Some("connection_init") {
+        return Err(P081WsClose::INIT_TIMEOUT);
     }
+    Ok(value
+        .get("payload")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({})))
+}
+
+async fn send_p081_ws_close<S>(sink: &mut S, close: P081WsClose)
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let _ = sink
+        .send(Message::Close(Some(CloseFrame {
+            code: close.code,
+            reason: close.reason.into(),
+        })))
+        .await;
 }
 
 /// WebSocket subscription handler with `connection_init` auth.
@@ -140,14 +317,35 @@ async fn graphql_ws_handler(
     Extension(principal_table): Extension<auth::PrincipalTable>,
 ) -> impl IntoResponse {
     ws.protocols(ALL_WEBSOCKET_PROTOCOLS)
-        .on_upgrade(move |stream| {
+        .on_upgrade(move |stream| async move {
             let table = principal_table;
-            GraphQLWebSocket::new(stream, schema, protocol)
+            let (mut sink, mut stream) = stream.split();
+            let first = match tokio::time::timeout(GRAPHQL_WS_INIT_TIMEOUT, stream.next()).await {
+                Ok(Some(Ok(message))) => message,
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => {
+                    send_p081_ws_close(&mut sink, P081WsClose::INIT_TIMEOUT).await;
+                    return;
+                }
+            };
+            let payload = match connection_init_payload_from_message(&first) {
+                Ok(payload) => payload,
+                Err(close) => {
+                    send_p081_ws_close(&mut sink, close).await;
+                    return;
+                }
+            };
+            if let Err(close) = p081_connection_init_data(payload, table.clone()).await {
+                send_p081_ws_close(&mut sink, close).await;
+                return;
+            }
+            let replay = futures_util::stream::once(async move { Ok(first) }).chain(stream);
+            GraphQLWebSocket::new_with_pair(sink, replay, schema, protocol)
                 .on_connection_init(move |value: serde_json::Value| {
                     let table = table;
                     async move { connection_init_data(value, table).await }
                 })
                 .serve()
+                .await
         })
 }
 
@@ -232,6 +430,18 @@ pub(crate) fn build_router(
     principal_table: auth::PrincipalTable,
     reporter: LifecycleReporter,
 ) -> Router {
+    // SEC-003: Emit a one-time startup warning when the playground auth bypass
+    // is active so it is visible in operator logs and never silently set in prod.
+    if std::env::var("CHAINWORKS_PLAYGROUND_AUTH")
+        .ok()
+        .map(|v| v == "skip")
+        .unwrap_or(false)
+    {
+        tracing::warn!(
+            "CHAINWORKS_PLAYGROUND_AUTH=skip is set: GET /graphql playground HTML \
+             shell bypasses bearer authentication. Do not enable in production."
+        );
+    }
     let pt = principal_table.clone();
     Router::new()
         .route(
@@ -282,8 +492,18 @@ mod tests {
     use engine::command_handler::CommandHandler;
     use engine::event_bus;
     use engine::work_queue::WorkQueue;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    fn secure_principal_table(contents: &str) -> auth::PrincipalTable {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("principals.json");
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        auth::PrincipalTable::load_or_bootstrap(&path).unwrap()
+    }
 
     fn test_reporter() -> LifecycleReporter {
         LifecycleReporter::new(0, "test-sha", event_bus::new_bus(16))
@@ -331,7 +551,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/graphql")
-                    .header("authorization", "Bearer test-token")
+                    .header("authorization", "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx")
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
@@ -368,14 +588,9 @@ mod tests {
             .unwrap();
         let approval = make_approval(run_id, "state_6");
         approvals::insert(&pool, &approval).await.unwrap();
-        let principal_path = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            principal_path.path(),
-            r#"{"principals":[{"token":"observer-token","id":"observer","class":"observer"}]}"#,
-        )
-        .unwrap();
-        let principal_table =
-            auth::PrincipalTable::load_or_bootstrap(principal_path.path()).unwrap();
+        let principal_table = secure_principal_table(
+            r#"{"principals":[{"token":"observer-token-xxxxxxxxxxxxxxxxx","id":"observer","class":"observer"}]}"#,
+        );
         let schema = crate::schema::build_schema(
             pool.clone(),
             make_command_handler(pool.clone()),
@@ -393,7 +608,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/graphql")
-                    .header("authorization", "Bearer observer-token")
+                    .header("authorization", "Bearer observer-token-xxxxxxxxxxxxxxxxx")
                     .header("content-type", "application/json")
                     .body(Body::from(body.to_string()))
                     .unwrap(),
@@ -405,6 +620,10 @@ mod tests {
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["errors"][0]["message"], "forbidden");
+        assert_eq!(
+            json["extensions"]["redactions"][0]["redactionMode"], "drop_resource",
+            "P081 GraphQL denial responses must expose top-level extensions.redactions"
+        );
         let journal_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM command_journal")
             .fetch_one(&pool)
             .await
@@ -485,31 +704,58 @@ mod tests {
 
     #[tokio::test]
     async fn test_graphql_ws_rejects_missing_connection_init_auth() {
-        let err = connection_init_data(serde_json::json!({}), auth::PrincipalTable::test_fixture())
-            .await
-            .expect_err("missing WS token must fail");
+        let err =
+            p081_connection_init_data(serde_json::json!({}), auth::PrincipalTable::test_fixture())
+                .await
+                .expect_err("missing WS token must fail");
 
-        assert_eq!(err.message, "unauthorized");
-        assert_eq!(GRAPHQL_WS_UNAUTHORIZED_CLOSE_CODE, 1002);
+        assert_eq!(err, P081WsClose::UNAUTHORIZED);
+        assert_eq!(GRAPHQL_WS_UNAUTHORIZED_CLOSE_CODE, 4401);
     }
 
     #[tokio::test]
     async fn test_graphql_ws_rejects_unknown_connection_init_token() {
-        let err = connection_init_data(
+        let err = p081_connection_init_data(
             serde_json::json!({"Authorization":"Bearer bad-token"}),
             auth::PrincipalTable::test_fixture(),
         )
         .await
         .expect_err("unknown WS token must fail");
 
-        assert_eq!(err.message, "unauthorized");
-        assert_eq!(GRAPHQL_WS_UNAUTHORIZED_CLOSE_CODE, 1002);
+        assert_eq!(err, P081WsClose::UNAUTHORIZED);
+        assert_eq!(GRAPHQL_WS_UNAUTHORIZED_CLOSE_CODE, 4401);
+    }
+
+    #[tokio::test]
+    async fn test_graphql_ws_rejects_non_ui_caller_with_forbidden_close() {
+        let principal_table = secure_principal_table(
+            r#"{"principals":[{"token":"observer-token-xxxxxxxxxxxxxxxxx","id":"observer","class":"observer"}]}"#,
+        );
+        let err = p081_connection_init_data(
+            serde_json::json!({"Authorization":"Bearer observer-token-xxxxxxxxxxxxxxxxx"}),
+            principal_table,
+        )
+        .await
+        .expect_err("observer GraphQL WS subscription must fail before subscribe");
+
+        assert_eq!(err, P081WsClose::FORBIDDEN);
+        assert_eq!(GRAPHQL_WS_FORBIDDEN_CLOSE_CODE, 4403);
+    }
+
+    #[test]
+    fn test_graphql_ws_connection_init_parser_requires_init_message() {
+        let err = connection_init_payload_from_message(&Message::Text(
+            r#"{"type":"subscribe","id":"1"}"#.into(),
+        ))
+        .expect_err("first WS frame must be connection_init");
+        assert_eq!(err, P081WsClose::INIT_TIMEOUT);
+        assert_eq!(GRAPHQL_WS_INIT_TIMEOUT_CLOSE_CODE, 4408);
     }
 
     #[tokio::test]
     async fn test_graphql_ws_accepts_valid_connection_init_token() {
         let data = connection_init_data(
-            serde_json::json!({"Authorization":"Bearer test-token"}),
+            serde_json::json!({"Authorization":"Bearer test-token-xxxxxxxxxxxxxxxxxxxxx"}),
             auth::PrincipalTable::test_fixture(),
         )
         .await
@@ -522,16 +768,20 @@ mod tests {
         assert_eq!(principal.id, "test-operator");
     }
 
+    #[test]
+    fn proposal_081_websocket_policy_reload_close_contract_is_explicit() {
+        assert_eq!(GRAPHQL_WS_POLICY_RELOAD_CLOSE_CODE, 4408);
+        assert_eq!(GRAPHQL_WS_POLICY_RELOAD_CLOSE_REASON, "POLICY_RELOAD");
+    }
+
     async fn test_pool() -> sqlx::SqlitePool {
         let pool = create_pool("sqlite::memory:")
             .await
             .expect("in-memory pool failed");
-        db::writer::register_shared_writer(
-            &pool,
-            Arc::new(db::writer::DbWriter::new(pool.clone())),
-        )
-        .await
-        .expect("register shared writer");
+        let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .expect("register shared DbWriter for test pool");
         pool
     }
 
@@ -630,10 +880,11 @@ mod tests {
     }
 
     fn approve_approval_mutation(approval_id: ApprovalId) -> String {
+        let key = uuid::Uuid::now_v7();
         format!(
             r#"
             mutation ApproveApproval {{
-              approveApproval(approvalId: "{approval_id}") {{
+              approveApproval(approvalId: "{approval_id}", idempotencyKey: "{key}") {{
                 approval {{ id }}
                 journalId
               }}

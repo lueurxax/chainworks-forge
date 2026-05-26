@@ -1,43 +1,36 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "structured_logging",
+  "fixture_purpose": "Continuation worker emits a structured correlation event with the required P086 operator/debug keys before side-effecting provider work.",
+  "status": "pass",
+  "evidence_kind": "code",
+  "evidence": {
+    "implemented": {
+      "location": "control-plane/crates/engine/src/executor.rs::run_continuation_worker",
+      "required_correlation_keys": [
+        "run_id",
+        "stage_execution_id",
+        "agent_execution_id",
+        "continuation_id",
+        "continuation_mode",
+        "trigger_kind",
+        "idempotency_scope",
+        "idempotency_key",
+        "request_fingerprint_sha256",
+        "command_journal_id",
+        "provider_family",
+        "runtime_profile_id",
+        "daemon_generation_id",
+        "session_generation_id",
+        "worker_pid",
+        "lifecycle_status",
+        "failure_reason",
+        "reconciliation_status"
+      ],
+      "mechanism": "A single structured tracing event carries every key before claim-side effects and provider prompt dispatch."
+    }
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:missing_log_correlation_key",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "missing_correlation_key_rejected_by_source_review"
 }

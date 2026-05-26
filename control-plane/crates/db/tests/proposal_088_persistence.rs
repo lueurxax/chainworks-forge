@@ -363,6 +363,21 @@ fn minimal_completion_receipt_for_provider(
     receipt
 }
 
+async fn set_completion_link_updated_at(
+    pool: &sqlx::SqlitePool,
+    receipt_id: &str,
+    updated_at: chrono::DateTime<Utc>,
+) {
+    sqlx::query(
+        "UPDATE code_writer_completion_receipt_links SET updated_at = ?1 WHERE receipt_id = ?2",
+    )
+    .bind(updated_at.to_rfc3339())
+    .bind(receipt_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn proposal_088_runtime_receipts_preserve_prompt_level_rows_per_execution() {
     let pool = setup_db().await;
@@ -780,6 +795,65 @@ async fn proposal_088_canonical_readback_uses_receipt_link_not_latest_created_at
     assert_eq!(canonical[0].receipt.id, "p088-active-linked");
     let summary = domain::code_writer_completion::project_implementation_completion(&canonical);
     assert_eq!(summary.status.value, "failed");
+}
+
+#[tokio::test]
+async fn proposal_088_counts_consecutive_canonical_completed_no_diff_receipts() {
+    let pool = setup_db().await;
+    let (run_id, stage_id, diff_exec_id) = seed_execution(&pool).await;
+    let no_diff_exec_1 = seed_additional_execution(&pool, stage_id, "code_writer").await;
+    let no_diff_exec_2 = seed_additional_execution(&pool, stage_id, "code_writer").await;
+    let no_diff_exec_3 = seed_additional_execution(&pool, stage_id, "code_writer").await;
+    let base = Utc::now();
+
+    let mut diff_receipt = minimal_completion_receipt(
+        "p088-diff-before-no-diff",
+        run_id,
+        stage_id,
+        diff_exec_id,
+        "complete",
+        base - Duration::minutes(30),
+    );
+    diff_receipt.current_attempt_changed_path_count = 2;
+    code_writer_completion_receipts::upsert(&pool, &diff_receipt, &[], &[])
+        .await
+        .unwrap();
+    set_completion_link_updated_at(&pool, &diff_receipt.id, diff_receipt.created_at).await;
+
+    let no_diff_receipts = [
+        (
+            "p088-no-diff-1",
+            no_diff_exec_1,
+            base - Duration::minutes(20),
+        ),
+        (
+            "p088-no-diff-2",
+            no_diff_exec_2,
+            base - Duration::minutes(10),
+        ),
+        ("p088-no-diff-3", no_diff_exec_3, base),
+    ];
+    for (receipt_id, exec_id, created_at) in no_diff_receipts {
+        let mut receipt = minimal_completion_receipt(
+            receipt_id, run_id, stage_id, exec_id, "complete", created_at,
+        );
+        receipt.current_attempt_changed_path_count = 0;
+        receipt.work_change_kind = Some("preexisting_dirty_work".into());
+        code_writer_completion_receipts::upsert(&pool, &receipt, &[], &[])
+            .await
+            .unwrap();
+        set_completion_link_updated_at(&pool, &receipt.id, receipt.created_at).await;
+    }
+
+    let count =
+        code_writer_completion_receipts::consecutive_completed_no_diff_count_by_run(&pool, run_id)
+            .await
+            .unwrap();
+
+    assert_eq!(
+        count, 3,
+        "count must include only latest consecutive completed no-diff canonical receipts"
+    );
 }
 
 #[tokio::test]

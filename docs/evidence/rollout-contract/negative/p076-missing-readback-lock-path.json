@@ -1,0 +1,22 @@
+{
+  "fixture_description": "P076 auto_retry_readback envelope that omits lock_path. Proves the lock_path top-level required field is enforced.",
+  "proves_missing_lock_path": true,
+  "auto_retry_readback": {
+    "schema_version": "auto_retry_readback.v1",
+    "generated_at": "2026-05-23T09:00:07Z",
+    "version_negotiation": {
+      "selected_version": "auto_retry_readback.v1",
+      "supported_versions": ["auto_retry_readback.v1"],
+      "unsupported_versions": []
+    },
+    "ledger_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-observations.jsonl",
+    "budget_state_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-budget.json",
+    "known_issue_catalog_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-known-issues.json",
+    "generated_markdown_catalog_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-known-issues.md",
+    "MISSING_FIELD_NOTE": "lock_path is intentionally absent here to prove it is a required top-level field",
+    "rollup_report_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-rollup.json",
+    "diagnostics": [],
+    "observations": [],
+    "latest_by_run": []
+  }
+}

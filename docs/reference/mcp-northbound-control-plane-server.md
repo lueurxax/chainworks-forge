@@ -25,6 +25,18 @@ MCP is the external control plane for operational commands. GraphQL is the UI re
 
 Both surfaces are authenticated with bearer tokens and filter their visible surface area by the caller's principal class. MCP command tools and approval-gate GraphQL mutations converge on a single `engine::command_handler::CommandHandler` for command execution. Every command execution writes an auditable row to `command_journal` tagged with the caller's surface, principal id, principal class, and tool/mutation name.
 
+P081 adds the boundary-first authorization contract that supersedes static-only
+principal-class filtering. The matrix, executable fixture, validator, audit-log
+storage, `CallerClass` enum, and principal-table `schema_version 3` reader are
+implemented. A daemon-injected `BoundaryPolicy` governs MCP `initialize`,
+`tools/list`, and `tools/call` with mode-aware semantics (`shadow`, `enforce`,
+`read_only_safe_mode`, `legacy_compat`). Known-but-denied tools return JSON-RPC
+`-32004` with structured policy data, `initialize` advertises the
+`boundary_policy` capability (`capability_schema_version: 1`), and
+`command_journal.caller_class` is populated by the shared decision path. See
+[boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md) for
+the matrix, rollout modes, audit, idempotency, and readback contracts.
+
 ## Scope
 
 This reference covers:
@@ -99,8 +111,13 @@ Implementation: `control-plane/crates/domain/src/commands.rs` (`PrincipalClass`,
 | `EffectsReconcile` | `effects.reconcile` | no (direct) |
 | `EffectsMarkUnrecoverable` | `effects.mark_unrecoverable` | no (direct) |
 | `EffectsClearAfterManualVerification` | `effects.clear_after_manual_verification` | no (direct) |
+| `AgentsContinuationStatus` | `agents.continuation_status` | no (direct) |
+| `AgentsContinuationCandidates` | `agents.continuation_candidates` | no (direct) |
+| `AgentsContinueWork` | `agents.continue_work` | no (direct) |
 
 Command tools build a typed `Command` enum value and call `CommandHandler::handle`; they emit a `command_journal` row and return `journal_id`. Direct tools call repo functions directly and do not produce journal rows or `journal_id`.
+
+The Proposal 086 continuation tools (`agents.continue_work`, `agents.continuation_status`, `agents.continuation_candidates`) have typed `CapabilityToolId` variants (`AgentsContinueWork`, `AgentsContinuationStatus`, `AgentsContinuationCandidates`) so they participate in standard `tools/list` capability filtering. The read tools are exposed to `Operator` and `Observer` principals; `agents.continue_work` is exposed only to `Operator`. They are dispatched by prefix into a separate `tools::agents` namespace in `control-plane/crates/mcp-server/src/server.rs` rather than through `CommandHandler::handle`: `agents.continue_work` runs its own atomic admission transaction that persists a `command_journal_id` on the `agent_work_continuations` row alongside the canonical request fingerprint, while the read tools omit unauthorized rows without leaking existence. See [`proposal-086-api-contracts.md`](proposal-086-api-contracts.md) for the request/response schemas and admission semantics.
 
 ### MCP tool payloads
 
@@ -109,9 +126,9 @@ Command tools build a typed `Command` enum value and call `CommandHandler::handl
 The `approvals.resolve` tool supports additive evolution to handle both legacy stage approvals and new lead mediation confirmations.
 
 **Legacy Stage Approval (subject_kind implicitly stage_approval):**
-- `run_id`: UUID
-- `stage_id`: String
+- `approval_id` (preferred) or (`run_id` + `stage_id`)
 - `decision`: `"granted"` | `"rejected"`
+- `idempotency_key`: UUIDv7 string (required; P081 SEC-003). Per-attempt key enables safe retry without double settlement. Malformed (non-UUIDv7) keys are rejected before dispatch.
 - `comment`: String (optional)
 
 **Lead Mediation Confirmation:**
@@ -119,8 +136,10 @@ The `approvals.resolve` tool supports additive evolution to handle both legacy s
 - `subject_id`: UUID
 - `decision`: `"confirm"` | `"manual_fallback"`
 - `conflict_fingerprint`: String (must match current mediation truth)
-- `idempotency_key`: UUID
+- `idempotency_key`: UUIDv7 string (required; validated per P081 SEC-003)
 - `comment`: String (optional)
+
+Both subtypes route through `ResolveApprovalCmd` so the approval-mutation idempotency contract enforced by `approval_mutation_idempotency` applies uniformly to MCP and GraphQL approval surfaces.
 
 ### Registered resource templates
 
@@ -188,9 +207,28 @@ Implementation: `control-plane/crates/domain/src/capabilities.rs`, `control-plan
 
 `class` is one of `operator`, `agent`, or `observer`.
 
+P081 added a `schema_version 3` reader path for boundary-aware caller and transport
+policy. Existing files without a `schema_version` field (legacy v1) and explicit
+`schema_version 2` files remain readable through the same loader. The bootstrap
+writer now emits `schema_version 3`; existing v2 files are never silently rewritten.
+See [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md) for
+the schema-version compatibility contract.
+
+v3 principal entries accept the v2 `surface_policies` stanza and add three
+optional time-and-state fields used by the boundary-aware loader:
+
+- `expires_at_ms` (i64, optional): Unix epoch milliseconds after which the entry is rejected at resolution time. Absent means no expiry.
+- `not_before_ms` (i64, optional): Unix epoch milliseconds before which the entry is rejected. Absent means no not-before constraint.
+- `disabled` (bool, optional): When `true`, the entry is rejected without disclosing the disable reason. Absent or `false` means enabled.
+
+v3 files reject unknown JSON fields at every level and require an explicit
+`surface_policies` stanza for every principal (no implicit class-default fallback).
+Bearer-token comparison is constant-time across all entries; `token_id` derivation
+stays in-process and is never logged or emitted on the wire.
+
 ### Discovery and bootstrap
 
-- **Env var:** `CHAINWORKS_AUTH_PRINCIPALS_PATH` names an absolute path to the principal table JSON.
+- **Env var:** `CHAINWORKS_AUTH_PRINCIPALS_PATH` names an absolute path to the principal table JSON. Relative paths are rejected; in packaged daemon modes the path must canonicalize within `~/.chainworks/auth/` so a config-injection attack cannot redirect auth loading to an arbitrary file.
 - **Default:** `~/.chainworks/auth/principals.json`.
 - **Empty env:** if `CHAINWORKS_AUTH_PRINCIPALS_PATH` is set to the empty string, the daemon refuses to start.
 - **Missing file:** on first start the daemon generates a random UUID token, writes a single-entry table with `class = operator` and `id = default-operator` to the discovered path, and logs the path + token at `info` level exactly once.
@@ -253,12 +291,15 @@ Implementation: `control-plane/crates/graphql-server/src/auth_layer.rs`, `contro
 
 ### GraphQL WebSocket (`/graphql/ws`)
 
-WebSocket subscriptions are mounted outside the HTTP auth middleware because the middleware cannot reject a WebSocket upgrade while still allowing a `connection_init` handshake to fire. Auth is enforced inside the `connection_init` callback after the WebSocket opens:
+WebSocket subscriptions are mounted outside the HTTP auth middleware because the middleware cannot reject a WebSocket upgrade while still allowing a `connection_init` handshake to fire. P081 therefore pre-validates the first WebSocket frame before handing the socket to async-graphql:
 
 - the `connection_init` payload must include `{ "Authorization": "Bearer <token>" }`,
 - `connection_init_data` extracts the bearer token and calls `auth::resolve_bearer`,
 - on success the resolved `Principal` is injected into the subscription's `async_graphql::Data` and subscription resolvers can read it,
-- on missing or unresolvable token, the handler returns `async_graphql::Error("unauthorized")` and no subscription resolver fires.
+- missing or unresolvable token closes the socket with `4401`,
+- authenticated callers that are not allowed to use the UI GraphQL subscription surface close with `4403`,
+- missing, malformed, delayed, or non-`connection_init` first frames close with `4408`,
+- policy reload remains `4408` with reason `POLICY_RELOAD`; the Swift shell reconnects and restores operator window state.
 
 Implementation: `control-plane/crates/graphql-server/src/server.rs` (`graphql_ws_handler`, `connection_init_data`).
 
@@ -299,6 +340,9 @@ Both checks are required, so a future change that wants to narrow a specific pri
 | `effects.reconcile` | yes | no | no |
 | `effects.mark_unrecoverable` | yes | no | no |
 | `effects.clear_after_manual_verification` | yes | no | no |
+| `agents.continuation_status` | yes | no | yes |
+| `agents.continuation_candidates` | yes | no | yes |
+| `agents.continue_work` | yes | no | no |
 
 Rationale for the Steward trio: `run_analysis` queues compute work and drives the quality-gate pipeline, so only operators can trigger it. `list_analyses` and `get_analysis` are read-only over persisted analysis records and are visible to the operational/audit (observer) class. Agents are scoped to executing their own run and have no legitimate cross-cohort read surface, so they see none of the three.
 
@@ -345,10 +389,10 @@ Current Rust schema compatibility note: older non-approval GraphQL mutation reso
 
 ### Enforcement points
 
-- `McpServer::handle_request` filters `tools/list` through `visible_tool_specs` (which calls `auth::filter_tools`), and gates every `tools/call` by `principal.tool_capabilities.contains(&tool_id)`. A denied tool returns `-32601 "Method not found: <name>"` (not `"forbidden"`) so the error does not leak capability existence.
+- `McpServer::handle_request` filters `tools/list` through `visible_tool_specs` (which calls `auth::filter_tools`), evaluates the injected P081 `BoundaryPolicy` for known `tools/call` requests, and then applies the caller token capability set. Unknown tools and feature-gated tools return `-32601 "Method not found: <name>"`; known-but-denied tools return `-32004 "tool denied"` with `error.data.reason_code`, `caller_class`, `row_id`, and `boundary_policy_version`. Storage diagnostics tools keep their typed success-envelope error protocol after the required deny audit row commits.
 - `resources/list` is filtered by `auth::filter_resources` over `auth::all_resource_templates()`.
 - `resources/read` parses the concrete URI into a `ResourceTemplateId` via `resource_template_id_for_uri`, then calls `auth::match_resource_uri`. A denied read returns `-32002 "Resource not found"`.
-- GraphQL approval mutation resolvers read `Principal` from `async_graphql::Context`, call the same capability policy, and return `Error::new("forbidden")` on denial.
+- GraphQL approval mutation resolvers read `Principal` from `async_graphql::Context`, evaluate the same injected `BoundaryPolicy`, and return the P081 denial envelope before command side effects on denial.
 
 Implementation: `control-plane/crates/auth/src/lib.rs` (`filter_tools`, `filter_resources`, `match_resource_uri`, `tool_allowed_for_class`, `resource_allowed_for_class`), `control-plane/crates/mcp-server/src/server.rs` (`handle_request`, `visible_tool_specs`), `control-plane/crates/graphql-server/src/schema.rs` (approval mutation resolvers and explicitly quarantined legacy compatibility resolvers).
 
@@ -366,6 +410,14 @@ pub struct CallerContext {
     pub caller_tool: String,         // MCP tool name or approval GraphQL mutation name
 }
 ```
+
+P081 Phase 2 added a separate `auth::CallerContext` that carries
+`principal_id`, `principal_class`, `caller_class`, `transport`, `token_id`, and
+`request_id` for boundary-policy evaluation. Phase 3 added a `caller_class:
+Option<String>` field to `domain::commands::CallerContext` (populated via
+`CallerContext::with_caller_class(...)`) so the boundary-derived caller class
+flows through `CommandHandler` to `command_journal`. The two structs remain
+distinct types; future phases may converge them further.
 
 Constructors:
 
@@ -408,6 +460,14 @@ Migration `011_auth_tracking.sql` adds four nullable TEXT columns to the existin
 | `caller_tool` | MCP tool name (e.g. `runs.start`) or approval GraphQL mutation name (e.g. `approveApproval`) |
 
 Columns are nullable so pre-P029 rows remain readable. Post-P029 rows written through `CommandHandler::handle` always populate all four.
+
+P081 migration `070_p081_caller_class.sql` adds a nullable `caller_class` TEXT
+column to `command_journal`. Phase 3 wires population through
+`CommandHandler::handle`, which copies `CallerContext.caller_class` (set by
+GraphQL and MCP entry points via `auth::derive_caller_class_*` helpers and
+`CallerContext::with_caller_class(...)`) into the journal row. Pre-P081 rows
+remain NULL. See
+[boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md).
 
 Implementation: `control-plane/crates/db/migrations/011_auth_tracking.sql`, `control-plane/crates/engine/src/command_handler.rs` (`handle`, `Commanded`), `control-plane/crates/domain/src/commands.rs` (`CallerContext`, `CallerSurface`, `PrincipalClass`).
 
