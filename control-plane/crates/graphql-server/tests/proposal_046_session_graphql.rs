@@ -61,6 +61,26 @@ fn make_schema_with_p046(pool: sqlx::SqlitePool) -> AppSchema {
     )
 }
 
+fn make_schema_with_p046_enabled(pool: sqlx::SqlitePool, enabled: bool) -> AppSchema {
+    let events = event_bus::new_bus(16);
+    let handler = Arc::new(CommandHandler::new(
+        pool.clone(),
+        events.clone(),
+        WorkQueue::new(pool.clone()),
+    ));
+    build_schema_with_p046_config(
+        pool,
+        handler,
+        events.clone(),
+        auth::PrincipalTable::test_fixture(),
+        LifecycleReporter::new(15, "test-build", events),
+        P046Config {
+            enabled,
+            subscription_channel_capacity: 64,
+        },
+    )
+}
+
 fn make_schema_with_p046_and_events(
     pool: sqlx::SqlitePool,
 ) -> (AppSchema, engine::event_bus::EventSender) {
@@ -468,14 +488,39 @@ async fn proposal_046_schema_fields_present_when_enabled() {
 }
 
 #[tokio::test]
-async fn proposal_046_schema_fields_absent_when_disabled() {
+async fn proposal_046_schema_fields_present_by_default() {
     let pool = test_pool().await;
-    // Use standard build_schema (disabled by default unless env var is set)
     let schema = make_schema(pool);
 
     let fields = root_field_names(&schema, "queryType").await;
+    assert!(
+        fields.iter().any(|name| name == "sessionLineages"),
+        "P046 session observability must be enabled by default after dogfood signoff; got: {fields:?}"
+    );
 
-    // When disabled, attempting to execute a P046 query must fail
+    let capability_query = r#"{ sessionObservabilityAvailable }"#;
+    let resp = schema
+        .execute(Request::new(capability_query).data(operator_principal()))
+        .await;
+    assert!(
+        resp.errors.is_empty(),
+        "default P046 capability probe must execute without schema errors; errors={:?}",
+        resp.errors
+    );
+    assert_eq!(
+        resp.data.into_json().unwrap()["sessionObservabilityAvailable"],
+        serde_json::json!(true),
+        "default P046 capability probe must report true"
+    );
+}
+
+#[tokio::test]
+async fn proposal_046_schema_fields_absent_when_explicitly_disabled() {
+    let pool = test_pool().await;
+    let schema = make_schema_with_p046_enabled(pool, false);
+
+    let fields = root_field_names(&schema, "queryType").await;
+
     let lineages_query =
         r#"{ sessionLineages(runId: "00000000-0000-0000-0000-000000000001") { nodes { id } } }"#;
     let resp = schema
@@ -488,7 +533,7 @@ async fn proposal_046_schema_fields_absent_when_disabled() {
         .any(|e| e.message.contains("Cannot query field") || e.message.contains("not enabled"));
     assert!(
         field_absent && disabled_or_validation_error,
-        "P046 disabled schema must not expose session lineages without feature flag; \
+        "P046 explicitly disabled schema must not expose session lineages; \
          field_absent={field_absent}, errors={:?}",
         resp.errors
     );
@@ -3216,7 +3261,7 @@ async fn proposal_046_session_observability_available_returns_true_when_enabled(
 #[tokio::test]
 async fn proposal_046_session_observability_available_absent_when_disabled() {
     let pool = test_pool().await;
-    let schema = make_schema(pool);
+    let schema = make_schema_with_p046_enabled(pool, false);
 
     let query = r#"query { sessionObservabilityAvailable }"#;
     let resp = schema

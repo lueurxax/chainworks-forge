@@ -212,16 +212,7 @@ pub fn build_schema_with_storage_writer_and_handle(
     reporter: LifecycleReporter,
     storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
 ) -> (AppSchema, P046LivePrincipalHandle) {
-    let p046 = P046Config {
-        enabled: matches!(
-            std::env::var("CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY")
-                .unwrap_or_default()
-                .to_lowercase()
-                .as_str(),
-            "1" | "true" | "yes"
-        ),
-        subscription_channel_capacity: 64,
-    };
+    let p046 = default_p046_config();
     let live_handle = P046LivePrincipalHandle::new(principal_table.clone());
     let schema = build_schema_inner_with_p046_and_handle(
         pool,
@@ -246,16 +237,7 @@ pub fn build_schema_with_storage_writer_boundary_policy_and_handle(
     storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
     boundary_policy: Arc<auth::boundary::BoundaryPolicy>,
 ) -> (AppSchema, P046LivePrincipalHandle) {
-    let p046 = P046Config {
-        enabled: matches!(
-            std::env::var("CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY")
-                .unwrap_or_default()
-                .to_lowercase()
-                .as_str(),
-            "1" | "true" | "yes"
-        ),
-        subscription_channel_capacity: 64,
-    };
+    let p046 = default_p046_config();
     let live_handle = P046LivePrincipalHandle::new(principal_table.clone());
     let schema = build_schema_inner_with_p046_and_handle(
         pool,
@@ -280,16 +262,7 @@ fn build_schema_inner(
     storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
     boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
 ) -> AppSchema {
-    let p046 = P046Config {
-        enabled: matches!(
-            std::env::var("CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY")
-                .unwrap_or_default()
-                .to_lowercase()
-                .as_str(),
-            "1" | "true" | "yes"
-        ),
-        subscription_channel_capacity: 64,
-    };
+    let p046 = default_p046_config();
     build_schema_inner_with_p046(
         pool,
         cmd_handler,
@@ -300,6 +273,13 @@ fn build_schema_inner(
         boundary_policy,
         p046,
     )
+}
+
+fn default_p046_config() -> P046Config {
+    P046Config {
+        enabled: true,
+        subscription_channel_capacity: 64,
+    }
 }
 
 fn build_schema_inner_with_p046(

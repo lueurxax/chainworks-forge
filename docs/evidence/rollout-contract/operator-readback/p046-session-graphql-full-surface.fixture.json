@@ -13,18 +13,18 @@
       "rolloutContractEnforcementModeReason": "phase3_dogfood_complete",
       "rolloutContractHoldConditions": [],
       "rolloutContractRollbackDisposition": {
-        "mode": "feature_flag_disable_graphql_session_observability_fields",
+        "mode": "rollback_patch_disable_graphql_session_observability_fields",
         "dataLossRisk": "none"
       },
       "rolloutContractSourceLane": "graphql",
       "rolloutContractEnabledState": "dogfood_passed",
       "rolloutContractDisabledReasonCode": null,
       "rolloutContractActionId": "p046-dogfood-signoff-2026-05-26",
-      "rolloutContractOperatorMessage": "P046 implementation and Phase 3 dogfood are accepted for implementation closeout. The feature was merged to main, the daemon was rebuilt/restarted with CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY=1, and the operator reported a full working day with no observed session-observability regressions. Cursor kind/version, invalid cursor rejection, subscription auth, redaction, Swift capability gating, and SQLite retry semantics are covered by proposal-046 gate evidence. Release receipt remains a release-stage artifact, not an implementation blocker.",
+      "rolloutContractOperatorMessage": "P046 implementation and Phase 3 dogfood are accepted for implementation closeout. The feature was merged to main, the daemon was rebuilt/restarted with session observability enabled, and the operator reported a full working day with no observed session-observability regressions. Cursor kind/version, invalid cursor rejection, subscription auth, redaction, Swift capability gating, and SQLite retry semantics are covered by proposal-046 gate evidence. Release receipt remains a release-stage artifact, not an implementation blocker.",
       "rolloutContractProjectionIntegrity": "complete",
       "rolloutContractCutoverPolicyRevision": "p046-r8-refine-implementation-2026-05-23",
       "rolloutContractNextSteps": [
-        "Generate release receipt when P046 is enabled in a release build"
+        "Generate release receipt for the release build"
       ],
       "p046_dogfood_evidence": "docs/evidence/046-session-graphql-dogfood-signoff-2026-05-26.md",
       "p046_dogfood_window_status": "accepted_one_working_day",
@@ -88,7 +88,7 @@
       "rolloutContractHoldConditions": [],
       "rolloutContractEnforcementMode": "waived",
       "rolloutContractEnforcementModeReason": "release_receipt is a post-release artifact; waived until P046 enters release build",
-      "rolloutContractOperatorMessage": "P046 release receipt will be generated when CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY is enabled in a release build after dogfood success."
+      "rolloutContractOperatorMessage": "P046 release receipt will be generated for the release build after dogfood success."
     }
   }
 }

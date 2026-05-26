@@ -110,14 +110,14 @@ That means the boundary should not be treated as fully done until:
 - `ui_operator` / default operator cannot execute non-approval mutations,
 - tests enforce this,
 - old broad mutation permissions are clearly legacy/test/admin-only,
-- P031/P068/P046 align with the reference boundary.
+- P031/P068/session observability align with the reference boundary.
 
 Related docs:
 
 - [UI action boundary](../reference/ui-action-boundary.md)
 - [P068 GraphQL UI boundary proposal](../proposals/068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md)
 - [P081 API/auth contract matrix](../proposals/081-boundary-first-api-auth-contract-matrix.md)
-- [P046 session management GraphQL API](../proposals/046-session-management-graphql-api.md)
+- [Session observability GraphQL readback](../reference/rust-control-plane.md#graphql)
 
 ### 2.2 SQLite write pressure is now a first-class risk
 
