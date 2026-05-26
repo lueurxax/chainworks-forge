@@ -634,11 +634,7 @@ mod tests {
         ] {
             increment_counter(counter);
         }
-        record_p081_audit_log_append_failure(
-            "boundary_decision_deny",
-            "graphql_query",
-            "enforce",
-        );
+        record_p081_audit_log_append_failure("boundary_decision_deny", "graphql_query", "enforce");
         record_p081_operator_alert_native_delivery("critical", "macos", "delivered");
         assert!(get_counter("boundary_policy_decisions_total") > 0);
         assert!(get_counter("boundary_policy_shadow_disagreement_total") > 0);

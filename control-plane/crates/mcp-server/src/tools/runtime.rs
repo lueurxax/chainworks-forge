@@ -171,7 +171,9 @@ pub async fn operator_alerts_readback(
     let now_ms = Utc::now().timestamp_millis();
     let mut alerts = Vec::new();
 
-    let safe_mode_active = boundary_runtime["safeModeActive"].as_bool().unwrap_or(false);
+    let safe_mode_active = boundary_runtime["safeModeActive"]
+        .as_bool()
+        .unwrap_or(false);
     record_safe_mode_alert_lifecycle(safe_mode_active, now_ms);
 
     if safe_mode_active {

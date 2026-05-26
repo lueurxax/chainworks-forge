@@ -8,20 +8,24 @@
 //! 2. `packaging::enforce_loopback` — packaged modes rewrite `0.0.0.0`
 //!    overrides to `127.0.0.1` so a stolen bearer token is not usable
 //!    from the LAN (§7.4).
-//! 3. `supervisor::acquire_pid_lock` — advisory singleton per app-support
+//! 3. `supervisor::acquire_database_lock` — authoritative singleton per
+//!    SQLite DB file. This catches mixed launch paths, for example a
+//!    debug `target/debug/control-plane` pointed at the packaged DB and
+//!    the bundled helper trying to start on a fallback port.
+//! 4. `supervisor::acquire_pid_lock` — advisory singleton per app-support
 //!    root (§6.1): `DuplicateHealthy` → exit 0; `AnomalousHolder` →
 //!    exit 75 (`EX_TEMPFAIL`); `Acquired` → continue.
-//! 4. `supervisor::read_crash_budget` — ≥5 crashes within 60 s puts the
+//! 5. `supervisor::read_crash_budget` — ≥5 crashes within 60 s puts the
 //!    daemon into §8.7 failed-serve mode with
 //!    `FailureKind::CrashLoopBudgetExhausted` instead of a normal startup.
-//! 5. `db::migrate::run_preflight` — typed three-branch migration classifier.
+//! 6. `db::migrate::run_preflight` — typed three-branch migration classifier.
 //!    Any error maps (§8.4) to a `FailureKind` and the daemon drops into
 //!    failed-serve mode rather than panicking, so `/health`, `/ready`,
 //!    and `daemonStatus` still report the terminal condition.
-//! 6. `packaging::bind_with_fallback` — try preferred port, fall back to
+//! 7. `packaging::bind_with_fallback` — try preferred port, fall back to
 //!    ephemeral loopback in packaged modes; write the chosen port to
 //!    `daemon.port` so the Swift client can locate us (§7.3).
-//! 7. `packaging::write_build_sha` — record the embedded build SHA for
+//! 8. `packaging::write_build_sha` — record the embedded build SHA for
 //!    the Swift diagnostics bundle (§9.4).
 //!
 //! If any §8.4 terminal condition is hit, the daemon transitions the
@@ -143,6 +147,34 @@ async fn run_daemon() -> Result<()> {
     let build_sha = packaging::resolved_build_sha();
     let reporter = LifecycleReporter::new(binary_schema_version, build_sha, events.clone());
     reporter.set_state(DaemonLifecycleState::Starting);
+
+    // ── DB singleton lock (all file-backed modes) ──────────────────────
+    let _database_lock = match supervisor::acquire_database_lock(&paths.database_url) {
+        Ok(Some(PidLockOutcome::Acquired(lock))) => {
+            info!(path = %lock.path().display(), "database singleton lock acquired");
+            Some(lock)
+        }
+        Ok(Some(PidLockOutcome::DuplicateHealthy { peer_pid })) => {
+            info!(
+                peer_pid,
+                "another daemon already owns this database — singleton policy, exit 0"
+            );
+            return Ok(());
+        }
+        Ok(Some(PidLockOutcome::AnomalousHolder { recorded_pid })) => {
+            error!(
+                recorded_pid,
+                database_url = %paths.database_url,
+                "database singleton lock anomalous: flock held but recorded PID is dead; exit {EX_TEMPFAIL}"
+            );
+            std::process::exit(EX_TEMPFAIL);
+        }
+        Ok(None) => None,
+        Err(e) => {
+            error!(err = %e, "database singleton lock acquisition errored");
+            return Err(anyhow::anyhow!("database singleton lock: {e}"));
+        }
+    };
 
     // ── §6.1 PID lock (packaged modes only) ────────────────────────────
     let _pid_lock = if mode.is_packaged() {

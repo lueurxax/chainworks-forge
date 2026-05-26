@@ -522,7 +522,9 @@ fn p081_next_subscription_sequence() -> i64 {
 
 fn p081_record_safe_mode_alert_lifecycle(active: bool, now_ms: i64) {
     let slot = P081_GRAPHQL_SAFE_MODE_ALERT_OPENED_AT_MS.get_or_init(|| Mutex::new(None));
-    let mut opened = slot.lock().expect("p081 safe-mode alert lifecycle poisoned");
+    let mut opened = slot
+        .lock()
+        .expect("p081 safe-mode alert lifecycle poisoned");
     match (active, *opened) {
         (true, None) => *opened = Some(now_ms),
         (false, Some(opened_at)) => {
@@ -798,8 +800,7 @@ async fn require_graphql_read(
                         );
                         if principal.class == auth::PrincipalClass::Operator {
                             db::metrics::record_p081_boundary_policy_enforcement_parity(
-                                "allow",
-                                "deny",
+                                "allow", "deny",
                             );
                             db::metrics::record_p081_boundary_shadow_disagreement(
                                 "graphql_query",
@@ -815,8 +816,7 @@ async fn require_graphql_read(
                         // matrix would deny must still be denied in shadow mode.
                         if principal.class != auth::PrincipalClass::Operator {
                             db::metrics::record_p081_boundary_policy_enforcement_parity(
-                                "deny",
-                                "deny",
+                                "deny", "deny",
                             );
                             // MEDIUM-001: best-effort audit for shadow-mode denials.
                             write_graphql_legacy_deny_audit(
@@ -890,7 +890,10 @@ async fn require_graphql_read(
             }
         }
     } else if principal.class != auth::PrincipalClass::Operator {
-        db::metrics::record_p081_boundary_policy_evaluation_error("graphql_query", "policy_missing");
+        db::metrics::record_p081_boundary_policy_evaluation_error(
+            "graphql_query",
+            "policy_missing",
+        );
         // No BoundaryPolicy available — fall back to operator-only guard.
         // No audit written here: this seam does not yet have bounded DB access.
         return Err(boundary_denial_error("CAPABILITY_OUT_OF_SCOPE", None, None));
@@ -990,8 +993,7 @@ async fn require_subscription_read(ctx: &Context<'_>) -> Result<()> {
                     );
                     if principal.class == auth::PrincipalClass::Operator {
                         db::metrics::record_p081_boundary_policy_enforcement_parity(
-                            "allow",
-                            "deny",
+                            "allow", "deny",
                         );
                         db::metrics::record_p081_boundary_shadow_disagreement(
                             "graphql_subscription",
@@ -1004,10 +1006,7 @@ async fn require_subscription_read(ctx: &Context<'_>) -> Result<()> {
                         );
                     }
                     if principal.class != auth::PrincipalClass::Operator {
-                        db::metrics::record_p081_boundary_policy_enforcement_parity(
-                            "deny",
-                            "deny",
-                        );
+                        db::metrics::record_p081_boundary_policy_enforcement_parity("deny", "deny");
                         // MEDIUM-001: best-effort audit for shadow-mode subscription denials.
                         write_graphql_legacy_deny_audit(
                             ctx,
@@ -3270,8 +3269,7 @@ async fn mutation_allowed(
                     );
                     if principal.class == auth::PrincipalClass::Operator {
                         db::metrics::record_p081_boundary_policy_enforcement_parity(
-                            "allow",
-                            "deny",
+                            "allow", "deny",
                         );
                         db::metrics::record_p081_boundary_shadow_disagreement(
                             "graphql_mutation",
@@ -3813,12 +3811,13 @@ impl SubscriptionRoot {
         );
         let bootstrap_frames = if replay["gapDetected"].as_bool().unwrap_or(false) {
             vec![Ok(Some(GqlRuntimeEvent {
-                id: ID(format!("rte_subscription_gap_{}", replay["sequenceCursor"].as_str().unwrap_or("seq-0"))),
-                run_id: ID(
-                    filter_run_id
-                        .unwrap_or_else(|| RunId::from(uuid::Uuid::nil()))
-                        .to_string(),
-                ),
+                id: ID(format!(
+                    "rte_subscription_gap_{}",
+                    replay["sequenceCursor"].as_str().unwrap_or("seq-0")
+                )),
+                run_id: ID(filter_run_id
+                    .unwrap_or_else(|| RunId::from(uuid::Uuid::nil()))
+                    .to_string()),
                 stage_id: "boundary_subscription_replay".to_string(),
                 agent_id: "control_plane".to_string(),
                 provider: "control_plane".to_string(),
@@ -7571,10 +7570,11 @@ mod tests {
             });
         });
 
-        let live_frame = tokio::time::timeout(std::time::Duration::from_secs(5), live_stream.next())
-            .await
-            .expect("runtime status subscription frame timed out")
-            .expect("runtime status subscription ended");
+        let live_frame =
+            tokio::time::timeout(std::time::Duration::from_secs(5), live_stream.next())
+                .await
+                .expect("runtime status subscription frame timed out")
+                .expect("runtime status subscription ended");
         assert!(live_frame.errors.is_empty(), "{live_frame:?}");
         let live_json = live_frame.data.into_json().unwrap();
         let live = &live_json["runtimeStatusChanged"];

@@ -873,7 +873,7 @@ fn compile_agent_task(
     for output_name in &outputs {
         if let Some(schema) = contracts.resolve(output_name, explicit_contract, output_count) {
             output_schemas.insert(output_name.clone(), schema);
-        } else if let Some(contract_id) = explicit_contract {
+        } else if let Some(contract_id) = explicit_contract.filter(|_| output_count == 1) {
             warn!(
                 output_name = %output_name,
                 contract_id = %contract_id,

@@ -150,6 +150,58 @@ pub fn acquire_pid_lock(path: &Path) -> Result<PidLockOutcome, LockError> {
     }
 }
 
+/// Derive the daemon singleton lock path for a SQLite file URL.
+///
+/// This is intentionally scoped to the database file, not to app-support
+/// or the packaged helper name. A debug `target/debug/control-plane`
+/// process pointed at the production DB and a bundled
+/// `chainworks-forge-daemon` process therefore contend on the same kernel
+/// flock even if they have different `daemon.pid` paths or bind different
+/// ports.
+#[cfg(unix)]
+fn sqlite_database_lock_path(database_url: &str) -> Option<PathBuf> {
+    if database_url.contains(":memory:") {
+        return None;
+    }
+
+    let raw_path = database_url
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.strip_prefix("sqlite:"))
+        .unwrap_or(database_url)
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if raw_path.is_empty() {
+        return None;
+    }
+
+    let db_path = PathBuf::from(raw_path);
+    let lock_name = match db_path.file_name().and_then(|name| name.to_str()) {
+        Some(name) if !name.is_empty() => format!("{name}.lock"),
+        _ => return None,
+    };
+    Some(db_path.with_file_name(lock_name))
+}
+
+/// Acquire a singleton lock derived from the SQLite database file.
+///
+/// Returns `Ok(None)` for in-memory databases where no cross-process file
+/// owner exists. File-backed databases return the same three-state outcome
+/// as [`acquire_pid_lock`].
+#[cfg(unix)]
+pub fn acquire_database_lock(database_url: &str) -> Result<Option<PidLockOutcome>, LockError> {
+    let Some(path) = sqlite_database_lock_path(database_url) else {
+        return Ok(None);
+    };
+    acquire_pid_lock(&path).map(Some)
+}
+
+#[cfg(not(unix))]
+pub fn acquire_database_lock(_database_url: &str) -> Result<Option<PidLockOutcome>, LockError> {
+    Ok(None)
+}
+
 /// Non-Unix stub: returns a permissive lock that does nothing. Packaged
 /// mode targets macOS only; dev/test on Windows is unsupported.
 #[cfg(not(unix))]
@@ -356,6 +408,32 @@ mod tests {
             }
             other => panic!("stale file should be reclaimed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn database_lock_rejects_duplicate_even_when_pid_paths_differ() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("control-plane.db");
+        let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+        let first = acquire_database_lock(&database_url).unwrap();
+        let _keepalive = match first {
+            Some(PidLockOutcome::Acquired(lock)) => lock,
+            other => panic!("first DB lock should acquire, got {other:?}"),
+        };
+
+        match acquire_database_lock(&database_url).unwrap() {
+            Some(PidLockOutcome::DuplicateHealthy { peer_pid }) => {
+                assert_eq!(peer_pid, std::process::id());
+            }
+            other => panic!("duplicate DB lock should be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn database_lock_is_not_required_for_memory_database() {
+        let outcome = acquire_database_lock("sqlite::memory:").unwrap();
+        assert!(outcome.is_none());
     }
 
     // ── Crash-budget tests ────────────────────────────────────────────

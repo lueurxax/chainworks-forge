@@ -549,8 +549,7 @@ impl McpServer {
                                 );
                                 if principal.class == auth::PrincipalClass::Operator {
                                     db::metrics::record_p081_boundary_policy_enforcement_parity(
-                                        "allow",
-                                        "deny",
+                                        "allow", "deny",
                                     );
                                     db::metrics::record_p081_boundary_shadow_disagreement(
                                         "mcp_tools_list",
@@ -687,8 +686,7 @@ impl McpServer {
                                 );
                                 if principal.class == auth::PrincipalClass::Operator {
                                     db::metrics::record_p081_boundary_policy_enforcement_parity(
-                                        "allow",
-                                        "deny",
+                                        "allow", "deny",
                                     );
                                     db::metrics::record_p081_boundary_shadow_disagreement(
                                         "mcp_tools_call",
@@ -2148,11 +2146,7 @@ async fn write_mcp_deny_audit(
     db::repos::audit_log::append(pool, &entry)
         .await
         .map_err(|e| {
-            db::metrics::record_p081_audit_log_append_failure(
-                "boundary_decision",
-                transport,
-                mode,
-            );
+            db::metrics::record_p081_audit_log_append_failure("boundary_decision", transport, mode);
             e
         })
 }

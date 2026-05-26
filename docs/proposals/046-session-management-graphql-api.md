@@ -12,6 +12,7 @@
 - **Status:** draft_for_review
 - **Date:** 2026-05-21
 - **Source Run Id:** b4f4b41c-b1a1-4d1a-a89b-6d54e1500c0c
+- **Main Sync Note:** 2026-05-25 main addendum pins the implementation-audit clarifications for generation-start event typing, resync identity payloads, and retry deadline headroom.
 
 ## Summary
 
@@ -165,7 +166,7 @@ Expose run-scoped session lineage, generation, event, KPI, health, and live stat
   - cursor: String!
   - node: Node!
 - **Has Next Page Semantics:** Resolvers fetch limit+1 rows after applying authorization and filters. hasNextPage is true only when an extra row exists beyond the returned page.
-- **Invalid Cursor Error:** Malformed, expired, wrong-type, or mismatched-filter cursors return a sanitized GraphQL BAD_USER_INPUT-style error with message 'invalid cursor' and no raw cursor echo.
+- **Invalid Cursor Error:** Malformed, wrong-type, or mismatched-filter cursors return a sanitized GraphQL BAD_USER_INPUT-style error with message 'invalid cursor' and no raw cursor echo. P046 v1 cursors are opaque base64 envelopes containing `p046_cursor_v1`, a connection kind (`session_lineage`, `session_generation`, or `session_event`), and the stable sort/filter tuple. Decoders must reject cursors whose version or kind does not match the target connection. P046 v1 cursors are not time-expiring because historical operator pagination must remain replayable; timestamp tuple components still must parse as RFC3339 values.
 - **Page Info Fields**
   - hasNextPage: Boolean!
   - startCursor: String
@@ -205,7 +206,7 @@ Expose run-scoped session lineage, generation, event, KPI, health, and live stat
 - Any GraphQL mutation that closes, resets, invalidates, compacts, retries, recovers, cancels, or otherwise controls a session.
 ### Queries
 1. **sessionLineages**
-   - **Bounds:** Ordered by agent_id, lineage_id, created_at, id. Default first=100, max first=500. Cursor is opaque base64 over the stable sort tuple.
+   - **Bounds:** Ordered by agent_id, lineage_id, created_at, id. Default first=100, max first=500. Cursor is opaque base64 over the P046 cursor version, `session_lineage` kind, and stable sort tuple.
    - **Name:** sessionLineages
    - **Signature:** sessionLineages(runId: ID!, first: Int =100, after: String): SessionLineageConnection!
 2. **sessionLineage**
@@ -213,11 +214,11 @@ Expose run-scoped session lineage, generation, event, KPI, health, and live stat
    - **Name:** sessionLineage
    - **Signature:** sessionLineage(id: ID!): SessionLineage
 3. **sessionGenerations**
-   - **Bounds:** Ordered by generation ascending, created_at, id. Default first=100, max first=500. Cursor is opaque base64 over the stable sort tuple.
+   - **Bounds:** Ordered by generation ascending, created_at, id. Default first=100, max first=500. Cursor is opaque base64 over the P046 cursor version, `session_generation` kind, and stable sort tuple.
    - **Name:** sessionGenerations
    - **Signature:** sessionGenerations(lineageId: ID!, first: Int =100, after: String): SessionGenerationConnection!
 4. **sessionEvents**
-   - **Bounds:** Ordered by recorded_at ascending, id ascending. Default first=200, max first=1000. Cursor is opaque base64 over recorded_at and id. Requests above max fail validation before DB access.
+   - **Bounds:** Ordered by recorded_at ascending, id ascending. Default first=200, max first=1000. Cursor is opaque base64 over the P046 cursor version, `session_event` kind, recorded_at, id, and the active lineage/generation filter tuple. Requests above max fail validation before DB access.
    - **Name:** sessionEvents
    - **Signature:** sessionEvents(lineageId: ID!, generationId: ID, first: Int =200, after: String): SessionEventConnection!
 5. **sessionKpiSummary**
@@ -269,6 +270,8 @@ Expose run-scoped session lineage, generation, event, KPI, health, and live stat
 - **Delivery Contract**
   - Payloads are small and do not include event history.
   - Each payload includes eventId, lineageId, generationId, recordedAt, and status so clients can deduplicate and detect gaps.
+  - Persisted generation creation events are generation-scoped and must render as eventType=GENERATION_STARTED in both SessionEvent readback and sessionStatusChanged payloads. LINEAGE_CREATED is reserved for a distinct lineage-owned event shape and must not be used for generation-created rows.
+  - resyncRequired=true payloads are synthetic control-plane notifications, but they still carry non-null synthetic eventId, lineageId, and generationId values. The values are daemon-owned identities scoped to the subscribed run and are used only for client deduplication/gap handling; clients must still perform a fresh query before treating state as current.
   - Delivery is best-effort live notification, not durable event replay. Clients must re-query sessionLineages, sessionKpiSummary, and sessionHealth after reconnect, lag, daemon restart, graceful shutdown, or resyncRequired=true.
   - On broadcast lag or overflow, the server emits at most one resyncRequired=true payload between successful non-resync payloads. The client must then re-query before treating state as current.
   - If the daemon restarts or the WebSocket closes, SwiftUI treats the view as stale until fresh query readback completes.
@@ -907,6 +910,7 @@ _None._
   - `150`
 - **Deadline Headroom Ms Min:** `250`
 - **Exhaustion Behavior:** If all attempts fail or remaining resolver budget would fall below deadline_headroom_ms_min, stop retrying. sessionHealth returns state=UNKNOWN with reasonCode=transient_db_unavailable and a bounded warning. Other P046 queries return a sanitized db_unavailable resolver error without partial data.
+- **Headroom Invariant:** The retry helper must check the remaining resolver budget before the first attempt, before every retry sleep, and before each retry attempt. It must not enter a retry sleep when the sleep would consume the reserved 250ms resolver headroom.
 - **Jitter Ms Max:** `25`
 - **Max Attempts Total:** `3`
 - **Metrics**

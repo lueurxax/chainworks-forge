@@ -52,8 +52,8 @@ use domain::discovery::{
     DiscoveryPathKind, ExpectedOutputSpec, ExpectedPathBaselineStatus, LegacyBroadDiscoveryPolicy,
     NoopDiscoveryOperationRecorder, OutputDiscoveryDecision, OutputDiscoveryProvenance,
     OutputDiscoveryReason, OutputDiscoveryStatus, OutputReusePolicy, OutputRootClass,
-    PrePromptExpectedOutputMetadata, SourceGenerationOwner, StdDiscoveryFilesystem,
-    DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
+    PrePromptExpectedOutputContext, PrePromptExpectedOutputMetadata, SourceGenerationOwner,
+    StdDiscoveryFilesystem, DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
 };
 use domain::error_sanitizer::sanitize_error_for_storage;
 use domain::ids::RunId;
@@ -1170,6 +1170,23 @@ fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn path_looks_like_directory_target(path: &str) -> bool {
+    path.ends_with('/') || Path::new(path).is_dir()
+}
+
+fn spec_is_directory_target(
+    spec: &ExpectedOutputSpec,
+    filesystem: &dyn DiscoveryFilesystem,
+) -> bool {
+    if spec.target_path.ends_with('/') {
+        return true;
+    }
+    let recorder = NoopDiscoveryOperationRecorder;
+    filesystem
+        .path_metadata_with_recorder(Path::new(&spec.target_path), &recorder)
+        .is_some_and(|metadata| metadata.kind == DiscoveryPathKind::Directory)
+}
+
 fn p086_continuation_response_hash(
     continuation_id: &str,
     terminal_status: &str,
@@ -1232,6 +1249,89 @@ fn build_declared_output_discovery_settlement_with_filesystem(
     let mut aggregate_cap_hit = false;
 
     for spec in expected_outputs {
+        if spec_is_directory_target(spec, filesystem) {
+            if let Some(directory_candidate) =
+                read_changed_directory_output(spec, pre_prompt_expected_outputs, filesystem)
+            {
+                let (
+                    reason,
+                    provenance,
+                    payload_ref,
+                    bytes,
+                    source_path,
+                    baseline_status,
+                    directory_metadata,
+                ) = directory_candidate;
+                let aggregate_after = accepted_aggregate_bytes.saturating_add(bytes.len() as u64);
+                if aggregate_after > spec.aggregate_acceptance_cap_bytes {
+                    aggregate_cap_hit = true;
+                    decisions.push(rejected_output_decision(
+                        spec,
+                        OutputDiscoveryReason::AggregateExactOutputCap,
+                        Some(provenance),
+                        source_path,
+                        Some(baseline_status),
+                        Some(bytes.len() as u64),
+                        Some(spec.max_bytes),
+                        Some(accepted_aggregate_bytes),
+                        filesystem,
+                    ));
+                    continue;
+                }
+
+                accepted_aggregate_bytes = aggregate_after;
+                let accepted_digest = sha256_digest(&bytes);
+                accepted_payloads.insert(payload_ref.clone(), bytes);
+                let mut diagnostics = BTreeMap::new();
+                diagnostics.insert("output_kind".to_string(), "directory_manifest".to_string());
+                if let Some(file_count) = directory_metadata.file_count {
+                    diagnostics.insert("file_count".to_string(), file_count.to_string());
+                }
+                if let Some(total_bytes) = directory_metadata.size_bytes {
+                    diagnostics
+                        .insert("directory_total_bytes".to_string(), total_bytes.to_string());
+                }
+                decisions.push(OutputDiscoveryDecision {
+                    output_name: spec.output_name.clone(),
+                    output_role: spec.output_role,
+                    target_path: spec.target_path.clone(),
+                    companion_of: spec.companion_of.clone(),
+                    status: OutputDiscoveryStatus::Accepted,
+                    reason,
+                    provenance: Some(provenance),
+                    canonical_path: directory_metadata.canonical_path.clone().or_else(|| {
+                        canonical_path_for_decision(
+                            source_path.as_deref(),
+                            &spec.target_path,
+                            filesystem,
+                        )
+                    }),
+                    root_class: Some(directory_metadata.root_class),
+                    baseline_status: Some(baseline_status),
+                    size_bytes: Some(directory_metadata.size_bytes.unwrap_or_else(|| {
+                        accepted_payloads
+                            .get(&payload_ref)
+                            .map(|bytes| bytes.len() as u64)
+                            .unwrap_or(0)
+                    })),
+                    content_digest: directory_metadata.content_digest.clone(),
+                    max_bytes_applied: Some(spec.max_bytes),
+                    aggregate_bytes_after_acceptance: Some(aggregate_after),
+                    accepted_payload_ref: Some(payload_ref),
+                    accepted_bytes_sha256: Some(accepted_digest),
+                    generated_by: None,
+                    diagnostics,
+                    decision_at: chrono::Utc::now(),
+                });
+            } else {
+                decisions.push(
+                    stale_expected_output_decision(spec, pre_prompt_expected_outputs, filesystem)
+                        .unwrap_or_else(|| missing_output_decision(spec)),
+                );
+            }
+            continue;
+        }
+
         let envelope = find_provider_envelope_for_spec(discovered_artifacts, spec);
         let exact_path = find_exact_path_artifact_for_spec(discovered_artifacts, spec);
         let candidate = if let Some(artifact) = envelope {
@@ -1471,6 +1571,9 @@ fn materialize_validated_output_candidate(
     settlement: &DeclaredOutputDiscoverySettlement,
     valid_output_names: &HashSet<&str>,
 ) -> Result<()> {
+    if path_looks_like_directory_target(target_path) {
+        return Ok(());
+    }
     if !valid_output_names.contains(output_name) {
         return Ok(());
     }
@@ -1605,7 +1708,12 @@ fn stage_p090_repair_materialization(
                         .unwrap_or_else(|| decision.target_path.clone())
                 });
             let canonical_before_sha256 = file_sha256_if_exists(&canonical_path)?;
-            let staging_path = if let Some(bytes) = payload {
+            let output_is_directory = decision
+                .diagnostics
+                .get("output_kind")
+                .is_some_and(|kind| kind == "directory_manifest")
+                || path_looks_like_directory_target(&canonical_path);
+            let staging_path = if let Some(bytes) = payload.filter(|_| !output_is_directory) {
                 let path = p090_repair_staging_path(
                     artifact_root,
                     agent_execution_id,
@@ -1821,9 +1929,8 @@ pub async fn run_production_declared_output_settlement_for_canary(
             let decision = decisions_by_name
                 .get(declared.output_name.as_str())
                 .copied();
-            let (materialized, size_bytes, sha256) = std::fs::read(&declared.target_path)
-                .map(|bytes| (true, Some(bytes.len() as u64), Some(sha256_digest(&bytes))))
-                .unwrap_or((false, None, None));
+            let (materialized, size_bytes, sha256) =
+                declared_output_materialization_readback(&declared.target_path);
             serde_json::json!({
                 "output_name": declared.output_name,
                 "canonical_path": declared.target_path,
@@ -1868,6 +1975,22 @@ pub async fn run_production_declared_output_settlement_for_canary(
         "aggregate_cap_hit": settlement.aggregate_cap_hit,
         "idempotency_key": settlement.idempotency_key,
     }))
+}
+
+fn declared_output_materialization_readback(path: &str) -> (bool, Option<u64>, Option<String>) {
+    let path = Path::new(path);
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return (false, None, None);
+    };
+    if metadata.is_dir() {
+        return (true, None, None);
+    }
+    if !metadata.is_file() {
+        return (false, None, None);
+    }
+    std::fs::read(path)
+        .map(|bytes| (true, Some(bytes.len() as u64), Some(sha256_digest(&bytes))))
+        .unwrap_or((false, None, None))
 }
 
 fn exact_path_rejection_for_spec(
@@ -2080,6 +2203,85 @@ fn read_declared_reuse_policy_output(
         bytes,
         Some(spec.target_path.clone()),
         Some(metadata.baseline_status),
+    ))
+}
+
+fn read_changed_directory_output(
+    spec: &ExpectedOutputSpec,
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+    filesystem: &dyn DiscoveryFilesystem,
+) -> Option<(
+    OutputDiscoveryReason,
+    OutputDiscoveryProvenance,
+    String,
+    Vec<u8>,
+    Option<String>,
+    ExpectedPathBaselineStatus,
+    PrePromptExpectedOutputMetadata,
+)> {
+    let current = filesystem.capture_pre_prompt_expected_output_metadata_with_recorder(
+        spec,
+        &PrePromptExpectedOutputContext {
+            agent_execution_id: "directory-output-settlement".to_string(),
+            stage_execution_id: "directory-output-settlement".to_string(),
+            attempt_number: 0,
+            session_generation_id: "directory-output-settlement".to_string(),
+            prompt_turn_id: "directory-output-settlement".to_string(),
+            discovery_generation_id: "directory-output-settlement".to_string(),
+        },
+        &NoopDiscoveryOperationRecorder,
+    );
+    if current.baseline_status != ExpectedPathBaselineStatus::DirectoryManifestCaptured {
+        return None;
+    }
+    if current.file_count.unwrap_or(0) == 0 {
+        return None;
+    }
+
+    let previous = pre_prompt_expected_outputs.iter().find(|metadata| {
+        metadata.output_name == spec.output_name && metadata.target_path == spec.target_path
+    });
+    let reason = match previous {
+        Some(metadata)
+            if metadata.baseline_status
+                == ExpectedPathBaselineStatus::DirectoryManifestCaptured =>
+        {
+            if metadata.content_digest == current.content_digest {
+                return None;
+            }
+            OutputDiscoveryReason::ExactPathChanged
+        }
+        Some(metadata) if metadata.baseline_status == ExpectedPathBaselineStatus::Absent => {
+            OutputDiscoveryReason::ExactPathNew
+        }
+        Some(metadata)
+            if metadata.file_type == "directory"
+                && metadata.mtime_ns.is_some()
+                && metadata.mtime_ns != current.mtime_ns =>
+        {
+            OutputDiscoveryReason::ExactPathChanged
+        }
+        Some(_) | None => OutputDiscoveryReason::ExactPathChanged,
+    };
+
+    let payload = serde_json::json!({
+        "schema_version": "directory_manifest_v1",
+        "output_name": spec.output_name,
+        "target_path": spec.target_path,
+        "canonical_path": current.canonical_path.clone(),
+        "file_count": current.file_count,
+        "total_bytes": current.size_bytes,
+        "content_digest": current.content_digest.clone(),
+    });
+    let bytes = serde_json::to_vec(&payload).ok()?;
+    Some((
+        reason,
+        OutputDiscoveryProvenance::ExactPath,
+        exact_path_payload_ref(&spec.output_name),
+        bytes,
+        Some(spec.target_path.clone()),
+        current.baseline_status,
+        current,
     ))
 }
 
@@ -13574,24 +13776,52 @@ fn prompt_with_runtime_invocation_contract(
             "- `{}` -> `{}`\n",
             output.output_name, output.target_path
         ));
+        if path_looks_like_directory_target(&output.target_path) {
+            prompt.push_str(
+                "  Directory output: write files inside this directory directly; do not return \
+                 directory content in `CHAINWORKS_OUTPUT`.\n",
+            );
+        }
         append_status_allowed_values_for_declared_output(&mut prompt, output);
         if let (Some(name), Some(path)) = (
             output.companion_output_name.as_deref(),
             output.companion_path.as_deref(),
         ) {
             prompt.push_str(&format!("- `{name}` companion -> `{path}`\n"));
+            if path_looks_like_directory_target(path) {
+                prompt.push_str(
+                    "  Directory companion: write files inside this directory directly; do not \
+                     return directory content in `CHAINWORKS_OUTPUT`.\n",
+                );
+            }
         }
     }
+    let has_returnable_outputs = input.declared_outputs.iter().any(|output| {
+        !path_looks_like_directory_target(&output.target_path)
+            || output
+                .companion_path
+                .as_deref()
+                .is_some_and(|path| !path_looks_like_directory_target(path))
+    });
     prompt.push_str(
         "\nOutputs from prior stage executions, prior work items, or prior prompt turns are stale \
-         unless they are explicitly accepted by the current output contract. Return a fresh \
-         `CHAINWORKS_OUTPUT` object for this invocation, using the exact canonical paths above as \
-         keys. You must not finish this turn without `CHAINWORKS_OUTPUT` when required outputs are \
-         listed.\n\
-         Tool stdout is not an output channel. Only the final assistant message is settled for \
-         `CHAINWORKS_OUTPUT`. Do not call shell `echo`, `printf`, or file-writing commands to \
-         return `CHAINWORKS_OUTPUT`.\n",
+         unless they are explicitly accepted by the current output contract. ",
     );
+    if has_returnable_outputs {
+        prompt.push_str(
+            "Return a fresh `CHAINWORKS_OUTPUT` object for file/json outputs in this invocation, \
+             using the exact canonical paths above as keys. You must not finish this turn without \
+             `CHAINWORKS_OUTPUT` for required file/json outputs.\n\
+             Tool stdout is not an output channel. Only the final assistant message is settled for \
+             `CHAINWORKS_OUTPUT`. Do not call shell `echo`, `printf`, or file-writing commands to \
+             return `CHAINWORKS_OUTPUT`.\n",
+        );
+    } else {
+        prompt.push_str(
+            "All required outputs are directories, so write files directly under the listed \
+             directories; `CHAINWORKS_OUTPUT` is not required for directory content.\n",
+        );
+    }
     append_chainworks_output_contract_example(&mut prompt, input.declared_outputs);
     append_docs_noop_contract_guidance(&mut prompt, input.declared_outputs);
     prompt
@@ -13690,6 +13920,9 @@ fn chainworks_output_contract_example(
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut outputs = serde_json::Map::new();
     for output in declared_outputs {
+        if path_looks_like_directory_target(&output.target_path) {
+            continue;
+        }
         outputs.insert(
             output.target_path.clone(),
             declared_output_contract_example_value(output),
@@ -13703,6 +13936,9 @@ fn chainworks_output_contract_example_by_output_name(
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut outputs = serde_json::Map::new();
     for output in declared_outputs {
+        if path_looks_like_directory_target(&output.target_path) {
+            continue;
+        }
         outputs.insert(
             output.output_name.clone(),
             declared_output_contract_example_value(output),
@@ -16358,6 +16594,38 @@ plain progress line without gate evidence";
             "\"/workspace/.chainworks/runs/run-1/proposals/current.md\":\"<proposal_current content>\""
         ));
         assert!(!prompt.contains("{\"status\":\"complete\"}"));
+    }
+
+    #[test]
+    fn runtime_invocation_contract_treats_directory_outputs_as_filesystem_outputs() {
+        let declared_outputs = vec![DeclaredOutput {
+            output_name: "system_articles".to_string(),
+            target_path: "/workspace/.playground/intent-demo/2-context/3-system/articles/"
+                .to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        }];
+
+        let prompt = prompt_with_runtime_invocation_contract(
+            "Collect system context".to_string(),
+            RuntimeInvocationContractInput {
+                run_id: RunId::new().to_string(),
+                stage_id: "state_2_system_context_collected".to_string(),
+                stage_execution_id: domain::ids::StageExecutionId::new().to_string(),
+                agent_execution_id: domain::ids::AgentExecutionId::new().to_string(),
+                work_item_id: "work-system-context".to_string(),
+                session_generation_id: None,
+                session_reuse_disposition: None,
+                declared_outputs: &declared_outputs,
+            },
+        );
+
+        assert!(prompt.contains("Directory output: write files inside this directory directly"));
+        assert!(prompt.contains("CHAINWORKS_OUTPUT` is not required for directory content"));
+        assert!(!prompt.contains("Example `CHAINWORKS_OUTPUT` skeleton"));
+        assert!(!prompt.contains("<system_articles content>"));
     }
 
     #[test]
@@ -19353,6 +19621,74 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn directory_output_settlement_accepts_files_written_inside_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let articles_dir = tmp.path().join("articles");
+        let target_path = format!("{}/", articles_dir.to_string_lossy());
+        let declared = DeclaredOutput {
+            output_name: "system_articles".to_string(),
+            target_path: target_path.clone(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata = vec![
+            StdDiscoveryFilesystem::capture_pre_prompt_expected_output_metadata(
+                &specs[0],
+                &metadata_context,
+            ),
+        ];
+        std::fs::create_dir_all(&articles_dir).unwrap();
+        std::fs::write(articles_dir.join("overview.md"), b"# Overview").unwrap();
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &[], &pre_prompt_metadata);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared.clone()],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Accepted
+        );
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::ExactPathNew
+        );
+        assert_eq!(
+            settlement.decisions[0].diagnostics.get("output_kind"),
+            Some(&"directory_manifest".to_string())
+        );
+        assert!(validation.failure_class.is_none());
+        materialize_validated_discovery_decisions(&[declared], &settlement, &validation)
+            .expect("directory outputs should not be materialized as files");
+        assert!(articles_dir.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(articles_dir.join("overview.md")).unwrap(),
+            "# Overview"
+        );
+    }
+
+    #[test]
     fn proposal_053_settlement_boundary_records_idempotency_key() {
         let tmp = tempfile::tempdir().unwrap();
         let machine_path = tmp.path().join("proposal_review.json");
@@ -19385,6 +19721,7 @@ plain progress line without gate evidence";
             existed: false,
             file_type: "absent".to_string(),
             size_bytes: None,
+            file_count: None,
             content_digest: None,
             mtime_ns: None,
             baseline_status: ExpectedPathBaselineStatus::Absent,
