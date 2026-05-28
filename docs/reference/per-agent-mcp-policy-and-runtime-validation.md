@@ -165,6 +165,10 @@ This slice depends on and composes with:
 - [output-contracts-failure-evidence-and-recovery.md](output-contracts-failure-evidence-and-recovery.md)
 - [acp-runtime-transport.md](acp-runtime-transport.md)
 
+## Escalation policy integration
+
+Per-agent policy/runtime validation feeds the escalation classifier: validation failures (missing permission, unsafe side-effect binding, etc.) surface as escalation pause reasons rather than bypassing this slice. The escalation chain's frozen `policy_hash` and binding data are produced by the workflow compiler alongside the per-agent policy resolution described above. Schema, pause-reason catalog, and policy-drift behavior live in [escalation-policies.md](escalation-policies.md).
+
 ## Current implementation anchors
 
 - `control-plane/crates/workflow/src/compiler.rs`
@@ -174,3 +178,4 @@ This slice depends on and composes with:
 - `control-plane/crates/mcp-server/src/tools/reports.rs`
 - `control-plane/crates/graphql-server/src/types/stage.rs`
 - `control-plane/crates/graphql-server/src/types/artifact.rs`
+- `control-plane/crates/db/src/repos/escalation.rs`

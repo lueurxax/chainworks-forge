@@ -1,6 +1,6 @@
 {
   "schema_version": "operator_readback_v1",
-  "fixture_purpose": "P058 escalation policy rollout operator decision surface. Proves all required operator_readback_v1 fields are present across governed readback lanes.",
+  "fixture_purpose": "P058 escalation policy rollout operator decision surface. Proves required operator_readback_v1 fields are present across governed readback lanes for implementation closeout. Release-soak evidence remains tracked separately from implementation readiness.",
   "proposal_id": "proposal-058",
   "proposal_revision_id": "p058-r14-2026-05-07",
   "source_lane": "run_report",
@@ -20,11 +20,38 @@
   "rollout_contract_enabled_state": "enabled",
   "rollout_contract_disabled_reason_code": null,
   "rollout_contract_action_id": "p058-action-00000000-0000-0000-0000-000000000001",
-  "rollout_contract_operator_message": null,
+  "rollout_contract_operator_message": "P058 foundation, scheduler readback parity, governed macOS read components, provider force-detach fail-closed pauses, launch-recycle storm pauses, late-frame event journaling, and startup force-detach replay are implemented. Remote visual soak and long-run threshold evidence remain release-closeout evidence, not implementation blockers.",
   "rollout_contract_projection_integrity": "valid",
   "rollout_contract_cutover_policy_revision": "p058-cutover-v1",
   "rollout_contract_diagnostic_redaction": "none",
-  "rollout_contract_next_steps": [],
+  "rollout_contract_next_steps": [
+    "Release-closeout follow-up p058-release-followup-remote-ui-soak: collect remote visual/runtime soak evidence for governed macOS read surfaces before broad user-facing release.",
+    "Release-closeout follow-up p058-release-followup-metric-thresholds: continue live threshold trending for P058 operational metrics during rollout.",
+    "Release-closeout follow-up p058-release-followup-operational-drills: keep migration and recovery drills in the release evidence pack as non-code operational proof."
+  ],
+  "release_closeout_followups": [
+    {
+      "id": "p058-release-followup-remote-ui-soak",
+      "owner": "release_evidence",
+      "blocking_for_implementation_closeout": false,
+      "blocking_for_broad_release": true,
+      "evidence_path": "docs/evidence/058-configurable-agent-escalation-chains/release-closeout-followups.json"
+    },
+    {
+      "id": "p058-release-followup-metric-thresholds",
+      "owner": "observability_rollout",
+      "blocking_for_implementation_closeout": false,
+      "blocking_for_broad_release": true,
+      "evidence_path": "docs/evidence/058-configurable-agent-escalation-chains/release-closeout-followups.json"
+    },
+    {
+      "id": "p058-release-followup-operational-drills",
+      "owner": "release_evidence",
+      "blocking_for_implementation_closeout": false,
+      "blocking_for_broad_release": true,
+      "evidence_path": "docs/evidence/058-configurable-agent-escalation-chains/release-closeout-followups.json"
+    }
+  ],
   "parity_lanes": {
     "mcp": {
       "rollout_contract_status": "pass",
@@ -34,7 +61,9 @@
       "rollout_contract_waiver_expires_at": null,
       "rollout_contract_enforcement_mode": "enforce",
       "rollout_contract_enforcement_mode_reason": "post-cutover-implementation-start",
-      "rollout_contract_hold_conditions": [],
+      "rollout_contract_hold_conditions": [
+        "No MCP-lane hold remains for scheduler readback fields."
+      ],
       "rollout_contract_rollback_disposition": {
         "mode": "disable_escalation_policy_behavior_keep_readback",
         "data_loss_risk": "low"
@@ -80,7 +109,9 @@
       "rolloutContractWaiverExpiresAt": null,
       "rolloutContractEnforcementMode": "enforce",
       "rolloutContractEnforcementModeReason": "post-cutover-implementation-start",
-      "rolloutContractHoldConditions": [],
+      "rolloutContractHoldConditions": [
+        "No GraphQL-lane hold remains for scheduler readback fields."
+      ],
       "rolloutContractRollbackDisposition": {
         "mode": "disable_escalation_policy_behavior_keep_readback",
         "dataLossRisk": "low"

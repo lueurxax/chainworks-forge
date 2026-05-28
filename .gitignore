@@ -24,6 +24,9 @@ DerivedDataCodex/
 /0
 /1
 
+# Engine runtime output channel — never committed; run `git rm --cached CHAINWORKS_OUTPUT` if tracked
+/CHAINWORKS_OUTPUT
+
 # Swift Package Manager
 .build/
 control-plane/target/

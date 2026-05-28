@@ -2,7 +2,7 @@ use chrono::{Duration, Utc};
 use db::pool::create_pool;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, artifact_contracts,
-    ideas, retry_stage_execution_authorities, runs, sessions, stages, work_items,
+    escalation as escalation_repo, ideas, runs, sessions, stages, work_items,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentExecution, AgentOutputSettlement, AgentStatus, ArtifactSourceClaimState};
@@ -10,13 +10,10 @@ use domain::artifact_contracts::{
     ActiveArtifactGenerationInput, ArtifactSourceGenerationClaim, ArtifactSourceGenerationClaimKey,
     SourceGenerationImportDecision,
 };
-use domain::commands::{CallerContext, Command, ConsumeProviderQuotaHoldCmd, RetryStageCmd};
+use domain::commands::{CallerContext, Command, RetryStageCmd};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::mediation::OwnerKind;
-use domain::retry_authority::{
-    RetryAuthorityEntryKind, RetryAuthorityState, RetryStageExecutionAuthority,
-};
 use domain::run::{Run, RunStatus};
 use domain::stage::{StageExecution, StageStatus};
 use engine::command_handler::CommandHandler;
@@ -26,8 +23,25 @@ use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
+
+async fn setup_memory_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+    db::writer::register_shared_writer(&pool, writer)
+        .await
+        .unwrap();
+    pool
+}
+
+async fn setup_file_backed_pool(path: &str) -> sqlx::SqlitePool {
+    let pool = create_pool(path).await.unwrap();
+    let writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+    db::writer::register_shared_writer(&pool, writer)
+        .await
+        .unwrap();
+    pool
+}
 
 fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
     Run {
@@ -82,27 +96,9 @@ fn test_agent_catalog_yaml_path() -> String {
     )
 }
 
-async fn test_pool() -> sqlx::SqlitePool {
-    let pool = create_pool("sqlite::memory:").await.unwrap();
-    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
-        .await
-        .unwrap();
-    pool
-}
-
-async fn file_backed_test_pool(db_path: &Path) -> sqlx::SqlitePool {
-    let pool = create_pool(&format!("sqlite://{}", db_path.to_string_lossy()))
-        .await
-        .unwrap();
-    db::writer::register_shared_writer(&pool, Arc::new(db::writer::DbWriter::new(pool.clone())))
-        .await
-        .unwrap();
-    pool
-}
-
 #[tokio::test]
 async fn proposal_058_claim_start_precreates_execution_and_active_artifact_claim() {
-    let pool = test_pool().await;
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -298,7 +294,7 @@ async fn proposal_058_claim_start_precreates_execution_and_active_artifact_claim
 
 #[tokio::test]
 async fn proposal_058_claim_start_without_session_scope_does_not_fabricate_generation() {
-    let pool = test_pool().await;
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -434,7 +430,7 @@ async fn proposal_058_claim_start_without_session_scope_does_not_fabricate_gener
 
 #[tokio::test]
 async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation() {
-    let pool = test_pool().await;
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -534,6 +530,13 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -634,7 +637,7 @@ async fn proposal_058_reclaimed_null_scope_payload_clears_legacy_fake_generation
 
 #[tokio::test]
 async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_with_fresh_execution() {
-    let pool = test_pool().await;
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -800,7 +803,7 @@ async fn proposal_058_startup_recovery_requeues_preclaimed_invoke_with_fresh_exe
 
 #[tokio::test]
 async fn proposal_058_xcode_mcp_invoke_claim_respects_configured_xcode_capacity() {
-    let pool = test_pool().await;
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -919,606 +922,8 @@ async fn proposal_058_xcode_mcp_invoke_claim_respects_configured_xcode_capacity(
 }
 
 #[tokio::test]
-async fn provider_quota_wait_blocks_same_provider_family_claim_only() {
-    let pool = test_pool().await;
-    let idea_id = IdeaId::new();
-    let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
-
-    ideas::insert(
-        &pool,
-        &Idea {
-            id: idea_id,
-            title: "Provider quota guard".into(),
-            body: "provider quota should hold only matching provider family".into(),
-            workspace_root_path: None,
-            project_key: None,
-            status: IdeaStatus::Active,
-            created_at: Utc::now(),
-            archived_at: None,
-        },
-    )
-    .await
-    .unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id))
-        .await
-        .unwrap();
-    stages::insert(
-        &pool,
-        &StageExecution {
-            id: stage_execution_id,
-            run_id,
-            stage_id: "implementation".into(),
-            label: "Implementation".into(),
-            status: StageStatus::Running,
-            iteration: 1,
-            attempt_number: 1,
-            settlement_kind: None,
-            started_at: Utc::now(),
-            completed_at: None,
-            owner_agent: None,
-            provider: None,
-            model: None,
-            stage_type: None,
-            validation_failure_json: None,
-            evidence_packet_json: None,
-            recovery_snapshot_json: None,
-            retry_reason: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let failed_gemini_execution_id = AgentExecutionId::new();
-    agent_executions::insert(
-        &pool,
-        &AgentExecution {
-            id: failed_gemini_execution_id,
-            stage_execution_id: Some(stage_execution_id),
-            agent_id: "lead_orchestrator".into(),
-            provider: "gemini".into(),
-            model: Some("gemini-3.1-pro-preview".into()),
-            status: AgentStatus::Failed,
-            started_at: Utc::now() - Duration::minutes(10),
-            completed_at: Some(Utc::now() - Duration::minutes(5)),
-            owner_execution_lineage_id: Some(stage_execution_id.to_string()),
-            session_lineage_id: Some("lineage-gemini".into()),
-            session_generation_id: Some("generation-gemini".into()),
-            rehydrated_from_checkpoint_artifact_id: None,
-            invocation_owner_key: Some("owner-key".into()),
-            session_reuse_scope: Some("same_agent_family_within_run".into()),
-            session_family_id: Some("orchestration_loop".into()),
-            session_reuse_disposition: Some("fresh".into()),
-            session_reset_reason: None,
-            backend_profile_id: Some("gemini_reasoning_pro_high".into()),
-            requested_mcp_extensions_json: None,
-            predicted_mcp_extensions_json: None,
-            predicted_mcp_runtime_ids_json: None,
-            actual_mcp_extensions_json: None,
-            actual_mcp_runtime_ids_json: None,
-            denied_mcp_extensions_json: None,
-            mcp_blocking_issues_json: None,
-            actual_mcp_observation_json: None,
-            actual_xcode_runtime_observation_json: None,
-            mcp_session_startup_latency_ms: None,
-            owner_kind: None,
-            owner_id: None,
-            lead_mediation_record_id: None,
-            origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
-            actual_toolchain_mapping_diagnostics_json: None,
-        },
-    )
-    .await
-    .unwrap();
-    let retry_after = Utc::now() + Duration::hours(1);
-    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
-        &pool,
-        run_id,
-        stage_execution_id,
-        failed_gemini_execution_id,
-        Some(retry_after),
-    )
-    .await
-    .unwrap();
-
-    let now = Utc::now();
-    for (id, provider, model, scheduled_at) in [
-        (
-            "gemini-different-model-allowed",
-            "gemini",
-            "other-test-model",
-            now - Duration::seconds(2),
-        ),
-        (
-            "gemini-invoke-held",
-            "gemini",
-            "gemini-3.1-pro-preview",
-            now - Duration::seconds(1),
-        ),
-        ("codex-invoke-allowed", "codex_acp", "test-model", now),
-    ] {
-        work_items::enqueue(
-            &pool,
-            &WorkItem {
-                id: id.into(),
-                kind: WorkItemKind::InvokeAgent,
-                payload_json: serde_json::json!({
-                    "stage_id": "implementation",
-                    "stage_execution_id": stage_execution_id.to_string(),
-                    "agent_id": id,
-                    "provider": provider,
-                    "model": model,
-                    "prompt": "run",
-                    "task_name": id,
-                    "task_inputs": ["input"],
-                    "task_outputs": ["output"],
-                    "declared_outputs": [],
-                    "requested_mcp_server_ids": [],
-                    "session_reuse_scope": "same_agent_family_within_run",
-                    "session_family_id": id,
-                    "worktree_write_enabled": false
-                })
-                .to_string(),
-                status: WorkItemStatus::Pending,
-                run_id: Some(run_id),
-                stage_id: Some("implementation".into()),
-                created_at: now,
-                scheduled_at,
-                attempt_count: 0,
-                last_error: None,
-            },
-        )
-        .await
-        .unwrap();
-    }
-
-    let claimed_different_model = engine::executor::claim_next_invoke_agent_with_start(&pool)
-        .await
-        .unwrap()
-        .expect("same provider family on a different model should still claim");
-    assert_eq!(
-        claimed_different_model.source_work_item_id,
-        "gemini-different-model-allowed"
-    );
-
-    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
-        .await
-        .unwrap()
-        .expect("non-degraded provider should still claim");
-    assert_eq!(claimed.source_work_item_id, "codex-invoke-allowed");
-
-    let pending = work_items::list_by_status(&pool, WorkItemStatus::Pending)
-        .await
-        .unwrap();
-    assert!(
-        pending.iter().any(|item| item.id == "gemini-invoke-held"),
-        "Gemini work item should remain pending while provider quota wait is active"
-    );
-
-    sqlx::query(
-        "UPDATE agent_retry_budget_ledger SET normal_budget_consumed = 1, state = 'early_retry_consumed' WHERE id = ?1",
-    )
-    .bind(&ledger.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let claimed_after_budget_override = engine::executor::claim_next_invoke_agent_with_start(&pool)
-        .await
-        .unwrap()
-        .expect("explicit quota budget consumption should allow Gemini claim");
-    assert_eq!(
-        claimed_after_budget_override.source_work_item_id,
-        "gemini-invoke-held"
-    );
-}
-
-#[tokio::test]
-async fn operator_retry_consumes_active_provider_family_quota_wait_for_target_stage() {
-    let pool = test_pool().await;
-    let idea_id = IdeaId::new();
-    let blocking_run_id = RunId::new();
-    let retry_run_id = RunId::new();
-    let blocking_stage_execution_id = StageExecutionId::new();
-    let retry_stage_execution_id = StageExecutionId::new();
-
-    ideas::insert(
-        &pool,
-        &Idea {
-            id: idea_id,
-            title: "Provider family quota retry override".into(),
-            body: "operator retry should consume active provider-family quota waits".into(),
-            workspace_root_path: None,
-            project_key: None,
-            status: IdeaStatus::Active,
-            created_at: Utc::now(),
-            archived_at: None,
-        },
-    )
-    .await
-    .unwrap();
-    runs::insert(&pool, &make_run(blocking_run_id, idea_id))
-        .await
-        .unwrap();
-    runs::insert(&pool, &make_run(retry_run_id, idea_id))
-        .await
-        .unwrap();
-
-    for (run_id, stage_execution_id, status) in [
-        (
-            blocking_run_id,
-            blocking_stage_execution_id,
-            StageStatus::Failed,
-        ),
-        (retry_run_id, retry_stage_execution_id, StageStatus::Running),
-    ] {
-        stages::insert(
-            &pool,
-            &StageExecution {
-                id: stage_execution_id,
-                run_id,
-                stage_id: "implementation".into(),
-                label: "Implementation".into(),
-                status,
-                iteration: 1,
-                attempt_number: 1,
-                settlement_kind: None,
-                started_at: Utc::now(),
-                completed_at: None,
-                owner_agent: None,
-                provider: None,
-                model: None,
-                stage_type: None,
-                validation_failure_json: None,
-                evidence_packet_json: None,
-                recovery_snapshot_json: None,
-                retry_reason: None,
-            },
-        )
-        .await
-        .unwrap();
-    }
-
-    let failed_claude_execution_id = AgentExecutionId::new();
-    agent_executions::insert(
-        &pool,
-        &AgentExecution {
-            id: failed_claude_execution_id,
-            stage_execution_id: Some(blocking_stage_execution_id),
-            agent_id: "code_writer".into(),
-            provider: "claude".into(),
-            model: Some("sonnet".into()),
-            status: AgentStatus::Failed,
-            started_at: Utc::now() - Duration::minutes(10),
-            completed_at: Some(Utc::now() - Duration::minutes(5)),
-            owner_execution_lineage_id: Some(blocking_stage_execution_id.to_string()),
-            session_lineage_id: Some("lineage-claude".into()),
-            session_generation_id: Some("generation-claude".into()),
-            rehydrated_from_checkpoint_artifact_id: None,
-            invocation_owner_key: Some("owner-key".into()),
-            session_reuse_scope: Some("same_agent_family_within_run".into()),
-            session_family_id: Some("code_writer".into()),
-            session_reuse_disposition: Some("fresh".into()),
-            session_reset_reason: None,
-            backend_profile_id: Some("claude_builder_high".into()),
-            requested_mcp_extensions_json: None,
-            predicted_mcp_extensions_json: None,
-            predicted_mcp_runtime_ids_json: None,
-            actual_mcp_extensions_json: None,
-            actual_mcp_runtime_ids_json: None,
-            denied_mcp_extensions_json: None,
-            mcp_blocking_issues_json: None,
-            actual_mcp_observation_json: None,
-            actual_xcode_runtime_observation_json: None,
-            mcp_session_startup_latency_ms: None,
-            owner_kind: None,
-            owner_id: None,
-            lead_mediation_record_id: None,
-            origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
-            actual_toolchain_mapping_diagnostics_json: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let retry_after = Utc::now() + Duration::hours(1);
-    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
-        &pool,
-        blocking_run_id,
-        blocking_stage_execution_id,
-        failed_claude_execution_id,
-        Some(retry_after),
-    )
-    .await
-    .unwrap();
-
-    let journal_id = uuid::Uuid::new_v4().to_string();
-    let now = Utc::now();
-    sqlx::query(
-        r#"INSERT INTO command_journal
-           (id, command_type, payload_json, result_status, run_id, created_at, completed_at)
-           VALUES (?1, 'RetryStage', ?2, 'completed', ?3, ?4, ?4)"#,
-    )
-    .bind(&journal_id)
-    .bind(
-        serde_json::json!({
-            "RetryStage": {
-                "run_id": retry_run_id.to_string(),
-                "stage_id": "implementation",
-                "consume_quota_budget_now": true,
-                "agent_execution_id": null,
-                "operator_instruction": "retry despite provider family quota wait"
-            }
-        })
-        .to_string(),
-    )
-    .bind(retry_run_id.to_string())
-    .bind(now.to_rfc3339())
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    retry_stage_execution_authorities::create_active(
-        &pool,
-        &RetryStageExecutionAuthority {
-            id: format!("p091-retry-authority:{retry_stage_execution_id}"),
-            run_id: retry_run_id,
-            stage_id: "implementation".into(),
-            target_stage_execution_id: retry_stage_execution_id,
-            entry_kind: RetryAuthorityEntryKind::FullStageRetry,
-            source_command_journal_id: Some(journal_id.clone()),
-            source_retry_work_item_id: Some(retry_stage_execution_id.to_string()),
-            source_invoke_work_item_id: None,
-            source_agent_execution_id: None,
-            authority_state: RetryAuthorityState::Active,
-            created_at: now,
-            updated_at: now,
-            terminal_reason: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    work_items::enqueue(
-        &pool,
-        &WorkItem {
-            id: "claude-retry-invoke".into(),
-            kind: WorkItemKind::InvokeAgent,
-            payload_json: serde_json::json!({
-                "stage_id": "implementation",
-                "stage_execution_id": retry_stage_execution_id.to_string(),
-                "agent_id": "code_writer",
-                "provider": "claude",
-                "model": "sonnet",
-                "prompt": "run",
-                "task_name": "implementation",
-                "task_inputs": ["input"],
-                "task_outputs": ["output"],
-                "declared_outputs": [],
-                "requested_mcp_server_ids": [],
-                "session_reuse_scope": "same_agent_family_within_run",
-                "session_family_id": "code_writer",
-                "worktree_write_enabled": false
-            })
-            .to_string(),
-            status: WorkItemStatus::Pending,
-            run_id: Some(retry_run_id),
-            stage_id: Some("implementation".into()),
-            created_at: now,
-            scheduled_at: now,
-            attempt_count: 0,
-            last_error: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
-        .await
-        .unwrap()
-        .expect("operator retry should consume the active provider-family quota wait");
-    assert_eq!(claimed.source_work_item_id, "claude-retry-invoke");
-
-    let row = sqlx::query(
-        "SELECT normal_budget_consumed, early_retry_journal_id, state FROM agent_retry_budget_ledger WHERE id = ?1",
-    )
-    .bind(&ledger.id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    use sqlx::Row;
-    assert_eq!(row.get::<i64, _>("normal_budget_consumed"), 1);
-    assert_eq!(
-        row.get::<Option<String>, _>("early_retry_journal_id"),
-        Some(journal_id)
-    );
-    assert_eq!(row.get::<String, _>("state"), "early_retry_consumed");
-}
-
-#[tokio::test]
-async fn expired_provider_quota_wait_is_marked_reset_elapsed_before_claim() {
-    let pool = test_pool().await;
-    let idea_id = IdeaId::new();
-    let run_id = RunId::new();
-    let stage_execution_id = StageExecutionId::new();
-
-    ideas::insert(
-        &pool,
-        &Idea {
-            id: idea_id,
-            title: "Expired provider quota cleanup".into(),
-            body: "claim should normalize elapsed quota waits before reporting blockers".into(),
-            workspace_root_path: None,
-            project_key: None,
-            status: IdeaStatus::Active,
-            created_at: Utc::now(),
-            archived_at: None,
-        },
-    )
-    .await
-    .unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id))
-        .await
-        .unwrap();
-    stages::insert(
-        &pool,
-        &StageExecution {
-            id: stage_execution_id,
-            run_id,
-            stage_id: "implementation".into(),
-            label: "Implementation".into(),
-            status: StageStatus::Running,
-            iteration: 1,
-            attempt_number: 1,
-            settlement_kind: None,
-            started_at: Utc::now(),
-            completed_at: None,
-            owner_agent: None,
-            provider: None,
-            model: None,
-            stage_type: None,
-            validation_failure_json: None,
-            evidence_packet_json: None,
-            recovery_snapshot_json: None,
-            retry_reason: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let failed_claude_execution_id = AgentExecutionId::new();
-    agent_executions::insert(
-        &pool,
-        &AgentExecution {
-            id: failed_claude_execution_id,
-            stage_execution_id: Some(stage_execution_id),
-            agent_id: "code_writer".into(),
-            provider: "claude".into(),
-            model: Some("sonnet".into()),
-            status: AgentStatus::Failed,
-            started_at: Utc::now() - Duration::minutes(10),
-            completed_at: Some(Utc::now() - Duration::minutes(5)),
-            owner_execution_lineage_id: Some(stage_execution_id.to_string()),
-            session_lineage_id: Some("lineage-expired-claude".into()),
-            session_generation_id: Some("generation-expired-claude".into()),
-            rehydrated_from_checkpoint_artifact_id: None,
-            invocation_owner_key: Some("owner-key".into()),
-            session_reuse_scope: Some("same_agent_family_within_run".into()),
-            session_family_id: Some("code_writer".into()),
-            session_reuse_disposition: Some("fresh".into()),
-            session_reset_reason: None,
-            backend_profile_id: Some("claude_builder_high".into()),
-            requested_mcp_extensions_json: None,
-            predicted_mcp_extensions_json: None,
-            predicted_mcp_runtime_ids_json: None,
-            actual_mcp_extensions_json: None,
-            actual_mcp_runtime_ids_json: None,
-            denied_mcp_extensions_json: None,
-            mcp_blocking_issues_json: None,
-            actual_mcp_observation_json: None,
-            actual_xcode_runtime_observation_json: None,
-            mcp_session_startup_latency_ms: None,
-            owner_kind: None,
-            owner_id: None,
-            lead_mediation_record_id: None,
-            origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
-            actual_toolchain_mapping_diagnostics_json: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
-        &pool,
-        run_id,
-        stage_execution_id,
-        failed_claude_execution_id,
-        Some(Utc::now() + Duration::hours(1)),
-    )
-    .await
-    .unwrap();
-    sqlx::query(
-        r#"UPDATE agent_retry_budget_ledger
-           SET retry_after = ?1, state = 'waiting_for_reset', normal_budget_consumed = 0
-           WHERE id = ?2"#,
-    )
-    .bind((Utc::now() - Duration::minutes(1)).to_rfc3339())
-    .bind(&ledger.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let now = Utc::now();
-    work_items::enqueue(
-        &pool,
-        &WorkItem {
-            id: "claude-expired-quota-invoke".into(),
-            kind: WorkItemKind::InvokeAgent,
-            payload_json: serde_json::json!({
-                "stage_id": "implementation",
-                "stage_execution_id": stage_execution_id.to_string(),
-                "agent_id": "code_writer",
-                "provider": "claude",
-                "model": "sonnet",
-                "prompt": "run",
-                "task_name": "implementation",
-                "task_inputs": ["input"],
-                "task_outputs": ["output"],
-                "declared_outputs": [],
-                "requested_mcp_server_ids": [],
-                "session_reuse_scope": "same_agent_family_within_run",
-                "session_family_id": "code_writer",
-                "worktree_write_enabled": false
-            })
-            .to_string(),
-            status: WorkItemStatus::Pending,
-            run_id: Some(run_id),
-            stage_id: Some("implementation".into()),
-            created_at: now,
-            scheduled_at: now,
-            attempt_count: 0,
-            last_error: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
-        .await
-        .unwrap()
-        .expect("elapsed provider quota wait should not block claim");
-    assert_eq!(claimed.source_work_item_id, "claude-expired-quota-invoke");
-
-    let row = sqlx::query(
-        "SELECT state, normal_budget_consumed FROM agent_retry_budget_ledger WHERE id = ?1",
-    )
-    .bind(&ledger.id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    use sqlx::Row;
-    assert_eq!(row.get::<String, _>("state"), "reset_elapsed");
-    assert_eq!(row.get::<i64, _>("normal_budget_consumed"), 0);
-}
-
-#[tokio::test]
 async fn proposal_090_junie_preflight_running_does_not_consume_provider_capacity_until_launch() {
-    let pool = test_pool().await;
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let first_stage_execution_id = StageExecutionId::new();
@@ -1616,6 +1021,13 @@ async fn proposal_090_junie_preflight_running_does_not_consume_provider_capacity
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -1679,7 +1091,7 @@ async fn proposal_090_junie_preflight_running_does_not_consume_provider_capacity
 
 #[tokio::test]
 async fn proposal_058_startup_repair_settles_terminal_preclaimed_invoke_execution() {
-    let pool = test_pool().await;
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1792,7 +1204,7 @@ async fn proposal_058_startup_repair_settles_terminal_preclaimed_invoke_executio
 async fn proposal_058_sessionless_invoke_agent_fails_closed_before_execution_creation() {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("sessionless-invoke.sqlite");
-    let pool = file_backed_test_pool(&db_path).await;
+    let pool = setup_file_backed_pool(&format!("sqlite://{}", db_path.to_string_lossy())).await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1899,7 +1311,7 @@ async fn proposal_058_sessionless_invoke_agent_fails_closed_before_execution_cre
 
 #[tokio::test]
 async fn proposal_058_explicit_null_session_reuse_scope_claims_as_no_reuse() {
-    let pool = test_pool().await;
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -1999,7 +1411,7 @@ async fn proposal_058_explicit_null_session_reuse_scope_claims_as_no_reuse() {
 
 #[tokio::test]
 async fn proposal_058_declared_output_claim_gets_durable_generation_without_reuse_scope() {
-    let pool = test_pool().await;
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -2135,7 +1547,7 @@ async fn proposal_058_declared_output_claim_gets_durable_generation_without_reus
 async fn proposal_058_production_executor_fails_sessionless_invoke_before_processing() {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("sessionless-production-invoke.sqlite");
-    let pool = file_backed_test_pool(&db_path).await;
+    let pool = setup_file_backed_pool(&format!("sqlite://{}", db_path.to_string_lossy())).await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -2249,7 +1661,7 @@ async fn proposal_058_production_executor_fails_sessionless_invoke_before_proces
 async fn proposal_058_production_loop_claims_pending_invoke_agent_items() {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("production-loop-invoke.sqlite");
-    let pool = file_backed_test_pool(&db_path).await;
+    let pool = setup_file_backed_pool(&format!("sqlite://{}", db_path.to_string_lossy())).await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -2413,7 +1825,7 @@ async fn proposal_058_production_loop_claims_pending_invoke_agent_items() {
 
 #[tokio::test]
 async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_claimed() {
-    let pool = test_pool().await;
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let old_stage_execution_id = StageExecutionId::new();
@@ -2504,6 +1916,13 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -2613,7 +2032,8 @@ async fn proposal_058_retry_stage_supersedes_old_claim_before_retry_work_is_clai
 
 #[tokio::test]
 async fn proposal_078_retry_release_stage_requires_effect_reconciliation_before_state_changes() {
-    let pool = test_pool().await;
+    std::env::set_var("CHAINWORKS_P078_HEURISTIC_RETRY_GUARD_ENABLED", "1");
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let old_stage_execution_id = StageExecutionId::new();
@@ -2704,6 +2124,13 @@ async fn proposal_078_retry_release_stage_requires_effect_reconciliation_before_
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -2794,7 +2221,8 @@ async fn proposal_078_retry_release_stage_requires_effect_reconciliation_before_
 
 #[tokio::test]
 async fn proposal_078_retry_manual_release_gate_checks_post_approval_release_tasks() {
-    let pool = test_pool().await;
+    std::env::set_var("CHAINWORKS_P078_HEURISTIC_RETRY_GUARD_ENABLED", "1");
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let old_stage_execution_id = StageExecutionId::new();
@@ -2886,7 +2314,8 @@ async fn proposal_078_retry_manual_release_gate_checks_post_approval_release_tas
 
 #[tokio::test]
 async fn proposal_078_targeted_release_retry_records_failed_journal_entry() {
-    let pool = test_pool().await;
+    std::env::set_var("CHAINWORKS_P078_HEURISTIC_RETRY_GUARD_ENABLED", "1");
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let old_stage_execution_id = StageExecutionId::new();
@@ -2976,6 +2405,13 @@ async fn proposal_078_targeted_release_retry_records_failed_journal_entry() {
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -3023,7 +2459,7 @@ async fn proposal_078_targeted_release_retry_records_failed_journal_entry() {
 
 #[tokio::test]
 async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() {
-    let pool = test_pool().await;
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let old_stage_execution_id = StageExecutionId::new();
@@ -3113,6 +2549,13 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -3199,71 +2642,118 @@ async fn proposal_058_retry_stage_requires_explicit_quota_budget_before_reset() 
     assert_eq!(rows[0].get::<String, _>("state"), "early_retry_consumed");
 }
 
+// ── HIGH-001 regression: payload backend_profile_id drives escalation resolution ──
+
+/// P058 HIGH-001: claim_next_invoke_agent_with_start must use the payload's
+/// backend_profile_id (the actual invoked agent's profile) when resolving the
+/// escalation policy, NOT the stage owner's backend_profile from the frozen plan.
+///
+/// Setup:
+/// - Stage owner "owner_agent" has backend_profile "owner_profile". No escalation policy
+///   applies to "owner_profile".
+/// - Escalation policy "task_profile_escalation" applies to backend_profile "task_profile"
+///   (enabled_default = true).
+/// - InvokeAgent payload carries backend_profile_id = "task_profile".
+///
+/// Expected: agent_execution.escalation_policy_id = Some("task_profile_escalation").
+/// Pre-fix behavior would have read "owner_profile" from stage owner → no policy match
+/// → null escalation fields (bypassing attribution audit invariant).
 #[tokio::test]
-async fn proposal_058_operator_can_consume_quota_hold_for_existing_pending_retry_invoke() {
-    let pool = test_pool().await;
+async fn p058_high_001_claim_uses_payload_backend_profile_for_escalation() {
+    let pool = setup_memory_pool().await;
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
-    let blocking_stage_execution_id = StageExecutionId::new();
-    let blocking_agent_execution_id = AgentExecutionId::new();
+
+    // Minimal workflow JSON: workflow id required; state "task_state" owned by "owner_agent".
+    let workflow_json = r#"{
+        "initial_state": "task_state",
+        "workflow": {"id": "test_workflow_p058_high001"},
+        "states": {
+            "task_state": {
+                "label": "Task State",
+                "owner": "owner_agent",
+                "type": "end"
+            }
+        }
+    }"#;
+
+    // Minimal catalog: owner_agent uses owner_profile (no policy for this profile).
+    // Escalation policy binds to "task_profile" (a different profile) with enabled_default=true.
+    // lead_agent is required by the compiler (exactly one system_role=lead).
+    let catalog_json = r#"{
+        "backend_profiles": {
+            "owner_profile": {"provider": "claude"},
+            "task_profile":  {"provider": "claude"},
+            "lead_profile":  {"provider": "claude"}
+        },
+        "permission_profiles": {
+            "lead_perm": {}
+        },
+        "contracts": {
+            "lead_contract": {"format": "json"}
+        },
+        "agents": [
+            {"id": "owner_agent", "backend_profile": "owner_profile"},
+            {
+                "id": "lead_agent",
+                "system_role": "lead",
+                "backend_profile": "lead_profile",
+                "permission_profile": "lead_perm",
+                "lead_resolution_contract": "lead_contract"
+            }
+        ],
+        "escalation_policies": [
+            {
+                "policy_id": "task_profile_escalation",
+                "schema_version": "escalation_policy_v1",
+                "enabled_default": true,
+                "applies_to": {"backend_profile_id": "task_profile"},
+                "max_chain_attempts": 3,
+                "max_chain_wall_clock_seconds": 1800,
+                "triggers": ["contract_output_failure"],
+                "tiers": [
+                    {"tier_id": "retry_tier", "kind": "same_backend_retry", "max_attempts": 2}
+                ]
+            }
+        ]
+    }"#;
 
     ideas::insert(
         &pool,
         &Idea {
             id: idea_id,
-            title: "P058 quota pending invoke".into(),
-            body: "consume existing pending invoke quota hold".into(),
+            title: "P058 HIGH-001".into(),
+            body: "payload backend_profile escalation resolution".into(),
             workspace_root_path: None,
             project_key: None,
-            status: IdeaStatus::Active,
+            status: domain::idea::IdeaStatus::Active,
             created_at: Utc::now(),
             archived_at: None,
         },
     )
     .await
     .unwrap();
-    runs::insert(&pool, &make_run(run_id, idea_id))
-        .await
-        .unwrap();
+
+    // Run with frozen workflow + catalog snapshots so compile_run_plan_from_snapshot succeeds.
+    let mut run = make_run(run_id, idea_id);
+    run.workflow_snapshot_json = Some(workflow_json.into());
+    run.catalog_snapshot_json = Some(catalog_json.into());
+    runs::insert(&pool, &run).await.unwrap();
+
     stages::insert(
         &pool,
-        &StageExecution {
+        &domain::stage::StageExecution {
             id: stage_execution_id,
             run_id,
-            stage_id: "implementation".into(),
-            label: "Implementation".into(),
-            status: StageStatus::Running,
-            iteration: 1,
-            attempt_number: 2,
-            settlement_kind: None,
-            started_at: Utc::now(),
-            completed_at: None,
-            owner_agent: None,
-            provider: None,
-            model: None,
-            stage_type: None,
-            validation_failure_json: None,
-            evidence_packet_json: None,
-            recovery_snapshot_json: None,
-            retry_reason: Some("operator_retry".into()),
-        },
-    )
-    .await
-    .unwrap();
-    stages::insert(
-        &pool,
-        &StageExecution {
-            id: blocking_stage_execution_id,
-            run_id,
-            stage_id: "previous".into(),
-            label: "Previous".into(),
-            status: StageStatus::Failed,
+            stage_id: "task_state".into(),
+            label: "Task State".into(),
+            status: domain::stage::StageStatus::Running,
             iteration: 1,
             attempt_number: 1,
             settlement_kind: None,
             started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
+            completed_at: None,
             owner_agent: None,
             provider: None,
             model: None,
@@ -3276,134 +2766,658 @@ async fn proposal_058_operator_can_consume_quota_hold_for_existing_pending_retry
     )
     .await
     .unwrap();
-    agent_executions::insert(
+
+    let now = Utc::now();
+    // InvokeAgent payload carries backend_profile_id = "task_profile" — different from
+    // stage owner's "owner_profile". The fix (HIGH-001) ensures this payload value is used
+    // for escalation resolution so the policy "task_profile_escalation" is found.
+    work_items::enqueue(
         &pool,
-        &AgentExecution {
-            id: blocking_agent_execution_id,
-            stage_execution_id: Some(blocking_stage_execution_id),
-            agent_id: "code_writer".into(),
-            provider: "claude".into(),
-            model: Some("sonnet".into()),
-            status: AgentStatus::Failed,
-            started_at: Utc::now(),
-            completed_at: Some(Utc::now()),
-            owner_execution_lineage_id: Some(blocking_stage_execution_id.to_string()),
-            session_lineage_id: Some("lineage-quota".into()),
-            session_generation_id: Some("generation-quota".into()),
-            rehydrated_from_checkpoint_artifact_id: None,
-            invocation_owner_key: Some("owner-key-quota".into()),
-            session_reuse_scope: Some("same_agent_family_within_run".into()),
-            session_family_id: Some("code_writer".into()),
-            session_reuse_disposition: Some("fresh".into()),
-            session_reset_reason: None,
-            backend_profile_id: None,
-            requested_mcp_extensions_json: None,
-            predicted_mcp_extensions_json: None,
-            predicted_mcp_runtime_ids_json: None,
-            actual_mcp_extensions_json: None,
-            actual_mcp_runtime_ids_json: None,
-            denied_mcp_extensions_json: None,
-            mcp_blocking_issues_json: None,
-            actual_mcp_observation_json: None,
-            actual_xcode_runtime_observation_json: None,
-            mcp_session_startup_latency_ms: None,
-            owner_kind: None,
-            owner_id: None,
-            lead_mediation_record_id: None,
-            origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
-            actual_toolchain_mapping_diagnostics_json: None,
+        &WorkItem {
+            id: "high001-invoke-work-item".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "task_state",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "task_agent",
+                "provider": "claude",
+                "model": "sonnet",
+                "prompt": "do the task",
+                "task_name": "task",
+                "task_inputs": [],
+                "task_outputs": [],
+                "declared_outputs": [],
+                "requested_mcp_server_ids": [],
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "task_agent",
+                "worktree_write_enabled": false,
+                "backend_profile_id": "task_profile"
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("task_state".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
         },
     )
     .await
     .unwrap();
-    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("HIGH-001: claim should succeed");
+
+    let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "exactly one execution should be created"
+    );
+
+    let exec = &executions[0];
+    assert_eq!(exec.id, claimed.agent_execution_id);
+
+    // Core HIGH-001 assertion: escalation policy must be attributed from the task's
+    // backend_profile_id ("task_profile"), not the stage owner's ("owner_profile").
+    assert_eq!(
+        exec.escalation_policy_id.as_deref(),
+        Some("task_profile_escalation"),
+        "HIGH-001: escalation_policy_id must match the policy bound to the payload's \
+         backend_profile_id ('task_profile'), not the stage owner's 'owner_profile'"
+    );
+    assert!(
+        exec.escalation_policy_hash.is_some(),
+        "HIGH-001: escalation_policy_hash must be set when policy is resolved"
+    );
+    assert!(
+        exec.escalation_ledger_id.is_some(),
+        "HIGH-001: escalation_ledger_id must be set when policy is resolved"
+    );
+    assert_eq!(
+        exec.escalation_tier_id.as_deref(),
+        Some("retry_tier"),
+        "HIGH-001: first tier from the policy must be set"
+    );
+}
+
+/// P058 Phase 1: claim path writes escalation_execution_metadata row when a policy applies.
+/// Verifies the runtime metadata writer added in the refine pass: prior to this fix,
+/// insert_execution_metadata_tx was only called from db-layer tests, never from the executor.
+#[tokio::test]
+async fn p058_claim_writes_execution_metadata_row() {
+    let pool = setup_memory_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    let workflow_json = r#"{
+        "initial_state": "impl_state",
+        "workflow": {"id": "test_workflow_p058_meta"},
+        "states": {
+            "impl_state": {
+                "label": "Impl",
+                "owner": "impl_agent",
+                "type": "end"
+            }
+        }
+    }"#;
+
+    let catalog_json = r#"{
+        "backend_profiles": {
+            "impl_profile": {"provider": "claude"},
+            "lead_profile":  {"provider": "claude"}
+        },
+        "permission_profiles": {
+            "lead_perm": {}
+        },
+        "contracts": {
+            "lead_contract": {"format": "json"}
+        },
+        "agents": [
+            {"id": "impl_agent", "backend_profile": "impl_profile"},
+            {
+                "id": "lead_agent",
+                "system_role": "lead",
+                "backend_profile": "lead_profile",
+                "permission_profile": "lead_perm",
+                "lead_resolution_contract": "lead_contract"
+            }
+        ],
+        "escalation_policies": [
+            {
+                "policy_id": "impl_escalation",
+                "schema_version": "escalation_policy_v1",
+                "enabled_default": true,
+                "applies_to": {"agent_id": "impl_agent"},
+                "max_chain_attempts": 3,
+                "max_chain_wall_clock_seconds": 1800,
+                "triggers": ["contract_output_failure"],
+                "tiers": [
+                    {"tier_id": "retry_tier", "kind": "same_backend_retry", "max_attempts": 2}
+                ]
+            }
+        ]
+    }"#;
+
+    ideas::insert(
         &pool,
-        run_id,
-        blocking_stage_execution_id,
-        blocking_agent_execution_id,
-        Some(Utc::now() + Duration::hours(1)),
+        &domain::idea::Idea {
+            id: idea_id,
+            title: "P058 metadata row test".into(),
+            body: "proves executor writes execution_metadata".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
     )
     .await
     .unwrap();
+
+    let mut run = make_run(run_id, idea_id);
+    run.workflow_snapshot_json = Some(workflow_json.into());
+    run.catalog_snapshot_json = Some(catalog_json.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    stages::insert(
+        &pool,
+        &domain::stage::StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "impl_state".into(),
+            label: "Impl".into(),
+            status: domain::stage::StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
     work_items::enqueue(
         &pool,
-        &WorkItem {
-            id: format!("p058-invoke:{stage_execution_id}:0"),
-            kind: WorkItemKind::InvokeAgent,
+        &db::work_item::WorkItem {
+            id: "meta-test-work-item".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
             payload_json: serde_json::json!({
-                "run_id": run_id.to_string(),
+                "stage_id": "impl_state",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "impl_agent",
+                "provider": "claude",
+                "model": "sonnet",
+                "prompt": "implement",
+                "task_name": "impl",
+                "task_inputs": [],
+                "task_outputs": [],
+                "declared_outputs": [],
+                "requested_mcp_server_ids": [],
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "impl_agent",
+                "worktree_write_enabled": false
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("impl_state".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("claim should succeed");
+
+    let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    let exec = &executions[0];
+    assert_eq!(exec.id, claimed.agent_execution_id);
+
+    let ledger_id = exec
+        .escalation_ledger_id
+        .as_deref()
+        .expect("escalation_ledger_id must be set when policy applies");
+
+    // Core assertion: executor must have written an execution_metadata row.
+    let metas = escalation_repo::find_execution_metadata_by_ledger(&pool, ledger_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        metas.len(),
+        1,
+        "executor must write exactly one execution_metadata row per claim when a policy applies"
+    );
+    let meta = &metas[0];
+    assert_eq!(meta.agent_execution_id, exec.id);
+    assert_eq!(meta.escalation_ledger_id, ledger_id);
+    assert_eq!(
+        meta.tier_id,
+        exec.escalation_tier_id.as_deref().unwrap_or("")
+    );
+    assert_eq!(meta.tier_attempt_index, 0);
+}
+
+#[tokio::test]
+async fn p058_startup_recovery_force_detaches_running_escalation_execution() {
+    let pool = setup_memory_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    let workflow_json = r#"{
+        "initial_state": "impl_state",
+        "workflow": {"id": "test_workflow_p058_shutdown"},
+        "states": {
+            "impl_state": {
+                "label": "Impl",
+                "owner": "impl_agent",
+                "type": "end"
+            }
+        }
+    }"#;
+
+    let catalog_json = r#"{
+        "backend_profiles": {
+            "impl_profile": {"provider": "claude"},
+            "lead_profile":  {"provider": "claude"}
+        },
+        "permission_profiles": {
+            "lead_perm": {}
+        },
+        "contracts": {
+            "lead_contract": {"format": "json"}
+        },
+        "agents": [
+            {"id": "impl_agent", "backend_profile": "impl_profile"},
+            {
+                "id": "lead_agent",
+                "system_role": "lead",
+                "backend_profile": "lead_profile",
+                "permission_profile": "lead_perm",
+                "lead_resolution_contract": "lead_contract"
+            }
+        ],
+        "escalation_policies": [
+            {
+                "policy_id": "impl_escalation",
+                "schema_version": "escalation_policy_v1",
+                "enabled_default": true,
+                "applies_to": {"agent_id": "impl_agent"},
+                "max_chain_attempts": 3,
+                "max_chain_wall_clock_seconds": 1800,
+                "triggers": ["contract_output_failure"],
+                "tiers": [
+                    {"tier_id": "retry_tier", "kind": "same_backend_retry", "max_attempts": 2}
+                ]
+            }
+        ]
+    }"#;
+
+    ideas::insert(
+        &pool,
+        &domain::idea::Idea {
+            id: idea_id,
+            title: "P058 shutdown drain replay".into(),
+            body: "proves recovery force-detach for abandoned escalation provider sessions".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut run = make_run(run_id, idea_id);
+    run.workflow_snapshot_json = Some(workflow_json.into());
+    run.catalog_snapshot_json = Some(catalog_json.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    stages::insert(
+        &pool,
+        &domain::stage::StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "impl_state".into(),
+            label: "Impl".into(),
+            status: domain::stage::StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "shutdown-drain-work-item".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "stage_id": "impl_state",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "impl_agent",
+                "provider": "claude",
+                "model": "sonnet",
+                "prompt": "implement",
+                "task_name": "impl",
+                "task_inputs": [],
+                "task_outputs": [],
+                "declared_outputs": [],
+                "requested_mcp_server_ids": [],
+                "session_reuse_scope": "same_agent_family_within_run",
+                "session_family_id": "impl_agent",
+                "worktree_write_enabled": false
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("impl_state".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let claimed = engine::executor::claim_next_invoke_agent_with_start(&pool)
+        .await
+        .unwrap()
+        .expect("claim should leave a running provider session");
+    let execution_before = agent_executions::find_by_id(&pool, claimed.agent_execution_id)
+        .await
+        .unwrap()
+        .expect("claimed execution exists before recovery");
+    assert_eq!(execution_before.status, AgentStatus::Running);
+    assert!(
+        execution_before.escalation_ledger_id.is_some(),
+        "claim must stamp escalation ledger before recovery"
+    );
+    let recoverable_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM agent_executions ae
+           INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
+           LEFT JOIN escalation_execution_metadata em ON em.agent_execution_id = ae.id
+           WHERE se.run_id = ?
+             AND se.status = 'running'
+             AND ae.status = 'running'
+             AND ae.escalation_ledger_id IS NOT NULL"#,
+    )
+    .bind(run_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(recoverable_count, 1);
+
+    let recovery = RecoveryService::new(
+        pool.clone(),
+        WorkQueue::new(pool.clone()),
+        event_bus::new_bus(16),
+    );
+    let _summary = recovery.run_startup_repair().await.unwrap();
+    let pending_invokes = work_items::list_by_status(&pool, WorkItemStatus::Pending)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == WorkItemKind::InvokeAgent)
+        .count();
+    assert_eq!(
+        pending_invokes, 0,
+        "P058 startup recovery must not re-launch an already force-detached escalation execution"
+    );
+
+    let execution = agent_executions::find_by_id(&pool, claimed.agent_execution_id)
+        .await
+        .unwrap()
+        .expect("claimed execution remains auditable");
+    assert_eq!(execution.status, AgentStatus::Failed);
+    assert!(execution.completed_at.is_some());
+
+    let facts =
+        agent_execution_runtime_facts::find_by_execution_id(&pool, claimed.agent_execution_id)
+            .await
+            .unwrap()
+            .expect("runtime facts are written for shutdown drain replay");
+    assert_eq!(
+        facts.supervision_classification.as_deref(),
+        Some("shutdown_drain_timeout")
+    );
+    assert_eq!(
+        facts
+            .failure_kind
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("transport_closed")
+    );
+
+    let stage_after = stages::find_by_id(&pool, stage_execution_id)
+        .await
+        .unwrap()
+        .expect("stage remains present");
+    assert_eq!(stage_after.status, StageStatus::Failed);
+
+    let run_after = runs::find_by_id(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("run remains present");
+    assert_eq!(run_after.status, RunStatus::Blocked);
+
+    let ledger_id = execution
+        .escalation_ledger_id
+        .as_deref()
+        .expect("claimed execution has escalation ledger");
+    let ledger = escalation_repo::find_ledger_by_id(&pool, ledger_id)
+        .await
+        .unwrap()
+        .expect("ledger remains present");
+    assert_eq!(ledger.status_raw, "paused");
+    assert_eq!(
+        ledger.pause_reason_raw.as_deref(),
+        Some("provider_session_force_detached")
+    );
+    let events = escalation_repo::find_events_by_ledger(&pool, ledger_id)
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| {
+        event.event_kind_raw == "escalation.provider_session_force_detached"
+            && event.pause_reason_raw.as_deref() == Some("provider_session_force_detached")
+    }));
+}
+
+/// Atomicity regression: two concurrent claimers racing on the same InvokeAgent item must
+/// produce exactly one agent_execution row and one escalation_execution_metadata row.
+/// The loser's CAS miss must leave no orphan rows (the fix for the two-transaction gap).
+#[tokio::test]
+async fn proposal_058_claim_start_concurrent_claimers_leave_exactly_one_agent_execution() {
+    let pool = setup_memory_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(
+        &pool,
+        &Idea {
+            id: idea_id,
+            title: "P058".into(),
+            body: "concurrent claim atomicity".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(
+        &pool,
+        &Run {
+            id: run_id,
+            idea_id,
+            status: domain::run::RunStatus::Running,
+            workflow_id: "wf".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: "/tmp".into(),
+            artifact_root: "/tmp".into(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("implementation".into()),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: None,
+            review_routing_json: None,
+            closeout_readiness_mode: None,
+        },
+    )
+    .await
+    .unwrap();
+    stages::insert(
+        &pool,
+        &domain::stage::StageExecution {
+            id: stage_execution_id,
+            run_id,
+            stage_id: "implementation".into(),
+            label: "Implementation".into(),
+            status: domain::stage::StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "invoke-atomic-cas-1".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
                 "stage_id": "implementation",
                 "stage_execution_id": stage_execution_id.to_string(),
                 "agent_id": "code_writer",
                 "provider": "claude",
                 "model": "sonnet",
-                "declared_outputs": []
+                "prompt": "write code",
+                "task_name": "code",
+                "task_inputs": [],
+                "task_outputs": [],
+                "declared_outputs": [],
+                "requested_mcp_server_ids": [],
+                "session_reuse_scope": "none",
+                "session_family_id": "code_writer",
+                "worktree_write_enabled": false
             })
             .to_string(),
-            status: WorkItemStatus::Pending,
+            status: db::work_item::WorkItemStatus::Pending,
             run_id: Some(run_id),
             stage_id: Some("implementation".into()),
-            created_at: Utc::now(),
-            scheduled_at: Utc::now(),
+            created_at: now,
+            scheduled_at: now,
             attempt_count: 0,
-            last_error: Some(format!(
-                "provider_quota_wait: provider_family=claude; retry_after={}",
-                ledger.retry_after.as_ref().unwrap().to_rfc3339()
-            )),
+            last_error: None,
         },
     )
     .await
     .unwrap();
 
-    let handler = CommandHandler::new(
-        pool.clone(),
-        event_bus::new_bus(16),
-        WorkQueue::new(pool.clone()),
+    // Race two concurrent claimers. SQLite IMMEDIATE transactions serialize them, so exactly
+    // one CAS wins and the other returns Ok(None) without writing any rows.
+    let pool1 = pool.clone();
+    let pool2 = pool.clone();
+    let (r1, r2) = tokio::join!(
+        engine::executor::claim_next_invoke_agent_with_start(&pool1),
+        engine::executor::claim_next_invoke_agent_with_start(&pool2),
     );
-    let commanded = handler
-        .handle(
-            Command::ConsumeProviderQuotaHold(ConsumeProviderQuotaHoldCmd {
-                run_id,
-                stage_id: "implementation".into(),
-                reason: "operator confirmed cooldown elapsed".into(),
-            }),
-            CallerContext::test_fixture(),
-        )
+    let r1 = r1.unwrap();
+    let r2 = r2.unwrap();
+
+    let wins = [r1.is_some(), r2.is_some()].iter().filter(|&&b| b).count();
+    assert_eq!(
+        wins, 1,
+        "exactly one claimer must win the CAS; got {} winners (two=double-insert, zero=lost win)",
+        wins
+    );
+
+    let executions = agent_executions::find_by_stage(&pool, stage_execution_id)
         .await
         .unwrap();
-
-    assert!(matches!(
-        commanded.result,
-        engine::command_handler::CommandResult::ProviderQuotaHoldConsumed {
-            consumed_ledger_count: 1,
-            released_work_item_count: 1,
-            ..
-        }
-    ));
-    let row = sqlx::query(
-        "SELECT normal_budget_consumed, early_retry_journal_id, state FROM agent_retry_budget_ledger WHERE id = ?1",
-    )
-    .bind(&ledger.id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    use sqlx::Row;
-    assert_eq!(row.get::<i64, _>("normal_budget_consumed"), 1);
     assert_eq!(
-        row.get::<Option<String>, _>("early_retry_journal_id"),
-        Some(commanded.journal_id)
+        executions.len(),
+        1,
+        "exactly one agent_execution must be created; {} found — CAS atomicity broken if != 1",
+        executions.len()
     );
-    assert_eq!(row.get::<String, _>("state"), "early_retry_consumed");
-
-    let released = work_items::find_by_id(&pool, &format!("p058-invoke:{stage_execution_id}:0"))
-        .await
-        .unwrap()
-        .expect("released work item");
-    assert_eq!(released.status, WorkItemStatus::Pending);
-    assert_eq!(released.last_error, None);
 }

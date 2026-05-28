@@ -1148,15 +1148,21 @@ mod tests {
 
     #[tokio::test]
     async fn proposal_078_prepare_effect_blocked_when_flag_off() {
+        // The enabled flag was removed — the feature is always-on. This test now
+        // verifies that duplicate idempotency_key use is blocked (the primary guard),
+        // which is the structural invariant that the flag formerly protected.
         let pool = test_pool().await;
-        let coord = DurableEffectCoordinator::new_with_disabled(pool, "instance-1".into());
+        let coord = DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into());
+        let run_id = RunId::new();
+        let stage_id = StageExecutionId::new();
+        let key = "p078:v1:dup-test".to_string();
         let intent = PrepareEffectIntent {
-            run_id: RunId::new(),
-            stage_execution_id: StageExecutionId::new(),
+            run_id,
+            stage_execution_id: stage_id,
             agent_execution_id: None,
             effect_kind: EffectKind::GitPush,
             target_key: "refs/heads/main".into(),
-            idempotency_key: "p078:v1:test".into(),
+            idempotency_key: key.clone(),
             idempotency_key_version: 1,
             request_fingerprint: "fp-abc".into(),
             request_fingerprint_version: 1,
@@ -1164,8 +1170,13 @@ mod tests {
             evidence_root: None,
             deadline_at: None,
         };
+        coord.prepare_effect(intent.clone()).await.unwrap();
+        // Second call with the same key must be rejected.
         let result = coord.prepare_effect(intent).await;
-        assert!(result.is_err(), "should fail when feature flag is off");
+        assert!(
+            result.is_err(),
+            "should fail when idempotency_key is already active"
+        );
     }
 
     #[tokio::test]

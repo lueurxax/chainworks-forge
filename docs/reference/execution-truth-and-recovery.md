@@ -2,6 +2,8 @@
 
 Stable reference for the execution-truth, settlement, and recovery contract.
 
+P058 layers a chain-level escalation contract on top of agent-level execution truth: tier advancement, trigger classification, ledger persistence, and recovery semantics are owned by the Rust control plane. See [escalation-policies.md](escalation-policies.md) for policy schema, pause-reason catalog, and rollout phasing. The escalation-specific invariants relevant to recovery readers are pinned in *Escalation chain invariants* below.
+
 ## Purpose
 
 The runtime must be able to say, once and only once, what actually happened in an agent attempt after output, timeout, cancellation, limit exhaustion, relaunch, and recovery.
@@ -111,6 +113,15 @@ Readers must therefore interpret agent-level execution truth in this order:
 3. `transportErrorKind` and `providerStopReason` for transport/provider context,
 4. evidence payloads only as supporting detail.
 
+### Escalation chain invariants
+
+Two escalation invariants directly affect recovery readers:
+
+- **Overlap-free tier**: `escalation.tier_advanced` is emitted only after the previous tier reaches a settled terminal outcome, and no ledger holds more than one active tier. Force-detach windows therefore cannot double-charge provider quota.
+- **Single scheduler transaction**: settlement, trigger selection, digest calculation, frozen policy lookup, readiness/capacity validation, and all `escalation_ledger` / `escalation_events` / `escalation_execution_metadata` updates commit in one SQLite transaction. Provider launch occurs only after commit.
+
+Full policy schema, pause-reason catalog, and Phase 2+ recovery contracts (force-detach replay, shutdown drain, SQLITE_BUSY retry budget) live in [escalation-policies.md](escalation-policies.md).
+
 ### Rust ACP runtime facts are durable execution truth
 
 The Rust control plane persists provider-independent runtime facts for every ACP-backed
@@ -129,7 +140,7 @@ uses a general owner model (ARCH-037).
 This allows mediation-owned executions to reuse the same retry, quota, 
 artifact, and cost infrastructure as stage-owned executions.
 
-`agent_execution_runtime_facts` is the durable execution-facts row keyed by 
+`agent_execution_runtime_facts` is the durable execution-facts row keyed by
 `agent_execution_id`. It records:
 
 - `failure_kind` as a stable `AgentFailureKind`,
@@ -144,8 +155,9 @@ artifact, and cost infrastructure as stage-owned executions.
 - `quota_ledger_id`,
 - creation and update timestamps.
 
-`agent_execution_discovery_diagnostics` is a related durable table that owns detailed discovery pipeline execution decisions (exact paths, provider envelopes, meta-root bounding). `agent_execution_runtime_facts` projects those decisions into scalar `output_settlement` truth but does not store the full payload.
+`escalation_ledger`, `escalation_execution_metadata`, and `escalation_events` are the durable chain-level companions to `agent_execution_runtime_facts`: tier advancements, chain exhaustion, and pause reasons are recorded there. Schema details live in [escalation-policies.md](escalation-policies.md).
 
+`agent_execution_discovery_diagnostics` is a related durable table that owns detailed discovery pipeline execution decisions (exact paths, provider envelopes, meta-root bounding). `agent_execution_runtime_facts` projects those decisions into scalar `output_settlement` truth but does not store the full payload.
 Current `AgentFailureKind` values include:
 
 - `provider_quota`

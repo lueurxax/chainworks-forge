@@ -38,20 +38,19 @@ These are not active workstreams:
 - **P046** session observability via GraphQL.
   - Stable truth lives in [rust-control-plane.md](reference/rust-control-plane.md#graphql) and [test-gates.md](reference/test-gates.md#session-observability-graphql).
   - The GraphQL schema includes the P046 read/subscription surface by default; disabled-schema mode is retained only for rollback and compatibility proof.
-- **Local persistence write-budget / evidence-spooling infrastructure**.
-  - Implemented baseline in [rust-control-plane.md](reference/rust-control-plane.md).
-  - SQLite remains compact canonical state; high-volume evidence is file-spooled.
-- **Storage tiering / read-path liveness**.
-  - Retained alias: **P087**.
+- **P087** local storage tiering, read-path liveness, and SQLite exit criteria.
   - Operational truth lives in [query-projections-and-client-consumption-contract.md](reference/query-projections-and-client-consumption-contract.md) and [rust-control-plane.md](reference/rust-control-plane.md).
-  - No active P087 proposal file is expected.
+  - SQLite remains compact canonical state; high-volume evidence is file-spooled.
 - **Durable side-effect ledger / P078**.
   - Treated as implemented baseline in [rust-control-plane.md](reference/rust-control-plane.md).
-  - Remaining issues should flow through recovery/test/ownership follow-ups, not "implement P078".
-- **Retry authority payload target invariants and recovery**.
-  - Retained historical alias: **P092**.
+  - Release settlement, retry blocking, and reconciliation remain outside normal retry/continuation.
+- **P058** configurable agent escalation chains, Phase 0-1.
+  - Implemented baseline: `escalation_policy_v1` schema, durable ledger/metadata/events tables, GraphQL `runEscalationReadback`, MCP `runs.get` parity, redaction tiers, and safe kill-switch defaults.
+  - Operational truth lives in [escalation-policies.md](reference/escalation-policies.md).
+  - Phase 2+ scheduler behavior remains scoped to contract-output repair/fallback and must not include release agents or bypass durable side-effect safety.
+- **P092** retry authority payload target invariants and recovery.
   - Operational truth lives in [rust-control-plane.md](reference/rust-control-plane.md#retry-payload-target-invariants-and-recovery) and [test-gates.md](reference/test-gates.md#proposal-092p092-retained-historical-alias).
-- **macOS operator navigation / P036** and **thin-client affordance contract / P085**.
+- **P036/P085** macOS operator navigation and thin-client affordance baseline.
   - Treat as implemented UI/read-model baseline unless a new delta proposal explicitly says otherwise.
 
 ## Now
@@ -104,7 +103,7 @@ After the current recovery/output/ownership block stabilizes:
 ## Backlog
 
 - Future limit observatory / runtime budget dashboard - number TBD.
-  - Do not use P086, P087, P088, P089, P092, or P093.
+  - Do not reuse existing proposal numbers.
 - Future limit-aware session pool / runtime fallback policy - number TBD.
 - Additional ACP runtime/provider expansion only after the stabilization window.
 - Additional UI polish only after P032/P036/P093 remain stable under dogfood.

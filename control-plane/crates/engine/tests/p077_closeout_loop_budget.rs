@@ -86,6 +86,7 @@ fn test_plan(loop_max: Option<u64>) -> RunPlan {
         dynamic_candidate_bindings: Vec::new(),
         run_plan_snapshot_format_version: None,
         closeout_readiness_mode: None,
+        escalation_policies: Vec::new(),
     }
 }
 

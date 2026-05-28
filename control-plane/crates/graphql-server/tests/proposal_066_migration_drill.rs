@@ -116,6 +116,13 @@ fn make_execution(stage_id: StageExecutionId) -> AgentExecution {
         // insert() does not include this column; call update_toolchain_mapping_diagnostics
         // separately to simulate the post-migration write path.
         actual_toolchain_mapping_diagnostics_json: None,
+        escalation_policy_id: None,
+        escalation_policy_hash: None,
+        escalation_tier_id: None,
+        escalation_tier_kind_raw: None,
+        escalation_trigger_raw: None,
+        escalation_digest_version: None,
+        escalation_ledger_id: None,
     }
 }
 

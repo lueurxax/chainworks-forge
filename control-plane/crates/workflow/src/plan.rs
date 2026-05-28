@@ -90,6 +90,56 @@ pub struct RunPlan {
     /// Accepted values: "advisory" | "enforcement". Absent means advisory (legacy fallback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closeout_readiness_mode: Option<String>,
+    /// P058: Frozen escalation policies compiled from the agent catalog at run start.
+    /// Absent for pre-P058 runs and catalogs without escalation_policies declarations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escalation_policies: Vec<EscalationPolicySnapshot>,
+}
+
+// ── P058: Escalation policy snapshot types ────────────────────────────────────
+
+/// A single tier as frozen into a RunPlan escalation policy snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EscalationTierSnapshot {
+    pub tier_id: String,
+    /// Raw tier kind string: same_backend_retry | backend_profile | lead_mediation | pause
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+}
+
+/// A frozen escalation policy as stored in a RunPlan snapshot.
+///
+/// Captured at run compile time from the agent catalog's `escalation_policies:` section.
+/// `policy_hash` is the SHA-256 of the canonical JSON of the source `EscalationPolicyYaml`,
+/// enabling drift detection on resume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationPolicySnapshot {
+    pub policy_id: String,
+    pub schema_version: String,
+    pub enabled_default: bool,
+    pub applies_to_agent_id: Option<String>,
+    pub applies_to_backend_profile_id: Option<String>,
+    pub applies_to_stage_id: Option<String>,
+    pub max_chain_attempts: u32,
+    pub max_chain_wall_clock_seconds: u64,
+    /// Raw trigger strings — forward-compatible with future values.
+    pub triggers: Vec<String>,
+    pub tiers: Vec<EscalationTierSnapshot>,
+    /// SHA-256 of the canonical JSON of the source policy at compile time.
+    pub policy_hash: String,
+    /// Blocker digest algorithm version frozen at compile time (e.g. "escalation_blocker_digest_v1").
+    /// Frozen here so digest computation uses the same algorithm version as when the run was planned,
+    /// even if future versions ship after the run starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest_version: Option<String>,
+    /// Frozen rollout override state at compile time. None means policy is governed by
+    /// `enabled_default` only (Phase 0-1). Phase 2+ runtime_policy_overrides populate this field
+    /// when the kill-switch or in_flight_toggle_behavior is set at plan compile time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_override_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

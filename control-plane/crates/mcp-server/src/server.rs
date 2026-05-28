@@ -1177,6 +1177,13 @@ impl McpServer {
                         );
                     }
                 };
+                if matches!(
+                    principal.class,
+                    auth::PrincipalClass::Agent | auth::PrincipalClass::Observer
+                ) && (uri.starts_with("artifact://") || uri.starts_with("report://"))
+                {
+                    return JsonRpcResponse::error(id, -32002, "Resource not found".to_string());
+                }
                 if auth::match_resource_uri(principal, &uri, resource_template_id_for_uri).is_none()
                 {
                     return JsonRpcResponse::error(id, -32002, "Resource not found".to_string());
@@ -1404,8 +1411,18 @@ impl McpServer {
         }
 
         if uri == "chainworks://runs" {
+            let is_operator = principal.class == auth::PrincipalClass::Operator;
             let rows = projections::list_active_projection(&self.pool).await?;
-            return Ok(serde_json::to_value(rows)?);
+            // SEC-003: Redact local filesystem path fields for non-Operator principals.
+            let values = rows
+                .into_iter()
+                .map(|row| {
+                    let mut v = serde_json::to_value(row)?;
+                    tools::runs::redact_run_projection_paths(&mut v, is_operator);
+                    Ok(v)
+                })
+                .collect::<std::result::Result<Vec<serde_json::Value>, serde_json::Error>>()?;
+            return Ok(serde_json::Value::Array(values));
         }
 
         if uri == "chainworks://ideas" {
@@ -1458,7 +1475,7 @@ impl McpServer {
     async fn read_canonical_run_resource(
         &self,
         run_id: &str,
-        _principal: &auth::Principal,
+        principal: &auth::Principal,
     ) -> anyhow::Result<serde_json::Value> {
         let run_id_parsed: domain::ids::RunId = run_id
             .parse::<uuid::Uuid>()
@@ -1467,20 +1484,35 @@ impl McpServer {
         let run = runs::find_by_id(&self.pool, run_id_parsed)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Run not found: {run_id}"))?;
+        let is_operator = matches!(principal.class, auth::PrincipalClass::Operator);
         let mut value = serde_json::to_value(run)?;
+        // SEC HIGH-001: strip operator-only snapshot fields before any caller-visible return.
+        tools::runs::redact_run_snapshot_fields(&mut value, is_operator);
         if let Some(obj) = value.as_object_mut() {
-            if let Some(projection) =
-                db::repos::artifact_contracts::find_run_state_projection(&self.pool, run_id_parsed)
-                    .await?
-            {
-                obj.insert("active_artifact_index".into(), projection.active_index_json);
-                obj.insert("run_state_projection".into(), projection.run_state_json);
-                obj.insert(
-                    "operator_overrides".into(),
-                    serde_json::to_value(
-                        db::repos::artifact_contracts::list_overrides(&self.pool, run_id_parsed)
+            // HIGH-002: projection, overrides, and rollout readback are Operator-only.
+            if is_operator {
+                if let Some(projection) = db::repos::artifact_contracts::find_run_state_projection(
+                    &self.pool,
+                    run_id_parsed,
+                )
+                .await?
+                {
+                    obj.insert("active_artifact_index".into(), projection.active_index_json);
+                    obj.insert("run_state_projection".into(), projection.run_state_json);
+                    obj.insert(
+                        "operator_overrides".into(),
+                        serde_json::to_value(
+                            db::repos::artifact_contracts::list_overrides(
+                                &self.pool,
+                                run_id_parsed,
+                            )
                             .await?,
-                    )?,
+                        )?,
+                    );
+                }
+                obj.insert(
+                    "rollout_contract_readback".into(),
+                    rollout_contract_readback_json(&self.pool, run_id_parsed).await?,
                 );
             }
             if let Some(row) = projections::find_run_projection(&self.pool, run_id).await? {
@@ -1503,21 +1535,56 @@ impl McpServer {
                 )
                 .await?,
             );
-            obj.insert(
-                "rollout_contract_readback".into(),
-                rollout_contract_readback_json(&self.pool, run_id_parsed).await?,
-            );
+            // SEC-001: escalation attribution columns are Operator-only; strip them from
+            // agent_executions rows served to Agent and Observer principals.
+            let is_operator = matches!(principal.class, auth::PrincipalClass::Operator);
+            const ESCALATION_EXECUTION_FIELDS: &[&str] = &[
+                "escalation_policy_id",
+                "escalation_policy_hash",
+                "escalation_tier_id",
+                "escalation_tier_kind_raw",
+                "escalation_trigger_raw",
+                "escalation_digest_version",
+                "escalation_ledger_id",
+            ];
             let stage_rows = stages::list_by_run(&self.pool, run_id_parsed).await?;
             let mut stage_values = Vec::new();
             for stage in stage_rows {
                 let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
                 let mut stage_value = serde_json::to_value(&stage)?;
                 if let Some(stage_obj) = stage_value.as_object_mut() {
-                    stage_obj.insert("agent_executions".into(), serde_json::to_value(executions)?);
+                    let exec_values: Vec<serde_json::Value> = executions
+                        .iter()
+                        .map(|exec| {
+                            let mut v = serde_json::to_value(exec)
+                                .map_err(|e| anyhow::anyhow!("exec serialize: {e}"))?;
+                            if !is_operator {
+                                if let Some(o) = v.as_object_mut() {
+                                    for field in ESCALATION_EXECUTION_FIELDS {
+                                        o.remove(*field);
+                                    }
+                                }
+                            }
+                            Ok(v)
+                        })
+                        .collect::<anyhow::Result<_>>()?;
+                    stage_obj.insert(
+                        "agent_executions".into(),
+                        serde_json::Value::Array(exec_values),
+                    );
                 }
                 stage_values.push(stage_value);
             }
             obj.insert("stages".into(), serde_json::Value::Array(stage_values));
+            // P058 Phase 1: attach escalation_readback parity on run:// resource.
+            // Full chain detail only for Operator; summary-only for Agent/Observer.
+            let escalation_readback = if is_operator {
+                tools::runs::build_escalation_readback_json(&self.pool, run_id_parsed).await?
+            } else {
+                tools::runs::build_escalation_readback_summary_json(&self.pool, run_id_parsed)
+                    .await?
+            };
+            obj.insert("escalation_readback".into(), escalation_readback);
         }
         Ok(value)
     }
@@ -2415,20 +2482,15 @@ mod p029_capability_tests {
     fn test_mcp_tools_list_filtered_for_agent() {
         let ag = Principal::new("ag", PrincipalClass::Agent);
         let names = tools_list_names_for(&ag);
-        // Agents can create ideas and start runs but cannot approve, cancel,
-        // retry, or enter the steward surface.
-        for expected in [
-            "ideas.create",
-            "ideas.list",
-            "runs.start",
-            "runs.list",
-            "runs.get",
-            "reports.get",
-        ] {
+        // SEC-001: Agents can create ideas, list and get runs, but cannot start runs
+        // (runs.start supplies filesystem paths to the daemon — Operator-only).
+        // Agents also cannot approve, cancel, retry, or enter the steward surface.
+        for expected in ["ideas.create", "ideas.list", "runs.list", "runs.get"] {
             let expected = expected.replace('.', "_");
             assert!(names.contains(&expected), "agent missing {expected}");
         }
         for forbidden in [
+            "runs.start", // SEC-001: Operator-only (supplies daemon-side filesystem paths)
             "runs.main_sync.request",
             "runs.main_sync.retry",
             "runs.main_sync.set_override",
@@ -2444,6 +2506,7 @@ mod p029_capability_tests {
             "steward.run_analysis",
             "steward.list_analyses",
             "steward.get_analysis",
+            "reports.get", // SEC-HIGH-001: exposes file_path, evidence, rollout readback — Operator-only
         ] {
             let forbidden = forbidden.replace('.', "_");
             assert!(
@@ -2464,7 +2527,6 @@ mod p029_capability_tests {
             "runs.list",
             "runs.get",
             "approvals.list",
-            "reports.get",
             "steward.list_analyses",
             "steward.get_analysis",
         ] {
@@ -2480,6 +2542,7 @@ mod p029_capability_tests {
             "stages.consume_provider_quota_hold",
             "legacy_discovery_override_create",
             "steward.run_analysis",
+            "reports.get", // SEC-HIGH-001: exposes file_path, evidence, rollout readback — Operator-only
         ] {
             let forbidden = forbidden.replace('.', "_");
             assert!(
@@ -2514,22 +2577,33 @@ mod p029_capability_tests {
     fn test_mcp_resources_list_is_capability_filtered() {
         let ag = Principal::new("ag", PrincipalClass::Agent);
         let uris = resource_list_uris_for(&ag);
-        // Agent must NOT see steward-analysis template or approvals inbox /
-        // chainworks run stages / chainworks run artifacts (operator+observer-only).
+        // Agent must NOT see steward-analysis template, approvals inbox,
+        // chainworks run stages/artifacts, or artifact:// / report:// (HIGH-001).
         for forbidden in [
             "steward-analysis://{analysis_id}",
             "chainworks://approvals/inbox",
             "chainworks://runs/{run_id}/stages",
             "chainworks://runs/{run_id}/artifacts",
+            "artifact://{artifact_id}",
+            "report://{run_id}",
         ] {
             assert!(!uris.contains(forbidden), "agent must not see {forbidden}");
         }
 
-        // Observer sees the approvals inbox and the steward template.
+        // Observer sees the approvals inbox and the steward template but NOT
+        // artifact:// or report:// (HIGH-001).
         let ob = Principal::new("ob", PrincipalClass::Observer);
         let ob_uris = resource_list_uris_for(&ob);
         assert!(ob_uris.contains("steward-analysis://{analysis_id}"));
         assert!(ob_uris.contains("chainworks://approvals/inbox"));
+        assert!(
+            !ob_uris.contains("artifact://{artifact_id}"),
+            "observer must not see artifact://"
+        );
+        assert!(
+            !ob_uris.contains("report://{run_id}"),
+            "observer must not see report://"
+        );
     }
 
     // ── resources/read denial ────────────────────────────────────────
@@ -2541,17 +2615,27 @@ mod p029_capability_tests {
         let ag = Principal::new("ag", PrincipalClass::Agent);
         assert!(!resources_read_allowed(&ag, "steward-analysis://abc-123"));
 
-        // Same agent CAN read run://, idea://, artifact://, report:// (allowed
-        // for all classes).
+        // Agent can read run:// and idea://.
         assert!(resources_read_allowed(&ag, "run://r-1"));
         assert!(resources_read_allowed(&ag, "idea://i-1"));
+
+        // HIGH-001: artifact:// and report:// are Operator-only; Agent must be denied.
+        assert!(!resources_read_allowed(&ag, "artifact://a-1"));
+        assert!(!resources_read_allowed(&ag, "report://r-1"));
+
+        // Observer also denied artifact:// and report://.
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        assert!(!resources_read_allowed(&ob, "artifact://a-1"));
+        assert!(!resources_read_allowed(&ob, "report://r-1"));
 
         // Unknown URI scheme also denied.
         assert!(!resources_read_allowed(&ag, "bogus://1"));
 
-        // Operator can read steward-analysis.
+        // Operator can read steward-analysis, artifact://, and report://.
         let op = Principal::new("op", PrincipalClass::Operator);
         assert!(resources_read_allowed(&op, "steward-analysis://abc-123"));
+        assert!(resources_read_allowed(&op, "artifact://a-1"));
+        assert!(resources_read_allowed(&op, "report://r-1"));
     }
 
     // ── Steward-specific capability tests ────────────────────────────
@@ -2930,6 +3014,13 @@ mod tests {
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
                 actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
             },
         )
         .await

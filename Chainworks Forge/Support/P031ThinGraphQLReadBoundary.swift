@@ -2782,6 +2782,7 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
   let runStageTopology: [P031RunStageTopologyReadModel]
   let continuations: [P086ContinuationRecordReadModel]
   let continuationMetricsSummary: P086ContinuationMetricsSummaryReadModel?
+  let runEscalationReadback: P058EscalationRunReadbackReadModel?
 
   nonisolated init(
     run: P031RunRowReadModel?,
@@ -2792,7 +2793,8 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
     activeAgentExecutions: [P031ActiveAgentExecutionReadModel] = [],
     runStageTopology: [P031RunStageTopologyReadModel] = [],
     continuations: [P086ContinuationRecordReadModel] = [],
-    continuationMetricsSummary: P086ContinuationMetricsSummaryReadModel? = nil
+    continuationMetricsSummary: P086ContinuationMetricsSummaryReadModel? = nil,
+    runEscalationReadback: P058EscalationRunReadbackReadModel? = nil
   ) {
     self.run = run
     self.idea = idea
@@ -2803,6 +2805,7 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
     self.runStageTopology = runStageTopology
     self.continuations = continuations
     self.continuationMetricsSummary = continuationMetricsSummary
+    self.runEscalationReadback = runEscalationReadback
   }
 
   nonisolated var freshnessStates: [P031FreshnessState] {
@@ -2838,6 +2841,7 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
     case runStageTopology
     case continuations
     case continuationMetricsSummary
+    case runEscalationReadback
   }
 
   init(from decoder: Decoder) throws {
@@ -2868,6 +2872,10 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
         P086ContinuationMetricsSummaryReadModel.self,
         forKey: .continuationMetricsSummary
       )
+    self.runEscalationReadback = try container.decodeIfPresent(
+      P058EscalationRunReadbackReadModel.self,
+      forKey: .runEscalationReadback
+    )
   }
 }
 
@@ -3010,6 +3018,26 @@ struct P086ContinuationMetricsSummaryReadModel: Decodable, Equatable, Sendable {
     case orphanReapAttemptedTotal
     case orphanReapVerifiedTotal
     case resurrectionUnsupportedTotal
+  }
+}
+
+struct P058EscalationRunReadbackReadModel: Decodable, Equatable, Sendable {
+  let runID: String
+  let chains: [EscalationChainStateDTO]
+  let chainsTruncated: Bool
+  let chainsTotal: Int
+  let pausedChainCount: Int
+  let hasActiveEscalation: Bool
+  let dominantPauseReasonRaw: String?
+
+  enum CodingKeys: String, CodingKey {
+    case runID = "runId"
+    case chains
+    case chainsTruncated
+    case chainsTotal
+    case pausedChainCount
+    case hasActiveEscalation
+    case dominantPauseReasonRaw
   }
 }
 
@@ -3319,6 +3347,38 @@ enum P031GraphQLDocuments {
         orphanReapAttemptedTotal
         orphanReapVerifiedTotal
         resurrectionUnsupportedTotal
+      }
+      runEscalationReadback(runId: $runId) {
+        runId
+        chainsTotal
+        chainsTruncated
+        pausedChainCount
+        hasActiveEscalation
+        dominantPauseReasonRaw
+        chains {
+          id
+          runId
+          stageId
+          agentId
+          policyId
+          policyHash
+          statusRaw
+          currentTierId
+          currentTierKindRaw
+          chainAttemptIndex
+          triggerRaw
+          pauseReasonRaw
+          waitingRetryAfterUntil
+          traceUnavailableReasonRaw
+          escalationTraceJsonRedacted
+          policyDriftState
+          externalAcknowledgementRef
+          featureFlagState
+          operatorActionHint
+          runbookAnchor
+          createdAt
+          updatedAt
+        }
       }
       artifacts(runId: $runId) {
         id
@@ -3698,7 +3758,8 @@ struct P031GraphQLWorkflowReadStore<
       activeAgentExecutions: detail.activeAgentExecutions,
       runStageTopology: detail.runStageTopology,
       continuations: detail.continuations,
-      continuationMetricsSummary: detail.continuationMetricsSummary
+      continuationMetricsSummary: detail.continuationMetricsSummary,
+      runEscalationReadback: detail.runEscalationReadback
     )
   }
 
@@ -5616,6 +5677,8 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let implementationCompletion: P088ImplementationCompletionPresentation?
   let sideEffectReadback: P078SideEffectReadbackPresentation?
   let continuationReadback: P086ContinuationReadbackPresentation?
+  let escalationSnapshot: EscalationSnapshot?
+  let escalationTraceJSONRedacted: String?
   let freshness: P031FreshnessSnapshot
   let refreshFeedbackText: String
   let emptyStateTitle: String?
@@ -5645,6 +5708,8 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     implementationCompletion: P088ImplementationCompletionPresentation? = nil,
     sideEffectReadback: P078SideEffectReadbackPresentation? = nil,
     continuationReadback: P086ContinuationReadbackPresentation? = nil,
+    escalationSnapshot: EscalationSnapshot? = nil,
+    escalationTraceJSONRedacted: String? = nil,
     freshness: P031FreshnessSnapshot,
     refreshFeedbackText: String,
     emptyStateTitle: String?,
@@ -5672,6 +5737,8 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.implementationCompletion = implementationCompletion
     self.sideEffectReadback = sideEffectReadback
     self.continuationReadback = continuationReadback
+    self.escalationSnapshot = escalationSnapshot
+    self.escalationTraceJSONRedacted = escalationTraceJSONRedacted
     self.freshness = freshness
     self.refreshFeedbackText = refreshFeedbackText
     self.emptyStateTitle = emptyStateTitle
@@ -6580,6 +6647,12 @@ enum P031RunDetailPresenter {
       records: detail.continuations,
       metrics: detail.continuationMetricsSummary
     )
+    let escalationSnapshot = detail.runEscalationReadback.map {
+      EscalationSnapshot.build(runId: $0.runID, chains: $0.chains)
+    }
+    let escalationTraceJSONRedacted = detail.runEscalationReadback?.chains.compactMap {
+      $0.escalationTraceJSONRedacted
+    }.first
     let emptyStateTitle: String?
     switch run {
     case .some:
@@ -6609,6 +6682,8 @@ enum P031RunDetailPresenter {
       implementationCompletion: implementationCompletion,
       sideEffectReadback: sideEffectReadback,
       continuationReadback: continuationReadback,
+      escalationSnapshot: escalationSnapshot,
+      escalationTraceJSONRedacted: escalationTraceJSONRedacted,
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
         currentFreshness: currentFreshness,
         checkedAt: checkedAt,
@@ -7536,7 +7611,10 @@ struct P031ThinWorkflowScreenCoordinator<Store: P031WorkflowReadStore>: Sendable
           artifacts: detail.artifacts,
           approvalInbox: detail.approvalInbox,
           activeAgentExecutions: detail.activeAgentExecutions,
-          runStageTopology: detail.runStageTopology
+          runStageTopology: detail.runStageTopology,
+          continuations: detail.continuations,
+          continuationMetricsSummary: detail.continuationMetricsSummary,
+          runEscalationReadback: detail.runEscalationReadback
         )
       } else {
         hydratedDetail = detail

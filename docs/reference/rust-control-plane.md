@@ -21,9 +21,10 @@ The Rust control-plane daemon is a server-side parity replica of the orchestrati
 - approval waits and settlement
 - retries and restart reconciliation
 - cancellation flow
+- **escalation policy resolution, trigger classification, blocker digest calculation, and policy lifecycle management**
 - projection updates for read models
 - ACP runtime adapter coordination
-- command journaling and startup repair
+- escalation ledger persistence (domain enums, three SQLite tables, repo-layer redaction enforcement, `run_escalation_readback` GraphQL query) and P058 tier selection writer (`engine/src/shadow_escalation.rs`) populating `would_select_*` diagnostics while advancing durable ledger/event readback for owned active tiers
 
 The daemon runs alongside the desktop application on the same machine. During the current phase, the SwiftUI client remains the canonical user-facing owner. The daemon provides shadow truth through GraphQL and MCP, validated before any authority transfer.
 
@@ -82,8 +83,8 @@ The daemon is a single Rust binary built from a 9-crate workspace at `control-pl
 
 | Crate | Path | Role |
 |---|---|---|
-| `domain` | `crates/domain/src/lib.rs` | Value types, status enums, commands, events. No I/O. |
-| `db` | `crates/db/src/lib.rs` | SQLite pool, migrations, repository modules, work item types. |
+| `domain` | `crates/domain/src/lib.rs` | Value types, status enums, commands, events, and escalation ledger models. No I/O. |
+| `db` | `crates/db/src/lib.rs` | SQLite pool, migrations, repository modules (including escalation), work item types. |
 | `auth` | `crates/auth/src/lib.rs` | Bearer principals, principal-table loading, caller-class derivation, and shared boundary authorization helpers. |
 | `workflow` | `crates/workflow/src/lib.rs` | YAML workflow definition parsing, agent catalog loading, `RunPlan` compilation, and `PhaseBLeadResolver` compatibility mapping. |
 | `acp` | `crates/acp/src/lib.rs` | ACP runtime manager, per-provider adapters, JSON-RPC 2.0 stdio transport. |
@@ -91,6 +92,8 @@ The daemon is a single Rust binary built from a 9-crate workspace at `control-pl
 | `graphql-server` | `crates/graphql-server/src/lib.rs` | async-graphql schema (queries, mutations, subscriptions) served over axum. |
 | `mcp-server` | `crates/mcp-server/src/lib.rs` | MCP JSON-RPC server with tool dispatch, resource reads, stdio and HTTP transports. |
 | `daemon` | `crates/daemon/src/main.rs` | Binary entry point. Wires all crates, runs startup recovery, enters mode dispatch. |
+
+Escalation policy resolution, trigger classification, ledger/event/metadata persistence, and Phase 2+ scheduler behavior are owned by the control plane. Schema, contracts, invariants, and rollout phasing are pinned in [escalation-policies.md](escalation-policies.md).
 
 ### Dependency flow
 
@@ -110,29 +113,10 @@ db + auth + workflow + acp  -->  engine  -->  graphql-server
 ## Boundary shape
 
 The daemon exposes two northbound surfaces on a single port (default `0.0.0.0:4000`).
-Both surfaces are authenticated with bearer tokens (P029) and filter their visible
-area by the caller's principal class. See
+Both surfaces are authenticated with bearer tokens (P029) and filter their
+visible area by the caller's principal class. See
 [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md)
-for the implemented authentication and capability filtering reference.
-
-P081 implements a boundary-first authorization contract that routes decisions
-through a shared `BoundaryPolicy` keyed on a server-derived `CallerClass`. The
-boundary matrix, executable fixture, validator, audit-log storage, `CallerClass`
-enum, and principal-table `schema_version 3` reader have landed. The
-daemon-injected `BoundaryPolicy` is wired into the `CommandHandler`, GraphQL
-query/subscription/mutation paths, and MCP `initialize`/`tools/list`/`tools/call`
-paths with mode-aware semantics (`shadow`, `enforce`, `read_only_safe_mode`,
-`legacy_compat`), and `command_journal.caller_class` is populated by the shared
-decision path. `approval_mutation_idempotency` backs the
-`approveApproval`/`rejectApproval` retry contract, while
-`mcp_command_idempotency` plus dispatcher enforcement governs state-changing MCP
-tools (require `idempotency_key`, replay cached result on duplicate hash,
-`IDEMPOTENCY_CONFLICT` on hash mismatch, reject `idempotency_key` on read-only
-tools). Bounded readback includes `boundaryRuntime`, GraphQL `operatorAlerts`,
-MCP `boundary.runtime.get` / `operator.alerts.list`, principal-file hardening,
-typed Swift `extensions.redactions` preservation, and redaction accessibility
-state tests; production mode selection remains governed by the rollout-mode and
-fixture rules in [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md).
+for the full authentication and capability filtering reference.
 
 ### GraphQL
 
@@ -142,19 +126,14 @@ fixture rules in [boundary-first-api-auth-contract.md](boundary-first-api-auth-c
 
 Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`, `storageHealth`.
 
-**Session observability GraphQL readback** (enabled by default after dogfood signoff; absent from the schema only when explicitly disabled by schema configuration): `sessionObservabilityAvailable`, `sessionLineages(runId)`, `sessionLineage(id)`, `sessionGenerations(lineageId)`, `sessionEvents(lineageId, generationId?)`, `sessionKpiSummary(runId)`, `sessionHealth(runId)`. Governed clients still use `sessionObservabilityAvailable` as the lightweight capability probe before issuing the other session observability documents. All resolvers enforce operator-read authorization scoped to the owning run, use cursor pagination with deterministic ordering and bounded `first`, and return derived non-secret references in place of raw `providerSessionId`, `bindingFingerprint`, `invocationOwnerKey`, and absolute `workingDirectory`. Event details follow the `p046_event_details_redaction_v1` default-deny allowlist; the `p046_*` schema/version labels are retained historical aliases for already-shipped fixtures, tests, and gate names. The surface is read/subscription-only: no `resetSession` or equivalent session-control mutation is exposed; reset remains MCP-only (see [session-lineage-reuse-and-operator-reset.md](session-lineage-reuse-and-operator-reset.md#operator-surfaces)).
-
-Connection cursors are opaque `p046_cursor_v1` envelopes scoped to their connection kind (`session_lineage`, `session_generation`, or `session_event`); these labels are retained historical aliases. Wrong-kind cursors, mismatched filters, malformed timestamps, and malformed payloads return the sanitized error `invalid cursor`. Cursors are not time-expiring; access is enforced by the current operator-read authorization check on each resolver call.
-
-Session observability DB reads use the db-owned `db::p046_retry::p046_retry_db` helper, where the helper name is a retained historical alias. The pinned policy is 3 total attempts, 50 ms then 150 ms backoff, jitter <= 25 ms, total retry sleep <= 250 ms, and at least 250 ms resolver-deadline headroom. Retry exhaustion returns deterministic `db_unavailable` resolver errors, except `sessionHealth`, which returns `UNKNOWN` with `transient_db_unavailable`.
-
-`sessionHealth` reads persisted session rows and reports `thresholdsVersion = p046_session_health_thresholds_v1`, a retained historical alias. A run with no session rows returns `UNKNOWN` with `no_session_data`; orphan generation rows are treated as critical data integrity warnings. Health warnings use bounded reason codes and never include raw provider/session identifiers.
-
 **Storage Health Readback:**
-The `storageHealth` query exposes the current health state of the storage subsystem, including `DbWriter`, WAL, projections, evidence spool, and freshness details for the implemented local storage tiering and read-path liveness contract. It preserves the legacy `projections` field and exposes identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `projectionFreshness` and `projectionFreshnessBySource`.
+The `storageHealth` query exposes the current health state of the storage subsystem, including `DbWriter`, WAL, projections, evidence spool, and freshness details, aligning with the P087 proposal for local storage tiering and read-path liveness. Specifically, it now exposes identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `projectionFreshness` and `projectionFreshnessBySource`.
 
 **Implementation self-assessment summary extension:**
 The `Run` type includes a nullable `implementationSelfAssessmentSummary` field that exposes structured assessment truth (status, verification, code tasks, handoff tasks) without requiring raw artifact parsing.
+
+**Escalation chain readback (Phase 0-1):**
+A dedicated `runEscalationReadback` query exposes ledger chains, events, and execution metadata with per-array row caps (50 ledgers / 200 events / 100 execution metas) and `*_truncated`/`*_total` markers. Phase 2+ chain fields (`featureFlagState`, `wouldSelectTierId`, `policyDriftState`, `waitingRetryAfterUntil`, `escalationTraceJsonRedacted`, etc.) are wired into the SDL today but emit `null` until the Phase 2+ scheduler populates them. MCP `runs.get` returns the same payload for Operator principals and a summary projection (`paused_chain_count`, `has_active_escalation`, `chains_redacted: true`) for Agent/Observer principals. See [escalation-policies.md](escalation-policies.md) for the full readback shape and authorization contract.
 
 **Targeted retry authority readback:**
 The `Run` type includes `retryAuthorityJson`, `retryAuthorityHistoryJson`, and `p091OrphanRepairReadbackJson`. Stage summaries expose `terminalReason`, `retryAuthorityId`, `isRetryAuthoritative`, and `retryAuthorityState` from the projection layer.
@@ -166,7 +145,7 @@ settlement surface. Non-approval operator commands such as starting runs,
 retrying stages, cancelling runs, resolving workflow conflicts, and recovery
 actions are MCP-only.
 
-Subscriptions: `runStatusChanged`, `stageStatusChanged`, `approvalRequested`, `approvalResolved`, `runtimeStatusChanged`, `sessionStatusChanged(runId)`. The session status subscription authorizes the principal at subscription setup and rechecks operator-read on every emission, filters by `run_id` before resolving payloads, uses a bounded 64-payload per-subscriber buffer with at-most-once `resyncRequired` between successful payloads, and disconnects slow consumers after 5 s of full queue or 3 consecutive enqueue failures.
+Subscriptions: `runStatusChanged`, `stageStatusChanged`, `approvalRequested`, `approvalResolved`, `runtimeStatusChanged`.
 
 Implementation: `control-plane/crates/graphql-server/src/schema.rs`.
 
@@ -200,6 +179,9 @@ Tools are namespaced:
 
 **Targeted Retry Authority Readback:**
 `runs.get` includes `retry_authority`, `retry_authority_history`, and `p091_orphan_repair_readback`. `reports.get` includes the same truth as `retryAuthority`, `retryAuthorityHistory`, and `p091OrphanRepairReadback`.
+
+**Escalation Readback (P058 Phase 1):**
+`runs.get` includes an `escalation_readback` projection at parity with the GraphQL `runEscalationReadback` query. Operator principals receive full chain detail (capped at 50 ledgers, 200 events/ledger, 100 execution-metadata rows/ledger with `*_truncated`/`*_total` markers); Agent and Observer principals receive a summary projection (`chains_redacted: true`) with `paused_chain_count` and `has_active_escalation` only. See [escalation-policies.md](escalation-policies.md) for the full contract.
 
 Resources follow two URI families:
 
@@ -300,7 +282,7 @@ The workflow compiler at `crates/workflow/src/compiler.rs` transforms a workflow
 - `variables` -- resolved workflow variables (YAML to JSON)
 - `artifact_paths` -- name-to-path-template map from the catalog's `artifacts:` section
 
-Each agent reference is resolved against backend profiles in the catalog to produce a `ResolvedAgent` with provider, model, effort, and system prompt.
+Each agent reference is resolved against backend profiles in the catalog to produce a `ResolvedAgent` with provider, model, effort, and system prompt. Unknown agent references — a state `owner` or a task `agent` that does not appear in the catalog — fail the compile rather than resolving to a placeholder binding, so a typo or stale reference cannot silently bypass catalog-defined provider, permission, and output-contract settings.
 
 Provider names are normalized: `claude_acp` becomes `claude`, `codex_acp` becomes `codex`, `gemini_cli_acp` becomes `gemini`.
 
@@ -313,6 +295,8 @@ State types:
 - **Compute state** -- creates a `StageExecution` with status `Running`, enqueues `InvokeAgent` work items for each task. If no explicit tasks, the owner agent runs as a single task.
 - **Manual gate** (`is_manual_gate`) -- creates a `StageExecution` with status `WaitingApproval` and an `Approval` record. The run pauses until the operator approves or rejects.
 - **End state** (`is_end`) -- marks the run `Completed`.
+
+Escalation pause reasons enter the same `StageExecution.status = Paused` lane with a structured `pause_reason` code, `operator_action_hint`, and `runbook_anchor` surfaced through GraphQL and MCP. The full pause-reason catalog and runbook anchors live in [escalation-policies.md](escalation-policies.md) and [docs/runbooks/escalation/](../runbooks/escalation/).
 
 ### Fan-out parallel tasks
 
@@ -452,6 +436,12 @@ wait.
 
 ## Persistence model
 
+### Escalation Ledger
+Escalation state is persisted in three main tables:
+1. `escalation_ledger`: Tracks the current state, active tier, and aggregate counters for a chain.
+2. `escalation_execution_metadata`: Stores per-attempt attribution (tier_id, trigger, digest_version).
+3. `escalation_events`: A journal of transitions (tier_advanced, chain_exhausted, pause_reason).
+
 The system's persistence model is designed to keep SQLite as a compact canonical state, storing high-volume evidence in file-backed storage, and facilitating hot operator reads on projections or bounded snapshots.
 
 ### SQLite configuration
@@ -545,10 +535,12 @@ remaining byte budget is skipped without being read and truncates the pass.
 `storage.reconcile_evidence_orphans` exposes the sweep through MCP with camelCase
 `runId`, `dryRun`, and `maxFiles` parameters. `runId` is required for non-dry-run calls
 so recovered metadata is bound to a real run, and `artifact_root` is resolved
-server-side from `CHAINWORKS_META_ROOT` or the `DATABASE_URL` parent rather than
-accepted from the client. GraphQL `storageHealth` returns a typed `StorageHealth` SDL
+server-side from `CHAINWORKS_META_ROOT` or the `DATABASE_URL` parent rather than from
+client-supplied paths.
+
+GraphQL `storageHealth` returns a typed `StorageHealth` SDL
 object (`writer`, `wal`, `projections`, `evidenceSpool`, `killSwitches`, `thresholds`, `projectionFreshness`, `projectionFreshnessBySource`,
-plus `updatedAt`/`staleAfterMs`/`isStale`) instead of an opaque JSON blob, with
+  plus `updatedAt`/`staleAfterMs`/`isStale`) instead of an opaque JSON blob, with
 fail-closed defaults that map an absent or unrecognised `dbState` to `DEGRADED`,
 absent `writer.alive` to `false`, and no live writer heartbeat to stale/degraded
 readback. MCP storage diagnostics return typed error envelopes for `invalid_input`,
@@ -638,12 +630,15 @@ queue-wait latency.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`, `068_p081_audit_log.sql`, `069_p081_audit_log_checkpoints.sql`, `070_p081_caller_class.sql`, `071_p081_approval_idempotency.sql`, `072_p081_fix_payload_length_check.sql`, `073_p081_approval_idempotency_request_hash.sql`, `074_p081_mcp_command_idempotency.sql`, `075_p081_command_journal_idempotency.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`, `062_p087_projection_freshness_healthy_window.sql`, `063_p058_escalation_schema.sql`, `064_p058_escalation_redaction_version.sql`, `065_p058_escalation_idempotency.sql`):
 
 | Table | Purpose |
 |---|---|
 | `ideas` | Idea backlog items with status, workspace path |
 | `runs` | Run lifecycle: status, workflow binding, current state, timestamps, cancellation |
+| `escalation_ledger` | Tracks the current state, active tier, and aggregate counters for an escalation chain |
+| `escalation_execution_metadata` | Stores per-attempt attribution (tier_id, trigger, digest_version) for escalation executions |
+| `escalation_events` | A journal of transitions (tier_advanced, chain_exhausted, pause_reason) for escalation chains |
 | `stage_executions` | Per-stage execution records with iteration and attempt tracking |
 | `agent_executions` | Per-agent invocation records (status, **actual_toolchain_mapping_diagnostics_json**, etc.) |
 | `workflow_conflicts` | Blocking graph-authority conflicts (run_id, fingerprint, status, reason, current_mediation_id) |
@@ -667,10 +662,6 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `artifacts` | Artifact metadata (file path, format, checksum, provider, report kind) |
 | `work_items` | Internal work queue (kind, payload, status, attempts, errors) |
 | `command_journal` | Audit trail for mutating commands (type, payload, result, errors, caller metadata) |
-| `audit_log` | P081: Hash-chained durable audit evidence for boundary decisions (allow, deny, redaction, idempotency) |
-| `audit_log_checkpoints` | P081: Periodic checkpoint windows over `audit_log` for integrity verification and retention |
-| `approval_mutation_idempotency` | P081 Phase 5: Backing store for `approveApproval` / `rejectApproval` retry contract (one record per `idempotency_key` with 7-day retention) |
-| `mcp_command_idempotency` | P081: Backing store for state-changing MCP tool retry contract (one record per `idempotency_key` with 7-day retention; canonical request hash distinguishes replay from `IDEMPOTENCY_CONFLICT`) |
 
 **AgentExecution Owner Migration:**
 To support lead-mediated conflicts without synthetic stage states, `agent_executions`
@@ -706,7 +697,6 @@ migrated to a general owner model:
 | `session_lineages` | Session reuse/reset metadata per agent |
 | `agent_execution_runtime_facts` | Durable provider-independent execution truth |
 | `artifact_source_claims` | CAS-backed ownership for artifact generation |
-| `retry_payload_recovery_events` | Durable targeted-retry payload recovery diagnostics and repair evidence |
 
 ### Projection rebuild
 
@@ -728,6 +718,10 @@ state, not only process logs.
 | `conflict_reason_to_action_outcome_total` | Counter event | `conflict_reason`, `action_class`, `terminal_status` | Counts outcomes (resolved, terminal, superseded) per conflict reason. |
 | `recovery_action_chosen_total` | Counter event | `conflict_reason`, `action_class`, `source_surface`, `result` | Counts chosen recovery actions (retry, clone, manual_fallback). |
 | `phase_c_validation_outcome_total` | Counter | `outcome` | Phase C validation results: `static_fail`, `preflight_fail`, `legacy_catalog_warning`, `pass`. |
+
+### Escalation Metrics (P058)
+
+The control plane declares the full P058 metric inventory in `db::metrics::P058_REQUIRED_METRICS`. Durable escalation ledger inserts emit `escalation_chains_started_total`; escalation event writes emit the relevant pause, exhausted-chain, repeated-digest, capacity, force-detach, drift, storm, retry-after, late-frame, and success-rate counters from redacted event metadata. Metrics that require wall-clock SLO samples, provider force-detach timings, or operator adjudication are emitted by their corresponding event producers rather than synthesized at read time.
 
 ## Work queue
 
@@ -772,53 +766,6 @@ Startup repair is controlled by two environment variables:
 - `CHAINWORKS_P091_DISABLE_STARTUP_ORPHAN_REPAIR=1` disables mutation and records disabled readback.
 
 Each startup repair pass writes `p091_orphan_repair_passes` with mode, kill-switch state, candidate/exclusion/repair counts, and bounded samples. Public readback surfaces those counters through `p091_orphan_repair_readback`; the retained counter vocabulary includes `p091_orphan_repair_candidates_total`. The retained gate alias `./scripts/test-gate.sh proposal-091` proves the evidence fixture, typed payload parser, DB authority repository, work-item semantics, runtime settlement, recovery exclusions, GraphQL readback, and MCP `retryAuthorityHistory` readback.
-
-### Retry payload target invariants and recovery
-
-Targeted retry `InvokeAgent` payloads keep current routing and source provenance separate. Top-level routing fields describe the current run, stage, stage execution, target stage execution, and retry authority only. Older failed attempts remain provenance under `targeted_retry.source_stage_execution_id`, `targeted_retry.source_agent_execution_id`, and `targeted_retry.source_work_item_id`; those source fields never select the current target during completion.
-
-All targeted retry producers use the shared sanitizer in `domain::retry_authority::sanitize_targeted_retry_invoke_payload` before enqueueing an invoke. This covers auto-contract output retry and operator targeted retry. The sanitizer clears stale settlement/routing fields (`p058_claimed`, stale `target_stage_execution_id`, top-level source fields, and prior `retry_authority_id`) before writing the current target and authority.
-
-Post-invoke completion is authority/current-truth driven:
-
-- if `retry_authority_id` is present, the active authority row is loaded by id;
-- the authority target is the current target stage execution;
-- `stage_execution_id` and `target_stage_execution_id` must match the authority target or be backfilled from it;
-- `p058_claimed.agent_execution_id` is the current completed-agent truth when present;
-- `targeted_retry.source_*` is copied as diagnostics/provenance only.
-
-Contradictions fail closed with typed recovery events. A claimed agent on a different stage records `retry_authority_target_agent_stage_mismatch`; a targeted invoke with no active authority or no current completed-agent truth records `retry_authority_missing_for_targeted_invoke` and does not enqueue post-invoke advance.
-
-The recovery service handles the valid stranded retry shape directly. A candidate is a running `InvokeAgent` with active retry authority, a running authority target stage, a completed agent execution on that target, and runtime facts showing valid required outputs. Startup recovery runs this check before generic abandoned-invoke requeue so a valid completed retry is not converted into blind retry work. The daemon watchdog runs the same reconciliation after stale `AdvanceRun` inspection and before degraded-state reporting.
-
-Runtime controls:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE` | `diagnostic` | Retained historical alias name; `diagnostic` records candidates without mutation; `enforce` repairs through normal invoke completion. |
-| `CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED` | unset / false | Retained historical alias name; disables mutation while still recording readback diagnostics. |
-| `CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_BATCH_LIMIT` | `20` | Retained historical alias name; caps live recovery candidates per watchdog tick; accepted values are clamped to 1..100. |
-
-Recovery events are stored in `retry_payload_recovery_events` using an idempotency key derived from `(run_id, invoke_work_item_id, retry_authority_id, completed_agent_execution_id)`. Diagnostic rows can be promoted by enforce-mode repair without creating duplicate rows. Event JSON separates:
-
-- `current_json`: run, invoke work item, target stage execution, retry authority, completed agent;
-- `provenance_json`: source stage, source agent, and source work item;
-- `repaired_fields_json`: stale fields corrected or that would be corrected;
-- `diagnostic_json`: bounded counters such as `candidates_total`, `repaired_total`, `excluded_total`, disabled state, and fail-closed metadata.
-
-GraphQL attaches the latest durable event to `Run.retryAuthorityJson.retry_payload_recovery` and per-history rows in `Run.retryAuthorityHistoryJson[].retry_payload_recovery`. MCP `runs.get` exposes `retry_authority.retry_payload_recovery`; MCP `reports.get` and run report JSON expose both `retryPayloadRecovery` and `retry_payload_recovery` on current/history authority objects. Missing-authority hard mismatch rows are represented as history entries with `authority_state = missing_authority` rather than as an active current authority.
-
-Recognized retry payload recovery reason codes are:
-
-- `retry_payload_stale_target_stage_repaired`
-- `retry_payload_source_provenance_ignored_for_target`
-- `valid_retry_invoke_completion_recovered`
-- `retry_authority_target_agent_stage_mismatch`
-- `retry_authority_missing_for_targeted_invoke`
-
-Unknown reason codes round-trip in readback with `unknown_reason_code = true`.
-
-The retained historical alias `./scripts/test-gate.sh proposal-092` / `p092` proves the sanitizer, post-invoke fail-closed paths, recovery event storage, configurable live batch limit, disabled/excluded diagnostics, startup diagnostic/enforce behavior, GraphQL/MCP missing-authority readback, and daemon live-hook compilation. The retired proposal document is not the operational source of truth.
 
 ## Capacity-aware Scheduling
 

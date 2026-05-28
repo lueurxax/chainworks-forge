@@ -73,6 +73,7 @@ Use these reference docs as the current source of truth:
 | ACP runtime transport | [acp-runtime-transport.md](acp-runtime-transport.md) |
 | Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
 | Rust control plane, scheduler, targeted retry authority, and retry payload recovery | [rust-control-plane.md](rust-control-plane.md) |
+| Escalation policy and chain management | [escalation-policies.md](escalation-policies.md) |
 | Auto-retry observation ledger | [auto-retry-observation-ledger.md](auto-retry-observation-ledger.md) |
 | API/auth boundary matrix, audit, and idempotency | [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md), [swift-macos-boundary-contract.md](swift-macos-boundary-contract.md) |
 | Proposal-loop feedback fidelity | [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) |

@@ -302,6 +302,18 @@ pub async fn active_provider_family_quota_wait(
         .transpose()
 }
 
+pub async fn has_active_provider_quota_wait(
+    pool: &SqlitePool,
+    provider_family: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    Ok(
+        active_provider_family_quota_wait(pool, provider_family, None, now)
+            .await?
+            .is_some(),
+    )
+}
+
 pub async fn consume_active_provider_family_quota_for_retry_target(
     pool: &SqlitePool,
     target_stage_execution_id: StageExecutionId,

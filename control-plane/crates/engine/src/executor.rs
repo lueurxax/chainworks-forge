@@ -24,9 +24,9 @@ use acp::AcpRuntimeManager;
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
     agent_execution_runtime_receipts, agent_executions, agent_retry_budget_ledger,
-    artifact_contracts, artifacts, code_writer_completion_receipts, evidence_spool_refs, ideas,
-    legacy_discovery_overrides, projections, rollout_contract_checks, runs, scheduler, sessions,
-    stages, storage_health, validation, work_items, workflow_conflicts,
+    artifact_contracts, artifacts, code_writer_completion_receipts, escalation as escalation_repo,
+    evidence_spool_refs, ideas, legacy_discovery_overrides, projections, rollout_contract_checks,
+    runs, scheduler, sessions, stages, storage_health, validation, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::{WriteLane, WriteResult};
@@ -350,6 +350,119 @@ fn invoke_agent_start_capacity_from_domain(
             .map(|(provider, cap)| (provider.to_string(), *cap))
             .collect(),
     }
+}
+
+async fn resolve_escalation_chain_candidate(
+    pool: &SqlitePool,
+    run_id: RunId,
+    stage_id: &str,
+    agent_id: &str,
+    backend_profile_id_override: Option<&str>,
+) -> Result<Option<(domain::escalation::EscalationLedger, String, String)>> {
+    let Some(run) = db::repos::runs::find_by_id(pool, run_id).await? else {
+        return Ok(None);
+    };
+    let Some(plan) = crate::command_handler::compile_run_plan_from_snapshot(&run)? else {
+        return Ok(None);
+    };
+    if plan.escalation_policies.is_empty() {
+        return Ok(None);
+    }
+
+    let backend_profile_id: Option<String> =
+        backend_profile_id_override.map(String::from).or_else(|| {
+            plan.states
+                .get(stage_id)
+                .and_then(|state| state.owner.backend_profile_id.clone())
+        });
+
+    let Some(resolved) = workflow::escalation_policy::resolve_policy_for_agent(
+        &plan.escalation_policies,
+        stage_id,
+        agent_id,
+        backend_profile_id.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(policy_snapshot) = plan
+        .escalation_policies
+        .iter()
+        .find(|policy| policy.policy_id == resolved.policy_id)
+    else {
+        return Err(anyhow::anyhow!(
+            "escalation_policy_resolution_internal_error: resolved policy {} is absent from frozen plan",
+            resolved.policy_id
+        ));
+    };
+
+    let existing_ledger = escalation_repo::find_ledger_by_chain_key(
+        pool,
+        run_id,
+        stage_id,
+        agent_id,
+        &resolved.policy_id,
+    )
+    .await?;
+    let (resolved_tier_id, resolved_tier_kind_raw) = if let Some(existing) = &existing_ledger {
+        if existing.policy_hash == resolved.policy_hash {
+            if let Some(current_tier_id) = existing.current_tier_id.as_deref() {
+                let Some(current_tier) = policy_snapshot
+                    .tiers
+                    .iter()
+                    .find(|tier| tier.tier_id == current_tier_id)
+                else {
+                    return Err(anyhow::anyhow!(
+                        "escalation_policy_drift: existing ledger {} current_tier_id={} is not present in frozen policy {}",
+                        existing.id,
+                        current_tier_id,
+                        resolved.policy_id
+                    ));
+                };
+                (current_tier.tier_id.clone(), current_tier.kind.clone())
+            } else {
+                (
+                    resolved.first_tier_id.clone(),
+                    resolved.first_tier_kind_raw.clone(),
+                )
+            }
+        } else {
+            (
+                resolved.first_tier_id.clone(),
+                resolved.first_tier_kind_raw.clone(),
+            )
+        }
+    } else {
+        (
+            resolved.first_tier_id.clone(),
+            resolved.first_tier_kind_raw.clone(),
+        )
+    };
+
+    let now = chrono::Utc::now();
+    let ledger_candidate = domain::escalation::EscalationLedger {
+        id: uuid::Uuid::new_v4().to_string(),
+        run_id,
+        stage_id: stage_id.to_string(),
+        agent_id: agent_id.to_string(),
+        policy_id: resolved.policy_id.clone(),
+        policy_hash: resolved.policy_hash.clone(),
+        status_raw: "active".to_string(),
+        current_tier_id: Some(resolved_tier_id.clone()),
+        current_tier_kind_raw: Some(resolved_tier_kind_raw.clone()),
+        chain_attempt_index: 0,
+        trigger_raw: None,
+        pause_reason_raw: None,
+        operator_action_hint: None,
+        runbook_anchor: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    Ok(Some((
+        ledger_candidate,
+        resolved_tier_id,
+        resolved_tier_kind_raw,
+    )))
 }
 
 pub async fn claim_next_invoke_agent_with_start(
@@ -794,6 +907,10 @@ async fn claim_invoke_agent_work_item_with_start(
         .and_then(|value| value.as_str())
         .unwrap_or(&stage_id)
         .to_string();
+    let payload_backend_profile_id = payload
+        .get("backend_profile_id")
+        .and_then(|value| value.as_str())
+        .map(String::from);
     let now = chrono::Utc::now();
     let agent_execution_id = domain::ids::AgentExecutionId::new();
     let session_generation_id =
@@ -808,71 +925,17 @@ async fn claim_invoke_agent_work_item_with_start(
         owner_execution_lineage_id: &owner_execution_lineage_id,
     });
 
-    agent_executions::insert(
+    let esc_candidate = resolve_escalation_chain_candidate(
         pool,
-        &domain::agent::AgentExecution {
-            id: agent_execution_id,
-            stage_execution_id: Some(stage_execution_id),
-            agent_id,
-            provider: provider.clone(),
-            model,
-            status: AgentStatus::Running,
-            started_at: now,
-            completed_at: None,
-            owner_execution_lineage_id: Some(owner_execution_lineage_id),
-            session_lineage_id: session_generation_id.clone(),
-            session_generation_id: session_generation_id.clone(),
-            rehydrated_from_checkpoint_artifact_id: None,
-            invocation_owner_key: Some(invocation_owner_key),
-            session_reuse_scope,
-            session_family_id,
-            session_reuse_disposition: session_generation_id.as_ref().map(|_| "fresh".into()),
-            session_reset_reason: None,
-            backend_profile_id: None,
-            requested_mcp_extensions_json: None,
-            predicted_mcp_extensions_json: None,
-            predicted_mcp_runtime_ids_json: None,
-            actual_mcp_extensions_json: None,
-            actual_mcp_runtime_ids_json: None,
-            denied_mcp_extensions_json: None,
-            mcp_blocking_issues_json: None,
-            actual_mcp_observation_json: None,
-            actual_xcode_runtime_observation_json: None,
-            mcp_session_startup_latency_ms: None,
-            owner_kind: Some("stage_execution".to_string()),
-            owner_id: Some(stage_execution_id.to_string()),
-            lead_mediation_record_id: None,
-            origin_stage_execution_id: None,
-            total_cost_cents: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            transcript_artifact_id: None,
-            actual_toolchain_mapping_diagnostics_json: None,
-        },
+        run_id,
+        &stage_id,
+        &agent_id,
+        payload_backend_profile_id.as_deref(),
     )
-    .await?;
-
-    let mut facts =
-        domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
-    facts.session_reuse_reason = Some("legacy_unknown".into());
-    if p090_junie_preflight_records_diagnostics(&provider) {
-        facts.runtime_preflight_phase = Some("preflight_running".into());
-        facts.runtime_preflight_attempt_count = Some(1);
-        facts.runtime_preflight_provider_launched = Some(false);
-        facts.runtime_preflight_json = Some(
-            serde_json::json!({
-                "schema": "p090_runtime_tool_path_preflight_v1",
-                "status": "preflight_running",
-                "attempt_count": 1,
-                "provider_launched": false,
-                "enforcement_enabled": p090_junie_preflight_enforce_enabled(&provider),
-                "lifecycle_phases": ["preflight_running"]
-            })
-            .to_string(),
-        );
-    }
-    agent_execution_runtime_facts::upsert(pool, &facts).await?;
+    .await
+    .with_context(|| {
+        format!("P058 escalation chain resolution failed for run={run_id} stage={stage_id}")
+    })?;
 
     let artifact_claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
         run_id,
@@ -882,29 +945,6 @@ async fn claim_invoke_agent_work_item_with_start(
         agent_execution_id,
         source_work_item_id: item.id.clone(),
     };
-    artifact_contracts::insert_source_generation_claim(
-        pool,
-        domain::artifact_contracts::ArtifactSourceGenerationClaim {
-            key: artifact_claim_key.clone(),
-            current_session_generation_id: session_generation_id.clone(),
-            claim_state: domain::agent::ArtifactSourceClaimState::Active,
-            superseding_work_item_id: None,
-            superseded_by_agent_execution_id: None,
-            supersession_journal_id: None,
-            superseded_at: None,
-            closed_at: None,
-            created_at: now,
-            updated_at: now,
-        },
-    )
-    .await?;
-    artifact_contracts::finalize_pending_retry_supersession_for_work_item(
-        pool,
-        &item.id,
-        agent_execution_id,
-    )
-    .await?;
-
     let claimed = ClaimedInvokeAgentStart {
         work_item_id: item.id.clone(),
         source_work_item_id: item.id.clone(),
@@ -928,7 +968,187 @@ async fn claim_invoke_agent_work_item_with_start(
     }
     payload["p058_claimed"] = claimed_payload;
     let payload_json = serde_json::to_string(&payload)?;
-    update_invoke_work_item_claimed_payload_and_running(writer, &item.id, &payload_json).await?;
+
+    let mut tx = writer
+        .begin_immediate_transaction(
+            class_a_operation(
+                "executor.claim_invoke_agent_work_item_with_start",
+                WriteLane::CriticalBarrier,
+                format!(
+                    "executor.claim_invoke_agent_work_item_with_start:{}",
+                    item.id
+                ),
+            ),
+            "executor.claim_invoke_agent_work_item_with_start",
+        )
+        .await?;
+    let updated = sqlx::query(
+        "UPDATE work_items SET payload_json = ?1, status = ?2, started_at = ?3, failed_at = NULL, last_error = NULL, attempt_count = attempt_count + 1 WHERE id = ?4 AND status = ?5",
+    )
+    .bind(&payload_json)
+    .bind(WorkItemStatus::Running.to_string())
+    .bind(now.to_rfc3339())
+    .bind(&item.id)
+    .bind(WorkItemStatus::Pending.to_string())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        return Ok(None);
+    }
+
+    let (esc_policy_id, esc_policy_hash, esc_ledger_id, esc_tier_id, esc_tier_kind_raw) =
+        if let Some(ref candidate) = esc_candidate {
+            match escalation_repo::insert_or_ignore_ledger_tx(&mut tx, &candidate.0).await {
+                Ok(ledger_id) => (
+                    Some(candidate.0.policy_id.clone()),
+                    Some(candidate.0.policy_hash.clone()),
+                    Some(ledger_id),
+                    Some(candidate.1.clone()),
+                    Some(candidate.2.clone()),
+                ),
+                Err(error) => {
+                    if let Some(drift) =
+                        error.downcast_ref::<escalation_repo::EscalationPolicyDrift>()
+                    {
+                        let ledger_id = drift.ledger_id.clone();
+                        drop(tx);
+                        escalation_repo::open_drift_pause(pool, &ledger_id).await?;
+                        return Ok(None);
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            (None, None, None, None, None)
+        };
+
+    agent_executions::insert_tx(
+        &mut tx,
+        &domain::agent::AgentExecution {
+            id: agent_execution_id,
+            stage_execution_id: Some(stage_execution_id),
+            agent_id,
+            provider: provider.clone(),
+            model,
+            status: AgentStatus::Running,
+            started_at: now,
+            completed_at: None,
+            owner_execution_lineage_id: Some(owner_execution_lineage_id),
+            session_lineage_id: claimed.session_generation_id.clone(),
+            session_generation_id: claimed.session_generation_id.clone(),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some(invocation_owner_key),
+            session_reuse_scope,
+            session_family_id,
+            session_reuse_disposition: claimed
+                .session_generation_id
+                .as_ref()
+                .map(|_| "fresh".into()),
+            session_reset_reason: None,
+            backend_profile_id: payload_backend_profile_id,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: Some("stage_execution".to_string()),
+            owner_id: Some(stage_execution_id.to_string()),
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: esc_policy_id.clone(),
+            escalation_policy_hash: esc_policy_hash,
+            escalation_tier_id: esc_tier_id.clone(),
+            escalation_tier_kind_raw: esc_tier_kind_raw.clone(),
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: esc_ledger_id.clone(),
+        },
+    )
+    .await?;
+
+    if let (Some(ledger_id), Some(tier_id), Some(tier_kind_raw)) =
+        (&esc_ledger_id, &esc_tier_id, &esc_tier_kind_raw)
+    {
+        let tier_attempt_index =
+            escalation_repo::next_tier_attempt_index_tx(&mut tx, ledger_id, tier_id).await?;
+        escalation_repo::insert_execution_metadata_tx(
+            &mut tx,
+            &domain::escalation::EscalationExecutionMetadata {
+                agent_execution_id,
+                escalation_ledger_id: ledger_id.clone(),
+                tier_id: tier_id.clone(),
+                tier_kind_raw: tier_kind_raw.clone(),
+                tier_attempt_index,
+                trigger_raw: None,
+                digest_version: None,
+                capacity_probe_counter: 0,
+                created_at: now,
+                updated_at: now,
+                would_select_tier_id: None,
+                would_select_trigger_raw: None,
+                would_select_decision_json: None,
+            },
+        )
+        .await?;
+    }
+
+    let mut facts =
+        domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.session_reuse_reason = Some("legacy_unknown".into());
+    if p090_junie_preflight_records_diagnostics(&provider) {
+        facts.runtime_preflight_phase = Some("preflight_running".into());
+        facts.runtime_preflight_attempt_count = Some(1);
+        facts.runtime_preflight_provider_launched = Some(false);
+        facts.runtime_preflight_json = Some(
+            serde_json::json!({
+                "schema": "p090_runtime_tool_path_preflight_v1",
+                "status": "preflight_running",
+                "attempt_count": 1,
+                "provider_launched": false,
+                "enforcement_enabled": p090_junie_preflight_enforce_enabled(&provider),
+                "lifecycle_phases": ["preflight_running"]
+            })
+            .to_string(),
+        );
+    }
+    agent_execution_runtime_facts::upsert_tx(&mut tx, &facts).await?;
+
+    artifact_contracts::insert_source_generation_claim_tx(
+        &mut tx,
+        domain::artifact_contracts::ArtifactSourceGenerationClaim {
+            key: claimed.artifact_claim_key.clone(),
+            current_session_generation_id: claimed.session_generation_id.clone(),
+            claim_state: domain::agent::ArtifactSourceClaimState::Active,
+            superseding_work_item_id: None,
+            superseded_by_agent_execution_id: None,
+            supersession_journal_id: None,
+            superseded_at: None,
+            closed_at: None,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await?;
+    artifact_contracts::finalize_pending_retry_supersession_tx(
+        &mut tx,
+        &item.id,
+        claimed.agent_execution_id,
+    )
+    .await?;
+    tx.commit().await?;
+
     let mut running_item = item;
     running_item.status = WorkItemStatus::Running;
     running_item.payload_json = payload_json;
@@ -7883,6 +8103,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                         cached_input_tokens: None,
                         transcript_artifact_id: None,
                         actual_toolchain_mapping_diagnostics_json: None,
+                        escalation_policy_id: None,
+                        escalation_policy_hash: None,
+                        escalation_tier_id: None,
+                        escalation_tier_kind_raw: None,
+                        escalation_trigger_raw: None,
+                        escalation_digest_version: None,
+                        escalation_ledger_id: None,
                     };
                     agent_executions::insert(&self.pool, &agent_exec).await?;
                 }
@@ -18742,6 +18969,13 @@ plain progress line without gate evidence";
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
                 actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
             },
         )
         .await
@@ -18858,6 +19092,13 @@ plain progress line without gate evidence";
                     cached_input_tokens: None,
                     transcript_artifact_id: None,
                     actual_toolchain_mapping_diagnostics_json: None,
+                    escalation_policy_id: None,
+                    escalation_policy_hash: None,
+                    escalation_tier_id: None,
+                    escalation_tier_kind_raw: None,
+                    escalation_trigger_raw: None,
+                    escalation_digest_version: None,
+                    escalation_ledger_id: None,
                 },
             )
             .await

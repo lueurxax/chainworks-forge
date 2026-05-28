@@ -7,7 +7,7 @@ use domain::agent::{AgentStatus, ArtifactSourceClaimState};
 use domain::artifact_contracts::ArtifactSourceGenerationClaimKey;
 use domain::ids::{AgentExecutionId, RunId, StageExecutionId};
 use domain::provider::InvokeAgentCapacityConfig;
-use domain::retry_authority::{AdvanceRunPayloadV1, RetryPayloadRecoveryEvent};
+use domain::retry_authority::AdvanceRunPayloadV1;
 
 use crate::pool::log_write_transaction;
 use crate::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
@@ -68,114 +68,6 @@ pub async fn claim_next(pool: &SqlitePool) -> Result<Option<WorkItem>> {
 
 pub async fn claim_next_non_invoke(pool: &SqlitePool) -> Result<Option<WorkItem>> {
     claim_next_where(pool, "kind != 'invoke_agent'").await
-}
-
-pub async fn record_pending_invoke_agent_wait_reason(
-    pool: &SqlitePool,
-    work_item_id: &str,
-    reason: &str,
-) -> Result<bool> {
-    let tx_started = Instant::now();
-    let mut tx = begin_registered_immediate_transaction(
-        pool,
-        crate::writer::class_a_operation(
-            "work_items.record_pending_invoke_agent_wait_reason",
-            crate::write_class::WriteLane::CriticalBarrier,
-            "work_items.record_pending_invoke_agent_wait_reason",
-        ),
-        "work_items.record_pending_invoke_agent_wait_reason",
-    )
-    .await?;
-    let updated = sqlx::query(
-        r#"UPDATE work_items
-           SET last_error = ?1
-           WHERE id = ?2
-             AND kind = ?3
-             AND status = ?4
-             AND COALESCE(last_error, '') != ?1"#,
-    )
-    .bind(reason)
-    .bind(work_item_id)
-    .bind(WorkItemKind::InvokeAgent.to_string())
-    .bind(WorkItemStatus::Pending.to_string())
-    .execute(&mut **tx)
-    .await
-    .context("record pending InvokeAgent wait reason")?
-    .rows_affected();
-    tx.commit()
-        .await
-        .context("commit pending InvokeAgent wait reason")?;
-    log_write_transaction(
-        "work_items.record_pending_invoke_agent_wait_reason",
-        tx_started,
-    );
-    Ok(updated > 0)
-}
-
-pub async fn list_pending_invoke_agents_for_run_stage_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    run_id: RunId,
-    stage_id: &str,
-) -> Result<Vec<WorkItem>> {
-    let pending_status = WorkItemStatus::Pending.to_string();
-    let invoke_kind = WorkItemKind::InvokeAgent.to_string();
-    let rows = sqlx::query(
-        r#"SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
-           FROM work_items
-           WHERE run_id = ?1
-             AND stage_id = ?2
-             AND kind = ?3
-             AND status = ?4
-           ORDER BY scheduled_at ASC, rowid ASC"#,
-    )
-    .bind(run_id.to_string())
-    .bind(stage_id)
-    .bind(&invoke_kind)
-    .bind(&pending_status)
-    .fetch_all(&mut **tx)
-    .await
-    .context("list pending InvokeAgent work items by run/stage")?;
-
-    rows.into_iter()
-        .map(|row| {
-            parse_work_item_row(
-                row.get("id"),
-                row.get("kind"),
-                row.get("payload_json"),
-                row.get("status"),
-                row.get("run_id"),
-                row.get("stage_id"),
-                row.get("created_at"),
-                row.get("scheduled_at"),
-                row.get("attempt_count"),
-                row.get("last_error"),
-            )
-        })
-        .collect()
-}
-
-pub async fn release_pending_invoke_agent_quota_wait_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    work_item_id: &str,
-    now: DateTime<Utc>,
-) -> Result<bool> {
-    let updated = sqlx::query(
-        r#"UPDATE work_items
-           SET last_error = NULL,
-               scheduled_at = ?1
-           WHERE id = ?2
-             AND kind = ?3
-             AND status = ?4"#,
-    )
-    .bind(now.to_rfc3339())
-    .bind(work_item_id)
-    .bind(WorkItemKind::InvokeAgent.to_string())
-    .bind(WorkItemStatus::Pending.to_string())
-    .execute(&mut **tx)
-    .await
-    .context("release pending InvokeAgent quota wait")?
-    .rows_affected();
-    Ok(updated > 0)
 }
 
 async fn claim_next_where(pool: &SqlitePool, kind_predicate: &str) -> Result<Option<WorkItem>> {
@@ -368,6 +260,90 @@ pub async fn select_pending_invoke_agents_for_start_tx(
         .collect()
 }
 
+pub async fn list_pending_invoke_agents_for_run_stage_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    stage_id: &str,
+) -> Result<Vec<WorkItem>> {
+    let pending_status = WorkItemStatus::Pending.to_string();
+    let invoke_kind = WorkItemKind::InvokeAgent.to_string();
+    let rows = sqlx::query(
+        r#"SELECT id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, attempt_count, last_error
+           FROM work_items
+           WHERE status = ?1 AND kind = ?2 AND run_id = ?3 AND stage_id = ?4
+           ORDER BY scheduled_at ASC, rowid ASC"#,
+    )
+    .bind(&pending_status)
+    .bind(&invoke_kind)
+    .bind(run_id.to_string())
+    .bind(stage_id)
+    .fetch_all(&mut **tx)
+    .await
+    .context("list pending InvokeAgent work items for run stage")?;
+
+    rows.into_iter()
+        .map(|row| {
+            parse_work_item_row(
+                row.get("id"),
+                row.get("kind"),
+                row.get("payload_json"),
+                row.get("status"),
+                row.get("run_id"),
+                row.get("stage_id"),
+                row.get("created_at"),
+                row.get("scheduled_at"),
+                row.get("attempt_count"),
+                row.get("last_error"),
+            )
+        })
+        .collect()
+}
+
+pub async fn release_pending_invoke_agent_quota_wait_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let pending_status = WorkItemStatus::Pending.to_string();
+    let invoke_kind = WorkItemKind::InvokeAgent.to_string();
+    let updated = sqlx::query(
+        r#"UPDATE work_items
+           SET scheduled_at = ?1, last_error = NULL
+           WHERE id = ?2 AND status = ?3 AND kind = ?4"#,
+    )
+    .bind(now.to_rfc3339())
+    .bind(work_item_id)
+    .bind(&pending_status)
+    .bind(&invoke_kind)
+    .execute(&mut **tx)
+    .await
+    .context("release pending InvokeAgent provider quota wait")?
+    .rows_affected();
+    Ok(updated > 0)
+}
+
+pub async fn record_pending_invoke_agent_wait_reason(
+    pool: &SqlitePool,
+    work_item_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let pending_status = WorkItemStatus::Pending.to_string();
+    let invoke_kind = WorkItemKind::InvokeAgent.to_string();
+    sqlx::query(
+        r#"UPDATE work_items
+           SET last_error = ?1
+           WHERE id = ?2 AND status = ?3 AND kind = ?4"#,
+    )
+    .bind(reason)
+    .bind(work_item_id)
+    .bind(&pending_status)
+    .bind(&invoke_kind)
+    .execute(pool)
+    .await
+    .context("record pending InvokeAgent wait reason")?;
+    Ok(())
+}
+
 pub async fn mark_claimed_running_tx(
     tx: &mut Transaction<'_, Sqlite>,
     work_item_id: &str,
@@ -474,18 +450,6 @@ pub async fn requeue_running_preclaimed_invoke_for_stage_tx(
         r#"SELECT id, payload_json
            FROM work_items
            WHERE run_id = ?1 AND stage_id = ?2 AND kind = ?3 AND status = ?4
-             AND NOT EXISTS (
-                 SELECT 1
-                 FROM retry_payload_recovery_events p092
-                 JOIN agent_execution_runtime_facts p092_facts
-                   ON p092_facts.agent_execution_id = p092.completed_agent_execution_id
-                  AND p092_facts.output_settlement IN ('valid_outputs_from_completed_execution', 'valid_outputs_from_failed_execution')
-                  AND COALESCE(p092_facts.valid_required_outputs, 0) > 0
-                 WHERE p092.invoke_work_item_id = work_items.id
-                   AND p092.mode = 'diagnostic'
-                   AND p092.repaired = 0
-                   AND COALESCE(json_extract(p092.diagnostic_json, '$.disabled'), 0) = 0
-             )
            ORDER BY scheduled_at ASC, rowid ASC"#,
     )
     .bind(run_id.to_string())
@@ -1118,18 +1082,6 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
         r#"SELECT id, payload_json
            FROM work_items
            WHERE kind = ?1 AND status = ?2
-             AND NOT EXISTS (
-                 SELECT 1
-                 FROM retry_payload_recovery_events p092
-                 JOIN agent_execution_runtime_facts p092_facts
-                   ON p092_facts.agent_execution_id = p092.completed_agent_execution_id
-                  AND p092_facts.output_settlement IN ('valid_outputs_from_completed_execution', 'valid_outputs_from_failed_execution')
-                  AND COALESCE(p092_facts.valid_required_outputs, 0) > 0
-                 WHERE p092.invoke_work_item_id = work_items.id
-                   AND p092.mode = 'diagnostic'
-                   AND p092.repaired = 0
-                   AND COALESCE(json_extract(p092.diagnostic_json, '$.disabled'), 0) = 0
-             )
            ORDER BY scheduled_at ASC, rowid ASC"#,
     )
     .bind(WorkItemKind::InvokeAgent.to_string())
@@ -2354,25 +2306,46 @@ async fn build_post_invoke_advance_payload_tx(
         .get("target_stage_execution_id")
         .and_then(|value| value.as_str())
         .map(str::to_owned);
+    let top_level_source_agent_execution_id = source_payload
+        .get("source_agent_execution_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let targeted_source_agent_execution_id = source_payload
+        .pointer("/targeted_retry/source_agent_execution_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
     let claimed_agent_execution_id = source_payload
         .pointer("/p058_claimed/agent_execution_id")
         .and_then(|value| value.as_str())
         .map(str::to_owned);
-    let source_agent_execution_id = claimed_agent_execution_id
-        .as_deref()
-        .or_else(|| {
-            source_payload
-                .get("source_agent_execution_id")
-                .and_then(|value| value.as_str())
-        })
-        .or_else(|| {
-            source_payload
-                .pointer("/targeted_retry/source_agent_execution_id")
-                .and_then(|value| value.as_str())
-        })
-        .map(str::to_owned);
+    let mut durable_source_agent_execution_id = claimed_agent_execution_id
+        .clone()
+        .or_else(|| targeted_source_agent_execution_id.clone())
+        .or_else(|| top_level_source_agent_execution_id.clone());
+    if let Some(claimed) = claimed_agent_execution_id.as_deref() {
+        // targeted_retry.source_agent_execution_id is the PAST failed execution being
+        // retried; p058_claimed is the CURRENT owner — they legitimately differ in retry.
+        // Only validate the top-level source_agent_execution_id against the claim.
+        if let Some(top) = top_level_source_agent_execution_id.as_deref() {
+            if top != claimed {
+                anyhow::bail!(
+                    "advance_run_source_agent_mismatch: source invoke {invoke_work_item_id} source_agent_execution_id {top} does not match durable p058_claimed agent {claimed}"
+                );
+            }
+        }
+        durable_source_agent_execution_id = Some(claimed.to_string());
+    } else if let (Some(top), Some(targeted)) = (
+        top_level_source_agent_execution_id.as_deref(),
+        targeted_source_agent_execution_id.as_deref(),
+    ) {
+        if top != targeted {
+            anyhow::bail!(
+                "advance_run_source_agent_mismatch: source invoke {invoke_work_item_id} source_agent_execution_id {top} does not match targeted_retry.source_agent_execution_id {targeted}"
+            );
+        }
+    }
     let agent_execution_stage_id =
-        if let Some(agent_execution_id) = source_agent_execution_id.as_deref() {
+        if let Some(agent_execution_id) = durable_source_agent_execution_id.as_deref() {
             find_agent_execution_stage_id_tx(tx, agent_execution_id).await?
         } else {
             None
@@ -2398,23 +2371,27 @@ async fn build_post_invoke_advance_payload_tx(
     let has_targeted_hint = explicit_target_stage_execution_id.is_some()
         || source_retry_authority_id.is_some()
         || source_payload.get("targeted_retry").is_some();
+    if has_targeted_hint
+        && durable_source_agent_execution_id.is_some()
+        && agent_execution_stage_id.is_none()
+    {
+        anyhow::bail!(
+            "advance_run_source_agent_mismatch: targeted InvokeAgent {invoke_work_item_id} source agent has no durable stage"
+        );
+    }
     if has_targeted_hint && source_stage_execution_id.is_none() {
         anyhow::bail!(
             "advance_run_source_target_mismatch: targeted InvokeAgent {invoke_work_item_id} has no durable source stage"
         );
     }
 
-    let active_by_id = if let Some(authority_id) = source_retry_authority_id.as_deref() {
-        find_active_retry_authority_by_id_tx(tx, run_id, authority_id).await?
+    let active_by_target = if let Some(target_id) = source_stage_execution_id.as_deref() {
+        find_active_retry_authority_by_target_tx(tx, run_id, target_id).await?
     } else {
         None
     };
-    let active_by_target = if active_by_id.is_none() {
-        if let Some(target_id) = source_stage_execution_id.as_deref() {
-            find_active_retry_authority_by_target_tx(tx, run_id, target_id).await?
-        } else {
-            None
-        }
+    let active_by_id = if let Some(authority_id) = source_retry_authority_id.as_deref() {
+        find_active_retry_authority_by_id_tx(tx, run_id, authority_id).await?
     } else {
         None
     };
@@ -2433,30 +2410,6 @@ async fn build_post_invoke_advance_payload_tx(
         (None, None) => None,
     };
     if has_targeted_hint && active_authority.is_none() {
-        record_p092_retry_payload_mismatch_tx(
-            tx,
-            run_id,
-            invoke_work_item_id,
-            None,
-            source_stage_execution_id.as_deref(),
-            claimed_agent_execution_id.as_deref(),
-            "retry_authority_missing_for_targeted_invoke",
-            serde_json::json!({
-                "run_id": run_id,
-                "target_stage_execution_id": source_stage_execution_id,
-                "retry_authority_id": serde_json::Value::Null,
-                "completed_agent_execution_id": claimed_agent_execution_id,
-                "invoke_work_item_id": invoke_work_item_id,
-            }),
-            serde_json::json!({
-                "payload_retry_authority_id": source_retry_authority_id,
-                "payload_target_stage_execution_id": explicit_target_stage_execution_id,
-                "source_stage_execution_id": source_payload.pointer("/targeted_retry/source_stage_execution_id").and_then(|value| value.as_str()),
-                "source_agent_execution_id": source_payload.pointer("/targeted_retry/source_agent_execution_id").and_then(|value| value.as_str()),
-                "source_work_item_id": source_payload.pointer("/targeted_retry/source_work_item_id").and_then(|value| value.as_str()),
-            }),
-        )
-        .await?;
         anyhow::bail!(
             "advance_run_source_authority_mismatch: targeted InvokeAgent {invoke_work_item_id} has no active retry authority"
         );
@@ -2502,74 +2455,12 @@ async fn build_post_invoke_advance_payload_tx(
         }
     }
     if let Some(active) = active_authority.as_ref() {
-        let authority_target: String = active.get("target_stage_execution_id");
-        if let Some(explicit_target_stage_execution_id) =
-            explicit_target_stage_execution_id.as_deref()
-        {
-            if explicit_target_stage_execution_id != authority_target
-                && claimed_agent_execution_id.is_none()
-            {
-                let retry_authority_id: String = active.get("id");
-                record_p092_retry_payload_mismatch_tx(
-                    tx,
-                    run_id,
-                    invoke_work_item_id,
-                    Some(&retry_authority_id),
-                    Some(&authority_target),
-                    None,
-                    "retry_authority_missing_for_targeted_invoke",
-                    serde_json::json!({
-                        "run_id": run_id,
-                        "target_stage_execution_id": authority_target,
-                        "retry_authority_id": retry_authority_id,
-                        "invoke_work_item_id": invoke_work_item_id,
-                    }),
-                    serde_json::json!({
-                        "payload_target_stage_execution_id": explicit_target_stage_execution_id,
-                        "source_stage_execution_id": source_payload.pointer("/targeted_retry/source_stage_execution_id").and_then(|value| value.as_str()),
-                        "source_agent_execution_id": source_payload.pointer("/targeted_retry/source_agent_execution_id").and_then(|value| value.as_str()),
-                        "source_work_item_id": source_payload.pointer("/targeted_retry/source_work_item_id").and_then(|value| value.as_str()),
-                    }),
-                )
-                .await?;
+        if let Some(source_stage_execution_id) = source_stage_execution_id.as_deref() {
+            let authority_target: String = active.get("target_stage_execution_id");
+            if authority_target != source_stage_execution_id {
                 anyhow::bail!(
-                    "advance_run_source_target_mismatch: targeted InvokeAgent {invoke_work_item_id} has stale target {explicit_target_stage_execution_id} but no current completed agent truth for authority target {authority_target}"
+                    "advance_run_source_target_mismatch: source invoke {invoke_work_item_id} stage {source_stage_execution_id} does not match authority target {authority_target}"
                 );
-            }
-        }
-        if let Some(claimed_agent_execution_id) = claimed_agent_execution_id.as_deref() {
-            if let Some(claimed_stage_id) =
-                find_agent_execution_stage_id_tx(tx, claimed_agent_execution_id).await?
-            {
-                if claimed_stage_id.to_string() != authority_target {
-                    let retry_authority_id: String = active.get("id");
-                    record_p092_retry_payload_mismatch_tx(
-                        tx,
-                        run_id,
-                        invoke_work_item_id,
-                        Some(&retry_authority_id),
-                        Some(&authority_target),
-                        Some(claimed_agent_execution_id),
-                        "retry_authority_target_agent_stage_mismatch",
-                        serde_json::json!({
-                            "run_id": run_id,
-                            "target_stage_execution_id": authority_target,
-                            "retry_authority_id": retry_authority_id,
-                            "completed_agent_execution_id": claimed_agent_execution_id,
-                            "invoke_work_item_id": invoke_work_item_id,
-                        }),
-                        serde_json::json!({
-                            "claimed_stage_execution_id": claimed_stage_id.to_string(),
-                            "source_stage_execution_id": source_payload.pointer("/targeted_retry/source_stage_execution_id").and_then(|value| value.as_str()),
-                            "source_agent_execution_id": source_payload.pointer("/targeted_retry/source_agent_execution_id").and_then(|value| value.as_str()),
-                            "source_work_item_id": source_payload.pointer("/targeted_retry/source_work_item_id").and_then(|value| value.as_str()),
-                        }),
-                    )
-                    .await?;
-                    anyhow::bail!(
-                        "retry_authority_target_agent_stage_mismatch: source invoke {invoke_work_item_id} claimed agent {claimed_agent_execution_id} stage {claimed_stage_id} does not match authority target {authority_target}"
-                    );
-                }
             }
         }
     }
@@ -2602,7 +2493,7 @@ async fn build_post_invoke_advance_payload_tx(
         payload["source_work_item_id"] = serde_json::json!(invoke_work_item_id);
         payload["source_invoke_work_item_id"] = serde_json::json!(invoke_work_item_id);
         payload["source_stage_execution_id"] = serde_json::json!(target_id);
-        if let Some(source_agent_execution_id) = source_agent_execution_id.as_deref() {
+        if let Some(source_agent_execution_id) = durable_source_agent_execution_id.as_deref() {
             payload["source_agent_execution_id"] = serde_json::json!(source_agent_execution_id);
         }
         return Ok((payload.to_string(), Some(stage_id.to_string())));
@@ -2635,63 +2526,13 @@ async fn find_agent_execution_stage_id_tx(
         .transpose()
 }
 
-async fn record_p092_retry_payload_mismatch_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    run_id: &str,
-    invoke_work_item_id: &str,
-    retry_authority_id: Option<&str>,
-    target_stage_execution_id: Option<&str>,
-    completed_agent_execution_id: Option<&str>,
-    reason_code: &str,
-    current_json: serde_json::Value,
-    provenance_json: serde_json::Value,
-) -> Result<()> {
-    let now = Utc::now();
-    let run_id = run_id
-        .parse::<RunId>()
-        .context("parse P092 mismatch run_id")?;
-    let target_stage_execution_id = target_stage_execution_id
-        .map(|raw| raw.parse::<StageExecutionId>())
-        .transpose()
-        .context("parse P092 mismatch target_stage_execution_id")?;
-    let idempotency_key = format!(
-        "p092:{}:{}:{}:{}",
-        run_id,
-        invoke_work_item_id,
-        retry_authority_id.unwrap_or("missing-authority"),
-        completed_agent_execution_id.unwrap_or("missing-agent")
-    );
-    let event = RetryPayloadRecoveryEvent {
-        idempotency_key,
-        run_id,
-        invoke_work_item_id: invoke_work_item_id.to_string(),
-        retry_authority_id: retry_authority_id.map(str::to_string),
-        target_stage_execution_id,
-        completed_agent_execution_id: completed_agent_execution_id.map(str::to_string),
-        reason_code: reason_code.to_string(),
-        mode: "enforce".to_string(),
-        repaired: false,
-        current_json,
-        provenance_json: Some(provenance_json),
-        repaired_fields_json: Some(serde_json::json!([])),
-        diagnostic_json: Some(serde_json::json!({
-            "fail_closed": true,
-            "disabled": 0,
-        })),
-        created_at: now,
-        updated_at: now,
-    };
-    crate::repos::retry_payload_recovery_events::upsert_tx(tx, &event).await
-}
-
 async fn find_active_retry_authority_by_target_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: &str,
     target_id: &str,
 ) -> Result<Option<sqlx::sqlite::SqliteRow>> {
     let rows = sqlx::query(
-        r#"SELECT id, stage_id, target_stage_execution_id, source_invoke_work_item_id,
-                  source_agent_execution_id
+        r#"SELECT id, stage_id, target_stage_execution_id, source_invoke_work_item_id
            FROM retry_stage_execution_authorities
            WHERE target_stage_execution_id = ?1
              AND run_id = ?2
@@ -2717,8 +2558,7 @@ async fn find_active_retry_authority_by_id_tx(
     authority_id: &str,
 ) -> Result<Option<sqlx::sqlite::SqliteRow>> {
     sqlx::query(
-        r#"SELECT id, stage_id, target_stage_execution_id, source_invoke_work_item_id,
-                  source_agent_execution_id
+        r#"SELECT id, stage_id, target_stage_execution_id, source_invoke_work_item_id
            FROM retry_stage_execution_authorities
            WHERE id = ?1
              AND run_id = ?2
@@ -3180,10 +3020,12 @@ mod tests {
         let pool = crate::pool::create_pool("sqlite::memory:")
             .await
             .expect("in-memory pool");
-        let writer = std::sync::Arc::new(crate::writer::DbWriter::new(pool.clone()));
-        crate::writer::register_shared_writer(&pool, writer)
-            .await
-            .unwrap();
+        crate::writer::register_shared_writer(
+            &pool,
+            std::sync::Arc::new(crate::writer::DbWriter::new(pool.clone())),
+        )
+        .await
+        .expect("register shared writer");
         pool
     }
 
@@ -3905,181 +3747,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p092_post_invoke_ignores_targeted_retry_source_agent_for_current_target() {
-        let pool = test_pool().await;
-        let run_id = RunId::new();
-        let target = StageExecutionId::new();
-        let stale_source_stage = StageExecutionId::new();
-        let current_agent_execution_id = AgentExecutionId::new();
-        let stale_source_agent_execution_id = AgentExecutionId::new();
-        seed_p091_post_invoke_rows(
-            &pool,
-            run_id,
-            target,
-            current_agent_execution_id,
-            "invoke-post-invoke",
-        )
-        .await;
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"INSERT INTO stage_executions
-               (id, run_id, stage_id, label, status, iteration, attempt_number, started_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
-        )
-        .bind(stale_source_stage.to_string())
-        .bind(run_id.to_string())
-        .bind("implement")
-        .bind("Implement")
-        .bind("failed")
-        .bind(0_i64)
-        .bind(1_i64)
-        .bind(&now)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"INSERT INTO agent_executions
-               (id, stage_execution_id, agent_id, provider, status, started_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
-        )
-        .bind(stale_source_agent_execution_id.to_string())
-        .bind(stale_source_stage.to_string())
-        .bind("code_writer")
-        .bind("junie")
-        .bind("failed")
-        .bind(&now)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let mut tx = crate::pool::begin_immediate_with_retry(&pool, "p092-post-invoke")
-            .await
-            .unwrap();
-        let (payload_json, stage_id) = build_post_invoke_advance_payload_tx(
-            &mut tx,
-            &run_id.to_string(),
-            "invoke_agent_completed",
-            "completed_invoke_work_item_id",
-            "invoke-post-invoke",
-            &serde_json::json!({
-                "run_id": run_id.to_string(),
-                "stage_id": "implement",
-                "retry_authority_id": "auth-post-invoke",
-                "targeted_retry": {
-                    "retry_authority_id": "auth-post-invoke",
-                    "source_stage_execution_id": stale_source_stage.to_string(),
-                    "source_agent_execution_id": stale_source_agent_execution_id.to_string()
-                },
-                "p058_claimed": {
-                    "agent_execution_id": current_agent_execution_id.to_string()
-                }
-            })
-            .to_string(),
-        )
-        .await
-        .unwrap();
-        tx.commit().await.unwrap();
-
-        let payload = AdvanceRunPayloadV1::parse_json(&payload_json).unwrap();
-        assert_eq!(stage_id.as_deref(), Some("implement"));
-        assert_eq!(payload.target_stage_execution_id, Some(target));
-        assert_eq!(payload.source_stage_execution_id, Some(target));
-        assert_eq!(
-            payload.source_agent_execution_id.as_deref(),
-            Some(current_agent_execution_id.to_string().as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn p092_post_invoke_claimed_agent_on_wrong_stage_fails_closed() {
-        let pool = test_pool().await;
-        let run_id = RunId::new();
-        let target = StageExecutionId::new();
-        let wrong_stage = StageExecutionId::new();
-        let authority_agent_execution_id = AgentExecutionId::new();
-        let wrong_agent_execution_id = AgentExecutionId::new();
-        seed_p091_post_invoke_rows(
-            &pool,
-            run_id,
-            target,
-            authority_agent_execution_id,
-            "invoke-post-invoke",
-        )
-        .await;
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"INSERT INTO stage_executions
-               (id, run_id, stage_id, label, status, iteration, attempt_number, started_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
-        )
-        .bind(wrong_stage.to_string())
-        .bind(run_id.to_string())
-        .bind("implement")
-        .bind("Wrong")
-        .bind("running")
-        .bind(0_i64)
-        .bind(3_i64)
-        .bind(&now)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"INSERT INTO agent_executions
-               (id, stage_execution_id, agent_id, provider, status, started_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
-        )
-        .bind(wrong_agent_execution_id.to_string())
-        .bind(wrong_stage.to_string())
-        .bind("code_writer")
-        .bind("junie")
-        .bind("completed")
-        .bind(&now)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let mut tx = crate::pool::begin_immediate_with_retry(&pool, "p092-post-invoke-mismatch")
-            .await
-            .unwrap();
-        let error = build_post_invoke_advance_payload_tx(
-            &mut tx,
-            &run_id.to_string(),
-            "invoke_agent_completed",
-            "completed_invoke_work_item_id",
-            "invoke-post-invoke",
-            &serde_json::json!({
-                "run_id": run_id.to_string(),
-                "stage_id": "implement",
-                "retry_authority_id": "auth-post-invoke",
-                "p058_claimed": {
-                    "agent_execution_id": wrong_agent_execution_id.to_string()
-                }
-            })
-            .to_string(),
-        )
-        .await
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("retry_authority_target_agent_stage_mismatch"));
-        tx.commit().await.unwrap();
-
-        let events = crate::repos::retry_payload_recovery_events::list_by_run(&pool, run_id)
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].reason_code,
-            "retry_authority_target_agent_stage_mismatch"
-        );
-        assert_eq!(
-            events[0].retry_authority_id.as_deref(),
-            Some("auth-post-invoke")
-        );
-        assert!(!events[0].repaired);
-    }
-
-    #[tokio::test]
     async fn p091_normal_post_invoke_terminalizes_stale_targeted_authority_from_prior_retry() {
         let pool = test_pool().await;
         let run_id = RunId::new();
@@ -4183,63 +3850,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p092_post_invoke_missing_active_authority_records_nullable_history_event() {
-        let pool = test_pool().await;
-        let run_id = RunId::new();
-        let target = StageExecutionId::new();
-        seed_p091_post_invoke_rows(
-            &pool,
-            run_id,
-            target,
-            AgentExecutionId::new(),
-            "invoke-post-invoke",
-        )
-        .await;
-        sqlx::query("DELETE FROM retry_stage_execution_authorities WHERE id = ?1")
-            .bind("auth-post-invoke")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let mut tx =
-            crate::pool::begin_immediate_with_retry(&pool, "p092-post-invoke-missing-authority")
-                .await
-                .unwrap();
-        let error = build_post_invoke_advance_payload_tx(
-            &mut tx,
-            &run_id.to_string(),
-            "invoke_agent_completed",
-            "completed_invoke_work_item_id",
-            "invoke-post-invoke",
-            &serde_json::json!({
-                "run_id": run_id.to_string(),
-                "stage_id": "implement",
-                "target_stage_execution_id": target.to_string(),
-                "retry_authority_id": "auth-post-invoke"
-            })
-            .to_string(),
-        )
-        .await
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("advance_run_source_authority_mismatch"));
-        tx.commit().await.unwrap();
-
-        let events = crate::repos::retry_payload_recovery_events::list_by_run(&pool, run_id)
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].reason_code,
-            "retry_authority_missing_for_targeted_invoke"
-        );
-        assert!(events[0].retry_authority_id.is_none());
-        assert_eq!(events[0].target_stage_execution_id, Some(target));
-        assert!(!events[0].repaired);
-    }
-
-    #[tokio::test]
     async fn p091_post_invoke_authority_target_mismatch_fails_closed() {
         let pool = test_pool().await;
         let run_id = RunId::new();
@@ -4276,21 +3886,50 @@ mod tests {
         assert!(error
             .to_string()
             .contains("advance_run_source_target_mismatch"));
-        tx.commit().await.unwrap();
+    }
 
-        let events = crate::repos::retry_payload_recovery_events::list_by_run(&pool, run_id)
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].reason_code,
-            "retry_authority_missing_for_targeted_invoke"
-        );
-        assert_eq!(
-            events[0].retry_authority_id.as_deref(),
-            Some("auth-post-invoke")
-        );
-        assert!(!events[0].repaired);
+    #[tokio::test]
+    async fn p058_post_invoke_rejects_spoofed_source_agent_when_claimed_agent_is_durable_truth() {
+        let pool = test_pool().await;
+        let run_id = RunId::new();
+        let target = StageExecutionId::new();
+        let claimed_agent_execution_id = AgentExecutionId::new();
+        seed_p091_post_invoke_rows(
+            &pool,
+            run_id,
+            target,
+            claimed_agent_execution_id,
+            "invoke-post-invoke",
+        )
+        .await;
+
+        let mut tx =
+            crate::pool::begin_immediate_with_retry(&pool, "p058-post-invoke-spoofed-source-agent")
+                .await
+                .unwrap();
+        let error = build_post_invoke_advance_payload_tx(
+            &mut tx,
+            &run_id.to_string(),
+            "invoke_agent_completed",
+            "completed_invoke_work_item_id",
+            "invoke-post-invoke",
+            &serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "implement",
+                "target_stage_execution_id": target.to_string(),
+                "retry_authority_id": "auth-post-invoke",
+                "source_agent_execution_id": AgentExecutionId::new().to_string(),
+                "p058_claimed": {
+                    "agent_execution_id": claimed_agent_execution_id.to_string()
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("advance_run_source_agent_mismatch"));
     }
 
     #[tokio::test]
@@ -4427,170 +4066,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_requeue_ignores_p092_diagnostic_when_claimed_agent_has_no_valid_outputs() {
-        let pool = test_pool().await;
-        let run_id = RunId::new();
-        let stage_execution_id = StageExecutionId::new();
-        let agent_execution_id = AgentExecutionId::new();
-        let now = Utc::now();
-        let now_raw = now.to_rfc3339();
-
-        sqlx::query(
-            r#"INSERT INTO ideas (id, title, body, status, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5)"#,
-        )
-        .bind("idea-p092-generic-requeue")
-        .bind("P092 generic requeue")
-        .bind("P092")
-        .bind("active")
-        .bind(&now_raw)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"INSERT INTO runs
-               (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
-        )
-        .bind(run_id.to_string())
-        .bind("idea-p092-generic-requeue")
-        .bind("running")
-        .bind("wf-p092")
-        .bind("P092")
-        .bind("/tmp/ws")
-        .bind("/tmp/artifacts")
-        .bind(&now_raw)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"INSERT INTO stage_executions
-               (id, run_id, stage_id, label, status, iteration, attempt_number, started_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
-        )
-        .bind(stage_execution_id.to_string())
-        .bind(run_id.to_string())
-        .bind("review")
-        .bind("Review")
-        .bind("running")
-        .bind(0_i64)
-        .bind(1_i64)
-        .bind(&now_raw)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"INSERT INTO agent_executions
-               (id, stage_execution_id, agent_id, provider, status, started_at, completed_at, owner_kind, owner_id)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
-        )
-        .bind(agent_execution_id.to_string())
-        .bind(stage_execution_id.to_string())
-        .bind("prepush_code_reviewer")
-        .bind("codex_acp")
-        .bind("completed")
-        .bind(&now_raw)
-        .bind(&now_raw)
-        .bind("stage_execution")
-        .bind(stage_execution_id.to_string())
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"INSERT INTO agent_execution_runtime_facts
-               (agent_execution_id, output_settlement, valid_required_outputs, created_at, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5)"#,
-        )
-        .bind(agent_execution_id.to_string())
-        .bind("none")
-        .bind(0_i64)
-        .bind(&now_raw)
-        .bind(&now_raw)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let item = WorkItem {
-            id: "invoke-p092-diagnostic-without-outputs".to_string(),
-            kind: WorkItemKind::InvokeAgent,
-            payload_json: serde_json::json!({
-                "run_id": run_id.to_string(),
-                "stage_id": "review",
-                "stage_execution_id": stage_execution_id.to_string(),
-                "p058_claimed": {
-                    "agent_execution_id": agent_execution_id.to_string(),
-                    "session_generation_id": uuid::Uuid::new_v4().to_string()
-                }
-            })
-            .to_string(),
-            status: WorkItemStatus::Running,
-            run_id: Some(run_id),
-            stage_id: Some("review".to_string()),
-            created_at: now,
-            scheduled_at: now,
-            attempt_count: 1,
-            last_error: None,
-        };
-        enqueue(&pool, &item)
-            .await
-            .expect("insert running work item");
-
-        crate::repos::retry_payload_recovery_events::upsert(
-            &pool,
-            &RetryPayloadRecoveryEvent {
-                idempotency_key: format!("p092:{}:{}:auth:{}", run_id, item.id, agent_execution_id),
-                run_id,
-                invoke_work_item_id: item.id.clone(),
-                retry_authority_id: Some("auth".to_string()),
-                target_stage_execution_id: Some(stage_execution_id),
-                completed_agent_execution_id: Some(agent_execution_id.to_string()),
-                reason_code: "valid_retry_invoke_completion_recovered".to_string(),
-                mode: "diagnostic".to_string(),
-                repaired: false,
-                current_json: serde_json::json!({}),
-                provenance_json: Some(serde_json::json!({})),
-                repaired_fields_json: Some(serde_json::json!([])),
-                diagnostic_json: Some(serde_json::json!({
-                    "disabled": 0,
-                    "would_repair": true,
-                })),
-                created_at: now,
-                updated_at: now,
-            },
-        )
-        .await
-        .unwrap();
-
-        let requeued = {
-            let mut tx = crate::pool::begin_immediate_with_retry(
-                &pool,
-                "test.startup_requeue_ignores_p092_without_outputs",
-            )
-            .await
-            .unwrap();
-            let count = requeue_running_invoke_agent_on_startup_tx(
-                &mut tx,
-                now + Duration::seconds(5),
-                "startup_repair_abandoned_invoke_agent",
-            )
-            .await
-            .unwrap();
-            tx.commit().await.unwrap();
-            count
-        };
-
-        assert_eq!(requeued, 1);
-        let requeued_item = find_by_id(&pool, &item.id)
-            .await
-            .unwrap()
-            .expect("requeued item");
-        assert_eq!(requeued_item.status, WorkItemStatus::Pending);
-        let payload: serde_json::Value =
-            serde_json::from_str(&requeued_item.payload_json).expect("payload json");
-        assert!(payload.get("p058_claimed").is_none());
-    }
-
-    #[tokio::test]
     async fn startup_recovery_completes_running_invoke_when_agent_already_has_valid_outputs() {
         let pool = test_pool().await;
         let run_id = RunId::new();
@@ -4721,6 +4196,13 @@ mod tests {
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
                 actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
             },
         )
         .await
@@ -4758,7 +4240,7 @@ mod tests {
             },
         )
         .await
-        .expect("insert running work item");
+        .expect("insert targeted running work item");
 
         let completed = complete_running_invoke_agents_with_terminal_valid_outputs_on_startup(
             &pool,
@@ -4913,6 +4395,13 @@ mod tests {
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
                 actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
             },
         )
         .await

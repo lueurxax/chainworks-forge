@@ -11,6 +11,7 @@ pub mod commands;
 pub mod continuation;
 pub mod discovery;
 pub mod error_sanitizer;
+pub mod escalation;
 pub mod events;
 pub mod idea;
 pub mod ids;

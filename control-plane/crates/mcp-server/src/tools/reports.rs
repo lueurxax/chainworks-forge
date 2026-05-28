@@ -1515,6 +1515,13 @@ mod tests {
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
                 actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
             },
         )
         .await
@@ -2305,6 +2312,13 @@ mod tests {
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         };
         let exec_one_id = exec_one.id;
         db::repos::agent_executions::insert(&pool, &exec_one)

@@ -73,6 +73,10 @@ pub struct AgentCatalogFile {
     pub backend_profiles: Option<HashMap<String, BackendProfile>>,
     pub permission_profiles: Option<serde_yaml::Value>,
     pub agents: Option<Vec<AgentEntry>>,
+    /// P058: Escalation policy declarations for ordered agent retry/escalation chains.
+    /// Absent means no escalation policies apply to this catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_policies: Option<Vec<crate::escalation_policy::EscalationPolicyYaml>>,
 }
 
 /// A skill definition from the catalog's `skills:` section.
