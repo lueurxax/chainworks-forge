@@ -172,7 +172,7 @@ extension EscalationSnapshot {
         pausedChainCount: 0
     )
 
-    static func build(
+    nonisolated static func build(
         runId: String,
         chains: [EscalationChainStateDTO],
         readPipelineState: EscalationReadPipelineState = .ready

@@ -314,6 +314,168 @@ struct EscalationPauseCard: View {
     }
 }
 
+struct EscalationCommandMirrorRow: View {
+    let title: String
+    let subtitle: String
+    let command: String
+    var onCopyCommand: ((String) -> Void)?
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "terminal")
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+            Button("Copy command") {
+                onCopyCommand?(command)
+            }
+            .buttonStyle(.bordered)
+            .accessibilityLabel("Copy escalation command for \(title)")
+        }
+        .padding(10)
+        .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("p058-escalation-command-row")
+    }
+}
+
+struct EscalationCommandMirrorList: View {
+    let snapshot: EscalationSnapshot
+    var onCopyCommand: ((String) -> Void)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Operator commands")
+                .font(.headline)
+            ForEach(commandRows, id: \.command) { row in
+                EscalationCommandMirrorRow(
+                    title: row.title,
+                    subtitle: row.subtitle,
+                    command: row.command,
+                    onCopyCommand: onCopyCommand
+                )
+            }
+        }
+        .accessibilityIdentifier("p058-escalation-command-list")
+    }
+
+    private var commandRows: [(title: String, subtitle: String, command: String)] {
+        snapshot.activeChains.compactMap { chain in
+            guard let reason = chain.pauseReasonRaw else { return nil }
+            let title = EscalationPresentationStyle.pauseTitle(for: reason)
+            let command = [
+                "reports.get",
+                "run_id=\(chain.runId)",
+                "stage_id=\(chain.stageId)",
+                "ledger_id=\(chain.id)",
+            ].joined(separator: " ")
+            return (
+                title: title,
+                subtitle: chain.operatorActionHint ?? "Inspect the escalation readback before taking action.",
+                command: command
+            )
+        }
+    }
+}
+
+enum EscalationScreenState: String, CaseIterable, Sendable {
+    case unavailable
+    case subscribing
+    case ready
+    case stale
+    case disconnected
+    case decodeFailed
+    case paused
+    case drift
+    case killSwitch
+}
+
+enum EscalationScreenStateMatrix {
+    static func states(for snapshot: EscalationSnapshot) -> [EscalationScreenState] {
+        var states: [EscalationScreenState] = []
+        switch snapshot.readPipelineState {
+        case .unavailable:
+            states.append(.unavailable)
+        case .subscribing:
+            states.append(.subscribing)
+        case .ready:
+            states.append(.ready)
+        case .stale:
+            states.append(.stale)
+        case .transportDisconnected:
+            states.append(.disconnected)
+        case .decodeFailed:
+            states.append(.decodeFailed)
+        }
+        if snapshot.pausedChainCount > 0 {
+            states.append(.paused)
+        }
+        if snapshot.isPolicyDrift {
+            states.append(.drift)
+        }
+        if snapshot.isKillSwitchEngaged {
+            states.append(.killSwitch)
+        }
+        return states
+    }
+
+    static func accessibilityLabel(for snapshot: EscalationSnapshot) -> String {
+        states(for: snapshot)
+            .map(\.rawValue)
+            .joined(separator: ", ")
+    }
+}
+
+struct EscalationMenuBarList: View {
+    let snapshots: [EscalationSnapshot]
+    var onOpenRun: ((String) -> Void)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Escalation attention")
+                .font(.headline)
+            if attentionSnapshots.isEmpty {
+                Text("No paused escalation chains")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(attentionSnapshots, id: \.runId) { snapshot in
+                    Button {
+                        onOpenRun?(snapshot.runId)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: EscalationPresentationStyle.stateSymbol(for: snapshot))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(snapshot.runId)
+                                    .font(.caption.weight(.semibold))
+                                Text(EscalationScreenStateMatrix.accessibilityLabel(for: snapshot))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Open escalation run \(snapshot.runId)")
+                }
+            }
+        }
+        .padding(10)
+        .frame(minWidth: 260)
+        .accessibilityIdentifier("p058-escalation-menubar-list")
+    }
+
+    private var attentionSnapshots: [EscalationSnapshot] {
+        snapshots.filter { $0.pausedChainCount > 0 || $0.isPolicyDrift || $0.isKillSwitchEngaged }
+    }
+}
+
 struct EscalationTraceTimeline: View {
     let traceJSONRedacted: String?
     var initiallyExpanded: Bool = false
@@ -416,10 +578,11 @@ struct EscalationInspector: View {
             if let paused = snapshot.activeChains.first(where: { $0.statusRaw == "paused" || $0.statusRaw == "exhausted" }) {
                 EscalationPauseCard(chain: paused)
             }
+            EscalationCommandMirrorList(snapshot: snapshot)
             EscalationTraceTimeline(traceJSONRedacted: traceJSONRedacted)
         }
         .padding(16)
+        .accessibilityLabel(EscalationScreenStateMatrix.accessibilityLabel(for: snapshot))
         .accessibilityIdentifier("p058-escalation-inspector")
     }
 }
-

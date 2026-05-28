@@ -289,6 +289,13 @@ struct Proposal058Tests {
         _ = EscalationBannerStack(snapshot: snapshot)
         _ = EscalationLineageView(snapshot: snapshot)
         _ = EscalationPauseCard(chain: chain)
+        _ = EscalationCommandMirrorRow(
+            title: "Escalation chain exhausted",
+            subtitle: "Open runbook before resuming.",
+            command: "reports.get run_id=run-ui"
+        )
+        _ = EscalationCommandMirrorList(snapshot: snapshot)
+        _ = EscalationMenuBarList(snapshots: [snapshot])
         _ = EscalationTraceTimeline(traceJSONRedacted: #"{"schema_version":"p058_escalation_trace_redacted_v1","events":[]}"#)
         _ = DriftReviewSheet(
             frozenPolicyHash: "sha256:frozen",
@@ -297,6 +304,71 @@ struct Proposal058Tests {
             onClose: {}
         )
         _ = EscalationInspector(snapshot: snapshot, traceJSONRedacted: nil)
+    }
+
+    @Test("P058 screen-state matrix covers ready stale disconnected paused drift and kill-switch states")
+    func screenStateMatrixCoversProposalStates() {
+        let paused = makeChain(
+            id: "ledger-state-paused",
+            status: "paused",
+            pauseReason: EscalationPauseReasonCode.escalationChainExhausted.rawValue
+        )
+        let drift = makeChain(
+            id: "ledger-state-drift",
+            status: "paused",
+            pauseReason: EscalationPauseReasonCode.escalationPolicyDrift.rawValue
+        )
+        let killSwitch = makeChain(
+            id: "ledger-state-kill",
+            status: "paused",
+            pauseReason: EscalationPauseReasonCode.escalationKillSwitchEngaged.rawValue
+        )
+
+        let ready = EscalationSnapshot.build(runId: "run-ready", chains: [paused])
+        let stale = EscalationSnapshot.build(
+            runId: "run-stale",
+            chains: [paused],
+            readPipelineState: .stale
+        )
+        let disconnected = EscalationSnapshot.build(
+            runId: "run-disconnected",
+            chains: [paused],
+            readPipelineState: .transportDisconnected
+        )
+        let driftSnapshot = EscalationSnapshot.build(runId: "run-drift", chains: [drift])
+        let killSwitchSnapshot = EscalationSnapshot.build(runId: "run-kill", chains: [killSwitch])
+
+        #expect(EscalationScreenStateMatrix.states(for: ready).contains(.ready))
+        #expect(EscalationScreenStateMatrix.states(for: ready).contains(.paused))
+        #expect(EscalationScreenStateMatrix.states(for: stale).contains(.stale))
+        #expect(EscalationScreenStateMatrix.states(for: disconnected).contains(.disconnected))
+        #expect(EscalationScreenStateMatrix.states(for: driftSnapshot).contains(.drift))
+        #expect(EscalationScreenStateMatrix.states(for: killSwitchSnapshot).contains(.killSwitch))
+    }
+
+    @Test("P058 dock badge and menu bar attention aggregate paused escalation snapshots")
+    func dockBadgeAndMenuBarAggregateEscalationAttention() {
+        let service = NotificationService()
+        let paused = EscalationSnapshot.build(
+            runId: "run-menu",
+            chains: [
+                makeChain(
+                    id: "ledger-menu",
+                    status: "paused",
+                    pauseReason: EscalationPauseReasonCode.escalationChainExhausted.rawValue
+                ),
+            ]
+        )
+
+        service.applyP058EscalationSnapshots([paused])
+
+        #expect(service.pendingAttentionCount == 1)
+        #expect(service.isMenuBarEnabled)
+
+        service.applyP058EscalationSnapshots([])
+
+        #expect(service.pendingAttentionCount == 0)
+        #expect(!service.isMenuBarEnabled)
     }
 
     @Test("P031 run detail query includes P058 escalation readback")

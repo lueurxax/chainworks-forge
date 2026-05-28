@@ -815,6 +815,96 @@ mod tests {
     }
 
     #[test]
+    fn proposal_058_required_metric_names_are_declared() {
+        for metric in [
+            "escalation_chains_started_total",
+            "escalation_tier_success_rate",
+            "time_to_success_after_escalation_seconds",
+            "escalation_pause_total",
+            "false_escalation_rate",
+            "policy_compile_failure_total",
+            "shadow_tier_selection_match_rate",
+            "provider_session_kill_latency_seconds",
+            "daemon_outage_credit_seconds_total",
+            "fan_out_blocked_dwell_seconds",
+            "launch_recycle_storm_total",
+            "capacity_probe_failure_total",
+            "escalation_drift_pending_ack_dwell_seconds",
+            "tier_dwell_share_of_chain",
+            "chain_exhausted_total_by_terminal_tier_kind",
+            "escalation_repeated_digest_no_progress_total",
+            "escalation_commit_contention_total",
+            "escalation_retry_after_parse_anomaly_total",
+            "escalation_provider_late_frame_after_detach_total",
+        ] {
+            assert!(
+                P058_REQUIRED_METRICS.contains(&metric),
+                "missing required P058 metric declaration: {metric}"
+            );
+        }
+
+        let chains_started_before = get_counter("escalation_chains_started_total");
+        let tier_success_before = get_counter("escalation_tier_success_rate");
+        let tier_success_samples_before =
+            get_p058_metric_sample_count("escalation_tier_success_rate");
+        let time_to_success_samples_before =
+            get_p058_metric_sample_count("time_to_success_after_escalation_seconds");
+        let kill_latency_samples_before =
+            get_p058_metric_sample_count("provider_session_kill_latency_seconds");
+        let pause_before = get_counter("escalation_pause_total:provider_session_force_detached");
+        let exhausted_before =
+            get_counter("chain_exhausted_total_by_terminal_tier_kind:same_backend_retry");
+        let no_progress_before = get_counter("escalation_repeated_digest_no_progress_total");
+
+        record_escalation_chain_started("policy-p058", Some("same_backend_retry"));
+        record_escalation_event(
+            "escalation.tier_success",
+            None,
+            None,
+            Some(r#"{"metric_numerator": 1, "metric_denominator": 1}"#),
+        );
+        record_escalation_event(
+            "escalation.time_to_success_recorded",
+            None,
+            None,
+            Some(r#"{"metric_sample_ms": 1200}"#),
+        );
+        record_escalation_event(
+            "escalation.provider_force_detach",
+            Some("provider_session_force_detached"),
+            None,
+            Some(r#"{"metric_sample_ms": 30}"#),
+        );
+        record_escalation_event(
+            "escalation.chain_exhausted",
+            Some("escalation_repeated_digest_no_progress"),
+            Some("same_backend_retry"),
+            None,
+        );
+
+        assert!(get_counter("escalation_chains_started_total") > chains_started_before);
+        assert!(get_counter("escalation_tier_success_rate") > tier_success_before);
+        assert!(
+            get_p058_metric_sample_count("escalation_tier_success_rate")
+                > tier_success_samples_before
+        );
+        assert!(
+            get_p058_metric_sample_count("time_to_success_after_escalation_seconds")
+                > time_to_success_samples_before
+        );
+        assert!(
+            get_p058_metric_sample_count("provider_session_kill_latency_seconds")
+                > kill_latency_samples_before
+        );
+        assert!(get_counter("escalation_pause_total:provider_session_force_detached") > pause_before);
+        assert!(
+            get_counter("chain_exhausted_total_by_terminal_tier_kind:same_backend_retry")
+                > exhausted_before
+        );
+        assert!(get_counter("escalation_repeated_digest_no_progress_total") > no_progress_before);
+    }
+
+    #[test]
     fn proposal_081_required_metric_names_are_declared_and_recordable() {
         for metric in [
             "p081_boundary_policy_enforcement_parity_percent",

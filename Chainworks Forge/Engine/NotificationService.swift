@@ -26,8 +26,10 @@ final class NotificationService {
     private var authorizationStatus: UNAuthorizationStatus?
     private var runAttentionCount: Int = 0
     private var operatorAlertAttentionCount: Int = 0
+    private var escalationAttentionCount: Int = 0
     private var userMenuBarEnabled: Bool = false
     private var operatorAlertForcesMenuBar: Bool = false
+    private var escalationForcesMenuBar: Bool = false
     private var deliveredOperatorAlertKeys: Set<String> = []
     private(set) var p081NativeDeliveryMetricEvents: [P081OperatorAlertNativeDeliveryMetricEvent] = []
 
@@ -117,7 +119,23 @@ final class NotificationService {
     func clearDockBadge() {
         runAttentionCount = 0
         operatorAlertAttentionCount = 0
+        escalationAttentionCount = 0
+        escalationForcesMenuBar = false
         deliveredOperatorAlertKeys.removeAll()
+        refreshMenuBarState()
+        refreshDockBadgeLabel()
+    }
+
+    // MARK: - P058 Escalation Attention
+
+    func applyP058EscalationSnapshots(_ snapshots: [EscalationSnapshot]) {
+        escalationAttentionCount = snapshots.reduce(0) { total, snapshot in
+            total + max(0, snapshot.pausedChainCount)
+                + (snapshot.isPolicyDrift ? 1 : 0)
+                + (snapshot.isKillSwitchEngaged ? 1 : 0)
+        }
+        escalationForcesMenuBar = escalationAttentionCount > 0
+        refreshMenuBarState()
         refreshDockBadgeLabel()
     }
 
@@ -204,14 +222,14 @@ final class NotificationService {
     }
 
     private func refreshDockBadgeLabel() {
-        pendingAttentionCount = max(0, runAttentionCount + operatorAlertAttentionCount)
+        pendingAttentionCount = max(0, runAttentionCount + operatorAlertAttentionCount + escalationAttentionCount)
         if let app = NSApp {
             app.dockTile.badgeLabel = pendingAttentionCount > 0 ? "\(pendingAttentionCount)" : nil
         }
     }
 
     private func refreshMenuBarState() {
-        isMenuBarEnabled = userMenuBarEnabled || operatorAlertForcesMenuBar
+        isMenuBarEnabled = userMenuBarEnabled || operatorAlertForcesMenuBar || escalationForcesMenuBar
     }
 
     private func isP081OperatorAlertSilenced(_ alert: P081OperatorAlert, now: Date) -> Bool {
