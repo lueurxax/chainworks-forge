@@ -6,7 +6,7 @@
 | Status | Draft |
 | Author | Engineer (single-engineer project) |
 | Depends on | Implemented live-handle continuation contract in [Agent Work Continuation](../reference/agent-work-continuation.md), [ACP Runtime Transport](../reference/acp-runtime-transport.md), [Local persistence write-budget contract](../reference/rust-control-plane.md#sqlite-write-serialization-and-gateway-dbwriter), [durable side-effect ledger](../reference/rust-control-plane.md#durable-side-effect-ledger) |
-| Related | P079 Contract-Aware Output Repair, P080 Continuous Stale Execution Reconciliation, P093 Agent Work Continuation Expansion Soak |
+| Related | P079 Contract-Aware Output Repair, P080 Continuous Stale Execution Reconciliation, P093 Agent Work Continuation Expansion Soak, P095 Two-Phase Agent Invocation |
 | Scope | Complete the remaining `provider_session_resurrection` implementation: start a new Chainworks-managed ACP process and attach/resume a known provider session id for adapters that support it, while preserving the existing fail-closed unsupported behavior for adapters that do not. |
 | Non-goal | Do not re-implement already shipped live-handle continuation, continuation readback, lead-auto live-handle admission, continuation metrics plumbing, or Phase 5 soak/scale evidence. P093 owns soak/scale only and must not be treated as owning provider-session resurrection implementation. |
 | Goal | Allow an operator to continue useful code-writer work from a provider session id even after Chainworks no longer owns the live ACP handle, without falling back to a fresh retry or losing provenance. |
@@ -417,6 +417,24 @@ Required tests and evidence:
     provider session id, resurrection phase, and resurrection result.
 18. Proposal gate: `./scripts/test-gate.sh proposal-086` covers the above or a
     focused `proposal-086-resurrection` gate is added and documented.
+
+## Relationship to P095: Two-Phase Agent Invocation
+
+P095 makes work and output settlement separate normal phases. In that model,
+P086 continuation is another work turn, not an output collection turn.
+
+Continuation prompts must follow P095 prompt minimalism:
+
+- continuation prompts carry the work objective and completion target;
+- continuation prompts do not include output artifact paths;
+- continuation prompts do not include `CHAINWORKS_OUTPUT` instructions;
+- continuation prompts do not rely on long negative-rule lists for safety.
+
+After a continuation turn completes or blocks, the server may still need to run
+normal deterministic readback and output collection before the execution can
+settle. P086 extends useful work context through live-handle or provider-session
+continuity; P095 defines the normal work/output separation that follows any
+work turn, including continuation.
 
 ## 7. Acceptance Criteria
 

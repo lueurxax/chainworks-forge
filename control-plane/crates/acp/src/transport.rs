@@ -389,6 +389,8 @@ struct ClaudeLocalActivitySummary {
     tool_uses: u64,
     tool_results: u64,
     user_tool_results: u64,
+    background_tasks_started: u64,
+    background_tasks_finished: u64,
     last_prompts: u64,
     type_counts: HashMap<String, u64>,
     last_event_type: Option<String>,
@@ -406,6 +408,7 @@ struct ClaudeLocalActivityMonitor {
     offset: u64,
     summary: ClaudeLocalActivitySummary,
     open_tool_use_ids: HashSet<String>,
+    open_background_task_ids: HashSet<String>,
 }
 
 impl ClaudeLocalActivityMonitor {
@@ -431,6 +434,7 @@ impl ClaudeLocalActivityMonitor {
             offset,
             summary: ClaudeLocalActivitySummary::default(),
             open_tool_use_ids: HashSet::new(),
+            open_background_task_ids: HashSet::new(),
         }
     }
 
@@ -440,7 +444,7 @@ impl ClaudeLocalActivityMonitor {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ClaudeLocalActivityObservation {
-                    should_extend_watchdog: self.has_open_tool_use(),
+                    should_extend_watchdog: self.has_open_local_activity(),
                     new_event_count: 0,
                 });
             }
@@ -490,7 +494,7 @@ impl ClaudeLocalActivityMonitor {
         }
 
         Ok(ClaudeLocalActivityObservation {
-            should_extend_watchdog: new_event_count > 0 || self.has_open_tool_use(),
+            should_extend_watchdog: new_event_count > 0 || self.has_open_local_activity(),
             new_event_count,
         })
     }
@@ -546,18 +550,55 @@ impl ClaudeLocalActivityMonitor {
             }
         }
 
+        let mut background_task_observations = Vec::new();
+        collect_claude_background_task_observations(entry, &mut background_task_observations);
+        if !background_task_observations.is_empty() {
+            let mut by_id: HashMap<String, ClaudeBackgroundTaskObservation> = HashMap::new();
+            for observation in background_task_observations {
+                by_id
+                    .entry(observation.id.clone())
+                    .and_modify(|existing| {
+                        existing.terminal = existing.terminal || observation.terminal;
+                    })
+                    .or_insert(observation);
+            }
+            relevant = true;
+            self.summary.last_event_type = Some("background_task".to_string());
+            for observation in by_id.into_values() {
+                if observation.terminal {
+                    self.summary.background_tasks_finished += 1;
+                    self.open_background_task_ids.remove(&observation.id);
+                } else {
+                    self.summary.background_tasks_started += 1;
+                    self.open_background_task_ids.insert(observation.id);
+                }
+            }
+        }
+
         if relevant {
             self.summary.event_count += 1;
         }
         relevant
     }
 
+    fn has_open_local_activity(&self) -> bool {
+        self.has_open_tool_use() || self.has_open_background_task()
+    }
+
     fn has_open_tool_use(&self) -> bool {
         !self.open_tool_use_ids.is_empty()
     }
 
+    fn has_open_background_task(&self) -> bool {
+        !self.open_background_task_ids.is_empty()
+    }
+
     fn open_tool_use_count(&self) -> usize {
         self.open_tool_use_ids.len()
+    }
+
+    fn open_background_task_count(&self) -> usize {
+        self.open_background_task_ids.len()
     }
 
     fn summary(&self) -> &ClaudeLocalActivitySummary {
@@ -566,12 +607,15 @@ impl ClaudeLocalActivityMonitor {
 
     fn summary_for_error(&self) -> String {
         format!(
-            "local_event_count={}, assistant_messages={}, tool_uses={}, tool_results={}, open_tool_uses={}, last_event_type={}",
+            "local_event_count={}, assistant_messages={}, tool_uses={}, tool_results={}, background_tasks_started={}, background_tasks_finished={}, open_tool_uses={}, open_background_tasks={}, last_event_type={}",
             self.summary.event_count,
             self.summary.assistant_messages,
             self.summary.tool_uses,
             self.summary.tool_results,
+            self.summary.background_tasks_started,
+            self.summary.background_tasks_finished,
             self.open_tool_use_count(),
+            self.open_background_task_count(),
             self.summary
                 .last_event_type
                 .as_deref()
@@ -582,6 +626,12 @@ impl ClaudeLocalActivityMonitor {
     fn has_observed_activity(&self) -> bool {
         self.summary.event_count > 0
     }
+}
+
+#[derive(Clone, Debug)]
+struct ClaudeBackgroundTaskObservation {
+    id: String,
+    terminal: bool,
 }
 
 fn claude_projects_root() -> Option<PathBuf> {
@@ -658,6 +708,155 @@ fn collect_claude_tool_result_ids(value: &Value, ids: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+fn collect_claude_background_task_observations(
+    value: &Value,
+    observations: &mut Vec<ClaudeBackgroundTaskObservation>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(id) = extract_background_task_id_from_object(map) {
+                observations.push(ClaudeBackgroundTaskObservation {
+                    id,
+                    terminal: object_has_terminal_background_task_status(map),
+                });
+            }
+            for nested in map.values() {
+                collect_claude_background_task_observations(nested, observations);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_claude_background_task_observations(item, observations);
+            }
+        }
+        Value::String(text) => {
+            if let Some(id) = background_task_start_id_from_text(text) {
+                observations.push(ClaudeBackgroundTaskObservation {
+                    id,
+                    terminal: false,
+                });
+            }
+            if let Some(id) = terminal_background_task_id_from_text(text) {
+                observations.push(ClaudeBackgroundTaskObservation { id, terminal: true });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_background_task_id_from_object(map: &serde_json::Map<String, Value>) -> Option<String> {
+    const KEYS: &[&str] = &[
+        "backgroundTaskId",
+        "background_task_id",
+        "taskId",
+        "task_id",
+    ];
+    KEYS.iter().find_map(|key| {
+        map.get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn object_has_terminal_background_task_status(map: &serde_json::Map<String, Value>) -> bool {
+    const STATUS_KEYS: &[&str] = &["status", "state", "outcome", "result"];
+    STATUS_KEYS.iter().any(|key| {
+        map.get(*key)
+            .and_then(Value::as_str)
+            .map(background_task_status_is_terminal)
+            .unwrap_or(false)
+    })
+}
+
+fn background_task_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed"
+            | "complete"
+            | "done"
+            | "success"
+            | "succeeded"
+            | "failed"
+            | "failure"
+            | "error"
+            | "errored"
+            | "killed"
+            | "cancelled"
+            | "canceled"
+            | "stopped"
+            | "terminated"
+    )
+}
+
+fn background_task_start_id_from_text(text: &str) -> Option<String> {
+    const PREFIX: &str = "Command running in background with ID:";
+    let (_, rest) = text.split_once(PREFIX)?;
+    let id = rest
+        .trim_start()
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+fn terminal_background_task_id_from_text(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let terminal_word = [
+        " completed",
+        " failed",
+        " killed",
+        " cancelled",
+        " canceled",
+        " stopped",
+        " terminated",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if !terminal_word
+        || !(lower.contains("taskoutput")
+            || lower.contains("task output")
+            || lower.contains("background task"))
+    {
+        return None;
+    }
+    task_id_token_from_text(text)
+}
+
+fn task_id_token_from_text(text: &str) -> Option<String> {
+    const IGNORED: &[&str] = &[
+        "taskoutput",
+        "task",
+        "output",
+        "background",
+        "with",
+        "id",
+        "completed",
+        "complete",
+        "failed",
+        "failure",
+        "killed",
+        "cancelled",
+        "canceled",
+        "stopped",
+        "terminated",
+    ];
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        .map(str::trim)
+        .filter(|token| token.len() >= 3)
+        .find(|token| {
+            let lower = token.to_ascii_lowercase();
+            !IGNORED.contains(&lower.as_str())
+        })
+        .map(ToOwned::to_owned)
 }
 
 fn max_instant_option(base: Instant, candidate: Option<Instant>) -> Instant {
@@ -2762,6 +2961,7 @@ async fn poll_claude_local_activity_watchdog(
                     tool_uses = monitor.summary().tool_uses,
                     tool_results = monitor.summary().tool_results,
                     open_tool_uses = monitor.open_tool_use_count(),
+                    open_background_tasks = monitor.open_background_task_count(),
                     "Claude local activity observed while ACP stream is quiet"
                 );
             }
@@ -2788,6 +2988,15 @@ async fn poll_claude_local_activity_watchdog(
             );
         }
     }
+}
+
+fn note_claude_local_activity_receipt_event(
+    runtime_receipt: &mut RuntimeReceiptTracker,
+    monitor: Option<&ClaudeLocalActivityMonitor>,
+) -> Option<String> {
+    let summary = monitor.map(ClaudeLocalActivityMonitor::summary_for_error)?;
+    runtime_receipt.push_event("provider_local_activity_summary", Some(summary.clone()));
+    Some(summary)
 }
 
 impl AcpTransportSession {
@@ -3512,11 +3721,12 @@ impl AcpTransportSession {
                         }
                     })
                     .unwrap_or("idle_hang_before_first_progress");
-                let local_summary = claude_local_activity
-                    .as_ref()
-                    .map(|monitor| monitor.summary_for_error())
-                    .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
                 failure_phase = Some("idle_timeout".to_string());
+                let local_summary = note_claude_local_activity_receipt_event(
+                    &mut runtime_receipt,
+                    claude_local_activity.as_ref(),
+                )
+                .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
                 self.last_runtime_receipt = Some(runtime_receipt.build(
                     &self.provider,
                     self.model.as_ref(),
@@ -3552,6 +3762,11 @@ impl AcpTransportSession {
                     })
                     .unwrap_or("idle_hang_before_first_progress");
                 failure_phase = Some("progress_timeout".to_string());
+                let local_summary = note_claude_local_activity_receipt_event(
+                    &mut runtime_receipt,
+                    claude_local_activity.as_ref(),
+                )
+                .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
                 self.last_runtime_receipt = Some(runtime_receipt.build(
                     &self.provider,
                     self.model.as_ref(),
@@ -3563,7 +3778,7 @@ impl AcpTransportSession {
                     failure_phase.clone(),
                 ));
                 return Err(anyhow::anyhow!(
-                    "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={})",
+                    "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={}, {local_summary})",
                     PROGRESS_TIMEOUT.as_secs(),
                     self.session_id
                 ));
@@ -3655,13 +3870,14 @@ impl AcpTransportSession {
                                         }
                                     })
                                     .unwrap_or("idle_hang_before_first_progress");
-                                let local_summary = claude_local_activity
-                                    .as_ref()
-                                    .map(|monitor| monitor.summary_for_error())
-                                    .unwrap_or_else(|| {
-                                        "provider_local_activity=unavailable".to_string()
-                                    });
                                 failure_phase = Some("idle_timeout".to_string());
+                                let local_summary = note_claude_local_activity_receipt_event(
+                                    &mut runtime_receipt,
+                                    claude_local_activity.as_ref(),
+                                )
+                                .unwrap_or_else(|| {
+                                    "provider_local_activity=unavailable".to_string()
+                                });
                                 break Err(anyhow::anyhow!(
                                     "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
                                     IDLE_TIMEOUT.as_secs(),
@@ -3687,8 +3903,15 @@ impl AcpTransportSession {
                                     })
                                     .unwrap_or("idle_hang_before_first_progress");
                                 failure_phase = Some("progress_timeout".to_string());
+                                let local_summary = note_claude_local_activity_receipt_event(
+                                    &mut runtime_receipt,
+                                    claude_local_activity.as_ref(),
+                                )
+                                .unwrap_or_else(|| {
+                                    "provider_local_activity=unavailable".to_string()
+                                });
                                 break Err(anyhow::anyhow!(
-                                    "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={})",
+                                    "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={}, {local_summary})",
                                     PROGRESS_TIMEOUT.as_secs(),
                                     session_id
                                 ));
@@ -4679,6 +4902,45 @@ mod tests {
     }
 
     #[test]
+    fn runtime_receipt_records_claude_local_activity_summary() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tempdir.path().join("session.jsonl");
+        let mut file = std::fs::File::create(&transcript_path).expect("transcript");
+        let mut monitor = ClaudeLocalActivityMonitor::new_for_path(transcript_path);
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"Command running in background with ID: bttluot5u. Output is being written to: /tmp/tasks/bttluot5u.output","is_error":false}}]}},"toolUseResult":{{"backgroundTaskId":"bttluot5u"}}}}"#
+        )
+        .expect("write background task result");
+        file.flush().expect("flush background task");
+        monitor.poll(Instant::now()).expect("poll");
+
+        let started_wall = chrono::Utc::now();
+        let started_mono = Instant::now();
+        let mut tracker = RuntimeReceiptTracker::new(started_wall, started_mono);
+        note_claude_local_activity_receipt_event(&mut tracker, Some(&monitor));
+
+        let receipt = tracker.build(
+            "claude",
+            None,
+            "provider-session-1",
+            None,
+            false,
+            false,
+            "failed",
+            Some("idle_timeout".to_string()),
+        );
+
+        assert!(receipt.last_events.iter().any(|event| {
+            event.kind == "provider_local_activity_summary"
+                && event
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("open_background_tasks=1"))
+        }));
+    }
+
+    #[test]
     fn runtime_receipt_marks_permission_timeout_without_post_grant_event() {
         let started_wall = chrono::Utc::now();
         let started_mono = Instant::now();
@@ -4798,6 +5060,95 @@ mod tests {
         assert!(
             !observation.should_extend_watchdog,
             "after tool_result and no new JSONL entries, Claude local activity no longer masks ACP silence"
+        );
+    }
+
+    #[test]
+    fn claude_local_activity_tracks_background_task_after_tool_result() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tempdir.path().join("session.jsonl");
+        let mut file = std::fs::File::create(&transcript_path).expect("transcript");
+        let mut monitor = ClaudeLocalActivityMonitor::new_for_path(transcript_path.clone());
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"./scripts/test-gate.sh proposal-086"}}}}]}}}}"#
+        )
+        .expect("write tool_use");
+        file.flush().expect("flush tool_use");
+
+        assert!(
+            monitor
+                .poll(Instant::now())
+                .expect("poll")
+                .should_extend_watchdog
+        );
+
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"Command running in background with ID: bttluot5u. Output is being written to: /tmp/tasks/bttluot5u.output","is_error":false}}]}},"toolUseResult":{{"stdout":"","stderr":"","interrupted":false,"backgroundTaskId":"bttluot5u","assistantAutoBackgrounded":false}}}}"#
+        )
+        .expect("write background task result");
+        file.flush().expect("flush transcript");
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+
+        assert!(observation.should_extend_watchdog);
+        assert_eq!(monitor.open_tool_use_count(), 0);
+        assert!(
+            monitor
+                .summary_for_error()
+                .contains("open_background_tasks=1"),
+            "summary should expose the open Claude background task"
+        );
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+        assert!(
+            observation.should_extend_watchdog,
+            "an unresolved Claude background task keeps the provider locally active while ACP is quiet"
+        );
+    }
+
+    #[test]
+    fn claude_local_activity_clears_background_task_on_terminal_status() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tempdir.path().join("session.jsonl");
+        let mut file = std::fs::File::create(&transcript_path).expect("transcript");
+        let mut monitor = ClaudeLocalActivityMonitor::new_for_path(transcript_path.clone());
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"Command running in background with ID: bttluot5u. Output is being written to: /tmp/tasks/bttluot5u.output","is_error":false}}]}},"toolUseResult":{{"backgroundTaskId":"bttluot5u"}}}}"#
+        )
+        .expect("write background task result");
+        file.flush().expect("flush background task");
+
+        assert!(
+            monitor
+                .poll(Instant::now())
+                .expect("poll")
+                .should_extend_watchdog
+        );
+        assert!(monitor
+            .summary_for_error()
+            .contains("open_background_tasks=1"));
+
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","content":"TaskOutput bttluot5u completed","is_error":false}}]}},"toolUseResult":{{"backgroundTaskId":"bttluot5u","status":"completed"}}}}"#
+        )
+        .expect("write terminal background task result");
+        file.flush().expect("flush terminal task");
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+
+        assert!(observation.should_extend_watchdog);
+        assert!(monitor
+            .summary_for_error()
+            .contains("open_background_tasks=0"));
+
+        let observation = monitor.poll(Instant::now()).expect("poll");
+        assert!(
+            !observation.should_extend_watchdog,
+            "after terminal TaskOutput and no new JSONL entries, Claude local activity no longer masks ACP silence"
         );
     }
 

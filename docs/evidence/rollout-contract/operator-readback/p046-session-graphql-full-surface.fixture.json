@@ -87,7 +87,7 @@
       "rolloutContractFailureReasons": [],
       "rolloutContractHoldConditions": [],
       "rolloutContractEnforcementMode": "waived",
-      "rolloutContractEnforcementModeReason": "release_receipt is a post-release artifact; waived until P046 enters release build",
+      "rolloutContractEnforcementModeReason": "release_receipt is a post-release artifact; waived until release-build packaging evidence is generated",
       "rolloutContractOperatorMessage": "P046 release receipt will be generated for the release build after dogfood success."
     }
   }

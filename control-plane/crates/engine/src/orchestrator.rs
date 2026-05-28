@@ -6637,16 +6637,31 @@ async fn provider_family_quota_wait_active(
     model: Option<&str>,
 ) -> Result<bool> {
     let provider_family = provider_family_for_health_fallback(provider);
-    Ok(
-        agent_retry_budget_ledger::active_provider_family_quota_wait(
-            pool,
-            provider_family,
-            model,
-            Utc::now(),
-        )
-        .await?
-        .is_some(),
+    let now = Utc::now();
+    if agent_retry_budget_ledger::active_provider_family_quota_wait(
+        pool,
+        provider_family,
+        model,
+        now,
     )
+    .await?
+    .is_some()
+    {
+        return Ok(true);
+    }
+    if model.is_some() {
+        return Ok(
+            agent_retry_budget_ledger::active_provider_family_quota_wait(
+                pool,
+                provider_family,
+                None,
+                now,
+            )
+            .await?
+            .is_some(),
+        );
+    }
+    Ok(false)
 }
 
 fn is_code_writer_implementation_output_task(
@@ -7238,13 +7253,18 @@ fn build_task_prompt(
         parts.push(String::from(
             "Return each required output through the final `CHAINWORKS_OUTPUT` \
              object using the canonical path keys below; the engine will \
-             materialize canonical files after contract validation.",
+             materialize canonical files after contract validation. For large \
+             file/json outputs, write the output directly to the listed canonical \
+             path and return only a small manifest in `CHAINWORKS_OUTPUT`: \
+             `{ \"mode\": \"direct_file\", \"output_name\": \"<name>\", \
+             \"path\": \"<canonical path>\", \"digest\": \"sha256:<digest>\", \
+             \"size_bytes\": <bytes> }`.",
         ));
         parts.push(String::from(
             "Tool stdout is not an output channel. Only the final assistant \
              message is settled for `CHAINWORKS_OUTPUT`. Do not call shell \
-             `echo`, `printf`, or file-writing commands to return \
-             `CHAINWORKS_OUTPUT`.",
+             `echo` or `printf` to return `CHAINWORKS_OUTPUT`; write only the \
+             actual large output file itself when using direct-file mode.",
         ));
         for output_name in &task.outputs {
             let normalized = resolved_artifact_path_for_task(output_name, plan, run, task);
@@ -7289,11 +7309,12 @@ fn build_task_prompt(
             "CRITICAL: Each required output file must contain exactly one \
              top-level JSON object and nothing else.\n\
              - When returning outputs through `CHAINWORKS_OUTPUT`, the value \
-               for each canonical path is treated as that output file content.\n\
+               for each canonical path is treated as that output file content, \
+               unless it is the direct-file manifest shape documented above.\n\
              - Tool stdout is not an output channel; only the final assistant \
                message is settled.\n\
-             - Do not call shell `echo`, `printf`, or file-writing commands \
-               to return `CHAINWORKS_OUTPUT`.\n\
+             - Do not call shell `echo` or `printf` to return \
+               `CHAINWORKS_OUTPUT`.\n\
              - Do NOT wrap the JSON in code fences (```​ or ```json).\n\
              - Do NOT emit markdown, prose, or companion files unless they \
                are explicitly listed as required outputs.\n\
@@ -7369,7 +7390,7 @@ fn build_task_prompt(
                  - Do NOT write files outside the worktree root.\n\
                  - Read source from the worktree, not the original workspace.\n\
                  - Do not commit, push, or modify git state.\n\
-                 - Do not write run artifact outputs directly into the run meta-root; return them through `CHAINWORKS_OUTPUT`.\n\
+                 - Return run artifact outputs through `CHAINWORKS_OUTPUT`; for large outputs, write the canonical file directly and return the direct-file manifest.\n\
                  - Do not rely on implicit working directory."
             ));
         } else {
@@ -7646,10 +7667,10 @@ fn append_task_specific_guidance(
              contents, and continue with the smallest viable edit.",
         ));
         parts.push(String::from(
-            "Do not write run artifact outputs directly into the run meta-root \
-             with shell commands. Required outputs must be returned through the \
-             final `CHAINWORKS_OUTPUT` JSON object so the engine can validate and \
-             materialize them.",
+            "Required outputs must be returned through the final `CHAINWORKS_OUTPUT` \
+             JSON object so the engine can validate and materialize them. For \
+             large outputs, write the canonical file directly and return the \
+             direct-file manifest instead of embedding the full content.",
         ));
         parts.push(String::from(
             "Use the exact canonical output paths from Required Outputs as \
@@ -7659,7 +7680,8 @@ fn append_task_specific_guidance(
         parts.push(String::from(
             "Each `CHAINWORKS_OUTPUT` value must be the full JSON object for that \
              output contract, including every field listed in Structured Output \
-             Requirements. For `implementation_self_assessment_v2`, use \
+             Requirements, unless it is the direct-file manifest for a large \
+             canonical file. For `implementation_self_assessment_v2`, use \
              `implementation_complete`, `verification_green`, \
              `remaining_code_tasks`, `handoff_tasks`, `known_risks`, \
              `tests_run`, and `docs_impacted`; do not use legacy self-assessment \
@@ -9192,7 +9214,7 @@ mod tests {
         assert!(prompt.contains("Tool stdout is not an output channel"));
         assert!(prompt.contains("Only the final assistant message is settled"));
         assert!(prompt.contains("Do not call shell `echo`"));
-        assert!(prompt.contains("Do not write run artifact outputs directly"));
+        assert!(prompt.contains("direct-file manifest"));
         assert!(prompt.contains("implementation_complete"));
         assert!(prompt.contains("remaining_code_tasks"));
         assert!(!prompt.contains("Write each output to its canonical path below"));

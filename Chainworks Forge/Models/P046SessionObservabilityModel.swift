@@ -166,7 +166,7 @@ final class P046SessionObservabilityModel: ObservableObject {
     enum Availability: Equatable {
         case unknown
         case available
-        case unavailable  // feature flag disabled or P046 fields absent from schema
+        case unavailable  // P046 fields absent from schema or disabled-schema rollback mode
     }
 
     @Published private(set) var availability: Availability = .unknown

@@ -23,6 +23,15 @@
 - Governed macOS is a read/subscription presentation surface for escalation state. The r13 DriftAcknowledgementSheet blocker is resolved by making the sheet read-only and routing drift acknowledgement through the existing MCP/operator workflow; SwiftUI performs no policy-drift mutation in v1.
 - The proposal now pins implementation-grade contracts for deadlines, force-detach, shutdown drain, SQLite contention, outage credit, repeated-digest observability, macOS actor ownership, SF Symbols, attention requests, dock badges, pasteboard writes, narrow layouts, keyboard focus, read-pipeline states, command rows, menu-bar layout, and shadow-row visuals.
 
+## Implementation Sync
+
+- **Last synchronized:** 2026-05-27
+- **Implementation worktree:** `.chainworks/worktrees/cw-configurable-agent-escalation-6764a0c2`
+- **Current proof gate:** `./scripts/test-gate.sh proposal-058`
+- **Current implemented runtime slice:** scheduler-owned durable tier advancement for `same_backend_retry`, `backend_profile`, `lead_mediation`, and `pause`; post-invoke authority uses durable `p058_claimed` identity; startup recovery preserves P058 claims; provider `retry_after` blocks claim/start capacity; `runs.start` path inputs are canonicalized and root-confined; escalation readback is derived from durable events; `CHAINWORKS_ESCALATION_FORCE_PRIMARY`, chain wall-clock deadline, and capacity-probe threshold pauses are enforced before launching an escalation retry; GraphQL/MCP focused parity proves non-null scheduler readback fields from durable event/runtime data.
+- **Current governed macOS slice:** `EscalationReadAdapter` feeds read-only SwiftUI components for status capsule, banner stack, lineage, pause card, trace timeline, drift review sheet, trace pasteboard copy, and inspector presentation. Focused Swift tests are now included in `proposal-058`; remote visual/runtime evidence remains a release-closeout item.
+- **Implementation closeout status:** scheduler fail-closed slices cover provider force-detach classification, launch-recycle storm pauses, escalation-owned late-frame event journaling from durable runtime facts/metadata, startup force-detach replay, and metric emission from durable escalation events. Remote visual soak, long-run metric-threshold trending, and operational drill artifacts are release-closeout evidence items, not missing implementation paths.
+
 ## Problem
 
 ### Impacts
@@ -318,7 +327,7 @@
   - quota_with_valid_retry_after
   - transport_failure
   - ambiguous_failure
-- **Recovery:** Recovery-inconsistent triggers pause fail-closed with escalation_recovery_inconsistent. v1 unstick is cancellation with a recovery-cancelled marker preserving ledger order, originating trigger code, report successor immutability, partial-progress signal, and unstick latency metrics. The recovery-cancelled marker is committed inside the same scheduler transaction as the cancellation event, so replay observes either the full cancellation or none of it. Cancellation invokes provider force-detach with the same 120s ceiling. Provider sessions that have not settled by shutdown_drain_seconds are treated as crash-interrupted; on next start, force_detach_replay reissues the in-flight force-detach with the same idempotency key, and late frames are dropped and journaled as escalation.provider.late_frame_after_detach.
+- **Recovery:** Recovery-inconsistent triggers pause fail-closed with escalation_recovery_inconsistent. v1 unstick is cancellation with a recovery-cancelled marker preserving ledger order, originating trigger code, report successor immutability, partial-progress signal, and unstick latency metrics. The recovery-cancelled marker is committed inside the same scheduler transaction as the cancellation event, so replay observes either the full cancellation or none of it. Cancellation invokes provider force-detach with the same 120s ceiling. Provider sessions that have not settled by shutdown_drain_seconds are treated as crash-interrupted; on next start, force_detach_replay reissues the in-flight force-detach with the same idempotency key, and late frames are dropped and journaled as escalation.provider_late_frame_after_detach.
 - **Scheduler Transaction:** Settlement, trigger selection, digest calculation, frozen policy lookup, ledger lookup, readiness validation, capacity validation, ledger/event/metadata updates, and work-queue insert commit in one SQLite transaction. Provider launch occurs only after commit. Housekeeping uses the same compare-and-swap path and is idempotent.
 
 ## Runtime Invocation
@@ -716,8 +725,8 @@
 ## Migration Evidence Plan
 
 - **Drill:** populated SQLite fixture with mixed pre/post-escalation runs, forward migration, projection rebuild, MCP/GraphQL/report parity assertions, no row-count drift on agent_executions, escalation_ledger empty for pre-escalation runs, redaction_version stamped
-- **Phase 3 Artifact Drill:** fixtures prove recovery does not silently discard settled mediation_response or human_decision artifacts before Phase 3 GA
-- **Phase 3 Shutdown Drill:** SIGTERM during in-flight escalation, daemon restart inside drain window, force_detach_replay observed through late_frame_after_detach metric, no double-advance and no double-charge of provider quota
+- **Phase 3 Artifact Drill:** release evidence keeps fixtures proving recovery does not silently discard settled mediation_response or human_decision artifacts before broad GA
+- **Phase 3 Shutdown Drill:** implementation tests prove startup force-detach replay for a running escalation execution, no InvokeAgent relaunch, paused ledger, runtime facts, failed stage, and blocked run; release evidence may add a live SIGTERM soak showing force_detach_replay and late_frame_after_detach metrics under operator restart conditions
 - **Resume:** pre-escalation snapshots read null policy_id as inactive ledger; later escalation_policies edits produce escalation_policy_drift requiring external operator acknowledgement
 - **Rollback:** data-preserving rollback disables behavior via kill-switch, drops projection consumers, and leaves committed columns/tables intact
 - **Stance:** forward-only; no destructive down-migration
@@ -805,7 +814,7 @@
 - escalation.shadow.tier_selected
 - escalation.operator_forced.reserved_rejected
 - escalation.compile_failed
-- escalation.provider.late_frame_after_detach
+- escalation.provider_late_frame_after_detach
 - escalation.retry_after.parse_anomaly
 - escalation.commit_contention.retry
 - escalation.drift.pending_ack_dwell_threshold

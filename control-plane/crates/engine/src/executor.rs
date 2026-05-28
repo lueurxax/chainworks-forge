@@ -1334,7 +1334,12 @@ fn build_declared_output_discovery_settlement_with_filesystem(
 
         let envelope = find_provider_envelope_for_spec(discovered_artifacts, spec);
         let exact_path = find_exact_path_artifact_for_spec(discovered_artifacts, spec);
-        let candidate = if let Some(artifact) = envelope {
+        let direct_file_ref = envelope.and_then(|artifact| {
+            read_direct_file_ref_output(spec, artifact, pre_prompt_expected_outputs, filesystem)
+        });
+        let candidate = if let Some(candidate) = direct_file_ref {
+            Some(candidate)
+        } else if let Some(artifact) = envelope {
             Some((
                 OutputDiscoveryReason::ProviderEnvelope,
                 OutputDiscoveryProvenance::ProviderEnvelope,
@@ -1439,6 +1444,11 @@ fn build_declared_output_discovery_settlement_with_filesystem(
         let mut diagnostics = BTreeMap::new();
         if let Some(source_kind) = source_kind {
             diagnostics.insert("source_kind".to_string(), enum_snake_value(source_kind));
+            if source_kind == acp::DiscoveredArtifactSourceKind::ChainworksOutput
+                && provenance == OutputDiscoveryProvenance::ExactPath
+            {
+                diagnostics.insert("output_mode".to_string(), "direct_file_ref".to_string());
+            }
         }
         decisions.push(OutputDiscoveryDecision {
             output_name: spec.output_name.clone(),
@@ -2162,6 +2172,144 @@ fn read_control_plane_generated_output(
         Some(spec.target_path.clone()),
         Some(ExpectedPathBaselineStatus::RegularContentCaptured),
     ))
+}
+
+fn read_direct_file_ref_output(
+    spec: &ExpectedOutputSpec,
+    artifact: &acp::DiscoveredArtifact,
+    pre_prompt_expected_outputs: &[PrePromptExpectedOutputMetadata],
+    filesystem: &dyn DiscoveryFilesystem,
+) -> Option<(
+    OutputDiscoveryReason,
+    OutputDiscoveryProvenance,
+    Option<acp::DiscoveredArtifactSourceKind>,
+    String,
+    Vec<u8>,
+    Option<String>,
+    Option<ExpectedPathBaselineStatus>,
+)> {
+    let manifest = direct_file_ref_manifest(&artifact.content, &spec.output_name)?;
+    if manifest.path != spec.target_path {
+        return None;
+    }
+    if exact_path_rejection_for_spec(spec, Some(&manifest.path), filesystem).is_some() {
+        return None;
+    }
+
+    let recorder = NoopDiscoveryOperationRecorder;
+    let bytes = filesystem.read_file_with_cap_and_recorder(
+        Path::new(&manifest.path),
+        spec.max_bytes.saturating_add(1),
+        &recorder,
+    )?;
+    if bytes.len() as u64 > spec.max_bytes {
+        return None;
+    }
+
+    let digest = sha256_digest(&bytes);
+    if manifest
+        .digest
+        .as_deref()
+        .is_some_and(|expected| normalize_sha256_digest(expected) != digest)
+    {
+        return None;
+    }
+    if manifest
+        .size_bytes
+        .is_some_and(|expected| expected != bytes.len() as u64)
+    {
+        return None;
+    }
+
+    let previous = pre_prompt_expected_outputs.iter().find(|metadata| {
+        metadata.output_name == spec.output_name && metadata.target_path == spec.target_path
+    })?;
+    let reason = match previous.baseline_status {
+        ExpectedPathBaselineStatus::Absent => OutputDiscoveryReason::ExactPathNew,
+        ExpectedPathBaselineStatus::RegularContentCaptured => {
+            if previous.content_digest.as_deref() == Some(digest.as_str()) {
+                return None;
+            }
+            OutputDiscoveryReason::ExactPathChanged
+        }
+        _ => OutputDiscoveryReason::ExactPathChanged,
+    };
+
+    Some((
+        reason,
+        OutputDiscoveryProvenance::ExactPath,
+        Some(artifact.source_kind),
+        exact_path_payload_ref(&spec.output_name),
+        bytes,
+        Some(manifest.path),
+        Some(previous.baseline_status),
+    ))
+}
+
+struct DirectFileRefManifest {
+    path: String,
+    digest: Option<String>,
+    size_bytes: Option<u64>,
+}
+
+fn direct_file_ref_manifest(content: &[u8], output_name: &str) -> Option<DirectFileRefManifest> {
+    let value = serde_json::from_slice::<serde_json::Value>(content).ok()?;
+    let object = value.as_object()?;
+    let mode = object
+        .get("mode")
+        .or_else(|| object.get("output_mode"))
+        .or_else(|| object.get("content_mode"))
+        .and_then(serde_json::Value::as_str);
+    if let Some(mode) = mode {
+        if !matches!(
+            mode,
+            "direct_file" | "direct_file_ref" | "file_ref" | "canonical_file"
+        ) {
+            return None;
+        }
+    }
+    let actual_output_name = object
+        .get("output_name")
+        .and_then(serde_json::Value::as_str);
+    if actual_output_name.is_some_and(|actual| actual != output_name) {
+        return None;
+    }
+    let path = object
+        .get("path")
+        .or_else(|| object.get("canonical_path"))
+        .and_then(serde_json::Value::as_str)?
+        .trim();
+    if path.is_empty() {
+        return None;
+    }
+    let digest = object
+        .get("digest")
+        .or_else(|| object.get("sha256"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let size_bytes = object
+        .get("size_bytes")
+        .or_else(|| object.get("bytes"))
+        .and_then(serde_json::Value::as_u64);
+    if mode.is_none()
+        && (actual_output_name != Some(output_name) || digest.is_none() || size_bytes.is_none())
+    {
+        return None;
+    }
+    Some(DirectFileRefManifest {
+        path: path.to_string(),
+        digest,
+        size_bytes,
+    })
+}
+
+fn normalize_sha256_digest(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.starts_with("sha256:") {
+        trimmed.to_string()
+    } else {
+        format!("sha256:{trimmed}")
+    }
 }
 
 fn read_declared_reuse_policy_output(
@@ -4008,7 +4156,9 @@ impl BackgroundExecutor {
                 "Failed to persist output contract repair session event"
             );
         } else {
-            let _ = self.events.send(domain::events::DomainEvent::SessionEventRecorded { run_id });
+            let _ = self
+                .events
+                .send(domain::events::DomainEvent::SessionEventRecorded { run_id });
         }
     }
 
@@ -7555,9 +7705,9 @@ You are continuing the same Chainworks agent execution through an existing live 
                 let mut policy_decision: Option<SessionPolicyDecision> =
                     if invocation_generation_required {
                         let d = ensure_policy(&self.pool, policy_input.clone()).await?;
-                        let _ = self.events.send(
-                            domain::events::DomainEvent::SessionEventRecorded { run_id },
-                        );
+                        let _ = self
+                            .events
+                            .send(domain::events::DomainEvent::SessionEventRecorded { run_id });
                         Some(d)
                     } else {
                         None
@@ -7596,9 +7746,9 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                         let d = ensure_policy(&self.pool, policy_input).await?;
-                        let _ = self.events.send(
-                            domain::events::DomainEvent::SessionEventRecorded { run_id },
-                        );
+                        let _ = self
+                            .events
+                            .send(domain::events::DomainEvent::SessionEventRecorded { run_id });
                         policy_decision = Some(d);
                     }
                 }
@@ -13820,11 +13970,17 @@ fn prompt_with_runtime_invocation_contract(
     if has_returnable_outputs {
         prompt.push_str(
             "Return a fresh `CHAINWORKS_OUTPUT` object for file/json outputs in this invocation, \
-             using the exact canonical paths above as keys. You must not finish this turn without \
-             `CHAINWORKS_OUTPUT` for required file/json outputs.\n\
+             using the exact canonical paths above as keys. For large file/json outputs, write the \
+             output directly to the listed canonical path and return a small direct-file manifest \
+             instead of embedding the full content: `{ \"mode\": \"direct_file\", \"output_name\": \
+             \"<name>\", \"path\": \"<canonical path>\", \"digest\": \"sha256:<digest>\", \
+             \"size_bytes\": <bytes> }`. You must not finish this turn without either full \
+             `CHAINWORKS_OUTPUT` content or a valid direct-file manifest for every required \
+             file/json output.\n\
              Tool stdout is not an output channel. Only the final assistant message is settled for \
-             `CHAINWORKS_OUTPUT`. Do not call shell `echo`, `printf`, or file-writing commands to \
-             return `CHAINWORKS_OUTPUT`.\n",
+             `CHAINWORKS_OUTPUT`. Do not call shell `echo` or `printf` to return \
+             `CHAINWORKS_OUTPUT`; write only the actual large output file itself when using \
+             direct-file mode.\n",
         );
     } else {
         prompt.push_str(
@@ -13916,7 +14072,8 @@ fn append_chainworks_output_contract_example(
     }
     prompt.push_str(
         "\nExample `CHAINWORKS_OUTPUT` skeleton. Replace placeholder values with truthful values, \
-         but keep every required field for each contract:\n",
+         but keep every required field for each contract. If an output is large, replace that \
+         value with the direct-file manifest shape described above:\n",
     );
     let example = serde_json::json!({ "CHAINWORKS_OUTPUT": example });
     if let Ok(example) = serde_json::to_string(&example) {
@@ -14725,7 +14882,15 @@ fn p088_completion_mode(
                 }
             }
             OutputDiscoveryReason::ExactPathNew | OutputDiscoveryReason::ExactPathChanged => {
-                Some("exact_path_current_attempt")
+                if decision
+                    .diagnostics
+                    .get("output_mode")
+                    .is_some_and(|mode| mode == "direct_file_ref")
+                {
+                    Some("direct_file_ref")
+                } else {
+                    Some("exact_path_current_attempt")
+                }
             }
             _ => None,
         })
@@ -14862,6 +15027,16 @@ fn p090_settlement_source_kind(
 ) -> String {
     if decision.reason == OutputDiscoveryReason::ControlPlaneGenerated {
         "control_plane_generated".to_string()
+    } else if decision
+        .diagnostics
+        .get("output_mode")
+        .is_some_and(|mode| mode == "direct_file_ref")
+    {
+        if completion_turn_attempted {
+            "repair_direct_file_ref".to_string()
+        } else {
+            "completion_direct_file_ref".to_string()
+        }
     } else if completion_turn_attempted {
         "repair_chainworks_output".to_string()
     } else {
@@ -15988,8 +16163,9 @@ fn output_contract_repair_prompt(
          outputs. Do not redo unrelated implementation work. Return only corrected \
          `CHAINWORKS_OUTPUT` payloads for the outputs listed below. Do not include Markdown, \
          explanations, or extra text. Do not wrap the JSON in code fences. Tool stdout is not an \
-         output channel. Only the final assistant message is settled. Do not call shell `echo`, \
-         `printf`, or file-writing commands to return `CHAINWORKS_OUTPUT`.\n",
+         output channel. Only the final assistant message is settled. Do not call shell `echo` \
+         or `printf` to return `CHAINWORKS_OUTPUT`. For large canonical files that already exist \
+         on disk, return a direct-file manifest instead of embedding the full content.\n",
     );
     if let Some(summary) = validation.failure_summary.as_deref() {
         prompt.push_str(&format!("- Validation failure: {summary}\n"));
@@ -16082,7 +16258,10 @@ fn code_writer_completion_repair_prompt(
     }
     prompt.push_str(
         "\nReturn exactly one JSON object. Use output names as `CHAINWORKS_OUTPUT` keys. \
-         Canonical target paths are accepted as fallback only:\n",
+         Canonical target paths are accepted as fallback only. If a missing/invalid output already \
+         exists as a large canonical file, do not embed the full content; return a direct-file \
+         manifest instead: `{ \"mode\": \"direct_file\", \"output_name\": \"<name>\", \"path\": \
+         \"<canonical path>\", \"digest\": \"sha256:<digest>\", \"size_bytes\": <bytes> }`.\n",
     );
     let failed_outputs: Vec<DeclaredOutput> = declared_outputs
         .iter()
@@ -16094,10 +16273,10 @@ fn code_writer_completion_repair_prompt(
         })
         .cloned()
         .collect();
-    let outputs_for_example = if declared_outputs.is_empty() {
-        failed_outputs
-    } else {
+    let outputs_for_example = if failed_outputs.is_empty() {
         declared_outputs.to_vec()
+    } else {
+        failed_outputs
     };
     for output in &outputs_for_example {
         append_status_allowed_values_for_declared_output(&mut prompt, output);
@@ -16978,7 +17157,81 @@ plain progress line without gate evidence";
     }
 
     #[test]
-    fn code_writer_completion_repair_prompt_includes_full_declared_output_set() {
+    fn code_writer_completion_repair_prompt_examples_only_failed_outputs() {
+        let declared_outputs = vec![
+            DeclaredOutput {
+                output_name: "proposal_current".to_string(),
+                target_path: "/workspace/.chainworks/proposals/current/proposal.md".to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "proposal_current_v1".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec!["status".to_string()],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "proposal_feedback_coverage".to_string(),
+                target_path: "/workspace/.chainworks/proposals/current/feedback-coverage.json"
+                    .to_string(),
+                schema: Some(workflow::plan::OutputSchema {
+                    contract_id: "proposal_feedback_coverage_v1".to_string(),
+                    format: "json".to_string(),
+                    human_format: None,
+                    machine_format: Some("json".to_string()),
+                    validation_mode: Some("strict_structured".to_string()),
+                    normalized_artifact_name: None,
+                    raw_artifact_name: None,
+                    required_fields: vec!["covered_feedback".to_string()],
+                }),
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let validation = TaskValidationSummary {
+            output_results: vec![
+                domain::validation::OutputValidationResult {
+                    output_name: "proposal_current".to_string(),
+                    contract_id: Some("proposal_current_v1".to_string()),
+                    status: domain::validation::ValidationStatus::Passed,
+                    missing_fields: vec![],
+                    validation_error: None,
+                    raw_payload_size: 130_000,
+                },
+                domain::validation::OutputValidationResult {
+                    output_name: "proposal_feedback_coverage".to_string(),
+                    contract_id: Some("proposal_feedback_coverage_v1".to_string()),
+                    status: domain::validation::ValidationStatus::Failed,
+                    missing_fields: vec!["covered_feedback".to_string()],
+                    validation_error: Some("required output was not produced".to_string()),
+                    raw_payload_size: 0,
+                },
+            ],
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some(
+                "proposal_feedback_coverage: required output was not produced".to_string(),
+            ),
+        };
+
+        let prompt = code_writer_completion_repair_prompt(&validation, &declared_outputs);
+
+        assert!(prompt.contains("proposal_feedback_coverage"));
+        assert!(prompt.contains("{\"CHAINWORKS_OUTPUT\":{\"proposal_feedback_coverage\""));
+        assert!(!prompt.contains("{\"CHAINWORKS_OUTPUT\":{\"proposal_current\""));
+        assert!(!prompt.contains("/workspace/.chainworks/proposals/current/proposal.md"));
+    }
+
+    #[test]
+    fn code_writer_completion_repair_prompt_omits_outputs_that_already_passed() {
         let declared_outputs = vec![
             DeclaredOutput {
                 output_name: "implementation_progress".to_string(),
@@ -17067,12 +17320,12 @@ plain progress line without gate evidence";
 
         let prompt = code_writer_completion_repair_prompt(&validation, &declared_outputs);
 
-        assert!(prompt.contains("\"implementation_progress\""));
         assert!(prompt.contains("\"implementation_self_assessment\""));
-        assert!(prompt.contains("\"tests_result\""));
-        assert!(prompt.contains("\"current_phase\":\"\""));
+        assert!(!prompt.contains("\"implementation_progress\""));
+        assert!(!prompt.contains("\"tests_result\""));
+        assert!(!prompt.contains("\"current_phase\":\"\""));
         assert!(prompt.contains("\"verification_green\":false"));
-        assert!(prompt.contains("\"summary\":\"\""));
+        assert!(!prompt.contains("\"summary\":\"\""));
     }
 
     #[test]
@@ -19628,6 +19881,168 @@ plain progress line without gate evidence";
             std::fs::read_to_string(machine_path).unwrap(),
             r#"{"seemingly_complete":true}"#
         );
+    }
+
+    #[test]
+    fn direct_file_ref_manifest_accepts_changed_canonical_file_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("proposals/current/proposal.json");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        let output_bytes = br#"{"status":"ready","summary":"large proposal body lives on disk"}"#;
+        std::fs::write(&output_path, output_bytes).unwrap();
+        let digest = sha256_digest(output_bytes);
+        let declared = DeclaredOutput {
+            output_name: "proposal_current".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id: "proposal_current_v1".to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec!["status".to_string(), "summary".to_string()],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(tmp.path().to_str().unwrap()),
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata = vec![PrePromptExpectedOutputMetadata::absent(
+            &specs[0],
+            &metadata_context,
+        )];
+        let manifest = serde_json::json!({
+            "mode": "direct_file",
+            "output_name": "proposal_current",
+            "path": output_path.to_string_lossy(),
+            "digest": digest,
+            "size_bytes": output_bytes.len()
+        });
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_current".to_string(),
+            content: serde_json::to_vec(&manifest).unwrap(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        }];
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Accepted
+        );
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::ExactPathNew
+        );
+        assert_eq!(
+            settlement.decisions[0].diagnostics.get("output_mode"),
+            Some(&"direct_file_ref".to_string())
+        );
+        assert_eq!(
+            captured[0].machine_bytes.as_deref(),
+            Some(&output_bytes[..])
+        );
+        assert!(validation.failure_class.is_none());
+    }
+
+    #[test]
+    fn direct_file_ref_manifest_accepts_compact_path_digest_size_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("proposals/current/proposal.json");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        let output_bytes = br#"{"status":"ready","summary":"compact direct-file manifest"}"#;
+        std::fs::write(&output_path, output_bytes).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "proposal_current".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id: "proposal_current_v1".to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec!["status".to_string(), "summary".to_string()],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(tmp.path().to_str().unwrap()),
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata = vec![PrePromptExpectedOutputMetadata::absent(
+            &specs[0],
+            &metadata_context,
+        )];
+        let manifest = serde_json::json!({
+            "output_name": "proposal_current",
+            "path": output_path.to_string_lossy(),
+            "digest": sha256_digest(output_bytes),
+            "size_bytes": output_bytes.len()
+        });
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_current".to_string(),
+            content: serde_json::to_vec(&manifest).unwrap(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        }];
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::ExactPathNew
+        );
+        assert_eq!(
+            captured[0].machine_bytes.as_deref(),
+            Some(&output_bytes[..])
+        );
+        assert!(validation.failure_class.is_none());
     }
 
     #[test]

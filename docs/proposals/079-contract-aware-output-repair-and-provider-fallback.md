@@ -6,7 +6,7 @@
 | Status | Draft |
 | Author | Codex |
 | Depends on | P057/P058 output settlement and artifact claims, P063 MCP field shaping, P065 operator retry instructions, [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md) |
-| Related | P017 workflow conflict mediation, P069 discovery diagnostics UI, `docs/reference/output-contracts-failure-evidence-and-recovery.md`, `docs/reference/artifact-discovery-and-settlement-optimization.md` |
+| Related | P017 workflow conflict mediation, P069 discovery diagnostics UI, P095 two-phase agent invocation, `docs/reference/output-contracts-failure-evidence-and-recovery.md`, `docs/reference/artifact-discovery-and-settlement-optimization.md` |
 | Scope | Make missing/invalid required agent outputs recoverable inside the invocation lifecycle before a run becomes durably blocked. |
 | Non-goal | No automatic human approvals, no acceptance of invalid artifacts, no live-provider-only acceptance gate, and no replacement for the observe-only auto-retry ledger or cooldown policy. |
 
@@ -367,6 +367,23 @@ Future MCP follow-up may add targeted controls such as:
 - `agent_outputs.fallback`
 
 Those are out of scope for P079 unless implementation discovers that automatic runtime repair needs an explicit operator command boundary.
+
+## Relationship to P095: Two-Phase Agent Invocation
+
+P095 defines output collection as the normal second model-facing phase after a
+work turn and server-owned deterministic readback. P079 remains a recovery path,
+not the default first attempt to collect output.
+
+The boundary is:
+
+- P095 output collection runs before P079 repair/fallback;
+- P079 repair applies only after output collection is missing, invalid, failed,
+  or unavailable;
+- same-session repair should not be used as the normal first mechanism for
+  producing required outputs;
+- provider fallback may be used after output collection fails, but it must not
+  replace deterministic readback or become a fresh implementation retry by
+  another name.
 
 ## 13. Acceptance Criteria
 

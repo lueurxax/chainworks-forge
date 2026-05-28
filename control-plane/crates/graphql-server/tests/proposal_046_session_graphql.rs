@@ -3636,8 +3636,11 @@ async fn proposal_046_subscription_same_principal_token_rotation_stops_emissions
 
     let dir = tempfile::tempdir().unwrap();
     #[cfg(unix)]
-    std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
-        .unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     let principals_path = dir.path().join("principals.json");
     let rotated_json = r#"{
         "schema_version": 2,
@@ -3702,8 +3705,11 @@ async fn proposal_046_file_backed_principal_revocation_observed_by_live_handle()
 
     let dir = tempfile::tempdir().unwrap();
     #[cfg(unix)]
-    std::fs::set_permissions(dir.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700))
-        .unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     let principals_path = dir.path().join("principals.json");
 
     // Bootstrap the first table (creates the file with a default-operator entry).

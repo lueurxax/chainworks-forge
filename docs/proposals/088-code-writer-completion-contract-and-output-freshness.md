@@ -6,7 +6,7 @@
 | Status | Draft |
 | Author | Codex |
 | Depends on | P037 ACP supervision and idle-hang watchdog, P058 output settlement and strict contract authority, P079 contract-aware output repair and provider fallback, P083 execution-truth ownership invariants |
-| Related | macOS operator navigation in `docs/reference/macos-operator-navigation.md`, agent work continuation in `docs/reference/agent-work-continuation.md`, storage tiering/read-path liveness in `docs/reference/query-projections-and-client-consumption-contract.md` and `docs/reference/rust-control-plane.md`, `docs/reference/output-contracts-failure-evidence-and-recovery.md` |
+| Related | P095 two-phase agent invocation, macOS operator navigation in `docs/reference/macos-operator-navigation.md`, agent work continuation in `docs/reference/agent-work-continuation.md`, storage tiering/read-path liveness in `docs/reference/query-projections-and-client-consumption-contract.md` and `docs/reference/rust-control-plane.md`, `docs/reference/output-contracts-failure-evidence-and-recovery.md` |
 | Scope | Contain and diagnose the `code_writer` completion-handoff class where substantive implementation work exists but fresh structured outputs for the current attempt do not settle. |
 | Non-goal | No weakening of output contracts, no acceptance of stale files as fresh truth, no provider-specific hotfixes as the main contract, no global missing-output fix for all agents, and no retroactive silent repair of historical blocked runs. |
 
@@ -1014,6 +1014,25 @@ P088 is complete when:
 20. P088 readback does not claim to close missing-output failures for non-`code_writer` agents;
 21. `proposal-088|p088` is registered in `scripts/test-gate.sh` and `docs/reference/test-gates.md`;
 22. targeted retries for current blocked runs no longer require forensic digging to distinguish provider failure from completion-handoff failure.
+
+## Relationship to P095: Two-Phase Agent Invocation
+
+P095 makes the P088 distinction explicit in the normal invocation lifecycle:
+work completion and output settlement are separate facts.
+
+For `code_writer`:
+
+- changed files, tests, generated artifacts, and tool traces can prove that work
+  happened;
+- those facts do not prove that required structured outputs settled;
+- fresh output must come from the P095 output collection turn or from a valid
+  P079/P088 repair path;
+- stale artifacts from previous attempts remain invalid even when the worktree
+  contains useful changes.
+
+P088 keeps owning freshness diagnostics and completion-handoff failure
+classification. P095 defines the normal prompt/readback/output sequence that
+should reduce how often P088 repair is needed.
 
 ## 13. Open Questions
 

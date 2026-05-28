@@ -43,7 +43,7 @@ It does not cover the SwiftUI operator shell or the implemented thin-client read
 
 ## Architecture
 
-The daemon is a single Rust binary built from an 8-crate workspace at `control-plane/`.
+The daemon is a single Rust binary built from a 9-crate workspace at `control-plane/`.
 
 ```text
                    GraphQL clients           MCP clients
@@ -84,6 +84,7 @@ The daemon is a single Rust binary built from an 8-crate workspace at `control-p
 |---|---|---|
 | `domain` | `crates/domain/src/lib.rs` | Value types, status enums, commands, events. No I/O. |
 | `db` | `crates/db/src/lib.rs` | SQLite pool, migrations, repository modules, work item types. |
+| `auth` | `crates/auth/src/lib.rs` | Bearer principals, principal-table loading, caller-class derivation, and shared boundary authorization helpers. |
 | `workflow` | `crates/workflow/src/lib.rs` | YAML workflow definition parsing, agent catalog loading, `RunPlan` compilation, and `PhaseBLeadResolver` compatibility mapping. |
 | `acp` | `crates/acp/src/lib.rs` | ACP runtime manager, per-provider adapters, JSON-RPC 2.0 stdio transport. |
 | `engine` | `crates/engine/src/lib.rs` | Orchestrator, command handler, background executor, work queue, recovery service, event bus, mediation settlement, and run-start rollout-contract preflight. |
@@ -94,14 +95,17 @@ The daemon is a single Rust binary built from an 8-crate workspace at `control-p
 ### Dependency flow
 
 ```text
-domain  <--  db  <--  workflow
-                  <--  acp
-                  <--  engine  <--  graphql-server
-                               <--  mcp-server
-                               <--  daemon
+domain  <--  db
+        <--  auth
+        <--  workflow
+        <--  acp
+
+db + auth + workflow + acp  -->  engine  -->  graphql-server
+                                        -->  mcp-server
+                                        -->  daemon
 ```
 
-`domain` has no dependencies on other workspace crates. `db` depends on `domain`. `engine` depends on `domain`, `db`, `workflow`, and `acp`. The server crates and `daemon` depend on `engine`.
+`domain` has no dependencies on other workspace crates. `db`, `auth`, `workflow`, and `acp` depend on `domain`. `engine` depends on `domain`, `db`, `auth`, `workflow`, and `acp`. The server crates and `daemon` depend on `engine`, and the boundary-facing server crates also depend directly on `auth` for principal and caller-class handling.
 
 ## Boundary shape
 

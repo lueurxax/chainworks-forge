@@ -6371,7 +6371,7 @@ private struct P036RecoveryEvidenceCard: View {
 
 // Renders P046 session observability readback in the selected-run overview tab.
 // Shows lineage list, KPI summary, health warnings, and generic MCP reset guidance.
-// Hides itself when P046 is unavailable (feature flag off or schema absent).
+// Hides itself when P046 is unavailable (schema absent or rollback mode).
 private struct P046SessionObservabilityCard: View {
     @ObservedObject var model: P046SessionObservabilityModel
 

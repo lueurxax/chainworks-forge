@@ -5,7 +5,7 @@
 | Date | 2026-04-18 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [043-query-projections-and-client-consumption-contract.md](043-query-projections-and-client-consumption-contract.md), [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), implemented canonical artifact contracts and implementation-completeness handoff in [output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md#implementation-self-assessment-and-handoff) |
+| Depends on | [../reference/query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md), [045-run-recovery-and-granular-retry-mcp-tools.md](045-run-recovery-and-granular-retry-mcp-tools.md), implemented canonical artifact contracts and implementation-completeness handoff in [output-contracts-failure-evidence-and-recovery.md](../reference/output-contracts-failure-evidence-and-recovery.md#implementation-self-assessment-and-handoff) |
 | Priority | P1 / High |
 | Scope | Convert release evidence and manual approval gates from prose/checklist artifacts into typed, server-validated gate payloads with automated evidence runners where possible. |
 | Goal | Let runs reach manual approval with complete, inspectable release evidence state and no hidden requirement for the operator to reconcile TBD placeholders by hand. |

@@ -33,6 +33,6 @@ remains a release-stage artifact.
 
 ## Follow-up Boundary
 
-Release receipt remains intentionally deferred until P046 is enabled in a
-release build. That is not an implementation blocker for the current merged
-slice.
+Release receipt remains intentionally deferred until release-build packaging
+evidence is generated. That is not an implementation blocker for the current
+merged slice because the GraphQL schema now includes the P046 surface by default.

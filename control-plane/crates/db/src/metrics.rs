@@ -406,14 +406,20 @@ pub fn get_counter_prefix_sum(prefix: &str) -> u64 {
 /// Stored as milliseconds internally; the metric name uses _seconds per the proposal vocabulary.
 pub fn record_p046_query_duration(field: &str, millis: u64) {
     let mut m = metrics().lock().unwrap();
-    let key = if m.p046_query_duration_ms.len() >= 32 && !m.p046_query_duration_ms.contains_key(field) {
-        "unbounded_overflow"
-    } else {
-        field
-    };
-    m.p046_query_duration_ms.entry(key.to_string()).or_default().record(millis);
+    let key =
+        if m.p046_query_duration_ms.len() >= 32 && !m.p046_query_duration_ms.contains_key(field) {
+            "unbounded_overflow"
+        } else {
+            field
+        };
+    m.p046_query_duration_ms
+        .entry(key.to_string())
+        .or_default()
+        .record(millis);
     // Also increment success-rate adoption counter (session_graphql_observability_query_success_rate).
-    *m.counters.entry("session_graphql_observability_query_success_rate".to_string()).or_default() += 1;
+    *m.counters
+        .entry("session_graphql_observability_query_success_rate".to_string())
+        .or_default() += 1;
 }
 
 pub fn get_p046_query_duration_p95(field: &str) -> Option<u64> {

@@ -60,8 +60,6 @@
     <dict>
         <key>MODE</key>
         <string>packaged-app</string>
-        <key>CHAINWORKS_GRAPHQL_SESSION_OBSERVABILITY</key>
-        <string>1</string>
     </dict>
 
     <!-- Absolute paths — launchd rejects the relative form with

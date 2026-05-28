@@ -5,7 +5,7 @@
 | Date | 2026-04-17 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [043-query-projections-and-client-consumption-contract.md](043-query-projections-and-client-consumption-contract.md) |
+| Depends on | [../reference/query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md) |
 | Scope | Add standalone YAML validation, dry-run compilation, and definition inspection to MCP and GraphQL, including execution-order sorting, agent grouping, semantic diffing, and cost estimation. |
 | Goal | The operator can validate, preview, and compare workflow and catalog definitions without starting a run, catching errors earlier and understanding impact before execution. |
 

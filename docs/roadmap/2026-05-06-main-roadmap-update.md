@@ -150,7 +150,7 @@ Related docs:
 
 ### 2.4 P073 and ROADMAP need stronger current alignment
 
-[P073](../proposals/073-stability-freeze-regression-budget-and-refactor-plan.md) should remain a stabilization operating mode, not a normal feature.
+[P073 freeze mode](../ROADMAP.md#operating-mode) should remain a stabilization operating mode, not a normal feature.
 
 [../ROADMAP.md](../ROADMAP.md) should now explicitly include the implemented write-budget contract, the durable side-effect ledger, P079/P080/P081/P082/P083, and the executable rollout-gate template, not only older P031/P038/P046/P068 style work.
 
@@ -162,7 +162,7 @@ Related docs:
 
 #### Step 0 - P073 freeze mode
 
-Run [P073](../proposals/073-stability-freeze-regression-budget-and-refactor-plan.md) as a continuous operating mode.
+Run [P073 freeze mode](../ROADMAP.md#operating-mode) as a continuous operating mode.
 
 Allowed work:
 

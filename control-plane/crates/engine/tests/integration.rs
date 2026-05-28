@@ -455,6 +455,11 @@ async fn proposal_087_projection_cache_rebuilds_after_restart() {
     stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Completed))
         .await
         .unwrap();
+    let continuation_agent = make_agent_execution(stage_id, AgentStatus::Completed);
+    let continuation_agent_id = continuation_agent.id;
+    agent_executions::insert(&pool, &continuation_agent)
+        .await
+        .unwrap();
 
     for suffix in ["a", "b"] {
         artifacts::insert(
@@ -495,7 +500,30 @@ async fn proposal_087_projection_cache_rebuilds_after_restart() {
     .bind(run_id.to_string())
     .bind(stage_id.to_string())
     .bind(format!("p087-restart-{}", uuid::Uuid::new_v4()))
-    .bind(now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO agent_work_continuations
+           (id, run_id, stage_execution_id, agent_execution_id,
+            mode, trigger_kind, status, idempotency_scope, idempotency_key,
+            request_fingerprint_sha256, created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4,
+                   'live_handle_continuation', 'operator_mcp', 'queued',
+                   'p087-runtime-health-test', ?5,
+                   'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                   ?6, ?6)"#,
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(run_id.to_string())
+    .bind(stage_id.to_string())
+    .bind(continuation_agent_id.to_string())
+    .bind(format!(
+        "p087-restart-continuation-{}",
+        uuid::Uuid::new_v4()
+    ))
+    .bind(now.clone())
     .execute(&pool)
     .await
     .unwrap();
@@ -570,7 +598,7 @@ async fn proposal_087_projection_cache_rebuilds_after_restart() {
     assert_eq!(
         runtime_health.get::<i64, _>("continuation_active_count"),
         1,
-        "startup rebuild must run after recovery enqueues catchup work"
+        "startup rebuild must refresh active continuation count from canonical P086 rows"
     );
     assert!(
         runtime_health.get::<i64, _>("updated_at_ms") > 1,
