@@ -295,7 +295,11 @@ struct Proposal058Tests {
             command: "reports.get run_id=run-ui"
         )
         _ = EscalationCommandMirrorList(snapshot: snapshot)
-        _ = EscalationMenuBarList(snapshots: [snapshot])
+        _ = EscalationMenuBarList(
+            snapshots: [snapshot],
+            onOpenRun: { _ in },
+            onShowAllPausedRuns: {}
+        )
         _ = EscalationTraceTimeline(traceJSONRedacted: #"{"schema_version":"p058_escalation_trace_redacted_v1","events":[]}"#)
         _ = DriftReviewSheet(
             frozenPolicyHash: "sha256:frozen",
@@ -472,8 +476,12 @@ struct Proposal058Tests {
         #expect(presentation.aggregateCount == 7)
         #expect(presentation.rows.count == 5)
         #expect(presentation.overflowCount == 2)
+        #expect(presentation.overflowRunIDs == ["run-menu-1", "run-menu-0"])
+        #expect(presentation.emptyTitle == "No paused escalation runs")
+        #expect(presentation.overflowTitle == "Show all paused runs...")
         #expect(presentation.rows.map(\.runId) == ["run-menu-6", "run-menu-5", "run-menu-4", "run-menu-3", "run-menu-2"])
         #expect(EscalationMenuBarPresenter.presentation(for: [snapshots[0]], limit: 5).rows.first?.stateLabel == "Escalating")
+        #expect(EscalationMenuBarPresenter.presentation(for: []).emptyTitle == "No paused escalation runs")
     }
 
     @Test("EscalationReadAdapterRegistry replaces visible run aggregation")

@@ -8,7 +8,7 @@ enum EscalationDensity: String, Sendable {
 }
 
 enum EscalationPresentationStyle {
-    static func stateLabel(for snapshot: EscalationSnapshot) -> String {
+    nonisolated static func stateLabel(for snapshot: EscalationSnapshot) -> String {
         if snapshot.isKillSwitchEngaged { return "Kill switch" }
         if snapshot.isPolicyDrift { return "Policy drift" }
         if snapshot.pausedChainCount > 0 { return "Paused" }
@@ -16,7 +16,7 @@ enum EscalationPresentationStyle {
         return "Standard"
     }
 
-    static func stateSymbol(for snapshot: EscalationSnapshot) -> String {
+    nonisolated static func stateSymbol(for snapshot: EscalationSnapshot) -> String {
         if snapshot.isKillSwitchEngaged { return "pause.circle.fill" }
         if snapshot.isPolicyDrift { return "exclamationmark.triangle.fill" }
         if snapshot.pausedChainCount > 0 { return "clock.badge.exclamationmark" }
@@ -31,11 +31,11 @@ enum EscalationPresentationStyle {
         return .secondary
     }
 
-    static func tierLabel(for chain: EscalationChainStateDTO) -> String {
+    nonisolated static func tierLabel(for chain: EscalationChainStateDTO) -> String {
         chain.currentTierId ?? "Tier 0"
     }
 
-    static func triggerLabel(for chain: EscalationChainStateDTO) -> String {
+    nonisolated static func triggerLabel(for chain: EscalationChainStateDTO) -> String {
         chain.triggerRaw ?? "standard execution"
     }
 
@@ -47,7 +47,7 @@ enum EscalationPresentationStyle {
             || chain.pauseReasonRaw?.contains("shadow") == true
     }
 
-    static func pauseTitle(for reason: String?) -> String {
+    nonisolated static func pauseTitle(for reason: String?) -> String {
         switch reason {
         case EscalationPauseReasonCode.escalationKillSwitchEngaged.rawValue:
             return "Escalation kill switch engaged"
@@ -68,7 +68,7 @@ enum EscalationPresentationStyle {
         }
     }
 
-    static func accessibilitySummary(for snapshot: EscalationSnapshot) -> String {
+    nonisolated static func accessibilitySummary(for snapshot: EscalationSnapshot) -> String {
         let state = stateLabel(for: snapshot)
         guard let first = snapshot.activeChains.first else {
             return "\(state), no escalation chain"
@@ -604,6 +604,7 @@ enum EscalationScreenStateMatrix {
 struct EscalationMenuBarList: View {
     let snapshots: [EscalationSnapshot]
     var onOpenRun: ((String) -> Void)?
+    var onShowAllPausedRuns: (() -> Void)?
 
     var body: some View {
         let presentation = EscalationMenuBarPresenter.presentation(for: snapshots)
@@ -659,10 +660,19 @@ struct EscalationMenuBarList: View {
                     .accessibilityLabel(row.accessibilityLabel)
                 }
                 if presentation.overflowCount > 0 {
-                    Text("Show all paused runs... +\(presentation.overflowCount)")
+                    Button {
+                        onShowAllPausedRuns?()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text(presentation.overflowTitle)
+                            Text("+\(presentation.overflowCount)")
+                                .foregroundStyle(.secondary)
+                        }
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel("\(presentation.overflowCount) additional escalation runs")
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(onShowAllPausedRuns == nil)
+                    .accessibilityLabel("\(presentation.overflowCount) additional escalation runs. Show all paused runs.")
                 }
             }
         }
@@ -675,8 +685,10 @@ struct EscalationMenuBarList: View {
 struct EscalationMenuBarPresentation: Equatable {
     let rows: [EscalationMenuBarRow]
     let overflowCount: Int
+    let overflowRunIDs: [String]
     let aggregateCount: Int
     let emptyTitle: String
+    let overflowTitle: String
 }
 
 struct EscalationMenuBarRow: Identifiable, Equatable {
@@ -712,34 +724,38 @@ enum EscalationMenuBarAccentRole: String, Equatable, Sendable {
 }
 
 enum EscalationMenuBarPresenter {
-    static let rowLimit = 5
+    nonisolated static let rowLimit = 5
 
-    static func presentation(
+    nonisolated static func presentation(
         for snapshots: [EscalationSnapshot],
         limit: Int = rowLimit
     ) -> EscalationMenuBarPresentation {
+        let visibleLimit = max(limit, 0)
         let attention = snapshots
             .filter(isAttentionSnapshot)
             .sorted(by: compare)
         let rows = attention
-            .prefix(max(limit, 0))
+            .prefix(visibleLimit)
             .map(row)
+        let overflow = attention.dropFirst(visibleLimit)
         return EscalationMenuBarPresentation(
             rows: rows,
-            overflowCount: max(0, attention.count - rows.count),
+            overflowCount: overflow.count,
+            overflowRunIDs: overflow.map(\.runId),
             aggregateCount: attention.count,
-            emptyTitle: "No escalation runs need attention"
+            emptyTitle: "No paused escalation runs",
+            overflowTitle: "Show all paused runs..."
         )
     }
 
-    static func isAttentionSnapshot(_ snapshot: EscalationSnapshot) -> Bool {
+    nonisolated static func isAttentionSnapshot(_ snapshot: EscalationSnapshot) -> Bool {
         snapshot.pausedChainCount > 0
             || snapshot.isPolicyDrift
             || snapshot.isKillSwitchEngaged
             || snapshot.hasActiveEscalation
     }
 
-    private static func compare(_ lhs: EscalationSnapshot, _ rhs: EscalationSnapshot) -> Bool {
+    nonisolated private static func compare(_ lhs: EscalationSnapshot, _ rhs: EscalationSnapshot) -> Bool {
         let left = latestUpdatedAt(lhs)
         let right = latestUpdatedAt(rhs)
         if left != right {
@@ -748,11 +764,11 @@ enum EscalationMenuBarPresenter {
         return lhs.runId < rhs.runId
     }
 
-    private static func latestUpdatedAt(_ snapshot: EscalationSnapshot) -> String {
+    nonisolated private static func latestUpdatedAt(_ snapshot: EscalationSnapshot) -> String {
         snapshot.activeChains.map(\.updatedAt).max() ?? ""
     }
 
-    private static func row(for snapshot: EscalationSnapshot) -> EscalationMenuBarRow {
+    nonisolated private static func row(for snapshot: EscalationSnapshot) -> EscalationMenuBarRow {
         let first = snapshot.activeChains.first
         let runLabel = compactRunLabel(snapshot.runId)
         let stateLabel = EscalationPresentationStyle.stateLabel(for: snapshot)
@@ -781,12 +797,12 @@ enum EscalationMenuBarPresenter {
         )
     }
 
-    private static func compactRunLabel(_ runId: String) -> String {
+    nonisolated private static func compactRunLabel(_ runId: String) -> String {
         guard runId.count > 12 else { return runId }
         return "\(runId.prefix(8))..."
     }
 
-    private static func accentRole(for snapshot: EscalationSnapshot) -> EscalationMenuBarAccentRole {
+    nonisolated private static func accentRole(for snapshot: EscalationSnapshot) -> EscalationMenuBarAccentRole {
         if snapshot.isKillSwitchEngaged || snapshot.isPolicyDrift { return .orange }
         if snapshot.pausedChainCount > 0 { return .yellow }
         if snapshot.hasActiveEscalation { return .accent }

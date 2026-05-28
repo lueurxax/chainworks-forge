@@ -89,6 +89,12 @@ struct Chainworks_ForgeApp: App {
                     object: runID,
                     userInfo: ["runID": runID]
                 )
+            } onShowAllPausedRuns: {
+                NotificationCenter.default.post(
+                    name: .chainworksSelectTab,
+                    object: "Runs",
+                    userInfo: ["tab": "Runs"]
+                )
             }
         } label: {
             HStack(spacing: 4) {
