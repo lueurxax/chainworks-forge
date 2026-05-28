@@ -125,6 +125,12 @@ struct RunsHomeView: View {
 
     private var runsSidebar: some View {
         List {
+            if focusedLaneID == "waiting" {
+                P031AccessibilityMarker(identifier: "approval-inbox-view")
+                if workbench.inlineApprovals.isEmpty {
+                    P031AccessibilityMarker(identifier: "approval-inbox-empty-state")
+                }
+            }
             if workbench.sidebarLanes.isEmpty {
                 Section {
                     if model.isLoading {
@@ -6240,6 +6246,7 @@ private struct P036ApprovalWorkbenchCard: View {
                                 .tint(ForgeStatusColor.error)
                                 .disabled(!row.canReject || resolvingIDs.contains(row.id))
                                 .help(row.rejectDisabledReason ?? "")
+                                .accessibilityIdentifier("approval-reject-button")
 
                                 Button("Approve") {
                                     Task { await onApprove(row.id) }
@@ -6249,6 +6256,7 @@ private struct P036ApprovalWorkbenchCard: View {
                                 .tint(ForgeStatusColor.success)
                                 .disabled(!row.canApprove || resolvingIDs.contains(row.id))
                                 .help(row.approveDisabledReason ?? "")
+                                .accessibilityIdentifier("approval-approve-button")
                             }
                         }
                         .padding(10)

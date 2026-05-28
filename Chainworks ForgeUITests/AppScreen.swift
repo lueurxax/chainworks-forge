@@ -258,6 +258,16 @@ struct AppScreen {
 
     @discardableResult
     func selectTab(_ label: String, timeout: TimeInterval = 10) -> Bool {
+        if label == "Approvals" {
+            if expectedRootVisible(for: "Approvals") {
+                return true
+            }
+            guard selectTab("Runs", timeout: timeout) else {
+                return false
+            }
+            return expectedRootVisible(for: "Approvals") || expectedRootVisible(for: "Runs")
+        }
+
         _ = revealCompactNavigationIfNeeded()
         if expectedRootVisible(for: label) {
             return true

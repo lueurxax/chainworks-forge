@@ -823,6 +823,14 @@ private struct P031IdeasCompatibilitySurface: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
+                Button {
+                    isShowingStartRun = true
+                } label: {
+                    Label("Start New Run", systemImage: "play.circle")
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("start-new-run-button")
+
                 P031RunProgressCompatibilitySurface()
                 Spacer()
             }
@@ -831,6 +839,12 @@ private struct P031IdeasCompatibilitySurface: View {
         }
         .onAppear {
             selectedTitle = seedTitle
+        }
+        .sheet(isPresented: $isShowingStartRun) {
+            P031StartRunCompatibilitySheet(
+                forceLiveRuntimeUnavailable: forceLiveRuntimeUnavailable,
+                isPresented: $isShowingStartRun
+            )
         }
     }
 }
