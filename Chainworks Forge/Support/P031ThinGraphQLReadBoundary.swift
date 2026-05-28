@@ -5678,7 +5678,6 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let sideEffectReadback: P078SideEffectReadbackPresentation?
   let continuationReadback: P086ContinuationReadbackPresentation?
   let escalationChains: [EscalationChainStateDTO]
-  let escalationSnapshot: EscalationSnapshot?
   let escalationTraceJSONRedacted: String?
   let freshness: P031FreshnessSnapshot
   let refreshFeedbackText: String
@@ -5710,7 +5709,6 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     sideEffectReadback: P078SideEffectReadbackPresentation? = nil,
     continuationReadback: P086ContinuationReadbackPresentation? = nil,
     escalationChains: [EscalationChainStateDTO] = [],
-    escalationSnapshot: EscalationSnapshot? = nil,
     escalationTraceJSONRedacted: String? = nil,
     freshness: P031FreshnessSnapshot,
     refreshFeedbackText: String,
@@ -5740,7 +5738,6 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.sideEffectReadback = sideEffectReadback
     self.continuationReadback = continuationReadback
     self.escalationChains = escalationChains
-    self.escalationSnapshot = escalationSnapshot
     self.escalationTraceJSONRedacted = escalationTraceJSONRedacted
     self.freshness = freshness
     self.refreshFeedbackText = refreshFeedbackText
@@ -6651,9 +6648,6 @@ enum P031RunDetailPresenter {
       metrics: detail.continuationMetricsSummary
     )
     let escalationChains = detail.runEscalationReadback?.chains ?? []
-    let escalationSnapshot = detail.runEscalationReadback.map {
-      EscalationSnapshot.build(runId: $0.runID, chains: $0.chains)
-    }
     let escalationTraceJSONRedacted = detail.runEscalationReadback?.chains.compactMap {
       $0.escalationTraceJSONRedacted
     }.first
@@ -6687,7 +6681,6 @@ enum P031RunDetailPresenter {
       sideEffectReadback: sideEffectReadback,
       continuationReadback: continuationReadback,
       escalationChains: escalationChains,
-      escalationSnapshot: escalationSnapshot,
       escalationTraceJSONRedacted: escalationTraceJSONRedacted,
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
         currentFreshness: currentFreshness,

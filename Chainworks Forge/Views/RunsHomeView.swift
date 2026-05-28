@@ -975,6 +975,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     @Published private(set) var daemonRestartError: String?
     @Published private(set) var selectedRunID: String?
     @Published private(set) var runtimeTimelineEvents: [P031RuntimeTimelineEventPresentation] = []
+    @Published private(set) var escalationAttentionSnapshots: [EscalationSnapshot] = []
 
     var totalPendingApprovalCount: Int {
         approvalInbox?.rows.count ?? 0
@@ -1550,6 +1551,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
             runDetail = nil
             stopLiveSubscriptions()
         }
+        await refreshEscalationAttentionSnapshots(for: availableRunIDs)
     }
 
     func selectRun(_ runID: String) {
@@ -1660,6 +1662,33 @@ final class P031ThinReadDashboardModel: ObservableObject {
         let presentation = await loadRunDetailAction(runID, runDetailFreshness)
         runDetailFreshness = presentation.freshness
         runDetail = presentation
+        if presentation.escalationChains.isEmpty {
+            EscalationReadAdapterRegistry.shared.reset(runId: runID)
+        } else {
+            EscalationReadAdapterRegistry.shared.applyChains(presentation.escalationChains, for: runID)
+        }
+        escalationAttentionSnapshots = EscalationReadAdapterRegistry.shared.attentionSnapshots
+    }
+
+    private func refreshEscalationAttentionSnapshots(for runIDs: [String]) async {
+        let uniqueRunIDs = Array(Set(runIDs)).sorted()
+        guard !uniqueRunIDs.isEmpty else {
+            EscalationReadAdapterRegistry.shared.applyVisibleRunChains([:])
+            escalationAttentionSnapshots = []
+            return
+        }
+
+        var chainsByRunID: [String: [EscalationChainStateDTO]] = [:]
+        for runID in uniqueRunIDs {
+            if selectedRunID == runID, let runDetail {
+                chainsByRunID[runID] = runDetail.escalationChains
+            } else {
+                let presentation = await loadRunDetailAction(runID, runDetailFreshness)
+                chainsByRunID[runID] = presentation.escalationChains
+            }
+        }
+        EscalationReadAdapterRegistry.shared.applyVisibleRunChains(chainsByRunID)
+        escalationAttentionSnapshots = EscalationReadAdapterRegistry.shared.attentionSnapshots
     }
 
     private func startLiveSubscriptions(for runID: String) {
@@ -1796,6 +1825,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
         approvalInbox = approvalsPresentation
         runDetail = detailPresentation
         schedulerHealth = schedulerResult
+        await refreshEscalationAttentionSnapshots(for: runsPresentation.rows.map(\.runID))
     }
 
     private static func restartPackagedDaemon() async -> String? {

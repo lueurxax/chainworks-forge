@@ -158,11 +158,13 @@ final class NotificationService {
 
     func applyP058EscalationSnapshots(_ snapshots: [EscalationSnapshot]) {
         p058EscalationSnapshots = snapshots
-        escalationAttentionCount = snapshots.reduce(0) { total, snapshot in
-            total + max(0, snapshot.pausedChainCount)
-                + (snapshot.isPolicyDrift ? 1 : 0)
-                + (snapshot.isKillSwitchEngaged ? 1 : 0)
+        escalationAttentionCount = snapshots.filter { snapshot in
+            snapshot.pausedChainCount > 0
+                || snapshot.isPolicyDrift
+                || snapshot.isKillSwitchEngaged
+                || snapshot.hasActiveEscalation
         }
+        .count
         escalationForcesMenuBar = escalationAttentionCount > 0
         refreshMenuBarState()
         refreshDockBadgeLabel()

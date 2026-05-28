@@ -140,6 +140,20 @@ final class EscalationReadAdapterRegistry {
         return adapter.snapshot
     }
 
+    func applyVisibleRunChains(_ chainsByRunId: [String: [EscalationChainStateDTO]]) {
+        let visibleRunIds = Set(chainsByRunId.keys)
+        for runId in Array(adapters.keys) where !visibleRunIds.contains(runId) {
+            adapters.removeValue(forKey: runId)
+        }
+        for (runId, chains) in chainsByRunId {
+            if chains.isEmpty {
+                reset(runId: runId)
+            } else {
+                applyChains(chains, for: runId)
+            }
+        }
+    }
+
     func reset(runId: String) {
         adapter(for: runId).reset()
     }

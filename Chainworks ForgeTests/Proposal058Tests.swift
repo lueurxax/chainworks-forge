@@ -388,6 +388,66 @@ struct Proposal058Tests {
         #expect(service.p058EscalationSnapshots.isEmpty)
     }
 
+    @Test("P058 dock badge counts attention per run, not per condition")
+    func dockBadgeCountsAttentionPerRun() {
+        let service = NotificationService()
+        let twoPausedChains = EscalationSnapshot.build(
+            runId: "run-menu-single",
+            chains: [
+                makeChain(
+                    id: "ledger-menu-single",
+                    status: "paused",
+                    pauseReason: EscalationPauseReasonCode.escalationChainExhausted.rawValue
+                ),
+                makeChain(
+                    id: "ledger-menu-single-2",
+                    status: "paused",
+                    pauseReason: EscalationPauseReasonCode.providerSessionForceDetached.rawValue
+                ),
+            ]
+        )
+
+        service.applyP058EscalationSnapshots([twoPausedChains])
+
+        #expect(service.pendingAttentionCount == 1)
+        #expect(service.isMenuBarEnabled)
+    }
+
+    @Test("EscalationReadAdapterRegistry replaces visible run aggregation")
+    func escalationRegistryReplacesVisibleRunAggregation() {
+        let registry = EscalationReadAdapterRegistry.shared
+        registry.applyVisibleRunChains([:])
+        registry.applyVisibleRunChains([
+            "run-visible-a": [
+                makeChain(
+                    id: "ledger-visible-a",
+                    status: "paused",
+                    pauseReason: EscalationPauseReasonCode.escalationChainExhausted.rawValue
+                ),
+            ],
+            "run-visible-b": [
+                makeChain(
+                    id: "ledger-visible-b",
+                    status: "active",
+                    pauseReason: nil
+                ),
+            ],
+        ])
+        registry.applyVisibleRunChains([
+            "run-visible-b": [
+                makeChain(
+                    id: "ledger-visible-b",
+                    status: "active",
+                    pauseReason: nil
+                ),
+            ],
+        ])
+
+        #expect(registry.snapshots.map(\.runId).contains("run-visible-a") == false)
+        #expect(registry.snapshots.map(\.runId).contains("run-visible-b"))
+        registry.applyVisibleRunChains([:])
+    }
+
     @Test("P058 adapter registry aggregates attention snapshots across runs")
     func adapterRegistryAggregatesAttentionSnapshotsAcrossRuns() {
         let registry = EscalationReadAdapterRegistry.shared
@@ -517,7 +577,7 @@ struct Proposal058Tests {
         #expect(query.contains("featureFlagState"))
     }
 
-    @Test("P031 presenter maps P058 readback into system-tab escalation snapshot")
+    @Test("P031 presenter maps P058 readback into adapter-owned escalation chains")
     func p031PresenterMapsEscalationReadback() {
         let chain = EscalationChainStateDTO(
             id: "ledger-p031",
@@ -559,10 +619,20 @@ struct Proposal058Tests {
             checkedAt: Date(timeIntervalSince1970: 0)
         )
 
-        #expect(presentation.escalationSnapshot?.runId == "run-p031")
-        #expect(presentation.escalationSnapshot?.pausedChainCount == 1)
         #expect(presentation.escalationChains.map(\.id) == ["ledger-p031"])
         #expect(presentation.escalationTraceJSONRedacted?.contains("p058_escalation_trace_redacted_v1") == true)
+    }
+
+    @Test("P031 presentation does not export direct escalation snapshots")
+    func p031PresentationDoesNotExportDirectEscalationSnapshots() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        #expect(!source.contains("let escalationSnapshot"))
+        #expect(!source.contains("EscalationSnapshot.build"))
     }
 
     @Test("Escalation trace copy writes string and public.json atomically")

@@ -135,6 +135,9 @@ struct ContentView: View {
             .onChange(of: runsModel.runDetail) {
                 syncRunDetailPresentation()
             }
+            .onChange(of: runsModel.escalationAttentionSnapshots) {
+                syncEscalationAttentionPresentation()
+            }
             .onChange(of: runsModel.daemonLifecycle) {
                 syncReadinessPresentation()
             }
@@ -238,15 +241,12 @@ struct ContentView: View {
     private func syncRunDetailPresentation() {
         guard let runDetail = runsModel.runDetail else { return }
         workbench.populate(from: runDetail)
-        if let runID = runDetail.runID {
-            if runDetail.escalationChains.isEmpty {
-                EscalationReadAdapterRegistry.shared.reset(runId: runID)
-            } else {
-                EscalationReadAdapterRegistry.shared.applyChains(runDetail.escalationChains, for: runID)
-            }
-        }
+        syncEscalationAttentionPresentation()
+    }
+
+    private func syncEscalationAttentionPresentation() {
         notificationService.applyP058EscalationSnapshots(
-            EscalationReadAdapterRegistry.shared.attentionSnapshots
+            runsModel.escalationAttentionSnapshots
         )
     }
 
