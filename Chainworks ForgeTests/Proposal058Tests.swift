@@ -413,6 +413,45 @@ struct Proposal058Tests {
         #expect(service.isMenuBarEnabled)
     }
 
+    @Test("P058 menu bar presenter includes active escalation, sorts newest first, and caps rows")
+    func menuBarPresenterSortsCapsAndMatchesAttentionFilter() {
+        let snapshots = (0..<7).map { index in
+            EscalationSnapshot.build(
+                runId: "run-menu-\(index)",
+                chains: [
+                    EscalationChainStateDTO(
+                        id: "ledger-menu-\(index)",
+                        runId: "run-menu-\(index)",
+                        stageId: "state_3",
+                        agentId: "code_writer",
+                        policyId: "policy-menu",
+                        policyHash: "sha256:menu",
+                        statusRaw: index == 0 ? "active" : "paused",
+                        currentTierId: index == 0 ? "same_backend_retry" : "human_pause",
+                        currentTierKindRaw: index == 0
+                            ? EscalationTierKindCode.sameBackendRetry.rawValue
+                            : EscalationTierKindCode.pause.rawValue,
+                        chainAttemptIndex: index,
+                        triggerRaw: "repeated_same_blocker_digest",
+                        pauseReasonRaw: index == 0 ? nil : EscalationPauseReasonCode.escalationChainExhausted.rawValue,
+                        operatorActionHint: nil,
+                        runbookAnchor: nil,
+                        createdAt: "2026-05-07T00:00:0\(index)Z",
+                        updatedAt: "2026-05-07T00:00:0\(index)Z"
+                    ),
+                ]
+            )
+        }
+
+        let presentation = EscalationMenuBarPresenter.presentation(for: snapshots)
+
+        #expect(presentation.aggregateCount == 7)
+        #expect(presentation.rows.count == 5)
+        #expect(presentation.overflowCount == 2)
+        #expect(presentation.rows.map(\.runId) == ["run-menu-6", "run-menu-5", "run-menu-4", "run-menu-3", "run-menu-2"])
+        #expect(EscalationMenuBarPresenter.presentation(for: [snapshots[0]], limit: 5).rows.first?.stateLabel == "Escalating")
+    }
+
     @Test("EscalationReadAdapterRegistry replaces visible run aggregation")
     func escalationRegistryReplacesVisibleRunAggregation() {
         let registry = EscalationReadAdapterRegistry.shared
@@ -446,6 +485,40 @@ struct Proposal058Tests {
         #expect(registry.snapshots.map(\.runId).contains("run-visible-a") == false)
         #expect(registry.snapshots.map(\.runId).contains("run-visible-b"))
         registry.applyVisibleRunChains([:])
+    }
+
+    @Test("P058 registry notifies all-run attention observers on every adapter snapshot")
+    func registryNotifiesAttentionObserversOnEveryAdapterSnapshot() {
+        let registry = EscalationReadAdapterRegistry.shared
+        let runA = "run-observer-a-\(UUID().uuidString)"
+        let runB = "run-observer-b-\(UUID().uuidString)"
+        var observedRunSets: [[String]] = []
+        let observerID = registry.addAttentionObserver { snapshots in
+            observedRunSets.append(snapshots.map(\.runId).sorted())
+        }
+        defer {
+            registry.removeAttentionObserver(observerID)
+            registry.removeAdapter(for: runA)
+            registry.removeAdapter(for: runB)
+        }
+
+        registry.applyChains([
+            makeChain(
+                id: "ledger-observer-a",
+                status: "paused",
+                pauseReason: EscalationPauseReasonCode.escalationChainExhausted.rawValue
+            ),
+        ], for: runA)
+        registry.applyChains([
+            makeChain(
+                id: "ledger-observer-b",
+                status: "paused",
+                pauseReason: EscalationPauseReasonCode.providerSessionForceDetached.rawValue
+            ),
+        ], for: runB)
+
+        #expect(observedRunSets.contains([runA]))
+        #expect(observedRunSets.contains([runA, runB].sorted()))
     }
 
     @Test("P058 adapter registry aggregates attention snapshots across runs")
@@ -624,15 +697,33 @@ struct Proposal058Tests {
     }
 
     @Test("P031 presentation does not export direct escalation snapshots")
-    func p031PresentationDoesNotExportDirectEscalationSnapshots() throws {
-        let sourceURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift")
-        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+    func p031PresentationDoesNotExportDirectEscalationSnapshots() {
+        let presentation = P031RunDetailPresentation(
+            title: "Run",
+            runID: "run-p031-no-snapshot",
+            workflowLabel: "Workflow",
+            statusLabel: "Running",
+            progressLabel: nil,
+            pendingApprovalsLabel: nil,
+            ideaContext: nil,
+            stageTransitions: [],
+            approvalRows: [],
+            artifactRows: [],
+            artifactViewerRows: [],
+            reportRows: [],
+            catalogContext: nil,
+            escalationChains: [],
+            freshness: P031FreshnessSnapshot(state: .live),
+            refreshFeedbackText: "Live",
+            emptyStateTitle: nil,
+            errorDescription: nil,
+            rawStatus: "running",
+            failedStages: 0
+        )
+        let fieldLabels = Set(Mirror(reflecting: presentation).children.compactMap(\.label))
 
-        #expect(!source.contains("let escalationSnapshot"))
-        #expect(!source.contains("EscalationSnapshot.build"))
+        #expect(!fieldLabels.contains("escalationSnapshot"))
+        #expect(fieldLabels.contains("escalationChains"))
     }
 
     @Test("Escalation trace copy writes string and public.json atomically")

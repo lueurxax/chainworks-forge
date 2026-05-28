@@ -121,6 +121,7 @@ final class EscalationReadAdapterRegistry {
     static let shared = EscalationReadAdapterRegistry()
 
     private var adapters: [String: EscalationReadAdapter] = [:]
+    private var attentionObservers: [UUID: ([EscalationSnapshot]) -> Void] = [:]
 
     private init() {}
 
@@ -135,8 +136,20 @@ final class EscalationReadAdapterRegistry {
 
     @discardableResult
     func applyChains(_ chains: [EscalationChainStateDTO], for runId: String) -> EscalationSnapshot {
+        applyChains(chains, for: runId, notify: true)
+    }
+
+    @discardableResult
+    private func applyChains(
+        _ chains: [EscalationChainStateDTO],
+        for runId: String,
+        notify: Bool
+    ) -> EscalationSnapshot {
         let adapter = adapter(for: runId)
         adapter.applyChains(chains)
+        if notify {
+            notifyAttentionObservers()
+        }
         return adapter.snapshot
     }
 
@@ -147,15 +160,23 @@ final class EscalationReadAdapterRegistry {
         }
         for (runId, chains) in chainsByRunId {
             if chains.isEmpty {
-                reset(runId: runId)
+                reset(runId: runId, notify: false)
             } else {
-                applyChains(chains, for: runId)
+                applyChains(chains, for: runId, notify: false)
             }
         }
+        notifyAttentionObservers()
     }
 
     func reset(runId: String) {
+        reset(runId: runId, notify: true)
+    }
+
+    private func reset(runId: String, notify: Bool) {
         adapter(for: runId).reset()
+        if notify {
+            notifyAttentionObservers()
+        }
     }
 
     var snapshots: [EscalationSnapshot] {
@@ -177,5 +198,26 @@ final class EscalationReadAdapterRegistry {
     // Retained for Phase 1+ subscription teardown when a run window closes.
     func removeAdapter(for runId: String) {
         adapters.removeValue(forKey: runId)
+        notifyAttentionObservers()
+    }
+
+    @discardableResult
+    func addAttentionObserver(_ observer: @escaping ([EscalationSnapshot]) -> Void) -> UUID {
+        let id = UUID()
+        attentionObservers[id] = observer
+        observer(attentionSnapshots)
+        return id
+    }
+
+    func removeAttentionObserver(_ id: UUID?) {
+        guard let id else { return }
+        attentionObservers.removeValue(forKey: id)
+    }
+
+    private func notifyAttentionObservers() {
+        let current = attentionSnapshots
+        for observer in attentionObservers.values {
+            observer(current)
+        }
     }
 }

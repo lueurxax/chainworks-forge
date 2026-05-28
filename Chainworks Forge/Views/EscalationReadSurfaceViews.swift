@@ -606,30 +606,63 @@ struct EscalationMenuBarList: View {
     var onOpenRun: ((String) -> Void)?
 
     var body: some View {
+        let presentation = EscalationMenuBarPresenter.presentation(for: snapshots)
         VStack(alignment: .leading, spacing: 8) {
-            Text("Escalation attention")
-                .font(.headline)
-            if attentionSnapshots.isEmpty {
-                Text("No paused escalation chains")
+            HStack(spacing: 8) {
+                Text("Escalation attention")
+                    .font(.headline)
+                Spacer()
+                if presentation.aggregateCount > 0 {
+                    Text("\(presentation.aggregateCount)")
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(.secondary.opacity(0.14), in: Capsule())
+                        .accessibilityLabel("\(presentation.aggregateCount) runs require escalation attention")
+                }
+            }
+            if presentation.rows.isEmpty {
+                Text(presentation.emptyTitle)
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(attentionSnapshots, id: \.runId) { snapshot in
+                ForEach(presentation.rows) { row in
                     Button {
-                        onOpenRun?(snapshot.runId)
+                        onOpenRun?(row.runId)
                     } label: {
                         HStack(spacing: 8) {
-                            Image(systemName: EscalationPresentationStyle.stateSymbol(for: snapshot))
+                            Image(systemName: row.symbol)
+                                .foregroundStyle(row.accentColor)
+                                .frame(width: 18)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(snapshot.runId)
+                                HStack(spacing: 6) {
+                                    Text(row.runLabel)
+                                        .font(.caption.weight(.semibold))
+                                        .lineLimit(1)
+                                    Text(row.stateLabel)
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(row.accentColor)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 2)
+                                        .background(row.accentColor.opacity(0.12), in: Capsule())
+                                }
+                                Text(row.detailLabel)
                                     .font(.caption.weight(.semibold))
-                                Text(EscalationScreenStateMatrix.accessibilityLabel(for: snapshot))
+                                    .lineLimit(1)
+                                Text(row.secondaryLabel)
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
+                                    .lineLimit(1)
                             }
                         }
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Open escalation run \(snapshot.runId)")
+                    .accessibilityLabel(row.accessibilityLabel)
+                }
+                if presentation.overflowCount > 0 {
+                    Text("Show all paused runs... +\(presentation.overflowCount)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("\(presentation.overflowCount) additional escalation runs")
                 }
             }
         }
@@ -637,9 +670,127 @@ struct EscalationMenuBarList: View {
         .frame(minWidth: 260)
         .accessibilityIdentifier("p058-escalation-menubar-list")
     }
+}
 
-    private var attentionSnapshots: [EscalationSnapshot] {
-        snapshots.filter { $0.pausedChainCount > 0 || $0.isPolicyDrift || $0.isKillSwitchEngaged }
+struct EscalationMenuBarPresentation: Equatable {
+    let rows: [EscalationMenuBarRow]
+    let overflowCount: Int
+    let aggregateCount: Int
+    let emptyTitle: String
+}
+
+struct EscalationMenuBarRow: Identifiable, Equatable {
+    let id: String
+    let runId: String
+    let runLabel: String
+    let stateLabel: String
+    let detailLabel: String
+    let secondaryLabel: String
+    let symbol: String
+    let accentRole: EscalationMenuBarAccentRole
+    let accessibilityLabel: String
+
+    var accentColor: Color {
+        switch accentRole {
+        case .orange:
+            return .orange
+        case .yellow:
+            return .yellow
+        case .accent:
+            return .accentColor
+        case .secondary:
+            return .secondary
+        }
+    }
+}
+
+enum EscalationMenuBarAccentRole: String, Equatable, Sendable {
+    case orange
+    case yellow
+    case accent
+    case secondary
+}
+
+enum EscalationMenuBarPresenter {
+    static let rowLimit = 5
+
+    static func presentation(
+        for snapshots: [EscalationSnapshot],
+        limit: Int = rowLimit
+    ) -> EscalationMenuBarPresentation {
+        let attention = snapshots
+            .filter(isAttentionSnapshot)
+            .sorted(by: compare)
+        let rows = attention
+            .prefix(max(limit, 0))
+            .map(row)
+        return EscalationMenuBarPresentation(
+            rows: rows,
+            overflowCount: max(0, attention.count - rows.count),
+            aggregateCount: attention.count,
+            emptyTitle: "No escalation runs need attention"
+        )
+    }
+
+    static func isAttentionSnapshot(_ snapshot: EscalationSnapshot) -> Bool {
+        snapshot.pausedChainCount > 0
+            || snapshot.isPolicyDrift
+            || snapshot.isKillSwitchEngaged
+            || snapshot.hasActiveEscalation
+    }
+
+    private static func compare(_ lhs: EscalationSnapshot, _ rhs: EscalationSnapshot) -> Bool {
+        let left = latestUpdatedAt(lhs)
+        let right = latestUpdatedAt(rhs)
+        if left != right {
+            return left > right
+        }
+        return lhs.runId < rhs.runId
+    }
+
+    private static func latestUpdatedAt(_ snapshot: EscalationSnapshot) -> String {
+        snapshot.activeChains.map(\.updatedAt).max() ?? ""
+    }
+
+    private static func row(for snapshot: EscalationSnapshot) -> EscalationMenuBarRow {
+        let first = snapshot.activeChains.first
+        let runLabel = compactRunLabel(snapshot.runId)
+        let stateLabel = EscalationPresentationStyle.stateLabel(for: snapshot)
+        let tier = first.map(EscalationPresentationStyle.tierLabel(for:)) ?? "No tier"
+        let trigger = first.map(EscalationPresentationStyle.triggerLabel(for:)) ?? "no trigger"
+        let paused = snapshot.pausedChainCount > 0 ? "\(snapshot.pausedChainCount) paused" : "no pause"
+        let updated = latestUpdatedAt(snapshot)
+        let detail = [tier, trigger].joined(separator: " / ")
+        let secondary = [paused, updated].filter { !$0.isEmpty }.joined(separator: " / ")
+        return EscalationMenuBarRow(
+            id: snapshot.runId,
+            runId: snapshot.runId,
+            runLabel: runLabel,
+            stateLabel: stateLabel,
+            detailLabel: detail,
+            secondaryLabel: secondary,
+            symbol: EscalationPresentationStyle.stateSymbol(for: snapshot),
+            accentRole: accentRole(for: snapshot),
+            accessibilityLabel: [
+                "Open escalation run \(snapshot.runId)",
+                stateLabel,
+                tier,
+                trigger,
+                paused,
+            ].joined(separator: ", ")
+        )
+    }
+
+    private static func compactRunLabel(_ runId: String) -> String {
+        guard runId.count > 12 else { return runId }
+        return "\(runId.prefix(8))..."
+    }
+
+    private static func accentRole(for snapshot: EscalationSnapshot) -> EscalationMenuBarAccentRole {
+        if snapshot.isKillSwitchEngaged || snapshot.isPolicyDrift { return .orange }
+        if snapshot.pausedChainCount > 0 { return .yellow }
+        if snapshot.hasActiveEscalation { return .accent }
+        return .secondary
     }
 }
 

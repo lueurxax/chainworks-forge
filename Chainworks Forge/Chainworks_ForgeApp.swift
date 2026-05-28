@@ -91,12 +91,18 @@ struct Chainworks_ForgeApp: App {
                 )
             }
         } label: {
-            Label(
-                "Escalation attention",
-                systemImage: notificationService.pendingAttentionCount > 0
-                    ? "clock.badge.exclamationmark"
-                    : "circle"
-            )
+            HStack(spacing: 4) {
+                Label(
+                    "Escalation attention",
+                    systemImage: notificationService.pendingAttentionCount > 0
+                        ? "clock.badge.exclamationmark"
+                        : "circle"
+                )
+                if notificationService.pendingAttentionCount > 0 {
+                    Text("\(notificationService.pendingAttentionCount)")
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                }
+            }
         }
         .menuBarExtraStyle(.menu)
     }

@@ -1007,6 +1007,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private var runtimeTimelineBuffer = P036RuntimeTimelineBuffer()
     private var runtimeTimelineLastPublish = Date.distantPast
     private let runtimeTimelineFlushInterval: TimeInterval
+    private var escalationAttentionObserverID: UUID?
 
     var daemonSchemaMismatchMessage: String? {
         [
@@ -1509,12 +1510,14 @@ final class P031ThinReadDashboardModel: ObservableObject {
 #endif
 
     func loadIfNeeded() async {
+        ensureEscalationAttentionObserver()
         guard !didLoad else { return }
         didLoad = true
         await refreshAll()
     }
 
     func refreshAll() async {
+        ensureEscalationAttentionObserver()
         guard !isLoading else { return }
         isLoading = true
         defer { isLoading = false }
@@ -1659,6 +1662,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     }
 
     private func loadRunDetail(for runID: String) async {
+        ensureEscalationAttentionObserver()
         let presentation = await loadRunDetailAction(runID, runDetailFreshness)
         runDetailFreshness = presentation.freshness
         runDetail = presentation
@@ -1667,14 +1671,13 @@ final class P031ThinReadDashboardModel: ObservableObject {
         } else {
             EscalationReadAdapterRegistry.shared.applyChains(presentation.escalationChains, for: runID)
         }
-        escalationAttentionSnapshots = EscalationReadAdapterRegistry.shared.attentionSnapshots
     }
 
     private func refreshEscalationAttentionSnapshots(for runIDs: [String]) async {
+        ensureEscalationAttentionObserver()
         let uniqueRunIDs = Array(Set(runIDs)).sorted()
         guard !uniqueRunIDs.isEmpty else {
             EscalationReadAdapterRegistry.shared.applyVisibleRunChains([:])
-            escalationAttentionSnapshots = []
             return
         }
 
@@ -1688,7 +1691,13 @@ final class P031ThinReadDashboardModel: ObservableObject {
             }
         }
         EscalationReadAdapterRegistry.shared.applyVisibleRunChains(chainsByRunID)
-        escalationAttentionSnapshots = EscalationReadAdapterRegistry.shared.attentionSnapshots
+    }
+
+    private func ensureEscalationAttentionObserver() {
+        guard escalationAttentionObserverID == nil else { return }
+        escalationAttentionObserverID = EscalationReadAdapterRegistry.shared.addAttentionObserver { [weak self] snapshots in
+            self?.escalationAttentionSnapshots = snapshots
+        }
     }
 
     private func startLiveSubscriptions(for runID: String) {
