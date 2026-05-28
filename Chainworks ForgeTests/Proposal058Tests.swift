@@ -378,14 +378,37 @@ struct Proposal058Tests {
         service.applyP058EscalationSnapshots([pausedA, pausedB])
 
         #expect(service.pendingAttentionCount == 2)
+        #expect(service.p058EscalationAttentionCount == 2)
         #expect(service.isMenuBarEnabled)
         #expect(service.p058EscalationSnapshots.map(\.runId) == ["run-menu-a", "run-menu-b"])
 
         service.applyP058EscalationSnapshots([])
 
         #expect(service.pendingAttentionCount == 0)
+        #expect(service.p058EscalationAttentionCount == 0)
         #expect(!service.isMenuBarEnabled)
         #expect(service.p058EscalationSnapshots.isEmpty)
+    }
+
+    @Test("P058 compact menu count remains separate from global attention count")
+    func compactMenuCountUsesP058AggregateNotGlobalAttention() {
+        let service = NotificationService()
+        service.updateDockBadge(waitingApprovalCount: 1, blockedCount: 2)
+        let paused = EscalationSnapshot.build(
+            runId: "run-p058-count",
+            chains: [
+                makeChain(
+                    id: "ledger-p058-count",
+                    status: "paused",
+                    pauseReason: EscalationPauseReasonCode.escalationChainExhausted.rawValue
+                ),
+            ]
+        )
+
+        service.applyP058EscalationSnapshots([paused])
+
+        #expect(service.pendingAttentionCount == 4)
+        #expect(service.p058EscalationAttentionCount == 1)
     }
 
     @Test("P058 dock badge counts attention per run, not per condition")
@@ -410,6 +433,7 @@ struct Proposal058Tests {
         service.applyP058EscalationSnapshots([twoPausedChains])
 
         #expect(service.pendingAttentionCount == 1)
+        #expect(service.p058EscalationAttentionCount == 1)
         #expect(service.isMenuBarEnabled)
     }
 

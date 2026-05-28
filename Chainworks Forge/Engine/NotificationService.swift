@@ -25,6 +25,7 @@ final class NotificationService {
     private(set) var pendingAttentionCount: Int = 0
     private(set) var isMenuBarEnabled: Bool = false
     private(set) var p058EscalationSnapshots: [EscalationSnapshot] = []
+    private(set) var p058EscalationAttentionCount: Int = 0
     private var preferences: NotificationPreferences
     private var authorizationStatus: UNAuthorizationStatus?
     private var runAttentionCount: Int = 0
@@ -147,6 +148,7 @@ final class NotificationService {
         operatorAlertAttentionCount = 0
         escalationAttentionCount = 0
         p058EscalationSnapshots = []
+        p058EscalationAttentionCount = 0
         escalationForcesMenuBar = false
         deliveredOperatorAlertKeys.removeAll()
         cancelP058EscalationAttention()
@@ -158,13 +160,14 @@ final class NotificationService {
 
     func applyP058EscalationSnapshots(_ snapshots: [EscalationSnapshot]) {
         p058EscalationSnapshots = snapshots
-        escalationAttentionCount = snapshots.filter { snapshot in
+        p058EscalationAttentionCount = snapshots.filter { snapshot in
             snapshot.pausedChainCount > 0
                 || snapshot.isPolicyDrift
                 || snapshot.isKillSwitchEngaged
                 || snapshot.hasActiveEscalation
         }
         .count
+        escalationAttentionCount = p058EscalationAttentionCount
         escalationForcesMenuBar = escalationAttentionCount > 0
         refreshMenuBarState()
         refreshDockBadgeLabel()

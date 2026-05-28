@@ -94,12 +94,12 @@ struct Chainworks_ForgeApp: App {
             HStack(spacing: 4) {
                 Label(
                     "Escalation attention",
-                    systemImage: notificationService.pendingAttentionCount > 0
+                    systemImage: notificationService.p058EscalationAttentionCount > 0
                         ? "clock.badge.exclamationmark"
                         : "circle"
                 )
-                if notificationService.pendingAttentionCount > 0 {
-                    Text("\(notificationService.pendingAttentionCount)")
+                if notificationService.p058EscalationAttentionCount > 0 {
+                    Text("\(notificationService.p058EscalationAttentionCount)")
                         .font(.caption.monospacedDigit().weight(.semibold))
                 }
             }
