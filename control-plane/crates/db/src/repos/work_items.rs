@@ -1067,9 +1067,6 @@ pub async fn complete_running_invoke_agents_with_terminal_valid_outputs_on_start
          AND COALESCE(facts.valid_required_outputs, 0) > 0
         WHERE wi.kind = ?4
           AND wi.status = ?5
-          AND wi.id NOT LIKE 'auto-contract-output-retry:%'
-          AND json_type(wi.payload_json, '$.retry_authority_id') IS NULL
-          AND json_type(wi.payload_json, '$.targeted_retry') IS NULL
           AND json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id') IS NOT NULL
         ORDER BY wi.scheduled_at ASC, wi.rowid ASC
         "#,
@@ -2210,22 +2207,46 @@ async fn build_post_invoke_advance_payload_tx(
         .get("target_stage_execution_id")
         .and_then(|value| value.as_str())
         .map(str::to_owned);
-    let source_agent_execution_id = source_payload
+    let top_level_source_agent_execution_id = source_payload
         .get("source_agent_execution_id")
         .and_then(|value| value.as_str())
-        .or_else(|| {
-            source_payload
-                .pointer("/targeted_retry/source_agent_execution_id")
-                .and_then(|value| value.as_str())
-        })
-        .or_else(|| {
-            source_payload
-                .pointer("/p058_claimed/agent_execution_id")
-                .and_then(|value| value.as_str())
-        })
         .map(str::to_owned);
+    let targeted_source_agent_execution_id = source_payload
+        .pointer("/targeted_retry/source_agent_execution_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let claimed_agent_execution_id = source_payload
+        .pointer("/p058_claimed/agent_execution_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let mut durable_source_agent_execution_id = claimed_agent_execution_id
+        .clone()
+        .or_else(|| targeted_source_agent_execution_id.clone())
+        .or_else(|| top_level_source_agent_execution_id.clone());
+    if let Some(claimed) = claimed_agent_execution_id.as_deref() {
+        // targeted_retry.source_agent_execution_id is the PAST failed execution being
+        // retried; p058_claimed is the CURRENT owner — they legitimately differ in retry.
+        // Only validate the top-level source_agent_execution_id against the claim.
+        if let Some(top) = top_level_source_agent_execution_id.as_deref() {
+            if top != claimed {
+                anyhow::bail!(
+                    "advance_run_source_agent_mismatch: source invoke {invoke_work_item_id} source_agent_execution_id {top} does not match durable p058_claimed agent {claimed}"
+                );
+            }
+        }
+        durable_source_agent_execution_id = Some(claimed.to_string());
+    } else if let (Some(top), Some(targeted)) = (
+        top_level_source_agent_execution_id.as_deref(),
+        targeted_source_agent_execution_id.as_deref(),
+    ) {
+        if top != targeted {
+            anyhow::bail!(
+                "advance_run_source_agent_mismatch: source invoke {invoke_work_item_id} source_agent_execution_id {top} does not match targeted_retry.source_agent_execution_id {targeted}"
+            );
+        }
+    }
     let agent_execution_stage_id =
-        if let Some(agent_execution_id) = source_agent_execution_id.as_deref() {
+        if let Some(agent_execution_id) = durable_source_agent_execution_id.as_deref() {
             find_agent_execution_stage_id_tx(tx, agent_execution_id).await?
         } else {
             None
@@ -2251,6 +2272,14 @@ async fn build_post_invoke_advance_payload_tx(
     let has_targeted_hint = explicit_target_stage_execution_id.is_some()
         || source_retry_authority_id.is_some()
         || source_payload.get("targeted_retry").is_some();
+    if has_targeted_hint
+        && durable_source_agent_execution_id.is_some()
+        && agent_execution_stage_id.is_none()
+    {
+        anyhow::bail!(
+            "advance_run_source_agent_mismatch: targeted InvokeAgent {invoke_work_item_id} source agent has no durable stage"
+        );
+    }
     if has_targeted_hint && source_stage_execution_id.is_none() {
         anyhow::bail!(
             "advance_run_source_target_mismatch: targeted InvokeAgent {invoke_work_item_id} has no durable source stage"
@@ -2346,7 +2375,7 @@ async fn build_post_invoke_advance_payload_tx(
         payload["source_work_item_id"] = serde_json::json!(invoke_work_item_id);
         payload["source_invoke_work_item_id"] = serde_json::json!(invoke_work_item_id);
         payload["source_stage_execution_id"] = serde_json::json!(target_id);
-        if let Some(source_agent_execution_id) = source_agent_execution_id.as_deref() {
+        if let Some(source_agent_execution_id) = durable_source_agent_execution_id.as_deref() {
             payload["source_agent_execution_id"] = serde_json::json!(source_agent_execution_id);
         }
         return Ok((payload.to_string(), Some(stage_id.to_string())));
@@ -3742,6 +3771,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn p058_post_invoke_rejects_spoofed_source_agent_when_claimed_agent_is_durable_truth() {
+        let pool = test_pool().await;
+        let run_id = RunId::new();
+        let target = StageExecutionId::new();
+        let claimed_agent_execution_id = AgentExecutionId::new();
+        seed_p091_post_invoke_rows(
+            &pool,
+            run_id,
+            target,
+            claimed_agent_execution_id,
+            "invoke-post-invoke",
+        )
+        .await;
+
+        let mut tx =
+            crate::pool::begin_immediate_with_retry(&pool, "p058-post-invoke-spoofed-source-agent")
+                .await
+                .unwrap();
+        let error = build_post_invoke_advance_payload_tx(
+            &mut tx,
+            &run_id.to_string(),
+            "invoke_agent_completed",
+            "completed_invoke_work_item_id",
+            "invoke-post-invoke",
+            &serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "implement",
+                "target_stage_execution_id": target.to_string(),
+                "retry_authority_id": "auth-post-invoke",
+                "source_agent_execution_id": AgentExecutionId::new().to_string(),
+                "p058_claimed": {
+                    "agent_execution_id": claimed_agent_execution_id.to_string()
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("advance_run_source_agent_mismatch"));
+    }
+
+    #[tokio::test]
     async fn proposal_061_host_interruption_requeue_strips_preclaim_and_reschedules() {
         let pool = test_pool().await;
         let run_id = RunId::new();
@@ -4005,6 +4078,13 @@ mod tests {
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
                 actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
             },
         )
         .await
@@ -4017,15 +4097,39 @@ mod tests {
         crate::repos::agent_execution_runtime_facts::upsert(&pool, &facts)
             .await
             .expect("insert runtime facts");
+        sqlx::query(
+            r#"INSERT INTO retry_stage_execution_authorities
+               (id, run_id, stage_id, target_stage_execution_id, entry_kind,
+                source_invoke_work_item_id, authority_state, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+        )
+        .bind("auth-close-hung-after-output")
+        .bind(run_id.to_string())
+        .bind("implementation_review")
+        .bind(stage_execution_id.to_string())
+        .bind("targeted_agent_retry")
+        .bind("auto-contract-output-retry:invoke-close-hung-after-output")
+        .bind("active")
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("insert retry authority");
         enqueue(
             &pool,
             &WorkItem {
-                id: "invoke-close-hung-after-output".to_string(),
+                id: "auto-contract-output-retry:invoke-close-hung-after-output".to_string(),
                 kind: WorkItemKind::InvokeAgent,
                 payload_json: serde_json::json!({
                     "run_id": run_id.to_string(),
                     "stage_id": "implementation_review",
                     "stage_execution_id": stage_execution_id.to_string(),
+                    "target_stage_execution_id": stage_execution_id.to_string(),
+                    "retry_authority_id": "auth-close-hung-after-output",
+                    "targeted_retry": {
+                        "retry_authority_id": "auth-close-hung-after-output",
+                        "source_agent_execution_id": agent_execution_id.to_string()
+                    },
                     "p058_claimed": {
                         "agent_execution_id": agent_execution_id.to_string(),
                         "session_generation_id": uuid::Uuid::new_v4().to_string()
@@ -4042,7 +4146,7 @@ mod tests {
             },
         )
         .await
-        .expect("insert running work item");
+        .expect("insert targeted running work item");
 
         let completed = complete_running_invoke_agents_with_terminal_valid_outputs_on_startup(
             &pool,
@@ -4052,16 +4156,22 @@ mod tests {
         .expect("complete stale running invoke");
 
         assert_eq!(completed, 1);
-        let item = find_by_id(&pool, "invoke-close-hung-after-output")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(item.status, WorkItemStatus::Completed);
-        let advance = find_by_id(&pool, "advance-after-invoke:invoke-close-hung-after-output")
-            .await
-            .unwrap()
-            .expect("post-invoke advance");
-        assert_eq!(advance.status, WorkItemStatus::Pending);
+        let targeted_item = find_by_id(
+            &pool,
+            "auto-contract-output-retry:invoke-close-hung-after-output",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(targeted_item.status, WorkItemStatus::Completed);
+        let targeted_advance = find_by_id(
+            &pool,
+            "advance-after-invoke:auto-contract-output-retry:invoke-close-hung-after-output",
+        )
+        .await
+        .unwrap()
+        .expect("targeted post-invoke advance");
+        assert_eq!(targeted_advance.status, WorkItemStatus::Pending);
     }
 
     #[tokio::test]

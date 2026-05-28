@@ -2684,3 +2684,73 @@ agents:
     let par_tasks: Vec<_> = state.tasks.iter().filter(|t| t.phase == 0).collect();
     assert!(par_tasks.iter().all(|t| t.selected_outputs_from.is_none()));
 }
+
+// ── SEC-HIGH-002 regression: unknown agent references must fail compilation ──
+
+#[test]
+fn sec_high_002_missing_state_owner_fails_compile() {
+    // A workflow whose state owner references an agent that is not in the catalog
+    // must fail compilation rather than silently falling back to a placeholder.
+    let workflow_yaml = r#"
+initial_state: only_state
+states:
+  only_state:
+    label: "Only State"
+    type: end
+    owner: nonexistent_agent
+"#;
+    let catalog_yaml = r#"
+backend_profiles:
+  claude_opus:
+    provider: claude
+    model: claude-opus-4-7
+agents:
+  - id: different_agent
+    backend_profile: claude_opus
+    prompt: "Some other agent"
+"#;
+    let err = compile_result_from_strings(workflow_yaml, catalog_yaml)
+        .expect_err("compile must fail when state owner is not in the catalog");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("nonexistent_agent") && msg.contains("not found in catalog"),
+        "error message must name the missing agent and say 'not found in catalog', got: {msg}"
+    );
+}
+
+#[test]
+fn sec_high_002_missing_task_agent_fails_compile() {
+    // A workflow whose run-block task references an agent not in the catalog
+    // must fail compilation — not silently resolve to a placeholder.
+    let workflow_yaml = r#"
+initial_state: only_state
+states:
+  only_state:
+    label: "Only State"
+    type: end
+    owner: known_agent
+    run:
+      sequence:
+        - agent: known_agent
+          task: first_task
+        - agent: ghost_agent
+          task: second_task
+"#;
+    let catalog_yaml = r#"
+backend_profiles:
+  claude_opus:
+    provider: claude
+    model: claude-opus-4-7
+agents:
+  - id: known_agent
+    backend_profile: claude_opus
+    prompt: "Known agent"
+"#;
+    let err = compile_result_from_strings(workflow_yaml, catalog_yaml)
+        .expect_err("compile must fail when a task references a missing catalog agent");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ghost_agent") && msg.contains("not found in catalog"),
+        "error message must name the missing agent and say 'not found in catalog', got: {msg}"
+    );
+}

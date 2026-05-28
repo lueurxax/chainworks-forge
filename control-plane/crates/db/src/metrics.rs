@@ -52,6 +52,7 @@ struct SystemMetrics {
     projection_backlog_rows: HashMap<String, u64>,
     projection_backlog_bytes: HashMap<String, u64>,
     counters: HashMap<String, u64>,
+    p058_metric_samples: HashMap<String, Histogram>,
     mcp_liveness_gate_last_recorded_at_ms: Option<i64>,
     mcp_hot_read_error_total_by_code: HashMap<String, u64>,
 }
@@ -92,6 +93,28 @@ pub const P087_REQUIRED_METRICS: &[&str] = &[
     "hot_read_circuit_open_total",
 ];
 
+pub const P058_REQUIRED_METRICS: &[&str] = &[
+    "escalation_chains_started_total",
+    "escalation_tier_success_rate",
+    "time_to_success_after_escalation_seconds",
+    "escalation_pause_total",
+    "false_escalation_rate",
+    "policy_compile_failure_total",
+    "shadow_tier_selection_match_rate",
+    "provider_session_kill_latency_seconds",
+    "daemon_outage_credit_seconds_total",
+    "fan_out_blocked_dwell_seconds",
+    "launch_recycle_storm_total",
+    "capacity_probe_failure_total",
+    "escalation_drift_pending_ack_dwell_seconds",
+    "tier_dwell_share_of_chain",
+    "chain_exhausted_total_by_terminal_tier_kind",
+    "escalation_repeated_digest_no_progress_total",
+    "escalation_commit_contention_total",
+    "escalation_retry_after_parse_anomaly_total",
+    "escalation_provider_late_frame_after_detach_total",
+];
+
 fn metrics() -> &'static Mutex<SystemMetrics> {
     METRICS.get_or_init(|| Mutex::new(SystemMetrics::default()))
 }
@@ -122,6 +145,157 @@ pub fn increment_counter_with_label(name: &str, label: &str) {
     let mut m = metrics().lock().unwrap();
     let key = format!("{}:{}", name, label);
     *m.counters.entry(key).or_default() += 1;
+}
+
+pub fn record_escalation_chain_started(policy_id: &str, tier_kind: Option<&str>) {
+    increment_counter_with_label("escalation_chains_started_total", policy_id);
+    if let Some(kind) = tier_kind {
+        increment_counter_with_label("escalation_chains_started_total_by_tier_kind", kind);
+    }
+}
+
+pub fn record_escalation_event(
+    event_kind: &str,
+    tier_kind: Option<&str>,
+    pause_reason: Option<&str>,
+    payload_json: Option<&str>,
+) {
+    let payload = payload_json.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    match event_kind {
+        "escalation.tier_succeeded" => {
+            increment_counter_with_label(
+                "escalation_tier_success_rate",
+                tier_kind.unwrap_or("unknown"),
+            );
+            record_p058_rate_from_payload("escalation_tier_success_rate", payload.as_ref());
+        }
+        "escalation.false_positive" => {
+            increment_counter("false_escalation_rate");
+            record_p058_rate_from_payload("false_escalation_rate", payload.as_ref());
+        }
+        "escalation.policy_compile_failed" => increment_counter("policy_compile_failure_total"),
+        "escalation.shadow_selection_matched" => {
+            increment_counter("shadow_tier_selection_match_rate");
+            record_p058_rate_from_payload("shadow_tier_selection_match_rate", payload.as_ref());
+        }
+        "escalation.provider_session_force_detached" => {
+            increment_counter("provider_session_kill_latency_seconds");
+            record_p058_duration_from_payload(
+                "provider_session_kill_latency_seconds",
+                payload.as_ref(),
+            );
+        }
+        "escalation.daemon_outage_credit" => {
+            increment_counter("daemon_outage_credit_seconds_total");
+            record_p058_duration_from_payload(
+                "daemon_outage_credit_seconds_total",
+                payload.as_ref(),
+            );
+        }
+        "escalation.fan_out_blocked" => {
+            increment_counter("fan_out_blocked_dwell_seconds");
+            record_p058_duration_from_payload("fan_out_blocked_dwell_seconds", payload.as_ref());
+        }
+        "escalation.launch_recycle_storm" => increment_counter("launch_recycle_storm_total"),
+        "escalation.capacity_probe_failed" => increment_counter("capacity_probe_failure_total"),
+        "escalation.policy_drift_pending_ack" => {
+            increment_counter("escalation_drift_pending_ack_dwell_seconds");
+            record_p058_duration_from_payload(
+                "escalation_drift_pending_ack_dwell_seconds",
+                payload.as_ref(),
+            );
+        }
+        "escalation.tier_dwell_recorded" => {
+            increment_counter("tier_dwell_share_of_chain");
+            record_p058_rate_from_payload("tier_dwell_share_of_chain", payload.as_ref());
+        }
+        "escalation.chain_exhausted" => increment_counter_with_label(
+            "chain_exhausted_total_by_terminal_tier_kind",
+            tier_kind.unwrap_or("unknown"),
+        ),
+        "escalation.commit_contention" => increment_counter("escalation_commit_contention_total"),
+        "escalation.retry_after_parse_anomaly" => {
+            increment_counter("escalation_retry_after_parse_anomaly_total")
+        }
+        "escalation.provider_late_frame_after_detach" => {
+            increment_counter("escalation_provider_late_frame_after_detach_total")
+        }
+        "escalation.time_to_success_recorded" => {
+            increment_counter("time_to_success_after_escalation_seconds");
+            record_p058_duration_from_payload(
+                "time_to_success_after_escalation_seconds",
+                payload.as_ref(),
+            );
+        }
+        _ => {}
+    }
+
+    if pause_reason.is_some() {
+        increment_counter_with_label("escalation_pause_total", pause_reason.unwrap());
+    }
+    if pause_reason == Some("escalation_repeated_digest_no_progress") {
+        increment_counter("escalation_repeated_digest_no_progress_total");
+    }
+}
+
+pub fn record_p058_metric_sample(metric_name: &str, sample_value: u64) {
+    if !P058_REQUIRED_METRICS.contains(&metric_name) {
+        return;
+    }
+    let mut m = metrics().lock().unwrap();
+    m.p058_metric_samples
+        .entry(metric_name.to_string())
+        .or_default()
+        .record(sample_value);
+}
+
+pub fn get_p058_metric_sample_count(metric_name: &str) -> u64 {
+    let m = metrics().lock().unwrap();
+    m.p058_metric_samples
+        .get(metric_name)
+        .map(Histogram::sample_count)
+        .unwrap_or(0)
+}
+
+pub fn get_p058_metric_latest(metric_name: &str) -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    m.p058_metric_samples
+        .get(metric_name)
+        .and_then(Histogram::latest)
+}
+
+pub fn get_p058_metric_p95(metric_name: &str) -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    m.p058_metric_samples
+        .get(metric_name)
+        .and_then(Histogram::p95)
+}
+
+fn record_p058_duration_from_payload(metric_name: &str, payload: Option<&serde_json::Value>) {
+    if let Some(sample) = payload
+        .and_then(|value| value.get("metric_sample_ms"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        record_p058_metric_sample(metric_name, sample);
+    }
+}
+
+fn record_p058_rate_from_payload(metric_name: &str, payload: Option<&serde_json::Value>) {
+    let Some(payload) = payload else {
+        return;
+    };
+    let numerator = payload
+        .get("metric_numerator")
+        .and_then(serde_json::Value::as_u64);
+    let denominator = payload
+        .get("metric_denominator")
+        .and_then(serde_json::Value::as_u64);
+    if let (Some(numerator), Some(denominator)) = (numerator, denominator) {
+        if denominator > 0 {
+            let basis_points = numerator.saturating_mul(10_000) / denominator;
+            record_p058_metric_sample(metric_name, basis_points.min(10_000));
+        }
+    }
 }
 
 pub fn get_counter(name: &str) -> u64 {
@@ -240,6 +414,7 @@ pub fn get_mcp_liveness_gate_last_recorded_at_ms() -> Option<i64> {
 pub fn reset_read_path_metrics_for_tests() {
     let mut m = metrics().lock().unwrap();
     m.hot_read_latency.clear();
+    m.p058_metric_samples.clear();
     m.mcp_liveness_gate_last_recorded_at_ms = None;
 }
 
@@ -310,5 +485,69 @@ mod tests {
                 "missing required P087 metric declaration: {metric}"
             );
         }
+    }
+
+    #[test]
+    fn proposal_058_required_metric_names_are_declared() {
+        for metric in [
+            "escalation_chains_started_total",
+            "escalation_tier_success_rate",
+            "time_to_success_after_escalation_seconds",
+            "escalation_pause_total",
+            "false_escalation_rate",
+            "policy_compile_failure_total",
+            "shadow_tier_selection_match_rate",
+            "provider_session_kill_latency_seconds",
+            "daemon_outage_credit_seconds_total",
+            "fan_out_blocked_dwell_seconds",
+            "launch_recycle_storm_total",
+            "capacity_probe_failure_total",
+            "escalation_drift_pending_ack_dwell_seconds",
+            "tier_dwell_share_of_chain",
+            "chain_exhausted_total_by_terminal_tier_kind",
+            "escalation_repeated_digest_no_progress_total",
+            "escalation_commit_contention_total",
+            "escalation_retry_after_parse_anomaly_total",
+            "escalation_provider_late_frame_after_detach_total",
+        ] {
+            assert!(
+                P058_REQUIRED_METRICS.contains(&metric),
+                "missing required P058 metric declaration: {metric}"
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_058_metric_samples_are_recorded_from_event_payloads() {
+        reset_read_path_metrics_for_tests();
+        record_escalation_event(
+            "escalation.provider_session_force_detached",
+            Some("backend_profile"),
+            Some("provider_session_force_detached"),
+            Some(r#"{"metric_sample_ms":4200}"#),
+        );
+        record_escalation_event(
+            "escalation.tier_succeeded",
+            Some("backend_profile"),
+            None,
+            Some(r#"{"metric_numerator":3,"metric_denominator":4}"#),
+        );
+
+        assert_eq!(
+            get_p058_metric_latest("provider_session_kill_latency_seconds"),
+            Some(4200)
+        );
+        assert_eq!(
+            get_p058_metric_p95("provider_session_kill_latency_seconds"),
+            Some(4200)
+        );
+        assert_eq!(
+            get_p058_metric_latest("escalation_tier_success_rate"),
+            Some(7500)
+        );
+        assert_eq!(
+            get_p058_metric_sample_count("escalation_tier_success_rate"),
+            1
+        );
     }
 }

@@ -228,6 +228,12 @@ struct RunsHomeView: View {
                     case .reports:
                         P031ReportMetadataCard(rows: runDetail.reportRows)
                     case .system:
+                        if let escalationSnapshot = runDetail.escalationSnapshot {
+                            EscalationInspector(
+                                snapshot: escalationSnapshot,
+                                traceJSONRedacted: runDetail.escalationTraceJSONRedacted
+                            )
+                        }
                         P031DaemonLifecycleCard(presentation: model.daemonLifecycle)
                     }
                 }

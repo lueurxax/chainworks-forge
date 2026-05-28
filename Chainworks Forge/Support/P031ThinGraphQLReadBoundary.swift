@@ -2159,19 +2159,22 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
   let stages: [P031StageReadModel]
   let artifacts: [P031ArtifactReadModel]
   let approvalInbox: [P031ApprovalReadModel]
+  let runEscalationReadback: P058EscalationRunReadbackReadModel?
 
   nonisolated init(
     run: P031RunRowReadModel?,
     idea: P031IdeaReadModel? = nil,
     stages: [P031StageReadModel],
     artifacts: [P031ArtifactReadModel],
-    approvalInbox: [P031ApprovalReadModel] = []
+    approvalInbox: [P031ApprovalReadModel] = [],
+    runEscalationReadback: P058EscalationRunReadbackReadModel? = nil
   ) {
     self.run = run
     self.idea = idea
     self.stages = stages
     self.artifacts = artifacts
     self.approvalInbox = approvalInbox
+    self.runEscalationReadback = runEscalationReadback
   }
 
   nonisolated var freshnessStates: [P031FreshnessState] {
@@ -2202,6 +2205,7 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
     case stages
     case artifacts
     case approvalInbox
+    case runEscalationReadback
   }
 
   init(from decoder: Decoder) throws {
@@ -2214,6 +2218,30 @@ struct P031RunDetailReadModel: Decodable, Equatable, Sendable {
       try container.decodeIfPresent([P031ArtifactReadModel].self, forKey: .artifacts) ?? []
     self.approvalInbox =
       try container.decodeIfPresent([P031ApprovalReadModel].self, forKey: .approvalInbox) ?? []
+    self.runEscalationReadback = try container.decodeIfPresent(
+      P058EscalationRunReadbackReadModel.self,
+      forKey: .runEscalationReadback
+    )
+  }
+}
+
+struct P058EscalationRunReadbackReadModel: Decodable, Equatable, Sendable {
+  let runID: String
+  let chains: [EscalationChainStateDTO]
+  let chainsTruncated: Bool
+  let chainsTotal: Int
+  let pausedChainCount: Int
+  let hasActiveEscalation: Bool
+  let dominantPauseReasonRaw: String?
+
+  enum CodingKeys: String, CodingKey {
+    case runID = "runId"
+    case chains
+    case chainsTruncated
+    case chainsTotal
+    case pausedChainCount
+    case hasActiveEscalation
+    case dominantPauseReasonRaw
   }
 }
 
@@ -2434,6 +2462,38 @@ enum P031GraphQLDocuments {
         disabledReason
         diagnosticId
         serverDebugDetail
+      }
+      runEscalationReadback(runId: $runId) {
+        runId
+        chainsTruncated
+        chainsTotal
+        pausedChainCount
+        hasActiveEscalation
+        dominantPauseReasonRaw
+        chains {
+          id
+          runId
+          stageId
+          agentId
+          policyId
+          policyHash
+          statusRaw
+          currentTierId
+          currentTierKindRaw
+          chainAttemptIndex
+          triggerRaw
+          pauseReasonRaw
+          operatorActionHint
+          runbookAnchor
+          waitingRetryAfterUntil
+          traceUnavailableReasonRaw
+          escalationTraceJsonRedacted
+          policyDriftState
+          externalAcknowledgementRef
+          featureFlagState
+          createdAt
+          updatedAt
+        }
       }
     }
     """
@@ -2731,7 +2791,8 @@ struct P031GraphQLWorkflowReadStore<
       idea: detail.idea,
       stages: detail.stages,
       artifacts: detail.artifacts,
-      approvalInbox: detail.approvalInbox
+      approvalInbox: detail.approvalInbox,
+      runEscalationReadback: detail.runEscalationReadback
     )
   }
 
@@ -4230,6 +4291,8 @@ struct P031RunDetailPresentation: Equatable, Sendable {
   let closeoutReadiness: P077CloseoutReadinessPresentation?
   let implementationCompletion: P088ImplementationCompletionPresentation?
   let sideEffectReadback: P078SideEffectReadbackPresentation?
+  let escalationSnapshot: EscalationSnapshot?
+  let escalationTraceJSONRedacted: String?
   let freshness: P031FreshnessSnapshot
   let refreshFeedbackText: String
   let emptyStateTitle: String?
@@ -4252,6 +4315,8 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     closeoutReadiness: P077CloseoutReadinessPresentation? = nil,
     implementationCompletion: P088ImplementationCompletionPresentation? = nil,
     sideEffectReadback: P078SideEffectReadbackPresentation? = nil,
+    escalationSnapshot: EscalationSnapshot? = nil,
+    escalationTraceJSONRedacted: String? = nil,
     freshness: P031FreshnessSnapshot,
     refreshFeedbackText: String,
     emptyStateTitle: String?,
@@ -4273,6 +4338,8 @@ struct P031RunDetailPresentation: Equatable, Sendable {
     self.closeoutReadiness = closeoutReadiness
     self.implementationCompletion = implementationCompletion
     self.sideEffectReadback = sideEffectReadback
+    self.escalationSnapshot = escalationSnapshot
+    self.escalationTraceJSONRedacted = escalationTraceJSONRedacted
     self.freshness = freshness
     self.refreshFeedbackText = refreshFeedbackText
     self.emptyStateTitle = emptyStateTitle
@@ -4993,6 +5060,12 @@ enum P031RunDetailPresenter {
     let sideEffectReadback = P078SideEffectReadbackPresenter.presentationIfPresent(
       for: run?.sideEffectReadback
     )
+    let escalationSnapshot = detail.runEscalationReadback.map { readback in
+      EscalationSnapshot.build(runId: readback.runID, chains: readback.chains)
+    }
+    let escalationTraceJSONRedacted = detail.runEscalationReadback?.chains.lazy
+      .compactMap(\.escalationTraceJSONRedacted)
+      .first
     let emptyStateTitle: String?
     switch run {
     case .some:
@@ -5018,6 +5091,8 @@ enum P031RunDetailPresenter {
       closeoutReadiness: closeoutReadiness,
       implementationCompletion: implementationCompletion,
       sideEffectReadback: sideEffectReadback,
+      escalationSnapshot: escalationSnapshot,
+      escalationTraceJSONRedacted: escalationTraceJSONRedacted,
       freshness: P031ThinPresentationFormatting.freshnessSnapshot(
         currentFreshness: currentFreshness,
         checkedAt: checkedAt,
@@ -5051,6 +5126,8 @@ enum P031RunDetailPresenter {
       closeoutReadiness: nil,
       implementationCompletion: nil,
       sideEffectReadback: nil,
+      escalationSnapshot: nil,
+      escalationTraceJSONRedacted: nil,
       freshness: WorkflowFreshnessReducer.reduce(
         currentFreshness,
         event: .refreshFailed(checkedAt: checkedAt, reason: P031ReadErrorPresenter.description(for: error))

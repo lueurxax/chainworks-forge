@@ -1,6 +1,5 @@
 pub mod agent;
 pub mod approval;
-pub mod escalation;
 pub mod artifact;
 pub mod artifact_contracts;
 pub mod capabilities;
@@ -11,6 +10,7 @@ pub mod code_writer_completion;
 pub mod commands;
 pub mod discovery;
 pub mod error_sanitizer;
+pub mod escalation;
 pub mod events;
 pub mod idea;
 pub mod ids;

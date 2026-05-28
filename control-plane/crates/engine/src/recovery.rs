@@ -12,18 +12,22 @@ use tracing::{info, warn};
 
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts,
-    code_writer_completion_receipts, projections, retry_stage_execution_authorities, runs,
-    sessions, side_effects, stages, startup_repairs, work_items, workflow_conflicts,
+    code_writer_completion_receipts, escalation, projections, retry_stage_execution_authorities,
+    runs, sessions, side_effects, stages, startup_repairs, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
 use db::writer::{class_a_operation, DbWriter};
-use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
+use domain::agent::{
+    AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement, AgentStatus,
+    OperatorActionHint,
+};
 use domain::approval::ApprovalDecision;
 use domain::code_writer_completion::{
     CodeWriterCompletionOutputDecisionRecord, CodeWriterCompletionReceiptRecord,
     CodeWriterCompletionTextCaptureRecord,
 };
+use domain::escalation::EscalationEvent;
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::retry_authority::RetryAuthorityState;
 use domain::run::Run;
@@ -404,6 +408,30 @@ impl RecoveryService {
         let mut runs_repaired = 0usize;
         let mut work_items_requeued = 0usize;
         let now = Utc::now();
+        for run in &active_runs {
+            match self
+                .recover_p058_shutdown_drain_force_detach_for_run(run)
+                .await
+            {
+                Ok(recovered) => {
+                    if recovered > 0 {
+                        work_items_requeued += recovered;
+                        warn!(
+                            run_id = %run.id,
+                            recovered = recovered,
+                            "Startup recovery opened P058 provider force-detach replay pauses"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        run_id = %run.id,
+                        error = %e,
+                        "Failed to recover P058 shutdown-drain force-detach state during startup"
+                    );
+                }
+            }
+        }
         let agent_executions_settled =
             work_items::settle_terminal_preclaimed_invoke_agent_executions(&self.pool, now).await?;
 
@@ -1032,6 +1060,155 @@ impl RecoveryService {
         if recovered > 0 {
             projections::rebuild_all_for_run(&self.pool, run.id).await?;
         }
+        Ok(recovered)
+    }
+
+    async fn recover_p058_shutdown_drain_force_detach_for_run(
+        &self,
+        run: &Run,
+    ) -> Result<usize> {
+        let rows = sqlx::query(
+            r#"SELECT ae.id AS agent_execution_id,
+                      ae.stage_execution_id AS stage_execution_id,
+                      ae.agent_id AS agent_id,
+                      COALESCE(em.escalation_ledger_id, ae.escalation_ledger_id) AS escalation_ledger_id,
+                      COALESCE(em.tier_id, ae.escalation_tier_id) AS tier_id,
+                      COALESCE(em.tier_kind_raw, ae.escalation_tier_kind_raw) AS tier_kind_raw,
+                      COALESCE(em.trigger_raw, ae.escalation_trigger_raw) AS trigger_raw
+               FROM agent_executions ae
+               INNER JOIN stage_executions se ON se.id = ae.stage_execution_id
+               LEFT JOIN escalation_execution_metadata em ON em.agent_execution_id = ae.id
+               WHERE se.run_id = ?
+                 AND se.status = 'running'
+                 AND ae.status = 'running'
+                 AND ae.escalation_ledger_id IS NOT NULL
+               ORDER BY ae.started_at ASC, ae.id ASC"#,
+        )
+        .bind(run.id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let now = Utc::now();
+        let mut recovered = 0usize;
+        for row in rows {
+            let agent_execution_id_raw: String = row.try_get("agent_execution_id")?;
+            let stage_execution_id_raw: String = row.try_get("stage_execution_id")?;
+            let escalation_ledger_id: String = row.try_get("escalation_ledger_id")?;
+            let tier_id: Option<String> = row.try_get("tier_id")?;
+            let tier_kind_raw: Option<String> = row.try_get("tier_kind_raw")?;
+            let trigger_raw: Option<String> = row.try_get("trigger_raw")?;
+            let agent_execution_id = agent_execution_id_raw
+                .parse()
+                .map_err(|e| anyhow!("bad agent_execution_id: {e}"))?;
+            let stage_execution_id = stage_execution_id_raw
+                .parse()
+                .map_err(|e| anyhow!("bad stage_execution_id: {e}"))?;
+
+            let Some(mut ledger) =
+                escalation::find_ledger_by_id(&self.pool, &escalation_ledger_id).await?
+            else {
+                continue;
+            };
+            if ledger.status_raw != "active" {
+                continue;
+            }
+
+            let event_id = format!(
+                "p058-force-detach-replay:{}:{}",
+                escalation_ledger_id, agent_execution_id_raw
+            );
+            let already_recorded =
+                escalation::find_events_by_ledger(&self.pool, &escalation_ledger_id)
+                    .await?
+                    .into_iter()
+                    .any(|event| event.id == event_id);
+            if already_recorded {
+                continue;
+            }
+
+            let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+            facts.failure_kind = Some(AgentFailureKind::TransportClosed);
+            facts.failure_kind_raw_debug = Some("shutdown_drain_timeout".to_string());
+            facts.operator_action_hint = Some(OperatorActionHint::InspectLogs);
+            facts.transport_error_code = Some("shutdown_drain_timeout".to_string());
+            facts.supervision_classification = Some("shutdown_drain_timeout".to_string());
+            facts.output_settlement = AgentOutputSettlement::None;
+
+            ledger.status_raw = "paused".to_string();
+            ledger.pause_reason_raw = Some("provider_session_force_detached".to_string());
+            ledger.operator_action_hint = Some(
+                "Provider session was still running at daemon startup after shutdown drain; inspect provider state before manual resume."
+                    .to_string(),
+            );
+            ledger.runbook_anchor = Some("escalation/provider-session-force-detached".to_string());
+            ledger.updated_at = now;
+
+            let tx_started = std::time::Instant::now();
+            let mut tx = self
+                .begin_transaction(
+                    "recovery.p058_force_detach_replay",
+                    format!("recovery.p058_force_detach_replay:{agent_execution_id_raw}"),
+                )
+                .await?;
+            agent_executions::update_completed_tx(
+                &mut tx,
+                agent_execution_id,
+                AgentStatus::Failed,
+                now,
+            )
+            .await?;
+            agent_execution_runtime_facts::upsert_tx(&mut tx, &facts).await?;
+            escalation::update_ledger_tx(&mut tx, &ledger).await?;
+            escalation::insert_event_tx(
+                &mut tx,
+                &EscalationEvent {
+                    id: event_id,
+                    escalation_ledger_id: escalation_ledger_id.clone(),
+                    event_kind_raw: "escalation.provider_session_force_detached".to_string(),
+                    tier_id: tier_id.clone(),
+                    tier_kind_raw: tier_kind_raw.clone(),
+                    trigger_raw: trigger_raw.clone(),
+                    pause_reason_raw: Some("provider_session_force_detached".to_string()),
+                    payload_json: Some(
+                        serde_json::json!({
+                            "event_kind_raw": "escalation.provider_session_force_detached",
+                            "pause_reason_raw": "provider_session_force_detached",
+                            "digest_inputs": {
+                                "failure_kind": "transport_closed",
+                                "output_settlement_state": "none",
+                                "validation_evidence_kind": "shutdown_drain_timeout",
+                                "redacted_message_fragment_hash": format!("sha256:{:x}", Sha256::digest(stage_execution_id_raw.as_bytes())),
+                            },
+                            "redacted_evidence_ref": format!("sha256:{:x}", Sha256::digest(agent_execution_id_raw.as_bytes())),
+                        })
+                        .to_string(),
+                    ),
+                    redaction_version: Some("redaction_v1".to_string()),
+                    created_at: now,
+                },
+            )
+            .await?;
+            work_items::cancel_pending_or_running_invoke_by_stage_execution_tx(
+                &mut tx,
+                run.id,
+                &stage_execution_id_raw,
+                now,
+                "p058_startup_force_detach_replay",
+            )
+            .await?;
+            stages::settle_tx(
+                &mut tx,
+                stage_execution_id,
+                StageSettlementKind::Failed,
+                now,
+            )
+            .await?;
+            runs::update_status_tx(&mut tx, run.id, domain::run::RunStatus::Blocked).await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("recovery.p058_force_detach_replay", tx_started);
+            recovered += 1;
+        }
+
         Ok(recovered)
     }
 

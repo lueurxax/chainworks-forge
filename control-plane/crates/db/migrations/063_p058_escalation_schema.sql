@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS escalation_execution_metadata (
 );
 
 -- Ordered event journal for the chain.
+-- redaction_version is NOT NULL with no DEFAULT so bare INSERTs without an explicit
+-- stamp fail the NOT NULL constraint. The CHECK enforces the known-version allowlist.
+-- The repo layer (insert_event_tx) also validates the stamp before any INSERT.
 CREATE TABLE IF NOT EXISTS escalation_events (
     id                   TEXT NOT NULL PRIMARY KEY,
     escalation_ledger_id TEXT NOT NULL REFERENCES escalation_ledger(id),
@@ -54,6 +57,7 @@ CREATE TABLE IF NOT EXISTS escalation_events (
     trigger_raw          TEXT,
     pause_reason_raw     TEXT,
     payload_json         TEXT,
+    redaction_version    TEXT NOT NULL CHECK(redaction_version IN ('redaction_v1')),
     created_at           TEXT NOT NULL
 );
 

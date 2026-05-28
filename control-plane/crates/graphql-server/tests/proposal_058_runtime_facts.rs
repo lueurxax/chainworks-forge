@@ -18,6 +18,7 @@ use domain::discovery::{
     OutputDiscoveryDecision, OutputDiscoveryProvenance, OutputDiscoveryReason,
     OutputDiscoveryStatus, DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
 };
+use domain::escalation::{EscalationEvent, EscalationExecutionMetadata, EscalationLedger};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::run::{Run, RunStatus};
@@ -358,6 +359,7 @@ fn discovery_payload(
 #[tokio::test]
 async fn proposal_058_agent_execution_exposes_runtime_facts_and_session_provenance() {
     let pool = test_pool().await;
+
     let (run_id, stage_execution_id, agent_execution_id, _artifact_id) =
         seed_execution(&pool).await;
     let ledger = agent_retry_budget_ledger::upsert_quota_failure(
@@ -524,6 +526,7 @@ async fn proposal_058_agent_execution_exposes_runtime_facts_and_session_provenan
 #[tokio::test]
 async fn proposal_053_agent_execution_projects_discovery_reconciliation_pending() {
     let pool = test_pool().await;
+
     let (_run_id, stage_execution_id, agent_execution_id, _artifact_id) =
         seed_execution(&pool).await;
     let now = Utc::now();
@@ -609,6 +612,7 @@ async fn proposal_053_agent_execution_projects_discovery_reconciliation_pending(
 #[tokio::test]
 async fn proposal_058_runtime_facts_exposes_operator_debug_on_operator_read_surface() {
     let pool = test_pool().await;
+
     let (_run_id, stage_execution_id, agent_execution_id, _artifact_id) =
         seed_execution(&pool).await;
     let now = Utc::now();
@@ -707,8 +711,177 @@ async fn proposal_058_runtime_facts_exposes_operator_debug_on_operator_read_surf
 }
 
 #[tokio::test]
+async fn proposal_058_graphql_run_escalation_readback_exposes_live_parity_fields() {
+    let pool = test_pool().await;
+
+    let (run_id, _stage_execution_id, agent_execution_id, _artifact_id) =
+        seed_execution(&pool).await;
+    let now = Utc::now();
+
+    let ledger = EscalationLedger {
+        id: "ledger-p058-graphql-live-fields".into(),
+        run_id,
+        stage_id: "state_1".into(),
+        agent_id: "code_writer".into(),
+        policy_id: "policy_escalation_v1".into(),
+        policy_hash: "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+            .into(),
+        status_raw: "active".into(),
+        current_tier_id: Some("primary_retry".into()),
+        current_tier_kind_raw: Some("same_backend_retry".into()),
+        chain_attempt_index: 1,
+        trigger_raw: Some("contract_output_failure".into()),
+        pause_reason_raw: None,
+        operator_action_hint: None,
+        runbook_anchor: None,
+        created_at: now,
+        updated_at: now,
+    };
+    db::repos::escalation::insert_ledger(&pool, &ledger)
+        .await
+        .unwrap();
+
+    db::repos::escalation::insert_execution_metadata(
+        &pool,
+        &EscalationExecutionMetadata {
+            agent_execution_id,
+            escalation_ledger_id: ledger.id.clone(),
+            tier_id: "primary_retry".into(),
+            tier_kind_raw: "same_backend_retry".into(),
+            tier_attempt_index: 1,
+            trigger_raw: Some("contract_output_failure".into()),
+            digest_version: Some("escalation_blocker_digest_v1".into()),
+            capacity_probe_counter: 0,
+            created_at: now,
+            updated_at: now,
+            would_select_tier_id: None,
+            would_select_trigger_raw: None,
+            would_select_decision_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+    let decision_json = serde_json::json!({
+        "policy_id": "policy_escalation_v1",
+        "policy_hash": "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        "tier_id": "primary_retry",
+        "tier_kind_raw": "same_backend_retry",
+        "trigger_raw": "contract_output_failure",
+        "chain_attempt_index": 1,
+        "redaction_version": "redaction_v1",
+        "timestamp_utc": "2026-05-25T12:00:00Z"
+    })
+    .to_string();
+    let mut tx = pool.begin().await.unwrap();
+    db::repos::escalation::update_shadow_escalation_columns_tx(
+        &mut tx,
+        &agent_execution_id.to_string(),
+        Some("primary_retry"),
+        Some("contract_output_failure"),
+        Some(&decision_json),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let event_payload = r#"{"digest_inputs":{"failure_kind":"contract_output_failure","output_settlement_state":"missing_required_outputs","validation_evidence_kind":"contract_validation"},"redacted_evidence_ref":"sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789","waiting_retry_after_until":"2026-05-25T12:00:00Z","external_acknowledgement_ref":"ack_p058_graphql_001"}"#;
+    db::repos::escalation::insert_event(
+        &pool,
+        &EscalationEvent {
+            id: "event-p058-graphql-live-fields".into(),
+            escalation_ledger_id: ledger.id.clone(),
+            event_kind_raw: "escalation.tier_selected".into(),
+            tier_id: Some("primary_retry".into()),
+            tier_kind_raw: Some("same_backend_retry".into()),
+            trigger_raw: Some("contract_output_failure".into()),
+            pause_reason_raw: None,
+            payload_json: Some(event_payload.into()),
+            redaction_version: Some("redaction_v1".into()),
+            created_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    let schema = make_schema(pool);
+    let response = schema
+        .execute(
+            Request::new(format!(
+                r#"{{
+                    runEscalationReadback(runId: "{}") {{
+                        runId
+                        hasActiveEscalation
+                        chains {{
+                            waitingRetryAfterUntil
+                            externalAcknowledgementRef
+                            featureFlagState
+                            escalationTraceJsonRedacted
+                            executionMetas {{
+                                wouldSelectTierId
+                                wouldSelectTriggerRaw
+                                wouldSelectDecisionJson
+                                digestInputs
+                            }}
+                        }}
+                    }}
+                }}"#,
+                run_id
+            ))
+            .data(auth::Principal::new(
+                "operator",
+                auth::PrincipalClass::Operator,
+            )),
+        )
+        .await;
+
+    assert!(
+        response.errors.is_empty(),
+        "graphql errors: {:?}",
+        response.errors
+    );
+    let data = response.data.into_json().unwrap();
+    let readback = &data["runEscalationReadback"];
+    assert_eq!(readback["runId"], run_id.to_string());
+    assert_eq!(readback["hasActiveEscalation"], true);
+    let chain = &readback["chains"][0];
+    assert_eq!(chain["waitingRetryAfterUntil"], "2026-05-25T12:00:00Z");
+    assert_eq!(chain["externalAcknowledgementRef"], "ack_p058_graphql_001");
+    assert_eq!(chain["featureFlagState"], "in_flight_continue");
+    let trace: serde_json::Value =
+        serde_json::from_str(chain["escalationTraceJsonRedacted"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        trace["schema_version"],
+        serde_json::json!("p058_escalation_trace_redacted_v1")
+    );
+    assert_eq!(trace["events"].as_array().unwrap().len(), 1);
+
+    let meta = &chain["executionMetas"][0];
+    assert_eq!(meta["wouldSelectTierId"], "primary_retry");
+    assert_eq!(meta["wouldSelectTriggerRaw"], "contract_output_failure");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            meta["wouldSelectDecisionJson"].as_str().unwrap()
+        )
+        .unwrap()["tier_id"],
+        serde_json::json!("primary_retry")
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(meta["digestInputs"].as_str().unwrap()).unwrap()
+            ["failure_kind"],
+        serde_json::json!("contract_output_failure")
+    );
+}
+
+#[tokio::test]
 async fn proposal_058_runtime_facts_marks_fresh_after_budget_as_fresh_process() {
     let pool = test_pool().await;
+
     let (_run_id, stage_execution_id, agent_execution_id, _artifact_id) =
         seed_execution(&pool).await;
     let facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, Utc::now());
@@ -759,6 +932,7 @@ async fn proposal_058_runtime_facts_marks_fresh_after_budget_as_fresh_process() 
 #[tokio::test]
 async fn proposal_058_artifact_projection_populates_source_generation_fields() {
     let pool = test_pool().await;
+
     let (run_id, stage_execution_id, agent_execution_id, _artifact_id) =
         seed_execution(&pool).await;
     let artifact_id = ArtifactId::new();

@@ -87,6 +87,20 @@ impl WorkflowState {
             || self.approval.as_deref() == Some("required")
     }
 
+    /// Whether this state is unsafe for auto-escalation binding (SEC-P058-001).
+    ///
+    /// Manual gates require human approval — binding auto-escalation to them is unsafe.
+    /// Any non-compute stage type that is not "start" or "end" is also treated as unsafe
+    /// fail-closed, covering future stage types like "release", "side_effect", "publish"
+    /// before they exist in the YAML schema.
+    pub fn is_unsafe_for_escalation(&self) -> bool {
+        self.is_manual_gate()
+            || matches!(
+                self.state_type.as_deref(),
+                Some(t) if !matches!(t, "start" | "end" | "manual_gate")
+            )
+    }
+
     /// Whether this state is an end state.
     pub fn is_end(&self) -> bool {
         self.state_type.as_deref() == Some("end")

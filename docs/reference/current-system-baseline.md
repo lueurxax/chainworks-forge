@@ -26,6 +26,7 @@ At the current baseline, the product includes:
 - GraphQL-only thin UI boundary ensuring governed SwiftUI workflow truth is read from server projections,
 - lead conflict mediation for same-run resolution of workflow conflicts,
 - capacity-aware scheduling, fairness, executor backpressure, SQLite write serialization, and host interruption recovery (Rust daemon),
+- configurable agent escalation chains with ordered retry and escalation tiers, policy resolution, tier advancement, and state management owned by the Rust control plane,
 - DbWriter bounded MPSC executor with priority lanes, deadlines, busy-retry classification, heartbeat, lane-starvation watchdog, graceful shutdown drain with populated terminal-operation admission allowlist, Class B coalescing buffer (500 ms drain-all flush, 64-merge force-flush, 1024-key saturation reject), per-lane oldest-enqueued reporting on `WriteRejected`, evidence file spool module (canonical `evidence/runs/...` layout, run-id-bound write-time path ownership check, symlink-escape rejection, `0o600`/`0o700` POSIX modes, checksum + double `fsync` + atomic no-replace commit), bounded `sweep_evidence_orphans` walk that backfills `recovered_orphan` metadata for crash-orphaned evidence files, stream-hashes candidates, skips over-budget candidates before read, and is exposed via the `storage.reconcile_evidence_orphans` MCP tool, evidence spool metadata schema, storage write-pressure snapshots, typed operator-only GraphQL `storageHealth`, operator-only MCP `storage.health` / `storage.write_pressure` / `storage.evidence_spool_summary` diagnostics, fail-closed stale/degraded storage readback when live writer health is unavailable, and a fail-closed write-budget registry gate that rejects temporary rollout bypasses, production runtime transaction paths outside DbWriter-owned entrypoints, and operation-registry drift,
 - catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
 - live ACP-backed execution for real provider sessions,
@@ -70,6 +71,7 @@ Use these reference docs as the current source of truth:
 | ACP runtime transport | [acp-runtime-transport.md](acp-runtime-transport.md) |
 | Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
 | Rust control plane, scheduler, and targeted retry authority | [rust-control-plane.md](rust-control-plane.md) |
+| Escalation policy and chain management | [escalation-policies.md](escalation-policies.md) |
 | Proposal-loop feedback fidelity | [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) |
 | Live provider-backed proposal loop | [live-provider-execution-slice.md](live-provider-execution-slice.md) |
 | Operator shell | [operator-experience.md](operator-experience.md) |

@@ -211,6 +211,30 @@ pub async fn consume_early_quota_retry_tx(
     find_by_id_tx(tx, ledger_id).await
 }
 
+pub async fn has_active_provider_quota_wait(
+    pool: &SqlitePool,
+    provider_family: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM agent_retry_budget_ledger ledger
+           JOIN agent_executions ae ON ae.id = ledger.agent_execution_id
+           WHERE ledger.failure_kind = ?1
+             AND COALESCE(ledger.normal_budget_consumed, 0) = 0
+             AND ledger.retry_after IS NOT NULL
+             AND ledger.retry_after > ?2
+             AND ledger.state = 'waiting_for_reset'
+             AND COALESCE(ae.provider_family, ae.provider) = ?3"#,
+    )
+    .bind(AgentFailureKind::ProviderQuota.to_string())
+    .bind(now.to_rfc3339())
+    .bind(provider_family)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
 pub async fn find_by_id_tx(
     tx: &mut Transaction<'_, Sqlite>,
     ledger_id: &str,

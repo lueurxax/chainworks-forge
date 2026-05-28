@@ -203,6 +203,19 @@ pub struct EscalationExecutionMetadata {
     pub capacity_probe_counter: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// P058 Phase 1b+: Shadow tier selection — which tier would have been selected.
+    /// Read from agent_execution_runtime_facts.would_select_tier_id via LEFT JOIN.
+    #[serde(default)]
+    pub would_select_tier_id: Option<String>,
+    /// P058 Phase 1b+: Shadow trigger classification — which trigger would have fired.
+    /// Read from agent_execution_runtime_facts.would_select_trigger_raw via LEFT JOIN.
+    #[serde(default)]
+    pub would_select_trigger_raw: Option<String>,
+    /// P058 Phase 1b+: Shadow decision JSON — the full decision context for shadow selection.
+    /// Read from agent_execution_runtime_facts.would_select_decision_json via LEFT JOIN.
+    /// Redacted and validated before persisting; null until Phase 1b shadow writer is live.
+    #[serde(default)]
+    pub would_select_decision_json: Option<String>,
 }
 
 /// Event journal entry for an escalation chain.

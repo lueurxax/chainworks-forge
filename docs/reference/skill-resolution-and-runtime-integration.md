@@ -116,6 +116,9 @@ Current rules:
 
 - external resolution is rooted in explicit catalog base context,
 - relative paths are resolved against the catalog source,
+- the bundle path is validated before any filesystem join: empty strings, null bytes, backslash separators, URI scheme prefixes (`://`), absolute paths, and `..` traversal components are rejected,
+- role names used in `roles/{role}.md` joins must be simple identifiers (no `/`, `\`, null byte, `.`, or `..`),
+- after joining, the resolved bundle path is canonicalized and must remain inside the canonicalized catalog root, blocking symlink-based escapes that component-level checks cannot catch,
 - the loader reads bundle content plus companion metadata,
 - resolution fails closed when the bundle cannot be read or the skill contract is malformed.
 

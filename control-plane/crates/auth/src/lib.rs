@@ -34,7 +34,7 @@ impl Principal {
         let mut principal = Principal::new(entry.id.clone(), entry.class.clone());
         if let Some(policies) = entry.surface_policies.as_ref() {
             // surface_policies present: override class defaults. Fail closed —
-            // an absent mcp stanza means no MCP tool access, not full defaults.
+            // an absent mcp stanza means no MCP tool or resource access.
             if let Some(mcp) = policies.mcp.as_ref() {
                 principal.tool_capabilities = mcp
                     .allowed_tools
@@ -45,8 +45,12 @@ impl Principal {
             } else {
                 principal.tool_capabilities = BTreeSet::new();
             }
+            // SEC-HIGH-001: when surface_policies are present, deny MCP resource access
+            // by default. Resources require an explicit allowlist in a future policy field;
+            // absent mcp stanza or absent resource stanza both map to empty resource set.
+            principal.resource_capabilities = BTreeSet::new();
         }
-        // No surface_policies: v1 behavior — keep class-default tool_capabilities.
+        // No surface_policies: v1 behavior — keep class-default capabilities.
         principal
     }
 }
@@ -143,27 +147,49 @@ impl PrincipalTable {
     /// operator-class principal, write it to disk, and return the table.
     pub fn load_or_bootstrap(path: &Path) -> Result<Self, AuthError> {
         if path.exists() {
-            // Security: reject symlinks and files with permissions other than 0600 (HIGH-002).
+            // MEDIUM-001: Close the TOCTOU window between the symlink check and open.
+            // lstat (symlink_metadata) rejects obvious symlink presence; the opened fd's
+            // inode is then compared with the lstat inode so a symlink substitution that
+            // races between the two checks is detected before any content is read.
             #[cfg(unix)]
-            {
+            let content = {
+                use std::io::Read;
                 use std::os::unix::fs::MetadataExt;
-                let meta = std::fs::symlink_metadata(path).map_err(|e| {
+                let sym_meta = std::fs::symlink_metadata(path).map_err(|e| {
                     AuthError::TableLoadFailed(format!("stat {}: {e}", path.display()))
                 })?;
-                if meta.file_type().is_symlink() {
+                if sym_meta.file_type().is_symlink() {
                     return Err(AuthError::TableLoadFailed(
                         "principals.json must not be a symlink".into(),
                     ));
                 }
-                let mode = meta.mode() & 0o777;
+                let lstat_ino = sym_meta.ino();
+                let mut file = std::fs::File::open(path).map_err(|e| {
+                    AuthError::TableLoadFailed(format!("open {}: {e}", path.display()))
+                })?;
+                let fd_meta = file.metadata().map_err(|e| {
+                    AuthError::TableLoadFailed(format!("fstat {}: {e}", path.display()))
+                })?;
+                // Inode mismatch means the file was replaced after lstat (symlink race).
+                if fd_meta.ino() != lstat_ino {
+                    return Err(AuthError::TableLoadFailed(
+                        "principals.json was replaced between stat and open".into(),
+                    ));
+                }
+                let mode = fd_meta.mode() & 0o777;
                 if mode != 0o600 {
                     return Err(AuthError::TableLoadFailed(format!(
                         "principals.json has unsafe permissions {:o}; expected 0600",
                         mode
                     )));
                 }
-            }
-
+                let mut content = String::new();
+                file.read_to_string(&mut content).map_err(|e| {
+                    AuthError::TableLoadFailed(format!("read {}: {e}", path.display()))
+                })?;
+                content
+            };
+            #[cfg(not(unix))]
             let content = std::fs::read_to_string(path)
                 .map_err(|e| AuthError::TableLoadFailed(format!("read {}: {e}", path.display())))?;
             let file: PrincipalTableFile = serde_json::from_str(&content).map_err(|e| {
@@ -281,11 +307,32 @@ fn normalize_principal_entries(
 
 // ── Token resolution ────────────────────────────────────────────────────
 
+/// Constant-time byte slice comparison to avoid timing side-channels during
+/// bearer-token lookup. MEDIUM-001: bearer tokens are secrets; normal string
+/// comparison allows timing oracle attacks. We scan all entries (no early exit
+/// on match) and XOR-fold bytes without short-circuiting on length mismatch.
+fn constant_time_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub fn resolve_bearer(token: &str, table: &PrincipalTable) -> Result<Principal, AuthError> {
-    table
-        .entries
-        .iter()
-        .find(|e| e.token == token)
+    // MEDIUM-001: scan all entries without early exit so the number of iterations
+    // does not leak how many entries are in the table, and use constant-time
+    // byte comparison so match position does not leak token prefix information.
+    let mut found: Option<&PrincipalEntry> = None;
+    for entry in &table.entries {
+        if constant_time_bytes_eq(entry.token.as_bytes(), token.as_bytes()) {
+            found = Some(entry);
+        }
+    }
+    found
         .map(Principal::from_entry)
         .ok_or(AuthError::UnknownToken)
 }
@@ -329,6 +376,20 @@ fn validate_v2_principals(entries: &[PrincipalEntry]) -> Result<(), AuthError> {
             return Err(AuthError::TableLoadFailed(
                 "duplicate token in principal table".into(),
             ));
+        }
+    }
+
+    // HIGH-002: ALL principals in schema_version 2 must declare surface_policies explicitly.
+    // Omitting surface_policies keeps class-default tool_capabilities (fail-open) for every
+    // class, not just Operator.  Reject at load time so no misconfigured entry reaches
+    // resolve_bearer regardless of class.
+    for entry in entries {
+        if entry.surface_policies.is_none() {
+            return Err(AuthError::TableLoadFailed(format!(
+                "schema_version 2 principal '{}' (class {:?}) must declare surface_policies; \
+                 omitting surface_policies grants class-default MCP/resource access (fail-closed)",
+                entry.id, entry.class
+            )));
         }
     }
 
@@ -448,32 +509,26 @@ pub fn is_mutation_allowed_by_surface_policy(
 
 /// P072: Check if GraphQL queries are allowed for a principal based on v2 surface_policies.
 /// Returns None if the principal has no surface_policies (v1 behavior applies).
+/// When surface_policies is present but graphql stanza is absent, returns Some(false) (fail closed).
 pub fn is_query_allowed_by_surface_policy(
     table: &PrincipalTable,
     principal_id: &str,
 ) -> Option<bool> {
-    table
-        .entries
-        .iter()
-        .find(|e| e.id == principal_id)
-        .and_then(|e| e.surface_policies.as_ref())
-        .and_then(|sp| sp.graphql.as_ref())
-        .map(|graphql| graphql.allow_queries)
+    let entry = table.entries.iter().find(|e| e.id == principal_id)?;
+    let sp = entry.surface_policies.as_ref()?;
+    Some(sp.graphql.as_ref().map_or(false, |g| g.allow_queries))
 }
 
 /// P072: Check if GraphQL subscriptions are allowed for a principal based on v2 surface_policies.
 /// Returns None if the principal has no surface_policies (v1 behavior applies).
+/// When surface_policies is present but graphql stanza is absent, returns Some(false) (fail closed).
 pub fn is_subscription_allowed_by_surface_policy(
     table: &PrincipalTable,
     principal_id: &str,
 ) -> Option<bool> {
-    table
-        .entries
-        .iter()
-        .find(|e| e.id == principal_id)
-        .and_then(|e| e.surface_policies.as_ref())
-        .and_then(|sp| sp.graphql.as_ref())
-        .map(|graphql| graphql.allow_subscriptions)
+    let entry = table.entries.iter().find(|e| e.id == principal_id)?;
+    let sp = entry.surface_policies.as_ref()?;
+    Some(sp.graphql.as_ref().map_or(false, |g| g.allow_subscriptions))
 }
 
 // ── Capability filtering ────────────────────────────────────────────────
@@ -565,8 +620,10 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
             matches!(class, PrincipalClass::Operator | PrincipalClass::Agent)
         }
         CapabilityToolId::IdeasList => true,
+        // SEC-001: runs.start supplies caller-controlled filesystem paths to the daemon.
+        // Restrict to Operator to prevent Agent principals from directing arbitrary reads.
         CapabilityToolId::RunsStart => {
-            matches!(class, PrincipalClass::Operator | PrincipalClass::Agent)
+            matches!(class, PrincipalClass::Operator)
         }
         CapabilityToolId::RunsList => true,
         CapabilityToolId::RunsGet => true,
@@ -589,7 +646,10 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::LegacyDiscoveryOverrideCreate => {
             matches!(class, PrincipalClass::Operator)
         }
-        CapabilityToolId::ReportsGet => true,
+        // SEC-HIGH-001: reports.get returns operator-grade report/evidence payloads,
+        // local file_path values, rollout readback, and failed-stage evidence. Restrict
+        // to Operator principals to match the report:// resource boundary.
+        CapabilityToolId::ReportsGet => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::ArtifactsOverrideContract => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StewardRunAnalysis => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StewardListAnalyses => {
@@ -670,8 +730,11 @@ fn resource_allowed_for_class(class: &PrincipalClass, id: ResourceTemplateId) ->
     match id {
         ResourceTemplateId::RunEntity => true,
         ResourceTemplateId::IdeaEntity => true,
-        ResourceTemplateId::ArtifactEntity => true,
-        ResourceTemplateId::ReportEntity => true,
+        // HIGH-001: artifact:// exposes local filesystem file_path; report:// exposes
+        // execution evidence and artifact payloads. Both are Operator-only to prevent
+        // Agent/Observer principals from reading sensitive path or evidence material.
+        ResourceTemplateId::ArtifactEntity => matches!(class, PrincipalClass::Operator),
+        ResourceTemplateId::ReportEntity => matches!(class, PrincipalClass::Operator),
         ResourceTemplateId::StewardAnalysisEntity => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
         }
@@ -683,8 +746,12 @@ fn resource_allowed_for_class(class: &PrincipalClass, id: ResourceTemplateId) ->
         ResourceTemplateId::ChainworksRunStages => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
         }
+        // SEC-HIGH-002: chainworks://runs/{run_id}/artifacts handler returns
+        // ArtifactIndexRow including file_path and source generation metadata.
+        // Restrict to Operator to prevent Observer/Agent callers from leaking
+        // filesystem paths and sensitive source/session/work-item identifiers.
         ResourceTemplateId::ChainworksRunArtifacts => {
-            matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
+            matches!(class, PrincipalClass::Operator)
         }
     }
 }
@@ -789,13 +856,15 @@ mod tests {
                 CapabilityToolId::StewardGetAnalysis
             ]
         );
+        // SEC-HIGH-002: chainworks://runs/{id}/artifacts is now Operator-only;
+        // Observer match must return None.
         assert_eq!(
             match_resource_uri(
                 &observer,
                 "server-owned-artifacts-uri",
                 test_resource_id_for_uri
             ),
-            Some(ResourceTemplateId::ChainworksRunArtifacts)
+            None
         );
         assert_eq!(
             match_resource_uri(
@@ -827,7 +896,8 @@ mod tests {
     #[test]
     fn agent_cannot_approve() {
         let p = Principal::new("ag", PrincipalClass::Agent);
-        assert!(is_tool_allowed(&p, "runs.start"));
+        // SEC-001: runs.start is now Operator-only (supplies daemon-side filesystem paths).
+        assert!(!is_tool_allowed(&p, "runs.start"));
         assert!(!is_tool_allowed(&p, "approvals.resolve"));
         assert!(!is_tool_allowed(&p, "stages.retry"));
         assert!(!is_tool_allowed(&p, "runs.main_sync.request"));
@@ -838,7 +908,8 @@ mod tests {
     fn observer_read_only() {
         let p = Principal::new("ob", PrincipalClass::Observer);
         assert!(is_tool_allowed(&p, "runs.list"));
-        assert!(is_tool_allowed(&p, "reports.get"));
+        // SEC-HIGH-001: reports.get is Operator-only; Observer must be denied.
+        assert!(!is_tool_allowed(&p, "reports.get"));
         assert!(!is_tool_allowed(&p, "ideas.create"));
         assert!(!is_tool_allowed(&p, "runs.start"));
     }
@@ -861,6 +932,27 @@ mod tests {
             assert!(!is_tool_allowed(&ag, tool), "Agent should deny {}", tool);
             assert!(!is_tool_allowed(&ob, tool), "Observer should deny {}", tool);
         }
+    }
+
+    #[test]
+    fn reports_get_is_operator_only() {
+        // SEC-HIGH-001: reports.get exposes operator-grade report payloads,
+        // local file_path values, rollout readback, and failed-stage evidence.
+        let op = Principal::new("op", PrincipalClass::Operator);
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        assert!(
+            is_tool_allowed(&op, "reports.get"),
+            "Operator must have reports.get"
+        );
+        assert!(
+            !is_tool_allowed(&ag, "reports.get"),
+            "Agent must not have reports.get"
+        );
+        assert!(
+            !is_tool_allowed(&ob, "reports.get"),
+            "Observer must not have reports.get"
+        );
     }
 
     #[test]
@@ -934,8 +1026,12 @@ mod tests {
         let ob = Principal::new("ob", PrincipalClass::Observer);
         assert!(is_resource_allowed(&ob, ResourceTemplateId::RunEntity));
         assert!(is_resource_allowed(&ob, ResourceTemplateId::IdeaEntity));
-        assert!(is_resource_allowed(&ob, ResourceTemplateId::ArtifactEntity));
-        assert!(is_resource_allowed(&ob, ResourceTemplateId::ReportEntity));
+        // HIGH-001: ArtifactEntity and ReportEntity are Operator-only; Observer no longer has access.
+        assert!(!is_resource_allowed(
+            &ob,
+            ResourceTemplateId::ArtifactEntity
+        ));
+        assert!(!is_resource_allowed(&ob, ResourceTemplateId::ReportEntity));
         assert!(is_resource_allowed(
             &ob,
             ResourceTemplateId::StewardAnalysisEntity
@@ -953,10 +1049,138 @@ mod tests {
             &ob,
             ResourceTemplateId::ChainworksRunStages
         ));
-        assert!(is_resource_allowed(
+        // SEC-HIGH-002: chainworks://runs/{id}/artifacts returns file_path and
+        // source generation metadata; Observer must be denied.
+        assert!(!is_resource_allowed(
             &ob,
             ResourceTemplateId::ChainworksRunArtifacts
         ));
+    }
+
+    #[test]
+    fn chainworks_run_artifacts_resource_is_operator_only() {
+        // SEC-HIGH-002: artifact list returns unredacted file_path and sensitive
+        // source/session/work-item identifiers; must be Operator-only.
+        let op = Principal::new("op", PrincipalClass::Operator);
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        assert!(
+            is_resource_allowed(&op, ResourceTemplateId::ChainworksRunArtifacts),
+            "Operator must have ChainworksRunArtifacts"
+        );
+        assert!(
+            !is_resource_allowed(&ag, ResourceTemplateId::ChainworksRunArtifacts),
+            "Agent must not have ChainworksRunArtifacts"
+        );
+        assert!(
+            !is_resource_allowed(&ob, ResourceTemplateId::ChainworksRunArtifacts),
+            "Observer must not have ChainworksRunArtifacts"
+        );
+    }
+
+    #[test]
+    fn artifact_and_report_resources_are_operator_only() {
+        let op = Principal::new("op", PrincipalClass::Operator);
+        let ag = Principal::new("ag", PrincipalClass::Agent);
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        // HIGH-001: artifact:// exposes local file_path; report:// exposes execution evidence.
+        assert!(is_resource_allowed(&op, ResourceTemplateId::ArtifactEntity));
+        assert!(is_resource_allowed(&op, ResourceTemplateId::ReportEntity));
+        assert!(!is_resource_allowed(
+            &ag,
+            ResourceTemplateId::ArtifactEntity
+        ));
+        assert!(!is_resource_allowed(&ag, ResourceTemplateId::ReportEntity));
+        assert!(!is_resource_allowed(
+            &ob,
+            ResourceTemplateId::ArtifactEntity
+        ));
+        assert!(!is_resource_allowed(&ob, ResourceTemplateId::ReportEntity));
+    }
+
+    #[test]
+    fn v2_custom_operator_without_surface_policies_fails_closed() {
+        // HIGH-002: any Operator principal in schema_version 2 that omits surface_policies
+        // must be rejected at load time rather than granted class-default access.
+        let entries = vec![
+            PrincipalEntry {
+                token: "tok-op".into(),
+                id: "default-operator".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: Some(GraphqlPolicy {
+                        allow_queries: true,
+                        allow_subscriptions: true,
+                        allowed_mutations: vec!["approveApproval".into(), "rejectApproval".into()],
+                    }),
+                    mcp: None,
+                }),
+            },
+            PrincipalEntry {
+                token: "tok-custom".into(),
+                id: "custom-agent-operator".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: None,
+            },
+        ];
+        let err = validate_v2_principals(&entries).unwrap_err();
+        assert!(
+            err.to_string().contains("must declare surface_policies"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn v2_agent_without_surface_policies_fails_closed() {
+        // HIGH-002 extended: Agent and Observer principals in schema_version 2 must also
+        // declare surface_policies; omitting keeps class-default MCP/resource capabilities.
+        for (class, id, token) in [
+            (PrincipalClass::Agent, "my-agent", "tok-ag"),
+            (PrincipalClass::Observer, "my-observer", "tok-ob"),
+        ] {
+            let entries = vec![PrincipalEntry {
+                token: token.into(),
+                id: id.into(),
+                class,
+                surface_policies: None,
+            }];
+            let err = validate_v2_principals(&entries).unwrap_err();
+            assert!(
+                err.to_string().contains("must declare surface_policies"),
+                "class {:?} without surface_policies must be rejected: {err}",
+                entries[0].class
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_constant_time_eq_rejects_on_diff_and_wrong_length() {
+        // MEDIUM-001: constant_time_bytes_eq must reject wrong values and lengths.
+        assert!(constant_time_bytes_eq(b"abcdef", b"abcdef"));
+        assert!(!constant_time_bytes_eq(b"abcdef", b"abcdeX"));
+        assert!(!constant_time_bytes_eq(b"abcdef", b"abcde"));
+        assert!(!constant_time_bytes_eq(b"abcdef", b"abcdefg"));
+    }
+
+    #[test]
+    fn resolve_bearer_uses_constant_time_comparison() {
+        let table = PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: "aaaa-bbbb-cccc-dddd".into(),
+                id: "test-op".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: None,
+            }],
+        };
+        // Correct token resolves.
+        assert!(resolve_bearer("aaaa-bbbb-cccc-dddd", &table).is_ok());
+        // Off-by-one character (same length): must fail.
+        assert!(resolve_bearer("aaaa-bbbb-cccc-dddX", &table).is_err());
+        // Wrong length: must fail.
+        assert!(resolve_bearer("aaaa-bbbb-cccc-dddd-extra", &table).is_err());
+        assert!(resolve_bearer("short", &table).is_err());
+        // Empty: must fail.
+        assert!(resolve_bearer("", &table).is_err());
     }
 
     // ── P072 v2 schema tests ───────────────────────────────────────────
@@ -1408,6 +1632,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn surface_policies_without_graphql_stanza_fails_closed() {
+        // A principal that has surface_policies but NO graphql stanza must not be
+        // allowed to bypass the check by returning None (which callers treat as
+        // "v1, allow through"). It must return Some(false) — fail closed.
+        let table = PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: "tok-mcp-only".into(),
+                id: "mcp-only".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: None,
+                    mcp: Some(McpPolicy {
+                        allowed_tools: vec!["runs.list".into()],
+                    }),
+                }),
+            }],
+        };
+        assert_eq!(
+            is_query_allowed_by_surface_policy(&table, "mcp-only"),
+            Some(false),
+            "surface_policies present but no graphql stanza must deny queries"
+        );
+        assert_eq!(
+            is_subscription_allowed_by_surface_policy(&table, "mcp-only"),
+            Some(false),
+            "surface_policies present but no graphql stanza must deny subscriptions"
+        );
+    }
+
     // ── P078 effects.* auth tests ─────────────────────────────────────────
 
     #[test]
@@ -1681,5 +1935,97 @@ mod tests {
                 "Operator must have {tool:?} (SEC-004)"
             );
         }
+    }
+
+    #[test]
+    fn sec_high_001_v2_surface_policies_deny_mcp_resources_by_default() {
+        // SEC-HIGH-001: when surface_policies is present, resource_capabilities must be
+        // empty by default regardless of class. An Operator with surface_policies but no
+        // explicit resource allowlist must NOT be able to read artifact://, report://, or
+        // chainworks://runs/{id}/artifacts resources.
+        let entry = PrincipalEntry {
+            token: "tok".into(),
+            id: "graphql-scoped-operator".into(),
+            class: PrincipalClass::Operator,
+            surface_policies: Some(SurfacePolicies {
+                graphql: Some(GraphqlPolicy {
+                    allow_queries: true,
+                    allow_subscriptions: true,
+                    allowed_mutations: vec!["approveApproval".into(), "rejectApproval".into()],
+                }),
+                mcp: None,
+            }),
+        };
+        let principal = Principal::from_entry(&entry);
+        assert!(
+            principal.resource_capabilities.is_empty(),
+            "v2 Operator with surface_policies must have empty resource_capabilities by default"
+        );
+        assert!(
+            !is_resource_allowed(&principal, ResourceTemplateId::ArtifactEntity),
+            "ArtifactEntity must be denied when surface_policies present and no resource allowlist"
+        );
+        assert!(
+            !is_resource_allowed(&principal, ResourceTemplateId::ReportEntity),
+            "ReportEntity must be denied when surface_policies present and no resource allowlist"
+        );
+        assert!(
+            !is_resource_allowed(&principal, ResourceTemplateId::ChainworksRunArtifacts),
+            "ChainworksRunArtifacts must be denied when surface_policies present"
+        );
+        assert!(
+            !is_resource_allowed(&principal, ResourceTemplateId::RunEntity),
+            "RunEntity must be denied when surface_policies present and no resource allowlist"
+        );
+    }
+
+    #[test]
+    fn sec_high_001_v2_surface_policies_with_empty_mcp_also_denies_resources() {
+        // SEC-HIGH-001: an explicit empty McpPolicy must also result in no resource access.
+        let entry = PrincipalEntry {
+            token: "tok".into(),
+            id: "mcp-empty-operator".into(),
+            class: PrincipalClass::Operator,
+            surface_policies: Some(SurfacePolicies {
+                graphql: Some(GraphqlPolicy {
+                    allow_queries: true,
+                    allow_subscriptions: true,
+                    allowed_mutations: vec!["approveApproval".into(), "rejectApproval".into()],
+                }),
+                mcp: Some(McpPolicy {
+                    allowed_tools: vec![],
+                }),
+            }),
+        };
+        let principal = Principal::from_entry(&entry);
+        assert!(
+            principal.resource_capabilities.is_empty(),
+            "v2 Operator with empty McpPolicy must have empty resource_capabilities"
+        );
+        assert!(
+            !is_resource_allowed(&principal, ResourceTemplateId::ArtifactEntity),
+            "ArtifactEntity must be denied for empty-tool v2 principal"
+        );
+    }
+
+    #[test]
+    fn sec_high_001_v1_principal_without_surface_policies_retains_default_resources() {
+        // SEC-HIGH-001: v1 principals (no surface_policies) must NOT be affected —
+        // they keep class-default resource_capabilities.
+        let entry = PrincipalEntry {
+            token: "tok".into(),
+            id: "legacy-operator".into(),
+            class: PrincipalClass::Operator,
+            surface_policies: None,
+        };
+        let principal = Principal::from_entry(&entry);
+        assert!(
+            !principal.resource_capabilities.is_empty(),
+            "v1 Operator without surface_policies must retain default resource_capabilities"
+        );
+        assert!(
+            is_resource_allowed(&principal, ResourceTemplateId::ArtifactEntity),
+            "ArtifactEntity must be allowed for v1 Operator"
+        );
     }
 }

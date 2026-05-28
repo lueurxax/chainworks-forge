@@ -23,8 +23,62 @@ struct EscalationChainStateDTO: Codable, Sendable, Equatable {
     let pauseReasonRaw: String?
     let operatorActionHint: String?
     let runbookAnchor: String?
+    let waitingRetryAfterUntil: String?
+    let traceUnavailableReasonRaw: String?
+    let escalationTraceJSONRedacted: String?
+    let policyDriftState: String?
+    let externalAcknowledgementRef: String?
+    let featureFlagState: String?
     let createdAt: String
     let updatedAt: String
+
+    nonisolated init(
+        id: String,
+        runId: String,
+        stageId: String,
+        agentId: String,
+        policyId: String,
+        policyHash: String,
+        statusRaw: String,
+        currentTierId: String?,
+        currentTierKindRaw: String?,
+        chainAttemptIndex: Int,
+        triggerRaw: String?,
+        pauseReasonRaw: String?,
+        operatorActionHint: String?,
+        runbookAnchor: String?,
+        waitingRetryAfterUntil: String? = nil,
+        traceUnavailableReasonRaw: String? = nil,
+        escalationTraceJSONRedacted: String? = nil,
+        policyDriftState: String? = nil,
+        externalAcknowledgementRef: String? = nil,
+        featureFlagState: String? = nil,
+        createdAt: String,
+        updatedAt: String
+    ) {
+        self.id = id
+        self.runId = runId
+        self.stageId = stageId
+        self.agentId = agentId
+        self.policyId = policyId
+        self.policyHash = policyHash
+        self.statusRaw = statusRaw
+        self.currentTierId = currentTierId
+        self.currentTierKindRaw = currentTierKindRaw
+        self.chainAttemptIndex = chainAttemptIndex
+        self.triggerRaw = triggerRaw
+        self.pauseReasonRaw = pauseReasonRaw
+        self.operatorActionHint = operatorActionHint
+        self.runbookAnchor = runbookAnchor
+        self.waitingRetryAfterUntil = waitingRetryAfterUntil
+        self.traceUnavailableReasonRaw = traceUnavailableReasonRaw
+        self.escalationTraceJSONRedacted = escalationTraceJSONRedacted
+        self.policyDriftState = policyDriftState
+        self.externalAcknowledgementRef = externalAcknowledgementRef
+        self.featureFlagState = featureFlagState
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -41,9 +95,26 @@ struct EscalationChainStateDTO: Codable, Sendable, Equatable {
         case pauseReasonRaw
         case operatorActionHint
         case runbookAnchor
+        case waitingRetryAfterUntil
+        case traceUnavailableReasonRaw
+        case escalationTraceJSONRedacted = "escalationTraceJsonRedacted"
+        case policyDriftState
+        case externalAcknowledgementRef
+        case featureFlagState
         case createdAt
         case updatedAt
     }
+}
+
+/// P058 read-pipeline state for the governed macOS read surface.
+/// This is presentation/readback state only; it must not become escalation authority.
+enum EscalationReadPipelineState: String, Sendable, Equatable {
+    case unavailable
+    case subscribing
+    case ready
+    case stale
+    case transportDisconnected
+    case decodeFailed
 }
 
 // MARK: - Stable vocabulary helpers
@@ -82,6 +153,7 @@ struct EscalationSnapshot: Sendable, Equatable {
     let runId: String
     let activeChains: [EscalationChainStateDTO]
     let pauseReasonRaw: String?
+    let readPipelineState: EscalationReadPipelineState
     let isKillSwitchEngaged: Bool
     let isPolicyDrift: Bool
     let hasActiveEscalation: Bool
@@ -93,13 +165,18 @@ extension EscalationSnapshot {
         runId: "",
         activeChains: [],
         pauseReasonRaw: nil,
+        readPipelineState: .unavailable,
         isKillSwitchEngaged: false,
         isPolicyDrift: false,
         hasActiveEscalation: false,
         pausedChainCount: 0
     )
 
-    static func build(runId: String, chains: [EscalationChainStateDTO]) -> EscalationSnapshot {
+    static func build(
+        runId: String,
+        chains: [EscalationChainStateDTO],
+        readPipelineState: EscalationReadPipelineState = .ready
+    ) -> EscalationSnapshot {
         let pausedChains = chains.filter {
             $0.statusRaw == "paused" || $0.statusRaw == "exhausted"
         }
@@ -109,13 +186,19 @@ extension EscalationSnapshot {
         let isDrift = chains.contains {
             $0.pauseReasonRaw == EscalationPauseReasonCode.escalationPolicyDrift.rawValue
         }
+        // A claim-start ledger with statusRaw == "active" and triggerRaw == nil is not an
+        // active escalation (proposal P058: server is the authority; null trigger_raw means
+        // no escalation has been triggered yet). Only count chains that have actually been
+        // triggered or have left the initial active state.
+        let hasTriggered = chains.contains { $0.triggerRaw != nil || $0.statusRaw != "active" }
         return EscalationSnapshot(
             runId: runId,
             activeChains: chains,
             pauseReasonRaw: pausedChains.first?.pauseReasonRaw,
+            readPipelineState: readPipelineState,
             isKillSwitchEngaged: isKillSwitch,
             isPolicyDrift: isDrift,
-            hasActiveEscalation: !chains.isEmpty,
+            hasActiveEscalation: hasTriggered,
             pausedChainCount: pausedChains.count
         )
     }

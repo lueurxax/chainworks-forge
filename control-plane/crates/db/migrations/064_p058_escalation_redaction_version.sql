@@ -1,0 +1,4 @@
+-- P058 Phase 1: redaction_version column is included in the escalation_events CREATE TABLE
+-- in migration 063_p058_escalation_schema.sql as NOT NULL without a DEFAULT, plus a CHECK
+-- constraint enforcing the known-version allowlist. No ALTER TABLE is needed here.
+-- This migration is intentionally empty and retained for migration-sequence continuity.

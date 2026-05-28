@@ -1177,7 +1177,7 @@ fn retry_state_has_release_post_approval_tasks(run: &Run, stage_id: &str) -> Res
     }))
 }
 
-fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
+pub fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
     match (
         run.workflow_snapshot_json.as_deref(),
         run.catalog_snapshot_json.as_deref(),
@@ -1206,6 +1206,31 @@ fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunPlan>
     }
 }
 
+/// Compile a RunPlan exclusively from frozen snapshots stamped at run start.
+/// Returns `Ok(None)` when no frozen snapshots are available — does NOT fall back
+/// to mutable on-disk YAML, enforcing the frozen-snapshot invariant (P058-SEC-003).
+/// Use this in contexts where YAML drift would violate the proposal contract
+/// (e.g., escalation policy resolution during live agent execution).
+pub fn compile_run_plan_from_snapshot(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
+    match (
+        run.workflow_snapshot_json.as_deref(),
+        run.catalog_snapshot_json.as_deref(),
+    ) {
+        (Some(workflow_snapshot_json), Some(catalog_snapshot_json))
+            if !workflow_snapshot_json.trim().is_empty()
+                && !catalog_snapshot_json.trim().is_empty() =>
+        {
+            let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or(".");
+            Ok(Some(workflow::compiler::compile_from_snapshot_json(
+                workflow_snapshot_json,
+                catalog_snapshot_json,
+                catalog_path,
+            )?))
+        }
+        _ => Ok(None),
+    }
+}
+
 async fn closeout_loop_budget_remaining_for_run(
     pool: &SqlitePool,
     run: &Run,
@@ -1230,7 +1255,7 @@ fn requires_effect_reconciliation_error(stage: &StageExecution) -> anyhow::Error
     )
 }
 
-fn find_source_invoke_work_item<'a>(
+pub(crate) fn find_source_invoke_work_item<'a>(
     work_items: &'a [WorkItem],
     stage_execution_id: &str,
     agent_id: &str,

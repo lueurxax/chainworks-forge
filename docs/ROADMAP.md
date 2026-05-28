@@ -31,10 +31,7 @@ These are not active workstreams:
 - **P081** boundary-first API/auth contract matrix.
 - **Local persistence write-budget / evidence-spooling infrastructure** is implemented and remains the persistence safety baseline.
 - **Durable side-effect ledger**: release settlement, retry blocking, and reconciliation.
-- **Configurable Agent Escalation Chains**:
-  - keep scoped to contract-output repair/fallback;
-  - do not include release agents;
-  - do not bypass durable side-effect safety.
+- **P058** Configurable Agent Escalation Chains — Phase 0-1 landed: `escalation_policy_v1` schema, durable ledger/metadata/events tables, GraphQL `runEscalationReadback` + MCP `runs.get` parity with redaction tiers, kill-switch as safe default. Phase 2+ scheduler behavior (capacity probes, force-detach, lead mediation, shadow writes) remains gated. See [reference/escalation-policies.md](reference/escalation-policies.md). Constraints still apply: scoped to contract-output repair/fallback, no release agents, must not bypass durable side-effect safety.
 
 ## Parallel UI recovery lane
 

@@ -5,7 +5,7 @@ use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts, agent_executions,
-    agent_retry_budget_ledger, ideas, runs, sessions, stages,
+    agent_retry_budget_ledger, escalation, ideas, runs, sessions, stages,
 };
 use domain::agent::{
     AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
@@ -74,6 +74,15 @@ fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
         review_routing_json: None,
         closeout_readiness_mode: None,
     }
+}
+
+async fn setup_pool() -> sqlx::SqlitePool {
+    let pool = create_pool("sqlite::memory:").await.unwrap();
+    let writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+    db::writer::register_shared_writer(&pool, writer)
+        .await
+        .unwrap();
+    pool
 }
 
 async fn seed_execution(pool: &sqlx::SqlitePool) -> (RunId, StageExecutionId, AgentExecutionId) {
@@ -344,6 +353,7 @@ fn discovery_payload(
 #[tokio::test]
 async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields() {
     let pool = test_pool().await;
+
     let (run_id, stage_execution_id, agent_execution_id) = seed_execution(&pool).await;
     sqlx::query("UPDATE agent_executions SET session_reuse_disposition = ?1 WHERE id = ?2")
         .bind("fresh_after_transport_error")
@@ -474,6 +484,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
         Arc::new(make_command_handler(pool.clone())),
         auth::PrincipalTable::test_fixture(),
     );
+    // HIGH-001: report:// exposes execution evidence; Operator-only.
     let resource_response = server
         .handle_request(
             JsonRpcRequest {
@@ -484,12 +495,34 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
                     "uri": format!("report://{}", run_id),
                 })),
             },
-            &auth::Principal::new("observer", auth::PrincipalClass::Observer),
+            &auth::Principal::new("operator", auth::PrincipalClass::Operator),
+        )
+        .await;
+    // HIGH-001: report:// is Operator-only; Observer must be denied.
+    let observer_server = McpServer::new(
+        pool.clone(),
+        Arc::new(make_command_handler(pool.clone())),
+        auth::PrincipalTable::test_fixture(),
+    );
+    let observer_resource_response = observer_server
+        .handle_request(
+            JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(serde_json::json!(99)),
+                method: "resources/read".into(),
+                params: Some(serde_json::json!({ "uri": format!("report://{}", run_id) })),
+            },
+            &auth::Principal::new("obs-denial", auth::PrincipalClass::Observer),
         )
         .await;
     assert!(
+        observer_resource_response.error.is_some(),
+        "Observer must NOT be able to read report:// (HIGH-001 regression)"
+    );
+
+    assert!(
         resource_response.error.is_none(),
-        "resource read error: {:?}",
+        "Operator resource read error: {:?}",
         resource_response.error
     );
     let resource_text = resource_response.result.as_ref().unwrap()["contents"][0]["text"]
@@ -502,9 +535,10 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
         agent_execution_id.to_string()
     );
     assert_eq!(resource_runtime_facts["failure_kind"], "provider_quota");
+    // Operator sees the unredacted raw_debug value.
     assert_eq!(
         resource_runtime_facts["failure_kind_raw_debug"],
-        serde_json::Value::Null
+        "future_provider_quota_variant"
     );
     assert_eq!(
         resource_runtime_facts["failure_message_redacted"],
@@ -524,6 +558,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
 #[tokio::test]
 async fn proposal_053_reports_get_projects_discovery_reconciliation_pending() {
     let pool = test_pool().await;
+
     let (run_id, _stage_execution_id, agent_execution_id) = seed_execution(&pool).await;
     let now = Utc::now();
     let diagnostics = AgentExecutionDiscoveryDiagnostics::from_payload(
@@ -593,4 +628,291 @@ async fn proposal_053_reports_get_projects_discovery_reconciliation_pending() {
         "valid_outputs_from_completed_execution"
     );
     assert_eq!(execution["runtime_facts"]["valid_required_outputs"], false);
+}
+
+// ── SEC-004: non-Operator MCP readback authz contract ─────────────────────────
+
+/// SEC-004: build_escalation_readback_summary_json must NOT include dominant_pause_reason_raw.
+/// Agent/Observer principals see only paused_chain_count and has_active_escalation.
+#[tokio::test]
+async fn p058_sec004_non_operator_summary_excludes_dominant_pause_reason() {
+    use domain::escalation::EscalationLedger;
+    use domain::ids::RunId;
+    use mcp_server::tools::runs::build_escalation_readback_summary_json;
+
+    let pool = setup_pool().await;
+    let run_id = RunId::new();
+    let idea_id = domain::ids::IdeaId::new();
+    ideas::insert(
+        &pool,
+        &domain::idea::Idea {
+            id: idea_id,
+            title: "sec004 test".into(),
+            body: "authz".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    runs::insert(
+        &pool,
+        &domain::run::Run {
+            id: run_id,
+            idea_id,
+            status: domain::run::RunStatus::Running,
+            workflow_id: "wf".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: "/tmp".into(),
+            artifact_root: "/tmp".into(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: None,
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: None,
+            review_routing_json: None,
+            closeout_readiness_mode: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = Utc::now();
+    // Insert a paused ledger so there IS a pause reason that could be leaked.
+    let ledger = EscalationLedger {
+        id: "ledger-sec004-authz".into(),
+        run_id,
+        stage_id: "state_3".into(),
+        agent_id: "code_writer".into(),
+        policy_id: "policy-sec004".into(),
+        policy_hash: "sha256:s4authz".into(),
+        status_raw: "paused".into(),
+        current_tier_id: None,
+        current_tier_kind_raw: None,
+        chain_attempt_index: 1,
+        trigger_raw: Some("contract_output_failure".into()),
+        pause_reason_raw: Some("escalation_chain_exhausted".into()),
+        operator_action_hint: None,
+        runbook_anchor: None,
+        created_at: now,
+        updated_at: now,
+    };
+    escalation::insert_ledger(&pool, &ledger).await.unwrap();
+
+    let summary = build_escalation_readback_summary_json(&pool, run_id)
+        .await
+        .unwrap();
+
+    assert!(
+        summary.get("dominant_pause_reason_raw").is_none(),
+        "non-Operator summary must not expose dominant_pause_reason_raw (SEC-004); got: {summary:?}"
+    );
+    assert_eq!(
+        summary.get("paused_chain_count").and_then(|v| v.as_i64()),
+        Some(1),
+        "paused_chain_count must reflect the paused ledger"
+    );
+    assert_eq!(
+        summary
+            .get("has_active_escalation")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+    );
+    assert_eq!(
+        summary.get("chains_redacted").and_then(|v| v.as_bool()),
+        Some(true),
+    );
+}
+
+// ── SEC HIGH-001: run:// resource must not leak snapshot fields to non-Operator ─────────────────
+
+/// SEC HIGH-001: Agent principals must not recover catalog_snapshot_json (which contains frozen
+/// escalation policies) or other operator-only fields via the run:// resource surface.
+/// Operator readback must be unaffected.
+#[tokio::test]
+async fn p058_sec001_run_resource_agent_cannot_see_snapshot_fields() {
+    let pool = setup_pool().await;
+    let idea_id = domain::ids::IdeaId::new();
+    let run_id = RunId::new();
+
+    ideas::insert(
+        &pool,
+        &domain::idea::Idea {
+            id: idea_id,
+            title: "sec001 run-resource test".into(),
+            body: "escalation policy leak prevention".into(),
+            workspace_root_path: None,
+            project_key: None,
+            status: domain::idea::IdeaStatus::Active,
+            created_at: Utc::now(),
+            archived_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    runs::insert(
+        &pool,
+        &domain::run::Run {
+            id: run_id,
+            idea_id,
+            status: domain::run::RunStatus::Running,
+            workflow_id: "wf-snap".into(),
+            workflow_title: "Snapshot Run".into(),
+            workspace_root: "/tmp/ws".into(),
+            artifact_root: "/tmp/art".into(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("state_1".into()),
+            workflow_yaml_path: Some("/workspace/workflows/main.yaml".into()),
+            agent_catalog_yaml_path: Some("/workspace/agents/agents.yaml".into()),
+            worktree_root: Some("/tmp/worktrees/cw-test".into()),
+            base_branch: Some("main".into()),
+            base_revision: None,
+            target_branch: Some("cw/feature".into()),
+            delivery_configuration_json: Some(r#"{"repo_identifier":"repo-snap"}"#.into()),
+            delivery_preflight_json: Some(r#"{"passed":true}"#.into()),
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: Some("sha256:wf-snap".into()),
+            catalog_snapshot_hash: Some("sha256:cat-snap".into()),
+            workflow_snapshot_json: Some(r#"{"states":{"state_1":{}}}"#.into()),
+            catalog_snapshot_json: Some(
+                r#"{"escalation_policies":[{"policy_id":"p_secret"}]}"#.into(),
+            ),
+            drift_detected_at: None,
+            drift_details_json: Some(r#"{"policy_hash_mismatch":true}"#.into()),
+            chainworks_meta_root: Some("/Users/user/Documents/Chainworks Forge/.chainworks".into()),
+            review_routing_json: None,
+            closeout_readiness_mode: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let server = McpServer::new(
+        pool.clone(),
+        Arc::new(make_command_handler(pool.clone())),
+        auth::PrincipalTable::test_fixture(),
+    );
+
+    let operator_only_fields = [
+        "catalog_snapshot_json",
+        "workflow_snapshot_json",
+        "delivery_configuration_json",
+        "delivery_preflight_json",
+        "drift_details_json",
+        "chainworks_meta_root",
+        "workflow_yaml_path",
+        "agent_catalog_yaml_path",
+        "worktree_root",
+    ];
+
+    // Agent principal must not receive any operator-only snapshot fields via run://.
+    let agent_response = server
+        .handle_request(
+            JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(serde_json::json!(1)),
+                method: "resources/read".into(),
+                params: Some(serde_json::json!({ "uri": format!("run://{}", run_id) })),
+            },
+            &auth::Principal::new("agent-sec001", auth::PrincipalClass::Agent),
+        )
+        .await;
+    assert!(
+        agent_response.error.is_none(),
+        "run:// resource read error for agent: {:?}",
+        agent_response.error
+    );
+    let agent_text = agent_response.result.as_ref().unwrap()["contents"][0]["text"]
+        .as_str()
+        .expect("agent resource text");
+    let agent_run: serde_json::Value = serde_json::from_str(agent_text).unwrap();
+    for field in &operator_only_fields {
+        assert!(
+            agent_run.get(*field).is_none(),
+            "Agent must not receive {field} via run:// (SEC HIGH-001); got: {agent_run:?}"
+        );
+    }
+
+    // Observer principal must also be redacted.
+    let observer_response = server
+        .handle_request(
+            JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(serde_json::json!(2)),
+                method: "resources/read".into(),
+                params: Some(serde_json::json!({ "uri": format!("run://{}", run_id) })),
+            },
+            &auth::Principal::new("obs-sec001", auth::PrincipalClass::Observer),
+        )
+        .await;
+    let observer_text = observer_response.result.as_ref().unwrap()["contents"][0]["text"]
+        .as_str()
+        .expect("observer resource text");
+    let observer_run: serde_json::Value = serde_json::from_str(observer_text).unwrap();
+    for field in &operator_only_fields {
+        assert!(
+            observer_run.get(*field).is_none(),
+            "Observer must not receive {field} via run:// (SEC HIGH-001)"
+        );
+    }
+
+    // Operator principal must still receive the full run including snapshot fields.
+    let operator_response = server
+        .handle_request(
+            JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(serde_json::json!(3)),
+                method: "resources/read".into(),
+                params: Some(serde_json::json!({ "uri": format!("run://{}", run_id) })),
+            },
+            &auth::Principal::new("op-sec001", auth::PrincipalClass::Operator),
+        )
+        .await;
+    let operator_text = operator_response.result.as_ref().unwrap()["contents"][0]["text"]
+        .as_str()
+        .expect("operator resource text");
+    let operator_run: serde_json::Value = serde_json::from_str(operator_text).unwrap();
+    assert!(
+        operator_run.get("catalog_snapshot_json").is_some(),
+        "Operator must receive catalog_snapshot_json via run:// (SEC HIGH-001)"
+    );
+    assert!(
+        operator_run.get("workflow_snapshot_json").is_some(),
+        "Operator must receive workflow_snapshot_json via run://"
+    );
+    assert!(
+        operator_run.get("chainworks_meta_root").is_some(),
+        "Operator must receive chainworks_meta_root via run://"
+    );
 }

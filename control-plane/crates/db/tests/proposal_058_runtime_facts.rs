@@ -2,7 +2,7 @@ use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, artifact_contracts,
-    artifacts, ideas, runs, stages, work_items,
+    artifacts, escalation, ideas, runs, stages, work_items,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{
@@ -14,6 +14,7 @@ use domain::artifact_contracts::{
     ActiveArtifactGenerationInput, ArtifactSourceGenerationClaim, ArtifactSourceGenerationClaimKey,
     SourceGenerationImportDecision,
 };
+use domain::escalation::{EscalationEvent, EscalationExecutionMetadata, EscalationLedger};
 use domain::idea::{Idea, IdeaStatus};
 use domain::ids::{AgentExecutionId, ArtifactId, IdeaId, RunId, StageExecutionId};
 use domain::mediation::OwnerKind;
@@ -71,6 +72,11 @@ fn make_run(run_id: RunId, idea_id: IdeaId) -> Run {
 async fn seed_execution(
     pool: &sqlx::SqlitePool,
 ) -> (RunId, StageExecutionId, AgentExecutionId, String) {
+    use db::writer::{register_shared_writer, DbWriter};
+    use std::sync::Arc;
+    // P075 DbWriter must be registered before calling repos that use execute_repository_write!.
+    let writer = Arc::new(DbWriter::new(pool.clone()));
+    register_shared_writer(pool, writer).await.unwrap();
     let idea_id = IdeaId::new();
     let run_id = RunId::new();
     let stage_execution_id = StageExecutionId::new();
@@ -224,6 +230,222 @@ async fn proposal_058_runtime_facts_upsert_preserves_unknown_raw_debug() {
         AgentOutputSettlement::MissingRequiredOutputs
     );
     assert_eq!(read.quota_ledger_id.as_deref(), Some(ledger.id.as_str()));
+}
+
+#[tokio::test]
+async fn proposal_058_counts_recent_escalation_launches_for_storm_detection() {
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id, agent_execution_id, _work_item_id) =
+        seed_execution(&pool).await;
+    let now = Utc::now();
+    escalation::insert_ledger(
+        &pool,
+        &EscalationLedger {
+            id: "ledger-p058-recent-launches".into(),
+            run_id,
+            stage_id: "state_1".into(),
+            agent_id: "code_writer".into(),
+            policy_id: "policy-p058".into(),
+            policy_hash: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .into(),
+            status_raw: "active".into(),
+            current_tier_id: Some("primary_retry".into()),
+            current_tier_kind_raw: Some("same_backend_retry".into()),
+            chain_attempt_index: 0,
+            trigger_raw: Some("contract_output_failure".into()),
+            pause_reason_raw: None,
+            operator_action_hint: None,
+            runbook_anchor: None,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    escalation::insert_execution_metadata(
+        &pool,
+        &EscalationExecutionMetadata {
+            agent_execution_id,
+            escalation_ledger_id: "ledger-p058-recent-launches".into(),
+            tier_id: "primary_retry".into(),
+            tier_kind_raw: "same_backend_retry".into(),
+            tier_attempt_index: 0,
+            trigger_raw: Some("contract_output_failure".into()),
+            digest_version: Some("escalation_blocker_digest_v1".into()),
+            capacity_probe_counter: 0,
+            created_at: now,
+            updated_at: now,
+            would_select_tier_id: None,
+            would_select_trigger_raw: None,
+            would_select_decision_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let recent = escalation::count_recent_metas_by_ledger(
+        &pool,
+        "ledger-p058-recent-launches",
+        now - chrono::Duration::seconds(300),
+    )
+    .await
+    .unwrap();
+    let future = escalation::count_recent_metas_by_ledger(
+        &pool,
+        "ledger-p058-recent-launches",
+        now + chrono::Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(recent, 1);
+    assert_eq!(future, 0);
+}
+
+#[tokio::test]
+async fn proposal_058_late_frame_event_and_runtime_facts_share_transaction() {
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id, agent_execution_id, _work_item_id) =
+        seed_execution(&pool).await;
+    let now = Utc::now();
+    escalation::insert_ledger(
+        &pool,
+        &EscalationLedger {
+            id: "ledger-p058-late-frame".into(),
+            run_id,
+            stage_id: "state_1".into(),
+            agent_id: "code_writer".into(),
+            policy_id: "policy-p058".into(),
+            policy_hash: "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+                .into(),
+            status_raw: "active".into(),
+            current_tier_id: Some("primary_retry".into()),
+            current_tier_kind_raw: Some("same_backend_retry".into()),
+            chain_attempt_index: 0,
+            trigger_raw: Some("contract_output_failure".into()),
+            pause_reason_raw: None,
+            operator_action_hint: None,
+            runbook_anchor: None,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    escalation::insert_execution_metadata(
+        &pool,
+        &EscalationExecutionMetadata {
+            agent_execution_id,
+            escalation_ledger_id: "ledger-p058-late-frame".into(),
+            tier_id: "primary_retry".into(),
+            tier_kind_raw: "same_backend_retry".into(),
+            tier_attempt_index: 0,
+            trigger_raw: Some("contract_output_failure".into()),
+            digest_version: Some("escalation_blocker_digest_v1".into()),
+            capacity_probe_counter: 0,
+            created_at: now,
+            updated_at: now,
+            would_select_tier_id: None,
+            would_select_trigger_raw: None,
+            would_select_decision_json: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let before_late_frame =
+        db::metrics::get_counter("escalation_provider_late_frame_after_detach_total");
+    let before_pause =
+        db::metrics::get_counter("escalation_pause_total:provider_session_force_detached");
+    let mut rollback_tx = pool.begin().await.unwrap();
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.output_settlement = AgentOutputSettlement::IgnoredLateOutputs;
+    facts.late_output_count = 1;
+    facts.ignored_late_output_count = 1;
+    agent_execution_runtime_facts::upsert_tx(&mut rollback_tx, &facts)
+        .await
+        .unwrap();
+    escalation::insert_event_tx(
+        &mut rollback_tx,
+        &EscalationEvent {
+            id: "p058-late-frame-rollback".into(),
+            escalation_ledger_id: "ledger-p058-late-frame".into(),
+            event_kind_raw: "escalation.provider_late_frame_after_detach".into(),
+            tier_id: Some("primary_retry".into()),
+            tier_kind_raw: Some("same_backend_retry".into()),
+            trigger_raw: Some("contract_output_failure".into()),
+            pause_reason_raw: Some("provider_session_force_detached".into()),
+            payload_json: Some(r#"{"event_kind_raw":"escalation.provider_late_frame_after_detach","tier_id":"primary_retry","tier_kind_raw":"same_backend_retry","trigger_raw":"contract_output_failure","digest_version":"escalation_blocker_digest_v1","redacted_evidence_ref":"sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"}"#.into()),
+            redaction_version: Some("redaction_v1".into()),
+            created_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    rollback_tx.rollback().await.unwrap();
+
+    assert!(
+        agent_execution_runtime_facts::find_by_execution_id(&pool, agent_execution_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        escalation::find_events_by_ledger(&pool, "ledger-p058-late-frame")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut commit_tx = pool.begin().await.unwrap();
+    let meta = escalation::find_execution_metadata_for_agent_tx(
+        &mut commit_tx,
+        &agent_execution_id.to_string(),
+    )
+    .await
+    .unwrap()
+    .expect("escalation metadata must be visible inside the commit transaction");
+    assert_eq!(meta.escalation_ledger_id, "ledger-p058-late-frame");
+    agent_execution_runtime_facts::upsert_tx(&mut commit_tx, &facts)
+        .await
+        .unwrap();
+    escalation::insert_event_tx(
+        &mut commit_tx,
+        &EscalationEvent {
+            id: "p058-late-frame-commit".into(),
+            escalation_ledger_id: "ledger-p058-late-frame".into(),
+            event_kind_raw: "escalation.provider_late_frame_after_detach".into(),
+            tier_id: Some(meta.tier_id),
+            tier_kind_raw: Some(meta.tier_kind_raw),
+            trigger_raw: meta.trigger_raw,
+            pause_reason_raw: Some("provider_session_force_detached".into()),
+            payload_json: Some(r#"{"event_kind_raw":"escalation.provider_late_frame_after_detach","tier_id":"primary_retry","tier_kind_raw":"same_backend_retry","trigger_raw":"contract_output_failure","digest_version":"escalation_blocker_digest_v1","redacted_evidence_ref":"sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"}"#.into()),
+            redaction_version: Some("redaction_v1".into()),
+            created_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    commit_tx.commit().await.unwrap();
+
+    let events = escalation::find_events_by_ledger(&pool, "ledger-p058-late-frame")
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].event_kind_raw,
+        "escalation.provider_late_frame_after_detach"
+    );
+    assert_eq!(
+        db::metrics::get_counter("escalation_provider_late_frame_after_detach_total"),
+        before_late_frame + 2,
+        "metrics emit when the authoritative event is written"
+    );
+    assert_eq!(
+        db::metrics::get_counter("escalation_pause_total:provider_session_force_detached"),
+        before_pause + 2,
+        "pause metric is labeled by durable pause reason"
+    );
 }
 
 #[tokio::test]

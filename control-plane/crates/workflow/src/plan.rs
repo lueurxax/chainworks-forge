@@ -130,6 +130,16 @@ pub struct EscalationPolicySnapshot {
     pub tiers: Vec<EscalationTierSnapshot>,
     /// SHA-256 of the canonical JSON of the source policy at compile time.
     pub policy_hash: String,
+    /// Blocker digest algorithm version frozen at compile time (e.g. "escalation_blocker_digest_v1").
+    /// Frozen here so digest computation uses the same algorithm version as when the run was planned,
+    /// even if future versions ship after the run starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest_version: Option<String>,
+    /// Frozen rollout override state at compile time. None means policy is governed by
+    /// `enabled_default` only (Phase 0-1). Phase 2+ runtime_policy_overrides populate this field
+    /// when the kill-switch or in_flight_toggle_behavior is set at plan compile time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_override_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

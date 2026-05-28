@@ -1372,9 +1372,9 @@ Important:
 
 ### `proposal-058|p058`
 
-Regression gate for ACP provider failure classification, session artifact ownership, and escalation schema (Phase 0-1 foundation).
+Regression gate for ACP provider failure classification, session artifact ownership, and P058 configurable escalation chain proof.
 
-The original ACP-classification proposal has been implemented and retired; the gate name remains `proposal-058` because Rust test targets and the historical proof lane use that identifier. This gate also covers the P058 configurable escalation chains Phase 0-1 schema and readback layer.
+The original ACP-classification proposal has been implemented and retired; the gate name remains `proposal-058` because Rust test targets and the historical proof lane use that identifier. This gate also covers the P058 configurable escalation chains schema, readback, metrics inventory, and owned tier-selection behavior.
 
 Scope:
 
@@ -1393,6 +1393,12 @@ Scope:
 - pause reason vocabulary coverage (all 13 catalog entries) and unknown-value round-trip
 - malformed payload_json rejection at repository layer
 - policy compile validation: `EscalationPolicyYaml` parser, deny_unknown_fields, backend_profile resolution, hash freezing into RunPlan
+- ledger/agent-execution/metadata commit inside the engine-owned start transaction (`proposal_058_claim_start`), including insert-or-ignore idempotency for the chain row
+- tier selection writes (`agent_execution_runtime_facts.would_select_*`) populated from the frozen `RunPlan` policy at agent-execution completion (`engine/src/shadow_escalation.rs`)
+- durable scheduler readback fields derived from redacted `escalation_events` (`waiting_retry_after_until`, `escalation_trace_json_redacted`, `external_acknowledgement_ref`, `feature_flag_state`, and per-attempt `digest_inputs`)
+- governed macOS read-surface components compile and are covered by focused Swift tests (`EscalationStatusCapsule`, `EscalationBannerStack`, `EscalationLineageView`, `EscalationPauseCard`, `EscalationTraceTimeline`, `DriftReviewSheet`, and read-only trace pasteboard copy)
+- full P058 metric inventory declaration plus production emission from ledger/event writes for the metrics backed by durable escalation state
+- idempotency-key uniqueness enforced by migration `065_p058_escalation_idempotency.sql` (one chain per `run_id`/`stage_id`/`agent_id`/`policy_id`; one execution-metadata row per `ledger_id`/`tier_id`/`tier_attempt_index`)
 
 Use when:
 
@@ -1406,7 +1412,7 @@ Use when:
 
 Host policy:
 
-- local Rust toolchain required
+- local Rust and macOS Swift test toolchains required
 - no live provider account, Xcode, simulator, daemon process, UI target, network, or real quota exhaustion required
 
 Command:
@@ -1779,65 +1785,6 @@ Important:
 - typed operator overrides are separate from raw report files, require operator capability, write command journal evidence, expire at `expires_at_stage`, and remain visible in readback after expiry
 - the gate fails closed if canonical status normalization, active-index SQLite ownership, stale export rebuild, raw artifact fallback denial, degraded policy, typed overrides, or GraphQL/MCP readback parity evidence is missing
 
-### `proposal-058|p058`
-
-Regression gate for ACP provider failure classification, session artifact ownership, and escalation schema (Phase 0-1 foundation).
-
-The original ACP-classification proposal has been implemented and retired; the gate name remains `proposal-058` because Rust test targets and the historical proof lane use that identifier. This gate also covers the P058 configurable escalation chains Phase 0-1 schema and readback layer.
-
-Scope:
-
-- typed `AgentFailureKind`, `AgentOutputSettlement`, runtime facts, and operator action hints
-- typed ACP/P037/P045/P051/P057 failure-observation classification matrix coverage
-- runtime failure redaction fixtures and P045 recovery-action mapping from P058 runtime facts
-- durable `agent_execution_runtime_facts` read/write behavior
-- artifact source-generation claims, including `superseded_pending_retry`
-- `InvokeAgent` claim/start ownership: generic work-queue claim skips `InvokeAgent`, while the engine-owned start transaction pre-creates exactly one `agent_executions` row and matching source-generation claim
-- retry enqueue-to-claim late-output rejection and source-generation CAS behavior
-- GraphQL/MCP runtime-facts parity and artifact source provenance
-- no-secret redacted runtime failure readback
-- escalation_policy_v1 schema: `EscalationTierKind`, `EscalationPauseReason`, `EscalationTrigger` domain types
-- escalation ledger, execution metadata, and event journal insert/read round-trips
-- `redaction_version` required at insert time for every escalation event
-- pause reason vocabulary coverage (all 13 catalog entries) and unknown-value round-trip
-- malformed payload_json rejection at repository layer
-- policy compile validation: `EscalationPolicyYaml` parser, deny_unknown_fields, backend_profile resolution, hash freezing into RunPlan
-
-Use when:
-
-- changing ACP provider/transport error classification
-- changing executor output validation settlement or degraded output behavior
-- changing session reuse, retry supersession, or late-output handling
-- changing artifact active-index source provenance
-- changing GraphQL or MCP execution truth readback
-- changing escalation domain types, repository layer, or GraphQL escalation readback
-- changing escalation_policy_v1 YAML parsing, compile validation, or RunPlan policy snapshot
-
-Host policy:
-
-- local Rust toolchain required
-- no live provider account, Xcode, simulator, daemon process, UI target, network, or real quota exhaustion required
-
-Command:
-
-```bash
-./scripts/test-gate.sh proposal-058
-```
-
-Prerequisite posture:
-
-- Same-tree dependency evidence: P058 consumes P037 timeout semantics, P045 recovery/retry semantics, P051 Xcode MCP observations, and canonical artifact contracts.
-- The focused P058 gate uses fixture/fake transport coverage for those consumed seams rather than requiring live provider, live Xcode, or UI evidence.
-
-Important:
-
-- `p058` is accepted as an alias
-- runtime facts are durable typed execution truth, not log parsing
-- `InvokeAgent` provider startup must use the pre-created execution identity from the claim/start DTO; creating a second execution row after the claim boundary is a gate failure
-- P058 claim/start tests must run; compiling them with `--no-run` is not sufficient proof
-- DB claim-start and MCP parity are executed single-job in gate-owned target directories so stale shared `target/` artifacts cannot satisfy or block the proof
-- `ignored_late_outputs` is output settlement truth, not an `AgentFailureKind`
-- stale output from `closed`, `superseded`, or `superseded_pending_retry` claims must never update active artifact truth
 - the gate fails closed if runtime facts, source-generation claims, pending retry supersession, artifact provenance, GraphQL/MCP runtime-facts parity, or escalation schema evidence is missing
 - escalation events must supply a `redaction_version` stamp; insert without one must fail
 

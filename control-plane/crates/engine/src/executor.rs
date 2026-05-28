@@ -23,9 +23,9 @@ use acp::AcpRuntimeManager;
 use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
     agent_execution_runtime_receipts, agent_executions, agent_retry_budget_ledger,
-    artifact_contracts, artifacts, code_writer_completion_receipts, evidence_spool_refs, ideas,
-    legacy_discovery_overrides, projections, rollout_contract_checks, scheduler, sessions, stages,
-    storage_health, validation, work_items, workflow_conflicts,
+    artifact_contracts, artifacts, code_writer_completion_receipts, escalation as escalation_repo,
+    evidence_spool_refs, ideas, legacy_discovery_overrides, projections, rollout_contract_checks,
+    scheduler, sessions, stages, storage_health, validation, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::{WriteLane, WriteResult};
@@ -55,6 +55,7 @@ use domain::discovery::{
     DISCOVERY_DIAGNOSTICS_V1_SCHEMA_VERSION,
 };
 use domain::error_sanitizer::sanitize_error_for_storage;
+use domain::escalation::EscalationEvent;
 use domain::ids::RunId;
 use domain::provider::ProviderFamily;
 use domain::retry_authority::AdvanceRunPayloadV1;
@@ -290,6 +291,8 @@ struct DeclaredContractImportResult {
     validation_summary: Option<TaskValidationSummary>,
     final_agent_status: AgentStatus,
     degraded_outputs_satisfy_stage: bool,
+    /// P058 Phase 1b: failure kind from runtime facts for shadow escalation write.
+    failure_kind: Option<AgentFailureKind>,
 }
 
 #[derive(Debug)]
@@ -322,6 +325,178 @@ fn invoke_agent_start_capacity_from_domain(
             .map(|(provider, cap)| (provider.to_string(), *cap))
             .collect(),
     }
+}
+
+/// P058 Phase 1: Resolve the applicable escalation policy for an agent execution and ensure the
+/// escalation_ledger row exists for this chain. Returns (policy_id, policy_hash, ledger_id,
+/// first_tier_id, first_tier_kind_raw) when a policy applies, or None when no policy matches.
+///
+/// Uses the frozen snapshot exclusively — no YAML fallback — to enforce the frozen-snapshot
+/// invariant (P058-SEC-003). Returns Ok(None) when no frozen snapshot is available or when no
+/// policy applies to this agent. Errors are fatal and propagate to the caller: a DB failure,
+/// malformed snapshot, or policy init error must NOT silently start an agent_execution with null
+/// escalation fields (fail-closed per proposal §architecture.policy_schema strictness).
+/// Policy matching uses `enabled_default` only (Phase 1); Phase 2+ adds runtime_policy_overrides.
+/// Tracking: P058-DEFER-001 — wire runtime_policy_overrides into resolve_policy_for_agent when
+/// Phase 2 scheduler behavior (trigger classification, in_flight_toggle_behavior, kill-switch) lands.
+///
+/// `backend_profile_id_override` must come from the InvokeAgent payload (the actual invoked
+/// agent's profile). When present it takes precedence over the stage-owner binding so that
+/// non-owner tasks, retries, and mediation invokes are attributed to the correct policy.
+/// (HIGH-001 fix: reading only from stage owner bypassed backend_profile-bound policies for
+/// any task whose runtime agent differed from the stage owner.)
+///
+/// Pure resolution — no database writes. Returns the ledger candidate (with frozen policy
+/// data) and the first-tier identity, or None if no policy matches. Callers must commit
+/// the ledger, agent_execution, and execution_metadata in a single transaction using
+/// `escalation_repo::insert_or_ignore_ledger_tx` (proposal §architecture.scheduler_transaction).
+async fn resolve_escalation_chain_candidate(
+    pool: &SqlitePool,
+    run_id: RunId,
+    stage_id: &str,
+    agent_id: &str,
+    backend_profile_id_override: Option<&str>,
+) -> Result<Option<(domain::escalation::EscalationLedger, String, String)>> {
+    let Some(run) = db::repos::runs::find_by_id(pool, run_id).await? else {
+        return Ok(None);
+    };
+    let Some(plan) = crate::command_handler::compile_run_plan_from_snapshot(&run)? else {
+        return Ok(None);
+    };
+    if plan.escalation_policies.is_empty() {
+        return Ok(None);
+    }
+
+    // Prefer the payload-supplied backend_profile_id (the actual invoked agent's profile)
+    // over the stage-owner's profile. For non-owner tasks, retries, dynamic reviewers, and
+    // mediation invokes the invoked agent may use a different profile than the stage owner,
+    // and a policy bound to that profile must still be resolved correctly (HIGH-001).
+    let backend_profile_id: Option<String> =
+        backend_profile_id_override.map(String::from).or_else(|| {
+            plan.states
+                .get(stage_id)
+                .and_then(|s| s.owner.backend_profile_id.clone())
+        });
+
+    let Some(resolved) = workflow::escalation_policy::resolve_policy_for_agent(
+        &plan.escalation_policies,
+        stage_id,
+        agent_id,
+        backend_profile_id.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(policy_snapshot) = plan
+        .escalation_policies
+        .iter()
+        .find(|policy| policy.policy_id == resolved.policy_id)
+    else {
+        return Err(anyhow::anyhow!(
+            "escalation_policy_resolution_internal_error: resolved policy {} is absent from frozen plan",
+            resolved.policy_id
+        ));
+    };
+
+    let existing_ledger = escalation_repo::find_ledger_by_chain_key(
+        pool,
+        run_id,
+        stage_id,
+        agent_id,
+        &resolved.policy_id,
+    )
+    .await?;
+    let (resolved_tier_id, resolved_tier_kind_raw) = if let Some(existing) = &existing_ledger {
+        if existing.policy_hash == resolved.policy_hash {
+            if let Some(current_tier_id) = existing.current_tier_id.as_deref() {
+                let Some(current_tier) = policy_snapshot
+                    .tiers
+                    .iter()
+                    .find(|tier| tier.tier_id == current_tier_id)
+                else {
+                    return Err(anyhow::anyhow!(
+                        "escalation_policy_drift: existing ledger {} current_tier_id={} \
+                         is not present in frozen policy {}",
+                        existing.id,
+                        current_tier_id,
+                        resolved.policy_id
+                    ));
+                };
+                (current_tier.tier_id.clone(), current_tier.kind.clone())
+            } else {
+                (
+                    resolved.first_tier_id.clone(),
+                    resolved.first_tier_kind_raw.clone(),
+                )
+            }
+        } else {
+            (
+                resolved.first_tier_id.clone(),
+                resolved.first_tier_kind_raw.clone(),
+            )
+        }
+    } else {
+        (
+            resolved.first_tier_id.clone(),
+            resolved.first_tier_kind_raw.clone(),
+        )
+    };
+
+    let now = chrono::Utc::now();
+    let ledger_candidate = domain::escalation::EscalationLedger {
+        id: uuid::Uuid::new_v4().to_string(),
+        run_id,
+        stage_id: stage_id.to_string(),
+        agent_id: agent_id.to_string(),
+        policy_id: resolved.policy_id.clone(),
+        policy_hash: resolved.policy_hash.clone(),
+        status_raw: "active".to_string(),
+        current_tier_id: Some(resolved_tier_id.clone()),
+        current_tier_kind_raw: Some(resolved_tier_kind_raw.clone()),
+        chain_attempt_index: 0,
+        trigger_raw: None,
+        pause_reason_raw: None,
+        operator_action_hint: None,
+        runbook_anchor: None,
+        created_at: now,
+        updated_at: now,
+    };
+
+    Ok(Some((
+        ledger_candidate,
+        resolved_tier_id,
+        resolved_tier_kind_raw,
+    )))
+}
+
+/// Non-atomic wrapper retained for unit tests. Runtime paths use the
+/// atomic call sites that commit ledger + agent_execution + metadata together.
+#[cfg(test)]
+async fn resolve_and_init_escalation_chain(
+    pool: &SqlitePool,
+    run_id: RunId,
+    stage_id: &str,
+    agent_id: &str,
+    backend_profile_id_override: Option<&str>,
+) -> Result<Option<(String, String, String, String, String)>> {
+    let Some((ledger_candidate, tier_id, tier_kind_raw)) = resolve_escalation_chain_candidate(
+        pool,
+        run_id,
+        stage_id,
+        agent_id,
+        backend_profile_id_override,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let ledger_id = escalation_repo::insert_or_ignore_ledger(pool, &ledger_candidate).await?;
+    Ok(Some((
+        ledger_candidate.policy_id,
+        ledger_candidate.policy_hash,
+        ledger_id,
+        tier_id,
+        tier_kind_raw,
+    )))
 }
 
 pub async fn claim_next_invoke_agent_with_start(
@@ -447,6 +622,15 @@ async fn invoke_item_has_start_capacity(
     }
     let provider_family =
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
+    if agent_retry_budget_ledger::has_active_provider_quota_wait(
+        pool,
+        &provider_family,
+        chrono::Utc::now(),
+    )
+    .await?
+    {
+        return Ok(false);
+    }
 
     let running_status = AgentStatus::Running.to_string();
     let total_active: i64 = sqlx::query_scalar(
@@ -700,6 +884,13 @@ async fn claim_invoke_agent_work_item_with_start(
         .and_then(|value| value.as_str())
         .unwrap_or(&stage_id)
         .to_string();
+    // Extract the actual invoked agent's backend_profile_id from the payload (HIGH-001).
+    // This is the runtime agent's profile and may differ from the stage owner's profile
+    // for non-owner tasks, retries, dynamic reviewers, or mediation invokes.
+    let payload_backend_profile_id = payload
+        .get("backend_profile_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let now = chrono::Utc::now();
     let agent_execution_id = domain::ids::AgentExecutionId::new();
     let session_generation_id =
@@ -714,8 +905,124 @@ async fn claim_invoke_agent_work_item_with_start(
         owner_execution_lineage_id: &owner_execution_lineage_id,
     });
 
-    agent_executions::insert(
+    // P058 Phase 1: resolve escalation chain, then commit ledger + agent_execution +
+    // execution_metadata atomically in one SQLite transaction
+    // (proposal §architecture.scheduler_transaction).
+    let esc_candidate = match resolve_escalation_chain_candidate(
         pool,
+        run_id,
+        &stage_id,
+        &agent_id,
+        payload_backend_profile_id.as_deref(),
+    )
+    .await
+    {
+        Ok(opt) => opt,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                    "P058 escalation chain resolution failed for run={run_id} stage={stage_id}: {e}; \
+                     agent execution blocked (fail-closed); resolve snapshot or policy error before retrying"
+                ));
+        }
+    };
+
+    // Build artifact_claim_key and claimed *before* inserting any durable rows so that the
+    // work_items CAS can be acquired first. A competing claimer that wins the CAS on the same
+    // item will find rows_affected=0 here and return Ok(None) without leaving orphan Running
+    // agent_execution or escalation_execution_metadata rows that would corrupt capacity/quota.
+    let artifact_claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
+        run_id,
+        owner_kind: domain::mediation::OwnerKind::StageExecution,
+        owner_id: stage_execution_id.to_string(),
+        stage_execution_id: Some(stage_execution_id),
+        agent_execution_id,
+        source_work_item_id: item.id.clone(),
+    };
+    let claimed = ClaimedInvokeAgentStart {
+        work_item_id: item.id.clone(),
+        source_work_item_id: item.id.clone(),
+        run_id,
+        stage_execution_id,
+        agent_execution_id,
+        session_generation_id,
+        artifact_claim_key,
+    };
+    let mut claimed_payload = serde_json::json!({
+        "agent_execution_id": claimed.agent_execution_id.to_string(),
+        "artifact_claim_key": claimed.artifact_claim_key,
+    });
+    if let Some(sgid) = claimed.session_generation_id.as_deref() {
+        claimed_payload["session_generation_id"] = serde_json::json!(sgid);
+        claimed_payload["session_policy_decision"] = serde_json::json!({
+            "generation": {"id": sgid}
+        });
+    }
+    payload["p058_claimed"] = claimed_payload;
+    let payload_json = serde_json::to_string(&payload)?;
+    // Atomic: CAS work_items Pending→Running AND agent_execution+escalation inserts in ONE
+    // begin_immediate_transaction. If the CAS misses, the tx drops without commit and no
+    // durable rows are written — preventing orphan Running work_items with no agent_execution.
+    let now_str = now.to_rfc3339();
+    let mut tx = writer
+        .begin_immediate_transaction(
+            class_a_operation(
+                "executor.claim_invoke_agent_work_item_with_start",
+                WriteLane::CriticalBarrier,
+                format!(
+                    "executor.claim_invoke_agent_work_item_with_start:{}",
+                    item.id
+                ),
+            ),
+            "executor.claim_invoke_agent_work_item_with_start",
+        )
+        .await?;
+    let cas_updated = sqlx::query(
+        "UPDATE work_items SET payload_json = ?1, status = ?2, started_at = ?3, \
+         failed_at = NULL, last_error = NULL, attempt_count = attempt_count + 1 \
+         WHERE id = ?4 AND status = ?5",
+    )
+    .bind(&payload_json)
+    .bind(WorkItemStatus::Running.to_string())
+    .bind(&now_str)
+    .bind(&item.id)
+    .bind(WorkItemStatus::Pending.to_string())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if cas_updated == 0 {
+        // CAS miss — another claimer won; tx drops without commit, no durable rows written.
+        return Ok(None);
+    }
+
+    let (esc_policy_id, esc_policy_hash, esc_ledger_id, esc_tier_id, esc_tier_kind_raw) = {
+        if let Some(ref lc) = esc_candidate {
+            match escalation_repo::insert_or_ignore_ledger_tx(&mut tx, &lc.0).await {
+                Ok(lid) => (
+                    Some(lc.0.policy_id.clone()),
+                    Some(lc.0.policy_hash.clone()),
+                    Some(lid),
+                    Some(lc.1.clone()),
+                    Some(lc.2.clone()),
+                ),
+                Err(e) => {
+                    if let Some(drift) = e.downcast_ref::<escalation_repo::EscalationPolicyDrift>()
+                    {
+                        let ledger_id = drift.ledger_id.clone();
+                        // tx rolls back on drop (CAS is rolled back — work item stays Pending).
+                        // Persist the drift pause on the existing ledger row outside the tx.
+                        escalation_repo::open_drift_pause(pool, &ledger_id).await?;
+                        return Ok(None);
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            (None, None, None, None, None)
+        }
+    };
+
+    agent_executions::insert_tx(
+        &mut tx,
         &domain::agent::AgentExecution {
             id: agent_execution_id,
             stage_execution_id: Some(stage_execution_id),
@@ -726,13 +1033,16 @@ async fn claim_invoke_agent_work_item_with_start(
             started_at: now,
             completed_at: None,
             owner_execution_lineage_id: Some(owner_execution_lineage_id),
-            session_lineage_id: session_generation_id.clone(),
-            session_generation_id: session_generation_id.clone(),
+            session_lineage_id: claimed.session_generation_id.clone(),
+            session_generation_id: claimed.session_generation_id.clone(),
             rehydrated_from_checkpoint_artifact_id: None,
             invocation_owner_key: Some(invocation_owner_key),
             session_reuse_scope,
             session_family_id,
-            session_reuse_disposition: session_generation_id.as_ref().map(|_| "fresh".into()),
+            session_reuse_disposition: claimed
+                .session_generation_id
+                .as_ref()
+                .map(|_| "fresh".into()),
             session_reset_reason: None,
             backend_profile_id: None,
             requested_mcp_extensions_json: None,
@@ -755,17 +1065,44 @@ async fn claim_invoke_agent_work_item_with_start(
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
-            escalation_policy_id: None,
-            escalation_policy_hash: None,
-            escalation_tier_id: None,
-            escalation_tier_kind_raw: None,
+            escalation_policy_id: esc_policy_id.clone(),
+            escalation_policy_hash: esc_policy_hash.clone(),
+            escalation_tier_id: esc_tier_id.clone(),
+            escalation_tier_kind_raw: esc_tier_kind_raw.clone(),
             escalation_trigger_raw: None,
             escalation_digest_version: None,
-            escalation_ledger_id: None,
+            escalation_ledger_id: esc_ledger_id.clone(),
         },
     )
     .await?;
 
+    if let (Some(lid), Some(tid), Some(tkind)) = (&esc_ledger_id, &esc_tier_id, &esc_tier_kind_raw)
+    {
+        let tier_attempt_index =
+            escalation_repo::next_tier_attempt_index_tx(&mut tx, lid, tid).await?;
+        escalation_repo::insert_execution_metadata_tx(
+            &mut tx,
+            &domain::escalation::EscalationExecutionMetadata {
+                agent_execution_id,
+                escalation_ledger_id: lid.clone(),
+                tier_id: tid.clone(),
+                tier_kind_raw: tkind.clone(),
+                tier_attempt_index,
+                trigger_raw: None,
+                digest_version: None,
+                capacity_probe_counter: 0,
+                created_at: now,
+                updated_at: now,
+                would_select_tier_id: None,
+                would_select_trigger_raw: None,
+                would_select_decision_json: None,
+            },
+        )
+        .await?;
+    }
+
+    // runtime_facts and artifact claims are included in the same transaction so that a
+    // post-commit failure cannot strand a Running work item with no provider processing.
     let mut facts =
         domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
     facts.session_reuse_reason = Some("legacy_unknown".into());
@@ -785,21 +1122,13 @@ async fn claim_invoke_agent_work_item_with_start(
             .to_string(),
         );
     }
-    agent_execution_runtime_facts::upsert(pool, &facts).await?;
+    agent_execution_runtime_facts::upsert_tx(&mut tx, &facts).await?;
 
-    let artifact_claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
-        run_id,
-        owner_kind: domain::mediation::OwnerKind::StageExecution,
-        owner_id: stage_execution_id.to_string(),
-        stage_execution_id: Some(stage_execution_id),
-        agent_execution_id,
-        source_work_item_id: item.id.clone(),
-    };
-    artifact_contracts::insert_source_generation_claim(
-        pool,
+    artifact_contracts::insert_source_generation_claim_tx(
+        &mut tx,
         domain::artifact_contracts::ArtifactSourceGenerationClaim {
-            key: artifact_claim_key.clone(),
-            current_session_generation_id: session_generation_id.clone(),
+            key: claimed.artifact_claim_key.clone(),
+            current_session_generation_id: claimed.session_generation_id.clone(),
             claim_state: domain::agent::ArtifactSourceClaimState::Active,
             superseding_work_item_id: None,
             superseded_by_agent_execution_id: None,
@@ -811,37 +1140,15 @@ async fn claim_invoke_agent_work_item_with_start(
         },
     )
     .await?;
-    artifact_contracts::finalize_pending_retry_supersession_for_work_item(
-        pool,
+    artifact_contracts::finalize_pending_retry_supersession_tx(
+        &mut tx,
         &item.id,
-        agent_execution_id,
+        claimed.agent_execution_id,
     )
     .await?;
 
-    let claimed = ClaimedInvokeAgentStart {
-        work_item_id: item.id.clone(),
-        source_work_item_id: item.id.clone(),
-        run_id,
-        stage_execution_id,
-        agent_execution_id,
-        session_generation_id,
-        artifact_claim_key,
-    };
-    let mut claimed_payload = serde_json::json!({
-        "agent_execution_id": claimed.agent_execution_id.to_string(),
-        "artifact_claim_key": claimed.artifact_claim_key,
-    });
-    if let Some(session_generation_id) = claimed.session_generation_id.as_deref() {
-        claimed_payload["session_generation_id"] = serde_json::json!(session_generation_id);
-        claimed_payload["session_policy_decision"] = serde_json::json!({
-            "generation": {
-                "id": session_generation_id
-            }
-        });
-    }
-    payload["p058_claimed"] = claimed_payload;
-    let payload_json = serde_json::to_string(&payload)?;
-    update_invoke_work_item_claimed_payload_and_running(writer, &item.id, &payload_json).await?;
+    tx.commit().await?;
+
     let mut running_item = item;
     running_item.status = WorkItemStatus::Running;
     running_item.payload_json = payload_json;
@@ -2468,14 +2775,20 @@ fn session_scope_can_remain_live_after_settlement(scope: &str) -> bool {
     scope != "none"
 }
 
+/// Returns true when the ACP session should be kept alive after the initial prompt completes.
+///
+/// A session stays live when an explicit reuse scope is configured, or when an output contract
+/// exists and the repair path may need to reuse the just-finished generation. Scope `none` still
+/// suppresses cross-invocation reuse; transient sessions are closed after settlement/repair by
+/// `close_transient_invocation_session_after_settlement`.
 fn should_keep_invocation_session_alive(
     policy_decision: Option<&SessionPolicyDecision>,
-    declared_outputs_present: bool,
+    has_output_contract: bool,
 ) -> bool {
     let Some(decision) = policy_decision else {
         return false;
     };
-    declared_outputs_present
+    has_output_contract
         || session_scope_can_remain_live_after_settlement(&decision.lineage.session_reuse_scope)
 }
 
@@ -3221,12 +3534,33 @@ fn redact_runtime_message(message: &str) -> String {
     let tokens: Vec<&str> = scrubbed.split_whitespace().collect();
     let mut redacted = Vec::with_capacity(tokens.len());
     let mut redact_next = false;
+    // Authorization: and Proxy-Authorization: introduce a scheme token (Bearer/Basic/…)
+    // followed by the credential token.  This two-step flag tracks the scheme position so
+    // the credential token two steps ahead is also redacted.
+    let mut auth_scheme_pending = false;
     for token in tokens {
         let lower = token.to_ascii_lowercase();
         let normalized = lower.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';'));
+
         if redact_next {
             redacted.push("[redacted]".to_string());
             redact_next = false;
+            continue;
+        }
+
+        // Second step of Authorization:/Proxy-Authorization: sequence: this token is the
+        // auth scheme (Bearer, Basic, Digest, …) or a merged scheme+value.
+        if auth_scheme_pending {
+            auth_scheme_pending = false;
+            let scheme = normalized.trim_end_matches(':');
+            if matches!(scheme, "bearer" | "basic" | "digest" | "ntlm") {
+                // Standalone scheme; credential is the next token.
+                redacted.push(token.to_string());
+                redact_next = true;
+            } else {
+                // Scheme and credential merged (e.g. "Basicabc123") or unrecognised form.
+                redacted.push("[redacted]".to_string());
+            }
             continue;
         }
 
@@ -3236,9 +3570,29 @@ fn redact_runtime_message(message: &str) -> String {
             continue;
         }
 
+        let normalized_no_colon = normalized.trim_end_matches(':');
+
+        // HTTP auth header names: next token is the scheme, token after that is the credential.
+        if matches!(normalized_no_colon, "authorization" | "proxy-authorization") {
+            redacted.push(token.to_string());
+            auth_scheme_pending = true;
+            continue;
+        }
+
+        // API key headers and well-known token keywords where the next token is directly the
+        // credential (no intervening scheme token).
         if matches!(
-            normalized.trim_end_matches(':'),
-            "token" | "api_key" | "apikey" | "secret" | "password"
+            normalized_no_colon,
+            "token"
+                | "api_key"
+                | "apikey"
+                | "secret"
+                | "password"
+                | "x-api-key"
+                | "api-key"
+                | "access_token"
+                | "refresh_token"
+                | "bearer_token"
         ) {
             redacted.push(token.to_string());
             redact_next = true;
@@ -3246,8 +3600,15 @@ fn redact_runtime_message(message: &str) -> String {
         }
 
         if normalized.ends_with("bearer") || normalized.contains("authorization:bearer") {
-            redacted.push(token.to_string());
-            redact_next = true;
+            if normalized.ends_with("bearer") {
+                // Standalone scheme token; credential is the next token.
+                redacted.push(token.to_string());
+                redact_next = true;
+            } else {
+                // Credential merged into this token (e.g. "Authorization:Bearertoken123");
+                // redact the whole token rather than leaking the embedded credential.
+                redacted.push("[redacted]".to_string());
+            }
             continue;
         }
 
@@ -3282,10 +3643,12 @@ fn redact_sensitive_assignment(token: &str) -> Option<String> {
     let key = &lower[..separator];
     let sensitive = key.contains("token")
         || key.contains("api_key")
+        || key.contains("api-key") // hyphenated form: X-API-Key, api-key
         || key.contains("apikey")
         || key.contains("secret")
         || key.contains("password")
-        || key.contains("authorization");
+        || key.contains("authorization")
+        || key.contains("bearer"); // bearer_token=, bearer: patterns
     if !sensitive {
         return None;
     }
@@ -4820,86 +5183,197 @@ impl BackgroundExecutor {
                 }
 
                 if preclaimed_start.is_none() {
-                    let agent_exec = domain::agent::AgentExecution {
-                        id: agent_exec_id,
-                        stage_execution_id,
-                        agent_id: agent_id.clone(),
-                        provider: provider.clone(),
-                        model: model.clone(),
-                        status: domain::agent::AgentStatus::Running,
-                        started_at: now,
-                        completed_at: None,
-                        owner_execution_lineage_id: Some(owner_execution_lineage_id.clone()),
-                        session_lineage_id: policy_decision
-                            .as_ref()
-                            .map(|decision| decision.lineage.id.clone()),
-                        session_generation_id: policy_decision
-                            .as_ref()
-                            .map(|decision| decision.generation.id.clone()),
-                        rehydrated_from_checkpoint_artifact_id: policy_decision.as_ref().and_then(
-                            |decision| {
-                                decision
-                                    .generation
-                                    .rehydrated_from_checkpoint_artifact_id
-                                    .clone()
-                            },
-                        ),
-                        invocation_owner_key: policy_decision
-                            .as_ref()
-                            .map(|decision| decision.generation.invocation_owner_key.clone()),
-                        session_reuse_scope: session_reuse_scope.clone(),
-                        session_family_id: session_family_id.clone(),
-                        session_reuse_disposition: policy_decision.as_ref().and_then(|decision| {
-                            serde_json::to_value(&decision.disposition)
-                                .ok()
-                                .and_then(|value| value.as_str().map(String::from))
-                        }),
-                        session_reset_reason: policy_decision
-                            .as_ref()
-                            .and_then(|decision| decision.session_reset_reason.clone()),
-                        backend_profile_id: backend_profile_id.clone(),
-                        requested_mcp_extensions_json: Some(requested_mcp_extensions_json.clone()),
-                        predicted_mcp_extensions_json: Some(predicted_mcp_extensions_json.clone()),
-                        predicted_mcp_runtime_ids_json: Some(
-                            predicted_mcp_runtime_ids_json.clone(),
-                        ),
-                        actual_mcp_extensions_json: None,
-                        actual_mcp_runtime_ids_json: None,
-                        denied_mcp_extensions_json: Some(denied_mcp_extensions_json.clone()),
-                        mcp_blocking_issues_json: Some(mcp_blocking_issues_json.clone()),
-                        actual_mcp_observation_json: None,
-                        actual_xcode_runtime_observation_json: None,
-                        mcp_session_startup_latency_ms: None,
-                        owner_kind: Some(owner_kind.clone()),
-                        // MF-PRE-ENABLE-003: For mediation-owned executions, owner_id
-                        // must come from the payload — never fall back to synthetic stage ID.
-                        owner_id: if is_mediation_owned {
-                            owner_id.clone()
-                        } else {
-                            owner_id
-                                .clone()
-                                .or_else(|| stage_execution_id.map(|id| id.to_string()))
-                        },
-                        lead_mediation_record_id: mediation_record_id.clone(),
-                        origin_stage_execution_id: origin_stage_execution_id.clone(),
-                        // P017 R4 / API-002: cost & transcript filled in by
-                        // update_attempt_attribution_tx after the provider
-                        // returns; insertion-time row holds None.
-                        total_cost_cents: None,
-                        input_tokens: None,
-                        output_tokens: None,
-                        cached_input_tokens: None,
-                        transcript_artifact_id: None,
-                        actual_toolchain_mapping_diagnostics_json: None,
-                        escalation_policy_id: None,
-                        escalation_policy_hash: None,
-                        escalation_tier_id: None,
-                        escalation_tier_kind_raw: None,
-                        escalation_trigger_raw: None,
-                        escalation_digest_version: None,
-                        escalation_ledger_id: None,
+                    // P058 MEDIUM-001: Non-preclaimed InvokeAgent executions must also carry
+                    // escalation attribution. Resolve the chain and commit ledger +
+                    // agent_execution + metadata atomically in one transaction
+                    // (proposal §architecture.scheduler_transaction).
+                    let np_esc_candidate = match resolve_escalation_chain_candidate(
+                        &self.pool,
+                        run_id,
+                        &stage_id,
+                        &agent_id,
+                        backend_profile_id.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "P058 escalation chain resolution failed (non-preclaimed) \
+                                     run={run_id} stage={stage_id}: {e}; \
+                                     agent execution blocked (fail-closed)"
+                            ));
+                        }
                     };
-                    agent_executions::insert(&self.pool, &agent_exec).await?;
+
+                    {
+                        let mut tx = self
+                            .begin_executor_transaction(
+                                "executor.invoke_agent_np_escalation_init",
+                                format!("executor.invoke_agent_np_escalation_init:{agent_exec_id}"),
+                            )
+                            .await?;
+
+                        let (np_esc_pid, np_esc_phash, np_esc_lid, np_esc_tid, np_esc_tkind) = {
+                            if let Some(ref lc) = np_esc_candidate {
+                                match escalation_repo::insert_or_ignore_ledger_tx(&mut tx, &lc.0)
+                                    .await
+                                {
+                                    Ok(lid) => (
+                                        Some(lc.0.policy_id.clone()),
+                                        Some(lc.0.policy_hash.clone()),
+                                        Some(lid),
+                                        Some(lc.1.clone()),
+                                        Some(lc.2.clone()),
+                                    ),
+                                    Err(e) => {
+                                        if let Some(drift) = e
+                                            .downcast_ref::<escalation_repo::EscalationPolicyDrift>(
+                                            )
+                                        {
+                                            let ledger_id = drift.ledger_id.clone();
+                                            // tx rolls back on drop; persist the drift pause outside the tx.
+                                            escalation_repo::open_drift_pause(
+                                                &self.pool, &ledger_id,
+                                            )
+                                            .await?;
+                                            return Err(anyhow::anyhow!(
+                                                "escalation_policy_drift pause opened on ledger_id={ledger_id} \
+                                                 for run_id={run_id} stage_id={stage_id}; \
+                                                 agent execution blocked pending operator acknowledgement"
+                                            ));
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            } else {
+                                (None, None, None, None, None)
+                            }
+                        };
+
+                        agent_executions::insert_tx(
+                            &mut tx,
+                            &domain::agent::AgentExecution {
+                                id: agent_exec_id,
+                                stage_execution_id,
+                                agent_id: agent_id.clone(),
+                                provider: provider.clone(),
+                                model: model.clone(),
+                                status: domain::agent::AgentStatus::Running,
+                                started_at: now,
+                                completed_at: None,
+                                owner_execution_lineage_id: Some(
+                                    owner_execution_lineage_id.clone(),
+                                ),
+                                session_lineage_id: policy_decision
+                                    .as_ref()
+                                    .map(|decision| decision.lineage.id.clone()),
+                                session_generation_id: policy_decision
+                                    .as_ref()
+                                    .map(|decision| decision.generation.id.clone()),
+                                rehydrated_from_checkpoint_artifact_id: policy_decision
+                                    .as_ref()
+                                    .and_then(|decision| {
+                                        decision
+                                            .generation
+                                            .rehydrated_from_checkpoint_artifact_id
+                                            .clone()
+                                    }),
+                                invocation_owner_key: policy_decision.as_ref().map(|decision| {
+                                    decision.generation.invocation_owner_key.clone()
+                                }),
+                                session_reuse_scope: session_reuse_scope.clone(),
+                                session_family_id: session_family_id.clone(),
+                                session_reuse_disposition: policy_decision.as_ref().and_then(
+                                    |decision| {
+                                        serde_json::to_value(&decision.disposition)
+                                            .ok()
+                                            .and_then(|value| value.as_str().map(String::from))
+                                    },
+                                ),
+                                session_reset_reason: policy_decision
+                                    .as_ref()
+                                    .and_then(|decision| decision.session_reset_reason.clone()),
+                                backend_profile_id: backend_profile_id.clone(),
+                                requested_mcp_extensions_json: Some(
+                                    requested_mcp_extensions_json.clone(),
+                                ),
+                                predicted_mcp_extensions_json: Some(
+                                    predicted_mcp_extensions_json.clone(),
+                                ),
+                                predicted_mcp_runtime_ids_json: Some(
+                                    predicted_mcp_runtime_ids_json.clone(),
+                                ),
+                                actual_mcp_extensions_json: None,
+                                actual_mcp_runtime_ids_json: None,
+                                denied_mcp_extensions_json: Some(
+                                    denied_mcp_extensions_json.clone(),
+                                ),
+                                mcp_blocking_issues_json: Some(mcp_blocking_issues_json.clone()),
+                                actual_mcp_observation_json: None,
+                                actual_xcode_runtime_observation_json: None,
+                                mcp_session_startup_latency_ms: None,
+                                owner_kind: Some(owner_kind.clone()),
+                                // MF-PRE-ENABLE-003: For mediation-owned executions, owner_id
+                                // must come from the payload — never fall back to synthetic stage ID.
+                                owner_id: if is_mediation_owned {
+                                    owner_id.clone()
+                                } else {
+                                    owner_id
+                                        .clone()
+                                        .or_else(|| stage_execution_id.map(|id| id.to_string()))
+                                },
+                                lead_mediation_record_id: mediation_record_id.clone(),
+                                origin_stage_execution_id: origin_stage_execution_id.clone(),
+                                // P017 R4 / API-002: cost & transcript filled in by
+                                // update_attempt_attribution_tx after the provider
+                                // returns; insertion-time row holds None.
+                                total_cost_cents: None,
+                                input_tokens: None,
+                                output_tokens: None,
+                                cached_input_tokens: None,
+                                transcript_artifact_id: None,
+                                actual_toolchain_mapping_diagnostics_json: None,
+                                escalation_policy_id: np_esc_pid,
+                                escalation_policy_hash: np_esc_phash,
+                                escalation_tier_id: np_esc_tid.clone(),
+                                escalation_tier_kind_raw: np_esc_tkind.clone(),
+                                escalation_trigger_raw: None,
+                                escalation_digest_version: None,
+                                escalation_ledger_id: np_esc_lid.clone(),
+                            },
+                        )
+                        .await?;
+
+                        if let (Some(lid), Some(tid), Some(tkind)) =
+                            (&np_esc_lid, &np_esc_tid, &np_esc_tkind)
+                        {
+                            let tier_attempt_index =
+                                escalation_repo::next_tier_attempt_index_tx(&mut tx, lid, tid)
+                                    .await?;
+                            escalation_repo::insert_execution_metadata_tx(
+                                &mut tx,
+                                &domain::escalation::EscalationExecutionMetadata {
+                                    agent_execution_id: agent_exec_id,
+                                    escalation_ledger_id: lid.clone(),
+                                    tier_id: tid.clone(),
+                                    tier_kind_raw: tkind.clone(),
+                                    tier_attempt_index,
+                                    trigger_raw: None,
+                                    digest_version: None,
+                                    capacity_probe_counter: 0,
+                                    created_at: now,
+                                    updated_at: now,
+                                    would_select_tier_id: None,
+                                    would_select_trigger_raw: None,
+                                    would_select_decision_json: None,
+                                },
+                            )
+                            .await?;
+                        }
+
+                        tx.commit().await?;
+                    }
                 }
 
                 // Reconcile pre-claimed agent execution with freshly evaluated session policy.
@@ -5430,6 +5904,16 @@ impl BackgroundExecutor {
                                 "Failed to persist ACP startup failure runtime facts"
                             );
                         }
+                        // P058 Phase 1b: best-effort shadow escalation write after ACP startup
+                        // failure. Classifies the trigger from the failure kind and records the
+                        // tier that would be selected next without changing execution behavior.
+                        crate::shadow_escalation::try_write_shadow_escalation(
+                            &self.pool,
+                            agent_exec_id,
+                            runtime_facts.failure_kind.as_ref(),
+                            completed_at,
+                        )
+                        .await;
                         if let Some(receipt) = acp::runtime_receipt_from_error(&error) {
                             match runtime_receipt_record_from_receipt(
                                 agent_exec_id,
@@ -7300,6 +7784,15 @@ impl BackgroundExecutor {
                 let validation_summary = import_result.validation_summary;
                 let final_agent_status = import_result.final_agent_status;
                 let _degraded_outputs_satisfy_stage = import_result.degraded_outputs_satisfy_stage;
+                // P058 Phase 1b: best-effort shadow escalation write after declared-output import.
+                // Captures contract_output_failure and stale_no_output triggers for shadow matching.
+                crate::shadow_escalation::try_write_shadow_escalation(
+                    &self.pool,
+                    agent_exec_id,
+                    import_result.failure_kind.as_ref(),
+                    completed_at,
+                )
+                .await;
                 if let Some(capture) = result.provider_session_store_capture.as_ref() {
                     let preserve_failure = final_agent_status == AgentStatus::Failed;
                     let archive_context = ProviderSessionStoreArchiveContext {
@@ -7850,6 +8343,8 @@ impl BackgroundExecutor {
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?;
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -7924,6 +8419,7 @@ impl BackgroundExecutor {
                         now,
                     )
                     .await?;
+                    db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?;
                     tx.commit().await?;
                     if let Some(artifact) = delivery_artifact {
                         let _ = self
@@ -8083,6 +8579,8 @@ impl BackgroundExecutor {
                     )
                     .await?;
                     work_items::enqueue_tx(&mut tx, &advance_run).await?;
+                    db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?;
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -8167,6 +8665,7 @@ impl BackgroundExecutor {
                         now,
                     )
                     .await?;
+                    db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?;
                     tx.commit().await?;
                     if let Some(artifact) = delivery_artifact {
                         let _ = self
@@ -8330,6 +8829,8 @@ impl BackgroundExecutor {
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?;
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -8404,6 +8905,7 @@ impl BackgroundExecutor {
                         now,
                     )
                     .await?;
+                    db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?;
                     tx.commit().await?;
                     if let Some(artifact) = delivery_artifact {
                         let _ = self
@@ -8610,6 +9112,8 @@ impl BackgroundExecutor {
                     )
                     .await?;
                     work_items::enqueue_tx(&mut tx, &advance_run).await?;
+                    db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?;
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -8708,6 +9212,7 @@ impl BackgroundExecutor {
                         now,
                     )
                     .await?;
+                    db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?;
                     tx.commit().await?;
                     if let Some(artifact) = delivery_artifact {
                         let _ = self
@@ -9128,6 +9633,68 @@ impl BackgroundExecutor {
                 runtime_receipt_record_from_receipt(agent_exec_id, runtime_receipt, completed_at)?;
             agent_execution_runtime_receipts::upsert_tx(&mut tx, &receipt_record).await?;
         }
+        if runtime_facts.output_settlement == AgentOutputSettlement::IgnoredLateOutputs
+            && runtime_facts.ignored_late_output_count > 0
+        {
+            if let Some(meta) = escalation_repo::find_execution_metadata_for_agent_tx(
+                &mut tx,
+                &agent_exec_id.to_string(),
+            )
+            .await?
+            {
+                let tier_id = meta.tier_id;
+                let tier_kind_raw = meta.tier_kind_raw;
+                let trigger_raw = meta.trigger_raw;
+                let digest_version = meta.digest_version;
+                let redacted_evidence_ref = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(agent_exec_id.to_string().as_bytes())
+                );
+                let mut payload = serde_json::Map::new();
+                payload.insert(
+                    "event_kind_raw".into(),
+                    serde_json::Value::String("escalation.provider_late_frame_after_detach".into()),
+                );
+                payload.insert("tier_id".into(), serde_json::Value::String(tier_id.clone()));
+                payload.insert(
+                    "tier_kind_raw".into(),
+                    serde_json::Value::String(tier_kind_raw.clone()),
+                );
+                if let Some(value) = trigger_raw.as_ref() {
+                    payload.insert(
+                        "trigger_raw".into(),
+                        serde_json::Value::String(value.clone()),
+                    );
+                }
+                if let Some(value) = digest_version.as_ref() {
+                    payload.insert(
+                        "digest_version".into(),
+                        serde_json::Value::String(value.clone()),
+                    );
+                }
+                payload.insert(
+                    "redacted_evidence_ref".into(),
+                    serde_json::Value::String(redacted_evidence_ref),
+                );
+                let payload_json = serde_json::Value::Object(payload).to_string();
+                escalation_repo::insert_event_tx(
+                    &mut tx,
+                    &EscalationEvent {
+                        id: format!("p058-late-frame-{}", uuid::Uuid::new_v4()),
+                        escalation_ledger_id: meta.escalation_ledger_id,
+                        event_kind_raw: "escalation.provider_late_frame_after_detach".into(),
+                        tier_id: Some(tier_id),
+                        tier_kind_raw: Some(tier_kind_raw),
+                        trigger_raw,
+                        pause_reason_raw: Some("provider_session_force_detached".into()),
+                        payload_json: Some(payload_json),
+                        redaction_version: Some("redaction_v1".into()),
+                        created_at: completed_at,
+                    },
+                )
+                .await?;
+            }
+        }
         agent_execution_runtime_facts::upsert_tx(&mut tx, &runtime_facts).await?;
         let invalidated_session_after_missing_outputs =
             invalidate_generation_after_missing_required_outputs_tx(
@@ -9162,6 +9729,7 @@ impl BackgroundExecutor {
             validation_summary,
             final_agent_status,
             degraded_outputs_satisfy_stage,
+            failure_kind: runtime_facts.failure_kind.clone(),
         })
     }
 
@@ -14069,6 +14637,10 @@ mod tests {
             "scope=none sessions without declared outputs do not need a post-prompt repair window"
         );
         assert!(
+            !should_keep_invocation_session_alive(None, true),
+            "without a policy session, keep_session_alive must always be false"
+        );
+        assert!(
             !should_reuse_existing_invocation_session(true, true),
             "Xcode shim sessions remain isolated across separate invocation claims"
         );
@@ -15237,6 +15809,13 @@ mod tests {
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
                 actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
             },
         )
         .await
@@ -15353,6 +15932,13 @@ mod tests {
                     cached_input_tokens: None,
                     transcript_artifact_id: None,
                     actual_toolchain_mapping_diagnostics_json: None,
+                    escalation_policy_id: None,
+                    escalation_policy_hash: None,
+                    escalation_tier_id: None,
+                    escalation_tier_kind_raw: None,
+                    escalation_trigger_raw: None,
+                    escalation_digest_version: None,
+                    escalation_ledger_id: None,
                 },
             )
             .await
@@ -16845,6 +17431,114 @@ mod tests {
             domain::discovery::ExpectedOutputRole::Machine
         ));
     }
+
+    // ── redact_runtime_message regression tests (SEC-HIGH-001) ─────────────
+
+    #[test]
+    fn redact_bearer_in_authorization_header() {
+        // Authorization: Bearer <token> — credential must be redacted, scheme preserved.
+        let out = redact_runtime_message("error: Authorization: Bearer sk-abc123def456");
+        assert!(out.contains("Authorization:"), "header name must be kept");
+        assert!(out.contains("Bearer"), "scheme must be kept");
+        assert!(
+            !out.contains("sk-abc123def456"),
+            "credential must be redacted"
+        );
+        assert!(out.contains("[redacted]"));
+    }
+
+    #[test]
+    fn redact_basic_auth_in_authorization_header() {
+        // Authorization: Basic <base64> — credential must be redacted.
+        let out = redact_runtime_message("request failed: Authorization: Basic dXNlcjpwYXNz");
+        assert!(
+            !out.contains("dXNlcjpwYXNz"),
+            "Basic credential must be redacted"
+        );
+        assert!(out.contains("[redacted]"));
+    }
+
+    #[test]
+    fn redact_basic_auth_merged_scheme_value() {
+        // Authorization: Basicdbase64value — merged form with no space.
+        let out = redact_runtime_message("error Authorization: Basicabc123def==");
+        assert!(
+            !out.contains("Basicabc123def=="),
+            "merged Basic credential must be redacted"
+        );
+        assert!(out.contains("[redacted]"));
+    }
+
+    #[test]
+    fn redact_x_api_key_header() {
+        // X-API-Key: <value> — credential must be redacted.
+        let out = redact_runtime_message("failed: X-API-Key: ak-live-abc123def456");
+        assert!(
+            !out.contains("ak-live-abc123def456"),
+            "X-API-Key value must be redacted"
+        );
+        assert!(out.contains("[redacted]"));
+    }
+
+    #[test]
+    fn redact_api_key_header() {
+        // API-Key: <value>
+        let out = redact_runtime_message("request error API-Key: somekeyvalue123");
+        assert!(
+            !out.contains("somekeyvalue123"),
+            "API-Key value must be redacted"
+        );
+        assert!(out.contains("[redacted]"));
+    }
+
+    #[test]
+    fn redact_inline_x_api_key_assignment() {
+        // X-API-Key:value (inline, no space) — handled by redact_sensitive_assignment.
+        let out = redact_runtime_message("header X-API-Key:livekey123 sent");
+        assert!(
+            !out.contains("livekey123"),
+            "inline X-API-Key value must be redacted"
+        );
+        assert!(out.contains("[redacted]"));
+    }
+
+    #[test]
+    fn redact_access_token_space_separated() {
+        // access_token <value> — space-separated form must redact next token.
+        let out = redact_runtime_message("oauth error: access_token abc123xyz");
+        assert!(
+            !out.contains("abc123xyz"),
+            "access_token value must be redacted"
+        );
+        assert!(out.contains("[redacted]"));
+    }
+
+    #[test]
+    fn redact_refresh_token_space_separated() {
+        let out = redact_runtime_message("refresh_token rt-abc123 rejected");
+        assert!(
+            !out.contains("rt-abc123"),
+            "refresh_token value must be redacted"
+        );
+        assert!(out.contains("[redacted]"));
+    }
+
+    #[test]
+    fn redact_bearer_token_keyword() {
+        let out = redact_runtime_message("auth bearer_token somevalue123 failed");
+        assert!(
+            !out.contains("somevalue123"),
+            "bearer_token value must be redacted"
+        );
+        assert!(out.contains("[redacted]"));
+    }
+
+    #[test]
+    fn redact_preserves_non_sensitive_content() {
+        // Non-credential content must not be redacted.
+        let out = redact_runtime_message("stage failed: timeout after 30s");
+        assert_eq!(out, "stage failed: timeout after 30s");
+    }
 }
 
 fn sanitize_release_error(s: &str) -> String {
@@ -16878,4 +17572,401 @@ fn derive_p078_request_fingerprint(effect_kind: &str, pairs: &[(&str, &str)]) ->
         input.push_str(value);
     }
     sha256_hex(input.as_bytes())
+}
+
+#[cfg(test)]
+mod p058_escalation_unit_tests {
+    use super::*;
+    use db::pool::create_pool;
+    use db::repos::{agent_executions, agent_retry_budget_ledger, escalation, ideas, runs, stages};
+    use domain::agent::{AgentExecution, AgentStatus};
+    use domain::idea::{Idea, IdeaStatus};
+    use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
+    use domain::stage::{StageExecution, StageStatus};
+
+    async fn make_pool() -> SqlitePool {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .unwrap();
+        pool
+    }
+
+    fn make_run(run_id: RunId, idea_id: IdeaId) -> domain::run::Run {
+        domain::run::Run {
+            id: run_id,
+            idea_id,
+            status: domain::run::RunStatus::Running,
+            workflow_id: "wf".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: "/tmp/workspace".into(),
+            artifact_root: "/tmp/artifacts".into(),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("task_state".into()),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: None,
+            review_routing_json: None,
+            closeout_readiness_mode: None,
+        }
+    }
+
+    /// P058 MEDIUM-001: verifies that the function called by the non-preclaimed InvokeAgent
+    /// branch (executor.rs: `if preclaimed_start.is_none()`) correctly resolves escalation
+    /// attribution and never returns null fields when a matching policy exists. This proves
+    /// the non-preclaimed path would not write null escalation fields (audit invariant).
+    #[tokio::test]
+    async fn proposal_058_medium_001_non_preclaimed_path_resolves_escalation_chain() {
+        let pool = make_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+
+        let workflow_json = r#"{
+            "initial_state": "task_state",
+            "workflow": {"id": "test_workflow_p058_medium001"},
+            "states": {
+                "task_state": {
+                    "label": "Task State",
+                    "owner": "owner_agent",
+                    "type": "end"
+                }
+            }
+        }"#;
+
+        let catalog_json = r#"{
+            "backend_profiles": {
+                "owner_profile": {"provider": "claude"},
+                "task_profile":  {"provider": "claude"},
+                "lead_profile":  {"provider": "claude"}
+            },
+            "permission_profiles": { "lead_perm": {} },
+            "contracts": { "lead_contract": {"format": "json"} },
+            "agents": [
+                {"id": "owner_agent", "backend_profile": "owner_profile"},
+                {
+                    "id": "lead_agent", "system_role": "lead",
+                    "backend_profile": "lead_profile",
+                    "permission_profile": "lead_perm",
+                    "lead_resolution_contract": "lead_contract"
+                }
+            ],
+            "escalation_policies": [
+                {
+                    "policy_id": "task_profile_escalation",
+                    "schema_version": "escalation_policy_v1",
+                    "enabled_default": true,
+                    "applies_to": {"backend_profile_id": "task_profile"},
+                    "max_chain_attempts": 3,
+                    "max_chain_wall_clock_seconds": 1800,
+                    "triggers": ["contract_output_failure"],
+                    "tiers": [
+                        {"tier_id": "retry_tier", "kind": "same_backend_retry", "max_attempts": 2},
+                        {"tier_id": "fallback_tier", "kind": "backend_profile", "backend_profile_id": "task_profile", "max_attempts": 1}
+                    ]
+                }
+            ]
+        }"#;
+
+        ideas::insert(
+            &pool,
+            &Idea {
+                id: idea_id,
+                title: "P058 MEDIUM-001".into(),
+                body: "non-preclaimed escalation resolution".into(),
+                workspace_root_path: None,
+                project_key: None,
+                status: IdeaStatus::Active,
+                created_at: chrono::Utc::now(),
+                archived_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut run = make_run(run_id, idea_id);
+        run.workflow_snapshot_json = Some(workflow_json.into());
+        run.catalog_snapshot_json = Some(catalog_json.into());
+        runs::insert(&pool, &run).await.unwrap();
+
+        stages::insert(
+            &pool,
+            &StageExecution {
+                id: stage_execution_id,
+                run_id,
+                stage_id: "task_state".into(),
+                label: "Task State".into(),
+                status: StageStatus::Running,
+                iteration: 1,
+                attempt_number: 1,
+                settlement_kind: None,
+                started_at: chrono::Utc::now(),
+                completed_at: None,
+                owner_agent: None,
+                provider: None,
+                model: None,
+                stage_type: None,
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Core MEDIUM-001: matching profile → non-null escalation chain fields.
+        // Same call made by the non-preclaimed branch in process_item.
+        let result = resolve_and_init_escalation_chain(
+            &pool,
+            run_id,
+            "task_state",
+            "task_agent",
+            Some("task_profile"),
+        )
+        .await
+        .expect("MEDIUM-001: resolve must not error when policy applies");
+
+        let (policy_id, policy_hash, ledger_id, tier_id, tier_kind) =
+            result.expect("MEDIUM-001: must return Some — non-preclaimed path must not write null");
+
+        assert_eq!(
+            policy_id, "task_profile_escalation",
+            "MEDIUM-001: policy_id"
+        );
+        assert!(!policy_hash.is_empty(), "MEDIUM-001: policy_hash non-empty");
+        assert!(!ledger_id.is_empty(), "MEDIUM-001: ledger_id non-empty");
+        assert_eq!(tier_id, "retry_tier", "MEDIUM-001: first tier_id");
+        assert_eq!(
+            tier_kind, "same_backend_retry",
+            "MEDIUM-001: first tier_kind"
+        );
+
+        // Idempotent: same ledger_id on second call.
+        let result2 = resolve_and_init_escalation_chain(
+            &pool,
+            run_id,
+            "task_state",
+            "task_agent",
+            Some("task_profile"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result2.2, ledger_id,
+            "MEDIUM-001: idempotent call returns same ledger_id"
+        );
+
+        let mut advanced_ledger = escalation::find_ledger_by_id(&pool, &ledger_id)
+            .await
+            .unwrap()
+            .expect("ledger exists");
+        advanced_ledger.current_tier_id = Some("fallback_tier".into());
+        advanced_ledger.current_tier_kind_raw = Some("backend_profile".into());
+        advanced_ledger.chain_attempt_index = 1;
+        advanced_ledger.trigger_raw = Some("contract_output_failure".into());
+        let mut tx = pool.begin().await.unwrap();
+        escalation::update_ledger_tx(&mut tx, &advanced_ledger)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let result3 = resolve_and_init_escalation_chain(
+            &pool,
+            run_id,
+            "task_state",
+            "task_agent",
+            Some("task_profile"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result3.3, "fallback_tier",
+            "P058 scheduler-owned follow-up starts must use durable current_tier_id"
+        );
+        assert_eq!(
+            result3.4, "backend_profile",
+            "P058 scheduler-owned follow-up starts must use durable current_tier_kind"
+        );
+
+        // Non-matching profile returns None → no null chain written.
+        let no_match = resolve_and_init_escalation_chain(
+            &pool,
+            run_id,
+            "task_state",
+            "other_agent",
+            Some("owner_profile"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            no_match.is_none(),
+            "MEDIUM-001: non-matching profile returns None"
+        );
+    }
+
+    #[tokio::test]
+    async fn p058_claim_start_capacity_waits_for_active_provider_quota_retry_after() {
+        let pool = make_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let agent_execution_id = AgentExecutionId::new();
+        let now = chrono::Utc::now();
+
+        ideas::insert(
+            &pool,
+            &Idea {
+                id: idea_id,
+                title: "P058 quota wait".into(),
+                body: "provider quota blocks same-family start".into(),
+                workspace_root_path: None,
+                project_key: None,
+                status: IdeaStatus::Active,
+                created_at: now,
+                archived_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        stages::insert(
+            &pool,
+            &StageExecution {
+                id: stage_execution_id,
+                run_id,
+                stage_id: "task_state".into(),
+                label: "Task State".into(),
+                status: StageStatus::Running,
+                iteration: 1,
+                attempt_number: 1,
+                settlement_kind: None,
+                started_at: now,
+                completed_at: None,
+                owner_agent: Some("task_agent".into()),
+                provider: Some("claude".into()),
+                model: None,
+                stage_type: None,
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        agent_executions::insert(
+            &pool,
+            &AgentExecution {
+                id: agent_execution_id,
+                stage_execution_id: Some(stage_execution_id),
+                agent_id: "task_agent".into(),
+                provider: "claude".into(),
+                model: None,
+                started_at: now - chrono::Duration::minutes(10),
+                completed_at: Some(now - chrono::Duration::minutes(5)),
+                status: AgentStatus::Failed,
+                owner_execution_lineage_id: None,
+                session_lineage_id: None,
+                session_generation_id: None,
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: None,
+                session_reuse_scope: None,
+                session_family_id: None,
+                session_reuse_disposition: None,
+                session_reset_reason: None,
+                backend_profile_id: None,
+                requested_mcp_extensions_json: None,
+                predicted_mcp_extensions_json: None,
+                predicted_mcp_runtime_ids_json: None,
+                actual_mcp_extensions_json: None,
+                actual_mcp_runtime_ids_json: None,
+                denied_mcp_extensions_json: None,
+                mcp_blocking_issues_json: None,
+                actual_mcp_observation_json: None,
+                actual_xcode_runtime_observation_json: None,
+                mcp_session_startup_latency_ms: None,
+                owner_kind: None,
+                owner_id: None,
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
+                total_cost_cents: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        agent_retry_budget_ledger::upsert_quota_failure(
+            &pool,
+            run_id,
+            stage_execution_id,
+            agent_execution_id,
+            Some(now + chrono::Duration::hours(1)),
+        )
+        .await
+        .unwrap();
+
+        let item = WorkItem {
+            id: "invoke-quota-wait".into(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "task_state",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "provider": "claude",
+                "session_reuse_scope": "none"
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("task_state".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        };
+        assert!(
+            !invoke_item_has_start_capacity(&pool, &item, &InvokeAgentCapacityConfig::unbounded())
+                .await
+                .unwrap(),
+            "same-provider InvokeAgent must wait until durable quota retry_after elapses"
+        );
+    }
 }

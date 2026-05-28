@@ -257,13 +257,26 @@ impl QueryRoot {
     async fn runs(&self, ctx: &Context<'_>, idea_id: Option<ID>) -> Result<Vec<GqlRun>> {
         require_operator_read(ctx)?;
         let pool = ctx.data::<SqlitePool>()?;
-        if let Some(id) = idea_id {
+        let runs: Vec<GqlRun> = if let Some(id) = idea_id {
             let items = projections::list_by_idea_projection(pool, id.as_str()).await?;
-            Ok(items.into_iter().map(GqlRun::from).collect())
+            items.into_iter().map(GqlRun::from).collect()
         } else {
             let items = projections::list_active_projection(pool).await?;
-            Ok(items.into_iter().map(GqlRun::from).collect())
+            items.into_iter().map(GqlRun::from).collect()
+        };
+        let mut enriched = Vec::with_capacity(runs.len());
+        for mut run in runs {
+            let run_id: RunId = run
+                .id
+                .as_str()
+                .parse()
+                .map_err(|e: uuid::Error| Error::new(e.to_string()))?;
+            run.workflow_conflict = workflow_conflicts::get_current_blocking_conflict(pool, run_id)
+                .await?
+                .map(Into::into);
+            enriched.push(run);
         }
+        Ok(enriched)
     }
 
     async fn run(&self, ctx: &Context<'_>, id: ID) -> Result<Option<GqlRun>> {
@@ -6620,6 +6633,115 @@ mod tests {
         let table = auth::PrincipalTable::load_or_bootstrap(file.path()).unwrap();
         let principal = auth::resolve_bearer("legacy-agent-token", &table).unwrap();
         (table, principal)
+    }
+
+    #[tokio::test]
+    async fn test_graphql_approve_stage_returns_payload_with_approval_and_journal_id() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let stage = make_manual_gate_stage(run_id, "state_approve");
+        stages::insert(&pool, &stage).await.unwrap();
+        let approval = make_approval(run_id, "state_approve");
+        approvals::insert(&pool, &approval).await.unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      approveApproval(approvalId: "{}") {{
+                        approval {{ id }}
+                        journalId
+                      }}
+                    }}"#,
+                    approval.id
+                ))
+                .data(test_principal()),
+            )
+            .await;
+
+        assert!(
+            response.errors.is_empty(),
+            "approveApproval must succeed: {response:?}"
+        );
+        let data = response.data.into_json().unwrap();
+        assert_eq!(
+            data["approveApproval"]["approval"]["id"],
+            serde_json::json!(approval.id.to_string()),
+        );
+        let jid = data["approveApproval"]["journalId"]
+            .as_str()
+            .expect("approveApproval.journalId must be present");
+        assert!(
+            !jid.is_empty(),
+            "journalId on ApproveApprovalPayload must be non-empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_response_omits_journal_id_when_capability_check_fails() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        let stage = make_manual_gate_stage(run_id, "state_cap");
+        stages::insert(&pool, &stage).await.unwrap();
+        let approval = make_approval(run_id, "state_cap");
+        approvals::insert(&pool, &approval).await.unwrap();
+
+        let schema = build_schema(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            event_bus::new_bus(64),
+            auth::PrincipalTable::test_fixture(),
+            test_reporter(),
+        );
+        // Observer class is forbidden from all mutations. The resolver returns
+        // a GraphQL error without a payload — therefore no journalId.
+        let response = schema
+            .execute(
+                Request::new(format!(
+                    r#"mutation {{
+                      approveApproval(approvalId: "{}") {{
+                        approval {{ id }}
+                        journalId
+                      }}
+                    }}"#,
+                    approval.id
+                ))
+                .data(observer_principal()),
+            )
+            .await;
+
+        assert!(
+            !response.errors.is_empty(),
+            "observer approveApproval must be rejected with an error"
+        );
+        assert!(
+            response.errors[0].message.contains("forbidden"),
+            "rejection error must say forbidden: {:?}",
+            response.errors[0].message
+        );
+        // No journalId in data: the payload is null because the mutation errored.
+        let data = response.data.into_json().unwrap_or_default();
+        assert!(
+            data["approveApproval"]["journalId"].is_null(),
+            "forbidden mutation must not surface a journalId"
+        );
     }
 
     #[tokio::test]

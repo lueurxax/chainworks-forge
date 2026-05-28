@@ -195,11 +195,15 @@ Implementation: `control-plane/crates/domain/src/capabilities.rs`, `control-plan
 - **Empty env:** if `CHAINWORKS_AUTH_PRINCIPALS_PATH` is set to the empty string, the daemon refuses to start.
 - **Missing file:** on first start the daemon generates a random UUID token, writes a single-entry table with `class = operator` and `id = default-operator` to the discovered path, and logs the path + token at `info` level exactly once.
 - **File mode:** on Unix, bootstrap opens the file with `OpenOptions::mode(0o600)` before writing, so only the owning user can read it. On non-Unix platforms the mode is not enforced and the corresponding test is `cfg(unix)`-gated.
+- **TOCTOU-safe read:** on Unix, `load_or_bootstrap` runs `symlink_metadata` first (rejecting symlinks), then opens the file once and verifies mode against the opened descriptor's `fstat`, closing the window between the symlink check and the read. Any mode other than `0o600` aborts startup.
+- **Strict surface policies in `schema_version: 2`:** every entry — not only the default operator — must declare `surface_policies` explicitly. An entry that omits `surface_policies` is rejected at load time, so a misconfigured custom principal cannot silently inherit class-default MCP/resource access. When `surface_policies` is present, `Principal::from_entry` overrides both capability sets: an absent or empty `mcp.allowed_tools` stanza maps to an empty `tool_capabilities` set, and `resource_capabilities` is always zeroed (no v2 field yet allowlists MCP resources, so the v2 default is deny-all resources). The GraphQL surface follows the same fail-closed rule: when an entry carries `surface_policies` but omits the `graphql` stanza, `is_query_allowed_by_surface_policy` and `is_subscription_allowed_by_surface_policy` return `Some(false)` so queries and subscriptions are denied rather than falling through to class defaults.
 - **Empty table:** if the file parses successfully but contains zero principals, the daemon refuses to start with `AuthError::TableLoadFailed("principal table contains zero entries")`. There is no silent auth-disabled mode.
 
 ### Token resolution
 
-`auth::extract_bearer_token` parses `"Bearer <token>"` from an `Authorization` header value (trimming whitespace; rejecting an empty token with `AuthError::MalformedHeader`). `auth::resolve_bearer` looks the token up in the `PrincipalTable` and returns a fresh `Principal` whose `tool_capabilities` and `resource_capabilities` are populated from the class's default capability set.
+`auth::extract_bearer_token` parses `"Bearer <token>"` from an `Authorization` header value (trimming whitespace; rejecting an empty token with `AuthError::MalformedHeader`). `auth::resolve_bearer` looks the token up in the `PrincipalTable` and returns a fresh `Principal` built by `Principal::from_entry`. Without `surface_policies` (v1 entries), `tool_capabilities` and `resource_capabilities` come from the class default set. With `surface_policies` (v2 entries), the entry overrides both sets as described above; resource access is deny-all by default.
+
+Token comparison is constant-time: `resolve_bearer` scans every entry without early exit and folds bytes with a non-short-circuiting XOR, so neither match position nor entry count leaks through timing.
 
 ### Rotation
 
@@ -273,16 +277,16 @@ Both checks are required, so a future change that wants to narrow a specific pri
 |---|:-:|:-:|:-:|
 | `ideas.create` | yes | yes | no |
 | `ideas.list` | yes | yes | yes |
-| `runs.start` | yes | yes | no |
-| `runs.list` | yes | yes | yes |
-| `runs.get` | yes | yes | yes |
+| `runs.start` | yes | no | no | (SEC-001: caller-supplied filesystem paths — Operator-only.) |
+| `runs.list` | yes | yes | yes | (SEC-003: local filesystem path fields — `workspace_root`, `artifact_root`, `chainworks_meta_root` — are redacted from each projection row for non-Operator callers.) |
+| `runs.get` | yes | yes | yes | (P058 Phase 1: operator-only snapshot fields (`workflow_snapshot_json`, `catalog_snapshot_json`, `delivery_*_json`, `drift_details_json`, and local filesystem paths) are stripped for non-Operator callers, and `escalation_readback` collapses to the summary projection (`chains_redacted: true`); see [escalation-policies.md](escalation-policies.md).) |
 | `runs.cancel` | yes | no | no |
 | `approvals.list` | yes | no | yes | (Mixed inbox: stage approvals + lead mediation confirmations) |
 | `approvals.resolve` | yes | no | no | (Resolves stage approvals or lead mediation confirmations) |
 | `stages.retry` | yes | no | no |
 | `workflow_conflicts.resolve` | yes | no | no |
 | `legacy_discovery_override_create` | yes | no | no |
-| `reports.get` | yes | yes | yes |
+| `reports.get` | yes | no | no | (SEC-HIGH-001: returns operator-grade evidence, rollout readback, and local `file_path` values — Operator-only, matches the `report://` resource boundary.) |
 | `artifacts.override_contract` | yes | no | no |
 | `steward.run_analysis` | yes | no | no |
 | `steward.list_analyses` | yes | no | yes |
@@ -304,14 +308,14 @@ Rationale for the Steward trio: `run_analysis` queues compute work and drives th
 |---|:-:|:-:|:-:|
 | `run://{run_id}` | yes | yes | yes |
 | `idea://{idea_id}` | yes | yes | yes |
-| `artifact://{artifact_id}` | yes | yes | yes |
-| `report://{run_id}` | yes | yes | yes |
+| `artifact://{artifact_id}` | yes | no | no | (HIGH-001: exposes local `file_path` — Operator-only.) |
+| `report://{run_id}` | yes | no | no | (HIGH-001: exposes execution evidence and artifact payloads — Operator-only.) |
 | `steward-analysis://{analysis_id}` | yes | no | yes |
 | `chainworks://runs` | yes | yes | yes |
 | `chainworks://ideas` | yes | yes | yes |
 | `chainworks://approvals/inbox` | yes | no | yes |
 | `chainworks://runs/{run_id}/stages` | yes | no | yes |
-| `chainworks://runs/{run_id}/artifacts` | yes | no | yes |
+| `chainworks://runs/{run_id}/artifacts` | yes | no | no | (SEC-HIGH-002: returns unredacted `file_path` and source generation metadata — Operator-only.) |
 
 ### GraphQL mutation boundary
 

@@ -581,7 +581,7 @@ PROPOSAL_029_MCP_TESTS=(
   "graphql-server test_graphql_rejects_missing_authorization_header"
   "graphql-server test_graphql_rejects_unknown_bearer_token"
   "graphql-server test_graphql_mutation_reads_principal_from_context"
-  "graphql-server test_graphql_observer_class_cannot_invoke_start_run"
+  "graphql-server test_graphql_observer_class_cannot_invoke_approval_mutation"
   "graphql-server test_graphql_ws_rejects_missing_connection_init_auth"
   "graphql-server test_graphql_ws_rejects_unknown_connection_init_token"
   "graphql-server test_graphql_ws_accepts_valid_connection_init_token"
@@ -619,7 +619,8 @@ PROPOSAL_029_MCP_TESTS=(
   "engine test_redact_approve_stage_preserves_run_and_stage_ids"
   "engine test_redact_reject_stage_redacts_comment"
   "engine test_redact_reject_stage_preserves_run_and_stage_ids"
-  "engine test_redact_retry_stage_preserves_all_fields"
+  "engine test_redact_retry_stage_redacts_operator_instruction"
+  "engine test_redact_retry_stage_preserves_structural_fields_without_instruction"
   "engine test_redact_cancel_run_preserves_run_id"
   "engine test_redact_reset_session_preserves_all_fields"
   "engine test_redact_run_steward_analysis_preserves_reason_and_artifact_base"
@@ -633,15 +634,12 @@ PROPOSAL_029_MCP_TESTS=(
   "mcp-server test_mcp_steward_get_analysis_response_omits_journal_id"
 
   # journal_id surfacing on GraphQL (graphql-server/src/schema.rs :: tests)
-  "graphql-server test_graphql_start_run_started_variant_includes_journal_id"
-  "graphql-server test_graphql_start_run_blocked_variant_includes_journal_id"
+  # startRun/retryStage/cancelRun moved to MCP; journalId on those covered by mcp-server tests above
   "graphql-server test_graphql_approve_stage_returns_payload_with_approval_and_journal_id"
-  "graphql-server test_graphql_retry_stage_returns_payload_with_retried_and_journal_id"
-  "graphql-server test_graphql_cancel_run_returns_payload_with_cancelled_and_journal_id"
   "graphql-server test_response_omits_journal_id_when_capability_check_fails"
 
-  # GraphQL blocked-startRun payload contract §4.4.b
-  "graphql-server graphql_start_run_blocked_payload_contract_tests"
+  # GraphQL delivery preflight contract §4.4.b (formerly graphql_start_run_blocked_payload_contract_tests)
+  "graphql-server delivery_preflight_graphql_readback_tests"
 
   # Cross-surface parity (engine/tests/cross_surface_parity.rs)
   "engine test_graphql_and_mcp_produce_identical_run_for_start_run"
@@ -2816,7 +2814,7 @@ PY
         fi
       done
       rm -f "$tmp_log"
-      cargo test --workspace 2>&1
+      RUST_MIN_STACK=8388608 cargo test --workspace -- --test-threads=4 2>&1
     )
     log "Proposal 029-MCP control-plane gate passed"
     ;;
@@ -4829,7 +4827,8 @@ PY
     log "Proposal 053 control-plane gate passed"
     ;;
   proposal-058|p058)
-    log "Proposal 058 control-plane gate: ACP provider failure classification, artifact ownership, escalation schema, and policy compile validation (Phase 0-1)"
+    log "Proposal 058 gate: ACP failure classification, escalation schema, readback parity, and governed macOS read surface"
+    run_targeted_tests "proposal-058-swift" "Chainworks ForgeTests/Proposal058Tests"
     (
       cd "$ROOT_DIR/control-plane"
       cargo test -p domain --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
@@ -4841,6 +4840,12 @@ PY
       cargo test -p mcp-server --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
       cargo test -p engine --test proposal_058_escalation_schema -- --test-threads=1 --nocapture &&
       cargo test -p workflow --test proposal_058_escalation_policy_schema -- --test-threads=1 --nocapture &&
+      cargo test -p db proposal_058_required_metric_names_are_declared --lib -- --test-threads=1 --nocapture &&
+      cargo test -p mcp-server runs_get_returns_escalation_readback --lib -- --test-threads=1 --nocapture &&
+      cargo test -p mcp-server runs_get_escalation_readback_event_payload_json_roundtrip --lib -- --test-threads=1 --nocapture &&
+      cargo test -p mcp-server runs_get_agent_principal_receives_summary_only_readback --lib -- --test-threads=1 --nocapture &&
+      cargo test -p mcp-server build_escalation_readback_truncates_events_beyond_cap --lib -- --test-threads=1 --nocapture &&
+      cargo test -p db payload_json_shape --lib -- --test-threads=1 --nocapture &&
       cargo check -p engine &&
       cargo check -p graphql-server &&
       cargo check -p mcp-server
@@ -7854,7 +7859,7 @@ PY
       run_p087_cargo_test() {
         local output status
         set +e
-        output=$(CARGO_TARGET_DIR=target/proposal-087-gate cargo test "$@" 2>&1)
+        output=$(RUST_MIN_STACK=8388608 CARGO_TARGET_DIR=target/proposal-087-gate cargo test "$@" 2>&1)
         status=$?
         set -e
         printf '%s\n' "$output"

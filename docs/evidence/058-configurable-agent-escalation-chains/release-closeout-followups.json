@@ -1,0 +1,44 @@
+{
+  "schema_version": "p058_release_closeout_followups_v1",
+  "proposal_id": "proposal-058",
+  "proposal_revision_id": "p058-r14-2026-05-07",
+  "implementation_closeout_boundary": {
+    "status": "non_blocking_for_implementation_closeout",
+    "rationale": "The same-tree proposal-058 gate proves the implementation paths. The items below require live operator hardware, long-running metric windows, or release-drill timing and are retained as broad-release evidence, not missing code paths."
+  },
+  "followups": [
+    {
+      "id": "p058-release-followup-remote-ui-soak",
+      "owner": "release_evidence",
+      "blocking_for_implementation_closeout": false,
+      "blocking_for_broad_release": true,
+      "required_evidence": [
+        "remote macOS screenshot/runtime proof for System-tab escalation inspector",
+        "stale/disconnected read-pipeline state proof",
+        "keyboard focus and accessibility proof"
+      ]
+    },
+    {
+      "id": "p058-release-followup-metric-thresholds",
+      "owner": "observability_rollout",
+      "blocking_for_implementation_closeout": false,
+      "blocking_for_broad_release": true,
+      "required_evidence": [
+        "long-running tier success and false-escalation windows",
+        "provider force-detach latency threshold trend",
+        "shadow match and time-to-success rollout trend"
+      ]
+    },
+    {
+      "id": "p058-release-followup-operational-drills",
+      "owner": "release_evidence",
+      "blocking_for_implementation_closeout": false,
+      "blocking_for_broad_release": true,
+      "required_evidence": [
+        "live SIGTERM/operator restart drill",
+        "populated migration drill",
+        "release receipt pack containing recovery artifact samples"
+      ]
+    }
+  ]
+}
