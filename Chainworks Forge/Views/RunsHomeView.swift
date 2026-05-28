@@ -373,9 +373,10 @@ struct RunsHomeView: View {
                         if let health = workbench.freshnessAndHealth {
                             P036SystemReadinessCard(health: health)
                         }
-                        if let escalationSnapshot = runDetail.escalationSnapshot {
-                            EscalationInspector(
-                                snapshot: escalationSnapshot,
+                        if let runID = runDetail.runID, !runDetail.escalationChains.isEmpty {
+                            EscalationInspectorAdapterView(
+                                runID: runID,
+                                chains: runDetail.escalationChains,
                                 traceJSONRedacted: runDetail.escalationTraceJSONRedacted
                             )
                         }

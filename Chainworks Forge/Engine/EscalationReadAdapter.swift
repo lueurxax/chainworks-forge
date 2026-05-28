@@ -133,6 +133,33 @@ final class EscalationReadAdapterRegistry {
         return adapter
     }
 
+    @discardableResult
+    func applyChains(_ chains: [EscalationChainStateDTO], for runId: String) -> EscalationSnapshot {
+        let adapter = adapter(for: runId)
+        adapter.applyChains(chains)
+        return adapter.snapshot
+    }
+
+    func reset(runId: String) {
+        adapter(for: runId).reset()
+    }
+
+    var snapshots: [EscalationSnapshot] {
+        adapters.values
+            .map(\.snapshot)
+            .filter { !$0.runId.isEmpty }
+            .sorted { $0.runId < $1.runId }
+    }
+
+    var attentionSnapshots: [EscalationSnapshot] {
+        snapshots.filter {
+            $0.pausedChainCount > 0
+                || $0.isPolicyDrift
+                || $0.isKillSwitchEngaged
+                || $0.hasActiveEscalation
+        }
+    }
+
     // Retained for Phase 1+ subscription teardown when a run window closes.
     func removeAdapter(for runId: String) {
         adapters.removeValue(forKey: runId)

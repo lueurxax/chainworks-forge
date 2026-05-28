@@ -753,3 +753,29 @@ struct EscalationInspector: View {
         .accessibilityIdentifier("p058-escalation-inspector")
     }
 }
+
+struct EscalationInspectorAdapterView: View {
+    @StateObject private var adapter: EscalationReadAdapter
+    private let chains: [EscalationChainStateDTO]
+    private let traceJSONRedacted: String?
+
+    init(
+        runID: String,
+        chains: [EscalationChainStateDTO],
+        traceJSONRedacted: String?
+    ) {
+        _adapter = StateObject(
+            wrappedValue: EscalationReadAdapterRegistry.shared.adapter(for: runID)
+        )
+        self.chains = chains
+        self.traceJSONRedacted = traceJSONRedacted
+    }
+
+    var body: some View {
+        EscalationInspector(snapshot: adapter.snapshot, traceJSONRedacted: traceJSONRedacted)
+            .task(id: chains) {
+                adapter.applyChains(chains)
+            }
+            .accessibilityIdentifier("p058-escalation-inspector-adapter")
+    }
+}

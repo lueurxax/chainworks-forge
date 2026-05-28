@@ -304,6 +304,11 @@ struct Proposal058Tests {
             onClose: {}
         )
         _ = EscalationInspector(snapshot: snapshot, traceJSONRedacted: nil)
+        _ = EscalationInspectorAdapterView(
+            runID: "run-ui",
+            chains: [chain],
+            traceJSONRedacted: nil
+        )
     }
 
     @Test("P058 screen-state matrix covers ready stale disconnected paused drift and kill-switch states")
@@ -349,28 +354,67 @@ struct Proposal058Tests {
     @Test("P058 dock badge and menu bar attention aggregate paused escalation snapshots")
     func dockBadgeAndMenuBarAggregateEscalationAttention() {
         let service = NotificationService()
-        let paused = EscalationSnapshot.build(
-            runId: "run-menu",
+        let pausedA = EscalationSnapshot.build(
+            runId: "run-menu-a",
             chains: [
                 makeChain(
-                    id: "ledger-menu",
+                    id: "ledger-menu-a",
                     status: "paused",
                     pauseReason: EscalationPauseReasonCode.escalationChainExhausted.rawValue
                 ),
             ]
         )
+        let pausedB = EscalationSnapshot.build(
+            runId: "run-menu-b",
+            chains: [
+                makeChain(
+                    id: "ledger-menu-b",
+                    status: "paused",
+                    pauseReason: EscalationPauseReasonCode.providerSessionForceDetached.rawValue
+                ),
+            ]
+        )
 
-        service.applyP058EscalationSnapshots([paused])
+        service.applyP058EscalationSnapshots([pausedA, pausedB])
 
-        #expect(service.pendingAttentionCount == 1)
+        #expect(service.pendingAttentionCount == 2)
         #expect(service.isMenuBarEnabled)
-        #expect(service.p058EscalationSnapshots.map(\.runId) == ["run-menu"])
+        #expect(service.p058EscalationSnapshots.map(\.runId) == ["run-menu-a", "run-menu-b"])
 
         service.applyP058EscalationSnapshots([])
 
         #expect(service.pendingAttentionCount == 0)
         #expect(!service.isMenuBarEnabled)
         #expect(service.p058EscalationSnapshots.isEmpty)
+    }
+
+    @Test("P058 adapter registry aggregates attention snapshots across runs")
+    func adapterRegistryAggregatesAttentionSnapshotsAcrossRuns() {
+        let registry = EscalationReadAdapterRegistry.shared
+        let runA = "run-registry-a-\(UUID().uuidString)"
+        let runB = "run-registry-b-\(UUID().uuidString)"
+        defer {
+            registry.removeAdapter(for: runA)
+            registry.removeAdapter(for: runB)
+        }
+
+        registry.applyChains([
+            makeChain(
+                id: "ledger-registry-a",
+                status: "paused",
+                pauseReason: EscalationPauseReasonCode.escalationChainExhausted.rawValue
+            ),
+        ], for: runA)
+        registry.applyChains([
+            makeChain(
+                id: "ledger-registry-b",
+                status: "paused",
+                pauseReason: EscalationPauseReasonCode.escalationPolicyDrift.rawValue
+            ),
+        ], for: runB)
+
+        #expect(registry.attentionSnapshots.map(\.runId).sorted() == [runA, runB].sorted())
+        #expect(registry.attentionSnapshots.reduce(0) { $0 + $1.pausedChainCount } == 2)
     }
 
     @Test("P058 escalation attention requests informational user attention and cancels on clear")
@@ -517,6 +561,7 @@ struct Proposal058Tests {
 
         #expect(presentation.escalationSnapshot?.runId == "run-p031")
         #expect(presentation.escalationSnapshot?.pausedChainCount == 1)
+        #expect(presentation.escalationChains.map(\.id) == ["ledger-p031"])
         #expect(presentation.escalationTraceJSONRedacted?.contains("p058_escalation_trace_redacted_v1") == true)
     }
 
