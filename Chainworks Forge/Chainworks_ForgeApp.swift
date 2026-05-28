@@ -22,6 +22,7 @@ struct Chainworks_ForgeApp: App {
     static let isUIAutomationHost = isUIAutomationHost(for: processEnvironment)
 
     @NSApplicationDelegateAdaptor(AutomationFallbackAppDelegate.self) private var automationFallbackAppDelegate
+    @State private var notificationService = NotificationService.shared
 
     init() {
         if Self.shouldDisableWindowRestoration {
@@ -41,7 +42,7 @@ struct Chainworks_ForgeApp: App {
             if Self.isTestHost {
                 EmptyView()
             } else {
-                ContentView()
+                ContentView(notificationService: notificationService)
             }
         }
         .commands {
@@ -81,6 +82,23 @@ struct Chainworks_ForgeApp: App {
                 .keyboardShortcut("4", modifiers: .command)
             }
         }
+        MenuBarExtra {
+            EscalationMenuBarList(snapshots: notificationService.p058EscalationSnapshots) { runID in
+                NotificationCenter.default.post(
+                    name: .chainworksOpenRunInRunsHome,
+                    object: runID,
+                    userInfo: ["runID": runID]
+                )
+            }
+        } label: {
+            Label(
+                "Escalation attention",
+                systemImage: notificationService.pendingAttentionCount > 0
+                    ? "clock.badge.exclamationmark"
+                    : "circle"
+            )
+        }
+        .menuBarExtraStyle(.menu)
     }
 
     static var shouldDisableWindowRestoration: Bool {

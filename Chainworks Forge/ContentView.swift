@@ -23,6 +23,7 @@ struct ContentView: View {
 
     private let forcedInitialTab: Tab?
     private let forcedUISurface: UISurface?
+    private let notificationService: NotificationService
     // P036: set true when CHAINWORKS_UI_TEST_INITIAL_TAB maps to "approvals" so
     // RunsHomeView can focus the waiting-approval lane after the view hierarchy loads.
     private let focusWaitingApprovalOnLoad: Bool
@@ -57,7 +58,8 @@ struct ContentView: View {
     }
 
 
-    init() {
+    init(notificationService: NotificationService) {
+        self.notificationService = notificationService
         let environment = ProcessInfo.processInfo.environment
         let rawInitialTab = environment["CHAINWORKS_UI_TEST_INITIAL_TAB"] ?? ""
         let initialTab = Tab.from(rawValue: rawInitialTab)
@@ -236,6 +238,11 @@ struct ContentView: View {
     private func syncRunDetailPresentation() {
         guard let runDetail = runsModel.runDetail else { return }
         workbench.populate(from: runDetail)
+        if let escalationSnapshot = runDetail.escalationSnapshot {
+            notificationService.applyP058EscalationSnapshots([escalationSnapshot])
+        } else {
+            notificationService.applyP058EscalationSnapshots([])
+        }
     }
 
     private func syncReadinessPresentation() {
@@ -1115,5 +1122,5 @@ extension ContentView.Tab: CaseIterable {
 }
 
 #Preview {
-    ContentView()
+    ContentView(notificationService: NotificationService())
 }

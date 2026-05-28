@@ -39,6 +39,14 @@ enum EscalationPresentationStyle {
         chain.triggerRaw ?? "standard execution"
     }
 
+    nonisolated static func isShadowLineageRow(_ chain: EscalationChainStateDTO) -> Bool {
+        chain.statusRaw == "shadow_only"
+            || chain.statusRaw == "shadow"
+            || chain.featureFlagState == "shadow"
+            || chain.triggerRaw?.contains("shadow") == true
+            || chain.pauseReasonRaw?.contains("shadow") == true
+    }
+
     static func pauseTitle(for reason: String?) -> String {
         switch reason {
         case EscalationPauseReasonCode.escalationKillSwitchEngaged.rawValue:
@@ -192,50 +200,70 @@ private struct EscalationBanner {
     let action: () -> Void
 }
 
-struct EscalationLineageView: View {
-    let snapshot: EscalationSnapshot
+struct EscalationLineageDisplayRow: Equatable, Identifiable {
+    let id: String
+    let chains: [EscalationChainStateDTO]
+    let title: String
+    let subtitle: String
+    let detail: String?
+    let attemptLabel: String
+    let symbol: String
+    let isShadow: Bool
+    let isRetryCollapse: Bool
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Escalation lineage")
-                .font(.headline)
-            if snapshot.activeChains.isEmpty {
-                Text("No escalation policy activity")
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(snapshot.activeChains, id: \.id) { chain in
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: symbol(for: chain))
-                            .foregroundStyle(color(for: chain))
-                            .frame(width: 18)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(EscalationPresentationStyle.tierLabel(for: chain))
-                                .font(.subheadline.weight(.semibold))
-                            Text("\(chain.statusRaw) • \(EscalationPresentationStyle.triggerLabel(for: chain))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                            if let reason = chain.pauseReasonRaw {
-                                Text(reason)
-                                    .font(.caption2.monospaced())
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        Spacer()
-                        Text("#\(chain.chainAttemptIndex)")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(8)
-                    .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-                    .accessibilityElement(children: .combine)
+    static func rows(from chains: [EscalationChainStateDTO]) -> [EscalationLineageDisplayRow] {
+        var result: [EscalationLineageDisplayRow] = []
+        var index = chains.startIndex
+
+        while index < chains.endIndex {
+            let chain = chains[index]
+            if chain.currentTierKindRaw == EscalationTierKindCode.sameBackendRetry.rawValue,
+               let tierID = chain.currentTierId {
+                var group: [EscalationChainStateDTO] = []
+                var cursor = index
+                while cursor < chains.endIndex,
+                      chains[cursor].currentTierKindRaw == EscalationTierKindCode.sameBackendRetry.rawValue,
+                      chains[cursor].currentTierId == tierID {
+                    group.append(chains[cursor])
+                    cursor = chains.index(after: cursor)
+                }
+                if group.count >= 3 {
+                    let latest = group.last ?? chain
+                    let maxAttempt = group.map(\.chainAttemptIndex).max() ?? group.count
+                    result.append(EscalationLineageDisplayRow(
+                        id: "retry-collapse-\(tierID)-\(group.first?.id ?? chain.id)-\(group.count)",
+                        chains: group,
+                        title: "Retry \(group.count) / \(maxAttempt)",
+                        subtitle: "\(tierID) • \(EscalationPresentationStyle.triggerLabel(for: latest))",
+                        detail: latest.pauseReasonRaw,
+                        attemptLabel: "#\(latest.chainAttemptIndex)",
+                        symbol: "arrow.triangle.2.circlepath",
+                        isShadow: group.contains(where: EscalationPresentationStyle.isShadowLineageRow),
+                        isRetryCollapse: true
+                    ))
+                    index = cursor
+                    continue
                 }
             }
+
+            result.append(EscalationLineageDisplayRow(
+                id: chain.id,
+                chains: [chain],
+                title: EscalationPresentationStyle.tierLabel(for: chain),
+                subtitle: "\(chain.statusRaw) • \(EscalationPresentationStyle.triggerLabel(for: chain))",
+                detail: chain.pauseReasonRaw,
+                attemptLabel: "#\(chain.chainAttemptIndex)",
+                symbol: symbol(for: chain),
+                isShadow: EscalationPresentationStyle.isShadowLineageRow(chain),
+                isRetryCollapse: false
+            ))
+            index = chains.index(after: index)
         }
-        .accessibilityIdentifier("p058-escalation-lineage-view")
+
+        return result
     }
 
-    private func symbol(for chain: EscalationChainStateDTO) -> String {
+    private static func symbol(for chain: EscalationChainStateDTO) -> String {
         switch chain.currentTierKindRaw {
         case EscalationTierKindCode.sameBackendRetry.rawValue:
             return "arrow.triangle.2.circlepath"
@@ -249,15 +277,154 @@ struct EscalationLineageView: View {
             return "circle"
         }
     }
+}
 
-    private func color(for chain: EscalationChainStateDTO) -> Color {
-        if chain.statusRaw == "paused" || chain.statusRaw == "exhausted" {
+struct EscalationLineageView: View {
+    let snapshot: EscalationSnapshot
+    @State private var expandedRows: Set<String> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Escalation lineage")
+                .font(.headline)
+            if snapshot.activeChains.isEmpty {
+                Text("No escalation policy activity")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(EscalationLineageDisplayRow.rows(from: snapshot.activeChains)) { row in
+                    EscalationLineageRowView(
+                        row: row,
+                        isExpanded: Binding(
+                            get: { expandedRows.contains(row.id) },
+                            set: { isExpanded in
+                                if isExpanded {
+                                    expandedRows.insert(row.id)
+                                } else {
+                                    expandedRows.remove(row.id)
+                                }
+                            }
+                        )
+                    )
+                }
+            }
+        }
+        .accessibilityIdentifier("p058-escalation-lineage-view")
+    }
+}
+
+private struct EscalationLineageRowView: View {
+    let row: EscalationLineageDisplayRow
+    @Binding var isExpanded: Bool
+
+    var body: some View {
+        Group {
+            if row.isRetryCollapse {
+                DisclosureGroup(isExpanded: $isExpanded) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(row.chains, id: \.id) { chain in
+                            Text("\(chain.currentTierId ?? "retry") • \(chain.statusRaw) • \(EscalationPresentationStyle.triggerLabel(for: chain))")
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                    .padding(.top, 4)
+                } label: {
+                    rowBody
+                }
+            } else {
+                rowBody
+            }
+        }
+        .focusable(true)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityIdentifier(row.isRetryCollapse ? "p058-escalation-lineage-retry-collapse" : "p058-escalation-lineage-row")
+        .padding(8)
+        .background(.secondary.opacity(row.isShadow ? 0.045 : 0.08), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(alignment: .leading) {
+            if row.isShadow {
+                Rectangle()
+                    .stroke(style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 1)
+                    .padding(.vertical, 6)
+            }
+        }
+        .opacity(row.isShadow ? 0.5 : 1)
+    }
+
+    private var rowBody: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: 10) {
+                symbol
+                titleBlock
+                Spacer()
+                attempt
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    symbol
+                    titleBlock
+                }
+                attempt
+            }
+        }
+    }
+
+    private var symbol: some View {
+        Image(systemName: row.isShadow ? "eye" : row.symbol)
+            .foregroundStyle(color)
+            .frame(width: 18)
+    }
+
+    private var titleBlock: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(row.title)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(2)
+            Text(row.subtitle)
+                .font(row.isShadow ? .caption.italic() : .caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            if let detail = row.detail {
+                Text(detail)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+    }
+
+    private var attempt: some View {
+        Text(row.attemptLabel)
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+    }
+
+    private var color: Color {
+        guard let first = row.chains.first else { return .secondary }
+        if first.statusRaw == "paused" || first.statusRaw == "exhausted" {
             return .orange
         }
-        if chain.triggerRaw != nil {
+        if first.triggerRaw != nil {
             return .accentColor
         }
         return .secondary
+    }
+
+    private var accessibilityLabel: String {
+        [
+            row.isRetryCollapse ? "collapsed retry lineage" : "escalation lineage",
+            row.title,
+            row.subtitle,
+            row.detail,
+            row.attemptLabel,
+            row.isShadow ? "shadow row" : nil,
+        ]
+        .compactMap { $0 }
+        .joined(separator: ", ")
     }
 }
 

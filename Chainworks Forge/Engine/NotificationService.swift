@@ -18,23 +18,49 @@ struct P081OperatorAlertNativeDeliveryMetricEvent: Equatable, Sendable {
 @MainActor
 @Observable
 final class NotificationService {
+    static let shared = NotificationService()
+
     private static let processEnvironment = ProcessInfo.processInfo.environment
 
     private(set) var pendingAttentionCount: Int = 0
     private(set) var isMenuBarEnabled: Bool = false
+    private(set) var p058EscalationSnapshots: [EscalationSnapshot] = []
     private var preferences: NotificationPreferences
     private var authorizationStatus: UNAuthorizationStatus?
     private var runAttentionCount: Int = 0
     private var operatorAlertAttentionCount: Int = 0
     private var escalationAttentionCount: Int = 0
+    private var p058AttentionToken: Int?
     private var userMenuBarEnabled: Bool = false
     private var operatorAlertForcesMenuBar: Bool = false
     private var escalationForcesMenuBar: Bool = false
     private var deliveredOperatorAlertKeys: Set<String> = []
+    private var activationObserver: NSObjectProtocol?
+    private let requestUserAttention: (NSApplication.RequestUserAttentionType) -> Int?
+    private let cancelUserAttention: (Int) -> Void
     private(set) var p081NativeDeliveryMetricEvents: [P081OperatorAlertNativeDeliveryMetricEvent] = []
 
-    init(preferences: NotificationPreferences = .defaultPreferences) {
+    init(
+        preferences: NotificationPreferences = .defaultPreferences,
+        requestUserAttention: ((NSApplication.RequestUserAttentionType) -> Int?)? = nil,
+        cancelUserAttention: ((Int) -> Void)? = nil
+    ) {
         self.preferences = preferences
+        self.requestUserAttention = requestUserAttention ?? { requestType in
+            NSApp?.requestUserAttention(requestType)
+        }
+        self.cancelUserAttention = cancelUserAttention ?? { token in
+            NSApp?.cancelUserAttentionRequest(token)
+        }
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.cancelP058EscalationAttention()
+            }
+        }
     }
 
     // MARK: - Setup
@@ -120,8 +146,10 @@ final class NotificationService {
         runAttentionCount = 0
         operatorAlertAttentionCount = 0
         escalationAttentionCount = 0
+        p058EscalationSnapshots = []
         escalationForcesMenuBar = false
         deliveredOperatorAlertKeys.removeAll()
+        cancelP058EscalationAttention()
         refreshMenuBarState()
         refreshDockBadgeLabel()
     }
@@ -129,6 +157,7 @@ final class NotificationService {
     // MARK: - P058 Escalation Attention
 
     func applyP058EscalationSnapshots(_ snapshots: [EscalationSnapshot]) {
+        p058EscalationSnapshots = snapshots
         escalationAttentionCount = snapshots.reduce(0) { total, snapshot in
             total + max(0, snapshot.pausedChainCount)
                 + (snapshot.isPolicyDrift ? 1 : 0)
@@ -137,6 +166,7 @@ final class NotificationService {
         escalationForcesMenuBar = escalationAttentionCount > 0
         refreshMenuBarState()
         refreshDockBadgeLabel()
+        refreshP058EscalationAttention()
     }
 
     // MARK: - P081 Operator Alerts
@@ -230,6 +260,22 @@ final class NotificationService {
 
     private func refreshMenuBarState() {
         isMenuBarEnabled = userMenuBarEnabled || operatorAlertForcesMenuBar || escalationForcesMenuBar
+    }
+
+    private func refreshP058EscalationAttention() {
+        guard escalationAttentionCount > 0 else {
+            cancelP058EscalationAttention()
+            return
+        }
+        guard p058AttentionToken == nil else { return }
+        if NSApp?.isActive == true { return }
+        p058AttentionToken = requestUserAttention(.informationalRequest)
+    }
+
+    private func cancelP058EscalationAttention() {
+        guard let token = p058AttentionToken else { return }
+        cancelUserAttention(token)
+        p058AttentionToken = nil
     }
 
     private func isP081OperatorAlertSilenced(_ alert: P081OperatorAlert, now: Date) -> Bool {

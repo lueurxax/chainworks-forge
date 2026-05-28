@@ -364,11 +364,105 @@ struct Proposal058Tests {
 
         #expect(service.pendingAttentionCount == 1)
         #expect(service.isMenuBarEnabled)
+        #expect(service.p058EscalationSnapshots.map(\.runId) == ["run-menu"])
 
         service.applyP058EscalationSnapshots([])
 
         #expect(service.pendingAttentionCount == 0)
         #expect(!service.isMenuBarEnabled)
+        #expect(service.p058EscalationSnapshots.isEmpty)
+    }
+
+    @Test("P058 escalation attention requests informational user attention and cancels on clear")
+    func escalationAttentionRequestsAndCancelsInformationalAttention() {
+        var requestedTypes: [NSApplication.RequestUserAttentionType] = []
+        var cancelledTokens: [Int] = []
+        let service = NotificationService(
+            requestUserAttention: { requestType in
+                requestedTypes.append(requestType)
+                return 42
+            },
+            cancelUserAttention: { token in
+                cancelledTokens.append(token)
+            }
+        )
+        let paused = EscalationSnapshot.build(
+            runId: "run-attention",
+            chains: [
+                makeChain(
+                    id: "ledger-attention",
+                    status: "paused",
+                    pauseReason: EscalationPauseReasonCode.escalationChainExhausted.rawValue
+                ),
+            ]
+        )
+
+        service.applyP058EscalationSnapshots([paused])
+        service.applyP058EscalationSnapshots([paused])
+        service.applyP058EscalationSnapshots([])
+
+        #expect(requestedTypes == [.informationalRequest])
+        #expect(cancelledTokens == [42])
+    }
+
+    @Test("P058 lineage presentation collapses repeated same-backend retry rows")
+    func lineagePresentationCollapsesRepeatedSameBackendRetries() {
+        let chains = (1...4).map { attempt in
+            EscalationChainStateDTO(
+                id: "ledger-retry-\(attempt)",
+                runId: "run-lineage",
+                stageId: "state_3",
+                agentId: "code_writer",
+                policyId: "policy-lineage",
+                policyHash: "sha256:lineage",
+                statusRaw: "active",
+                currentTierId: "primary_retry",
+                currentTierKindRaw: EscalationTierKindCode.sameBackendRetry.rawValue,
+                chainAttemptIndex: attempt,
+                triggerRaw: "repeated_same_blocker_digest",
+                pauseReasonRaw: nil,
+                operatorActionHint: nil,
+                runbookAnchor: nil,
+                createdAt: "2026-05-07T00:00:00Z",
+                updatedAt: "2026-05-07T00:00:0\(attempt)Z"
+            )
+        }
+
+        let rows = EscalationLineageDisplayRow.rows(from: chains)
+
+        #expect(rows.count == 1)
+        #expect(rows[0].isRetryCollapse)
+        #expect(rows[0].title == "Retry 4 / 4")
+        #expect(rows[0].chains.map(\.id) == chains.map(\.id))
+    }
+
+    @Test("P058 lineage presentation marks shadow rows")
+    func lineagePresentationMarksShadowRows() {
+        let chain = EscalationChainStateDTO(
+            id: "ledger-shadow",
+            runId: "run-lineage",
+            stageId: "state_3",
+            agentId: "code_writer",
+            policyId: "policy-lineage",
+            policyHash: "sha256:lineage",
+            statusRaw: "shadow_only",
+            currentTierId: "shadow_probe",
+            currentTierKindRaw: EscalationTierKindCode.backendProfile.rawValue,
+            chainAttemptIndex: 1,
+            triggerRaw: "shadow_policy_probe",
+            pauseReasonRaw: nil,
+            operatorActionHint: nil,
+            runbookAnchor: nil,
+            featureFlagState: "shadow",
+            createdAt: "2026-05-07T00:00:00Z",
+            updatedAt: "2026-05-07T00:00:01Z"
+        )
+
+        let rows = EscalationLineageDisplayRow.rows(from: [chain])
+
+        #expect(rows.count == 1)
+        #expect(rows[0].isShadow)
+        #expect(rows[0].symbol == "switch.2")
     }
 
     @Test("P031 run detail query includes P058 escalation readback")
