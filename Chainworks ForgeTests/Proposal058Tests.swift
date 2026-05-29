@@ -427,6 +427,91 @@ struct Proposal058Tests {
         #expect(presentation.handoffDetails.contains("acknowledgement_command=agents.escalation_drift_ack run-drift"))
     }
 
+    @Test("P058 drift review sheet path carries structured tier trigger and attempt inputs")
+    func driftReviewSheetPathCarriesStructuredDiffInputs() {
+        let sheet = DriftReviewSheet(
+            runID: "run-drift",
+            frozenPolicyHash: "sha256:frozen",
+            currentPolicyHash: "sha256:current",
+            acknowledgementCommand: "agents.escalation_drift_ack run-drift",
+            frozenTierIds: ["primary_retry", "human_pause"],
+            currentTierIds: ["primary_retry", "lead_review"],
+            frozenTriggers: ["contract_output_failure"],
+            currentTriggers: ["contract_output_failure", "provider_timeout"],
+            frozenMaxChainAttempts: 3,
+            currentMaxChainAttempts: 5,
+            onClose: {}
+        )
+
+        let presentation = sheet.presentationForTesting
+        #expect(presentation.rows.contains { $0.label == "Tier" && $0.frozen == "human_pause" && $0.badge == "removed" })
+        #expect(presentation.rows.contains { $0.label == "Tier" && $0.current == "lead_review" && $0.badge == "added" })
+        #expect(presentation.rows.contains { $0.label == "Trigger" && $0.current == "provider_timeout" && $0.badge == "added" })
+        #expect(presentation.rows.contains { $0.label == "Max chain attempts" && $0.frozen == "3" && $0.current == "5" })
+    }
+
+    @Test("P058 banner stack compact co-occurrence keeps highest precedence and suppressed titles")
+    func bannerStackCompactCoOccurrenceSummarizesSuppressedBanners() {
+        let snapshot = EscalationSnapshot.build(
+            runId: "run-banner",
+            chains: [
+                makeChain(
+                    id: "ledger-pause",
+                    status: "paused",
+                    pauseReason: EscalationPauseReasonCode.escalationChainExhausted.rawValue
+                ),
+                makeChain(
+                    id: "ledger-kill",
+                    status: "paused",
+                    pauseReason: EscalationPauseReasonCode.escalationKillSwitchEngaged.rawValue
+                ),
+                makeChain(
+                    id: "ledger-drift",
+                    status: "paused",
+                    pauseReason: EscalationPauseReasonCode.escalationPolicyDrift.rawValue
+                ),
+            ]
+        )
+
+        let compact = EscalationBannerStackPresentation.presentation(for: snapshot, density: .compact)
+        #expect(compact.visibleBanners.count == 1)
+        #expect(compact.visibleBanners.first?.id == "kill_switch")
+        #expect(compact.suppressedCount == 2)
+        #expect(compact.suppressedTooltip.contains("Escalation policy drift"))
+        #expect(compact.suppressedTooltip.contains("Escalation chain exhausted"))
+    }
+
+    @Test("P058 lineage rows expose disclosure support for non-collapsed details")
+    func lineageRowsExposeDisclosureForNonCollapsedDetails() {
+        let row = EscalationLineageDisplayRow.rows(from: [
+            makeChain(id: "ledger-lineage", status: "paused", pauseReason: EscalationPauseReasonCode.providerSessionForceDetached.rawValue),
+        ]).first
+
+        #expect(row?.supportsDisclosure == true)
+        #expect(row?.expandedDetails.contains("ledger ledger-lineage") == true)
+    }
+
+    @Test("P058 pause card has ultra narrow one-line fallback")
+    func pauseCardPresentationHasUltraNarrowFallback() {
+        let chain = makeChain(
+            id: "ledger-pause-narrow",
+            status: "paused",
+            pauseReason: EscalationPauseReasonCode.capacityProbeFailed.rawValue
+        )
+        let presentation = EscalationPauseCardPresentation.presentation(for: chain)
+
+        #expect(presentation.layout(forWidth: 279).mode == .oneLineSummary)
+        #expect(presentation.layout(forWidth: 320).mode == .minimumReadable)
+        #expect(presentation.layout(forWidth: 480).mode == .standard)
+    }
+
+    @Test("P058 required SF Symbols resolve on macOS")
+    func requiredSymbolsResolveOnMacOS() {
+        for symbol in EscalationSymbolCatalog.requiredSymbolNames {
+            #expect(NSImage(systemSymbolName: symbol, accessibilityDescription: nil) != nil, "Missing symbol \(symbol)")
+        }
+    }
+
     @Test("P058 screen-state matrix covers ready stale disconnected paused drift and kill-switch states")
     func screenStateMatrixCoversProposalStates() {
         let paused = makeChain(

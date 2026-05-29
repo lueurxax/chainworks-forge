@@ -136,6 +136,20 @@ enum EscalationPresentationStyle {
     }
 }
 
+enum EscalationSymbolCatalog {
+    nonisolated static let requiredSymbolNames: [String] = [
+        "pause.circle.fill",
+        "exclamationmark.triangle.fill",
+        "clock.badge.exclamationmark",
+        "arrow.triangle.2.circlepath",
+        "switch.2",
+        "person.2.badge.gearshape",
+        "pause.circle",
+        "eye",
+        "terminal",
+    ]
+}
+
 struct EscalationStatusCapsulePresentation: Equatable {
     let stateLabel: String
     let tierLabel: String?
@@ -220,12 +234,19 @@ struct EscalationStatusCapsule: View {
 
 struct EscalationBannerStack: View {
     let snapshot: EscalationSnapshot
+    var density: EscalationDensity = .standard
     var onReviewDrift: (() -> Void)?
     var onOpenRunbook: ((String) -> Void)?
 
     var body: some View {
+        let presentation = EscalationBannerStackPresentation.presentation(
+            for: snapshot,
+            density: density,
+            onReviewDrift: onReviewDrift,
+            onOpenRunbook: onOpenRunbook
+        )
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(banners, id: \.id) { banner in
+            ForEach(presentation.visibleBanners, id: \.id) { banner in
                 HStack(spacing: 10) {
                     Image(systemName: banner.symbol)
                         .foregroundStyle(banner.color)
@@ -243,6 +264,15 @@ struct EscalationBannerStack: View {
                         }
                         .buttonStyle(.bordered)
                     }
+                    if presentation.suppressedCount > 0, banner.id == presentation.visibleBanners.last?.id {
+                        Text("+\(presentation.suppressedCount)")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(.secondary.opacity(0.14), in: Capsule())
+                            .help(presentation.suppressedTooltip)
+                            .accessibilityLabel("\(presentation.suppressedCount) additional escalation banners: \(presentation.suppressedTooltip)")
+                    }
                 }
                 .padding(10)
                 .background(banner.color.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
@@ -251,8 +281,34 @@ struct EscalationBannerStack: View {
         }
         .accessibilityIdentifier("p058-escalation-banner-stack")
     }
+}
 
-    private var banners: [EscalationBanner] {
+struct EscalationBannerStackPresentation {
+    let visibleBanners: [EscalationBanner]
+    let suppressedCount: Int
+    let suppressedTooltip: String
+
+    static func presentation(
+        for snapshot: EscalationSnapshot,
+        density: EscalationDensity,
+        onReviewDrift: (() -> Void)? = nil,
+        onOpenRunbook: ((String) -> Void)? = nil
+    ) -> EscalationBannerStackPresentation {
+        let all = banners(for: snapshot, onReviewDrift: onReviewDrift, onOpenRunbook: onOpenRunbook)
+        let visible = density == .compact ? Array(all.prefix(1)) : all
+        let suppressed = density == .compact ? Array(all.dropFirst()) : []
+        return EscalationBannerStackPresentation(
+            visibleBanners: visible,
+            suppressedCount: suppressed.count,
+            suppressedTooltip: suppressed.map(\.title).joined(separator: ", ")
+        )
+    }
+
+    private static func banners(
+        for snapshot: EscalationSnapshot,
+        onReviewDrift: (() -> Void)?,
+        onOpenRunbook: ((String) -> Void)?
+    ) -> [EscalationBanner] {
         var result: [EscalationBanner] = []
         if snapshot.isKillSwitchEngaged {
             result.append(EscalationBanner(
@@ -295,7 +351,7 @@ struct EscalationBannerStack: View {
     }
 }
 
-private struct EscalationBanner {
+struct EscalationBanner {
     let id: String
     let symbol: String
     let color: Color
@@ -317,6 +373,7 @@ struct EscalationLineageDisplayRow: Equatable, Identifiable {
     let symbol: String
     let isShadow: Bool
     let isRetryCollapse: Bool
+    var supportsDisclosure: Bool { !expandedDetails.isEmpty }
 
     static func rows(from chains: [EscalationChainStateDTO]) -> [EscalationLineageDisplayRow] {
         var result: [EscalationLineageDisplayRow] = []
@@ -443,14 +500,16 @@ private struct EscalationLineageRowView: View {
 
     var body: some View {
         Group {
-            if row.isRetryCollapse {
+            if row.supportsDisclosure {
                 DisclosureGroup(isExpanded: $isExpanded) {
                     VStack(alignment: .leading, spacing: 6) {
-                        ForEach(row.chains, id: \.id) { chain in
-                            Text("\(chain.currentTierId ?? "retry") • \(chain.statusRaw) • \(EscalationPresentationStyle.triggerLabel(for: chain))")
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
+                        if row.isRetryCollapse {
+                            ForEach(row.chains, id: \.id) { chain in
+                                Text("\(chain.currentTierId ?? "retry") • \(chain.statusRaw) • \(EscalationPresentationStyle.triggerLabel(for: chain))")
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
                         }
                         ForEach(row.expandedDetails, id: \.self) { detail in
                             Text(detail)
@@ -465,17 +524,6 @@ private struct EscalationLineageRowView: View {
                 }
             } else {
                 rowBody
-                if isExpanded {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(row.expandedDetails, id: \.self) { detail in
-                            Text(detail)
-                                .font(.caption2.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                    }
-                    .padding(.top, 4)
-                }
             }
         }
         .focusable(true)
@@ -595,6 +643,30 @@ struct EscalationPauseCardPresentation: Equatable {
             accessibilityLabel: [title, countdown, metadata].compactMap { $0 }.joined(separator: ", ")
         )
     }
+
+    func layout(forWidth width: CGFloat) -> EscalationPauseCardLayout {
+        if width < 280 {
+            return EscalationPauseCardLayout(
+                mode: .oneLineSummary,
+                summary: [title, countdownLabel].compactMap { $0 }.joined(separator: " • ")
+            )
+        }
+        if width < 360 {
+            return EscalationPauseCardLayout(mode: .minimumReadable, summary: title)
+        }
+        return EscalationPauseCardLayout(mode: .standard, summary: title)
+    }
+}
+
+struct EscalationPauseCardLayout: Equatable {
+    let mode: EscalationPauseCardLayoutMode
+    let summary: String
+}
+
+enum EscalationPauseCardLayoutMode: Equatable {
+    case oneLineSummary
+    case minimumReadable
+    case standard
 }
 
 struct EscalationPauseCard: View {
@@ -604,13 +676,29 @@ struct EscalationPauseCard: View {
 
     var body: some View {
         let presentation = EscalationPauseCardPresentation.presentation(for: chain)
+        ViewThatFits(in: .horizontal) {
+            pauseCardStandard(presentation)
+            pauseCardMinimum(presentation)
+            Label(
+                presentation.layout(forWidth: 279).summary,
+                systemImage: "pause.circle.fill"
+            )
+            .font(.caption.weight(.semibold))
+            .lineLimit(1)
+        }
+        .padding(12)
+        .frame(minWidth: 240, idealWidth: 480, minHeight: 44, alignment: .leading)
+        .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(presentation.accessibilityLabel)
+        .accessibilityIdentifier("p058-escalation-pause-card")
+    }
+
+    private func pauseCardStandard(_ presentation: EscalationPauseCardPresentation) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label(
-                    presentation.title,
-                    systemImage: "pause.circle.fill"
-                )
-                .font(.headline)
+                Label(presentation.title, systemImage: "pause.circle.fill")
+                    .font(.headline)
                 Spacer()
                 Text(presentation.countdownLabel ?? chain.statusRaw)
                     .font(.caption.weight(.semibold))
@@ -619,23 +707,29 @@ struct EscalationPauseCard: View {
             Text(presentation.body)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-            ViewThatFits(in: .horizontal) {
-                affordanceRow
-                VStack(alignment: .leading, spacing: 8) {
-                    affordanceRow
-                }
-            }
+            affordanceRow
             Text(presentation.metadata)
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
         }
-        .padding(12)
-        .frame(minWidth: 280, idealWidth: 480, alignment: .leading)
-        .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(presentation.accessibilityLabel)
-        .accessibilityIdentifier("p058-escalation-pause-card")
+    }
+
+    private func pauseCardMinimum(_ presentation: EscalationPauseCardPresentation) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Label(presentation.title, systemImage: "pause.circle.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Text(presentation.countdownLabel ?? chain.statusRaw)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            Text(presentation.metadata)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
     }
 
     private var affordanceRow: some View {
@@ -1194,6 +1288,12 @@ struct DriftReviewSheet: View {
     let frozenPolicyHash: String
     let currentPolicyHash: String
     let acknowledgementCommand: String
+    var frozenTierIds: [String] = []
+    var currentTierIds: [String] = []
+    var frozenTriggers: [String] = []
+    var currentTriggers: [String] = []
+    var frozenMaxChainAttempts: Int?
+    var currentMaxChainAttempts: Int?
     var onClose: () -> Void
     var onCopyCommand: ((String) -> Void)?
     var onOpenExternalWorkflow: (() -> Void)?
@@ -1216,12 +1316,22 @@ struct DriftReviewSheet: View {
         .accessibilityIdentifier("p058-drift-review-sheet")
     }
 
+    var presentationForTesting: DriftReviewPresentation {
+        presentation
+    }
+
     private var presentation: DriftReviewPresentation {
         DriftReviewPresentation.presentation(
             runID: runID,
             frozenPolicyHash: frozenPolicyHash,
             currentPolicyHash: currentPolicyHash,
-            acknowledgementCommand: acknowledgementCommand
+            acknowledgementCommand: acknowledgementCommand,
+            frozenTierIds: frozenTierIds,
+            currentTierIds: currentTierIds,
+            frozenTriggers: frozenTriggers,
+            currentTriggers: currentTriggers,
+            frozenMaxChainAttempts: frozenMaxChainAttempts,
+            currentMaxChainAttempts: currentMaxChainAttempts
         )
     }
 
