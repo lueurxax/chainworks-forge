@@ -315,6 +315,118 @@ struct Proposal058Tests {
         )
     }
 
+    @Test("P058 status capsule preserves field order, truncation, and full accessibility ids")
+    func statusCapsulePresentationMatchesContract() {
+        let chain = EscalationChainStateDTO(
+            id: "ledger-status-contract",
+            runId: "run-ui",
+            stageId: "state_3",
+            agentId: "code_writer",
+            policyId: "policy-ui",
+            policyHash: "sha256:ui",
+            statusRaw: "active",
+            currentTierId: "same_backend_retry_with_a_very_long_identifier",
+            currentTierKindRaw: EscalationTierKindCode.sameBackendRetry.rawValue,
+            chainAttemptIndex: 3,
+            triggerRaw: "repeated_same_blocker_digest_with_long_tail",
+            pauseReasonRaw: nil,
+            operatorActionHint: nil,
+            runbookAnchor: nil,
+            createdAt: "2026-05-07T00:00:00Z",
+            updatedAt: "2026-05-07T00:00:10Z"
+        )
+        let snapshot = EscalationSnapshot.build(runId: "run-ui", chains: [chain])
+
+        let standard = EscalationStatusCapsulePresentation.presentation(for: snapshot, density: .standard)
+        let detailed = EscalationStatusCapsulePresentation.presentation(for: snapshot, density: .detailed)
+        let compact = EscalationStatusCapsulePresentation.presentation(for: snapshot, density: .compact)
+
+        #expect(standard.stateLabel == "Escalating")
+        #expect(standard.tierLabel?.contains("...") == true)
+        #expect(standard.triggerLabel == nil)
+        #expect(detailed.triggerLabel?.contains("...") == true)
+        #expect(compact.tierLabel == nil)
+        #expect(compact.triggerLabel == nil)
+        #expect(detailed.accessibilityLabel.contains("same_backend_retry_with_a_very_long_identifier"))
+        #expect(detailed.accessibilityLabel.contains("repeated_same_blocker_digest_with_long_tail"))
+    }
+
+    @Test("P058 pause card countdown and metadata use deterministic presentation")
+    func pauseCardPresentationFormatsCountdownAndMetadata() {
+        let chain = EscalationChainStateDTO(
+            id: "ledger-pause-contract",
+            runId: "run-ui",
+            stageId: "state_3",
+            agentId: "code_writer",
+            policyId: "policy-ui",
+            policyHash: "sha256:ui",
+            statusRaw: "paused",
+            currentTierId: "human_pause",
+            currentTierKindRaw: EscalationTierKindCode.pause.rawValue,
+            chainAttemptIndex: 4,
+            triggerRaw: "contract_output_failure",
+            pauseReasonRaw: EscalationPauseReasonCode.escalationChainExhausted.rawValue,
+            operatorActionHint: "Open runbook before resuming.",
+            runbookAnchor: "escalation/chain-exhausted",
+            waitingRetryAfterUntil: "2026-05-07T00:02:05Z",
+            createdAt: "2026-05-07T00:00:00Z",
+            updatedAt: "2026-05-07T00:00:01Z"
+        )
+
+        let presentation = EscalationPauseCardPresentation.presentation(
+            for: chain,
+            now: ISO8601DateFormatter().date(from: "2026-05-07T00:01:00Z")!
+        )
+
+        #expect(presentation.title == "Escalation chain exhausted")
+        #expect(presentation.countdownLabel == "1:05")
+        #expect(presentation.metadata.contains("Policy policy-ui"))
+        #expect(presentation.metadata.contains("Tier human_pause"))
+        #expect(presentation.accessibilityLabel.contains("1:05"))
+    }
+
+    @Test("P058 command mirror presentation carries disabled reason and middle truncation")
+    func commandMirrorPresentationMatchesDisabledReasonContract() {
+        let title = "Escalation command title that is intentionally far longer than forty eight characters"
+        let presentation = EscalationCommandMirrorPresentation.presentation(
+            title: title,
+            subtitle: "Copy this command.",
+            stateBadge: "paused",
+            disabledReason: "Unavailable while escalation state is active."
+        )
+
+        #expect(presentation.title.count <= EscalationPresentationStyle.commandTitleLimit + 2)
+        #expect(presentation.title.contains("..."))
+        #expect(presentation.fullTitle == title)
+        #expect(presentation.subtitle == "Unavailable while escalation state is active.")
+        #expect(presentation.accessibilityHint == "Unavailable while escalation state is active.")
+        #expect(presentation.helpText.contains(title))
+    }
+
+    @Test("P058 drift review presentation exposes structured diff and handoff details")
+    func driftReviewPresentationExposesStructuredDiff() {
+        let presentation = DriftReviewPresentation.presentation(
+            runID: "run-drift",
+            frozenPolicyHash: "sha256:frozen",
+            currentPolicyHash: "sha256:current",
+            acknowledgementCommand: "agents.escalation_drift_ack run-drift",
+            frozenTierIds: ["primary_retry", "human_pause"],
+            currentTierIds: ["primary_retry", "lead_review"],
+            frozenTriggers: ["contract_output_failure"],
+            currentTriggers: ["contract_output_failure", "provider_timeout"],
+            frozenMaxChainAttempts: 3,
+            currentMaxChainAttempts: 5
+        )
+
+        #expect(!presentation.isEmpty)
+        #expect(presentation.rows.contains { $0.label == "Tier" && $0.frozen == "human_pause" && $0.badge == "removed" })
+        #expect(presentation.rows.contains { $0.label == "Tier" && $0.current == "lead_review" && $0.badge == "added" })
+        #expect(presentation.rows.contains { $0.label == "Trigger" && $0.current == "provider_timeout" && $0.badge == "added" })
+        #expect(presentation.rows.contains { $0.label == "Max chain attempts" && $0.frozen == "3" && $0.current == "5" })
+        #expect(presentation.handoffDetails.contains("run_id=run-drift"))
+        #expect(presentation.handoffDetails.contains("acknowledgement_command=agents.escalation_drift_ack run-drift"))
+    }
+
     @Test("P058 screen-state matrix covers ready stale disconnected paused drift and kill-switch states")
     func screenStateMatrixCoversProposalStates() {
         let paused = makeChain(
@@ -519,6 +631,38 @@ struct Proposal058Tests {
         registry.applyVisibleRunChains([:])
     }
 
+    @Test("P058 retained inspector adapter survives visible-run aggregation refresh")
+    func retainedInspectorAdapterSurvivesVisibleRunRefresh() {
+        let registry = EscalationReadAdapterRegistry.shared
+        let retainedRun = "run-retained-\(UUID().uuidString)"
+        let visibleRun = "run-visible-\(UUID().uuidString)"
+        defer {
+            registry.removeAdapter(for: retainedRun)
+            registry.removeAdapter(for: visibleRun)
+        }
+
+        registry.retainAdapter(for: retainedRun)
+        registry.applyChains([
+            makeChain(
+                id: "ledger-retained",
+                status: "paused",
+                pauseReason: EscalationPauseReasonCode.escalationChainExhausted.rawValue
+            ),
+        ], for: retainedRun)
+        registry.applyVisibleRunChains([
+            visibleRun: [
+                makeChain(
+                    id: "ledger-visible",
+                    status: "paused",
+                    pauseReason: EscalationPauseReasonCode.providerSessionForceDetached.rawValue
+                ),
+            ],
+        ])
+
+        #expect(registry.snapshots.map(\.runId).contains(retainedRun))
+        #expect(registry.snapshots.map(\.runId).contains(visibleRun))
+    }
+
     @Test("P058 registry notifies all-run attention observers on every adapter snapshot")
     func registryNotifiesAttentionObserversOnEveryAdapterSnapshot() {
         let registry = EscalationReadAdapterRegistry.shared
@@ -693,6 +837,58 @@ struct Proposal058Tests {
         #expect(rows[0].isRetryCollapse)
         #expect(rows[0].title == "Retry 4 / 4")
         #expect(rows[0].chains.map(\.id) == chains.map(\.id))
+    }
+
+    @Test("P058 lineage presentation keeps non-collapsed rows, duration, and expanded refs")
+    func lineagePresentationKeepsRowsDurationAndRefs() {
+        let chains = [
+            EscalationChainStateDTO(
+                id: "ledger-lineage-a",
+                runId: "run-lineage",
+                stageId: "state_3",
+                agentId: "code_writer",
+                policyId: "policy-lineage",
+                policyHash: "sha256:lineage",
+                statusRaw: "active",
+                currentTierId: "lead_review",
+                currentTierKindRaw: EscalationTierKindCode.leadMediation.rawValue,
+                chainAttemptIndex: 1,
+                triggerRaw: "provider_timeout",
+                pauseReasonRaw: nil,
+                operatorActionHint: nil,
+                runbookAnchor: nil,
+                traceUnavailableReasonRaw: "redacted_ref_only",
+                createdAt: "2026-05-07T00:00:00Z",
+                updatedAt: "2026-05-07T00:01:05Z"
+            ),
+            EscalationChainStateDTO(
+                id: "ledger-lineage-b",
+                runId: "run-lineage",
+                stageId: "state_4",
+                agentId: "code_writer",
+                policyId: "policy-lineage",
+                policyHash: "sha256:lineage",
+                statusRaw: "paused",
+                currentTierId: "human_pause",
+                currentTierKindRaw: EscalationTierKindCode.pause.rawValue,
+                chainAttemptIndex: 2,
+                triggerRaw: "contract_output_failure",
+                pauseReasonRaw: EscalationPauseReasonCode.escalationChainExhausted.rawValue,
+                operatorActionHint: nil,
+                runbookAnchor: nil,
+                createdAt: "2026-05-07T00:02:00Z",
+                updatedAt: "2026-05-07T00:02:14Z"
+            ),
+        ]
+
+        let rows = EscalationLineageDisplayRow.rows(from: chains)
+
+        #expect(rows.map(\.id) == ["ledger-lineage-a", "ledger-lineage-b"])
+        #expect(rows[0].durationLabel == "1m 5s")
+        #expect(rows[1].durationLabel == "14s")
+        #expect(rows[0].expandedDetails.contains("ledger ledger-lineage-a"))
+        #expect(rows[0].expandedDetails.contains("trace redacted_ref_only"))
+        #expect(rows[1].attemptLabel == "#2")
     }
 
     @Test("P058 lineage presentation marks shadow rows")

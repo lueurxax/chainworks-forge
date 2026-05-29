@@ -1,4 +1,5 @@
 import AppKit
+import Foundation
 import SwiftUI
 
 enum EscalationDensity: String, Sendable {
@@ -8,6 +9,9 @@ enum EscalationDensity: String, Sendable {
 }
 
 enum EscalationPresentationStyle {
+    nonisolated static let statusLabelLimit = 24
+    nonisolated static let commandTitleLimit = 48
+
     nonisolated static func stateLabel(for snapshot: EscalationSnapshot) -> String {
         if snapshot.isKillSwitchEngaged { return "Kill switch" }
         if snapshot.isPolicyDrift { return "Policy drift" }
@@ -25,6 +29,15 @@ enum EscalationPresentationStyle {
     }
 
     static func accentColor(for snapshot: EscalationSnapshot) -> Color {
+        if let first = snapshot.activeChains.first,
+           first.currentTierKindRaw == EscalationTierKindCode.sameBackendRetry.rawValue {
+            if first.statusRaw == "paused" || first.statusRaw == "exhausted" {
+                return .orange
+            }
+            if first.statusRaw == "active" || first.triggerRaw != nil {
+                return .accentColor
+            }
+        }
         if snapshot.isKillSwitchEngaged || snapshot.isPolicyDrift { return .orange }
         if snapshot.pausedChainCount > 0 { return .yellow }
         if snapshot.hasActiveEscalation { return .accentColor }
@@ -36,7 +49,47 @@ enum EscalationPresentationStyle {
     }
 
     nonisolated static func triggerLabel(for chain: EscalationChainStateDTO) -> String {
-        chain.triggerRaw ?? "standard execution"
+        chain.triggerRaw ?? "Standard Execution"
+    }
+
+    nonisolated static func middleTruncated(_ value: String, limit: Int) -> String {
+        guard limit > 3, value.count > limit else { return value }
+        let available = limit - 1
+        let prefixCount = max(1, available / 2)
+        let suffixCount = max(1, available - prefixCount)
+        return "\(value.prefix(prefixCount))...\(value.suffix(suffixCount))"
+    }
+
+    nonisolated static func countdownLabel(until rawDate: String?, now: Date = Date()) -> String? {
+        guard let rawDate, let target = parseDate(rawDate) else { return nil }
+        let seconds = max(0, Int(target.timeIntervalSince(now).rounded(.down)))
+        if seconds == 0 { return "Ready to retry" }
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3_600 {
+            return "\(seconds / 60):\(String(format: "%02d", seconds % 60))"
+        }
+        if seconds < 86_400 {
+            return "\(seconds / 3_600):\(String(format: "%02d", (seconds % 3_600) / 60)):\(String(format: "%02d", seconds % 60))"
+        }
+        return "\(seconds / 86_400)d \((seconds % 86_400) / 3_600)h"
+    }
+
+    nonisolated static func durationLabel(createdAt: String, updatedAt: String) -> String? {
+        guard let created = parseDate(createdAt), let updated = parseDate(updatedAt) else { return nil }
+        let seconds = max(0, Int(updated.timeIntervalSince(created).rounded()))
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3_600 { return "\(seconds / 60)m \(seconds % 60)s" }
+        return "\(seconds / 3_600)h \((seconds % 3_600) / 60)m"
+    }
+
+    nonisolated private static func parseDate(_ raw: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: raw) {
+            return date
+        }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: raw)
     }
 
     nonisolated static func isShadowLineageRow(_ chain: EscalationChainStateDTO) -> Bool {
@@ -83,33 +136,85 @@ enum EscalationPresentationStyle {
     }
 }
 
+struct EscalationStatusCapsulePresentation: Equatable {
+    let stateLabel: String
+    let tierLabel: String?
+    let triggerLabel: String?
+    let accessibilityLabel: String
+    let helpText: String
+
+    static func presentation(
+        for snapshot: EscalationSnapshot,
+        density: EscalationDensity
+    ) -> EscalationStatusCapsulePresentation {
+        let state = EscalationPresentationStyle.stateLabel(for: snapshot)
+        guard let first = snapshot.activeChains.first else {
+            return EscalationStatusCapsulePresentation(
+                stateLabel: state,
+                tierLabel: nil,
+                triggerLabel: nil,
+                accessibilityLabel: EscalationPresentationStyle.accessibilitySummary(for: snapshot),
+                helpText: state
+            )
+        }
+
+        let tier = EscalationPresentationStyle.middleTruncated(
+            EscalationPresentationStyle.tierLabel(for: first),
+            limit: EscalationPresentationStyle.statusLabelLimit
+        )
+        let trigger = EscalationPresentationStyle.middleTruncated(
+            EscalationPresentationStyle.triggerLabel(for: first),
+            limit: EscalationPresentationStyle.statusLabelLimit
+        )
+        let fullParts = [
+            state,
+            EscalationPresentationStyle.tierLabel(for: first),
+            EscalationPresentationStyle.triggerLabel(for: first),
+            first.policyId,
+            first.id,
+        ]
+        return EscalationStatusCapsulePresentation(
+            stateLabel: state,
+            tierLabel: density == .compact ? nil : tier,
+            triggerLabel: density == .detailed ? trigger : nil,
+            accessibilityLabel: fullParts.joined(separator: ", "),
+            helpText: fullParts.joined(separator: " • ")
+        )
+    }
+}
+
 struct EscalationStatusCapsule: View {
     let snapshot: EscalationSnapshot
     let density: EscalationDensity
 
     var body: some View {
-        let label = EscalationPresentationStyle.stateLabel(for: snapshot)
-        Label(label, systemImage: EscalationPresentationStyle.stateSymbol(for: snapshot))
+        let presentation = EscalationStatusCapsulePresentation.presentation(for: snapshot, density: density)
+        HStack(spacing: 5) {
+            Label(presentation.stateLabel, systemImage: EscalationPresentationStyle.stateSymbol(for: snapshot))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(EscalationPresentationStyle.accentColor(for: snapshot).opacity(0.14), in: Capsule())
+            if let tierLabel = presentation.tierLabel {
+                Text("•")
+                    .foregroundStyle(.secondary)
+                Text(tierLabel)
+                    .lineLimit(1)
+            }
+            if let triggerLabel = presentation.triggerLabel {
+                Text("•")
+                    .foregroundStyle(.secondary)
+                Text(triggerLabel)
+                    .lineLimit(1)
+            }
+        }
             .font(.caption.weight(.semibold))
             .lineLimit(1)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.horizontal, density == .compact ? 0 : 2)
+            .padding(.vertical, 2)
             .foregroundStyle(EscalationPresentationStyle.accentColor(for: snapshot))
-            .background(EscalationPresentationStyle.accentColor(for: snapshot).opacity(0.14), in: Capsule())
-            .help(helpText)
-            .accessibilityLabel(EscalationPresentationStyle.accessibilitySummary(for: snapshot))
+            .help(presentation.helpText)
+            .accessibilityLabel(presentation.accessibilityLabel)
             .accessibilityIdentifier("p058-escalation-status-capsule-\(density.rawValue)")
-    }
-
-    private var helpText: String {
-        guard density != .compact, let first = snapshot.activeChains.first else {
-            return EscalationPresentationStyle.stateLabel(for: snapshot)
-        }
-        return [
-            EscalationPresentationStyle.stateLabel(for: snapshot),
-            EscalationPresentationStyle.tierLabel(for: first),
-            EscalationPresentationStyle.triggerLabel(for: first),
-        ].joined(separator: " • ")
     }
 }
 
@@ -207,6 +312,8 @@ struct EscalationLineageDisplayRow: Equatable, Identifiable {
     let subtitle: String
     let detail: String?
     let attemptLabel: String
+    let durationLabel: String?
+    let expandedDetails: [String]
     let symbol: String
     let isShadow: Bool
     let isRetryCollapse: Bool
@@ -237,6 +344,11 @@ struct EscalationLineageDisplayRow: Equatable, Identifiable {
                         subtitle: "\(tierID) • \(EscalationPresentationStyle.triggerLabel(for: latest))",
                         detail: latest.pauseReasonRaw,
                         attemptLabel: "#\(latest.chainAttemptIndex)",
+                        durationLabel: EscalationPresentationStyle.durationLabel(
+                            createdAt: group.first?.createdAt ?? latest.createdAt,
+                            updatedAt: latest.updatedAt
+                        ),
+                        expandedDetails: expandedDetails(for: latest),
                         symbol: "arrow.triangle.2.circlepath",
                         isShadow: group.contains(where: EscalationPresentationStyle.isShadowLineageRow),
                         isRetryCollapse: true
@@ -253,6 +365,8 @@ struct EscalationLineageDisplayRow: Equatable, Identifiable {
                 subtitle: "\(chain.statusRaw) • \(EscalationPresentationStyle.triggerLabel(for: chain))",
                 detail: chain.pauseReasonRaw,
                 attemptLabel: "#\(chain.chainAttemptIndex)",
+                durationLabel: EscalationPresentationStyle.durationLabel(createdAt: chain.createdAt, updatedAt: chain.updatedAt),
+                expandedDetails: expandedDetails(for: chain),
                 symbol: symbol(for: chain),
                 isShadow: EscalationPresentationStyle.isShadowLineageRow(chain),
                 isRetryCollapse: false
@@ -261,6 +375,17 @@ struct EscalationLineageDisplayRow: Equatable, Identifiable {
         }
 
         return result
+    }
+
+    private static func expandedDetails(for chain: EscalationChainStateDTO) -> [String] {
+        [
+            "ledger \(chain.id)",
+            "policy \(chain.policyId)",
+            "stage \(chain.stageId)",
+            "agent \(chain.agentId)",
+            "redaction v1",
+            "trace \(chain.traceUnavailableReasonRaw ?? "available")",
+        ]
     }
 
     private static func symbol(for chain: EscalationChainStateDTO) -> String {
@@ -327,6 +452,12 @@ private struct EscalationLineageRowView: View {
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
                         }
+                        ForEach(row.expandedDetails, id: \.self) { detail in
+                            Text(detail)
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                     }
                     .padding(.top, 4)
                 } label: {
@@ -334,6 +465,17 @@ private struct EscalationLineageRowView: View {
                 }
             } else {
                 rowBody
+                if isExpanded {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(row.expandedDetails, id: \.self) { detail in
+                            Text(detail)
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    .padding(.top, 4)
+                }
             }
         }
         .focusable(true)
@@ -360,14 +502,14 @@ private struct EscalationLineageRowView: View {
                 symbol
                 titleBlock
                 Spacer()
-                attempt
+                trailingFacts
             }
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
                     symbol
                     titleBlock
                 }
-                attempt
+                trailingFacts
             }
         }
     }
@@ -396,11 +538,16 @@ private struct EscalationLineageRowView: View {
         }
     }
 
-    private var attempt: some View {
-        Text(row.attemptLabel)
-            .font(.caption.monospacedDigit())
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
+    private var trailingFacts: some View {
+        VStack(alignment: .trailing, spacing: 3) {
+            Text(row.attemptLabel)
+            if let durationLabel = row.durationLabel {
+                Text(durationLabel)
+            }
+        }
+        .font(.caption.monospacedDigit())
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
     }
 
     private var color: Color {
@@ -421,10 +568,32 @@ private struct EscalationLineageRowView: View {
             row.subtitle,
             row.detail,
             row.attemptLabel,
+            row.durationLabel,
             row.isShadow ? "shadow row" : nil,
         ]
         .compactMap { $0 }
         .joined(separator: ", ")
+    }
+}
+
+struct EscalationPauseCardPresentation: Equatable {
+    let title: String
+    let body: String
+    let countdownLabel: String?
+    let metadata: String
+    let accessibilityLabel: String
+
+    static func presentation(for chain: EscalationChainStateDTO, now: Date = Date()) -> EscalationPauseCardPresentation {
+        let title = EscalationPresentationStyle.pauseTitle(for: chain.pauseReasonRaw)
+        let countdown = EscalationPresentationStyle.countdownLabel(until: chain.waitingRetryAfterUntil, now: now)
+        let metadata = "Policy \(chain.policyId) • Tier \(chain.currentTierId ?? "Tier 0") • Trigger \(chain.triggerRaw ?? "none")"
+        return EscalationPauseCardPresentation(
+            title: title,
+            body: chain.operatorActionHint ?? "Review the escalation runbook before taking action.",
+            countdownLabel: countdown,
+            metadata: metadata,
+            accessibilityLabel: [title, countdown, metadata].compactMap { $0 }.joined(separator: ", ")
+        )
     }
 }
 
@@ -434,37 +603,49 @@ struct EscalationPauseCard: View {
     var onCopyDiagnostic: ((String) -> Void)?
 
     var body: some View {
+        let presentation = EscalationPauseCardPresentation.presentation(for: chain)
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Label(
-                    EscalationPresentationStyle.pauseTitle(for: chain.pauseReasonRaw),
+                    presentation.title,
                     systemImage: "pause.circle.fill"
                 )
                 .font(.headline)
                 Spacer()
-                Text(chain.statusRaw)
+                Text(presentation.countdownLabel ?? chain.statusRaw)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
             }
-            Text(chain.operatorActionHint ?? "Review the escalation runbook before taking action.")
+            Text(presentation.body)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-            HStack {
-                if let runbook = chain.runbookAnchor {
-                    Button("Open runbook") { onOpenRunbook?(runbook) }
+            ViewThatFits(in: .horizontal) {
+                affordanceRow
+                VStack(alignment: .leading, spacing: 8) {
+                    affordanceRow
                 }
-                Button("Copy diagnostic bundle") { onCopyDiagnostic?(diagnosticBundle) }
             }
-            .buttonStyle(.bordered)
-            Text("Policy \(chain.policyId) • Tier \(chain.currentTierId ?? "Tier 0") • Trigger \(chain.triggerRaw ?? "none")")
+            Text(presentation.metadata)
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
         }
         .padding(12)
+        .frame(minWidth: 280, idealWidth: 480, alignment: .leading)
         .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
         .accessibilityElement(children: .combine)
+        .accessibilityLabel(presentation.accessibilityLabel)
         .accessibilityIdentifier("p058-escalation-pause-card")
+    }
+
+    private var affordanceRow: some View {
+        HStack {
+            if let runbook = chain.runbookAnchor {
+                Button("Open runbook") { onOpenRunbook?(runbook) }
+            }
+            Button("Copy diagnostic bundle") { onCopyDiagnostic?(diagnosticBundle) }
+        }
+        .buttonStyle(.bordered)
     }
 
     private var diagnosticBundle: String {
@@ -481,36 +662,115 @@ struct EscalationPauseCard: View {
     }
 }
 
+struct EscalationCommandMirrorPresentation: Equatable {
+    let title: String
+    let fullTitle: String
+    let subtitle: String
+    let stateBadge: String?
+    let disabledReason: String?
+    let helpText: String
+    let accessibilityLabel: String
+    let accessibilityHint: String
+
+    static func presentation(
+        title: String,
+        subtitle: String,
+        stateBadge: String? = nil,
+        disabledReason: String? = nil
+    ) -> EscalationCommandMirrorPresentation {
+        let displayedTitle = EscalationPresentationStyle.middleTruncated(
+            title,
+            limit: EscalationPresentationStyle.commandTitleLimit
+        )
+        let effectiveSubtitle = disabledReason ?? subtitle
+        return EscalationCommandMirrorPresentation(
+            title: displayedTitle,
+            fullTitle: title,
+            subtitle: effectiveSubtitle,
+            stateBadge: stateBadge,
+            disabledReason: disabledReason,
+            helpText: [title, effectiveSubtitle, stateBadge].compactMap { $0 }.joined(separator: " • "),
+            accessibilityLabel: [title, stateBadge, effectiveSubtitle].compactMap { $0 }.joined(separator: ", "),
+            accessibilityHint: disabledReason ?? "Copies the mirrored operator command"
+        )
+    }
+}
+
 struct EscalationCommandMirrorRow: View {
     let title: String
     let subtitle: String
     let command: String
+    var stateBadge: String?
+    var disabledReason: String?
     var onCopyCommand: ((String) -> Void)?
+
+    private var presentation: EscalationCommandMirrorPresentation {
+        EscalationCommandMirrorPresentation.presentation(
+            title: title,
+            subtitle: subtitle,
+            stateBadge: stateBadge,
+            disabledReason: disabledReason
+        )
+    }
+
+    private var subtitleColor: Color {
+        disabledReason == nil ? .secondary : .orange
+    }
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
-            Image(systemName: "terminal")
-                .foregroundStyle(.secondary)
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.subheadline.weight(.semibold))
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
+            commandIcon
+            commandText
             Spacer()
-            Button("Copy command") {
-                onCopyCommand?(command)
-            }
-            .buttonStyle(.bordered)
-            .accessibilityLabel("Copy escalation command for \(title)")
+            copyButton
         }
         .padding(10)
         .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .help(presentation.helpText)
         .accessibilityElement(children: .combine)
+        .accessibilityLabel(presentation.accessibilityLabel)
+        .accessibilityHint(presentation.accessibilityHint)
         .accessibilityIdentifier("p058-escalation-command-row")
+    }
+
+    private var commandIcon: some View {
+        Image(systemName: "terminal")
+            .foregroundStyle(.secondary)
+            .frame(width: 18)
+    }
+
+    private var commandText: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            commandTitleRow
+            Text(presentation.subtitle)
+                .font(.caption)
+                .foregroundStyle(subtitleColor)
+                .lineLimit(2)
+        }
+    }
+
+    private var commandTitleRow: some View {
+        HStack(spacing: 6) {
+            Text(presentation.title)
+                .font(.subheadline.weight(.semibold))
+                .help(presentation.fullTitle)
+            if let stateBadge = presentation.stateBadge {
+                Text(stateBadge)
+                    .font(.caption2.weight(.semibold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(.secondary.opacity(0.12), in: Capsule())
+            }
+        }
+    }
+
+    private var copyButton: some View {
+        Button("Copy command") {
+            onCopyCommand?(command)
+        }
+        .buttonStyle(.bordered)
+        .disabled(disabledReason != nil)
+        .accessibilityLabel("Copy escalation command for \(presentation.fullTitle)")
     }
 }
 
@@ -527,6 +787,8 @@ struct EscalationCommandMirrorList: View {
                     title: row.title,
                     subtitle: row.subtitle,
                     command: row.command,
+                    stateBadge: row.stateBadge,
+                    disabledReason: row.disabledReason,
                     onCopyCommand: onCopyCommand
                 )
             }
@@ -534,7 +796,7 @@ struct EscalationCommandMirrorList: View {
         .accessibilityIdentifier("p058-escalation-command-list")
     }
 
-    private var commandRows: [(title: String, subtitle: String, command: String)] {
+    private var commandRows: [(title: String, subtitle: String, command: String, stateBadge: String?, disabledReason: String?)] {
         snapshot.activeChains.compactMap { chain in
             guard let reason = chain.pauseReasonRaw else { return nil }
             let title = EscalationPresentationStyle.pauseTitle(for: reason)
@@ -547,7 +809,9 @@ struct EscalationCommandMirrorList: View {
             return (
                 title: title,
                 subtitle: chain.operatorActionHint ?? "Inspect the escalation readback before taking action.",
-                command: command
+                command: command,
+                stateBadge: chain.statusRaw,
+                disabledReason: chain.statusRaw == "paused" ? nil : "Unavailable while escalation state is \(chain.statusRaw)."
             )
         }
     }
@@ -851,7 +1115,82 @@ enum EscalationTracePasteboardWriter {
     }
 }
 
+struct DriftReviewPresentation: Equatable {
+    let rows: [DriftReviewRow]
+    let isEmpty: Bool
+    let handoffDetails: String
+
+    static func presentation(
+        runID: String,
+        frozenPolicyHash: String,
+        currentPolicyHash: String,
+        acknowledgementCommand: String,
+        frozenTierIds: [String] = [],
+        currentTierIds: [String] = [],
+        frozenTriggers: [String] = [],
+        currentTriggers: [String] = [],
+        frozenMaxChainAttempts: Int? = nil,
+        currentMaxChainAttempts: Int? = nil
+    ) -> DriftReviewPresentation {
+        var rows: [DriftReviewRow] = [
+            DriftReviewRow(label: "Run", frozen: runID, current: runID, badge: "context"),
+            DriftReviewRow(
+                label: "Policy hash",
+                frozen: frozenPolicyHash,
+                current: currentPolicyHash,
+                badge: frozenPolicyHash == currentPolicyHash ? "unchanged" : "changed"
+            ),
+        ]
+        rows.append(contentsOf: diffRows(label: "Tier", frozen: frozenTierIds, current: currentTierIds))
+        rows.append(contentsOf: diffRows(label: "Trigger", frozen: frozenTriggers, current: currentTriggers))
+        if frozenMaxChainAttempts != currentMaxChainAttempts {
+            rows.append(DriftReviewRow(
+                label: "Max chain attempts",
+                frozen: frozenMaxChainAttempts.map(String.init) ?? "unset",
+                current: currentMaxChainAttempts.map(String.init) ?? "unset",
+                badge: "changed"
+            ))
+        }
+
+        let handoff = [
+            "run_id=\(runID)",
+            "frozen_policy_hash=\(frozenPolicyHash)",
+            "current_policy_hash=\(currentPolicyHash)",
+            "acknowledgement_command=\(acknowledgementCommand)",
+        ].joined(separator: "\n")
+        return DriftReviewPresentation(
+            rows: rows,
+            isEmpty: rows.count <= 2 && frozenPolicyHash == currentPolicyHash,
+            handoffDetails: handoff
+        )
+    }
+
+    private static func diffRows(label: String, frozen: [String], current: [String]) -> [DriftReviewRow] {
+        let frozenSet = Set(frozen)
+        let currentSet = Set(current)
+        let removed = frozenSet.subtracting(currentSet).sorted().map {
+            DriftReviewRow(label: label, frozen: $0, current: "missing", badge: "removed")
+        }
+        let added = currentSet.subtracting(frozenSet).sorted().map {
+            DriftReviewRow(label: label, frozen: "missing", current: $0, badge: "added")
+        }
+        let retained = frozenSet.intersection(currentSet).sorted().map {
+            DriftReviewRow(label: label, frozen: $0, current: $0, badge: "unchanged")
+        }
+        return removed + added + retained
+    }
+}
+
+struct DriftReviewRow: Equatable, Identifiable {
+    var id: String { "\(label)-\(frozen)-\(current)-\(badge)" }
+    let label: String
+    let frozen: String
+    let current: String
+    let badge: String
+}
+
 struct DriftReviewSheet: View {
+    var runID: String = "unknown"
     let frozenPolicyHash: String
     let currentPolicyHash: String
     let acknowledgementCommand: String
@@ -863,40 +1202,82 @@ struct DriftReviewSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Escalation policy drift")
                 .font(.title3.weight(.semibold))
-            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
-                GridRow {
-                    Text("Frozen")
-                        .foregroundStyle(.secondary)
-                    Text(frozenPolicyHash)
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled)
-                }
-                GridRow {
-                    Text("Current")
-                        .foregroundStyle(.secondary)
-                    Text(currentPolicyHash)
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled)
-                }
-            }
+            driftContent
             Text("Acknowledgement is handled outside the macOS read surface.")
                 .foregroundStyle(.secondary)
-            HStack {
-                Button("Copy acknowledgement command") {
-                    onCopyCommand?(acknowledgementCommand)
-                }
-                Button("Open external workflow") {
-                    onOpenExternalWorkflow?()
-                }
-                Spacer()
-                Button("Close", action: onClose)
-                    .keyboardShortcut(.cancelAction)
-            }
+            Text(presentation.handoffDetails)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+            actionRow
         }
         .padding(20)
         .frame(minWidth: 520)
         .interactiveDismissDisabled()
         .accessibilityIdentifier("p058-drift-review-sheet")
+    }
+
+    private var presentation: DriftReviewPresentation {
+        DriftReviewPresentation.presentation(
+            runID: runID,
+            frozenPolicyHash: frozenPolicyHash,
+            currentPolicyHash: currentPolicyHash,
+            acknowledgementCommand: acknowledgementCommand
+        )
+    }
+
+    @ViewBuilder
+    private var driftContent: some View {
+        if presentation.isEmpty {
+            Text("Drift cleared while this sheet was open.")
+                .foregroundStyle(.secondary)
+        } else {
+            driftGrid
+        }
+    }
+
+    private var driftGrid: some View {
+        Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+            GridRow {
+                Text("Field").foregroundStyle(.secondary)
+                Text("Frozen").foregroundStyle(.secondary)
+                Text("Current").foregroundStyle(.secondary)
+                Text("Delta").foregroundStyle(.secondary)
+            }
+            ForEach(presentation.rows) { row in
+                driftGridRow(row)
+            }
+        }
+    }
+
+    private func driftGridRow(_ row: DriftReviewRow) -> some View {
+        GridRow {
+            Text(row.label)
+            Text(row.frozen)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+            Text(row.current)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+            Text(row.badge)
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(.secondary.opacity(0.12), in: Capsule())
+        }
+    }
+
+    private var actionRow: some View {
+        HStack {
+            Button("Copy acknowledgement command") {
+                onCopyCommand?(acknowledgementCommand)
+            }
+            Button("Open external workflow") {
+                onOpenExternalWorkflow?()
+            }
+            Spacer()
+            Button("Close", action: onClose)
+                .keyboardShortcut(.cancelAction)
+        }
     }
 }
 
@@ -940,6 +1321,12 @@ struct EscalationInspectorAdapterView: View {
 
     var body: some View {
         EscalationInspector(snapshot: adapter.snapshot, traceJSONRedacted: traceJSONRedacted)
+            .onAppear {
+                EscalationReadAdapterRegistry.shared.retainAdapter(for: adapter.runId)
+            }
+            .onDisappear {
+                EscalationReadAdapterRegistry.shared.releaseAdapter(for: adapter.runId)
+            }
             .task(id: chains) {
                 adapter.applyChains(chains)
             }

@@ -121,6 +121,7 @@ final class EscalationReadAdapterRegistry {
     static let shared = EscalationReadAdapterRegistry()
 
     private var adapters: [String: EscalationReadAdapter] = [:]
+    private var retainedRunIds: Set<String> = []
     private var attentionObservers: [UUID: ([EscalationSnapshot]) -> Void] = [:]
 
     private init() {}
@@ -155,7 +156,7 @@ final class EscalationReadAdapterRegistry {
 
     func applyVisibleRunChains(_ chainsByRunId: [String: [EscalationChainStateDTO]]) {
         let visibleRunIds = Set(chainsByRunId.keys)
-        for runId in Array(adapters.keys) where !visibleRunIds.contains(runId) {
+        for runId in Array(adapters.keys) where !visibleRunIds.contains(runId) && !retainedRunIds.contains(runId) {
             adapters.removeValue(forKey: runId)
         }
         for (runId, chains) in chainsByRunId {
@@ -166,6 +167,15 @@ final class EscalationReadAdapterRegistry {
             }
         }
         notifyAttentionObservers()
+    }
+
+    func retainAdapter(for runId: String) {
+        retainedRunIds.insert(runId)
+        _ = adapter(for: runId)
+    }
+
+    func releaseAdapter(for runId: String) {
+        retainedRunIds.remove(runId)
     }
 
     func reset(runId: String) {
@@ -197,6 +207,7 @@ final class EscalationReadAdapterRegistry {
 
     // Retained for Phase 1+ subscription teardown when a run window closes.
     func removeAdapter(for runId: String) {
+        retainedRunIds.remove(runId)
         adapters.removeValue(forKey: runId)
         notifyAttentionObservers()
     }
