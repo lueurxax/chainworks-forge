@@ -17,6 +17,8 @@ struct RunsHomeView: View {
     // PC-003: sidebar lane filter context — set when a deep-link or banner routes here
     // specifically to surface waiting approvals. Cleared when the user manually selects any run.
     @State private var focusedLaneID: String? = nil
+    private let waitingApprovalLaneID = "waiting"
+    private let escalationAttentionLaneID = "escalation_attention"
 
     @MainActor
     init(workbench: RunsWorkbenchPresentationModel) {
@@ -125,11 +127,14 @@ struct RunsHomeView: View {
 
     private var runsSidebar: some View {
         List {
-            if focusedLaneID == "waiting" {
+            if focusedLaneID == waitingApprovalLaneID {
                 P031AccessibilityMarker(identifier: "approval-inbox-view")
                 if workbench.inlineApprovals.isEmpty {
                     P031AccessibilityMarker(identifier: "approval-inbox-empty-state")
                 }
+            }
+            if focusedLaneID == escalationAttentionLaneID {
+                P031AccessibilityMarker(identifier: "p058-escalation-attention-runs-view")
             }
             if workbench.sidebarLanes.isEmpty {
                 Section {
@@ -149,6 +154,27 @@ struct RunsHomeView: View {
                     }
                 } header: {
                     Text("Runs")
+                }
+            } else if focusedLaneID == escalationAttentionLaneID {
+                Section {
+                    let rows = escalationAttentionRows
+                    if rows.isEmpty {
+                        ForgeEmptyState(
+                            title: "No paused escalation runs",
+                            systemImage: "clock.badge.exclamationmark",
+                            description: "Escalation attention is clear."
+                        )
+                        .padding(.vertical, 8)
+                    } else {
+                        ForEach(rows, id: \.runID) { row in
+                            runRow(row: row)
+                        }
+                    }
+                } header: {
+                    Label("Escalation attention", systemImage: "scope")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .accessibilityIdentifier("lane-focused-\(escalationAttentionLaneID)")
                 }
             } else {
                 ForEach(workbench.sidebarLanes) { lane in
@@ -183,8 +209,8 @@ struct RunsHomeView: View {
         // focusedLaneID is kept set so the sidebar-lane publisher below can
         // replay the selection once lanes populate (fixes the startup notification race).
         .onReceive(NotificationCenter.default.publisher(for: .chainworksFocusWaitingApprovalLane)) { _ in
-            focusedLaneID = "waiting"
-            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == "waiting" }),
+            focusedLaneID = waitingApprovalLaneID
+            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == waitingApprovalLaneID }),
                let firstRun = waitingLane.runs.first {
                 selectedRunDetailTab = .approvals
                 model.selectRun(firstRun.runID)
@@ -198,22 +224,62 @@ struct RunsHomeView: View {
         .onChange(of: workbench.pendingFocusWaitingApprovalLane, initial: true) {
             guard workbench.pendingFocusWaitingApprovalLane else { return }
             workbench.clearFocusWaitingApprovalLane()
-            focusedLaneID = "waiting"
-            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == "waiting" }),
+            focusedLaneID = waitingApprovalLaneID
+            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == waitingApprovalLaneID }),
                let firstRun = waitingLane.runs.first {
                 selectedRunDetailTab = .approvals
                 model.selectRun(firstRun.runID)
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .chainworksFocusEscalationAttentionRuns)) { _ in
+            focusEscalationAttentionLane()
+        }
+        .onChange(of: workbench.pendingFocusEscalationAttentionLane, initial: true) {
+            guard workbench.pendingFocusEscalationAttentionLane else { return }
+            workbench.clearFocusEscalationAttentionLane()
+            focusEscalationAttentionLane()
+        }
         // PC-003 lanes-change fallback: if focusedLaneID was set (by notification or workbench flag)
         // before lanes populated, auto-select once lanes arrive.
         .onReceive(workbench.$sidebarLanes) { sidebarLanes in
-            guard focusedLaneID == "waiting", model.selectedRunID == nil else { return }
-            if let waitingLane = sidebarLanes.first(where: { $0.id == "waiting" }),
+            guard model.selectedRunID == nil else { return }
+            if focusedLaneID == waitingApprovalLaneID,
+               let waitingLane = sidebarLanes.first(where: { $0.id == waitingApprovalLaneID }),
                let firstRun = waitingLane.runs.first {
                 selectedRunDetailTab = .approvals
                 model.selectRun(firstRun.runID)
+            } else if focusedLaneID == escalationAttentionLaneID,
+                      let firstRun = escalationAttentionRows(from: sidebarLanes).first {
+                selectedRunDetailTab = .overview
+                model.selectRun(firstRun.runID)
             }
+        }
+        .onChange(of: model.escalationAttentionSnapshots) {
+            guard focusedLaneID == escalationAttentionLaneID, model.selectedRunID == nil else { return }
+            if let firstRun = escalationAttentionRows.first {
+                selectedRunDetailTab = .overview
+                model.selectRun(firstRun.runID)
+            }
+        }
+    }
+
+    private var escalationAttentionRows: [P031RunsHomeRowPresentation] {
+        escalationAttentionRows(from: workbench.sidebarLanes)
+    }
+
+    private func escalationAttentionRows(
+        from lanes: [RunsWorkbenchPresentationModel.SidebarLane]
+    ) -> [P031RunsHomeRowPresentation] {
+        let attentionRunIDs = Set(model.escalationAttentionSnapshots.map(\.runId))
+        guard !attentionRunIDs.isEmpty else { return [] }
+        return lanes.flatMap(\.runs).filter { attentionRunIDs.contains($0.runID) }
+    }
+
+    private func focusEscalationAttentionLane() {
+        focusedLaneID = escalationAttentionLaneID
+        if let firstRun = escalationAttentionRows.first {
+            selectedRunDetailTab = .overview
+            model.selectRun(firstRun.runID)
         }
     }
 
@@ -989,6 +1055,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private let loadDaemonLifecycleAction: @Sendable (P031FreshnessSnapshot) async -> P031DaemonLifecyclePresentation
     private let loadSchedulerHealthAction: @Sendable () async -> SchedulerHealthReadback?
     private let subscribeRunStatusAction: @Sendable (String, P031FreshnessSnapshot) throws -> AsyncThrowingStream<P031RunStatusSubscriptionPresentation, Error>
+    private let subscribeAllRunStatusAction: @Sendable (P031FreshnessSnapshot) throws -> AsyncThrowingStream<P031RunStatusSubscriptionPresentation, Error>
     private let subscribeRuntimeTimelineAction: @Sendable (String) throws -> AsyncThrowingStream<P031RuntimeTimelineEventPresentation, Error>
     private let settleApprovalAction: @Sendable (String, P072ApprovalDecisionAction) async -> String?
     private let restartDaemonAction: @MainActor @Sendable () async -> String?
@@ -1000,6 +1067,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private var approvalFreshness = P031FreshnessSnapshot(state: .refreshing)
     private var daemonFreshness = P031FreshnessSnapshot(state: .refreshing)
     private var runStatusSubscriptionTask: Task<Void, Never>?
+    private var allRunStatusSubscriptionTask: Task<Void, Never>?
     private var runtimeTimelineSubscriptionTask: Task<Void, Never>?
     private var runtimeTimelinePublishTask: Task<Void, Never>?
     private var subscribedRunID: String?
@@ -1079,6 +1147,11 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 currentFreshness: currentFreshness
             )
         }
+        subscribeAllRunStatusAction = { currentFreshness in
+            try subscriptionCoordinator.allRunStatusPresentations(
+                currentFreshness: currentFreshness
+            )
+        }
         subscribeRuntimeTimelineAction = { runID in
             try subscriptionCoordinator.runtimeTimelinePresentations(runID: runID)
         }
@@ -1086,6 +1159,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
 
     deinit {
         runStatusSubscriptionTask?.cancel()
+        allRunStatusSubscriptionTask?.cancel()
         runtimeTimelineSubscriptionTask?.cancel()
         runtimeTimelinePublishTask?.cancel()
     }
@@ -1253,6 +1327,11 @@ final class P031ThinReadDashboardModel: ObservableObject {
         loadApprovalInboxAction = { _ in approvalInbox }
         loadDaemonLifecycleAction = { _ in daemonLifecycle }
         subscribeRunStatusAction = { _, _ in
+            AsyncThrowingStream { continuation in
+                continuation.finish()
+            }
+        }
+        subscribeAllRunStatusAction = { _ in
             AsyncThrowingStream { continuation in
                 continuation.finish()
             }
@@ -1511,6 +1590,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
 
     func loadIfNeeded() async {
         ensureEscalationAttentionObserver()
+        startAllRunEscalationAttentionSubscription()
         guard !didLoad else { return }
         didLoad = true
         await refreshAll()
@@ -1518,6 +1598,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
 
     func refreshAll() async {
         ensureEscalationAttentionObserver()
+        startAllRunEscalationAttentionSubscription()
         guard !isLoading else { return }
         isLoading = true
         defer { isLoading = false }
@@ -1701,8 +1782,28 @@ final class P031ThinReadDashboardModel: ObservableObject {
     }
 
     private func startLiveSubscriptions(for runID: String) {
+        startAllRunEscalationAttentionSubscription()
         startRunStatusSubscription(for: runID)
         startRuntimeTimelineSubscription(for: runID)
+    }
+
+    private func startAllRunEscalationAttentionSubscription() {
+        guard allRunStatusSubscriptionTask == nil else { return }
+        let freshness = runsFreshness
+        allRunStatusSubscriptionTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let stream = try self.subscribeAllRunStatusAction(freshness)
+                for try await _ in stream {
+                    try Task.checkCancellation()
+                    await self.refreshEscalationAttentionFromAllRuns()
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+        }
     }
 
     private func startRunStatusSubscription(for runID: String) {
@@ -1834,6 +1935,13 @@ final class P031ThinReadDashboardModel: ObservableObject {
         approvalInbox = approvalsPresentation
         runDetail = detailPresentation
         schedulerHealth = schedulerResult
+        await refreshEscalationAttentionSnapshots(for: runsPresentation.rows.map(\.runID))
+    }
+
+    private func refreshEscalationAttentionFromAllRuns() async {
+        let runsPresentation = await loadRunsHomeAction(runsFreshness, false)
+        runsFreshness = runsPresentation.freshness
+        runsHome = runsPresentation
         await refreshEscalationAttentionSnapshots(for: runsPresentation.rows.map(\.runID))
     }
 

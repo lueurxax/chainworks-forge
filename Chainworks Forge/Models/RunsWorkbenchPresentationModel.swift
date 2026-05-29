@@ -30,6 +30,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
     // reads this on mount (initial: true) so the flag survives the tab-switch render cycle
     // where a synchronous NotificationCenter post would be lost before the view is mounted.
     @Published private(set) var pendingFocusWaitingApprovalLane: Bool = false
+    @Published private(set) var pendingFocusEscalationAttentionLane: Bool = false
 
     init() {}
 
@@ -39,6 +40,14 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
 
     func clearFocusWaitingApprovalLane() {
         pendingFocusWaitingApprovalLane = false
+    }
+
+    func requestFocusEscalationAttentionLane() {
+        pendingFocusEscalationAttentionLane = true
+    }
+
+    func clearFocusEscalationAttentionLane() {
+        pendingFocusEscalationAttentionLane = false
     }
 
     func selectActiveTimelineAgent(_ agentID: String?) {

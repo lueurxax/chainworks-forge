@@ -4004,6 +4004,12 @@ private struct FailingP031WorkflowReadStore: P031WorkflowReadStore {
     throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
   }
 
+  nonisolated func subscribeToRunStatusChanges(runID: String?) throws -> AsyncThrowingStream<
+    P031RunStatusChangedReadModel, Error
+  > {
+    throw P031GraphQLReadBoundaryError.transportFailed("fixture read failure")
+  }
+
   nonisolated func subscribeToRuntimeTimeline(runID: String) throws -> AsyncThrowingStream<
     P031RuntimeTimelineEventReadModel, Error
   > {

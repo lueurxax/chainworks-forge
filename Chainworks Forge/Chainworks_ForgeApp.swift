@@ -91,9 +91,8 @@ struct Chainworks_ForgeApp: App {
                 )
             } onShowAllPausedRuns: {
                 NotificationCenter.default.post(
-                    name: .chainworksSelectTab,
-                    object: "Runs",
-                    userInfo: ["tab": "Runs"]
+                    name: .chainworksFocusEscalationAttentionRuns,
+                    object: nil
                 )
             }
         } label: {

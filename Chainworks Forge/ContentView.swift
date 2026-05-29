@@ -8,6 +8,7 @@ extension Notification.Name {
     static let chainworksOpenSystemReadiness = Notification.Name("chainworks.openSystemReadiness")
     // P036: signal RunsHomeView to scroll/select into the waiting-approval lane
     static let chainworksFocusWaitingApprovalLane = Notification.Name("chainworks.focusWaitingApprovalLane")
+    static let chainworksFocusEscalationAttentionRuns = Notification.Name("chainworks.focusEscalationAttentionRuns")
 }
 
 struct ContentView: View {
@@ -129,6 +130,7 @@ struct ContentView: View {
             .onReceive(NotificationCenter.default.publisher(for: .chainworksSelectTab), perform: handleTabSelectionNotification)
             .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { _ in openRunsHome() }
             .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenSystemReadiness)) { _ in openSystemReadiness() }
+            .onReceive(NotificationCenter.default.publisher(for: .chainworksFocusEscalationAttentionRuns)) { _ in focusEscalationAttentionRuns() }
             .onChange(of: runsModel.runsHome) {
                 syncRunsHomePresentation()
             }
@@ -222,6 +224,11 @@ struct ContentView: View {
     private func focusWaitingApprovalLane() {
         workbench.requestFocusWaitingApprovalLane()
         NotificationCenter.default.post(name: .chainworksFocusWaitingApprovalLane, object: nil)
+    }
+
+    private func focusEscalationAttentionRuns() {
+        workbench.requestFocusEscalationAttentionLane()
+        selectTab(.runs, result: "notification")
     }
 
     private func openRunsHome() {

@@ -3065,6 +3065,9 @@ protocol P031WorkflowReadStore: Sendable {
   nonisolated func subscribeToRunStatus(runID: String) throws -> AsyncThrowingStream<
     P031RunStatusChangedReadModel, Error
   >
+  nonisolated func subscribeToRunStatusChanges(runID: String?) throws -> AsyncThrowingStream<
+    P031RunStatusChangedReadModel, Error
+  >
   nonisolated func subscribeToRuntimeTimeline(runID: String) throws -> AsyncThrowingStream<
     P031RuntimeTimelineEventReadModel, Error
   >
@@ -3610,7 +3613,7 @@ enum P031GraphQLDocuments {
     """
 
   static let runStatusChanged = """
-    subscription P031RunStatusChanged($runId: ID!) {
+    subscription P031RunStatusChanged($runId: ID) {
       runStatusChanged(runId: $runId) {
         id
         status
@@ -3872,11 +3875,18 @@ struct P031GraphQLWorkflowReadStore<
   nonisolated func subscribeToRunStatus(runID: String) throws -> AsyncThrowingStream<
     P031RunStatusChangedReadModel, Error
   > {
-    try subscriptionClient.subscribe(
+    return try subscribeToRunStatusChanges(runID: runID)
+  }
+
+  nonisolated func subscribeToRunStatusChanges(runID: String?) throws -> AsyncThrowingStream<
+    P031RunStatusChangedReadModel, Error
+  > {
+    let variables = runID.map { ["runId": P031GraphQLVariableValue.string($0)] } ?? [:]
+    return try subscriptionClient.subscribe(
       RunStatusChangedPayload.self,
       operationName: "P031RunStatusChanged",
       document: documents.runStatusChanged,
-      variables: ["runId": .string(runID)]
+      variables: variables
     )
     .map { payload in payload.runStatusChanged }
   }
@@ -4137,7 +4147,18 @@ struct P031InMemoryWorkflowReadStore: P031WorkflowReadStore {
   nonisolated func subscribeToRunStatus(runID: String) throws -> AsyncThrowingStream<
     P031RunStatusChangedReadModel, Error
   > {
-    let events = runStatusEvents[runID, default: []]
+    return try subscribeToRunStatusChanges(runID: runID)
+  }
+
+  nonisolated func subscribeToRunStatusChanges(runID: String?) throws -> AsyncThrowingStream<
+    P031RunStatusChangedReadModel, Error
+  > {
+    let events: [P031RunStatusChangedReadModel]
+    if let runID {
+      events = runStatusEvents[runID, default: []]
+    } else {
+      events = runStatusEvents.keys.sorted().flatMap { runStatusEvents[$0, default: []] }
+    }
     return AsyncThrowingStream { continuation in
       for event in events {
         continuation.yield(event)
@@ -7776,7 +7797,21 @@ struct P031ThinWorkflowSubscriptionCoordinator<Store: P031WorkflowReadStore>: Se
     currentFreshness: P031FreshnessSnapshot,
     checkedAt: Date = Date()
   ) throws -> AsyncThrowingStream<P031RunStatusSubscriptionPresentation, Error> {
-    let stream = try store.subscribeToRunStatus(runID: runID)
+    let stream = try store.subscribeToRunStatusChanges(runID: runID)
+    return stream.map { event in
+      P031RunStatusSubscriptionPresenter.presentation(
+        for: event,
+        currentFreshness: currentFreshness,
+        checkedAt: checkedAt
+      )
+    }
+  }
+
+  nonisolated func allRunStatusPresentations(
+    currentFreshness: P031FreshnessSnapshot,
+    checkedAt: Date = Date()
+  ) throws -> AsyncThrowingStream<P031RunStatusSubscriptionPresentation, Error> {
+    let stream = try store.subscribeToRunStatusChanges(runID: nil)
     return stream.map { event in
       P031RunStatusSubscriptionPresenter.presentation(
         for: event,

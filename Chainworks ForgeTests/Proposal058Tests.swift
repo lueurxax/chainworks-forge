@@ -582,6 +582,56 @@ struct Proposal058Tests {
         #expect(registry.attentionSnapshots.reduce(0) { $0 + $1.pausedChainCount } == 2)
     }
 
+    @Test("P058 all-run status subscription presents every run for live attention refresh")
+    func allRunStatusSubscriptionPresentsEveryRun() async throws {
+        let store = P031InMemoryWorkflowReadStore(runStatusEvents: [
+            "run-b": [
+                P031RunStatusChangedReadModel(
+                    id: "run-b",
+                    status: "blocked",
+                    freshnessState: .live,
+                    projectionUpdatedAt: "2026-05-24T10:00:01Z",
+                    projectionLag: false
+                ),
+            ],
+            "run-a": [
+                P031RunStatusChangedReadModel(
+                    id: "run-a",
+                    status: "running",
+                    freshnessState: .live,
+                    projectionUpdatedAt: "2026-05-24T10:00:00Z",
+                    projectionLag: false
+                ),
+            ],
+        ])
+        let coordinator = P031ThinWorkflowSubscriptionCoordinator(store: store)
+        let stream = try coordinator.allRunStatusPresentations(
+            currentFreshness: P031FreshnessSnapshot(state: .live),
+            checkedAt: Date(timeIntervalSince1970: 0)
+        )
+
+        var observedRunIDs: [String] = []
+        for try await presentation in stream {
+            observedRunIDs.append(presentation.runID)
+        }
+
+        #expect(observedRunIDs == ["run-a", "run-b"])
+    }
+
+    @Test("P058 menu overflow has a dedicated escalation attention focus route")
+    func menuOverflowHasDedicatedEscalationAttentionFocusRoute() {
+        let workbench = RunsWorkbenchPresentationModel()
+
+        #expect(Notification.Name.chainworksFocusEscalationAttentionRuns.rawValue == "chainworks.focusEscalationAttentionRuns")
+        #expect(!workbench.pendingFocusEscalationAttentionLane)
+
+        workbench.requestFocusEscalationAttentionLane()
+        #expect(workbench.pendingFocusEscalationAttentionLane)
+
+        workbench.clearFocusEscalationAttentionLane()
+        #expect(!workbench.pendingFocusEscalationAttentionLane)
+    }
+
     @Test("P058 escalation attention requests informational user attention and cancels on clear")
     func escalationAttentionRequestsAndCancelsInformationalAttention() {
         var requestedTypes: [NSApplication.RequestUserAttentionType] = []
