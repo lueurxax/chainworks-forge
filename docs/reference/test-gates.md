@@ -1492,7 +1492,7 @@ Scope:
 - ledger/agent-execution/metadata commit inside the engine-owned start transaction (`proposal_058_claim_start`), including insert-or-ignore idempotency for the chain row
 - tier selection writes (`agent_execution_runtime_facts.would_select_*`) populated from the frozen `RunPlan` policy at agent-execution completion (`engine/src/shadow_escalation.rs`)
 - durable scheduler readback fields derived from redacted `escalation_events` (`waiting_retry_after_until`, `escalation_trace_json_redacted`, `external_acknowledgement_ref`, `feature_flag_state`, and per-attempt `digest_inputs`)
-- governed macOS read-surface components compile and are covered by focused Swift tests (`EscalationStatusCapsule`, `EscalationBannerStack`, `EscalationLineageView`, `EscalationPauseCard`, `EscalationTraceTimeline`, `DriftReviewSheet`, and read-only trace pasteboard copy)
+- governed macOS read-surface components compile and are covered by focused Swift tests (`EscalationStatusCapsule`, `EscalationBannerStack`, `EscalationLineageView`, `EscalationPauseCard`, `EscalationTraceTimeline`, `DriftReviewSheet`, MenuBarExtra overflow routing, retained shared adapters, command disabled-state parity, drift diff presentation, and read-only trace pasteboard copy)
 - full P058 metric inventory declaration plus production emission from ledger/event writes for the metrics backed by durable escalation state
 - idempotency-key uniqueness enforced by migration `078_p058_escalation_idempotency.sql` (one chain per `run_id`/`stage_id`/`agent_id`/`policy_id`; one execution-metadata row per `ledger_id`/`tier_id`/`tier_attempt_index`)
 
@@ -1509,7 +1509,8 @@ Use when:
 Host policy:
 
 - local Rust and macOS Swift test toolchains required
-- no live provider account, Xcode, simulator, daemon process, UI target, network, or real quota exhaustion required
+- no live provider account, simulator, daemon process, UI target, network, or real quota exhaustion required
+- remote visual/runtime, Full Keyboard Access, contrast/reduced-motion, and live operational drill evidence is owned by P096, not this implementation gate
 
 Command:
 

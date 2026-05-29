@@ -10,7 +10,7 @@
 - **Proposal Revision Id:** p058-r14-2026-05-07
 - **Schema Version:** proposal_current_v2
 - **Document Format:** proposal_json_v1
-- **Status:** refined_after_write_boundary_blocker_resolved
+- **Status:** implementation_reaudit_ready
 - **Date:** 2026-05-07
 - **Run Id:** 6764a0c2-456c-4643-95da-06e213a6dc91
 - **Source Review Pass Id:** p058-r13-aggregate-2026-05-07-state_4_proposal_reviewed
@@ -25,12 +25,12 @@
 
 ## Implementation Sync
 
-- **Last synchronized:** 2026-05-27
+- **Last synchronized:** 2026-05-29
 - **Implementation worktree:** `.chainworks/worktrees/cw-configurable-agent-escalation-6764a0c2`
 - **Current proof gate:** `./scripts/test-gate.sh proposal-058`
 - **Current implemented runtime slice:** scheduler-owned durable tier advancement for `same_backend_retry`, `backend_profile`, `lead_mediation`, and `pause`; post-invoke authority uses durable `p058_claimed` identity; startup recovery preserves P058 claims; provider `retry_after` blocks claim/start capacity; `runs.start` path inputs are canonicalized and root-confined; escalation readback is derived from durable events; `CHAINWORKS_ESCALATION_FORCE_PRIMARY`, chain wall-clock deadline, and capacity-probe threshold pauses are enforced before launching an escalation retry; GraphQL/MCP focused parity proves non-null scheduler readback fields from durable event/runtime data.
-- **Current governed macOS slice:** `EscalationReadAdapter` feeds read-only SwiftUI components for status capsule, banner stack, lineage, pause card, trace timeline, drift review sheet, trace pasteboard copy, and inspector presentation. Focused Swift tests are now included in `proposal-058`; remote visual/runtime evidence remains a release-closeout item.
-- **Implementation closeout status:** scheduler fail-closed slices cover provider force-detach classification, launch-recycle storm pauses, escalation-owned late-frame event journaling from durable runtime facts/metadata, startup force-detach replay, and metric emission from durable escalation events. Remote visual soak, long-run metric-threshold trending, and operational drill artifacts are release-closeout evidence items, not missing implementation paths.
+- **Current governed macOS slice:** `EscalationReadAdapter` is the sole governed SwiftUI source for status capsule, banner stack, lineage, pause card, trace timeline, drift review sheet, trace pasteboard copy, menu/attention aggregation, and inspector presentation. Focused Swift tests in `proposal-058` now cover the component presentation contracts, all-run attention aggregation, MenuBarExtra overflow routing, retained inspector/shared-adapter behavior, trace pasteboard copy, command disabled-reason parity, drift diff presentation, pause countdown formatting, lineage duration/ref disclosure, and status field-order/truncation/accessibility behavior.
+- **Implementation closeout status:** the implementation contract is ready for repeat audit at commit `2428b35f` after `./scripts/test-gate.sh proposal-058` passed with the expanded Swift P058 suite and control-plane gate. Release-only evidence that needs a live/remote environment is explicitly moved to P096 (`096-p058-release-evidence-and-macos-runtime-proof.md`): remote visual soak, Full Keyboard Access runtime walk, contrast/reduced-motion screenshots, long-run metric-threshold trending, and live operational drills. Those items are GA/release proof, not missing P058 implementation paths.
 
 ## Problem
 
