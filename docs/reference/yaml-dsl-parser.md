@@ -331,19 +331,19 @@ Types like `WorkflowDefinition.states`, `variables`, `backendProfiles`, and `per
 
 ## Verification scaffold UI
 
-Under proposal-036 the YAML verification surfaces are consolidated into the
-four-tab navigation shell: the **Ideas** tab covers idea persistence, and the
-**Definitions** tab hosts the parsed catalog and workflow under a segmented
-picker (Agent Catalog / Workflow). The legacy top-level `Agent Catalog` and
-`Workflow Inspector` tabs no longer exist as independent surfaces; their
-behavior is preserved as segments of Definitions.
+The YAML verification surfaces are consolidated into the four-tab navigation
+shell: the **Ideas** tab shows read-first idea context, and the **Definitions**
+tab hosts the parsed catalog and workflow under a segmented picker (Agent
+Catalog / Workflow). The legacy top-level `Agent Catalog` and `Workflow
+Inspector` tabs no longer exist as independent surfaces; their behavior is
+preserved as segments of Definitions.
 
 ### Ideas tab
 
-- SwiftData CRUD: create and delete ideas (title + body + optional attachment path)
-- Empty state: "No ideas yet. Create your first idea."
-- Summary strip with idea counts
-- No workflow actions — persistence verification only
+- daemon-backed idea list and selected idea metadata
+- compact projected run-status strips
+- explicit empty and unavailable states
+- no executable create, configure, archive, launch, or workflow actions in SwiftUI
 
 ### Definitions tab — Agent Catalog segment
 
@@ -351,7 +351,7 @@ behavior is preserved as segments of Definitions.
 - Agent list with drill-down: identity, backend profile, permissions, skill, inputs/outputs, prompt
 - Summary strip: agent count, backend count, permission count, error/warning count
 - Validation issues section when issues exist
-- Read-only inspection; deterministic grouping per proposal-036 (supported group, mode, profile, role, Other)
+- Read-only inspection; deterministic grouping per [macOS operator navigation](macos-operator-navigation.md) (supported group, mode, profile, role, Other)
 
 ### Definitions tab — Workflow segment
 

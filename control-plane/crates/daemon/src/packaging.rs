@@ -85,6 +85,30 @@ impl ModePaths {
     }
 }
 
+/// SEC-H001: Verify that neither `$HOME/.chainworks` nor `$HOME/.chainworks/auth`
+/// is a symlink. Must be called before canonicalizing the auth root in packaged mode.
+///
+/// Canonicalizing a symlinked directory makes the symlink target the trusted root,
+/// allowing an attacker-controlled directory to pass the starts_with containment
+/// check. Rejecting symlinked components before canonicalization prevents this.
+fn reject_symlinked_auth_root_components(home: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let chainworks = home.join(".chainworks");
+        let auth = chainworks.join("auth");
+        for candidate in [&chainworks, &auth] {
+            if let Ok(meta) = std::fs::symlink_metadata(candidate) {
+                anyhow::ensure!(
+                    !meta.file_type().is_symlink(),
+                    "auth root component must not be a symlink in packaged mode: {}",
+                    candidate.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve all per-mode paths using environment overrides where
 /// reasonable. Used once at startup in `main.rs`.
 pub fn resolve_paths(mode: DaemonMode) -> Result<ModePaths> {
@@ -135,11 +159,76 @@ pub fn resolve_paths(mode: DaemonMode) -> Result<ModePaths> {
     let bind_addr = std::env::var("GRAPHQL_ADDR").unwrap_or(default_bind);
 
     let principals_path = match std::env::var("CHAINWORKS_AUTH_PRINCIPALS_PATH") {
-        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
-        _ => home
-            .join(".chainworks")
-            .join("auth")
-            .join("principals.json"),
+        Ok(p) if !p.trim().is_empty() => {
+            let p = PathBuf::from(&p);
+            // SEC-M002: Reject relative paths so the path cannot be redirected via cwd.
+            anyhow::ensure!(
+                p.is_absolute(),
+                "CHAINWORKS_AUTH_PRINCIPALS_PATH must be an absolute path, got: {}",
+                p.display()
+            );
+            // In packaged modes, verify the path stays within the expected auth root.
+            // SEC-H001: Reject symlinks anywhere in the auth root parent chain BEFORE
+            // canonicalization. Canonicalizing a symlinked auth_root would make the symlink
+            // target the trusted root, allowing an attacker to redirect auth loading.
+            if mode.is_packaged() {
+                reject_symlinked_auth_root_components(&home)
+                    .context("packaged mode auth root symlink check")?;
+                let auth_root = home.join(".chainworks").join("auth");
+                let effective_root = if auth_root.exists() {
+                    std::fs::canonicalize(&auth_root)
+                        .unwrap_or_else(|_| normalize_path_components(&auth_root))
+                } else {
+                    normalize_path_components(&auth_root)
+                };
+                let effective_path = if p.exists() {
+                    std::fs::canonicalize(&p).unwrap_or_else(|_| normalize_path_components(&p))
+                } else {
+                    normalize_path_components(&p)
+                };
+                anyhow::ensure!(
+                    effective_path.starts_with(&effective_root),
+                    "CHAINWORKS_AUTH_PRINCIPALS_PATH must be within {} in packaged mode, got: {}",
+                    effective_root.display(),
+                    effective_path.display()
+                );
+            }
+            p
+        }
+        _ => {
+            let default_path = home
+                .join(".chainworks")
+                .join("auth")
+                .join("principals.json");
+            // SEC-H001: Reject symlinks anywhere in the auth root parent chain BEFORE
+            // canonicalization so a symlinked .chainworks or .chainworks/auth cannot
+            // redirect auth loading to an attacker-controlled directory.
+            if mode.is_packaged() {
+                reject_symlinked_auth_root_components(&home)
+                    .context("packaged mode auth root symlink check")?;
+                let auth_root = home.join(".chainworks").join("auth");
+                let effective_root = if auth_root.exists() {
+                    std::fs::canonicalize(&auth_root)
+                        .unwrap_or_else(|_| normalize_path_components(&auth_root))
+                } else {
+                    normalize_path_components(&auth_root)
+                };
+                let effective_path = if default_path.exists() {
+                    std::fs::canonicalize(&default_path)
+                        .unwrap_or_else(|_| normalize_path_components(&default_path))
+                } else {
+                    normalize_path_components(&default_path)
+                };
+                anyhow::ensure!(
+                    effective_path.starts_with(&effective_root),
+                    "default principals.json path resolved outside auth root (symlinked parent?): \
+                     expected within {}, got {}",
+                    effective_root.display(),
+                    effective_path.display()
+                );
+            }
+            default_path
+        }
     };
 
     Ok(ModePaths {
@@ -230,6 +319,24 @@ pub fn write_daemon_endpoint_snapshot(
 /// export the variable — that's the signal for `resolved_build_sha`
 /// to fall back to `"dev"`.
 pub const COMPILE_TIME_BUILD_SHA: Option<&str> = option_env!("GIT_SHA");
+
+/// SEC-M002: Normalize path components by resolving `..` and `.` lexically
+/// without following symlinks. Used to validate canonical containment before
+/// opening the file (symlink checks happen inside `load_or_bootstrap`).
+fn normalize_path_components(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 /// R13 OPS-002: packaged modes must run from `$HOME` so relative
 /// defaults (catalog YAMLs, workflow YAMLs, test fixtures) resolve
@@ -527,6 +634,54 @@ mod tests {
     /// env var; splitting them into two tests lets one race ahead and
     /// observe the other's in-flight state. Keeping them in one
     /// function guarantees ordering.
+    /// SEC-H001: a symlinked $HOME/.chainworks dir must be rejected in packaged mode.
+    #[test]
+    #[cfg(unix)]
+    fn sec_h001_symlinked_chainworks_dir_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let real_chainworks = dir.path().join("real_chainworks");
+        std::fs::create_dir_all(&real_chainworks).unwrap();
+        std::os::unix::fs::symlink(&real_chainworks, home.join(".chainworks")).unwrap();
+
+        let err = reject_symlinked_auth_root_components(&home).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "must reject symlinked .chainworks; got: {err}"
+        );
+    }
+
+    /// SEC-H001: a symlinked $HOME/.chainworks/auth dir must be rejected in packaged mode.
+    #[test]
+    #[cfg(unix)]
+    fn sec_h001_symlinked_auth_subdir_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let chainworks = home.join(".chainworks");
+        std::fs::create_dir_all(&chainworks).unwrap();
+        let real_auth = dir.path().join("real_auth");
+        std::fs::create_dir_all(&real_auth).unwrap();
+        std::os::unix::fs::symlink(&real_auth, chainworks.join("auth")).unwrap();
+
+        let err = reject_symlinked_auth_root_components(&home).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "must reject symlinked .chainworks/auth; got: {err}"
+        );
+    }
+
+    /// SEC-H001: real (non-symlinked) auth root components pass the check.
+    #[test]
+    #[cfg(unix)]
+    fn sec_h001_real_auth_root_components_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".chainworks").join("auth")).unwrap();
+
+        reject_symlinked_auth_root_components(&home)
+            .expect("real directories must pass the symlink check");
+    }
+
     #[test]
     fn resolved_build_sha_honors_runtime_override_and_dev_fallback() {
         let prev = std::env::var("GIT_SHA").ok();

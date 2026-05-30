@@ -1,0 +1,14 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "missing_run_filter_subscription",
+  "description": "sessionStatusChanged emits events for a different run_id than the one subscribed to.",
+  "hold_condition": "sessionStatusChanged does not filter by run_id before emitting.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_cross_run_subscription_leak",
+  "fixture_input": {
+    "subscribed_run_id": "run-A",
+    "emitted_run_id": "run-B",
+    "expected_result": "no_emission_for_run_b_subscriber"
+  }
+}

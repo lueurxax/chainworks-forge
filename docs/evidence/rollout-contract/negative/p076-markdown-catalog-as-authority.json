@@ -1,0 +1,15 @@
+{
+  "fixture_description": "P076 catalog update that read the markdown file as the canonical known-issue state and derived deduplication from it. Proves JSON is the only canonical source; markdown must be generated from JSON only.",
+  "proves_markdown_catalog_treated_as_authority": true,
+  "violation": "known_issue_deduplication_derived_from_markdown_not_json",
+  "hold_condition_triggered": "Known-issue markdown is treated as canonical instead of generated from JSON",
+  "required_behavior": "JSON catalog is canonical dedupe state. Markdown is generated from JSON only and must never be parsed as authority. If divergence is detected, reconstruct catalog from ledger plus budget state.",
+  "evidence": {
+    "catalog_read_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-known-issues.md",
+    "should_have_read": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry-known-issues.json",
+    "deduplication_source": "markdown",
+    "correct_deduplication_source": "json",
+    "json_catalog_state": "json catalog had 3 issues",
+    "markdown_catalog_state": "markdown had 2 issues (stale; one was not regenerated after archival)"
+  }
+}

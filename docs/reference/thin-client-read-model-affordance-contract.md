@@ -32,7 +32,7 @@ Sendable DTOs. SwiftUI views consume tested affordance states rather than raw Gr
 | Fallback copy changes | Allowed when disabled reason codes remain stable; copy-only changes must update presenter snapshot/render tests and accessibility help text tests |
 | Persisted projection state | If implementation needs stored fields for payload deadlines, stall reasons, or typed action availability, the rollout contract migrations section must be revised before implementation freeze |
 | Removed or retyped fields | Breaking change — requires explicit contract revision, gate update, and migration-contract update if persisted projection shape changes |
-| Renamed affordance IDs | Breaking change — must retain old id as deprecated alias for one contract version or update all tests, accessibility identifiers, P036 citations, and negative fixtures before freeze |
+| Renamed affordance IDs | Breaking change — must retain old id as deprecated alias for one contract version or update all tests, accessibility identifiers, macOS operator navigation citations, and negative fixtures before freeze |
 
 ---
 

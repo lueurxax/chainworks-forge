@@ -15,9 +15,11 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
     @Published private(set) var recoveryEvidence: [RecoveryEvidenceRow] = []
     @Published private(set) var freshnessAndHealth: FreshnessHealth?
     @Published private(set) var timelineEntries: [TimelineEntry] = []
+    @Published private(set) var activeTimelineAgents: [ActiveTimelineAgent] = []
+    @Published private(set) var selectedActiveTimelineAgentID: String?
     @Published private(set) var approvalInbox: P031ApprovalInboxPresentation?
     @Published private(set) var deferredStates: [DeferredStateRow] = []
-    
+
     @Published private(set) var ideaContext: P031IdeaContextPresentation?
     @Published private(set) var catalogContext: P031CatalogContextPresentation?
     @Published private(set) var closeoutReadiness: P077CloseoutReadinessPresentation?
@@ -28,6 +30,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
     // reads this on mount (initial: true) so the flag survives the tab-switch render cycle
     // where a synchronous NotificationCenter post would be lost before the view is mounted.
     @Published private(set) var pendingFocusWaitingApprovalLane: Bool = false
+    @Published private(set) var pendingFocusEscalationAttentionLane: Bool = false
 
     init() {}
 
@@ -39,13 +42,25 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         pendingFocusWaitingApprovalLane = false
     }
 
+    func requestFocusEscalationAttentionLane() {
+        pendingFocusEscalationAttentionLane = true
+    }
+
+    func clearFocusEscalationAttentionLane() {
+        pendingFocusEscalationAttentionLane = false
+    }
+
+    func selectActiveTimelineAgent(_ agentID: String?) {
+        selectedActiveTimelineAgentID = agentID
+    }
+
     // MARK: - Integration
     func populate(from runsHome: P031RunsHomePresentation) {
         var waiting: [P031RunsHomeRowPresentation] = []
         var blocked: [P031RunsHomeRowPresentation] = []
         var running: [P031RunsHomeRowPresentation] = []
         var completed: [P031RunsHomeRowPresentation] = []
-        
+
         var deferred: [P031RunsHomeRowPresentation] = []
         for row in runsHome.rows {
             switch row.lane {
@@ -74,6 +89,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
     func populate(from detail: P031RunDetailPresentation) {
         summaryHeader = SummaryHeader(
             title: detail.title,
+            runID: detail.runID,
             status: detail.statusLabel,
             workflowLabel: detail.workflowLabel,
             progressLabel: detail.progressLabel,
@@ -83,32 +99,48 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
             errorDescription: detail.errorDescription,
             freshness: detail.freshness.state.rawValue
         )
-        
+
         stageMap = StageMap(
-            stages: detail.stageTransitions.map { transition in
-                let status: String = {
-                    switch transition.connectorState {
-                    case .completed: return "terminal"
-                    case .running: return "active"
-                    case .blocked: return "blocked"
-                    case .pending: return "pending"
-                    case .unavailable: return "unavailable"
-                    }
-                }()
+            stages: detail.stageTopology.map { stage in
                 return StageCard(
-                    id: transition.stageExecutionID,
-                    title: transition.stageTitle,
-                    status: status,
-                    attemptText: transition.attemptText,
-                    startedLabel: transition.startedLabel,
-                    completedLabel: transition.completedLabel,
-                    durationLabel: transition.durationLabel,
-                    evidenceLabels: transition.evidenceLabels,
-                    artifactCount: detail.artifactViewerRows.filter { $0.stageExecutionID == transition.stageExecutionID }.count
+                    id: stage.stageID,
+                    ordinal: stage.ordinal,
+                    title: stage.title,
+                    ownerAgentTitle: stage.ownerAgentTitle,
+                    status: Self.stageTopologyStatus(for: stage.status),
+                    statusText: stage.statusText,
+                    isCurrent: stage.isCurrent,
+                    iterationText: stage.iterationText,
+                    attemptText: stage.attemptText,
+                    startedLabel: nil,
+                    completedLabel: nil,
+                    durationLabel: nil,
+                    evidenceLabels: Self.stageTopologyEvidenceLabels(for: stage),
+                    artifactCount: stage.artifactCount,
+                    communicationCount: stage.communicationCount,
+                    approvalRequired: stage.approvalRequired,
+                    occurrences: stage.occurrences.prefix(3).map { occurrence in
+                        StageOccurrence(
+                            id: "\(stage.stageID)-\(occurrence.agentID)-\(occurrence.taskName)",
+                            agentTitle: occurrence.agentTitle,
+                            taskName: occurrence.taskName,
+                            statusText: occurrence.statusText,
+                            providerLabel: occurrence.providerLabel,
+                            executionCountLabel: occurrence.executionCountLabel
+                        )
+                    },
+                    hiddenOccurrenceCount: max(0, stage.occurrences.count - 3),
+                    transitions: stage.transitions.map { transition in
+                        StageTransition(
+                            id: "\(stage.stageID)-\(transition.toStageID)",
+                            toLabel: transition.toLabel,
+                            detail: transition.detail
+                        )
+                    }
                 )
             }
         )
-        
+
         let mappedApprovals = detail.approvalRows.map { row in
             let affordance = row.affordance
 
@@ -143,6 +175,9 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
                         case .conflict: return .conflict
                         case .duplicate: return .duplicate
                         case .alreadyResolved: return .alreadyResolved
+                        case .approvalNotActionable: return .alreadyResolved
+                        case .observerScope: return .unauthorized
+                        case .nonApprovalMutation, .capabilityOutOfScope: return .unsupported
                         case .writePathNotAvailable: return .unavailable
                         }
                     }
@@ -173,7 +208,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
                 if case .disabled(_, let helpText) = affordance.rejectAvailability { return helpText }
                 return nil
             }()
-            
+
             // M2: When deferredState == .redacted, substitute a generic message rather than
             // leaking the raw helpText from the server (which may contain detail about what
             // was redacted). The generic message still communicates why buttons are disabled.
@@ -226,11 +261,6 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
                 case .unavailable: return .unavailable
                 }
             }()
-            P036UICounters.shared.recordArtifactPayloadState(
-                count: 1,
-                payloadAvailabilityState: availability.rawValue,
-                renderKind: "workbench_row"
-            )
             return ArtifactReportRow(
                 id: row.artifactID,
                 title: row.title,
@@ -238,13 +268,20 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
                 presentation: row
             )
         }
-        
+        if !artifactsAndReports.isEmpty {
+            P036UICounters.shared.recordArtifactPayloadState(
+                count: artifactsAndReports.count,
+                payloadAvailabilityState: "mixed",
+                renderKind: "workbench_row_batch"
+            )
+        }
+
         reportRows = detail.reportRows
-        
+
         recoveryEvidence = (detail.closeoutReadiness?.diagnosticRows ?? []).enumerated().map {
             RecoveryEvidenceRow(id: "recovery-\($0.offset)", title: $0.element)
         }
-        
+
         freshnessAndHealth = FreshnessHealth(
             freshness: detail.freshness.state.rawValue,
             daemonHealth: freshnessAndHealth?.daemonHealth ?? "Unknown",
@@ -254,15 +291,30 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
             isSystemReady: freshnessAndHealth?.isSystemReady ?? false,
             isReadinessDeferred: freshnessAndHealth?.isReadinessDeferred ?? true
         )
-        
+
         ideaContext = detail.ideaContext
         catalogContext = detail.catalogContext
         closeoutReadiness = detail.closeoutReadiness
         implementationCompletion = detail.implementationCompletion
         sideEffectReadback = detail.sideEffectReadback
-        
-        // timelineEntries is populated from projection via populate(from: WorkflowMapProjection)
-        
+        activeTimelineAgents = detail.activeAgentTimelineEntries.map { entry in
+            ActiveTimelineAgent(
+                id: entry.agentID,
+                title: entry.title,
+                providerID: entry.providerID,
+                stageID: entry.stageID,
+                stageLabel: entry.stageLabel,
+                taskLabel: entry.taskLabel,
+                status: entry.status,
+                sessionID: entry.sessionID,
+                latestAt: entry.timestamp,
+                eventCount: entry.eventCount ?? 0,
+                selectionOrder: entry.selectionOrder,
+                selectionUnavailableReason: entry.selectionUnavailableReason
+            )
+        }
+        timelineEntries = []
+
         if let error = detail.errorDescription {
             deferredStates = [
                 DeferredStateRow(id: "error", summary: error, state: .unavailable)
@@ -272,22 +324,31 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         }
     }
 
-    func populate(from projection: WorkflowMapProjection) {
-        timelineEntries = buildFocusedTimelineSpineEntries(
-            liveTimeline: projection.liveTimeline,
-            persistedTimeline: projection.persistedTimeline,
-            xcodeRuntimeObservations: projection.xcodeRuntimeObservations
-        ).map { entry in
-            TimelineEntry(
-                id: entry.id,
-                kind: TimelineEntryKind(rawValue: entry.kind.rawValue) ?? .text,
-                message: entry.title + ": " + entry.detail,
-                timestamp: entry.timestamp,
-                agentID: entry.agentID,
-                sessionID: entry.sessionID,
-                isCollapsed: entry.isCollapsed
-            )
+    private static func entriesForFocusedActiveAgent(
+        _ entries: [FocusedTimelineSpineEntry],
+        selectedAgentID: String?
+    ) -> [FocusedTimelineSpineEntry] {
+        let completedAgentIDs = Set(
+            entries.compactMap { entry -> String? in
+                guard entry.kind == .agentSummary else { return nil }
+                return entry.agentID
+            }
+        )
+        let activeEntries = entries.filter { entry in
+            guard let agentID = entry.agentID else { return false }
+            return !completedAgentIDs.contains(agentID)
         }
+        let resolvedAgentID: String? = {
+            if let selectedAgentID,
+               activeEntries.contains(where: { $0.agentID == selectedAgentID }) {
+                return selectedAgentID
+            }
+            return activeEntries
+                .max(by: { $0.timestamp < $1.timestamp })?
+                .agentID
+        }()
+        guard let resolvedAgentID else { return [] }
+        return activeEntries.filter { $0.agentID == resolvedAgentID }
     }
 
     func populate(from inbox: P031ApprovalInboxPresentation) {
@@ -300,18 +361,18 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
             guard let scheduler = scheduler?.health else { return nil }
             return "Queued: \(scheduler.queuedCount) / Active: \(scheduler.activeAgentExecutions)"
         }()
-        
+
         let mcpHubLabel: String = {
             guard let scheduler = scheduler?.health else { return "Unknown" }
             if scheduler.isStale { return "Disconnected" }
             return "Connected"
         }()
-        
+
         let capabilitiesLabel: String = {
             guard let scheduler = scheduler else { return "Pending" }
             return scheduler.activeProviders.isEmpty ? "Unavailable" : "Validated"
         }()
-        
+
         // Readiness is deferred when daemon projection hasn't arrived; do not infer false.
         let isReadinessDeferred = daemon == nil
 
@@ -334,6 +395,33 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         )
     }
 
+    private nonisolated static func stageTopologyStatus(for rawStatus: String) -> String {
+        let status = rawStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if status.contains("complete") || status == "succeeded" || status == "approved" {
+            return "terminal"
+        }
+        if status.contains("run") || status.contains("active") || status.contains("progress") {
+            return "active"
+        }
+        if status.contains("block") || status.contains("fail") {
+            return "blocked"
+        }
+        if status.contains("pending") || status.contains("waiting") {
+            return "pending"
+        }
+        return "unavailable"
+    }
+
+    private nonisolated static func stageTopologyEvidenceLabels(
+        for stage: P031StageTopologyPresentation
+    ) -> [String] {
+        [
+            stage.approvalRequired ? "Approval" : nil,
+            stage.artifactCount > 0 ? "\(stage.artifactCount) artifact\(stage.artifactCount == 1 ? "" : "s")" : nil,
+            stage.communicationCount > 0 ? "\(stage.communicationCount) signals" : nil
+        ].compactMap { $0 }
+    }
+
     // MARK: - Supporting Types
     struct SidebarLane: Identifiable, Equatable {
         let id: String
@@ -343,6 +431,7 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
 
     struct SummaryHeader: Equatable {
         let title: String
+        let runID: String?
         let status: String
         let workflowLabel: String?
         let progressLabel: String?
@@ -355,18 +444,227 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
 
     struct StageMap: Equatable {
         let stages: [StageCard]
+        let layoutColumns: [StageTopologyColumn]
+        let connectorColumns: [StageTopologyConnectorColumn]
+
+        init(stages: [StageCard]) {
+            self.stages = stages
+            let layout = StageTopologyLayoutBuilder.layout(for: stages)
+            self.layoutColumns = layout.columns
+            self.connectorColumns = layout.connectors
+        }
     }
 
     struct StageCard: Identifiable, Equatable {
         let id: String
+        let ordinal: Int
         let title: String
+        let ownerAgentTitle: String
         let status: String
+        let statusText: String
+        let isCurrent: Bool
+        let iterationText: String?
         let attemptText: String?
         let startedLabel: String?
         let completedLabel: String?
         let durationLabel: String?
         let evidenceLabels: [String]
         let artifactCount: Int
+        let communicationCount: Int
+        let approvalRequired: Bool
+        let occurrences: [StageOccurrence]
+        let hiddenOccurrenceCount: Int
+        let transitions: [StageTransition]
+    }
+
+    struct StageTopologyColumn: Identifiable, Equatable {
+        let id: String
+        let title: String
+        let slots: [StageTopologySlot]
+    }
+
+    struct StageTopologySlot: Identifiable, Equatable {
+        enum Kind: Equatable {
+            case stage
+            case bridge
+        }
+
+        let id: String
+        let kind: Kind
+        let stage: StageCard?
+        let bridgeLabel: String?
+        let heightUnits: Int
+
+        static func stage(_ stage: StageCard, heightUnits: Int = 1) -> StageTopologySlot {
+            StageTopologySlot(
+                id: "slot-\(stage.id)",
+                kind: .stage,
+                stage: stage,
+                bridgeLabel: nil,
+                heightUnits: max(1, heightUnits)
+            )
+        }
+
+        static func bridge(id: String, label: String, heightUnits: Int = 1) -> StageTopologySlot {
+            StageTopologySlot(
+                id: id,
+                kind: .bridge,
+                stage: nil,
+                bridgeLabel: label,
+                heightUnits: max(1, heightUnits)
+            )
+        }
+    }
+
+    struct StageTopologyConnectorColumn: Identifiable, Equatable {
+        let id: String
+        let connectors: [StageTopologyConnector]
+    }
+
+    struct StageTopologyConnector: Identifiable, Equatable {
+        enum Style: Equatable {
+            case primary
+            case retry
+            case manual
+            case hidden
+        }
+
+        let id: String
+        let style: Style
+    }
+
+    struct StageOccurrence: Identifiable, Equatable {
+        let id: String
+        let agentTitle: String
+        let taskName: String
+        let statusText: String
+        let providerLabel: String
+        let executionCountLabel: String?
+    }
+
+    struct StageTransition: Identifiable, Equatable {
+        let id: String
+        let toLabel: String
+        let detail: String?
+    }
+
+    private struct StageTopologyLayoutBuilder {
+        struct Layout {
+            let columns: [StageTopologyColumn]
+            let connectors: [StageTopologyConnectorColumn]
+        }
+
+        private static let fullMVPOrder = [
+            "state_1_idea_received",
+            "state_2_proposal_drafted",
+            "state_3_initial_proposal_approval",
+            "state_4_proposal_reviewed",
+            "state_5_proposal_refined",
+            "state_6_implementation_approval",
+            "state_7_implementation_started",
+            "state_8_implementation_continued",
+            "state_9_implementation_reviewed",
+            "state_10_implementation_refined",
+            "state_11_manual_release",
+            "state_12_workflow_complete"
+        ]
+
+        static func layout(for stages: [StageCard]) -> Layout {
+            let byID = Dictionary(uniqueKeysWithValues: stages.map { ($0.id, $0) })
+            if fullMVPOrder.allSatisfy({ byID[$0] != nil }) {
+                return fullMVPLayout(byID: byID)
+            }
+            return sequentialLayout(for: stages)
+        }
+
+        private static func fullMVPLayout(byID: [String: StageCard]) -> Layout {
+            func stage(_ id: String, heightUnits: Int = 1) -> StageTopologySlot {
+                StageTopologySlot.stage(byID[id]!, heightUnits: heightUnits)
+            }
+            func column(_ id: String, _ title: String, _ slots: [StageTopologySlot]) -> StageTopologyColumn {
+                StageTopologyColumn(id: "column-\(id)", title: title, slots: slots)
+            }
+            func connector(
+                _ id: String,
+                _ styles: [StageTopologyConnector.Style]
+            ) -> StageTopologyConnectorColumn {
+                StageTopologyConnectorColumn(
+                    id: "connector-\(id)",
+                    connectors: styles.enumerated().map { index, style in
+                        StageTopologyConnector(id: "connector-\(id)-\(index)", style: style)
+                    }
+                )
+            }
+
+            let columns = [
+                column("intake", "Intake", [
+                    stage("state_1_idea_received")
+                ]),
+                column("draft", "Draft", [
+                    stage("state_2_proposal_drafted")
+                ]),
+                column("approval", "Approval", [
+                    stage("state_3_initial_proposal_approval")
+                ]),
+                column("proposal-review-loop", "Proposal review loop", [
+                    stage("state_4_proposal_reviewed", heightUnits: 2)
+                ]),
+                column("unique-targets", "Unique targets", [
+                    stage("state_6_implementation_approval"),
+                    stage("state_5_proposal_refined")
+                ]),
+                column("implementation-start", "Implementation start", [
+                    stage("state_7_implementation_started", heightUnits: 2)
+                ]),
+                column("implementation-work-loop", "Implementation work loop", [
+                    stage("state_8_implementation_continued"),
+                    .bridge(id: "bridge-implementation-review-gate", label: "Review gate")
+                ]),
+                column("review-gate", "Review gate", [
+                    stage("state_9_implementation_reviewed", heightUnits: 2)
+                ]),
+                column("closeout-branch", "Closeout branch", [
+                    stage("state_10_implementation_refined"),
+                    stage("state_11_manual_release")
+                ]),
+                column("terminal", "Terminal", [
+                    stage("state_12_workflow_complete")
+                ])
+            ]
+
+            let connectors = [
+                connector("intake", [.primary]),
+                connector("draft", [.primary]),
+                connector("approval", [.primary]),
+                connector("proposal-review-loop", [.primary, .retry]),
+                connector("unique-targets", [.primary, .hidden]),
+                connector("implementation-start", [.primary, .hidden]),
+                connector("implementation-work-loop", [.primary, .hidden]),
+                connector("review-gate", [.retry, .manual]),
+                connector("closeout-branch", [.hidden, .primary])
+            ]
+
+            return Layout(columns: columns, connectors: connectors)
+        }
+
+        private static func sequentialLayout(for stages: [StageCard]) -> Layout {
+            let columns = stages.map { stage in
+                StageTopologyColumn(
+                    id: "column-\(stage.id)",
+                    title: "Stage \(stage.ordinal)",
+                    slots: [.stage(stage)]
+                )
+            }
+            let connectors = stages.dropLast().map { stage in
+                StageTopologyConnectorColumn(
+                    id: "connector-\(stage.id)",
+                    connectors: [
+                        StageTopologyConnector(id: "connector-\(stage.id)-primary", style: .primary)
+                    ]
+                )
+            }
+            return Layout(columns: columns, connectors: connectors)
+        }
     }
 
     struct ApprovalRow: Identifiable, Equatable {
@@ -429,14 +727,98 @@ final class RunsWorkbenchPresentationModel: ObservableObject {
         let isReadinessDeferred: Bool
     }
 
+    struct ActiveTimelineAgent: Identifiable, Equatable, Sendable {
+        let id: String
+        let title: String
+        let providerID: String?
+        let stageID: String?
+        let stageLabel: String?
+        let taskLabel: String?
+        let status: String
+        let sessionID: String?
+        let latestAt: Date
+        let eventCount: Int
+        let selectionOrder: Int?
+        let selectionUnavailableReason: String?
+    }
+
     struct TimelineEntry: Identifiable, Equatable {
         let id: String
         let kind: TimelineEntryKind
-        let message: String
+        let title: String
+        let detail: String
         let timestamp: Date
+        let displayTime: String?
+        let stageID: String?
+        let surfaceLabel: String
         let agentID: String?
         let sessionID: String?
         let isCollapsed: Bool
+        let rawDetail: String?
+        let rawDetailBytes: Int?
+        let rawDetailTruncated: Bool
+        let rawDetailHandle: String?
+        let rawDetailDigest: String?
+        let fullRawAvailable: Bool
+        let detailDigest: String?
+        let detailCharCount: Int?
+        let chunkCount: Int?
+        let isStreaming: Bool
+        let isTerminal: Bool
+        let stateLabel: String?
+        let providerID: String?
+
+        init(
+            id: String,
+            kind: TimelineEntryKind,
+            title: String,
+            detail: String,
+            timestamp: Date,
+            displayTime: String?,
+            stageID: String?,
+            surfaceLabel: String,
+            agentID: String?,
+            sessionID: String?,
+            isCollapsed: Bool,
+            rawDetail: String? = nil,
+            rawDetailBytes: Int? = nil,
+            rawDetailTruncated: Bool = false,
+            rawDetailHandle: String? = nil,
+            rawDetailDigest: String? = nil,
+            fullRawAvailable: Bool = true,
+            detailDigest: String? = nil,
+            detailCharCount: Int? = nil,
+            chunkCount: Int? = nil,
+            isStreaming: Bool = false,
+            isTerminal: Bool = false,
+            stateLabel: String? = nil,
+            providerID: String? = nil
+        ) {
+            self.id = id
+            self.kind = kind
+            self.title = title
+            self.detail = detail
+            self.timestamp = timestamp
+            self.displayTime = displayTime
+            self.stageID = stageID
+            self.surfaceLabel = surfaceLabel
+            self.agentID = agentID
+            self.sessionID = sessionID
+            self.isCollapsed = isCollapsed
+            self.rawDetail = rawDetail
+            self.rawDetailBytes = rawDetailBytes
+            self.rawDetailTruncated = rawDetailTruncated
+            self.rawDetailHandle = rawDetailHandle
+            self.rawDetailDigest = rawDetailDigest
+            self.fullRawAvailable = fullRawAvailable
+            self.detailDigest = detailDigest
+            self.detailCharCount = detailCharCount
+            self.chunkCount = chunkCount
+            self.isStreaming = isStreaming
+            self.isTerminal = isTerminal
+            self.stateLabel = stateLabel
+            self.providerID = providerID
+        }
     }
 
     enum TimelineEntryKind: String, Codable, CaseIterable {

@@ -39,7 +39,7 @@ Limitations:
 - This is not the Phase 3 two-run dogfood signoff.
 - The measurement did not force a synthetic projection-lag condition; lag/stale behavior remains covered by static/API tests and the scripted remote degraded-state drill.
 - Approval diagnostic comprehension was not measured because there were no pending approval rows in the current copied DB.
-- The release owner accepted this freshness baseline for P031 technical closeout on 2026-05-05, with broader operator dogfood and UI polish deferred to follow-up proposals P036/P085.
+- The release owner accepted this freshness baseline for P031 technical closeout on 2026-05-05, with broader operator dogfood and UI polish deferred to follow-up macOS operator navigation and P085 work.
 
 ## Results
 

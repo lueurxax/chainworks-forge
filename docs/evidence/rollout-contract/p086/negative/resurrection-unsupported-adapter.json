@@ -1,43 +1,18 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "unsupported_resurrection",
+  "fixture_purpose": "Demonstrates that provider_session_resurrection is universally rejected at Phase 0/pre-4, so no unsupported adapter can accidentally accept it. Phase 4 per-adapter enablement is gated by a separate fixture.",
+  "status": "pass",
+  "evidence_kind": "code",
+  "evidence": {
+    "location": "control-plane/crates/mcp-server/src/tools/agents.rs",
+    "function": "handle_continue_work",
+    "mechanism": "mode == 'provider_session_resurrection' returns -32010 provider_session_resurrection_unsupported before any eligibility check, DB write, or adapter dispatch. This is an unconditional early return at the MCP admission layer.",
+    "mcp_error_code": -32010,
+    "failure_reason": "provider_session_resurrection_unsupported",
+    "hold_predicate_prevented": "No adapter can accept provider_session_resurrection at Phase 0/pre-4 because the rejection occurs in the shared MCP handler before any adapter-specific code is reached."
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:resurrection_unsupported_adapter",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "hold_prevented_by_phase_gate"
 }

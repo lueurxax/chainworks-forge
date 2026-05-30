@@ -149,6 +149,13 @@ async fn seed_receipt(
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -531,6 +538,11 @@ async fn proposal_088_mcp_runs_get_and_list_expose_implementation_completion() {
         run_get["implementationCompletion"]["completion_boundary_subtype"]["value"],
         "junie_repair_outputs_partially_materialized"
     );
+
+    // runs.list is projection-based (P087): rebuild projections so implementationCompletion is baked in.
+    db::repos::projections::rebuild_all_for_run(&pool, run_id)
+        .await
+        .unwrap();
 
     let run_list = mcp_runs::execute(
         "runs.list",

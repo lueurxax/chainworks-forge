@@ -5,7 +5,7 @@
 | Date | 2026-04-18 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [027-rust-sqlite-local-control-plane-extraction.md](027-rust-sqlite-local-control-plane-extraction.md), [local daemon lifecycle contract](../reference/local-daemon-lifecycle-supervision-and-packaging.md), [044-idea-crud-completeness-and-lifecycle-mcp-tools.md](044-idea-crud-completeness-and-lifecycle-mcp-tools.md), [050-per-run-workspace-isolation.md](050-per-run-workspace-isolation.md) |
+| Depends on | [../reference/rust-control-plane.md](../reference/rust-control-plane.md), [local daemon lifecycle contract](../reference/local-daemon-lifecycle-supervision-and-packaging.md), [044-idea-crud-completeness-and-lifecycle-mcp-tools.md](044-idea-crud-completeness-and-lifecycle-mcp-tools.md), [../reference/per-run-workspace-isolation.md](../reference/per-run-workspace-isolation.md) |
 | Scope | Tighten the internal contracts that live inside the control-plane Rust workspace so that the boundaries the daemon already exposes externally are also type-safe on the inside. |
 | Goal | Remove the four remaining untyped seams inside `control-plane/` (work-item payload, `engine` god-crate, ACP session bootstrap JSON, `graphql-server::schema` monolith) and pin two new client-facing contracts (daemon-status snapshot+subscribe, ACP adapter config) without changing any externally observable behavior. |
 

@@ -6,8 +6,8 @@ use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
     agent_execution_runtime_receipts, agent_executions, artifact_contracts, artifacts, closeout,
     code_writer_completion_receipts, lead_conflict_mediations, legacy_discovery_overrides,
-    retry_stage_execution_authorities, rollout_contract_checks, sessions, validation,
-    workflow_conflicts,
+    retry_payload_recovery_events, retry_stage_execution_authorities, rollout_contract_checks,
+    runs, sessions, validation, workflow_conflicts,
 };
 use db::write_class::WriteLane;
 use db::writer::class_a_operation;
@@ -162,22 +162,55 @@ pub(crate) async fn retry_authority_history_json(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<serde_json::Value> {
-    Ok(serde_json::to_value(
-        retry_stage_execution_authorities::list_by_run(pool, run_id).await?,
-    )?)
+    let events = retry_payload_recovery_events::latest_by_authority_for_run(pool, run_id).await?;
+    let mut values = retry_stage_execution_authorities::list_by_run(pool, run_id)
+        .await?
+        .into_iter()
+        .map(|authority| {
+            let mut value = serde_json::to_value(&authority)?;
+            if let Some(event) = events.get(&authority.id) {
+                let readback = event.readback_json();
+                value["retryPayloadRecovery"] = readback.clone();
+                value["retry_payload_recovery"] = readback;
+            }
+            Ok::<_, anyhow::Error>(value)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for event in retry_payload_recovery_events::list_by_run(pool, run_id).await? {
+        if event.retry_authority_id.is_none() {
+            let readback = event.readback_json();
+            values.push(serde_json::json!({
+                "schema_version": "retry_payload_recovery_history_v1",
+                "authority_state": "missing_authority",
+                "run_id": event.run_id.to_string(),
+                "source_invoke_work_item_id": event.invoke_work_item_id,
+                "retryPayloadRecovery": readback.clone(),
+                "retry_payload_recovery": readback,
+            }));
+        }
+    }
+    Ok(serde_json::Value::Array(values))
 }
 
 pub(crate) async fn retry_authority_current_json(
     pool: &SqlitePool,
     run_id: RunId,
 ) -> Result<serde_json::Value> {
+    let events = retry_payload_recovery_events::latest_by_authority_for_run(pool, run_id).await?;
     let history = retry_stage_execution_authorities::list_by_run(pool, run_id).await?;
-    Ok(history
+    let Some(authority) = history
         .into_iter()
         .find(|authority| authority.authority_state.to_string() == "active")
-        .map(serde_json::to_value)
-        .transpose()?
-        .unwrap_or(serde_json::Value::Null))
+    else {
+        return Ok(serde_json::Value::Null);
+    };
+    let mut value = serde_json::to_value(&authority)?;
+    if let Some(event) = events.get(&authority.id) {
+        let readback = event.readback_json();
+        value["retryPayloadRecovery"] = readback.clone();
+        value["retry_payload_recovery"] = readback;
+    }
+    Ok(value)
 }
 
 /// P082: singular latest p082_recovery_matrix_readback for runs.get (null when none applies).
@@ -1112,9 +1145,36 @@ pub(crate) async fn artifact_report_json(
         }
     }
     if artifact.report_kind.as_deref() == Some("failed_stage_evidence") {
-        let payload = std::fs::read_to_string(&artifact.file_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
+        // SEC-P081: Enforce path containment under the run's artifact_root before
+        // reading. artifact.file_path is daemon-written, but corrupted metadata or
+        // a crafted DB row could redirect reads to arbitrary daemon-readable files.
+        // We resolve the run's artifact_root from DB, canonicalize both paths, and
+        // require the evidence file to reside strictly inside that root.
+        const MAX_EVIDENCE_BYTES: u64 = 1_048_576; // 1 MiB
+        let payload: Option<serde_json::Value> = async {
+            let run = runs::find_by_id(pool, artifact.run_id).await?;
+            let root_str = run
+                .as_ref()
+                .map(|r| r.artifact_root.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("artifact_root missing or empty"))?;
+            let canonical_root = std::fs::canonicalize(root_str)
+                .map_err(|e| anyhow::anyhow!("cannot canonicalize artifact_root: {e}"))?;
+            let canonical_path = std::fs::canonicalize(&artifact.file_path)
+                .map_err(|e| anyhow::anyhow!("cannot canonicalize file_path: {e}"))?;
+            if !canonical_path.starts_with(&canonical_root) {
+                anyhow::bail!("file_path escapes artifact_root containment");
+            }
+            let meta = std::fs::metadata(&canonical_path)?;
+            if meta.len() > MAX_EVIDENCE_BYTES {
+                anyhow::bail!("evidence file exceeds {} byte limit", MAX_EVIDENCE_BYTES);
+            }
+            let content = std::fs::read_to_string(&canonical_path)?;
+            let v: serde_json::Value = serde_json::from_str(&content)?;
+            Ok::<_, anyhow::Error>(v)
+        }
+        .await
+        .ok();
         if let serde_json::Value::Object(ref mut map) = value {
             map.insert(
                 "failed_stage_evidence".to_string(),
@@ -1382,12 +1442,10 @@ mod tests {
         let pool = create_pool("sqlite::memory:")
             .await
             .expect("in-memory pool failed");
-        db::writer::register_shared_writer(
-            &pool,
-            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
-        )
-        .await
-        .expect("register shared writer");
+        let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .expect("register shared DbWriter for test pool");
         pool
     }
 
@@ -1506,6 +1564,13 @@ mod tests {
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
                 actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
             },
         )
         .await
@@ -1889,8 +1954,13 @@ mod tests {
         .await
         .unwrap();
 
-        let reports: Vec<Artifact> = serde_json::from_value(result).unwrap();
-        let names: Vec<String> = reports.into_iter().map(|artifact| artifact.name).collect();
+        // reports.get returns enriched serde_json::Value objects with file_path stripped,
+        // so we extract names from the JSON array rather than deserializing as Vec<Artifact>.
+        let reports: Vec<serde_json::Value> = serde_json::from_value(result).unwrap();
+        let names: Vec<String> = reports
+            .into_iter()
+            .filter_map(|v| v["name"].as_str().map(String::from))
+            .collect();
 
         assert!(names.contains(&"release_manifest".to_string()));
         assert!(names.contains(&"delivery_receipt".to_string()));
@@ -2291,6 +2361,13 @@ mod tests {
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         };
         let exec_one_id = exec_one.id;
         db::repos::agent_executions::insert(&pool, &exec_one)
@@ -2643,17 +2720,29 @@ mod tests {
         );
     }
 
+    fn make_run_with_root(id: RunId, idea_id: IdeaId, artifact_root: &str) -> domain::run::Run {
+        let mut run = make_run(id, idea_id);
+        run.artifact_root = artifact_root.to_string();
+        run
+    }
+
     #[tokio::test]
     async fn reports_failed_stage_evidence_contract_tests() {
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        runs::insert(&pool, &make_run(run_id, idea_id))
+
+        // SEC-P081: evidence file must reside inside the run's artifact_root.
+        let artifact_dir = tempfile::TempDir::new().unwrap();
+        let artifact_root = artifact_dir.path().to_string_lossy().to_string();
+        runs::insert(&pool, &make_run_with_root(run_id, idea_id, &artifact_root))
             .await
             .unwrap();
-        let payload_path =
-            std::env::temp_dir().join(format!("failed-stage-evidence-{run_id}.json"));
+
+        let payload_path = artifact_dir
+            .path()
+            .join(format!("failed-stage-evidence-{run_id}.json"));
         std::fs::write(
             &payload_path,
             serde_json::to_vec(&serde_json::json!({
@@ -2716,6 +2805,86 @@ mod tests {
         assert_eq!(
             evidence["failed_stage_evidence"]["recovery_snapshot"]["status"],
             serde_json::json!("available")
+        );
+    }
+
+    // SEC-P081: evidence files outside the run's artifact_root must be silently
+    // omitted (null) rather than read and exposed through reports.get.
+    #[tokio::test]
+    async fn failed_stage_evidence_outside_artifact_root_is_rejected() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+        // artifact_root points to one temp dir; the evidence file lives outside it.
+        let artifact_dir = tempfile::TempDir::new().unwrap();
+        let outside_dir = tempfile::TempDir::new().unwrap();
+        let artifact_root = artifact_dir.path().to_string_lossy().to_string();
+        runs::insert(&pool, &make_run_with_root(run_id, idea_id, &artifact_root))
+            .await
+            .unwrap();
+
+        // Write the "sensitive" file outside the artifact_root.
+        let outside_path = outside_dir
+            .path()
+            .join(format!("outside-evidence-{run_id}.json"));
+        std::fs::write(&outside_path, br#"{"secret": "should_not_be_returned"}"#).unwrap();
+
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: ArtifactId::new(),
+                run_id,
+                stage_id: "stage_1".into(),
+                agent_id: "agent_1".into(),
+                name: "failed_stage_evidence_stage_1".into(),
+                contract_id: "failed_stage_evidence".into(),
+                format: ArtifactFormat::Json,
+                // Crafted to point outside artifact_root — containment must block this.
+                file_path: outside_path.to_string_lossy().to_string(),
+                checksum_sha256: None,
+                size_bytes: None,
+                provider: "system".into(),
+                model: None,
+                created_at: Utc::now(),
+                is_pinned: false,
+                report_kind: Some("failed_stage_evidence".into()),
+                report_version: Some(1),
+                agent_execution_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let principal = test_principal();
+        let result = execute(
+            "reports.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+            &principal,
+        )
+        .await
+        .unwrap();
+        let reports = result.as_array().expect("reports array");
+        let evidence = reports
+            .iter()
+            .find(|report| report["report_kind"] == serde_json::json!("failed_stage_evidence"))
+            .expect("failed-stage evidence report present");
+
+        // The payload must be null — the containment check must reject the outside path.
+        assert_eq!(
+            evidence["failed_stage_evidence"],
+            serde_json::Value::Null,
+            "evidence file outside artifact_root must be rejected (null), not served"
+        );
+        // The secret content must not appear anywhere in the response.
+        let serialized = serde_json::to_string(&evidence).unwrap();
+        assert!(
+            !serialized.contains("should_not_be_returned"),
+            "secret content must not leak through path-containment boundary"
         );
     }
 }

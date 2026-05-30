@@ -6,6 +6,9 @@ import AppKit
 
 struct RunsHomeView: View {
     @StateObject private var model: P031ThinReadDashboardModel
+    // P046: transient MainActor session observability state; never persisted to SwiftData.
+    // Owned here as the selected-run detail coordinator per Phase 3 requirement.
+    @StateObject private var p046Model: P046SessionObservabilityModel
     @ObservedObject var workbench: RunsWorkbenchPresentationModel
     @State private var selectedRunDetailTab: P031RunDetailTab = .overview
     @State private var focusedArtifactStageID: String?
@@ -14,21 +17,33 @@ struct RunsHomeView: View {
     // PC-003: sidebar lane filter context — set when a deep-link or banner routes here
     // specifically to surface waiting approvals. Cleared when the user manually selects any run.
     @State private var focusedLaneID: String? = nil
+    private let waitingApprovalLaneID = "waiting"
+    private let escalationAttentionLaneID = "escalation_attention"
 
     @MainActor
     init(workbench: RunsWorkbenchPresentationModel) {
         let model = P031ThinReadDashboardModel.bootstrap()
+        // Share the same endpoint for P046 session observability reads.
+        let endpoint = DaemonClientEndpoint.operatorDefault()
+        let p046Store = P031GraphQLWorkflowReadStore(
+            readTransport: P031URLSessionGraphQLReadTransport(endpoint: endpoint),
+            subscriptionTransport: P031URLSessionGraphQLSubscriptionTransport(endpoint: endpoint)
+        )
         _model = StateObject(wrappedValue: model)
+        _p046Model = StateObject(wrappedValue: P046SessionObservabilityModel.make(store: p046Store))
         self.workbench = workbench
         _selectedRunDetailTab = State(initialValue: .overview)
     }
 
+    @MainActor
     init(
         model: P031ThinReadDashboardModel,
         workbench: RunsWorkbenchPresentationModel,
-        initialTab: P031RunDetailTab
+        initialTab: P031RunDetailTab,
+        p046Model: P046SessionObservabilityModel? = nil
     ) {
         _model = StateObject(wrappedValue: model)
+        _p046Model = StateObject(wrappedValue: p046Model ?? P046SessionObservabilityModel.noOp())
         self.workbench = workbench
         _selectedRunDetailTab = State(initialValue: initialTab)
     }
@@ -43,6 +58,13 @@ struct RunsHomeView: View {
         .accessibilityIdentifier("runs-home-owner-view")
         .task {
             await model.loadIfNeeded()
+        }
+        // P046: drive session observability for the currently selected run.
+        // Capability discovery and gating happen inside the model before any P046
+        // documents are issued. On run change the prior task is cancelled automatically
+        // by SwiftUI's .task(id:) semantics; here we use onChange for the same effect.
+        .onChange(of: model.selectedRunID) { _, newRunID in
+            p046Model.updateSelectedRun(newRunID)
         }
         .toolbar {
             Button {
@@ -105,6 +127,15 @@ struct RunsHomeView: View {
 
     private var runsSidebar: some View {
         List {
+            if focusedLaneID == waitingApprovalLaneID {
+                P031AccessibilityMarker(identifier: "approval-inbox-view")
+                if workbench.inlineApprovals.isEmpty {
+                    P031AccessibilityMarker(identifier: "approval-inbox-empty-state")
+                }
+            }
+            if focusedLaneID == escalationAttentionLaneID {
+                P031AccessibilityMarker(identifier: "p058-escalation-attention-runs-view")
+            }
             if workbench.sidebarLanes.isEmpty {
                 Section {
                     if model.isLoading {
@@ -124,6 +155,27 @@ struct RunsHomeView: View {
                 } header: {
                     Text("Runs")
                 }
+            } else if focusedLaneID == escalationAttentionLaneID {
+                Section {
+                    let rows = escalationAttentionRows
+                    if rows.isEmpty {
+                        ForgeEmptyState(
+                            title: "No paused escalation runs",
+                            systemImage: "clock.badge.exclamationmark",
+                            description: "Escalation attention is clear."
+                        )
+                        .padding(.vertical, 8)
+                    } else {
+                        ForEach(rows, id: \.runID) { row in
+                            runRow(row: row)
+                        }
+                    }
+                } header: {
+                    Label("Escalation attention", systemImage: "scope")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .accessibilityIdentifier("lane-focused-\(escalationAttentionLaneID)")
+                }
             } else {
                 ForEach(workbench.sidebarLanes) { lane in
                     Section {
@@ -138,15 +190,11 @@ struct RunsHomeView: View {
         }
         .listStyle(.sidebar)
         .accessibilityIdentifier("runs-home-list")
-        .onChange(of: model.runDetail) {
-            if let newValue = model.runDetail {
-                workbench.populate(from: newValue)
-            }
+        .onReceive(model.$runDetail.compactMap { $0 }) { newValue in
+            workbench.populate(from: newValue)
         }
-        .onChange(of: model.approvalInbox) {
-            if let newValue = model.approvalInbox {
-                workbench.populate(from: newValue)
-            }
+        .onReceive(model.$approvalInbox.compactMap { $0 }) { newValue in
+            workbench.populate(from: newValue)
         }
         .onReceive(NotificationCenter.default.publisher(for: .chainworksOpenRunInRunsHome)) { notification in
             if let runID = notification.object as? String {
@@ -158,11 +206,11 @@ struct RunsHomeView: View {
         // PC-003: approvals deep-link → Runs focused on waiting approval lane.
         // Always set focusedLaneID so the sidebar shows the filter context even when
         // no run is currently waiting (the empty-state message remains informative).
-        // focusedLaneID is kept set so .onChange(of: workbench.sidebarLanes) below can
+        // focusedLaneID is kept set so the sidebar-lane publisher below can
         // replay the selection once lanes populate (fixes the startup notification race).
         .onReceive(NotificationCenter.default.publisher(for: .chainworksFocusWaitingApprovalLane)) { _ in
-            focusedLaneID = "waiting"
-            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == "waiting" }),
+            focusedLaneID = waitingApprovalLaneID
+            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == waitingApprovalLaneID }),
                let firstRun = waitingLane.runs.first {
                 selectedRunDetailTab = .approvals
                 model.selectRun(firstRun.runID)
@@ -176,22 +224,62 @@ struct RunsHomeView: View {
         .onChange(of: workbench.pendingFocusWaitingApprovalLane, initial: true) {
             guard workbench.pendingFocusWaitingApprovalLane else { return }
             workbench.clearFocusWaitingApprovalLane()
-            focusedLaneID = "waiting"
-            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == "waiting" }),
+            focusedLaneID = waitingApprovalLaneID
+            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == waitingApprovalLaneID }),
                let firstRun = waitingLane.runs.first {
                 selectedRunDetailTab = .approvals
                 model.selectRun(firstRun.runID)
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .chainworksFocusEscalationAttentionRuns)) { _ in
+            focusEscalationAttentionLane()
+        }
+        .onChange(of: workbench.pendingFocusEscalationAttentionLane, initial: true) {
+            guard workbench.pendingFocusEscalationAttentionLane else { return }
+            workbench.clearFocusEscalationAttentionLane()
+            focusEscalationAttentionLane()
+        }
         // PC-003 lanes-change fallback: if focusedLaneID was set (by notification or workbench flag)
         // before lanes populated, auto-select once lanes arrive.
-        .onChange(of: workbench.sidebarLanes) {
-            guard focusedLaneID == "waiting", model.selectedRunID == nil else { return }
-            if let waitingLane = workbench.sidebarLanes.first(where: { $0.id == "waiting" }),
+        .onReceive(workbench.$sidebarLanes) { sidebarLanes in
+            guard model.selectedRunID == nil else { return }
+            if focusedLaneID == waitingApprovalLaneID,
+               let waitingLane = sidebarLanes.first(where: { $0.id == waitingApprovalLaneID }),
                let firstRun = waitingLane.runs.first {
                 selectedRunDetailTab = .approvals
                 model.selectRun(firstRun.runID)
+            } else if focusedLaneID == escalationAttentionLaneID,
+                      let firstRun = escalationAttentionRows(from: sidebarLanes).first {
+                selectedRunDetailTab = .overview
+                model.selectRun(firstRun.runID)
             }
+        }
+        .onChange(of: model.escalationAttentionSnapshots) {
+            guard focusedLaneID == escalationAttentionLaneID, model.selectedRunID == nil else { return }
+            if let firstRun = escalationAttentionRows.first {
+                selectedRunDetailTab = .overview
+                model.selectRun(firstRun.runID)
+            }
+        }
+    }
+
+    private var escalationAttentionRows: [P031RunsHomeRowPresentation] {
+        escalationAttentionRows(from: workbench.sidebarLanes)
+    }
+
+    private func escalationAttentionRows(
+        from lanes: [RunsWorkbenchPresentationModel.SidebarLane]
+    ) -> [P031RunsHomeRowPresentation] {
+        let attentionRunIDs = Set(model.escalationAttentionSnapshots.map(\.runId))
+        guard !attentionRunIDs.isEmpty else { return [] }
+        return lanes.flatMap(\.runs).filter { attentionRunIDs.contains($0.runID) }
+    }
+
+    private func focusEscalationAttentionLane() {
+        focusedLaneID = escalationAttentionLaneID
+        if let firstRun = escalationAttentionRows.first {
+            selectedRunDetailTab = .overview
+            model.selectRun(firstRun.runID)
         }
     }
 
@@ -288,7 +376,7 @@ struct RunsHomeView: View {
                                 }
                             )
                         }
-                        
+
                         if !workbench.inlineApprovals.isEmpty {
                             P036ApprovalWorkbenchCard(
                                 rows: workbench.inlineApprovals,
@@ -297,22 +385,29 @@ struct RunsHomeView: View {
                                 resolvingIDs: model.resolvingApprovalIDs
                             )
                         }
-                        
+
                         if let stageMap = workbench.stageMap {
                             P036StageMapCard(map: stageMap)
                         }
-                        
+
+                        if let continuationReadback = runDetail.continuationReadback {
+                            P086ContinuationReadbackCard(presentation: continuationReadback)
+                        }
+
                         if !workbench.artifactsAndReports.isEmpty {
                             P036ArtifactWorkbenchCard(rows: workbench.artifactsAndReports)
                         }
-                        
+
                         if !workbench.recoveryEvidence.isEmpty {
                             P036RecoveryEvidenceCard(rows: workbench.recoveryEvidence)
                         }
-                        
+
                         if let health = workbench.freshnessAndHealth {
                             P036SystemReadinessCard(health: health)
                         }
+
+                        P046SessionObservabilityCard(model: p046Model)
+
                     case .stages:
                         if let stageMap = workbench.stageMap {
                             P036StageMapCard(map: stageMap)
@@ -331,28 +426,27 @@ struct RunsHomeView: View {
                             resolvingIDs: model.resolvingApprovalIDs
                         )
                     case .timeline:
-                        // P036 Phase 1-2: live agent-execution event timeline is deferred until
-                        // Phase 3 projection plumbing is validated (dogfood Phase 2.5).
-                        // p036_projection_gap_deferred_total{surface=timeline,gap_class=live_events}
-                        P031OperatorPlaceholder(
-                            title: "Timeline Deferred",
-                            message: "Live timeline requires a control-plane event-projection feed. Available in Phase 3 after dogfood validation (Phase 2.5).",
-                            identifier: "timeline-projection-deferred",
-                            titleIdentifier: "timeline-projection-title"
+                        P036TimelineWorkbenchCard(
+                            entries: timelineEntriesForSelectedRun(),
+                            activeAgents: workbench.activeTimelineAgents,
+                            resolveTimelineRawDetail: { handle in
+                                await model.resolveTimelineRawDetail(handle: handle)
+                            }
                         )
-                        .onAppear {
-                            P036UICounters.shared.recordProjectionGapDeferred(
-                                count: 1,
-                                surface: "timeline",
-                                gapClass: "live_events"
-                            )
-                        }
                     case .reports:
                         P031ReportMetadataCard(rows: workbench.reportRows)
                     case .system:
                         if let health = workbench.freshnessAndHealth {
                             P036SystemReadinessCard(health: health)
                         }
+                        if let runID = runDetail.runID, !runDetail.escalationChains.isEmpty {
+                            EscalationInspectorAdapterView(
+                                runID: runID,
+                                chains: runDetail.escalationChains,
+                                traceJSONRedacted: runDetail.escalationTraceJSONRedacted
+                            )
+                        }
+                        P031DaemonLifecycleCard(presentation: model.daemonLifecycle)
                     }
                 }
                 .padding(.horizontal, 20)
@@ -382,6 +476,38 @@ struct RunsHomeView: View {
         }
     }
 
+    private func timelineEntriesForSelectedRun() -> [RunsWorkbenchPresentationModel.TimelineEntry] {
+        let liveEntries = model.runtimeTimelineEvents.map { event in
+            RunsWorkbenchPresentationModel.TimelineEntry(
+                id: event.id,
+                kind: RunsWorkbenchPresentationModel.TimelineEntryKind(rawValue: event.surfaceLabel) ?? .sessionEvent,
+                title: event.title,
+                detail: event.detail,
+                timestamp: event.timestamp,
+                displayTime: event.timestamp.formatted(date: .omitted, time: .standard),
+                stageID: event.stageID,
+                surfaceLabel: event.surfaceLabel,
+                agentID: event.agentID,
+                sessionID: event.sessionGenerationID,
+                isCollapsed: false,
+                rawDetail: event.rawDetail,
+                rawDetailBytes: event.rawDetailBytes,
+                rawDetailTruncated: event.rawDetailTruncated,
+                rawDetailHandle: event.rawDetailHandle,
+                rawDetailDigest: event.rawDetailDigest,
+                fullRawAvailable: event.fullRawAvailable,
+                detailDigest: event.detailDigest,
+                detailCharCount: event.detailCharCount,
+                chunkCount: event.chunkCount,
+                isStreaming: event.isStreaming,
+                isTerminal: event.isTerminal,
+                stateLabel: event.stateLabel,
+                providerID: event.provider
+            )
+        }
+        return liveEntries.isEmpty ? workbench.timelineEntries : liveEntries
+    }
+
     private func artifactCountsByStageID(
         for runDetail: P031RunDetailPresentation
     ) -> [String: Int] {
@@ -390,6 +516,383 @@ struct RunsHomeView: View {
             by: { $0.stageExecutionID ?? $0.stageID }
         )
         .mapValues { $0.count }
+    }
+}
+
+struct P036RuntimeTimelineBuffer {
+    private static let liveResponseDetailLimit = 64_000
+    private static let retainedRawResponseDetailLimitBytes = 512 * 1024
+
+    private(set) var events: [P031RuntimeTimelineEventPresentation] = []
+
+    mutating func reset() {
+        events = []
+    }
+
+    mutating func record(
+        _ event: P031RuntimeTimelineEventPresentation,
+        selectedRunID: String?
+    ) {
+        guard selectedRunID == event.runID else { return }
+
+        if event.surfaceLabel == "final_response" {
+            collapseResponseChunks(
+                matching: event,
+                fallbackTerminalEvent: event,
+                terminalDetailOverride: event.detail
+            )
+            return
+        }
+
+        if event.eventKind == "session_completed" || event.eventKind == "session_failed" {
+            collapseResponseChunks(
+                matching: event,
+                fallbackTerminalEvent: event,
+                terminalDetailOverride: nil
+            )
+            return
+        }
+
+        if Self.isResponseChunk(event) {
+            mergeResponseChunk(event)
+            return
+        }
+
+        if Self.isProviderActionCompletion(event) {
+            collapseProviderActionCompletion(event)
+            return
+        }
+
+        append(event)
+    }
+
+    private mutating func append(_ event: P031RuntimeTimelineEventPresentation) {
+        events.append(event)
+        trimToVisibleLimit()
+    }
+
+    private mutating func trimToVisibleLimit() {
+        while events.count > 40 {
+            if let removableIndex = events.indices.first(where: { !Self.isResponseChunk(events[$0]) }) {
+                events.remove(at: removableIndex)
+            } else {
+                events.removeFirst()
+            }
+        }
+    }
+
+    private mutating func mergeResponseChunk(_ event: P031RuntimeTimelineEventPresentation) {
+        guard let existingIndex = events.indices.reversed().first(where: { index in
+            let existing = events[index]
+            return Self.isResponseChunk(existing)
+                && Self.matchesAgentSession(existing, terminalEvent: event)
+        })
+        else {
+            append(Self.normalizedResponseChunk(event))
+            return
+        }
+
+        let previous = events.remove(at: existingIndex)
+        let previousRawDetail = previous.rawDetail ?? previous.detail
+        let incomingRawDetail = event.rawDetail ?? event.detail
+        let combinedRawDetail = previousRawDetail + incomingRawDetail
+        let rawDetailWasTruncated = previous.rawDetailTruncated
+            || event.rawDetailTruncated
+            || combinedRawDetail.utf8.count > Self.retainedRawResponseDetailLimitBytes
+        let rawDetail = Self.boundedRawResponseDetail(combinedRawDetail)
+        let rawDetailBytes = Self.combinedRawDetailBytes(previous.rawDetailBytes, event.rawDetailBytes)
+        let rawDetailHandle = event.rawDetailHandle ?? previous.rawDetailHandle
+        append(P031RuntimeTimelineEventPresentation(
+            id: previous.id,
+            runID: event.runID,
+            stageID: event.stageID ?? previous.stageID,
+            agentID: event.agentID,
+            provider: event.provider,
+            eventKind: event.eventKind,
+            title: event.title,
+            detail: Self.boundedLiveResponseDetail(rawDetail),
+            surfaceLabel: event.surfaceLabel,
+            sessionGenerationID: previous.sessionGenerationID ?? event.sessionGenerationID,
+            timestamp: event.timestamp,
+            rawDetail: rawDetail,
+            rawDetailBytes: rawDetailBytes,
+            rawDetailTruncated: rawDetailWasTruncated,
+            rawDetailHandle: rawDetailHandle,
+            rawDetailDigest: event.rawDetailDigest ?? previous.rawDetailDigest,
+            fullRawAvailable: !rawDetailWasTruncated
+                || (rawDetailHandle != nil && event.fullRawAvailable && previous.fullRawAvailable),
+            detailDigest: event.detailDigest ?? previous.detailDigest,
+            detailCharCount: rawDetail.count,
+            chunkCount: (previous.chunkCount ?? 1) + (event.chunkCount ?? 1),
+            isStreaming: true,
+            isTerminal: false,
+            stateLabel: event.stateLabel ?? previous.stateLabel
+        ))
+    }
+
+    private mutating func collapseProviderActionCompletion(_ event: P031RuntimeTimelineEventPresentation) {
+        guard let incomingIdentity = Self.providerActionIdentity(for: event),
+              let existingIndex = events.indices.reversed().first(where: { index in
+                  let existing = events[index]
+                  return Self.isProviderActionInProgress(existing)
+                      && Self.matchesAgentSession(existing, terminalEvent: event)
+                      && Self.providerActionIdentity(for: existing) == incomingIdentity
+              })
+        else {
+            append(event)
+            return
+        }
+
+        let previous = events.remove(at: existingIndex)
+        append(P031RuntimeTimelineEventPresentation(
+            id: event.id,
+            runID: event.runID,
+            stageID: event.stageID ?? previous.stageID,
+            agentID: event.agentID,
+            provider: event.provider,
+            eventKind: event.eventKind,
+            title: event.title,
+            detail: event.detail,
+            surfaceLabel: event.surfaceLabel,
+            sessionGenerationID: event.sessionGenerationID ?? previous.sessionGenerationID,
+            timestamp: event.timestamp,
+            rawDetail: event.rawDetail ?? event.detail,
+            rawDetailBytes: event.rawDetailBytes,
+            rawDetailTruncated: event.rawDetailTruncated,
+            rawDetailHandle: event.rawDetailHandle,
+            rawDetailDigest: event.rawDetailDigest,
+            fullRawAvailable: event.fullRawAvailable,
+            detailDigest: event.detailDigest,
+            detailCharCount: event.detailCharCount,
+            chunkCount: event.chunkCount,
+            isStreaming: false,
+            isTerminal: true,
+            stateLabel: event.stateLabel ?? previous.stateLabel
+        ))
+    }
+
+    private mutating func collapseResponseChunks(
+        matching terminalEvent: P031RuntimeTimelineEventPresentation,
+        fallbackTerminalEvent: P031RuntimeTimelineEventPresentation,
+        terminalDetailOverride: String?
+    ) {
+        let matchingChunks = events.filter { existing in
+            Self.isResponseChunk(existing)
+                && Self.matchesAgentSession(existing, terminalEvent: terminalEvent)
+        }
+        let rawDetail = Self.accumulatedResponseDetail(
+            for: matchingChunks,
+            override: terminalDetailOverride
+        )
+        guard !rawDetail.isEmpty else { return }
+        let summaryDetail = Self.summaryDetail(
+            for: matchingChunks,
+            rawDetail: rawDetail
+        )
+        let rawDetailWasTruncated = matchingChunks.contains(where: \.rawDetailTruncated)
+            || rawDetail.utf8.count >= Self.retainedRawResponseDetailLimitBytes
+        let rawDetailBytes = Self.accumulatedRawDetailBytes(
+            for: matchingChunks,
+            fallback: fallbackTerminalEvent
+        )
+
+        events.removeAll { existing in
+            Self.isResponseChunk(existing)
+                && Self.matchesAgentSession(existing, terminalEvent: terminalEvent)
+        }
+
+        let lastChunk = matchingChunks.last ?? fallbackTerminalEvent
+        append(
+            P031RuntimeTimelineEventPresentation(
+                id: "\(fallbackTerminalEvent.id):response-summary",
+                runID: fallbackTerminalEvent.runID,
+                stageID: lastChunk.stageID ?? fallbackTerminalEvent.stageID,
+                agentID: fallbackTerminalEvent.agentID,
+                provider: fallbackTerminalEvent.provider,
+                eventKind: fallbackTerminalEvent.eventKind,
+                title: fallbackTerminalEvent.eventKind == "session_failed"
+                    ? "Agent response failed"
+                    : "Agent response complete",
+                detail: summaryDetail,
+                surfaceLabel: "agent_summary",
+                sessionGenerationID: lastChunk.sessionGenerationID,
+                timestamp: fallbackTerminalEvent.timestamp,
+                rawDetail: rawDetail,
+                rawDetailBytes: rawDetailBytes,
+                rawDetailTruncated: rawDetailWasTruncated,
+                rawDetailHandle: lastChunk.rawDetailHandle ?? fallbackTerminalEvent.rawDetailHandle,
+                rawDetailDigest: lastChunk.rawDetailDigest ?? fallbackTerminalEvent.rawDetailDigest,
+                fullRawAvailable: !rawDetailWasTruncated
+                    || ((lastChunk.rawDetailHandle ?? fallbackTerminalEvent.rawDetailHandle) != nil
+                        && lastChunk.fullRawAvailable
+                        && fallbackTerminalEvent.fullRawAvailable),
+                detailDigest: fallbackTerminalEvent.detailDigest,
+                detailCharCount: rawDetail.count,
+                chunkCount: matchingChunks.reduce(0) { total, chunk in
+                    total + (chunk.chunkCount ?? 1)
+                },
+                isStreaming: false,
+                isTerminal: true,
+                stateLabel: fallbackTerminalEvent.stateLabel ?? lastChunk.stateLabel
+            )
+        )
+    }
+
+    private static func isResponseChunk(_ event: P031RuntimeTimelineEventPresentation) -> Bool {
+        event.surfaceLabel == "agent_message_chunk" || event.surfaceLabel == "text_chunk"
+    }
+
+    private static func isProviderAction(_ event: P031RuntimeTimelineEventPresentation) -> Bool {
+        event.surfaceLabel == "provider_activity"
+            || event.surfaceLabel == "tool_call"
+            || event.surfaceLabel == "tool_call_update"
+    }
+
+    private static func isProviderActionInProgress(_ event: P031RuntimeTimelineEventPresentation) -> Bool {
+        isProviderAction(event) && event.detail.localizedCaseInsensitiveContains("in_progress")
+    }
+
+    private static func isProviderActionCompletion(_ event: P031RuntimeTimelineEventPresentation) -> Bool {
+        isProviderAction(event) && event.detail.localizedCaseInsensitiveContains("completed")
+    }
+
+    private static func providerActionIdentity(for event: P031RuntimeTimelineEventPresentation) -> String? {
+        let tokens = event.detail.components(separatedBy: CharacterSet.whitespacesAndNewlines.union(
+            CharacterSet(charactersIn: "·'\"`()[]{}")
+        ))
+        let pathTokens = tokens.compactMap { rawToken -> String? in
+            let token = rawToken.trimmingCharacters(in: CharacterSet(charactersIn: ",;:"))
+            guard token.contains("/") || token.contains(".") else { return nil }
+            return token.split(separator: "/").last.map(String.init)
+        }
+        if let lastPath = pathTokens.last, !lastPath.isEmpty {
+            return lastPath
+        }
+
+        let normalized = event.detail
+            .replacingOccurrences(of: "in_progress", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: "completed", with: "", options: .caseInsensitive)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func combinedRawDetailBytes(_ lhs: Int?, _ rhs: Int?) -> Int? {
+        guard let lhs, let rhs else { return nil }
+        return boundedRawDetailBytes(lhs + rhs)
+    }
+
+    private static func accumulatedRawDetailBytes(
+        for chunks: [P031RuntimeTimelineEventPresentation],
+        fallback: P031RuntimeTimelineEventPresentation
+    ) -> Int? {
+        guard !chunks.isEmpty else {
+            return boundedRawDetailBytes(fallback.rawDetailBytes)
+        }
+        var total = 0
+        for chunk in chunks {
+            guard let rawDetailBytes = chunk.rawDetailBytes else {
+                return nil
+            }
+            total += rawDetailBytes
+        }
+        return boundedRawDetailBytes(total)
+    }
+
+    private static func boundedRawDetailBytes(_ bytes: Int?) -> Int? {
+        bytes.map { min($0, retainedRawResponseDetailLimitBytes) }
+    }
+
+    private static func normalizedResponseChunk(
+        _ event: P031RuntimeTimelineEventPresentation
+    ) -> P031RuntimeTimelineEventPresentation {
+        let incomingRawDetail = event.rawDetail ?? event.detail
+        let rawDetailWasTruncated = event.rawDetailTruncated
+            || incomingRawDetail.utf8.count > Self.retainedRawResponseDetailLimitBytes
+        let rawDetail = Self.boundedRawResponseDetail(incomingRawDetail)
+        return P031RuntimeTimelineEventPresentation(
+            id: event.id,
+            runID: event.runID,
+            stageID: event.stageID,
+            agentID: event.agentID,
+            provider: event.provider,
+            eventKind: event.eventKind,
+            title: event.title,
+            detail: Self.boundedLiveResponseDetail(rawDetail),
+            surfaceLabel: event.surfaceLabel,
+            sessionGenerationID: event.sessionGenerationID,
+            timestamp: event.timestamp,
+            rawDetail: rawDetail,
+            rawDetailBytes: Self.boundedRawDetailBytes(event.rawDetailBytes),
+            rawDetailTruncated: rawDetailWasTruncated,
+            rawDetailHandle: event.rawDetailHandle,
+            rawDetailDigest: event.rawDetailDigest,
+            fullRawAvailable: !rawDetailWasTruncated
+                || (event.rawDetailHandle != nil && event.fullRawAvailable),
+            detailDigest: event.detailDigest,
+            detailCharCount: rawDetail.count,
+            chunkCount: event.chunkCount ?? 1,
+            isStreaming: true,
+            isTerminal: false,
+            stateLabel: event.stateLabel
+        )
+    }
+
+    private static func matchesAgentSession(
+        _ event: P031RuntimeTimelineEventPresentation,
+        terminalEvent: P031RuntimeTimelineEventPresentation
+    ) -> Bool {
+        guard event.agentID == terminalEvent.agentID else { return false }
+        guard event.runID == terminalEvent.runID else { return false }
+        if let terminalSessionID = terminalEvent.sessionGenerationID {
+            return event.sessionGenerationID == terminalSessionID
+        }
+        return true
+    }
+
+    private static func boundedLiveResponseDetail(_ detail: String) -> String {
+        guard detail.count > liveResponseDetailLimit else { return detail }
+        return String(detail.suffix(liveResponseDetailLimit))
+    }
+
+    private static func boundedRawResponseDetail(_ detail: String) -> String {
+        guard detail.utf8.count > retainedRawResponseDetailLimitBytes else { return detail }
+
+        var retained = ""
+        retained.reserveCapacity(min(detail.count, retainedRawResponseDetailLimitBytes))
+        for character in detail.reversed() {
+            let next = String(character)
+            if retained.utf8.count + next.utf8.count > retainedRawResponseDetailLimitBytes {
+                break
+            }
+            retained.insert(character, at: retained.startIndex)
+        }
+        return retained
+    }
+
+    private static func accumulatedResponseDetail(
+        for chunks: [P031RuntimeTimelineEventPresentation],
+        override: String?
+    ) -> String {
+        var detail = chunks
+            .map { $0.rawDetail ?? $0.detail }
+            .filter { !$0.isEmpty }
+            .joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if detail.isEmpty {
+            detail = override?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+        return boundedRawResponseDetail(detail)
+    }
+
+    private static func summaryDetail(
+        for chunks: [P031RuntimeTimelineEventPresentation],
+        rawDetail: String
+    ) -> String {
+        let chunkCount = chunks.reduce(0) { total, chunk in
+            total + (chunk.chunkCount ?? 1)
+        }
+        let byteCount = rawDetail.utf8.count
+        return "Response complete · \(chunkCount) chunk\(chunkCount == 1 ? "" : "s") · \(byteCount) byte\(byteCount == 1 ? "" : "s") retained"
     }
 }
 
@@ -442,6 +945,88 @@ private enum P077CloseoutReadinessFocus: Hashable {
     case modeExplainer
 }
 
+nonisolated final class P081ApprovalActionAttemptStore: @unchecked Sendable {
+    private let defaults: UserDefaults
+    private let storageKey: String
+    private let makeID: @Sendable () -> String
+    private let lock = NSLock()
+
+    init(
+        defaults: UserDefaults = .standard,
+        storageKey: String = "chainworks.p081.approval-action-attempts.v1",
+        makeID: @escaping @Sendable () -> String = { makeUUIDv7() }
+    ) {
+        self.defaults = defaults
+        self.storageKey = storageKey
+        self.makeID = makeID
+    }
+
+    func idempotencyKey(for approvalID: String, action: P072ApprovalDecisionAction) -> String {
+        let attemptKey = Self.attemptStorageKey(approvalID: approvalID, action: action)
+        lock.lock()
+        defer { lock.unlock() }
+
+        var attempts = loadLocked()
+        if let existing = attempts[attemptKey] {
+            return existing
+        }
+
+        let created = makeID()
+        attempts[attemptKey] = created
+        saveLocked(attempts)
+        return created
+    }
+
+    func clear(approvalID: String, action: P072ApprovalDecisionAction) {
+        let attemptKey = Self.attemptStorageKey(approvalID: approvalID, action: action)
+        lock.lock()
+        defer { lock.unlock() }
+
+        var attempts = loadLocked()
+        attempts.removeValue(forKey: attemptKey)
+        saveLocked(attempts)
+    }
+
+    func clearAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        defaults.removeObject(forKey: storageKey)
+    }
+
+    private func loadLocked() -> [String: String] {
+        guard let raw = defaults.dictionary(forKey: storageKey) else {
+            return [:]
+        }
+        return raw.compactMapValues { $0 as? String }
+    }
+
+    private func saveLocked(_ attempts: [String: String]) {
+        if attempts.isEmpty {
+            defaults.removeObject(forKey: storageKey)
+        } else {
+            defaults.set(attempts, forKey: storageKey)
+        }
+    }
+
+    private static func attemptStorageKey(
+        approvalID: String,
+        action: P072ApprovalDecisionAction
+    ) -> String {
+        let actionComponent: String
+        switch action {
+        case .approve:
+            actionComponent = "approve"
+        case .reject(let reason):
+            actionComponent = "reject:\(escaped(reason))"
+        }
+        return "approval:\(escaped(approvalID))|action:\(actionComponent)"
+    }
+
+    private static func escaped(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? value
+    }
+}
+
 @MainActor
 final class P031ThinReadDashboardModel: ObservableObject {
     @Published private(set) var runsHome: P031RunsHomePresentation?
@@ -455,6 +1040,8 @@ final class P031ThinReadDashboardModel: ObservableObject {
     @Published private(set) var approvalActionError: String?
     @Published private(set) var daemonRestartError: String?
     @Published private(set) var selectedRunID: String?
+    @Published private(set) var runtimeTimelineEvents: [P031RuntimeTimelineEventPresentation] = []
+    @Published private(set) var escalationAttentionSnapshots: [EscalationSnapshot] = []
 
     var totalPendingApprovalCount: Int {
         approvalInbox?.rows.count ?? 0
@@ -463,10 +1050,13 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private let loadRunsHomeAction: @Sendable (P031FreshnessSnapshot, Bool) async -> P031RunsHomePresentation
     private let loadRunDetailAction: @Sendable (String, P031FreshnessSnapshot) async -> P031RunDetailPresentation
     private let loadArtifactPreviewAction: (String) async -> P031ArtifactViewerPresentation?
+    private let resolveTimelineRawDetailAction: @Sendable (String) async -> P031TimelineRawDetailReadModel
     private let loadApprovalInboxAction: @Sendable (P031FreshnessSnapshot) async -> P031ApprovalInboxPresentation
     private let loadDaemonLifecycleAction: @Sendable (P031FreshnessSnapshot) async -> P031DaemonLifecyclePresentation
     private let loadSchedulerHealthAction: @Sendable () async -> SchedulerHealthReadback?
     private let subscribeRunStatusAction: @Sendable (String, P031FreshnessSnapshot) throws -> AsyncThrowingStream<P031RunStatusSubscriptionPresentation, Error>
+    private let subscribeAllRunStatusAction: @Sendable (P031FreshnessSnapshot) throws -> AsyncThrowingStream<P031RunStatusSubscriptionPresentation, Error>
+    private let subscribeRuntimeTimelineAction: @Sendable (String) throws -> AsyncThrowingStream<P031RuntimeTimelineEventPresentation, Error>
     private let settleApprovalAction: @Sendable (String, P072ApprovalDecisionAction) async -> String?
     private let restartDaemonAction: @MainActor @Sendable () async -> String?
     private let bundledDaemonBuildSHAAction: @Sendable () -> String?
@@ -477,7 +1067,15 @@ final class P031ThinReadDashboardModel: ObservableObject {
     private var approvalFreshness = P031FreshnessSnapshot(state: .refreshing)
     private var daemonFreshness = P031FreshnessSnapshot(state: .refreshing)
     private var runStatusSubscriptionTask: Task<Void, Never>?
+    private var allRunStatusSubscriptionTask: Task<Void, Never>?
+    private var runtimeTimelineSubscriptionTask: Task<Void, Never>?
+    private var runtimeTimelinePublishTask: Task<Void, Never>?
     private var subscribedRunID: String?
+    private var subscribedRuntimeTimelineRunID: String?
+    private var runtimeTimelineBuffer = P036RuntimeTimelineBuffer()
+    private var runtimeTimelineLastPublish = Date.distantPast
+    private let runtimeTimelineFlushInterval: TimeInterval
+    private var escalationAttentionObserverID: UUID?
 
     var daemonSchemaMismatchMessage: String? {
         [
@@ -513,12 +1111,14 @@ final class P031ThinReadDashboardModel: ObservableObject {
         bundledDaemonBuildSHAAction: @escaping @Sendable () -> String? = {
             P031ThinReadDashboardModel.bundledDaemonBuildSHA()
         },
-        loadSchedulerHealthAction: @escaping @Sendable () async -> SchedulerHealthReadback? = { nil }
+        loadSchedulerHealthAction: @escaping @Sendable () async -> SchedulerHealthReadback? = { nil },
+        runtimeTimelineFlushInterval: TimeInterval = 2.0
     ) {
         self.settleApprovalAction = settleApprovalAction
         self.restartDaemonAction = restartDaemonAction
         self.bundledDaemonBuildSHAAction = bundledDaemonBuildSHAAction
         self.loadSchedulerHealthAction = loadSchedulerHealthAction
+        self.runtimeTimelineFlushInterval = runtimeTimelineFlushInterval
         loadRunsHomeAction = { currentFreshness, showFirstRunOrientation in
             await coordinator.loadRunsHome(
                 currentFreshness: currentFreshness,
@@ -530,6 +1130,9 @@ final class P031ThinReadDashboardModel: ObservableObject {
         }
         loadArtifactPreviewAction = { artifactID in
             await coordinator.loadArtifactPreview(artifactID: artifactID)
+        }
+        resolveTimelineRawDetailAction = { handle in
+            await coordinator.resolveTimelineRawDetail(handle: handle)
         }
         loadApprovalInboxAction = { currentFreshness in
             await coordinator.loadApprovalInbox(currentFreshness: currentFreshness)
@@ -544,13 +1147,26 @@ final class P031ThinReadDashboardModel: ObservableObject {
                 currentFreshness: currentFreshness
             )
         }
+        subscribeAllRunStatusAction = { currentFreshness in
+            try subscriptionCoordinator.allRunStatusPresentations(
+                currentFreshness: currentFreshness
+            )
+        }
+        subscribeRuntimeTimelineAction = { runID in
+            try subscriptionCoordinator.runtimeTimelinePresentations(runID: runID)
+        }
     }
 
     deinit {
         runStatusSubscriptionTask?.cancel()
+        allRunStatusSubscriptionTask?.cancel()
+        runtimeTimelineSubscriptionTask?.cancel()
+        runtimeTimelinePublishTask?.cancel()
     }
 
-    static func bootstrap() -> P031ThinReadDashboardModel {
+    static func bootstrap(
+        approvalActionAttemptStore: P081ApprovalActionAttemptStore = P081ApprovalActionAttemptStore()
+    ) -> P031ThinReadDashboardModel {
         let endpoint = DaemonClientEndpoint.operatorDefault()
         let guideResource = P031OperatorWritePathGuideBootstrap.load()
         let store = P031GraphQLWorkflowReadStore(
@@ -569,17 +1185,27 @@ final class P031ThinReadDashboardModel: ObservableObject {
             coordinator: coordinator,
             settleApprovalAction: { approvalID, action in
                 do {
+                    let idempotencyKey = approvalActionAttemptStore.idempotencyKey(
+                        for: approvalID,
+                        action: action
+                    )
                     switch action {
                     case .approve:
-                        _ = try await approvalMutationClient.approve(approvalID: approvalID)
+                        _ = try await approvalMutationClient.approve(
+                            approvalID: approvalID,
+                            idempotencyKey: idempotencyKey
+                        )
                     case .reject(let reason):
                         _ = try await approvalMutationClient.reject(
                             approvalID: approvalID,
-                            reason: reason
+                            reason: reason,
+                            idempotencyKey: idempotencyKey
                         )
                     }
+                    approvalActionAttemptStore.clear(approvalID: approvalID, action: action)
                     return nil
                 } catch {
+                    // On error the key is retained so the next retry reuses the same key.
                     return P031ReadErrorPresenter.description(for: error)
                 }
             },
@@ -689,9 +1315,28 @@ final class P031ThinReadDashboardModel: ObservableObject {
         loadArtifactPreviewAction = { artifactID in
             runDetail.artifactViewerRows.first { $0.artifactID == artifactID }
         }
+        resolveTimelineRawDetailAction = { _ in
+            P031TimelineRawDetailReadModel(
+                status: .missing,
+                rawDetail: nil,
+                rawDetailBytes: nil,
+                rawDetailDigest: nil,
+                errorReason: .handleNotFound
+            )
+        }
         loadApprovalInboxAction = { _ in approvalInbox }
         loadDaemonLifecycleAction = { _ in daemonLifecycle }
         subscribeRunStatusAction = { _, _ in
+            AsyncThrowingStream { continuation in
+                continuation.finish()
+            }
+        }
+        subscribeAllRunStatusAction = { _ in
+            AsyncThrowingStream { continuation in
+                continuation.finish()
+            }
+        }
+        subscribeRuntimeTimelineAction = { _ in
             AsyncThrowingStream { continuation in
                 continuation.finish()
             }
@@ -700,6 +1345,7 @@ final class P031ThinReadDashboardModel: ObservableObject {
         restartDaemonAction = { nil }
         bundledDaemonBuildSHAAction = { "preview" }
         loadSchedulerHealthAction = { nil }
+        runtimeTimelineFlushInterval = 2.0
 
         self.runsHome = runsHome
         self.runDetail = runDetail
@@ -943,12 +1589,16 @@ final class P031ThinReadDashboardModel: ObservableObject {
 #endif
 
     func loadIfNeeded() async {
+        ensureEscalationAttentionObserver()
+        startAllRunEscalationAttentionSubscription()
         guard !didLoad else { return }
         didLoad = true
         await refreshAll()
     }
 
     func refreshAll() async {
+        ensureEscalationAttentionObserver()
+        startAllRunEscalationAttentionSubscription()
         guard !isLoading else { return }
         isLoading = true
         defer { isLoading = false }
@@ -975,27 +1625,44 @@ final class P031ThinReadDashboardModel: ObservableObject {
         let availableRunIDs = runsPresentation.rows.map { $0.runID }
         if let selectedRunID, availableRunIDs.contains(selectedRunID) {
             await loadRunDetail(for: selectedRunID)
-            startRunStatusSubscription(for: selectedRunID)
+            startLiveSubscriptions(for: selectedRunID)
         } else if let firstRunID = availableRunIDs.first {
             selectedRunID = firstRunID
             await loadRunDetail(for: firstRunID)
-            startRunStatusSubscription(for: firstRunID)
+            startLiveSubscriptions(for: firstRunID)
         } else {
             selectedRunID = nil
             runDetail = nil
-            stopRunStatusSubscription()
+            stopLiveSubscriptions()
         }
+        await refreshEscalationAttentionSnapshots(for: availableRunIDs)
     }
 
     func selectRun(_ runID: String) {
         guard selectedRunID != runID else { return }
+        P036UICounters.shared.recordOperatorTaskAttempt(
+            taskID: "runs.select_run",
+            result: "started",
+            blockedReason: nil
+        )
         selectedRunID = runID
-        startRunStatusSubscription(for: runID)
+        resetRuntimeTimelineBuffer()
+        startLiveSubscriptions(for: runID)
         Task { await loadRunDetail(for: runID) }
     }
 
     func loadArtifactPreview(artifactID: String) async -> P031ArtifactViewerPresentation? {
-        await loadArtifactPreviewAction(artifactID)
+        let preview = await loadArtifactPreviewAction(artifactID)
+        P036UICounters.shared.recordOperatorTaskAttempt(
+            taskID: "runs.load_artifact_preview",
+            result: preview == nil ? "blocked" : "succeeded",
+            blockedReason: preview == nil ? "payload_unavailable" : nil
+        )
+        return preview
+    }
+
+    func resolveTimelineRawDetail(handle: String) async -> P031TimelineRawDetailReadModel {
+        await resolveTimelineRawDetailAction(handle)
     }
 
     func isResolvingApproval(_ approvalID: String) -> Bool {
@@ -1003,15 +1670,32 @@ final class P031ThinReadDashboardModel: ObservableObject {
     }
 
     func settleApproval(_ approvalID: String, action: P072ApprovalDecisionAction) async {
-        guard !resolvingApprovalIDs.contains(approvalID) else { return }
+        guard !resolvingApprovalIDs.contains(approvalID) else {
+            P036UICounters.shared.recordOperatorTaskAttempt(
+                taskID: "runs.settle_approval",
+                result: "blocked",
+                blockedReason: "already_resolving"
+            )
+            return
+        }
         resolvingApprovalIDs.insert(approvalID)
         approvalActionError = nil
         defer { resolvingApprovalIDs.remove(approvalID) }
 
         if let error = await settleApprovalAction(approvalID, action) {
             approvalActionError = error
+            P036UICounters.shared.recordOperatorTaskAttempt(
+                taskID: "runs.settle_approval",
+                result: "blocked",
+                blockedReason: "write_failed"
+            )
             return
         }
+        P036UICounters.shared.recordOperatorTaskAttempt(
+            taskID: "runs.settle_approval",
+            result: "succeeded",
+            blockedReason: nil
+        )
         await refreshAll()
     }
 
@@ -1020,15 +1704,32 @@ final class P031ThinReadDashboardModel: ObservableObject {
     }
 
     func restartDaemonForUpdateRequired() async {
-        guard !isRestartingDaemon else { return }
+        guard !isRestartingDaemon else {
+            P036UICounters.shared.recordOperatorTaskAttempt(
+                taskID: "system.restart_daemon",
+                result: "blocked",
+                blockedReason: "already_restarting"
+            )
+            return
+        }
         isRestartingDaemon = true
         daemonRestartError = nil
         defer { isRestartingDaemon = false }
 
         if let error = await restartDaemonAction() {
             daemonRestartError = error
+            P036UICounters.shared.recordOperatorTaskAttempt(
+                taskID: "system.restart_daemon",
+                result: "blocked",
+                blockedReason: "restart_failed"
+            )
             return
         }
+        P036UICounters.shared.recordOperatorTaskAttempt(
+            taskID: "system.restart_daemon",
+            result: "succeeded",
+            blockedReason: nil
+        )
         await refreshAll()
     }
 
@@ -1036,15 +1737,73 @@ final class P031ThinReadDashboardModel: ObservableObject {
         let presentation = await loadDaemonLifecycleAction(daemonFreshness)
         daemonFreshness = presentation.freshness
         daemonLifecycle = presentation
-        
+
         let schedulerResult = await loadSchedulerHealthAction()
         schedulerHealth = schedulerResult
     }
 
     private func loadRunDetail(for runID: String) async {
+        ensureEscalationAttentionObserver()
         let presentation = await loadRunDetailAction(runID, runDetailFreshness)
         runDetailFreshness = presentation.freshness
         runDetail = presentation
+        if presentation.escalationChains.isEmpty {
+            EscalationReadAdapterRegistry.shared.reset(runId: runID)
+        } else {
+            EscalationReadAdapterRegistry.shared.applyChains(presentation.escalationChains, for: runID)
+        }
+    }
+
+    private func refreshEscalationAttentionSnapshots(for runIDs: [String]) async {
+        ensureEscalationAttentionObserver()
+        let uniqueRunIDs = Array(Set(runIDs)).sorted()
+        guard !uniqueRunIDs.isEmpty else {
+            EscalationReadAdapterRegistry.shared.applyVisibleRunChains([:])
+            return
+        }
+
+        var chainsByRunID: [String: [EscalationChainStateDTO]] = [:]
+        for runID in uniqueRunIDs {
+            if selectedRunID == runID, let runDetail {
+                chainsByRunID[runID] = runDetail.escalationChains
+            } else {
+                let presentation = await loadRunDetailAction(runID, runDetailFreshness)
+                chainsByRunID[runID] = presentation.escalationChains
+            }
+        }
+        EscalationReadAdapterRegistry.shared.applyVisibleRunChains(chainsByRunID)
+    }
+
+    private func ensureEscalationAttentionObserver() {
+        guard escalationAttentionObserverID == nil else { return }
+        escalationAttentionObserverID = EscalationReadAdapterRegistry.shared.addAttentionObserver { [weak self] snapshots in
+            self?.escalationAttentionSnapshots = snapshots
+        }
+    }
+
+    private func startLiveSubscriptions(for runID: String) {
+        startAllRunEscalationAttentionSubscription()
+        startRunStatusSubscription(for: runID)
+        startRuntimeTimelineSubscription(for: runID)
+    }
+
+    private func startAllRunEscalationAttentionSubscription() {
+        guard allRunStatusSubscriptionTask == nil else { return }
+        let freshness = runsFreshness
+        allRunStatusSubscriptionTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let stream = try self.subscribeAllRunStatusAction(freshness)
+                for try await _ in stream {
+                    try Task.checkCancellation()
+                    await self.refreshEscalationAttentionFromAllRuns()
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+        }
     }
 
     private func startRunStatusSubscription(for runID: String) {
@@ -1068,10 +1827,91 @@ final class P031ThinReadDashboardModel: ObservableObject {
         }
     }
 
+    private func startRuntimeTimelineSubscription(for runID: String) {
+        guard subscribedRuntimeTimelineRunID != runID else { return }
+        runtimeTimelineSubscriptionTask?.cancel()
+        subscribedRuntimeTimelineRunID = runID
+        resetRuntimeTimelineBuffer()
+        runtimeTimelineSubscriptionTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let stream = try self.subscribeRuntimeTimelineAction(runID)
+                for try await event in stream {
+                    try Task.checkCancellation()
+                    self.recordRuntimeTimelineEvent(event)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func stopLiveSubscriptions() {
+        stopRunStatusSubscription()
+        runtimeTimelineSubscriptionTask?.cancel()
+        runtimeTimelineSubscriptionTask = nil
+        runtimeTimelinePublishTask?.cancel()
+        runtimeTimelinePublishTask = nil
+        subscribedRuntimeTimelineRunID = nil
+        resetRuntimeTimelineBuffer()
+    }
+
     private func stopRunStatusSubscription() {
         runStatusSubscriptionTask?.cancel()
         runStatusSubscriptionTask = nil
         subscribedRunID = nil
+    }
+
+    private func recordRuntimeTimelineEvent(_ event: P031RuntimeTimelineEventPresentation) {
+        let forcePublish = Self.isRuntimeTimelineTerminalEvent(event)
+        runtimeTimelineBuffer.record(event, selectedRunID: selectedRunID)
+        scheduleRuntimeTimelinePublish(force: forcePublish || runtimeTimelineEvents.isEmpty)
+    }
+
+    private func scheduleRuntimeTimelinePublish(force: Bool) {
+        guard !runtimeTimelineBuffer.events.isEmpty else { return }
+        let elapsed = Date().timeIntervalSince(runtimeTimelineLastPublish)
+        if force || runtimeTimelineFlushInterval <= 0 || elapsed >= runtimeTimelineFlushInterval {
+            publishRuntimeTimelineEvents()
+            return
+        }
+        guard runtimeTimelinePublishTask == nil else { return }
+        let delay = max(0, runtimeTimelineFlushInterval - elapsed)
+        runtimeTimelinePublishTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            await MainActor.run {
+                self?.publishRuntimeTimelineEvents()
+            }
+        }
+    }
+
+    private func publishRuntimeTimelineEvents() {
+        runtimeTimelinePublishTask?.cancel()
+        runtimeTimelinePublishTask = nil
+        runtimeTimelineEvents = runtimeTimelineBuffer.events
+        runtimeTimelineLastPublish = Date()
+        P036UICounters.shared.recordTimelineBatchFlush(
+            entryCount: runtimeTimelineEvents.count,
+            reduceMotion: false
+        )
+    }
+
+    private func resetRuntimeTimelineBuffer() {
+        runtimeTimelinePublishTask?.cancel()
+        runtimeTimelinePublishTask = nil
+        runtimeTimelineBuffer.reset()
+        runtimeTimelineEvents = []
+        runtimeTimelineLastPublish = Date.distantPast
+    }
+
+    private static func isRuntimeTimelineTerminalEvent(
+        _ event: P031RuntimeTimelineEventPresentation
+    ) -> Bool {
+        event.surfaceLabel == "final_response"
+            || event.eventKind == "session_completed"
+            || event.eventKind == "session_failed"
     }
 
     private func refreshSelectedRunAfterSubscriptionEvent(runID: String) async {
@@ -1095,6 +1935,14 @@ final class P031ThinReadDashboardModel: ObservableObject {
         approvalInbox = approvalsPresentation
         runDetail = detailPresentation
         schedulerHealth = schedulerResult
+        await refreshEscalationAttentionSnapshots(for: runsPresentation.rows.map(\.runID))
+    }
+
+    private func refreshEscalationAttentionFromAllRuns() async {
+        let runsPresentation = await loadRunsHomeAction(runsFreshness, false)
+        runsFreshness = runsPresentation.freshness
+        runsHome = runsPresentation
+        await refreshEscalationAttentionSnapshots(for: runsPresentation.rows.map(\.runID))
     }
 
     private static func restartPackagedDaemon() async -> String? {
@@ -1319,25 +2167,228 @@ private struct P031RunsHomeRowCard: View {
 }
 
 private struct TimelineEntryRow: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     let entry: RunsWorkbenchPresentationModel.TimelineEntry
-    
+    let displayOrder: Int
+    let isExpanded: Bool
+    let resolveTimelineRawDetail: (String) async -> P031TimelineRawDetailReadModel
+    let formatterCache: P093TimelineFormatterCache
+    let onToggleExpanded: () -> Void
+
+    @State private var isHovering = false
+    @State private var resolvedFullRawDetail: String?
+    @State private var rawDetailResolutionStatus: P031TimelineRawDetailStatus?
+    @State private var rawDetailResolutionErrorReason: P031TimelineRawDetailErrorReason?
+    @State private var isResolvingRawDetail = false
+    @FocusState private var isFocused: Bool
+
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: iconName)
-                .foregroundStyle(.secondary)
-                .frame(width: 16)
-            
-            VStack(alignment: .leading, spacing: 2) {
-                Text(entry.message)
-                    .font(.subheadline)
-                Text(entry.timestamp, format: .dateTime.hour().minute().second())
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Button {
+                    isFocused = true
+                    onToggleExpanded()
+                } label: {
+                    Image(systemName: isExpanded ? "chevron.down.circle.fill" : "chevron.right.circle")
+                        .imageScale(.small)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(tint)
+                .accessibilityLabel(isExpanded ? "Collapse Timeline event" : "Expand Timeline event")
+                .accessibilityIdentifier("p093-timeline-toggle")
+
+                Image(systemName: iconName)
+                    .foregroundStyle(tint)
+                    .accessibilityHidden(true)
+
+                Text(entry.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.primary)
+                    .lineLimit(1)
+
+                if entry.isStreaming {
+                    StatusCapsule(
+                        text: "Streaming",
+                        color: ForgeStatusColor.running,
+                        icon: "waveform",
+                        size: .small
+                    )
+                    .accessibilityLabel("Timeline status Streaming")
+                    .accessibilityIdentifier("p093-timeline-status-badge")
+                } else if entry.isTerminal {
+                    StatusCapsule(
+                        text: "Complete",
+                        color: ForgeStatusColor.neutral,
+                        icon: "checkmark.circle",
+                        size: .small
+                    )
+                    .accessibilityLabel("Timeline status Complete")
+                    .accessibilityIdentifier("p093-timeline-status-badge")
+                }
+
+                Spacer(minLength: 8)
+
+                Text(entry.surfaceLabel)
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .lineLimit(1)
+            }
+
+            if isExpanded {
+                expandedControls
+                P093FormattedTimelineDetail(
+                    result: formatterCache.render(
+                        event: entry,
+                        detail: expandedDetail,
+                        detailDigest: entry.detailDigest,
+                        detailCharCount: entry.detailCharCount,
+                        chunkCount: entry.chunkCount
+                    )
+                )
+                    .frame(
+                        minHeight: P093TimelineFormattedResult.expandedMinimumHeight(for: expandedDetail),
+                        maxHeight: 420,
+                        alignment: .top
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .transaction { transaction in
+                        transaction.animation = nil
+                    }
+                    .accessibilityIdentifier("p093-timeline-formatted-detail")
+            } else if !entry.detail.isEmpty {
+                Text(collapsedDetail)
+                    .font(.caption)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: false)
+                    .frame(maxHeight: 64, alignment: .top)
+                    .clipped()
+            }
+
+            HStack(spacing: 8) {
+                if let providerID = entry.providerID, !providerID.isEmpty {
+                    Text(providerID)
+                        .accessibilityLabel("Provider \(providerID)")
+                        .accessibilityIdentifier("p093-timeline-provider-badge")
+                }
+                if let agentID = entry.agentID, !agentID.isEmpty {
+                    Text(agentID)
+                        .accessibilityLabel("Agent \(agentID)")
+                        .accessibilityIdentifier("p093-timeline-agent-badge")
+                }
+                Button {
+                    copyToPasteboard(entry.id)
+                } label: {
+                    Label(shortID(entry.id), systemImage: "doc.on.doc")
+                        .labelStyle(.titleAndIcon)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Copy Timeline event ID")
+                .accessibilityIdentifier("p093-timeline-copy-id")
+                .help("Copy Timeline event ID")
+
+                if isHovering || isFocused {
+                    metadataText
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(ForgeColor.Text.tertiary)
+            .lineLimit(1)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .onTapGesture {
+            onToggleExpanded()
+        }
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(tint.opacity(isExpanded ? 0.46 : 0.20), lineWidth: isExpanded ? 1.5 : 1)
+        )
+        .focusable(true)
+        .focused($isFocused)
+        .onKeyPress(.space) {
+            onToggleExpanded()
+            return .handled
+        }
+        .onKeyPress(.return) {
+            onToggleExpanded()
+            return .handled
+        }
+        .onHover { isHovering = $0 }
+        .help(metadataHelp)
+        .contextMenu {
+            Button("Copy event ID") {
+                copyToPasteboard(entry.id)
+            }
+            Button(rawCopyLabel) {
+                Task { await copyRawDetail() }
             }
         }
-        .padding(.vertical, 4)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("p093-timeline-entry")
+        .overlay(alignment: .topLeading) {
+            VStack {
+                P031AccessibilityMarker(identifier: "p093-timeline-entry-id-\(entry.id)")
+                P031AccessibilityMarker(identifier: "p093-timeline-order-\(displayOrder)-\(entry.id)")
+                if !isExpanded && entry.isTerminal && isResponseEntry {
+                    P031AccessibilityMarker(identifier: "p093-timeline-collapsed-terminal-summary-\(entry.id)")
+                }
+                if isExpanded {
+                    P031AccessibilityMarker(identifier: "p093-timeline-expanded-\(entry.id)")
+                }
+                if isExpanded && !expandedDetail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    P031AccessibilityMarker(identifier: "p093-timeline-detail-non-empty")
+                }
+            }
+        }
+        .task(id: isExpanded) {
+            if isExpanded {
+                await resolveRawDetailIfNeeded()
+            }
+        }
+        .id(entry.id)
+        .transition(reduceMotion ? .opacity : .asymmetric(
+            insertion: .push(from: .bottom).combined(with: .opacity),
+            removal: .opacity
+        ))
     }
-    
+
+    private var expandedControls: some View {
+        HStack(spacing: 8) {
+            Button {
+                copyToPasteboard(entry.id)
+            } label: {
+                Label("Copy ID", systemImage: "doc.on.doc")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityLabel("Copy Timeline event ID")
+            .accessibilityIdentifier("p093-timeline-copy-id")
+
+            Button {
+                Task { await copyRawDetail() }
+            } label: {
+                Label(rawCopyLabel, systemImage: "doc.text")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityLabel(rawCopyLabel)
+            .disabled(isResolvingRawDetail)
+
+            if let rawDetailStatusLabel {
+                Text(rawDetailStatusLabel)
+                    .font(.caption2)
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .accessibilityIdentifier("p093-timeline-expanded-controls")
+    }
+
     private var iconName: String {
         switch entry.kind {
         case .text: return "text.alignleft"
@@ -1348,6 +2399,737 @@ private struct TimelineEntryRow: View {
         case .implementationCompletion: return "flag.checkered"
         case .persisted: return "tray.full"
         }
+    }
+
+    private var tint: Color {
+        switch entry.kind {
+        case .implementationCompletion: return ForgeStatusColor.success
+        case .policyWarning: return ForgeStatusColor.approval
+        case .sessionEvent: return ForgeStatusColor.running
+        case .agentSummary: return ForgeStatusColor.neutral
+        case .persisted: return ForgeColor.Brand.accent
+        case .mergedTool: return ForgeStatusColor.warning
+        case .text: return ForgeStatusColor.neutral
+        }
+    }
+
+    private var previewDetail: String {
+        guard isResponseEntry else { return entry.detail }
+        let limit = 16_000
+        guard entry.detail.count > limit else { return entry.detail }
+        return "...\n" + String(entry.detail.suffix(limit))
+    }
+
+    private var collapsedDetail: String {
+        guard isResponseEntry else { return previewDetail }
+        if entry.isTerminal {
+            return entry.detail
+        }
+        if entry.isStreaming {
+            return streamingResponseSummary
+        }
+        return previewDetail
+    }
+
+    private var streamingResponseSummary: String {
+        let chunks = entry.chunkCount ?? 1
+        let chunkText = "\(chunks) chunk\(chunks == 1 ? "" : "s")"
+        guard let bytes = entry.rawDetailBytes else {
+            return "Response streaming · \(chunkText)"
+        }
+        return "Response streaming · \(chunkText) · \(bytes) byte\(bytes == 1 ? "" : "s") retained"
+    }
+
+    private var expandedDetail: String {
+        resolvedFullRawDetail ?? retainedRawDetail
+    }
+
+    private var retainedRawDetail: String {
+        entry.rawDetail?.isEmpty == false ? entry.rawDetail! : entry.detail
+    }
+
+    private var rawCopyLabel: String {
+        resolvedFullRawDetail != nil || (entry.fullRawAvailable && !entry.rawDetailTruncated)
+            ? "Copy full raw content"
+            : "Copy retained raw content"
+    }
+
+    private var rawDetailStatusLabel: String? {
+        if isResolvingRawDetail {
+            return "Resolving full raw content"
+        }
+        if let rawDetailResolutionStatus, rawDetailResolutionStatus != .available {
+            let reason = rawDetailResolutionErrorReason.map(rawDetailErrorLabel(for:))
+                ?? rawDetailResolutionStatus.rawValue
+            return "Full raw content unavailable: \(reason)"
+        }
+        if entry.rawDetailTruncated && resolvedFullRawDetail == nil {
+            return "Full raw content unavailable"
+        }
+        if let rawDetailResolutionStatus {
+            return "Raw detail: \(rawDetailResolutionStatus.rawValue)"
+        }
+        return nil
+    }
+
+    private func rawDetailErrorLabel(for reason: P031TimelineRawDetailErrorReason) -> String {
+        switch reason {
+        case .handleNotFound:
+            return "handle_not_found"
+        case .handleExpired:
+            return "handle_expired"
+        case .runNotAuthorized:
+            return "run_not_authorized"
+        case .eventNotAuthorized:
+            return "event_not_authorized"
+        case .storageUnavailable:
+            return "storage_unavailable"
+        case .digestValidationFailed:
+            return "digest_mismatch"
+        }
+    }
+
+    private var metadataText: some View {
+        HStack(spacing: 8) {
+            if let stageID = entry.stageID, !stageID.isEmpty {
+                Text(stageID)
+            }
+            if let stateLabel = entry.stateLabel, !stateLabel.isEmpty {
+                Text(stateLabel)
+            }
+            if let displayTime = entry.displayTime {
+                Text(displayTime).monospacedDigit()
+            }
+            if let rawDetailBytes = entry.rawDetailBytes {
+                Text("\(rawDetailBytes) bytes")
+            }
+            if entry.rawDetailTruncated {
+                Text("truncated")
+            }
+            if let rawDetailResolutionStatus {
+                Text(rawDetailResolutionStatus.rawValue)
+            }
+        }
+        .accessibilityLabel(metadataHelp)
+        .accessibilityIdentifier("p093-timeline-metadata")
+    }
+
+    private var metadataHelp: String {
+        [
+            entry.stageID.map { "State: \($0)" },
+            entry.agentID.map { "Agent: \($0)" },
+            entry.providerID.map { "Provider: \($0)" },
+            entry.displayTime.map { "Time: \($0)" },
+        ]
+            .compactMap { $0 }
+            .joined(separator: "\n")
+    }
+
+    private func shortID(_ id: String) -> String {
+        guard id.count > 12 else { return id }
+        return String(id.prefix(8)) + "..."
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    @MainActor
+    private func copyRawDetail() async {
+        await resolveRawDetailIfNeeded()
+        copyToPasteboard(expandedDetail)
+    }
+
+    @MainActor
+    private func resolveRawDetailIfNeeded() async {
+        guard resolvedFullRawDetail == nil,
+              rawDetailResolutionStatus == nil,
+              let handle = entry.rawDetailHandle?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !handle.isEmpty,
+              entry.fullRawAvailable
+        else {
+            return
+        }
+        isResolvingRawDetail = true
+        let result = await resolveTimelineRawDetail(handle)
+        isResolvingRawDetail = false
+        rawDetailResolutionStatus = result.status
+        rawDetailResolutionErrorReason = result.errorReason
+        guard result.status == .available,
+              let rawDetail = result.rawDetail,
+              result.rawDetailBytes == rawDetail.utf8.count,
+              resolverDigestMatches(result.rawDetailDigest)
+        else {
+            if result.status == .available {
+                rawDetailResolutionStatus = .digestMismatch
+                rawDetailResolutionErrorReason = .digestValidationFailed
+            }
+            return
+        }
+        resolvedFullRawDetail = rawDetail
+    }
+
+    private func resolverDigestMatches(_ resolverDigest: String?) -> Bool {
+        guard let expectedDigest = entry.rawDetailDigest?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !expectedDigest.isEmpty
+        else {
+            return true
+        }
+        return resolverDigest == expectedDigest
+    }
+
+    private var isResponseEntry: Bool {
+        entry.surfaceLabel == "text_chunk"
+            || entry.surfaceLabel == "agent_message_chunk"
+            || entry.surfaceLabel == "agent_summary"
+    }
+}
+
+@MainActor
+private final class P093TimelineFormatterCache {
+    private let maxCacheEntries = 32
+    private var entries: [String: P093TimelineFormattedResult] = [:]
+    private var accessOrder: [String] = []
+
+    func render(
+        event: RunsWorkbenchPresentationModel.TimelineEntry,
+        detail: String,
+        detailDigest: String?,
+        detailCharCount: Int?,
+        chunkCount: Int?
+    ) -> P093TimelineFormattedResult {
+        let key = cacheKey(
+            event: event,
+            detailDigest: detailDigest,
+            detailCharCount: detailCharCount,
+            chunkCount: chunkCount
+        )
+        if let cached = entries[key] {
+            markRecentlyUsed(key)
+            return cached
+        }
+        let rendered = P093TimelineFormattedResult.render(detail: detail, now: Date.init)
+        entries[key] = rendered
+        markRecentlyUsed(key)
+        evictLeastRecentlyUsedEntry()
+        return rendered
+    }
+
+    private func cacheKey(
+        event: RunsWorkbenchPresentationModel.TimelineEntry,
+        detailDigest: String?,
+        detailCharCount: Int?,
+        chunkCount: Int?
+    ) -> String {
+        let formatterVersion = P093TimelineFormattedResult.formatterVersion
+        if let detailDigest, !detailDigest.isEmpty {
+            return "\(event.id):\(detailDigest):\(formatterVersion)"
+        }
+        return "\(event.id):\(detailCharCount ?? 0):\(chunkCount ?? 0):\(formatterVersion)"
+    }
+
+    private func markRecentlyUsed(_ key: String) {
+        accessOrder.removeAll { $0 == key }
+        accessOrder.append(key)
+    }
+
+    private func evictLeastRecentlyUsedEntry() {
+        while accessOrder.count > maxCacheEntries, let evicted = accessOrder.first {
+            accessOrder.removeFirst()
+            entries.removeValue(forKey: evicted)
+        }
+    }
+}
+
+struct P093TimelineFormattedResult: Equatable {
+    static let formatterVersion = "p093-markdown-document-v1"
+    static let formattedPreviewInputLimit = 96 * 1024
+    static let jsonPrettyPrintInputLimit = 64 * 1024
+    static let codeBlockPreviewLimit = 32 * 1024
+    static let parseTimeFallbackLimitSeconds = 0.050
+
+    let content: String
+    let blocks: [Block]
+    let previewTruncated: Bool
+    let fallbackReason: FallbackReason?
+
+    enum Block: Equatable {
+        case text(String)
+        case code(String)
+    }
+
+    enum FallbackReason: Equatable {
+        case parseBudgetExceeded
+    }
+
+    static func expandedMinimumHeight(for detail: String) -> CGFloat {
+        let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return 0 }
+        let lineCount = max(1, min(trimmed.split(separator: "\n", omittingEmptySubsequences: false).count, 8))
+        return min(max(CGFloat(lineCount * 22 + 36), 72), 220)
+    }
+
+    static func render(detail: String) -> P093TimelineFormattedResult {
+        render(detail: detail, now: Date.init)
+    }
+
+    static func render(detail: String, now: () -> Date) -> P093TimelineFormattedResult {
+        let startedAt = now()
+        let budgeted = capped(detail, utf8Limit: formattedPreviewInputLimit)
+        let normalizedContent = P093FormattedTimelineDetail.normalizedMarkdownContent(from: budgeted.text)
+        let blocks = P093FormattedTimelineDetail.blocks(from: normalizedContent)
+        if now().timeIntervalSince(startedAt) > parseTimeFallbackLimitSeconds {
+            return P093TimelineFormattedResult(
+                content: normalizedContent,
+                blocks: [.text(normalizedContent)],
+                previewTruncated: true,
+                fallbackReason: .parseBudgetExceeded
+            )
+        }
+        return P093TimelineFormattedResult(
+            content: normalizedContent,
+            blocks: blocks.isEmpty ? [.text(normalizedContent)] : blocks,
+            previewTruncated: budgeted.truncated,
+            fallbackReason: nil
+        )
+    }
+
+    static func capped(_ text: String, utf8Limit: Int) -> (text: String, truncated: Bool) {
+        guard text.utf8.count > utf8Limit else {
+            return (text, false)
+        }
+        var capped = ""
+        capped.reserveCapacity(utf8Limit)
+        for character in text {
+            if (capped.utf8.count + String(character).utf8.count) > utf8Limit {
+                break
+            }
+            capped.append(character)
+        }
+        return (capped, true)
+    }
+}
+
+private struct P093FormattedTimelineDetail: View {
+    fileprivate let result: P093TimelineFormattedResult
+
+    fileprivate init(result: P093TimelineFormattedResult) {
+        self.result = result
+    }
+
+    var body: some View {
+        stableScrollContainer
+        .background(ForgeColor.Surface.muted.opacity(0.6), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(alignment: .topLeading) {
+            if hasAccessibleContent {
+                P031AccessibilityMarker(identifier: "p093-timeline-detail-non-empty")
+                    .accessibilityLabel(accessibilitySummary)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilitySummary)
+    }
+
+    @ViewBuilder
+    private var stableScrollContainer: some View {
+        ScrollView {
+            formattedContent
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var formattedContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if result.previewTruncated {
+                Label("Preview truncated", systemImage: "scissors")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+            }
+            if result.fallbackReason == .parseBudgetExceeded {
+                Label("Formatter budget fallback", systemImage: "timer")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+            }
+
+            ForEach(Array(result.blocks.enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .text(let text):
+                    P093TimelineMarkdownTextBlock(text: text)
+                case .code(let code):
+                    P093TimelineCodeBlock(code: code)
+                }
+            }
+        }
+        .padding(8)
+    }
+
+    private var accessibilitySummary: String {
+        let text = result.blocks
+            .map { block -> String in
+                switch block {
+                case .text(let text), .code(let text):
+                    return text
+                }
+            }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return "Timeline detail preview is empty" }
+        return String(text.prefix(1_000))
+    }
+
+    private var hasAccessibleContent: Bool {
+        accessibilitySummary != "Timeline detail preview is empty"
+    }
+
+    fileprivate static func normalizedMarkdownContent(from detail: String) -> String {
+        let normalizedNewlines = detail.replacingOccurrences(of: "\r\n", with: "\n")
+        let lines = normalizedNewlines.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var output: [String] = []
+        var inCodeFence = false
+
+        func appendLine(_ line: String) {
+            output.append(line)
+        }
+
+        func processTextLine(_ line: String) {
+            guard let markerRange = line.range(of: "```") else {
+                appendLine(line)
+                return
+            }
+
+            let prefix = String(line[..<markerRange.lowerBound])
+            if !prefix.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                appendLine(prefix)
+            }
+
+            let afterMarker = String(line[markerRange.upperBound...])
+            let parsed = parseOpeningFenceRemainder(afterMarker, forceSplitPayload: !prefix.isEmpty)
+            appendLine("```" + parsed.info)
+            inCodeFence = true
+            if let payload = parsed.payload, !payload.isEmpty {
+                appendLine(payload)
+            }
+        }
+
+        func processCodeLine(_ line: String) {
+            guard let markerRange = line.range(of: "```") else {
+                appendLine(line)
+                return
+            }
+
+            let codePrefix = String(line[..<markerRange.lowerBound])
+            if !codePrefix.isEmpty {
+                appendLine(codePrefix)
+            }
+            appendLine("```")
+            inCodeFence = false
+
+            let trailing = String(line[markerRange.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trailing.isEmpty {
+                processTextLine(trailing)
+            }
+        }
+
+        for line in lines {
+            if inCodeFence {
+                processCodeLine(line)
+            } else {
+                processTextLine(line)
+            }
+        }
+
+        return output.joined(separator: "\n")
+    }
+
+    private static func parseOpeningFenceRemainder(
+        _ remainder: String,
+        forceSplitPayload: Bool
+    ) -> (info: String, payload: String?) {
+        let trimmedLeading = remainder.trimmingCharacters(in: .whitespaces)
+        guard !trimmedLeading.isEmpty else {
+            return ("", nil)
+        }
+
+        guard forceSplitPayload else {
+            return (trimmedLeading, nil)
+        }
+
+        let pieces = trimmedLeading.split(maxSplits: 1, whereSeparator: { $0 == " " || $0 == "\t" })
+        guard let first = pieces.first else {
+            return ("", nil)
+        }
+
+        let language = String(first)
+        guard isLikelyFenceLanguage(language) else {
+            return ("", trimmedLeading)
+        }
+
+        let payload = pieces.count > 1
+            ? String(pieces[1]).trimmingCharacters(in: .whitespaces)
+            : nil
+        return (language, payload?.isEmpty == true ? nil : payload)
+    }
+
+    private static func isLikelyFenceLanguage(_ value: String) -> Bool {
+        guard !value.isEmpty, value.count <= 32 else { return false }
+        return value.allSatisfy { character in
+            character.isLetter
+                || character.isNumber
+                || character == "_"
+                || character == "-"
+                || character == "+"
+                || character == "#"
+                || character == "."
+        }
+    }
+
+    fileprivate static func blocks(from detail: String) -> [P093TimelineFormattedResult.Block] {
+        let lines = detail.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var blocks: [P093TimelineFormattedResult.Block] = []
+        var current: [String] = []
+        var code: [String] = []
+        var inCode = false
+
+        func flushText() {
+            let text = current.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                blocks.append(contentsOf: plainTextBlocks(from: text))
+            }
+            current.removeAll()
+        }
+
+        func flushCode() {
+            let text = code.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                let capped = P093TimelineFormattedResult.capped(
+                    text,
+                    utf8Limit: P093TimelineFormattedResult.codeBlockPreviewLimit
+                )
+                blocks.append(.code(capped.truncated ? capped.text + "\nPreview truncated" : capped.text))
+            }
+            code.removeAll()
+        }
+
+        for line in lines {
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                if inCode {
+                    flushCode()
+                } else {
+                    flushText()
+                }
+                inCode.toggle()
+                continue
+            }
+            if inCode {
+                code.append(line)
+            } else {
+                current.append(line)
+            }
+        }
+
+        if inCode {
+            flushCode()
+        } else {
+            flushText()
+        }
+        return blocks.isEmpty ? [.text(detail)] : blocks
+    }
+
+    private static func plainTextBlocks(from text: String) -> [P093TimelineFormattedResult.Block] {
+        if let prettyJSON = prettyPrintedJSON(text) {
+            return [.code(prettyJSON)]
+        }
+
+        if looksLikeChainworksOutputJSON(text) {
+            let capped = P093TimelineFormattedResult.capped(
+                text.trimmingCharacters(in: .whitespacesAndNewlines),
+                utf8Limit: P093TimelineFormattedResult.codeBlockPreviewLimit
+            )
+            return [.code(capped.truncated ? capped.text + "\nPreview truncated" : capped.text)]
+        }
+
+        if let markerBlocks = chainworksOutputBlocks(from: text) {
+            return markerBlocks
+        }
+
+        return [.text(text)]
+    }
+
+    private static func chainworksOutputBlocks(from text: String) -> [P093TimelineFormattedResult.Block]? {
+        guard let markerRange = chainworksOutputMarkerRange(in: text) else {
+            return nil
+        }
+
+        var blocks: [P093TimelineFormattedResult.Block] = []
+        let preface = String(text[..<markerRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !preface.isEmpty {
+            blocks.append(.text(preface))
+        }
+        blocks.append(.text("CHAINWORKS_OUTPUT"))
+
+        let payload = String(text[markerRange.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !payload.isEmpty else {
+            return blocks
+        }
+
+        if let prettyJSON = prettyPrintedJSON(payload) {
+            blocks.append(.code(prettyJSON))
+        } else if let extracted = firstPrettyPrintedJSONFragment(in: payload) {
+            let prefix = String(payload[..<extracted.range.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !prefix.isEmpty {
+                blocks.append(.text(prefix))
+            }
+            blocks.append(.code(extracted.prettyJSON))
+            let suffix = String(payload[extracted.range.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !suffix.isEmpty {
+                blocks.append(.text(suffix))
+            }
+        } else {
+            let capped = P093TimelineFormattedResult.capped(
+                payload,
+                utf8Limit: P093TimelineFormattedResult.codeBlockPreviewLimit
+            )
+            blocks.append(.code(capped.truncated ? capped.text + "\nPreview truncated" : capped.text))
+        }
+        return blocks
+    }
+
+    private static func looksLikeChainworksOutputJSON(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix(#"{"CHAINWORKS_OUTPUT""#)
+            || trimmed.hasPrefix(#"{ "CHAINWORKS_OUTPUT""#)
+    }
+
+    private static func chainworksOutputMarkerRange(in text: String) -> Range<String.Index>? {
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            let lineEnd = text[cursor...].firstIndex(of: "\n") ?? text.endIndex
+            let lineRange = cursor..<lineEnd
+            let trimmed = text[lineRange].trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed == "CHAINWORKS_OUTPUT" || trimmed == "CHAINWORKS_OUTPUT:" {
+                return lineRange
+            }
+            cursor = lineEnd == text.endIndex ? text.endIndex : text.index(after: lineEnd)
+        }
+        return nil
+    }
+
+    private static func firstPrettyPrintedJSONFragment(
+        in text: String
+    ) -> (range: Range<String.Index>, prettyJSON: String)? {
+        for start in text.indices where text[start] == "{" || text[start] == "[" {
+            guard let end = matchingJSONEnd(in: text, startingAt: start) else {
+                continue
+            }
+            let candidateRange = start..<text.index(after: end)
+            let candidate = String(text[candidateRange])
+            if let prettyJSON = prettyPrintedJSON(candidate) {
+                return (candidateRange, prettyJSON)
+            }
+        }
+        return nil
+    }
+
+    private static func matchingJSONEnd(in text: String, startingAt start: String.Index) -> String.Index? {
+        var stack: [Character] = []
+        var isInString = false
+        var isEscaped = false
+        var index = start
+        while index < text.endIndex {
+            let character = text[index]
+            if isInString {
+                if isEscaped {
+                    isEscaped = false
+                } else if character == "\\" {
+                    isEscaped = true
+                } else if character == "\"" {
+                    isInString = false
+                }
+            } else {
+                switch character {
+                case "\"":
+                    isInString = true
+                case "{":
+                    stack.append("}")
+                case "[":
+                    stack.append("]")
+                case "}", "]":
+                    guard stack.last == character else {
+                        return nil
+                    }
+                    stack.removeLast()
+                    if stack.isEmpty {
+                        return index
+                    }
+                default:
+                    break
+                }
+            }
+            index = text.index(after: index)
+        }
+        return nil
+    }
+
+    private static func prettyPrintedJSON(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("{") || trimmed.hasPrefix("["),
+              trimmed.utf8.count <= P093TimelineFormattedResult.jsonPrettyPrintInputLimit,
+              let data = trimmed.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              JSONSerialization.isValidJSONObject(object),
+              let pretty = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]),
+              let rendered = String(data: pretty, encoding: .utf8)
+        else {
+            return nil
+        }
+        return rendered
+    }
+}
+
+private struct P093TimelineMarkdownTextBlock: View {
+    let text: String
+
+    var body: some View {
+        Text(renderedText)
+            .font(.system(size: 13))
+            .foregroundStyle(ForgeColor.Text.secondary)
+            .lineSpacing(3)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityLabel(text)
+    }
+
+    private var renderedText: AttributedString {
+        if let attributed = try? AttributedString(
+            markdown: text,
+            options: .init(interpretedSyntax: .full)
+        ) {
+            return attributed
+        }
+        return AttributedString(text)
+    }
+}
+
+private struct P093TimelineCodeBlock: View {
+    let code: String
+
+    var body: some View {
+        Text(code)
+            .font(.system(size: 12, design: .monospaced))
+            .foregroundStyle(ForgeColor.Text.secondary)
+            .textSelection(.enabled)
+            .lineSpacing(2)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            .background(Color(nsColor: .textBackgroundColor).opacity(0.72), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -1370,12 +3152,12 @@ private struct P031RunDetailSummaryCard: View {
                 if let errorDescription = header.errorDescription {
                     ForgeWarningBanner.error(errorDescription)
                 }
-                
+
                 if header.status == "blocked" || header.status == "failed" {
                     Button {
                         onCheckSystemReadiness()
                     } label: {
-                        Label("Check System Readiness", systemImage: "stethoscope")
+                        Label("Check system readiness", systemImage: "stethoscope")
                             .font(.subheadline.weight(.semibold))
                     }
                     .buttonStyle(.bordered)
@@ -1396,6 +3178,98 @@ private struct P031RunDetailSummaryCard: View {
         ]
         .compactMap { $0 }
         .joined(separator: " • ")
+    }
+}
+
+private struct P086ContinuationReadbackCard: View {
+    let presentation: P086ContinuationReadbackPresentation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForgeSectionHeader(
+                title: presentation.title,
+                subtitle: presentation.summary,
+                symbol: "arrow.triangle.2.circlepath"
+            )
+
+            HStack(alignment: .top, spacing: 12) {
+                Label(presentation.latestStatus, systemImage: statusSymbolName)
+                    .font(ForgeTypography.supporting.weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(statusColor.opacity(0.15), in: Capsule())
+                    .foregroundStyle(statusColor)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(presentation.latestMode)
+                        .font(ForgeTypography.body.weight(.semibold))
+                        .foregroundStyle(ForgeColor.Text.primary)
+                    Text([
+                        presentation.latestTrigger,
+                        presentation.artifactSummary,
+                        presentation.metricSummary,
+                    ].joined(separator: " · "))
+                    .font(ForgeTypography.supporting)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+            }
+
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 10)], spacing: 8) {
+                if let id = presentation.latestContinuationID {
+                    P086ContinuationMetadataPill(label: "Continuation", value: id)
+                }
+                if let id = presentation.latestAgentExecutionID {
+                    P086ContinuationMetadataPill(label: "Agent execution", value: id)
+                }
+                if let id = presentation.latestStageExecutionID {
+                    P086ContinuationMetadataPill(label: "Stage execution", value: id)
+                }
+            }
+        }
+        .forgePanel()
+        .accessibilityIdentifier("p086-continuation-readback-card")
+        .accessibilityLabel(presentation.accessibilityLabel)
+    }
+
+    private var statusColor: Color {
+        let status = presentation.latestStatus.lowercased()
+        if status.contains("succeeded") { return ForgeColor.Status.success }
+        if status.contains("failed") || status.contains("no progress") { return ForgeColor.Status.error }
+        if status.contains("cancel") { return ForgeColor.Status.warning }
+        return ForgeColor.Status.running
+    }
+
+    private var statusSymbolName: String {
+        let status = presentation.latestStatus.lowercased()
+        if status.contains("succeeded") { return "checkmark.circle.fill" }
+        if status.contains("failed") || status.contains("no progress") { return "exclamationmark.triangle.fill" }
+        if status.contains("cancel") { return "xmark.circle.fill" }
+        return "arrow.triangle.2.circlepath"
+    }
+}
+
+private struct P086ContinuationMetadataPill: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(ForgeTypography.micro.weight(.semibold))
+                .foregroundStyle(ForgeColor.Text.tertiary)
+            Text(value)
+                .font(ForgeTypography.micro.monospaced())
+                .foregroundStyle(ForgeColor.Text.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(ForgeColor.Surface.muted, in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
@@ -2076,7 +3950,7 @@ private struct P031StageTransitionMapCard: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
-                                
+
                                 if !stage.evidenceLabels.isEmpty {
                                     P031BadgeRow(labels: stage.evidenceLabels)
                                 }
@@ -2119,7 +3993,7 @@ private struct P031StageTransitionMapCard: View {
         default: return .secondary
         }
     }
-    
+
     private func statusLabel(for status: String) -> String {
         switch status {
         case "terminal": return "Completed"
@@ -2197,7 +4071,7 @@ private struct P031ApprovalInboxCard: View {
                                     Label(actionLabel, systemImage: "terminal")
                                         .font(.caption)
                                 }
-                                
+
                                 if let state = row.deferredState {
                                     ForgeWarningBanner(state.displayLabel, tint: state.tint)
                                 }
@@ -2511,10 +4385,10 @@ private struct P031ArtifactViewerCard: View {
                 if isLatestGroup {
                     Text("Latest")
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.green)
+                        .foregroundStyle(ForgeStatusColor.success)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(Color.green.opacity(0.12), in: Capsule())
+                        .background(ForgeStatusColor.success.opacity(0.12), in: Capsule())
                 }
                 Spacer()
                 Text("\(group.rows.count)")
@@ -3293,45 +5167,368 @@ private struct P031FreshnessBadge: View {
 
 
 
+// P081 Defect1: Generate a UUIDv7 string for approval action idempotency keys.
+// UUIDv7 embeds the current Unix timestamp in ms in the high 48 bits, version nibble 0x7
+// in bits 48-51, and random bytes elsewhere (RFC 9562). The server validates
+// idempotency keys as UUIDv7 (version nibble check) so UUIDv4 from UUID() must not be used.
+private nonisolated func makeUUIDv7() -> String {
+    let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+    var bytes = [UInt8](repeating: 0, count: 16)
+    bytes[0] = UInt8((nowMs >> 40) & 0xFF)
+    bytes[1] = UInt8((nowMs >> 32) & 0xFF)
+    bytes[2] = UInt8((nowMs >> 24) & 0xFF)
+    bytes[3] = UInt8((nowMs >> 16) & 0xFF)
+    bytes[4] = UInt8((nowMs >> 8) & 0xFF)
+    bytes[5] = UInt8(nowMs & 0xFF)
+    for i in 6..<16 { bytes[i] = UInt8.random(in: 0...255) }
+    bytes[6] = (bytes[6] & 0x0F) | 0x70  // version = 7
+    bytes[8] = (bytes[8] & 0x3F) | 0x80  // variant = 10xx
+    return String(
+        format: "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
 #Preview("Stages") {
-    RunsHomeView(model: .previewLoaded(), workbench: RunsWorkbenchPresentationModel(), initialTab: .stages)
+    P036RunsHomePreviewHost(initialTab: .stages)
         .frame(width: 1200, height: 780)
 }
 
 #Preview("Artifacts") {
-    RunsHomeView(model: .previewLoaded(), workbench: RunsWorkbenchPresentationModel(), initialTab: .artifacts)
+    P036RunsHomePreviewHost(initialTab: .artifacts)
         .frame(width: 1200, height: 780)
 }
 
 #Preview("Overview") {
-    RunsHomeView(model: .previewLoaded(), workbench: RunsWorkbenchPresentationModel(), initialTab: .overview)
+    P036RunsHomePreviewHost(initialTab: .overview)
         .frame(width: 1200, height: 780)
 }
 
+#Preview("Timeline") {
+    P036RunsHomePreviewHost(initialTab: .timeline)
+        .frame(width: 1200, height: 780)
+}
+
+private struct P036RunsHomePreviewHost: View {
+    let initialTab: P031RunDetailTab
+
+    @StateObject private var model = P031ThinReadDashboardModel.previewLoaded()
+    @StateObject private var workbench = RunsWorkbenchPresentationModel()
+
+    var body: some View {
+        RunsHomeView(model: model, workbench: workbench, initialTab: initialTab)
+            .onAppear {
+                if let runsHome = model.runsHome {
+                    workbench.populate(from: runsHome)
+                }
+                if let runDetail = model.runDetail {
+                    workbench.populate(from: runDetail)
+                }
+                workbench.populate(daemon: model.daemonLifecycle, scheduler: model.schedulerHealth)
+            }
+    }
+}
+
+#Preview("Timeline Card") {
+    P036TimelineWorkbenchCard(entries: [
+        RunsWorkbenchPresentationModel.TimelineEntry(
+            id: "agent-session",
+            kind: .sessionEvent,
+            title: "Code Writer",
+            detail: "Session started",
+            timestamp: Date(),
+            displayTime: "08:00",
+            stageID: "implementation_refined",
+            surfaceLabel: "session_event",
+            agentID: "code-writer",
+            sessionID: "session-active",
+            isCollapsed: false
+        ),
+        RunsWorkbenchPresentationModel.TimelineEntry(
+            id: "agent-tool",
+            kind: .mergedTool,
+            title: "Code Writer",
+            detail: "Tool: edit (running)",
+            timestamp: Date(),
+            displayTime: "08:01",
+            stageID: "implementation_refined",
+            surfaceLabel: "merged_tool",
+            agentID: "code-writer",
+            sessionID: "session-active",
+            isCollapsed: false
+        ),
+        RunsWorkbenchPresentationModel.TimelineEntry(
+            id: "completed-agent-noise",
+            kind: .text,
+            title: "Previous Agent",
+            detail: "Collapsed after completion",
+            timestamp: Date(),
+            displayTime: "07:58",
+            stageID: "implementation_reviewed",
+            surfaceLabel: "text",
+            agentID: "previous-agent",
+            sessionID: "session-complete",
+            isCollapsed: true
+        )
+    ], activeAgents: [], resolveTimelineRawDetail: { _ in
+        P031TimelineRawDetailReadModel(
+            status: .missing,
+            rawDetail: nil,
+            rawDetailBytes: nil,
+            rawDetailDigest: nil,
+            errorReason: .handleNotFound
+        )
+    })
+    .frame(width: 760)
+    .padding()
+}
+
+private let p093TimelinePromptPreviewDetail = """
+## System Instructions
+Review the proposal as a macOS specialist. Focus on native macOS interaction patterns, SwiftUI/AppKit fit, accessibility, windowing, menus, keyboard workflows, and platform-specific UX risk. Output only the proposal_review_v1 contract.
+---
+## Task: dynamic_review_proposal_reviewer_macos
+Run meta-root (absolute): /Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218
+Workspace root: /Users/user/Documents/Chainworks Forge
+
+### Input Artifacts
+- `idea_brief` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218/context/idea.md`
+- `proposal_current` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218/proposals/current/proposal.md`
+- `proposal_feedback_coverage` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218/reviews/proposal/feedback-coverage.json`
+- `reviewer_scope_plan` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218/reviews/proposal/reviewer-scope-plan.json`
+- `score_lift_backlog` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218/reviews/proposal/score-lift-backlog.json`
+
+### Required Outputs
+Return each required output through the final `CHAINWORKS_OUTPUT` object using the canonical path keys below; the engine will materialize canonical files after contract validation.
+Tool stdout is not an output channel. Only the final assistant message is settled for `CHAINWORKS_OUTPUT`. Do not call shell `echo`, `printf`, or file-writing commands to return `CHAINWORKS_OUTPUT`.
+- `proposal_review_macos` -> `/Users/user/Documents/Chainworks Forge/.chainworks/runs/260ec20f-549a-487c-9bbe-698166801218/reviews/proposal/macos.json`
+
+### Structured Output Requirements
+CRITICAL: Each required output file must contain exactly one top-level JSON object and nothing else.
+- Do NOT wrap the JSON in code fences.
+- Do NOT emit markdown, prose, or companion files unless they are explicitly listed as required outputs.
+- Every listed field below MUST be present in the JSON, with its correct type.
+"""
+
+#Preview("Timeline Prompt Detail") {
+    P093FormattedTimelineDetail(
+        result: P093TimelineFormattedResult.render(detail: p093TimelinePromptPreviewDetail)
+    )
+    .frame(width: 1200, height: 420)
+    .padding()
+}
+
+#if DEBUG
+struct P093TimelineProofSurface: View {
+    var singleAgentOnly = false
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            ScrollView {
+                P036TimelineWorkbenchCard(
+                    entries: proofEntries,
+                    activeAgents: proofAgents,
+                    resolveTimelineRawDetail: { _ in
+                        P031TimelineRawDetailReadModel(
+                            status: .available,
+                            rawDetail: p093TimelinePromptPreviewDetail,
+                            rawDetailBytes: p093TimelinePromptPreviewDetail.utf8.count,
+                            rawDetailDigest: "p093-proof-detail",
+                            errorReason: nil
+                        )
+                    }
+                )
+                .padding(24)
+            }
+            .frame(minWidth: 920, minHeight: 620)
+
+            Color.clear
+                .frame(width: 1, height: 1)
+                .accessibilityIdentifier("ui-test-direct-surface-ready-p093_timeline_proof")
+        }
+    }
+
+    private var proofAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent] {
+        let agents = [
+            RunsWorkbenchPresentationModel.ActiveTimelineAgent(
+                id: "code_writer",
+                title: "Code Writer",
+                providerID: "codex",
+                stageID: "state_10_implementation_refined",
+                stageLabel: "Implementation refined",
+                taskLabel: "refine_implementation",
+                status: "running",
+                sessionID: "session-p093-code-writer",
+                latestAt: Date(timeIntervalSince1970: 1_778_000_000),
+                eventCount: 2,
+                selectionOrder: 0,
+                selectionUnavailableReason: nil
+            ),
+            RunsWorkbenchPresentationModel.ActiveTimelineAgent(
+                id: "reviewer",
+                title: "Reviewer",
+                providerID: "claude",
+                stageID: "state_9_implementation_reviewed",
+                stageLabel: "Implementation reviewed",
+                taskLabel: "review_implementation",
+                status: "running",
+                sessionID: "session-p093-reviewer",
+                latestAt: Date(timeIntervalSince1970: 1_777_999_900),
+                eventCount: 1,
+                selectionOrder: 1,
+                selectionUnavailableReason: nil
+            ),
+        ]
+        return singleAgentOnly ? Array(agents.prefix(1)) : agents
+    }
+
+    private var proofEntries: [RunsWorkbenchPresentationModel.TimelineEntry] {
+        let codeWriterEntries = [
+            RunsWorkbenchPresentationModel.TimelineEntry(
+                id: "rte_p093_prompt",
+                kind: .text,
+                title: "Prompt sent",
+                detail: p093TimelinePromptPreviewDetail,
+                timestamp: Date(timeIntervalSince1970: 1_778_000_010),
+                displayTime: "10:00:10",
+                stageID: "state_10_implementation_refined",
+                surfaceLabel: "operator_prompt",
+                agentID: "code_writer",
+                sessionID: "session-p093-code-writer",
+                isCollapsed: false,
+                rawDetail: p093TimelinePromptPreviewDetail,
+                rawDetailBytes: p093TimelinePromptPreviewDetail.utf8.count,
+                rawDetailTruncated: false,
+                rawDetailHandle: nil,
+                rawDetailDigest: "p093-proof-detail",
+                fullRawAvailable: true,
+                detailDigest: "p093-proof-detail",
+                detailCharCount: p093TimelinePromptPreviewDetail.count,
+                chunkCount: 1,
+                isStreaming: false,
+                isTerminal: true,
+                stateLabel: "state_10_implementation_refined",
+                providerID: "codex"
+            ),
+            RunsWorkbenchPresentationModel.TimelineEntry(
+                id: "rte_p093_tool",
+                kind: .mergedTool,
+                title: "Provider activity",
+                detail: "completed · rg -n \"TimelineEntryRow\" \"Chainworks Forge/Views/RunsHomeView.swift\"",
+                timestamp: Date(timeIntervalSince1970: 1_778_000_015),
+                displayTime: "10:00:15",
+                stageID: "state_10_implementation_refined",
+                surfaceLabel: "provider_activity",
+                agentID: "code_writer",
+                sessionID: "session-p093-code-writer",
+                isCollapsed: false,
+                isStreaming: false,
+                isTerminal: true,
+                stateLabel: "state_10_implementation_refined",
+                providerID: "codex"
+            ),
+            RunsWorkbenchPresentationModel.TimelineEntry(
+                id: "rte_p093_response",
+                kind: .text,
+                title: "Agent response complete",
+                detail: "Completed response summary: proposal review output ready.",
+                timestamp: Date(timeIntervalSince1970: 1_778_000_020),
+                displayTime: "10:00:20",
+                stageID: "state_10_implementation_refined",
+                surfaceLabel: "agent_summary",
+                agentID: "code_writer",
+                sessionID: "session-p093-code-writer",
+                isCollapsed: false,
+                rawDetail: """
+                Streaming response body with `inline code` and a short list.
+
+                - first
+                - second
+
+                ```json
+                {
+                  "contract": "proposal_review_v1",
+                  "verdict": "ready"
+                }
+                ```
+                """,
+                rawDetailBytes: """
+                Streaming response body with `inline code` and a short list.
+
+                - first
+                - second
+
+                ```json
+                {
+                  "contract": "proposal_review_v1",
+                  "verdict": "ready"
+                }
+                ```
+                """.utf8.count,
+                rawDetailTruncated: false,
+                rawDetailHandle: nil,
+                rawDetailDigest: "p093-proof-response-detail",
+                fullRawAvailable: true,
+                detailDigest: "p093-proof-response-detail",
+                detailCharCount: 164,
+                chunkCount: 4,
+                isStreaming: false,
+                isTerminal: true,
+                stateLabel: "state_10_implementation_refined",
+                providerID: "codex"
+            ),
+        ]
+        guard !singleAgentOnly else { return codeWriterEntries }
+        return codeWriterEntries + [
+            RunsWorkbenchPresentationModel.TimelineEntry(
+                id: "rte_p093_reviewer",
+                kind: .text,
+                title: "Reviewer note",
+                detail: "Reviewer-only timeline entry.",
+                timestamp: Date(timeIntervalSince1970: 1_778_000_030),
+                displayTime: "10:00:30",
+                stageID: "state_9_implementation_reviewed",
+                surfaceLabel: "text_chunk",
+                agentID: "reviewer",
+                sessionID: "session-p093-reviewer",
+                isCollapsed: false,
+                isStreaming: true,
+                isTerminal: false,
+                stateLabel: "state_9_implementation_reviewed",
+                providerID: "claude"
+            ),
+        ]
+    }
+}
+#endif
+
 private struct P036SystemReadinessCard: View {
     let health: RunsWorkbenchPresentationModel.FreshnessHealth
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Text("System Readiness")
-                    .font(.headline)
+                Text("System readiness")
+                    .font(ForgeTypography.sectionHeader)
                 Spacer()
                 if health.isReadinessDeferred {
-                    Label("Readiness Pending", systemImage: "clock.badge.questionmark")
+                    Label("Readiness pending", systemImage: "clock.badge.questionmark")
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("readiness-deferred")
                 } else if health.isSystemReady {
                     Label("Ready", systemImage: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+                        .foregroundStyle(ForgeStatusColor.success)
                 } else {
-                    Label("Action Required", systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
+                    Label("Action required", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(ForgeStatusColor.warning)
                 }
             }
-            
+
             Divider()
-            
+
             Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 10) {
                 GridRow {
                     Text("Daemon")
@@ -3372,7 +5569,8 @@ private struct P036SystemReadinessCard: View {
 private struct P036RunDetailSummaryCard: View {
     let header: RunsWorkbenchPresentationModel.SummaryHeader
     let onCheckSystemReadiness: () -> Void
-    
+    @State private var copyFeedback: String?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -3382,11 +5580,14 @@ private struct P036RunDetailSummaryCard: View {
                     Text(header.status)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                    if let runID = header.runID {
+                        runIDCopyControl(runID)
+                    }
                 }
                 Spacer()
-                
+
                 Button(action: onCheckSystemReadiness) {
-                    Label("Check Readiness", systemImage: "checkmark.shield")
+                        Label("Check readiness", systemImage: "checkmark.shield")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -3396,59 +5597,729 @@ private struct P036RunDetailSummaryCard: View {
         .background(Color.primary.opacity(0.03))
         .cornerRadius(12)
     }
+
+    private func runIDCopyControl(_ runID: String) -> some View {
+        Button {
+            copyRunID(runID)
+        } label: {
+            Label("Run \(shortRunID(runID))", systemImage: "doc.on.doc")
+                .labelStyle(.titleAndIcon)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(ForgeColor.Text.secondary)
+        .help(copyFeedback ?? "Copy full run ID: \(runID)")
+        .accessibilityLabel("Copy run ID \(runID)")
+        .accessibilityIdentifier("run-overview-copy-run-id")
+    }
+
+    private func shortRunID(_ runID: String) -> String {
+        let prefix = String(runID.prefix(5))
+        return runID.count > 5 ? "\(prefix)..." : prefix
+    }
+
+    private func copyRunID(_ runID: String) {
+        #if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(runID, forType: .string)
+        copyFeedback = "Copied full run ID"
+        #endif
+    }
 }
 
 private struct P036StageMapCard: View {
     let map: RunsWorkbenchPresentationModel.StageMap
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Execution Stages")
-                .font(.headline)
-            
-            FlowLayout(spacing: 8) {
-                ForEach(map.stages) { stage in
-                    HStack(spacing: 6) {
-                        stageIcon(for: stage.status)
-                        Text(stage.title)
-                            .font(.caption.weight(.medium))
+            ForgeSectionHeader(
+                title: "Stages",
+                subtitle: "Frozen workflow snapshot · \(map.stages.count) stage\(map.stages.count == 1 ? "" : "s")",
+                symbol: "point.topleft.down.curvedto.point.bottomright.up"
+            )
+
+            if map.stages.isEmpty {
+                Text("No topology readback yet")
+                    .font(ForgeTypography.body)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 92, alignment: .center)
+                    .background(ForgeColor.Surface.muted, in: RoundedRectangle(cornerRadius: 8))
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 10) {
+                        ForEach(Array(map.layoutColumns.enumerated()), id: \.element.id) { index, column in
+                            P036StageTopologyColumnView(column: column)
+                            if index < map.connectorColumns.count {
+                                P036StageTopologyConnectorColumnView(
+                                    column: map.connectorColumns[index]
+                                )
+                            }
+                        }
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(stageColor(for: stage.status).opacity(0.12))
-                    .foregroundStyle(stageColor(for: stage.status))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 6)
-                            .strokeBorder(stageColor(for: stage.status).opacity(0.24), lineWidth: 1)
+                    .padding(.vertical, 2)
+                    .padding(.trailing, 4)
+                }
+            }
+        }
+        .forgePanel()
+    }
+}
+
+private enum P036StageTopologyMetrics {
+    static let cardWidth: CGFloat = 292
+    static let cardHeight: CGFloat = 210
+    static let cardGap: CGFloat = 12
+    static let columnHeaderHeight: CGFloat = 22
+    static let connectorWidth: CGFloat = 34
+
+    static func slotHeight(units: Int) -> CGFloat {
+        let safeUnits = max(1, units)
+        return CGFloat(safeUnits) * cardHeight + CGFloat(safeUnits - 1) * cardGap
+    }
+}
+
+private struct P036StageTopologyColumnView: View {
+    let column: RunsWorkbenchPresentationModel.StageTopologyColumn
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: P036StageTopologyMetrics.cardGap) {
+            Text(column.title.uppercased())
+                .font(ForgeTypography.micro.weight(.semibold))
+                .foregroundStyle(ForgeColor.Text.tertiary)
+                .lineLimit(1)
+                .frame(
+                    width: P036StageTopologyMetrics.cardWidth,
+                    height: P036StageTopologyMetrics.columnHeaderHeight,
+                    alignment: .leading
+                )
+
+            ForEach(column.slots) { slot in
+                switch slot.kind {
+                case .stage:
+                    if let stage = slot.stage {
+                        P036StageTopologyCard(stage: stage, heightUnits: slot.heightUnits)
+                    }
+                case .bridge:
+                    P036StageTopologyBridgeLane(
+                        label: slot.bridgeLabel ?? "Transition",
+                        heightUnits: slot.heightUnits
+                    )
+                }
+            }
+        }
+    }
+}
+
+private struct P036StageTopologyConnectorColumnView: View {
+    let column: RunsWorkbenchPresentationModel.StageTopologyConnectorColumn
+
+    var body: some View {
+        VStack(spacing: P036StageTopologyMetrics.cardGap) {
+            Color.clear
+                .frame(
+                    width: P036StageTopologyMetrics.connectorWidth,
+                    height: P036StageTopologyMetrics.columnHeaderHeight
+                )
+
+            ForEach(column.connectors) { connector in
+                P036StageTopologyConnectorView(style: connector.style)
+                    .frame(
+                        width: P036StageTopologyMetrics.connectorWidth,
+                        height: P036StageTopologyMetrics.cardHeight
+                    )
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+private struct P036StageTopologyConnectorView: View {
+    let style: RunsWorkbenchPresentationModel.StageTopologyConnector.Style
+
+    var body: some View {
+        Group {
+            switch style {
+            case .primary:
+                connector(symbol: "arrow.right", tint: ForgeStatusColor.running)
+            case .retry:
+                connector(symbol: "arrow.uturn.left", tint: ForgeStatusColor.error)
+            case .manual:
+                connector(symbol: "arrow.right", tint: ForgeStatusColor.warning)
+            case .hidden:
+                Color.clear
+            }
+        }
+    }
+
+    private func connector(symbol: String, tint: Color) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(tint)
+            .frame(width: 30, height: 30)
+            .background(tint.opacity(0.12), in: Circle())
+            .overlay {
+                Circle().strokeBorder(tint.opacity(0.45), lineWidth: 1)
+            }
+    }
+}
+
+private struct P036StageTopologyBridgeLane: View {
+    let label: String
+    let heightUnits: Int
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Spacer()
+            Image(systemName: "arrow.right")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(ForgeStatusColor.running)
+                .frame(width: 42, height: 42)
+                .background(ForgeStatusColor.running.opacity(0.12), in: Circle())
+                .overlay {
+                    Circle().strokeBorder(ForgeStatusColor.running.opacity(0.4), lineWidth: 1)
+                }
+            Text(label.uppercased())
+                .font(ForgeTypography.micro.weight(.semibold))
+                .foregroundStyle(ForgeColor.Text.tertiary)
+                .lineLimit(1)
+            Spacer()
+        }
+        .frame(
+            width: P036StageTopologyMetrics.cardWidth,
+            height: P036StageTopologyMetrics.slotHeight(units: heightUnits)
+        )
+        .background(ForgeColor.Surface.elevated.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                .foregroundStyle(ForgeColor.Surface.border.opacity(0.7))
+        }
+        .accessibilityLabel("\(label) transition lane")
+    }
+}
+
+private struct P036StageTopologyCard: View {
+    let stage: RunsWorkbenchPresentationModel.StageCard
+    let heightUnits: Int
+
+    init(stage: RunsWorkbenchPresentationModel.StageCard, heightUnits: Int = 1) {
+        self.stage = stage
+        self.heightUnits = heightUnits
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 8) {
+                Text(String(format: "%02d", stage.ordinal))
+                    .font(ForgeTypography.micro.monospacedDigit())
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                    .frame(width: 24, alignment: .leading)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(stage.title)
+                        .font(ForgeTypography.cardTitle)
+                        .foregroundStyle(ForgeColor.Text.primary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(stage.ownerAgentTitle)
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                StatusCapsule(
+                    text: statusLabel(for: stage.status),
+                    color: stageColor(for: stage.status),
+                    icon: statusIconName(for: stage.status),
+                    size: .small
+                )
+            }
+
+            HStack(spacing: 6) {
+                ForEach(stageMetadataChips, id: \.self) { label in
+                    Text(label)
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                        .lineLimit(1)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(ForgeColor.Surface.muted, in: Capsule())
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(stage.occurrences) { occurrence in
+                    P036StageOccurrenceRow(occurrence: occurrence)
+                }
+                if stage.hiddenOccurrenceCount > 0 {
+                    Text("+ \(stage.hiddenOccurrenceCount) more")
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(ForgeColor.Text.tertiary)
+                }
+            }
+            .frame(minHeight: 46, alignment: .topLeading)
+
+            if !stage.transitions.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(stage.transitions.prefix(2)) { transition in
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.right")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(ForgeColor.Text.tertiary)
+                            Text(transition.toLabel)
+                                .font(ForgeTypography.micro)
+                                .foregroundStyle(ForgeColor.Text.secondary)
+                                .lineLimit(1)
+                        }
                     }
                 }
             }
         }
-        .padding(20)
-        .background(Color.primary.opacity(0.03))
-        .cornerRadius(12)
-    }
-    
-    @ViewBuilder
-    private func stageIcon(for status: String) -> some View {
-        switch status {
-        case "terminal": Image(systemName: "checkmark.circle.fill")
-        case "active": Image(systemName: "play.circle.fill")
-        case "blocked": Image(systemName: "exclamationmark.octagon.fill")
-        case "pending": Image(systemName: "clock.fill")
-        default: Image(systemName: "questionmark.circle.fill")
+        .frame(
+            width: P036StageTopologyMetrics.cardWidth,
+            height: P036StageTopologyMetrics.slotHeight(units: heightUnits),
+            alignment: .topLeading
+        )
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(stage.isCurrent ? ForgeStatusColor.running.opacity(0.08) : ForgeColor.Surface.elevated)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(
+                    stage.isCurrent ? ForgeStatusColor.running : ForgeColor.Surface.border,
+                    lineWidth: stage.isCurrent ? 2 : 1
+                )
         }
+        .modifier(P036RunningPulse(isActive: stage.status == "active" && stage.isCurrent))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(stage.ordinal). \(stage.title), \(stage.ownerAgentTitle), \(statusLabel(for: stage.status)), \(stageMetadata)")
     }
-    
+
+    private var stageMetadata: String {
+        let parts = stageMetadataChips + stage.evidenceLabels
+        return parts.isEmpty ? "No stage evidence yet" : parts.joined(separator: " · ")
+    }
+
+    private var stageMetadataChips: [String] {
+        [
+            stage.iterationText,
+            stage.attemptText,
+            stage.approvalRequired ? "Approval" : nil,
+            stage.artifactCount > 0 ? "\(stage.artifactCount) artifacts" : nil
+        ].compactMap { $0 }.filter { !$0.isEmpty }
+    }
+
     private func stageColor(for status: String) -> Color {
         switch status {
-        case "terminal": return .green
-        case "active": return .blue
-        case "blocked": return .red
-        case "pending": return .secondary
-        default: return .secondary
+        case "terminal": return ForgeStatusColor.success
+        case "active": return ForgeStatusColor.running
+        case "blocked": return ForgeStatusColor.error
+        case "pending": return ForgeStatusColor.neutral
+        default: return ForgeStatusColor.neutral
         }
+    }
+
+    private func statusLabel(for status: String) -> String {
+        switch status {
+        case "terminal": return "Completed"
+        case "active": return "Running"
+        case "blocked": return "Blocked"
+        case "pending": return "Pending"
+        default: return "Unavailable"
+        }
+    }
+
+    private func statusIconName(for status: String) -> String {
+        switch status {
+        case "terminal": return "checkmark.circle.fill"
+        case "active": return "play.circle.fill"
+        case "blocked": return "exclamationmark.octagon.fill"
+        case "pending": return "clock.fill"
+        default: return "questionmark.circle.fill"
+        }
+    }
+}
+
+private struct P036StageOccurrenceRow: View {
+    let occurrence: RunsWorkbenchPresentationModel.StageOccurrence
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "person.crop.circle")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(ForgeColor.Text.tertiary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(occurrence.agentTitle)
+                    .font(ForgeTypography.micro.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.primary)
+                    .lineLimit(1)
+                Text(detailText)
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    private var detailText: String {
+        [
+            occurrence.taskName,
+            occurrence.statusText,
+            occurrence.executionCountLabel,
+            occurrence.providerLabel.isEmpty ? nil : occurrence.providerLabel
+        ].compactMap { $0 }.joined(separator: " · ")
+    }
+}
+
+private struct P036RunningPulse: ViewModifier {
+    let isActive: Bool
+
+    func body(content: Content) -> some View {
+        if isActive {
+            content
+                .shadow(color: ForgeStatusColor.running.opacity(0.35), radius: 5)
+        } else {
+            content
+        }
+    }
+}
+
+#if os(macOS)
+private struct P093StableTimelineScrollView<Content: View>: NSViewRepresentable {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.contentView.postsBoundsChangedNotifications = true
+
+        let hostingView = NSHostingView(rootView: rootView(width: 1))
+        hostingView.autoresizingMask = [.width]
+        hostingView.translatesAutoresizingMaskIntoConstraints = true
+        scrollView.documentView = hostingView
+        context.coordinator.hostingView = hostingView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let hostingView = context.coordinator.hostingView else { return }
+
+        let clipView = scrollView.contentView
+        let previousOrigin = clipView.bounds.origin
+        let previousDocumentHeight = scrollView.documentView?.bounds.height ?? 0
+        let previousMaxY = max(0, previousDocumentHeight - clipView.bounds.height)
+        let wasNearBottom = previousMaxY - previousOrigin.y <= 20
+        let viewportWidth = max(clipView.bounds.width, 1)
+
+        NSAnimationContext.runAnimationGroup { animationContext in
+            animationContext.duration = 0
+            animationContext.allowsImplicitAnimation = false
+
+            hostingView.rootView = rootView(width: viewportWidth)
+            hostingView.layoutSubtreeIfNeeded()
+
+            let fittingHeight = hostingView.fittingSize.height
+            let documentHeight = max(fittingHeight, clipView.bounds.height)
+            hostingView.frame = NSRect(x: 0, y: 0, width: viewportWidth, height: documentHeight)
+            scrollView.documentView = hostingView
+
+            let nextMaxY = max(0, documentHeight - clipView.bounds.height)
+            let targetY = wasNearBottom ? nextMaxY : min(previousOrigin.y, nextMaxY)
+            clipView.scroll(to: NSPoint(x: 0, y: max(0, targetY)))
+            scrollView.reflectScrolledClipView(clipView)
+        }
+    }
+
+    private func rootView(width: CGFloat) -> AnyView {
+        AnyView(
+            content
+                .frame(width: width, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+        )
+    }
+
+    final class Coordinator {
+        var hostingView: NSHostingView<AnyView>?
+    }
+}
+#endif
+
+private struct P036TimelineWorkbenchCard: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    let entries: [RunsWorkbenchPresentationModel.TimelineEntry]
+    let activeAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent]
+    let resolveTimelineRawDetail: (String) async -> P031TimelineRawDetailReadModel
+
+    @State private var expandedEntryID: String?
+    @State private var selectedAgentID: String?
+    @State private var formatterCache = P093TimelineFormatterCache()
+
+    private var allVisibleEntries: [RunsWorkbenchPresentationModel.TimelineEntry] {
+        entries.filter { !$0.isCollapsed }.sorted { lhs, rhs in
+            if lhs.timestamp == rhs.timestamp { return lhs.id > rhs.id }
+            return lhs.timestamp > rhs.timestamp
+        }
+    }
+
+    private var agentOptions: [TimelineAgentOption] {
+        activeAgents.map { agent in
+            TimelineAgentOption(
+                id: agent.id,
+                title: agent.title,
+                providerID: agent.providerID,
+                stageID: agent.stageID,
+                stageLabel: agent.stageLabel,
+                taskLabel: agent.taskLabel,
+                status: agent.status,
+                sessionID: agent.sessionID,
+                latestAt: agent.latestAt,
+                eventCount: agent.eventCount,
+                selectionOrder: agent.selectionOrder,
+                selectionUnavailableReason: agent.selectionUnavailableReason
+            )
+        }
+    }
+
+    private var resolvedSelectedAgentID: String? {
+        if let selectedAgentID,
+           agentOptions.contains(where: { $0.id == selectedAgentID }) {
+            return selectedAgentID
+        }
+        return agentOptions.first?.id
+    }
+
+    private var visibleEntries: [RunsWorkbenchPresentationModel.TimelineEntry] {
+        guard let agentID = resolvedSelectedAgentID else { return [] }
+        return allVisibleEntries.filter { $0.agentID == agentID }
+    }
+
+    private var activeAgentReadbackUnavailable: Bool {
+        activeAgents.isEmpty && !allVisibleEntries.isEmpty
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Timeline")
+                        .font(.title3.weight(.semibold))
+                    Text(timelineSubtitle)
+                        .font(.caption)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                }
+
+                if activeAgentReadbackUnavailable {
+                    ContentUnavailableView(
+                        "Active-agent selector unavailable",
+                        systemImage: "person.crop.circle.badge.exclamationmark",
+                        description: Text("Control-plane active-agent readback is unavailable; Timeline will resume when daemon selector data is present.")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 160)
+                } else if visibleEntries.isEmpty {
+                    ContentUnavailableView(
+                        "No Timeline Data",
+                        systemImage: "waveform.path.ecg",
+                        description: Text("No active control-plane timeline events for the selected agent yet.")
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 160)
+                } else {
+                    GroupBox("Timeline") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            if agentOptions.count > 1 {
+                                TimelineAgentSelector(
+                                    options: agentOptions,
+                                    selectedAgentID: resolvedSelectedAgentID,
+                                    onSelect: { agentID in
+                                        selectedAgentID = agentID
+                                        expandedEntryID = nil
+                                    }
+                                )
+                            }
+
+                            ForEach(Array(visibleEntries.enumerated()), id: \.element.id) { index, entry in
+                                TimelineEntryRow(
+                                    entry: entry,
+                                    displayOrder: index,
+                                    isExpanded: expandedEntryID == entry.id,
+                                    resolveTimelineRawDetail: resolveTimelineRawDetail,
+                                    formatterCache: formatterCache,
+                                    onToggleExpanded: {
+                                        expandedEntryID = expandedEntryID == entry.id ? nil : entry.id
+                                    }
+                                )
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .animation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82), value: visibleEntries.map(\.id))
+                }
+
+                Color.clear
+                    .frame(height: 1)
+                    .id("live-timeline-bottom")
+            }
+            .onChange(of: visibleEntries.count) {
+                scrollToNewestIfNotInspecting(proxy)
+            }
+            .onChange(of: visibleEntries.first?.id) {
+                scrollToNewestIfNotInspecting(proxy)
+            }
+        }
+        .forgePanel()
+        .accessibilityIdentifier("p036-timeline-workbench-card")
+    }
+
+    private var timelineSubtitle: String {
+        if visibleEntries.isEmpty {
+            return "Focused run-detail timeline from control-plane active-agent readback."
+        }
+        return "\(visibleEntries.count) focused event\(visibleEntries.count == 1 ? "" : "s") from the selected active agent."
+    }
+
+    private func scrollToNewestIfNotInspecting(_ proxy: ScrollViewProxy) {
+        guard expandedEntryID == nil else { return }
+        withAnimation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82)) {
+            proxy.scrollTo(visibleEntries.first?.id ?? "live-timeline-bottom", anchor: .top)
+        }
+    }
+}
+
+private struct TimelineAgentOption: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let providerID: String?
+    let stageID: String?
+    let stageLabel: String?
+    let taskLabel: String?
+    let status: String
+    let sessionID: String?
+    let latestAt: Date
+    let eventCount: Int
+    let selectionOrder: Int?
+    let selectionUnavailableReason: String?
+}
+
+private struct TimelineAgentSelector: View {
+    let options: [TimelineAgentOption]
+    let selectedAgentID: String?
+    let onSelect: (String) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(options) { option in
+                    Button {
+                        onSelect(option.id)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Text(option.title.isEmpty ? option.id.replacingOccurrences(of: "_", with: " ").capitalized : option.title)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(ForgeColor.Text.primary)
+                                if let providerID = option.providerID, !providerID.isEmpty {
+                                    Text(providerID)
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundStyle(ForgeColor.Text.secondary)
+                                }
+                            }
+                            Text(selectorDetailLabel(for: option))
+                                .font(.caption2)
+                                .foregroundStyle(ForgeColor.Text.tertiary)
+                                .lineLimit(1)
+                            HStack(spacing: 6) {
+                                Text(selectionStatusLabel(for: option))
+                                Text(latestActivityLabel(for: option))
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(ForgeColor.Text.tertiary)
+                            .lineLimit(1)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(
+                            ForgeColor.Surface.muted,
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .strokeBorder(
+                                    option.id == selectedAgentID ? ForgeColor.Brand.accent : Color.clear,
+                                    lineWidth: 1
+                                )
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(
+                        "Timeline agent \(option.id), provider \(option.providerID ?? "unknown"), \(selectorDetailLabel(for: option)), \(selectionStatusLabel(for: option)), \(latestActivityLabel(for: option))"
+                    )
+                    .accessibilityIdentifier("p093-active-agent-option-\(option.id)")
+                }
+            }
+        }
+        .accessibilityIdentifier("p093-active-agent-selector")
+    }
+
+    private func selectorDetailLabel(for option: TimelineAgentOption) -> String {
+        if let taskLabel = option.taskLabel?.trimmingCharacters(in: .whitespacesAndNewlines), !taskLabel.isEmpty {
+            return taskLabel
+        }
+        if let stageLabel = option.stageLabel?.trimmingCharacters(in: .whitespacesAndNewlines), !stageLabel.isEmpty {
+            return stageLabel
+        }
+        if let sessionSummary = sessionSummaryLabel(for: option) {
+            return sessionSummary
+        }
+        return "\(option.eventCount) event\(option.eventCount == 1 ? "" : "s")"
+    }
+
+    private func sessionSummaryLabel(for option: TimelineAgentOption) -> String? {
+        guard let sessionID = option.sessionID?.trimmingCharacters(in: .whitespacesAndNewlines), !sessionID.isEmpty else {
+            return nil
+        }
+        return "Session \(shortSessionID(sessionID))"
+    }
+
+    private func selectionStatusLabel(for option: TimelineAgentOption) -> String {
+        if let reason = option.selectionUnavailableReason?.trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty {
+            return "Selector unavailable: \(reason)"
+        }
+        let status = option.status.trimmingCharacters(in: .whitespacesAndNewlines)
+        return status.isEmpty ? "Status unavailable" : status.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    private func latestActivityLabel(for option: TimelineAgentOption) -> String {
+        let age = max(0, Int(Date().timeIntervalSince(option.latestAt)))
+        if age < 60 {
+            return "Latest \(age)s ago"
+        }
+        let minutes = age / 60
+        if minutes < 60 {
+            return "Latest \(minutes)m ago"
+        }
+        return "Latest \(minutes / 60)h ago"
+    }
+
+    private func shortSessionID(_ id: String) -> String {
+        guard id.count > 8 else { return id }
+        return String(id.prefix(8))
     }
 }
 
@@ -3460,8 +6331,8 @@ private struct P036ApprovalWorkbenchCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Pending Approvals")
-                .font(.headline)
+            Text("Pending approvals")
+                .font(ForgeTypography.sectionHeader)
 
             if rows.isEmpty {
                 Text("No pending approvals for this run.")
@@ -3489,7 +6360,7 @@ private struct P036ApprovalWorkbenchCard: View {
                                 if let deferred = row.deferredState {
                                     Text(deferred.displayLabel)
                                         .font(.caption2)
-                                        .foregroundStyle(.orange)
+                                    .foregroundStyle(deferred.tint)
                                 }
                             }
                             Spacer()
@@ -3520,18 +6391,20 @@ private struct P036ApprovalWorkbenchCard: View {
                                 }
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
-                                .tint(.red)
+                                .tint(ForgeStatusColor.error)
                                 .disabled(!row.canReject || resolvingIDs.contains(row.id))
                                 .help(row.rejectDisabledReason ?? "")
+                                .accessibilityIdentifier("approval-reject-button")
 
                                 Button("Approve") {
                                     Task { await onApprove(row.id) }
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.small)
-                                .tint(.green)
+                                .tint(ForgeStatusColor.success)
                                 .disabled(!row.canApprove || resolvingIDs.contains(row.id))
                                 .help(row.approveDisabledReason ?? "")
+                                .accessibilityIdentifier("approval-approve-button")
                             }
                         }
                         .padding(10)
@@ -3542,40 +6415,56 @@ private struct P036ApprovalWorkbenchCard: View {
                 }
             }
         }
-        .padding(20)
-        .background(Color.primary.opacity(0.03))
-        .cornerRadius(12)
+        .forgePanel(tint: rows.isEmpty ? ForgeColor.Surface.border : ForgeStatusColor.approval)
     }
 }
 
 private struct P036ArtifactWorkbenchCard: View {
     let rows: [RunsWorkbenchPresentationModel.ArtifactReportRow]
-    
+
+    private let visibleRowLimit = 24
+
+    private var visibleRows: ArraySlice<RunsWorkbenchPresentationModel.ArtifactReportRow> {
+        rows.prefix(visibleRowLimit)
+    }
+
+    private var hiddenRowCount: Int {
+        max(0, rows.count - visibleRows.count)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Artifacts & Reports")
-                .font(.headline)
-            
+            ForgeSectionHeader(
+                title: "Artifacts and reports",
+                subtitle: rows.isEmpty ? "No durable outputs yet" : "\(rows.count) durable output\(rows.count == 1 ? "" : "s")",
+                symbol: "doc.text"
+            )
+
             if rows.isEmpty {
                 Text("No artifacts available.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             } else {
                 VStack(spacing: 8) {
-                    ForEach(rows) { row in
+                    ForEach(visibleRows) { row in
                         ArtifactRowView(row: row)
+                    }
+                    if hiddenRowCount > 0 {
+                        Text("\(hiddenRowCount) more durable output\(hiddenRowCount == 1 ? "" : "s") available in artifact detail")
+                            .font(ForgeTypography.micro)
+                            .foregroundStyle(ForgeColor.Text.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 2)
                     }
                 }
             }
         }
-        .padding(20)
-        .background(Color.primary.opacity(0.03))
-        .cornerRadius(12)
+        .forgePanel()
     }
 
     private struct ArtifactRowView: View {
         let row: RunsWorkbenchPresentationModel.ArtifactReportRow
-        
+
         var body: some View {
             HStack {
                 Label(row.title, systemImage: "doc.fill")
@@ -3587,7 +6476,7 @@ private struct P036ArtifactWorkbenchCard: View {
             .background(Color.primary.opacity(0.04))
             .cornerRadius(8)
         }
-        
+
         @ViewBuilder
         private func availabilityBadge(_ availability: RunsWorkbenchPresentationModel.ArtifactPayloadAvailability) -> some View {
             let color = availabilityColor(availability)
@@ -3599,14 +6488,14 @@ private struct P036ArtifactWorkbenchCard: View {
                 .foregroundStyle(color)
                 .clipShape(Capsule())
         }
-        
+
         private func availabilityColor(_ availability: RunsWorkbenchPresentationModel.ArtifactPayloadAvailability) -> Color {
             switch availability {
-            case .available: return .green
-            case .metadataOnly: return .blue
-            case .generating: return .orange
+            case .available: return ForgeStatusColor.success
+            case .metadataOnly: return ForgeStatusColor.running
+            case .generating: return ForgeStatusColor.warning
             case .deferred: return .secondary
-            case .unavailable, .unknown: return .red
+            case .unavailable, .unknown: return ForgeStatusColor.error
             }
         }
     }
@@ -3614,12 +6503,15 @@ private struct P036ArtifactWorkbenchCard: View {
 
 private struct P036RecoveryEvidenceCard: View {
     let rows: [RunsWorkbenchPresentationModel.RecoveryEvidenceRow]
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Recovery Evidence")
-                .font(.headline)
-            
+            ForgeSectionHeader(
+                title: "Recovery evidence",
+                subtitle: rows.isEmpty ? "No recovery facts yet" : "\(rows.count) diagnostic row\(rows.count == 1 ? "" : "s")",
+                symbol: "bandage"
+            )
+
             if rows.isEmpty {
                 Text("No recovery evidence found.")
                     .font(.subheadline)
@@ -3634,22 +6526,244 @@ private struct P036RecoveryEvidenceCard: View {
                 }
             }
         }
+        .forgePanel()
+    }
+}
+
+// MARK: - P046 Session Observability Card
+
+// Renders P046 session observability readback in the selected-run overview tab.
+// Shows lineage list, KPI summary, health warnings, and generic MCP reset guidance.
+// Hides itself when P046 is unavailable (schema absent or rollback mode).
+private struct P046SessionObservabilityCard: View {
+    @ObservedObject var model: P046SessionObservabilityModel
+
+    var body: some View {
+        switch model.availability {
+        case .unavailable:
+            EmptyView()
+        case .unknown:
+            if model.isLoading {
+                loadingShell
+            } else {
+                EmptyView()
+            }
+        case .available:
+            contentCard
+        }
+    }
+
+    private var loadingShell: some View {
+        HStack(spacing: 10) {
+            ProgressView().controlSize(.small)
+            Text("Loading session observability…")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
         .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.primary.opacity(0.03))
         .cornerRadius(12)
+        .accessibilityIdentifier("p046-session-observability-loading")
+    }
+
+    private var contentCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            headerRow
+            if let health = model.health {
+                healthSection(health)
+            }
+            if !model.lineages.isEmpty {
+                lineagesSection
+            }
+            if let kpi = model.kpiSummary {
+                kpiRow(kpi)
+            }
+            if shouldShowResetGuidance {
+                Text("Suggested MCP action: use the MCP session reset capability.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("p046-mcp-reset-guidance")
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.03))
+        .cornerRadius(12)
+        .accessibilityIdentifier("p046-session-observability-card")
+    }
+
+    private var shouldShowResetGuidance: Bool {
+        guard let state = model.health?.state else { return false }
+        return state == "WARNING" || state == "CRITICAL"
+    }
+
+    private var headerRow: some View {
+        HStack {
+            Text("Session Observability")
+                .font(.headline)
+            if model.isStale {
+                Label("Stale", systemImage: "arrow.clockwise")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            Spacer()
+            if let kpi = model.kpiSummary {
+                Text("\(kpi.lineageCount) lineage\(kpi.lineageCount == 1 ? "" : "s")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func healthSection(_ health: P046SessionHealthReadModel) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(healthLabel(health.state), systemImage: healthIcon(health.state))
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(healthColor(health.state))
+            if !health.warnings.isEmpty {
+                ForEach(health.warnings, id: \.reasonCode) { warning in
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(severityColor(warning.severity))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(warning.reasonCode.replacingOccurrences(of: "_", with: " ").capitalized)
+                                .font(.caption.weight(.medium))
+                            if let message = warning.message {
+                                Text(message)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var lineagesSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Agent Sessions")
+                .font(.subheadline.weight(.medium))
+            ForEach(model.lineages) { lineage in
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(lineageColor(lineage.healthState))
+                        .frame(width: 7, height: 7)
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 4) {
+                            Text(lineage.agentId)
+                                .font(.caption.weight(.medium))
+                            if let scope = lineage.sessionReuseScope {
+                                Text("·")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                                Text(scope)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        if let count = lineage.generationCount {
+                            Text("\(count) generation\(count == 1 ? "" : "s")")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    if lineage.activeGenerationId != nil {
+                        Text("active")
+                            .font(.caption2)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 2)
+                            .background(Color.green.opacity(0.12))
+                            .foregroundStyle(.green)
+                            .cornerRadius(4)
+                    }
+                }
+                .padding(.vertical, 1)
+            }
+        }
+    }
+
+    private func kpiRow(_ kpi: P046SessionKpiSummaryReadModel) -> some View {
+        HStack(spacing: 20) {
+            kpiChip("Active", value: "\(kpi.activeGenerationCount)")
+            if let closed = kpi.closedGenerationCount {
+                kpiChip("Closed", value: "\(closed)")
+            }
+            if let turns = kpi.totalTurnCount {
+                kpiChip("Turns", value: "\(turns)")
+            }
+            Spacer()
+        }
+    }
+
+    private func kpiChip(_ label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(value).font(.subheadline.weight(.semibold))
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+
+    private func healthLabel(_ state: String) -> String {
+        switch state {
+        case "HEALTHY": return "Healthy"
+        case "WARNING": return "Warning"
+        case "CRITICAL": return "Critical"
+        default: return "Unknown"
+        }
+    }
+
+    private func healthIcon(_ state: String) -> String {
+        switch state {
+        case "HEALTHY": return "checkmark.circle.fill"
+        case "WARNING": return "exclamationmark.triangle"
+        case "CRITICAL": return "xmark.circle.fill"
+        default: return "questionmark.circle"
+        }
+    }
+
+    private func healthColor(_ state: String) -> Color {
+        switch state {
+        case "HEALTHY": return .green
+        case "WARNING": return .orange
+        case "CRITICAL": return .red
+        default: return .secondary
+        }
+    }
+
+    private func severityColor(_ severity: String) -> Color {
+        switch severity {
+        case "INFO": return .blue
+        case "WARNING": return .orange
+        case "CRITICAL": return .red
+        default: return .secondary
+        }
+    }
+
+    private func lineageColor(_ healthState: String?) -> Color {
+        switch healthState {
+        case "HEALTHY": return .green
+        case "WARNING": return .orange
+        case "CRITICAL": return .red
+        default: return Color(nsColor: .secondaryLabelColor)
+        }
     }
 }
 
 /// Simple flow layout for stage cards
 private struct FlowLayout: Layout {
     var spacing: CGFloat
-    
+
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         let width = proposal.width ?? 0
         var currentX: CGFloat = 0
         var currentY: CGFloat = 0
         var maxHeight: CGFloat = 0
-        
+
         for subview in subviews {
             let size = subview.sizeThatFits(.unspecified)
             if currentX + size.width > width && currentX > 0 {
@@ -3660,15 +6774,15 @@ private struct FlowLayout: Layout {
             currentX += size.width + spacing
             maxHeight = max(maxHeight, size.height)
         }
-        
+
         return CGSize(width: width, height: currentY + maxHeight)
     }
-    
+
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
         var currentX: CGFloat = bounds.minX
         var currentY: CGFloat = bounds.minY
         var maxHeight: CGFloat = 0
-        
+
         for subview in subviews {
             let size = subview.sizeThatFits(.unspecified)
             if currentX + size.width > bounds.maxX && currentX > bounds.minX {

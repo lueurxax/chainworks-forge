@@ -22,6 +22,7 @@ struct Chainworks_ForgeApp: App {
     static let isUIAutomationHost = isUIAutomationHost(for: processEnvironment)
 
     @NSApplicationDelegateAdaptor(AutomationFallbackAppDelegate.self) private var automationFallbackAppDelegate
+    @State private var notificationService = NotificationService.shared
 
     init() {
         if Self.shouldDisableWindowRestoration {
@@ -41,7 +42,7 @@ struct Chainworks_ForgeApp: App {
             if Self.isTestHost {
                 EmptyView()
             } else {
-                ContentView()
+                ContentView(notificationService: notificationService)
             }
         }
         .commands {
@@ -81,6 +82,34 @@ struct Chainworks_ForgeApp: App {
                 .keyboardShortcut("4", modifiers: .command)
             }
         }
+        MenuBarExtra {
+            EscalationMenuBarList(snapshots: notificationService.p058EscalationSnapshots) { runID in
+                NotificationCenter.default.post(
+                    name: .chainworksOpenRunInRunsHome,
+                    object: runID,
+                    userInfo: ["runID": runID]
+                )
+            } onShowAllPausedRuns: {
+                NotificationCenter.default.post(
+                    name: .chainworksFocusEscalationAttentionRuns,
+                    object: nil
+                )
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Label(
+                    "Escalation attention",
+                    systemImage: notificationService.p058EscalationAttentionCount > 0
+                        ? "clock.badge.exclamationmark"
+                        : "circle"
+                )
+                if notificationService.p058EscalationAttentionCount > 0 {
+                    Text("\(notificationService.p058EscalationAttentionCount)")
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                }
+            }
+        }
+        .menuBarExtraStyle(.menu)
     }
 
     static var shouldDisableWindowRestoration: Bool {
@@ -307,6 +336,9 @@ private actor DebugPackagedDaemonProcess {
         }
 
         var environment = ProcessInfo.processInfo.environment
+        for (key, value) in Self.bundledDaemonEnvironment(bundleURL: bundleURL) {
+            environment[key] = value
+        }
         environment["MODE"] = "packaged-app"
         environment["PATH"] = DebugPackagedDaemonProcess.providerPath(
             existing: environment["PATH"]
@@ -326,6 +358,38 @@ private actor DebugPackagedDaemonProcess {
         }
         try process.run()
         return process
+    }
+
+    private nonisolated static func bundledDaemonEnvironment(bundleURL: URL) -> [String: String] {
+        let contentsURL = bundleURL.appendingPathComponent("Contents", isDirectory: true)
+        let plistCandidates = [
+            contentsURL
+                .appendingPathComponent("Resources", isDirectory: true)
+                .appendingPathComponent("com.chainworks.forge.daemon.plist", isDirectory: false),
+            contentsURL
+                .appendingPathComponent("Library", isDirectory: true)
+                .appendingPathComponent("LaunchAgents", isDirectory: true)
+                .appendingPathComponent("com.chainworks.forge.daemon.plist", isDirectory: false)
+        ]
+
+        for plistURL in plistCandidates {
+            guard let data = try? Data(contentsOf: plistURL),
+                  let plist = try? PropertyListSerialization.propertyList(
+                    from: data,
+                    options: [],
+                    format: nil
+                  ) as? [String: Any],
+                  let environment = plist["EnvironmentVariables"] as? [String: Any] else {
+                continue
+            }
+            return environment.reduce(into: [String: String]()) { result, entry in
+                if let value = entry.value as? String {
+                    result[entry.key] = value
+                }
+            }
+        }
+
+        return [:]
     }
 
     private func existingPackagedDaemonIsRunning() -> Bool {

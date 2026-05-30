@@ -1,0 +1,9 @@
+schemaVersion: 1
+sessionDefaults:
+  projectPath: /Users/user/Documents/Chainworks Forge/Chainworks Forge.xcodeproj
+  scheme: Chainworks Forge
+  configuration: Debug
+  derivedDataPath: /Users/user/Library/Developer/Xcode/DerivedData/ChainworksForge-XcodeBuildMCP
+  preferXcodebuild: true
+  platform: macOS
+  bundleId: xax.Chainworks-Forge

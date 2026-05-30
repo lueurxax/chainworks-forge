@@ -1,0 +1,17 @@
+# P046 negative fixture: connection schema missing required fields or has wrong nullability.
+# Expected: gate fails with hold condition about Connection/Edge/PageInfo/cursor nullability/hasNextPage.
+# This shape is IMPRECISE and must not be used: cursors should be non-null on edges,
+# startCursor/endCursor nullable only on empty pages.
+type SessionLineageConnection {
+  edges: [SessionLineageEdge]
+  pageInfo: PageInfo
+}
+type SessionLineageEdge {
+  cursor: String
+  node: SessionLineage
+}
+type PageInfo {
+  hasNextPage: Boolean
+  startCursor: String
+  endCursor: String
+}

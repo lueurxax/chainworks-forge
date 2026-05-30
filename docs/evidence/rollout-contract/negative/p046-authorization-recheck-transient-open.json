@@ -1,0 +1,13 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "authorization_recheck_transient_open",
+  "description": "Subscription per-emission auth recheck silently continues on transient authorization lookup failure rather than terminating fail-closed.",
+  "hold_condition": "sessionStatusChanged continues emitting after principal operator-read authorization is revoked or authorization recheck fails transiently.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_subscription_open_on_transient_auth_failure",
+  "fixture_input": {
+    "auth_lookup_behavior": "transient_lookup_failure",
+    "expected_result": "stream_terminates_with_authorization_recheck_failed_error"
+  }
+}

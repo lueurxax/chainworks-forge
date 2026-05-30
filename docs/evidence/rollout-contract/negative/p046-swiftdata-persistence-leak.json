@@ -1,0 +1,14 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "swiftdata_persistence_leak",
+  "description": "P046 readback state is persisted to SwiftData without a separate persistence proposal.",
+  "hold_condition": "P046 readback is persisted to SwiftData without a separate persistence proposal.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_swiftdata_persistence_without_proposal",
+  "fixture_input": {
+    "swift_model_type": "P046SessionObservabilityModel",
+    "persistence_check": "no_@Model_or_modelContext_writes_in_p046_session_observability_model",
+    "expected_result": "p046_state_is_transient_mainactor_ui_state_only"
+  }
+}

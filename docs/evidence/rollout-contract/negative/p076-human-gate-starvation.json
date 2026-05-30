@@ -1,0 +1,20 @@
+{
+  "fixture_description": "P076 poll where human_gate runs consumed all 25 consideration slots, starving non-human retry-safe runs. Proves at least 10 non-human consideration slots must be reserved when non-human blockers exist.",
+  "proves_human_gate_starvation": true,
+  "violation": "human_gate_runs_consumed_all_consideration_slots",
+  "max_runs_considered_per_poll": 25,
+  "human_gate_runs_considered": 25,
+  "non_human_runs_skipped": 8,
+  "non_human_runs_available": 8,
+  "hold_condition_triggered": "Skipped non-human work is not prioritized ahead of already-reported human gates",
+  "required_behavior": "Previously skipped non-human evidence or recovery work must be prioritized. At least 10 consideration slots reserved for non-human blockers when that many exist.",
+  "evidence": {
+    "observation_id": "ar_obs_20260523T090011Z_badbbadbbade",
+    "poll_summary": {
+      "human_gate_count": 25,
+      "non_human_skipped": 8,
+      "skipped_backpressure_count": 8,
+      "note": "all 8 non-human retry-safe runs were skipped by human_gate starvation"
+    }
+  }
+}

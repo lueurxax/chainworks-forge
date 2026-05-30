@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "continuation_response_snapshot_v1.schema.json",
+  "title": "continuation_response_snapshot_v1",
+  "description": "P086: Response snapshot artifact written on terminal status. Used for replay and reconciliation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_kind",
+    "run_id", "stage_execution_id", "agent_execution_id", "continuation_id",
+    "created_at", "redaction_tier", "retention_policy", "payload"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "continuation_response_snapshot_v1"},
+    "artifact_kind": {"type": "string", "const": "continuation_response_snapshot"},
+    "run_id": {"type": "string"},
+    "stage_execution_id": {"type": "string"},
+    "agent_execution_id": {"type": "string"},
+    "continuation_id": {"type": "string"},
+    "created_at": {"type": "string"},
+    "redaction_tier": {"type": "string", "enum": ["none", "partial", "full"]},
+    "retention_policy": {"type": "string"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status", "lifecycle_status",
+        "response_fingerprint_sha256", "response_artifact_id",
+        "request_fingerprint_sha256"
+      ],
+      "properties": {
+        "status": {"type": "string"},
+        "lifecycle_status": {"type": "string", "enum": ["active", "terminal"]},
+        "response_fingerprint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "response_artifact_id": {"type": "string"},
+        "request_fingerprint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "provider_status": {"type": ["string", "null"]},
+        "reused_existing_session": {"type": "boolean"},
+        "provider_session_id": {"type": ["string", "null"]},
+        "session_generation_id": {"type": ["string", "null"]},
+        "transcript_preview": {"type": ["string", "null"]},
+        "transcript_bytes": {"type": "integer", "minimum": 0},
+        "transcript_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

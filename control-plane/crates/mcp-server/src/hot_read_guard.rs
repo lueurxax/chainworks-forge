@@ -86,6 +86,7 @@ pub fn is_hot_read_tool(name: &str) -> bool {
             | "runs.list"
             | "tools.list"
             | "runtime.health"
+            | "boundary.runtime.get"
             | "storage.health"
             | "artifacts.metadata.get"
     )

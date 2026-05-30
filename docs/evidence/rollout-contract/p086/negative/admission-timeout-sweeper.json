@@ -1,43 +1,23 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "admission_timeout",
+  "fixture_purpose": "Admission-timeout sweep fails closed and terminal artifact repair materializes response/result evidence for rows swept to failed+admission_timeout.",
+  "status": "pass",
+  "evidence_kind": "code_and_regression_test",
+  "evidence": {
+    "implemented": {
+      "status_transition_location": "control-plane/crates/db/src/repos/agent_work_continuations.rs::sweep_admission_timeouts",
+      "artifact_repair_location": "control-plane/crates/engine/src/executor.rs::repair_p086_terminal_continuation_artifacts",
+      "mechanism": "Rows older than MAX_ADMISSION_TO_START_SECONDS are transitioned to failed/admission_timeout; the executor then lists terminal rows missing artifacts and materializes continuation_response_snapshot_v1 plus continuation_no_progress_report_v1 before readback passes.",
+      "constant": {
+        "MAX_ADMISSION_TO_START_SECONDS": 300
+      }
+    },
+    "tests": [
+      "cargo test -p db --test proposal_086_continuation_lifecycle p086_lists_terminal_rows_missing_artifacts_for_repair"
+    ]
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:admission_timeout_sweeper",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "fail_closed_with_terminal_artifacts"
 }

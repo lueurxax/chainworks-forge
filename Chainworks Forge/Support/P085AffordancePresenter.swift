@@ -395,6 +395,10 @@ enum P085AffordancePresenter {
     case .conflict: return "A conflict was detected. Refresh to see latest state."
     case .duplicate: return "This action is a duplicate of an existing request."
     case .alreadyResolved: return "This action has already been resolved."
+    case .approvalNotActionable: return "This approval is no longer actionable."
+    case .observerScope: return "Read-only access. Approval actions are not available."
+    case .nonApprovalMutation: return "GraphQL mutations are restricted to approval actions."
+    case .capabilityOutOfScope: return "Action Not Available."
     }
   }
 

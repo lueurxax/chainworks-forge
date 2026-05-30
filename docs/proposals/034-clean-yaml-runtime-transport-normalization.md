@@ -5,7 +5,7 @@
 | Date | 2026-04-07 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | [../reference/acp-runtime-transport.md](../reference/acp-runtime-transport.md), [033-remove-goose-from-canonical-transport-and-simplify-runtime.md](../reference/033-remove-goose-from-canonical-transport-and-simplify-runtime.md), [030-acp-second-wave-runtime-profiles-codex-auggie-junie.md](../reference/030-acp-second-wave-runtime-profiles-codex-auggie-junie.md) |
+| Depends on | [../reference/acp-runtime-transport.md](../reference/acp-runtime-transport.md), [../reference/provider-platform.md](../reference/provider-platform.md), [../reference/runtime-contract.md](../reference/runtime-contract.md) |
 | Scope | Identify and eliminate stale runtime transport selection defaults and duplicate normalization layers between YAML definitions, provider binding resolution, MCP policy, and receipts. |
 
 ## 1) Problem statement
@@ -83,9 +83,8 @@ The result is good to keep compatibility, but hard to audit and error-prone when
 - files:
   - [Chainworks Forge/DSL/AgentCatalog.swift](Chainworks Forge/DSL/AgentCatalog.swift)
   - examples:
-    - [examples/agents/agents.yaml](examples/agents/agents.yaml)
-    - [examples/agents/agents_mcp_profiles_v2.yaml](examples/agents/agents_mcp_profiles_v2.yaml)
-    - [examples/agents/proposal-po-reviewer.yaml](examples/agents/proposal-po-reviewer.yaml)
+    - [examples/agents/agents.yaml](../../examples/agents/agents.yaml)
+    - [examples/agents/proposal-po-reviewer.yaml](../../examples/agents/proposal-po-reviewer.yaml)
 
 ## 3) Proposed cleanup plan (no implementation yet)
 

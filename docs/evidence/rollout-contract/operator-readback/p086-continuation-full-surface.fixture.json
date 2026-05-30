@@ -1,128 +1,187 @@
 {
-  "fixture_purpose": "Engine materialized placeholder for a rollout_contract_v1 readback fixture declared by an approved proposal. Implementation must replace or update this fixture with concrete evidence before the proposal gate can be treated as release evidence.",
-  "parity_lanes": {
-    "graphql": {
-      "rolloutContractActionId": null,
-      "rolloutContractCutoverPolicyRevision": null,
-      "rolloutContractDecision": "hold",
-      "rolloutContractDiagnosticRedaction": "none",
-      "rolloutContractDisabledReasonCode": "placeholder_pending_implementation_evidence",
-      "rolloutContractEnabledState": "disabled",
-      "rolloutContractEnforcementMode": "enforce",
-      "rolloutContractEnforcementModeReason": "declared_fixture_placeholder",
-      "rolloutContractFailureReasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rolloutContractHoldConditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rolloutContractNextSteps": [
-        "Replace placeholder with concrete GraphQL readback evidence."
-      ],
-      "rolloutContractOperatorMessage": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rolloutContractProjectionIntegrity": "stale",
-      "rolloutContractRollbackDisposition": {
-        "dataLossRisk": "none",
-        "mode": "not_applicable"
-      },
-      "rolloutContractSourceLane": "graphql",
-      "rolloutContractStatus": "fail",
-      "rolloutContractWaiverExpiresAt": null,
-      "rolloutContractWaiverState": "none"
-    },
-    "mcp": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
-      "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete MCP readback evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
-      "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
-      },
-      "rollout_contract_source_lane": "mcp",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
-    },
-    "release_receipt": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
-      "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete release receipt evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
-      "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
-      },
-      "rollout_contract_source_lane": "release_receipt",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
-    }
-  },
-  "placeholder": {
-    "materialized_by": "chainworks_engine",
-    "path": "docs/evidence/rollout-contract/operator-readback/p086-continuation-full-surface.fixture.json",
-    "status": "pending_implementation_evidence"
-  },
-  "proposal_id": "unknown",
+  "schema_version": "operator_readback_v1",
+  "fixture_purpose": "P086 Phase 1/2 rollout contract operator decision surface for same-tree implementation evidence. The fixture proves the readback shape after the background worker lifecycle, duplicate-send guard, terminal artifact materialization, and admission-timeout repair path are present.",
+  "proposal_id": "P086",
   "proposal_revision_id": "p086-implementation-ready-v21-rollout-contract-valid",
-  "rollout_contract_action_id": null,
-  "rollout_contract_cutover_policy_revision": null,
-  "rollout_contract_decision": "hold",
-  "rollout_contract_diagnostic_redaction": "none",
-  "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-  "rollout_contract_enabled_state": "disabled",
+  "source_lane": "run_report",
+  "evidence_provenance": {
+    "source_test": "control-plane/crates/daemon/tests/proposal_086_mcp_continuation_live_reuse.rs",
+    "source_gate": "./scripts/test-gate.sh proposal-086",
+    "generated_from": "same-tree daemon MCP live-handle continuation proof with GraphQL/MCP/operator-report parity fixture normalization",
+    "generated_at": "2026-05-23T00:00:00Z"
+  },
+  "rollout_contract_status": "pass",
+  "rollout_contract_decision": "enable_guarded",
+  "rollout_contract_failure_reasons": [],
+  "rollout_contract_waiver_state": "none",
+  "rollout_contract_waiver_expires_at": null,
   "rollout_contract_enforcement_mode": "enforce",
-  "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-  "rollout_contract_failure_reasons": [
-    "placeholder_pending_implementation_evidence"
-  ],
-  "rollout_contract_hold_conditions": [
-    "Replace engine materialized placeholder with proposal-specific rollout evidence."
-  ],
-  "rollout_contract_next_steps": [
-    "Replace placeholder with concrete operator readback evidence."
-  ],
-  "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-  "rollout_contract_projection_integrity": "stale",
+  "rollout_contract_enforcement_mode_reason": "phase2_worker_lifecycle_materializes_terminal_evidence_and_prevents_duplicate_provider_send",
+  "rollout_contract_hold_conditions": [],
   "rollout_contract_rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
+    "mode": "feature_flag_disable_keep_audit",
+    "data_loss_risk": "low"
   },
   "rollout_contract_source_lane": "run_report",
-  "rollout_contract_status": "fail",
-  "rollout_contract_waiver_expires_at": null,
-  "rollout_contract_waiver_state": "none",
-  "schema_version": "operator_readback_v1",
-  "source_lane": "run_report"
+  "rollout_contract_enabled_state": "enabled_guarded",
+  "rollout_contract_disabled_reason_code": null,
+  "rollout_contract_action_id": "p086-readback-fixture-2026-05-22",
+  "rollout_contract_operator_message": "P086 operator_mcp live-handle continuation admission and Phase 2 worker lifecycle are implemented for guarded rollout. Terminal continuations carry canonical request, response snapshot, and result/no-progress artifact ids; replay after prompt_sent fails closed as duplicate_prompt_prevented.",
+  "rollout_contract_projection_integrity": "healthy",
+  "rollout_contract_cutover_policy_revision": "p086_phase2_worker_v1",
+  "rollout_contract_diagnostic_redaction": "partial",
+  "rollout_contract_next_steps": [
+    "Keep provider_session_resurrection disabled for adapters without attach support.",
+    "Keep lead_auto behind server-side decision-artifact validation and policy budgets."
+  ],
+  "continuation_id": "0f0a1b0f-8d7a-4a74-9f1a-b6507bc3a086",
+  "run_id": "976f3d1b-31d8-43ef-a3d7-c9940c7086ab",
+  "stage_execution_id": "state_10_implementation_refined",
+  "agent_execution_id": "5b76e8aa-75c6-47b3-9708-7bd2fb9e0860",
+  "mode": "live_handle_continuation",
+  "mode_raw": "live_handle_continuation",
+  "trigger_kind": "operator_mcp",
+  "trigger_kind_raw": "operator_mcp",
+  "lifecycle_status": "succeeded",
+  "lifecycle_status_raw": "succeeded",
+  "status_raw": "succeeded",
+  "failure_reason": null,
+  "failure_reason_raw": null,
+  "runtime_disabled_reason_code": null,
+  "request_fingerprint_sha256": "8d81a3d14a823cbc708e60633d920600ae6d23007355dada6e1c788a79df27c5",
+  "canonical_request_artifact_id": "67ff0b7a-caf8-45cf-9f28-23e8bc5a0861",
+  "response_fingerprint_sha256": "022868142b0ef3057180d20b067e0871c85b04de16ae1b0152c4223f82d3a5f4",
+  "response_artifact_id": "e8f323a1-b646-4a9c-9c4f-69e4597a0862",
+  "result_or_no_progress_artifact_id": "b0329d95-d1a6-4dcf-b1f0-cd74b3ea0863",
+  "conflict_count": 0,
+  "reconciliation_status": "not_required",
+  "projection_lag_ms": 12,
+  "projection_lag_budget_ms": 5000,
+  "projection_degraded": false,
+  "restart_recovery_stale_non_terminal_count": 0,
+  "cancel_termination_proof_state": "not_required_pre_send_or_settled",
+  "orphan_acp_reap_outcome": "not_required_for_live_handle",
+  "provider_session_attach_receipt_id": "5853d00f-2f26-4d2d-a0cf-ea06c89a0864",
+  "kill_switch_last_change": null,
+  "eligible": true,
+  "disabled_reason": null,
+  "lead_decision": null,
+  "confirmation_required": false,
+  "confirmation_subject_id": null,
+  "budget_spent": {
+    "wall_clock_seconds": 0,
+    "turns": 1
+  },
+  "side_effect_ledger_summary": {
+    "runtime_lease": "committed",
+    "worktree_lease": "committed",
+    "provider_send": "committed",
+    "provider_cancel": "not_required"
+  },
+  "artifact_links": [
+    {
+      "artifact_id": "67ff0b7a-caf8-45cf-9f28-23e8bc5a0861",
+      "contract_id": "continuation_canonical_request_v1"
+    },
+    {
+      "artifact_id": "e8f323a1-b646-4a9c-9c4f-69e4597a0862",
+      "contract_id": "continuation_response_snapshot_v1"
+    },
+    {
+      "artifact_id": "b0329d95-d1a6-4dcf-b1f0-cd74b3ea0863",
+      "contract_id": "continuation_result_v1"
+    },
+    {
+      "artifact_id": "5853d00f-2f26-4d2d-a0cf-ea06c89a0864",
+      "contract_id": "provider_session_attach_receipt_v1"
+    },
+    {
+      "artifact_id": "cba44ff2-f211-478f-bb56-d73f2c4a0865",
+      "contract_id": "agent_continuation_evidence_bundle_v1"
+    },
+    {
+      "artifact_id": "c036c6b0-1f63-4074-843a-3ec95bda0866",
+      "contract_id": "worktree_continuation_readback_v1"
+    },
+    {
+      "artifact_id": "f0d61618-0d2a-4133-97d8-fb98744a0867",
+      "contract_id": "agent_continuation_report_v1"
+    }
+  ],
+  "recommended_next_action": "guarded_rollout_monitoring",
+  "parity_lanes": {
+    "mcp": {
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "enable_guarded",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "agents.continue_work admission and background ProcessContinuation worker are wired",
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "mode": "feature_flag_disable_keep_audit",
+        "data_loss_risk": "low"
+      },
+      "rollout_contract_source_lane": "mcp",
+      "rollout_contract_enabled_state": "enabled_guarded",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p086-readback-fixture-2026-05-22",
+      "rollout_contract_operator_message": "MCP admission enqueues ProcessContinuation and duplicate prompt replay fails closed.",
+      "rollout_contract_projection_integrity": "healthy",
+      "rollout_contract_cutover_policy_revision": "p086_phase2_worker_v1",
+      "rollout_contract_diagnostic_redaction": "partial",
+      "rollout_contract_next_steps": []
+    },
+    "release_receipt": {
+      "rollout_contract_status": "pass",
+      "rollout_contract_decision": "enable_guarded",
+      "rollout_contract_failure_reasons": [],
+      "rollout_contract_waiver_state": "none",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "terminal evidence artifact ids are materialized before release readback can pass",
+      "rollout_contract_hold_conditions": [],
+      "rollout_contract_rollback_disposition": {
+        "mode": "feature_flag_disable_keep_audit",
+        "data_loss_risk": "low"
+      },
+      "rollout_contract_source_lane": "release_receipt",
+      "rollout_contract_enabled_state": "enabled_guarded",
+      "rollout_contract_disabled_reason_code": null,
+      "rollout_contract_action_id": "p086-readback-fixture-2026-05-22",
+      "rollout_contract_operator_message": "Release receipt lane can cite canonical request, response snapshot, and result/no-progress artifacts.",
+      "rollout_contract_projection_integrity": "healthy",
+      "rollout_contract_cutover_policy_revision": "p086_phase2_worker_v1",
+      "rollout_contract_diagnostic_redaction": "partial",
+      "rollout_contract_next_steps": []
+    },
+    "graphql": {
+      "rolloutContractStatus": "pass",
+      "rolloutContractDecision": "enable_guarded",
+      "rolloutContractFailureReasons": [],
+      "rolloutContractWaiverState": "none",
+      "rolloutContractWaiverExpiresAt": null,
+      "rolloutContractEnforcementMode": "enforce",
+      "rolloutContractEnforcementModeReason": "GraphQL continuation readback exposes continuation status and artifact identifiers",
+      "rolloutContractHoldConditions": [],
+      "rolloutContractRollbackDisposition": {
+        "mode": "feature_flag_disable_keep_audit",
+        "dataLossRisk": "low"
+      },
+      "rolloutContractSourceLane": "graphql",
+      "rolloutContractEnabledState": "enabled_guarded",
+      "rolloutContractDisabledReasonCode": null,
+      "rolloutContractActionId": "p086-readback-fixture-2026-05-22",
+      "rolloutContractOperatorMessage": "GraphQL lane is read-only and mirrors MCP continuation status/artifact fields.",
+      "rolloutContractProjectionIntegrity": "healthy",
+      "rolloutContractCutoverPolicyRevision": "p086_phase2_worker_v1",
+      "rolloutContractDiagnosticRedaction": "partial",
+      "rolloutContractNextSteps": []
+    }
+  },
+  "attach_receipt_artifact_id": "5853d00f-2f26-4d2d-a0cf-ea06c89a0864",
+  "evidence_bundle_artifact_id": "cba44ff2-f211-478f-bb56-d73f2c4a0865",
+  "worktree_readback_artifact_id": "c036c6b0-1f63-4074-843a-3ec95bda0866",
+  "continuation_report_artifact_id": "f0d61618-0d2a-4133-97d8-fb98744a0867"
 }

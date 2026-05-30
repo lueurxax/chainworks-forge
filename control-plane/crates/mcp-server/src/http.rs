@@ -60,12 +60,17 @@ async fn handle_mcp_post(
     }
 
     // ── Resolve principal from Authorization header ──────────────────────
-    let principal = {
+    // SEC-P081-M002: derive token_id here before losing the raw token; only the
+    // derived id (sha256 hex) is propagated downstream — the raw token never leaves.
+    let (principal, resolved_token_id) = {
         let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
         match auth_header {
             Some(header_value) => match auth::extract_bearer_token(header_value) {
                 Ok(token) => match auth::resolve_bearer(token, &mcp.principal_table) {
-                    Ok(p) => p,
+                    Ok(p) => {
+                        let tid = auth::derive_token_id(token, &p.id);
+                        (p, Some(tid))
+                    }
                     Err(_) => {
                         let resp = crate::protocol::JsonRpcResponse::error(
                             None,
@@ -113,27 +118,33 @@ async fn handle_mcp_post(
     let is_notification =
         request.id.is_none() || matches!(&request.id, Some(serde_json::Value::Null));
 
-    // For notifications (no id), return 202 Accepted. The request-id
-    // scope is still set so the downstream command journal INSERT can
-    // carry the correlation id.
+    // For notifications (no id), return 202 Accepted. The request-id and
+    // token-id scopes are set so the downstream command journal INSERT can
+    // carry the correlation ids.
     if is_notification {
-        let _ = request_context::scope_request_id(inbound_request_id.clone(), async {
-            mcp.handle_request(request, &principal).await
-        })
+        let _ = request_context::scope_request_id(
+            inbound_request_id.clone(),
+            request_context::scope_token_id(resolved_token_id.clone(), async {
+                mcp.handle_request(request, &principal).await
+            }),
+        )
         .await;
         return StatusCode::ACCEPTED.into_response();
     }
 
-    // Process the request inside the request-id scope so tool handlers
-    // pick the id up via `request_context::mcp_caller`.
+    // Process the request inside the request-id and token-id scopes so tool
+    // handlers and audit writers pick both ids up via task-locals.
     //
     // `rid_for_errors` keeps a copy of the id around so we can stamp
     // the final JSON-RPC response with it AFTER the scope finishes
     // (scope_request_id consumes the Option by move).
     let rid_for_errors = inbound_request_id.clone();
-    let response = request_context::scope_request_id(inbound_request_id, async {
-        mcp.handle_request(request, &principal).await
-    })
+    let response = request_context::scope_request_id(
+        inbound_request_id,
+        request_context::scope_token_id(resolved_token_id, async {
+            mcp.handle_request(request, &principal).await
+        }),
+    )
     .await
     .with_error_request_id(rid_for_errors.as_deref());
 
@@ -205,7 +216,10 @@ mod tests {
     async fn test_mcp_http_rejects_unknown_bearer_token() {
         let mcp = test_server().await;
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer bad-token".parse().unwrap());
+        headers.insert(
+            "authorization",
+            "Bearer bad-token-xxxxxxxxxxxxxxxxxxxxxx".parse().unwrap(),
+        );
         let response = handle_mcp_post(
             State(mcp),
             headers,
@@ -249,12 +263,14 @@ mod tests {
     async fn test_mcp_http_parse_error_includes_request_id() {
         let mcp = test_server().await;
         let mut headers = HeaderMap::new();
-        // `PrincipalTable::test_fixture()` uses a stable `"test-token"`
-        // string so integration callers don't have to scrape the
-        // bootstrapped uuid. Re-using the literal here keeps this test
-        // readable and avoids adding a new introspection API just for
-        // error-envelope verification.
-        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+        // `PrincipalTable::test_fixture()` uses a stable 32-char token
+        // so integration callers don't have to scrape the bootstrapped uuid.
+        // Re-using the literal here keeps this test readable and avoids
+        // adding a new introspection API just for error-envelope verification.
+        headers.insert(
+            "authorization",
+            "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx".parse().unwrap(),
+        );
         let response = handle_mcp_post(
             State(mcp),
             headers,
@@ -300,12 +316,10 @@ mod tests {
 
     async fn test_server() -> Arc<McpServer> {
         let pool = create_pool("sqlite::memory:").await.unwrap();
-        db::writer::register_shared_writer(
-            &pool,
-            Arc::new(db::writer::DbWriter::new(pool.clone())),
-        )
-        .await
-        .unwrap();
+        let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .unwrap();
         let events = event_bus::new_bus(64);
         let work_queue = WorkQueue::new(pool.clone());
         let command_handler = Arc::new(CommandHandler::new(pool.clone(), events, work_queue));
@@ -316,10 +330,167 @@ mod tests {
         ))
     }
 
+    async fn test_server_with_boundary_policy() -> Arc<McpServer> {
+        let pool = create_pool("sqlite::memory:").await.unwrap();
+        let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .unwrap();
+        let events = event_bus::new_bus(64);
+        let work_queue = WorkQueue::new(pool.clone());
+        let command_handler = Arc::new(CommandHandler::new(pool.clone(), events, work_queue));
+        // Enforce mode: Operator principals on MCP derive as agent_operator, which
+        // the embedded fixture allows for all MCP transports (initialize/list/call).
+        let policy = Arc::new(
+            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                auth::boundary::PolicyMode::Enforce,
+            )
+            .expect("embedded fixture must be valid"),
+        );
+        Arc::new(
+            McpServer::new(pool, command_handler, auth::PrincipalTable::test_fixture())
+                .with_boundary_policy(policy),
+        )
+    }
+
+    fn operator_auth_header() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx".parse().unwrap(),
+        );
+        h
+    }
+
     async fn response_json(response: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ── P081 Phase 4: boundary_policy capability in initialize ─────────────
+
+    /// matrix_row: p081.agent_operator.mcp_initialize.capability
+    /// required_test: mcp_initialize_boundary_policy_capability
+    #[tokio::test]
+    async fn p081_mcp_initialize_exposes_boundary_policy_capability() {
+        let mcp = test_server_with_boundary_policy().await;
+        let response = handle_mcp_post(
+            State(mcp),
+            operator_auth_header(),
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert!(json["error"].is_null(), "initialize must succeed: {json}");
+        let bp = &json["result"]["capabilities"]["boundary_policy"];
+        assert!(
+            !bp.is_null(),
+            "boundary_policy capability must be present in initialize result"
+        );
+        assert_eq!(bp["denied_known_tool_code"], -32004);
+        assert_eq!(bp["field_casing"], "snake_case");
+        assert_eq!(bp["capability_schema_version"], 1);
+    }
+
+    /// Legacy test constructors install the embedded shadow policy by default,
+    /// so new call sites do not silently bypass the boundary service.
+    #[tokio::test]
+    async fn p081_mcp_initialize_default_constructor_exposes_shadow_boundary_capability() {
+        let mcp = test_server().await;
+        let response = handle_mcp_post(
+            State(mcp),
+            operator_auth_header(),
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
+        )
+        .await;
+
+        let json = response_json(response).await;
+        assert!(json["error"].is_null(), "initialize must succeed: {json}");
+        let bp = &json["result"]["capabilities"]["boundary_policy"];
+        assert_eq!(bp["mode"], "shadow");
+        assert_eq!(bp["denied_known_tool_code"], -32004);
+    }
+
+    // ── P081: known-but-denied tools must return -32004 ───────────────────
+
+    /// matrix_row: p081.agent_operator.mcp_tools_call.command
+    /// required_test: denied_out_of_scope_tool
+    ///
+    /// An operator principal with no tool capabilities but a valid token
+    /// gets a known (registered) tool name → must receive -32004, not -32601.
+    #[tokio::test]
+    async fn p081_known_tool_denied_by_capability_returns_32004() {
+        // Drive handle_request directly with a custom server+principal; we cannot
+        // use test_server_with_boundary_policy because the HTTP handler resolves the
+        // principal from the token and the test fixture operator is fully-capable.
+        let policy = Arc::new(
+            auth::boundary::BoundaryPolicy::from_embedded()
+                .expect("embedded fixture must be valid"),
+        );
+        let server = Arc::new(
+            McpServer::new(
+                {
+                    let pool = create_pool("sqlite::memory:").await.unwrap();
+                    let writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
+                    db::writer::register_shared_writer(&pool, writer)
+                        .await
+                        .unwrap();
+                    pool
+                },
+                Arc::new(CommandHandler::new(
+                    create_pool("sqlite::memory:").await.unwrap(),
+                    event_bus::new_bus(64),
+                    WorkQueue::new(create_pool("sqlite::memory:").await.unwrap()),
+                )),
+                auth::PrincipalTable::test_fixture(),
+            )
+            .with_boundary_policy(policy),
+        );
+
+        // "runs.list" is a registered canonical tool name.
+        // An agent_operator (Agent principal) is allowed by the matrix, but
+        // this principal has tool capabilities explicitly cleared → capability check fails → -32004.
+        let mut agent = auth::Principal::new("agent-no-caps", auth::PrincipalClass::Agent);
+        agent.tool_capabilities.clear();
+        let req = crate::protocol::JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(42)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({ "name": "runs.list", "arguments": {} })),
+        };
+        let resp = server.handle_request(req, &agent).await;
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json["error"]["code"], -32004,
+            "known tool denied by capability must return -32004, got: {json}"
+        );
+    }
+
+    /// matrix_row: none (unknown tool)
+    /// Unknown tools that are not registered must still return -32601.
+    #[tokio::test]
+    async fn p081_unknown_tool_returns_32601_not_32004() {
+        let mcp = test_server_with_boundary_policy().await;
+        let operator = auth::Principal::new("op", auth::PrincipalClass::Operator);
+        let req = crate::protocol::JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(99)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({ "name": "nonexistent.tool", "arguments": {} })),
+        };
+
+        // Borrow inner McpServer to call handle_request directly.
+        let resp = mcp.handle_request(req, &operator).await;
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json["error"]["code"], -32601,
+            "unknown tool must still return -32601, got: {json}"
+        );
     }
 }

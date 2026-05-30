@@ -903,6 +903,13 @@ async fn p017_per_attempt_cost_and_transcript_persisted() {
         cached_input_tokens: None,
         transcript_artifact_id: None,
         actual_toolchain_mapping_diagnostics_json: None,
+        escalation_policy_id: None,
+        escalation_policy_hash: None,
+        escalation_tier_id: None,
+        escalation_tier_kind_raw: None,
+        escalation_trigger_raw: None,
+        escalation_digest_version: None,
+        escalation_ledger_id: None,
     };
     let _ = run_id; // run association via stage
     db::repos::agent_executions::insert(&pool, &exec)

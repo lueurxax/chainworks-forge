@@ -14,7 +14,9 @@ final class AutomationFallbackAppDelegate: AppTerminationCoordinator {
             return
         }
 
-        let hostingController = NSHostingController(rootView: ContentView())
+        let hostingController = NSHostingController(
+            rootView: ContentView(notificationService: NotificationService())
+        )
         let window = NSWindow(contentViewController: hostingController)
         window.title = "Chainworks Forge"
         window.identifier = NSUserInterfaceItemIdentifier("chainworks-fallback-window")

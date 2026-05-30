@@ -1,0 +1,14 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "slow_consumer_no_disconnect",
+  "description": "Subscription does not disconnect a slow consumer after 5 seconds of full queue or 3 consecutive enqueue failures.",
+  "hold_condition": "sessionStatusChanged lacks a 64 payload per-subscriber buffer cap, at-most-once resyncRequired behavior, or slow-consumer disconnect criteria.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_slow_consumer_not_disconnected",
+  "fixture_input": {
+    "queue_full_duration_seconds": 6,
+    "consecutive_enqueue_failures": 4,
+    "expected_result": "stream_terminates_with_slow_consumer_disconnected_error"
+  }
+}

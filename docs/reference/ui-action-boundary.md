@@ -24,6 +24,8 @@ SwiftUI must not use:
 - local workflow mutation fallback,
 - Swift-local workflow truth,
 - broad GraphQL command mutations.
+- escalation policy drift acknowledgement.
+- tier mutation (retry, resume, cancel, or force-primary).
 
 ## Boundary Matrix
 
@@ -52,6 +54,7 @@ Forbidden GraphQL mutation families for governed SwiftUI include:
 - context strategy changes,
 - experiments,
 - recovery / repair.
+- escalation (acknowledgement, tier mutation, etc.).
 
 ## MCP Boundary
 

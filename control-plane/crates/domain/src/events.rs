@@ -47,6 +47,20 @@ pub enum DomainEvent {
         /// "session_started" | "session_completed" | "session_failed"
         event_kind: String,
     },
+    /// Live, non-durable transcript/timeline event for an active ACP prompt.
+    /// This is intentionally transient: subscribers render it while the agent
+    /// is active and discard it when that agent execution completes.
+    RuntimeTimelineEvent {
+        run_id: RunId,
+        stage_id: String,
+        agent_id: String,
+        provider: String,
+        event_kind: String,
+        title: String,
+        detail: Option<String>,
+        surface_label: String,
+        session_generation_id: Option<String>,
+    },
     /// Daemon lifecycle state changed (Proposal 042 §5.1). Emitted by the
     /// lifecycle reporter on every transition so the `daemonStatusChanged`
     /// GraphQL subscription can push the updated snapshot.
@@ -89,5 +103,10 @@ pub enum DomainEvent {
         operation_id: String,
         slot_generation: i64,
         error: String,
+    },
+    /// P046: A session_events row was persisted. Wakes sessionStatusChanged subscribers
+    /// so live status changes are delivered without waiting for unrelated runtime events.
+    SessionEventRecorded {
+        run_id: RunId,
     },
 }

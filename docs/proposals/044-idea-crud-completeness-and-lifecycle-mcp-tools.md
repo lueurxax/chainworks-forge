@@ -5,7 +5,7 @@
 | Date | 2026-04-17 (revised R3) |
 | Status | Draft (R3 - readiness blockers addressed: StartRun lifecycle ownership, atomic archive/start invariant, command/journal ownership, explicit capabilities, GraphQL patch semantics, distinct gate alias) |
 | Author | Andrey Khasanov |
-| Depends on | [../reference/idea-lifecycle.md](../reference/idea-lifecycle.md), [../reference/project-workspace-contract.md](../reference/project-workspace-contract.md), [../reference/current-system-baseline.md](../reference/current-system-baseline.md), [../reference/test-gates.md](../reference/test-gates.md), [029-mcp-northbound-control-plane-server.md](029-mcp-northbound-control-plane-server.md), [../reference/domain-model.md](../reference/domain-model.md) |
+| Depends on | [../reference/idea-lifecycle.md](../reference/idea-lifecycle.md), [../reference/project-workspace-contract.md](../reference/project-workspace-contract.md), [../reference/current-system-baseline.md](../reference/current-system-baseline.md), [../reference/test-gates.md](../reference/test-gates.md), [../reference/mcp-northbound-control-plane-server.md](../reference/mcp-northbound-control-plane-server.md), [../reference/domain-model.md](../reference/domain-model.md) |
 | Scope | Add get, update, archive, unarchive, and duplicate MCP tools for ideas, plus enhanced list filtering, with matching GraphQL mutations and server-side guard rails. |
 | Goal | Give MCP-connected agents and operators full idea lifecycle management with patch-semantic updates and safety guards that exceed the Swift app's current capabilities. |
 

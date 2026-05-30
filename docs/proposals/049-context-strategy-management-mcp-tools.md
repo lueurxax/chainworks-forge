@@ -5,7 +5,7 @@
 | Date | 2026-04-17 |
 | Status | Draft |
 | Author | Andrey Khasanov |
-| Depends on | [043-query-projections-and-client-consumption-contract.md](043-query-projections-and-client-consumption-contract.md) |
+| Depends on | [../reference/query-projections-and-client-consumption-contract.md](../reference/query-projections-and-client-consumption-contract.md) |
 | Scope | Add context strategy assignment, querying, pressure monitoring, handoff compilation, and simulation to the MCP tool surface, with a file-based strategy profile registry. |
 | Goal | Orchestrating agents can manage context budgets dynamically during execution, and operators can simulate strategy impact before starting runs. |
 

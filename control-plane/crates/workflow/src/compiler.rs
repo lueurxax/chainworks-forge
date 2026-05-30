@@ -220,6 +220,66 @@ fn compile_loaded(
     let dynamic_candidate_bindings =
         compile_dynamic_candidate_bindings(&cat, &catalog_snapshot_hash);
 
+    // P058: Compile escalation policies before any partial moves on `cat`.
+    // Build the set of unsafe stage IDs for compile validation (SEC-P058-001).
+    // is_unsafe_for_escalation() catches manual gates AND any non-compute stage types
+    // (release, side_effect, publish, etc.) fail-closed before they exist in YAML.
+    let unsafe_stage_ids: std::collections::HashSet<String> = wf
+        .states
+        .iter()
+        .filter(|(_, state_def)| state_def.is_unsafe_for_escalation())
+        .map(|(state_id, _)| state_id.clone())
+        .collect();
+
+    // SEC-001: also collect agent IDs that own or run tasks in unsafe stages, and the
+    // backend_profile_ids of those agents, so agent_id/backend_profile_id bindings can
+    // be validated fail-closed against side-effect stages.
+    let mut unsafe_agent_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, state_def) in wf
+        .states
+        .iter()
+        .filter(|(_, sd)| sd.is_unsafe_for_escalation())
+    {
+        unsafe_agent_ids.insert(state_def.owner.clone());
+        let collect_tasks = |block: &crate::definition::RunBlock| {
+            let mut ids = Vec::new();
+            for task in block
+                .sequence
+                .iter()
+                .flatten()
+                .chain(block.parallel.iter().flatten())
+                .chain(block.then.iter().flatten())
+            {
+                ids.push(task.agent.clone());
+            }
+            ids
+        };
+        if let Some(ref run_block) = state_def.run {
+            unsafe_agent_ids.extend(collect_tasks(run_block));
+        }
+        if let Some(ref run_block) = state_def.run_after_approval {
+            unsafe_agent_ids.extend(collect_tasks(run_block));
+        }
+    }
+    // Map agent_id → backend_profile_id from catalog for the profile check.
+    let unsafe_backend_profile_ids: std::collections::HashSet<String> = cat
+        .agents
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|a| unsafe_agent_ids.contains(a.id.as_str()))
+        .map(|a| a.backend_profile.clone())
+        .collect();
+
+    let all_stage_ids: std::collections::HashSet<String> = wf.states.keys().cloned().collect();
+    let escalation_policies = compile_escalation_policies(
+        &cat,
+        &unsafe_stage_ids,
+        &unsafe_agent_ids,
+        &unsafe_backend_profile_ids,
+        &all_stage_ids,
+    )?;
+
     // Artifact name → path template from the catalog's `artifacts:` section.
     let artifact_paths: HashMap<String, String> =
         cat.artifacts.unwrap_or_default().into_iter().collect();
@@ -254,6 +314,7 @@ fn compile_loaded(
         dynamic_candidate_bindings,
         run_plan_snapshot_format_version,
         closeout_readiness_mode,
+        escalation_policies,
     })
 }
 
@@ -779,36 +840,14 @@ fn resolve_agent(agent_id: &str, agents: &HashMap<String, AgentBinding>) -> Resu
             toolchain_cache_policy: binding.toolchain_cache_policy.clone(),
         }),
         None => {
-            warn!(
-                agent_id = agent_id,
-                "Agent not found in catalog; using placeholder binding"
-            );
-            Ok(ResolvedAgent {
-                agent_id: agent_id.to_string(),
-                backend_profile_id: None,
-                provider: "claude".to_string(),
-                model: None,
-                effort: None,
-                max_turns: None,
-                temperature: None,
-                prompt: None,
-                permission_profile: None,
-                skill_ref: None,
-                skill_role: None,
-                skill_snapshot_hash: None,
-                requested_mcp_server_ids: Vec::new(),
-                resolved_skill: None,
-                output_contract: None,
-                worktree_write_enabled: false,
-                worktree_strategy: None,
-                session_reuse_scope: None,
-                session_family_id: None,
-                xcode_broker_required: false,
-                xcode_shim_injection_signal: false,
-                requires_xcode_host_execution: false,
-                xcode_prompt_lint_warnings: Vec::new(),
-                toolchain_cache_policy: None,
-            })
+            // SEC-HIGH-002: unknown agent references must fail the compile rather than
+            // silently resolving to a placeholder. A typo or injected agent_id must not
+            // bypass catalog bindings (provider, model, permissions, output_contract, etc.).
+            anyhow::bail!(
+                "agent '{}' not found in catalog; workflow compile failed. \
+                 Add the agent to the catalog or correct the reference.",
+                agent_id
+            )
         }
     }
 }
@@ -873,7 +912,7 @@ fn compile_agent_task(
     for output_name in &outputs {
         if let Some(schema) = contracts.resolve(output_name, explicit_contract, output_count) {
             output_schemas.insert(output_name.clone(), schema);
-        } else if let Some(contract_id) = explicit_contract {
+        } else if let Some(contract_id) = explicit_contract.filter(|_| output_count == 1) {
             warn!(
                 output_name = %output_name,
                 contract_id = %contract_id,
@@ -988,6 +1027,57 @@ fn resolve_loop_max(
 ///
 /// Pipeline:
 /// 1. Load base content (external → SKILL.md, inline → description, builtin → hardcoded)
+/// SEC-002: Validate that a skill bundle relative path does not escape the catalog root.
+/// Rejects absolute paths, `..` traversal components, null bytes, backslashes, and
+/// URI-scheme prefixes. Works on the raw string before joining with catalog_base.
+fn validate_skill_relative_path(skill_id: &str, field: &str, raw_path: &str) -> Result<()> {
+    if raw_path.is_empty() {
+        anyhow::bail!("skill '{skill_id}': field '{field}' is empty");
+    }
+    if raw_path.contains('\0') {
+        anyhow::bail!("skill '{skill_id}': field '{field}' contains a null byte");
+    }
+    if raw_path.contains('\\') {
+        anyhow::bail!("skill '{skill_id}': field '{field}' contains a backslash separator");
+    }
+    if raw_path.contains("://") {
+        anyhow::bail!("skill '{skill_id}': field '{field}' contains a URI scheme separator");
+    }
+    // Reject absolute paths — all skill paths must be relative to catalog_base.
+    if std::path::Path::new(raw_path).is_absolute() {
+        anyhow::bail!(
+            "skill '{skill_id}': field '{field}' must be a relative path, got '{raw_path}'"
+        );
+    }
+    for component in raw_path.split('/') {
+        if component == ".." {
+            anyhow::bail!(
+                "skill '{skill_id}': field '{field}' contains a path traversal component '..'"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// SEC-002: Validate a role name so it cannot be used to escape the catalog via path separator
+/// injection. Role names appear in `roles/{role}.md` joins and must be simple identifiers.
+fn validate_skill_role_name(skill_id: &str, role: &str) -> Result<()> {
+    if role.is_empty() {
+        anyhow::bail!("skill '{skill_id}': role name is empty");
+    }
+    if role.contains('/')
+        || role.contains('\\')
+        || role.contains('\0')
+        || role == ".."
+        || role == "."
+    {
+        anyhow::bail!(
+            "skill '{skill_id}': role name '{role}' contains unsafe characters or is a traversal token"
+        );
+    }
+    Ok(())
+}
+
 /// 2. Apply role specialization (triad mode map, roles/{role}.md, or generic)
 /// 3. Wrap with `## Skill: {id}\nType: {type}\n\n{content}` injection header
 fn resolve_skill(
@@ -998,6 +1088,11 @@ fn resolve_skill(
 ) -> Result<ResolvedSkill> {
     let skill_type_str = &skill_def.skill_type;
 
+    // SEC-002: Validate role name before it is used in any path join.
+    if let Some(role) = skill_role {
+        validate_skill_role_name(skill_id, role)?;
+    }
+
     // Step 1: Load base content by type
     let (base_content, type_label) = match skill_type_str.as_str() {
         "external_skill" => {
@@ -1005,8 +1100,28 @@ fn resolve_skill(
                 .path
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("external_skill '{skill_id}' missing 'path'"))?;
+            // SEC-002: Reject traversal and absolute paths before joining with catalog_base.
+            validate_skill_relative_path(skill_id, "path", raw_path)?;
             let bundle_dir = catalog_base.join(raw_path);
+            // SEC-002: After joining, verify the resolved path stays within the catalog base
+            // to block symlink-based escapes that component-level checks cannot catch.
+            if let (Ok(canon_base), Ok(canon_bundle)) = (
+                std::fs::canonicalize(catalog_base),
+                std::fs::canonicalize(&bundle_dir),
+            ) {
+                if !canon_bundle.starts_with(&canon_base) {
+                    anyhow::bail!("skill '{skill_id}': path escapes catalog root via symlink");
+                }
+            }
             let skill_md = bundle_dir.join("SKILL.md");
+            // Reject symlinks within the bundle to prevent escape via indirection.
+            #[cfg(unix)]
+            if std::fs::symlink_metadata(&skill_md)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                anyhow::bail!("SKILL.md for external skill '{skill_id}' must not be a symlink");
+            }
             let content = std::fs::read_to_string(&skill_md).with_context(|| {
                 format!(
                     "reading SKILL.md for external skill '{skill_id}' at {}",
@@ -1083,6 +1198,14 @@ fn apply_role_specialization(
                 .join(raw_path)
                 .join("roles")
                 .join(format!("{role}.md"));
+            // Reject symlinks to prevent escape via role file indirection.
+            #[cfg(unix)]
+            if std::fs::symlink_metadata(&role_file)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return base_content.to_string();
+            }
             if let Ok(role_content) = std::fs::read_to_string(&role_file) {
                 let trimmed = role_content.trim();
                 if !trimmed.is_empty() {
@@ -1256,6 +1379,129 @@ pub fn compile_dynamic_candidate_bindings_from_paths(
         &cat,
         &catalog_snapshot_hash,
     ))
+}
+
+// ── P058: Escalation policy compilation ───────────────────────────────────────
+
+/// Compile escalation policies from the agent catalog into frozen RunPlan snapshots.
+///
+/// Validates backend_profile references, ambiguous bindings, and unsafe side-effect stage
+/// bindings (by stage_id, agent_id, and backend_profile_id). Returns `Err` for any diagnostic.
+fn compile_escalation_policies(
+    cat: &catalog::AgentCatalogFile,
+    unsafe_stage_ids: &std::collections::HashSet<String>,
+    unsafe_agent_ids: &std::collections::HashSet<String>,
+    unsafe_backend_profile_ids: &std::collections::HashSet<String>,
+    all_stage_ids: &std::collections::HashSet<String>,
+) -> Result<Vec<EscalationPolicySnapshot>> {
+    use crate::escalation_policy::{
+        compute_policy_hash, validate_applies_to_stage_selectors,
+        validate_policies_against_catalog, validate_policies_for_ambiguous_bindings,
+        validate_policies_for_unsafe_stage_bindings,
+    };
+    use crate::plan::EscalationTierSnapshot;
+
+    // SEC-003: run structural validation FIRST so that malformed policy/stage/agent/
+    // backend_profile identifiers containing control characters cannot be interpolated into
+    // diagnostic messages before the safe-identifier check fires.
+    // Policies deserialized from AgentCatalogFile bypass parse_policy and therefore bypass
+    // the validate_policy_structure call there; re-run it here before any catalog validators
+    // build error strings from catalog-controlled identifiers.
+    if let Some(early_policies) = cat.escalation_policies.as_deref() {
+        for policy in early_policies {
+            crate::escalation_policy::validate_policy_structure(policy).map_err(|e| {
+                anyhow::anyhow!(
+                    "escalation_policy compile failed: [escalation_policy_compile_failed] \
+                     policy structural validation: {e}"
+                )
+            })?;
+        }
+    }
+
+    let mut all_diagnostics = validate_policies_against_catalog(cat);
+
+    // Build agent_id → backend_profile_id map for cross-axis ambiguity detection.
+    let agent_to_profile: std::collections::HashMap<&str, &str> = cat
+        .agents
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|a| (a.id.as_str(), a.backend_profile.as_str()))
+        .collect();
+
+    // Check for ambiguous bindings, unsafe side-effect stage bindings (all three axes),
+    // and unknown applies_to.stage_id selectors (HIGH-002 fail-closed).
+    if let Some(policies) = cat.escalation_policies.as_deref() {
+        all_diagnostics.extend(validate_policies_for_ambiguous_bindings(
+            policies,
+            &agent_to_profile,
+        ));
+        all_diagnostics.extend(validate_policies_for_unsafe_stage_bindings(
+            policies,
+            unsafe_stage_ids,
+            unsafe_agent_ids,
+            unsafe_backend_profile_ids,
+        ));
+        all_diagnostics.extend(validate_applies_to_stage_selectors(policies, all_stage_ids));
+    }
+
+    if !all_diagnostics.is_empty() {
+        let msgs: Vec<String> = all_diagnostics
+            .iter()
+            .map(|d| format!("[{}] {}", d.pause_reason_code, d.detail))
+            .collect();
+        return Err(anyhow::anyhow!(
+            "escalation_policy compile failed:\n{}",
+            msgs.join("\n")
+        ));
+    }
+
+    let policies = match cat.escalation_policies.as_deref() {
+        Some(p) => p,
+        None => return Ok(Vec::new()),
+    };
+
+    policies
+        .iter()
+        .map(|policy| {
+            let policy_hash = compute_policy_hash(policy)
+                .map_err(|e| anyhow::anyhow!("policy '{}' hash failed: {e}", policy.policy_id))?;
+            let tiers = policy
+                .tiers
+                .iter()
+                .map(|t| EscalationTierSnapshot {
+                    tier_id: t.tier_id.clone(),
+                    kind: t.kind.clone(),
+                    backend_profile_id: t.backend_profile_id.clone(),
+                    max_attempts: t.max_attempts,
+                })
+                .collect();
+            let triggers = policy
+                .triggers
+                .iter()
+                .map(|t| t.as_raw_str().to_string())
+                .collect();
+            Ok(EscalationPolicySnapshot {
+                policy_id: policy.policy_id.clone(),
+                schema_version: policy.schema_version.clone(),
+                enabled_default: policy.enabled_default,
+                applies_to_agent_id: policy.applies_to.agent_id.clone(),
+                applies_to_backend_profile_id: policy.applies_to.backend_profile_id.clone(),
+                applies_to_stage_id: policy.applies_to.stage_id.clone(),
+                max_chain_attempts: policy.max_chain_attempts,
+                max_chain_wall_clock_seconds: policy.max_chain_wall_clock_seconds,
+                triggers,
+                tiers,
+                policy_hash,
+                // Frozen at compile time — Phase 2+ digest computation reads this from the
+                // snapshot to ensure algorithm stability across daemon upgrades mid-run.
+                digest_version: Some("escalation_blocker_digest_v1".to_string()),
+                // Phase 2+ runtime overrides (kill-switch, in_flight_toggle_behavior) will
+                // populate this field when active at plan compile time. None for Phase 0-1.
+                rollout_override_state: None,
+            })
+        })
+        .collect()
 }
 
 fn yaml_to_json(v: &serde_yaml::Value) -> serde_json::Value {

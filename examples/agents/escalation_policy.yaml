@@ -1,0 +1,53 @@
+# P058: Example escalation_policy_v1 declaration for the code_writer agent.
+#
+# This file shows the complete schema for an escalation_policy_v1 block.
+# In production, escalation_policies are declared inside the agent catalog file
+# under the `escalation_policies:` section.
+#
+# Phase 0 status: policy is parsed and hash-frozen into RunPlan but enabled_default: false.
+# Phase 2 will enable scheduler-owned trigger classification and tier advancement.
+
+policy_id: code_writer_default_escalation
+schema_version: escalation_policy_v1
+enabled_default: false
+
+applies_to:
+  agent_id: code_writer
+
+max_chain_attempts: 6
+max_chain_wall_clock_seconds: 7200
+
+triggers:
+  - repeated_same_blocker_digest
+  - contract_output_failure
+  - stale_no_output
+  - provider_quota_exhausted
+  - transport_failure
+  - loop_budget_threshold
+
+tiers:
+  # Tier 0 (Tier 0 baseline): retry same backend profile up to 2 times.
+  - tier_id: primary_retry
+    kind: same_backend_retry
+    max_attempts: 2
+
+  # Tier 1: escalate to Claude frontier model profile.
+  - tier_id: frontier_profile
+    kind: backend_profile
+    backend_profile_id: claude_builder_frontier
+    max_attempts: 1
+
+  # Tier 2: escalate to Codex high-capability profile.
+  - tier_id: codex_profile
+    kind: backend_profile
+    backend_profile_id: codex_implementer_high
+    max_attempts: 1
+
+  # Tier 3: request lead agent mediation review.
+  - tier_id: lead_review
+    kind: lead_mediation
+    max_attempts: 1
+
+  # Tier 4 (terminal): pause and require human operator decision.
+  - tier_id: human_pause
+    kind: pause

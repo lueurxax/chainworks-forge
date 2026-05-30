@@ -1,0 +1,20 @@
+{
+  "fixture_description": "P076 budget row with a planned attempt older than 2x poll_deadline_seconds (600s) that was not escalated to needs_human_triage. Proves orphaned planned attempt escalation is required.",
+  "proves_orphaned_planned_attempt_not_escalated": true,
+  "violation": "planned_attempt_age_exceeded_threshold_without_escalation",
+  "poll_deadline_seconds": 300,
+  "orphan_threshold_seconds": 600,
+  "actual_planned_attempt_age_seconds": 901,
+  "actual_status": "available",
+  "expected_status": "needs_human_triage",
+  "hold_condition_triggered": "orphaned_planned_attempt_not_escalated",
+  "required_behavior": "A planned or unknown attempt older than 2x poll_deadline_seconds or observed in 3 consecutive polls without reconciliation must move to needs_human_triage.",
+  "evidence": {
+    "run_id": "run-orphaned-planned-001",
+    "blocker_signature_id": "sig-orphaned-planned-001",
+    "oldest_planned_attempt_at": "2026-05-23T08:45:00Z",
+    "planned_attempt_age_seconds": 901,
+    "current_budget_status": "available",
+    "required_operator_settlement": null
+  }
+}

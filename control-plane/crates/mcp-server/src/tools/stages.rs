@@ -2,8 +2,9 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use domain::commands::{
-    Command, ExtendWorkflowLoopBudgetCmd, OverrideLegacyDiscoveryPolicyCmd,
-    ResolveWorkflowConflictTransitionCmd, RetryStageCmd, WorkflowLoopBudgetExtensionCmd,
+    Command, ConsumeProviderQuotaHoldCmd, ExtendWorkflowLoopBudgetCmd,
+    OverrideLegacyDiscoveryPolicyCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
+    WorkflowLoopBudgetExtensionCmd,
 };
 use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::ids::{RunId, StageExecutionId};
@@ -19,10 +20,11 @@ pub fn tool_specs() -> Vec<McpTool> {
             description: "Retry a failed or blocked stage".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "required": ["run_id", "stage_id"],
+                "required": ["run_id", "stage_id", "idempotency_key"],
                 "properties": {
                     "run_id": { "type": "string" },
                     "stage_id": { "type": "string" },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." },
                     "agent_execution_id": {
                         "type": "string",
                         "description": "Optional. Retry only this InvokeAgent execution instead of the full stage fanout."
@@ -31,6 +33,22 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "legacy_discovery_override_policy": { "type": "string", "enum": ["workflow_opt_in"], "description": "Optional audited one-shot legacy discovery policy for this retry attempt." },
                     "legacy_discovery_override_reason": { "type": "string", "description": "Required reason when legacy_discovery_override_policy is set." },
                     "operator_instruction": { "type": "string", "description": "Optional one-shot operator instruction for the retry-created invocation scope (1-2000 chars, operator-only)." }
+                }
+            }),
+        },
+        McpTool {
+            name: "stages.consume_provider_quota_hold".to_string(),
+            description:
+                "Consume an active provider quota hold for an existing pending InvokeAgent"
+                    .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["run_id", "stage_id", "reason", "idempotency_key"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "stage_id": { "type": "string" },
+                    "reason": { "type": "string", "description": "Operator audit reason for overriding the active quota hold." },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe repair." }
                 }
             }),
         },
@@ -47,7 +65,8 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "target_stage_execution_id",
                     "target_attempt_number",
                     "legacy_discovery_override_policy",
-                    "legacy_discovery_override_reason"
+                    "legacy_discovery_override_reason",
+                    "idempotency_key"
                 ],
                 "properties": {
                     "run_id": { "type": "string" },
@@ -55,7 +74,8 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "target_stage_execution_id": { "type": "string" },
                     "target_attempt_number": { "type": "integer", "minimum": 1 },
                     "legacy_discovery_override_policy": { "type": "string", "enum": ["workflow_opt_in"] },
-                    "legacy_discovery_override_reason": { "type": "string" }
+                    "legacy_discovery_override_reason": { "type": "string" },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." }
                 }
             }),
         },
@@ -70,13 +90,15 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "run_id",
                     "conflict_id",
                     "selected_transition_id",
-                    "resolution_reason"
+                    "resolution_reason",
+                    "idempotency_key"
                 ],
                 "properties": {
                     "run_id": { "type": "string" },
                     "conflict_id": { "type": "string" },
                     "selected_transition_id": { "type": "string" },
                     "resolution_reason": { "type": "string" },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." },
                     "operator_instruction": { "type": "string", "description": "Optional one-shot operator instruction for the retry-created invocation scope (1-2000 chars, operator-only)." },
                     "loop_budget_extension": {
                         "type": "object",
@@ -98,12 +120,13 @@ pub fn tool_specs() -> Vec<McpTool> {
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "required": ["run_id", "counter", "additional_cycles", "reason"],
+                "required": ["run_id", "counter", "additional_cycles", "reason", "idempotency_key"],
                 "properties": {
                     "run_id": { "type": "string" },
                     "counter": { "type": "string" },
                     "additional_cycles": { "type": "integer", "minimum": 1, "maximum": 100 },
                     "reason": { "type": "string" },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 per attempt for safe retry." },
                     "target_conflict_id": { "type": "string" }
                 }
             }),
@@ -144,7 +167,7 @@ pub async fn execute(
                 .map(String::from);
             let operator_instruction = params["operator_instruction"].as_str().map(String::from);
 
-            let caller = mcp_caller(&principal.id, &principal.class, "stages.retry");
+            let caller = mcp_caller(&principal, "stages.retry");
             let cmd = Command::RetryStage(RetryStageCmd {
                 run_id,
                 stage_id,
@@ -175,6 +198,52 @@ pub async fn execute(
             }))
         }
 
+        "stages.consume_provider_quota_hold" => {
+            let run_id: RunId = params["run_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
+                .parse()?;
+            let stage_id = params["stage_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'stage_id'"))?
+                .to_string();
+            let reason = params["reason"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+                .to_string();
+
+            let caller = mcp_caller(&principal, "stages.consume_provider_quota_hold");
+            let cmd = Command::ConsumeProviderQuotaHold(ConsumeProviderQuotaHoldCmd {
+                run_id,
+                stage_id,
+                reason,
+            });
+            let commanded = cmd_handler.handle(cmd, caller).await?;
+            let (result_run_id, result_stage_id, consumed_ledger_count, released_work_item_count) =
+                match &commanded.result {
+                    engine::command_handler::CommandResult::ProviderQuotaHoldConsumed {
+                        run_id,
+                        stage_id,
+                        consumed_ledger_count,
+                        released_work_item_count,
+                    } => (
+                        run_id.to_string(),
+                        stage_id.clone(),
+                        *consumed_ledger_count,
+                        *released_work_item_count,
+                    ),
+                    _ => anyhow::bail!("Unexpected command result"),
+                };
+            Ok(serde_json::json!({
+                "consumed": true,
+                "run_id": result_run_id,
+                "stage_id": result_stage_id,
+                "consumed_ledger_count": consumed_ledger_count,
+                "released_work_item_count": released_work_item_count,
+                "journal_id": commanded.journal_id,
+            }))
+        }
+
         "legacy_discovery_override_create" => {
             let run_id: RunId = params["run_id"]
                 .as_str()
@@ -199,11 +268,7 @@ pub async fn execute(
                 .ok_or_else(|| anyhow::anyhow!("Missing 'legacy_discovery_override_reason'"))?
                 .to_string();
 
-            let caller = mcp_caller(
-                &principal.id,
-                &principal.class,
-                "legacy_discovery_override_create",
-            );
+            let caller = mcp_caller(&principal, "legacy_discovery_override_create");
             let cmd = Command::OverrideLegacyDiscoveryPolicy(OverrideLegacyDiscoveryPolicyCmd {
                 run_id,
                 stage_id,
@@ -246,11 +311,7 @@ pub async fn execute(
             let loop_budget_extension =
                 parse_loop_budget_extension(params.get("loop_budget_extension"))?;
 
-            let caller = mcp_caller(
-                &principal.id,
-                &principal.class,
-                "workflow_conflicts.resolve",
-            );
+            let caller = mcp_caller(&principal, "workflow_conflicts.resolve");
             let cmd =
                 Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
                     run_id,
@@ -291,11 +352,7 @@ pub async fn execute(
                 .parse()?;
             let extension = parse_loop_budget_extension(Some(&params))?
                 .ok_or_else(|| anyhow::anyhow!("Missing loop budget extension payload"))?;
-            let caller = mcp_caller(
-                &principal.id,
-                &principal.class,
-                "workflow_loop_budget.extend",
-            );
+            let caller = mcp_caller(principal, "workflow_loop_budget.extend");
             let commanded = cmd_handler
                 .handle(
                     Command::ExtendWorkflowLoopBudget(ExtendWorkflowLoopBudgetCmd {
@@ -460,12 +517,10 @@ mod tests {
     #[tokio::test]
     async fn workflow_conflicts_resolve_response_includes_retry_instruction_binding_id() {
         let pool = create_pool("sqlite::memory:").await.unwrap();
-        db::writer::register_shared_writer(
-            &pool,
-            std::sync::Arc::new(db::writer::DbWriter::new(pool.clone())),
-        )
-        .await
-        .unwrap();
+        let writer = std::sync::Arc::new(db::writer::DbWriter::new(pool.clone()));
+        db::writer::register_shared_writer(&pool, writer)
+            .await
+            .unwrap();
 
         let idea_id = IdeaId::new();
         let run_id = RunId::new();

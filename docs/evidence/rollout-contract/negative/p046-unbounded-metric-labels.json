@@ -1,0 +1,17 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "unbounded_metric_labels",
+  "description": "P046 metrics use unbounded-cardinality labels such as run_id, lineage_id, generation_id, raw cursor, raw client id, or raw error text.",
+  "hold_condition": "KPI, health, retry, subscription, or disabled-schema metrics use unbounded labels such as run_id, lineage_id, generation_id, raw cursor, raw client id, or raw error text.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_unbounded_metric_labels",
+  "fixture_input": {
+    "metric_name": "session_graphql_query_total",
+    "labels": {
+      "run_id": "00000000-0000-0000-0000-000000000001",
+      "field": "sessionLineages"
+    },
+    "expected_result": "run_id_label_must_not_appear_in_metrics"
+  }
+}

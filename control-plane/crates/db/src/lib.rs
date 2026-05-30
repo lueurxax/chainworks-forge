@@ -4,6 +4,7 @@ pub mod hot_read_guard;
 pub mod metrics;
 pub mod migrate;
 pub mod operation_registry;
+pub mod p046_retry;
 pub mod pool;
 pub mod repos;
 pub mod work_item;

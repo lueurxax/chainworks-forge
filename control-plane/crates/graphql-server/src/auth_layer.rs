@@ -5,6 +5,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+/// SEC-P081-M002: Derived token_id for audit correlation injected alongside Principal.
+/// This is the base32(sha256(...)) diagnostic identifier, not the raw bearer token.
+/// Carried through request extensions so GraphQL audit paths can include it without
+/// storing or logging raw tokens.
+#[derive(Clone, Debug)]
+pub struct GraphqlTokenId(pub String);
+
 /// Axum middleware that extracts and validates a Bearer token.
 /// On success, inserts `auth::Principal` into request extensions so that
 /// `async_graphql::Context::data::<auth::Principal>()` can retrieve it.
@@ -20,11 +27,16 @@ pub async fn require_auth(
     // Playground exemption: allow only the HTML playground shell when
     // CHAINWORKS_PLAYGROUND_AUTH=skip. GET requests carrying a query string
     // still pass through bearer auth.
+    // SEC-P081: disabled unconditionally in release builds so the env var cannot
+    // accidentally bypass auth in packaged/production builds.
     let is_playground_get = is_playground_html_request(&request);
+    #[cfg(debug_assertions)]
     let playground_skip = std::env::var("CHAINWORKS_PLAYGROUND_AUTH")
         .ok()
         .map(|v| v == "skip")
         .unwrap_or(false);
+    #[cfg(not(debug_assertions))]
+    let playground_skip = false;
 
     if is_playground_get && playground_skip {
         return next.run(request).await;
@@ -40,6 +52,10 @@ pub async fn require_auth(
         Some(header_value) => match auth::extract_bearer_token(&header_value) {
             Ok(token) => match auth::resolve_bearer(token, &principal_table) {
                 Ok(principal) => {
+                    // SEC-P081-M002: derive token_id for audit correlation. The raw token
+                    // is not stored; only the derived diagnostic identifier is propagated.
+                    let token_id = auth::derive_token_id(token, &principal.id);
+                    request.extensions_mut().insert(GraphqlTokenId(token_id));
                     request.extensions_mut().insert(principal);
                     next.run(request).await
                 }
@@ -61,7 +77,10 @@ fn unauthorized_response() -> Response {
     let body = serde_json::json!({
         "errors": [{
             "message": "unauthorized",
-            "extensions": { "code": "UNAUTHORIZED" }
+            "extensions": {
+                "code": "UNAUTHORIZED",
+                "reasonCode": "UNAUTHENTICATED"
+            }
         }]
     });
     (

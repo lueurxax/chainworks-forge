@@ -235,6 +235,7 @@ pub enum ExpectedPathBaselineStatus {
     Absent,
     #[serde(rename = "regular_digest_captured", alias = "regular_content_captured")]
     RegularContentCaptured,
+    DirectoryManifestCaptured,
     Oversized,
     Unreadable,
     NotRegularFile,
@@ -273,6 +274,8 @@ pub struct PrePromptExpectedOutputMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtime_ns: Option<i128>,
@@ -299,6 +302,7 @@ impl PrePromptExpectedOutputMetadata {
             existed: false,
             file_type: "absent".to_string(),
             size_bytes: None,
+            file_count: None,
             content_digest: None,
             mtime_ns: None,
             baseline_status: ExpectedPathBaselineStatus::Absent,
@@ -945,7 +949,9 @@ impl DiscoveryFilesystem for StdDiscoveryFilesystem {
     ) -> bool {
         if !matches!(
             baseline.baseline_status,
-            ExpectedPathBaselineStatus::Absent | ExpectedPathBaselineStatus::RegularContentCaptured
+            ExpectedPathBaselineStatus::Absent
+                | ExpectedPathBaselineStatus::RegularContentCaptured
+                | ExpectedPathBaselineStatus::DirectoryManifestCaptured
         ) {
             return false;
         }
@@ -959,6 +965,10 @@ impl DiscoveryFilesystem for StdDiscoveryFilesystem {
             (
                 ExpectedPathBaselineStatus::RegularContentCaptured,
                 ExpectedPathBaselineStatus::RegularContentCaptured,
+            ) => baseline.content_digest != current.content_digest,
+            (
+                ExpectedPathBaselineStatus::DirectoryManifestCaptured,
+                ExpectedPathBaselineStatus::DirectoryManifestCaptured,
             ) => baseline.content_digest != current.content_digest,
             _ => false,
         }
@@ -1221,6 +1231,10 @@ impl DiscoveryFilesystem for FakeDiscoveryFilesystem {
                 ExpectedPathBaselineStatus::RegularContentCaptured,
                 ExpectedPathBaselineStatus::RegularContentCaptured,
             ) => baseline.content_digest != current.content_digest,
+            (
+                ExpectedPathBaselineStatus::DirectoryManifestCaptured,
+                ExpectedPathBaselineStatus::DirectoryManifestCaptured,
+            ) => baseline.content_digest != current.content_digest,
             _ => false,
         }
     }
@@ -1410,6 +1424,7 @@ fn capture_pre_prompt_expected_output_metadata(
         existed: false,
         file_type: "absent".to_string(),
         size_bytes: None,
+        file_count: None,
         content_digest: None,
         mtime_ns: None,
         baseline_status: ExpectedPathBaselineStatus::Absent,
@@ -1477,6 +1492,21 @@ fn capture_pre_prompt_expected_output_metadata(
         } else {
             "other".to_string()
         };
+        if file_metadata.is_dir() {
+            match capture_directory_manifest(&canonical, spec.max_bytes, deadline, recorder) {
+                Ok(manifest) => {
+                    metadata.size_bytes = Some(manifest.total_bytes);
+                    metadata.file_count = Some(manifest.file_count);
+                    metadata.content_digest = Some(manifest.digest);
+                    metadata.baseline_status =
+                        ExpectedPathBaselineStatus::DirectoryManifestCaptured;
+                }
+                Err(status) => {
+                    metadata.baseline_status = status;
+                }
+            }
+            return metadata;
+        }
         metadata.baseline_status = ExpectedPathBaselineStatus::NotRegularFile;
         return metadata;
     }
@@ -1586,6 +1616,7 @@ fn pre_prompt_metadata_with_status(
         existed: false,
         file_type: "unknown".to_string(),
         size_bytes: None,
+        file_count: None,
         content_digest: None,
         mtime_ns: None,
         baseline_status: status,
@@ -1629,6 +1660,87 @@ fn metadata_mtime_ns(metadata: &std::fs::Metadata) -> Option<i128> {
 
 fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+struct DirectoryManifestCapture {
+    file_count: u64,
+    total_bytes: u64,
+    digest: String,
+}
+
+fn capture_directory_manifest(
+    root: &Path,
+    max_bytes: u64,
+    deadline: Option<Instant>,
+    recorder: &dyn DiscoveryOperationRecorder,
+) -> Result<DirectoryManifestCapture, ExpectedPathBaselineStatus> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    let mut total_bytes = 0u64;
+
+    while let Some(dir) = stack.pop() {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(ExpectedPathBaselineStatus::MetadataTimeout);
+        }
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::ReadDir,
+            &dir,
+        ));
+        let entries =
+            std::fs::read_dir(&dir).map_err(|_| ExpectedPathBaselineStatus::Unreadable)?;
+        let mut entries: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        entries.sort();
+
+        for path in entries {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(ExpectedPathBaselineStatus::MetadataTimeout);
+            }
+            recorder.record(DiscoveryOperation::path(
+                DiscoveryOperationKind::SymlinkMetadata,
+                &path,
+            ));
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|_| ExpectedPathBaselineStatus::Unreadable)?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(metadata.len());
+            if total_bytes > max_bytes {
+                return Err(ExpectedPathBaselineStatus::Oversized);
+            }
+            files.push(path);
+        }
+    }
+
+    files.sort();
+    let mut hasher = Sha256::new();
+    for path in &files {
+        let relative_path = path.strip_prefix(root).unwrap_or(path);
+        hasher.update(relative_path.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        recorder.record(DiscoveryOperation::path(
+            DiscoveryOperationKind::ReadFile,
+            path,
+        ));
+        let bytes = std::fs::read(path).map_err(|_| ExpectedPathBaselineStatus::Unreadable)?;
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update([0]);
+        hasher.update(Sha256::digest(&bytes));
+        hasher.update([0]);
+    }
+
+    Ok(DirectoryManifestCapture {
+        file_count: files.len() as u64,
+        total_bytes,
+        digest: format!("sha256:{:x}", hasher.finalize()),
+    })
 }
 
 fn discover_bounded_meta_root_artifacts(
@@ -2244,6 +2356,59 @@ mod tests {
             metadata_index < read_index,
             "metadata operation must be recorded before file read"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directory_expected_output_metadata_captures_manifest_without_reading_directory_as_file() {
+        let root = temp_test_dir("directory-output-metadata");
+        let articles = root.join("articles");
+        std::fs::create_dir_all(&articles).unwrap();
+        std::fs::write(articles.join("one.md"), b"# One").unwrap();
+        let spec = ExpectedOutputSpec {
+            output_name: "system_articles".to_string(),
+            output_role: ExpectedOutputRole::Machine,
+            target_path: articles.to_string_lossy().into_owned(),
+            companion_of: None,
+            display_label: "System articles".to_string(),
+            contract_id: None,
+            required: true,
+            reuse_policy: OutputReusePolicy::MustProduce,
+            max_bytes: 10 * 1024 * 1024,
+            aggregate_acceptance_cap_bytes: 64 * 1024 * 1024,
+            authorized_roots: vec![AuthorizedRoot {
+                root_class: OutputRootClass::Workspace,
+                root_path: root.to_string_lossy().into_owned(),
+            }],
+            source_generation_owner: SourceGenerationOwner::Agent,
+        };
+        let context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "turn-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let recorder = RecordingDiscoveryOperationRecorder::new();
+
+        let metadata =
+            StdDiscoveryFilesystem::capture_pre_prompt_expected_output_metadata_with_recorder(
+                &spec, &context, &recorder,
+            );
+
+        assert_eq!(metadata.file_type, "directory");
+        assert_eq!(
+            metadata.baseline_status,
+            ExpectedPathBaselineStatus::DirectoryManifestCaptured
+        );
+        assert_eq!(metadata.file_count, Some(1));
+        assert!(metadata.content_digest.is_some());
+        assert!(recorder
+            .operations()
+            .iter()
+            .any(|op| op.kind == DiscoveryOperationKind::ReadDir));
 
         let _ = std::fs::remove_dir_all(root);
     }

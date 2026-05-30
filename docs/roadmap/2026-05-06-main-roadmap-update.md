@@ -110,14 +110,14 @@ That means the boundary should not be treated as fully done until:
 - `ui_operator` / default operator cannot execute non-approval mutations,
 - tests enforce this,
 - old broad mutation permissions are clearly legacy/test/admin-only,
-- P031/P068/P046 align with the reference boundary.
+- P031/P068/session observability align with the reference boundary.
 
 Related docs:
 
 - [UI action boundary](../reference/ui-action-boundary.md)
 - [P068 GraphQL UI boundary proposal](../proposals/068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md)
 - [P081 API/auth contract matrix](../proposals/081-boundary-first-api-auth-contract-matrix.md)
-- [P046 session management GraphQL API](../proposals/046-session-management-graphql-api.md)
+- [Session observability GraphQL readback](../reference/rust-control-plane.md#graphql)
 
 ### 2.2 SQLite write pressure is now a first-class risk
 
@@ -139,18 +139,18 @@ The durable side-effect ledger identifies and guards the risk that retry of rele
 
 Retry automation must fail closed around release/publish/git stages while unresolved side effects exist.
 
-P076/P080 should not perform active repair/retry for side-effect lanes unless the durable ledger readback clears them.
+The auto-retry observation ledger and P080 should not perform active repair/retry for side-effect lanes unless the durable ledger readback clears them.
 
 Related docs:
 
 - [Durable side-effect ledger](../reference/rust-control-plane.md#durable-side-effect-ledger)
-- [P076 auto-retry observation ledger](../proposals/076-auto-retry-observation-ledger-and-recovery-policy.md)
+- [Auto-retry observation ledger](../reference/auto-retry-observation-ledger.md)
 - [P080 continuous stale execution reconciliation](../proposals/080-continuous-stale-execution-reconciliation.md)
 - [Execution truth and recovery](../reference/execution-truth-and-recovery.md)
 
 ### 2.4 P073 and ROADMAP need stronger current alignment
 
-[P073](../proposals/073-stability-freeze-regression-budget-and-refactor-plan.md) should remain a stabilization operating mode, not a normal feature.
+[P073 freeze mode](../ROADMAP.md#operating-mode) should remain a stabilization operating mode, not a normal feature.
 
 [../ROADMAP.md](../ROADMAP.md) should now explicitly include the implemented write-budget contract, the durable side-effect ledger, P079/P080/P081/P082/P083, and the executable rollout-gate template, not only older P031/P038/P046/P068 style work.
 
@@ -162,7 +162,7 @@ Related docs:
 
 #### Step 0 - P073 freeze mode
 
-Run [P073](../proposals/073-stability-freeze-regression-budget-and-refactor-plan.md) as a continuous operating mode.
+Run [P073 freeze mode](../ROADMAP.md#operating-mode) as a continuous operating mode.
 
 Allowed work:
 
@@ -240,7 +240,7 @@ P031 should not own:
 - create/start/cancel/retry/reset/compact/clone,
 - broader dogfood/productization tails.
 
-Those remain [P032](../proposals/032-polish-stabilization-and-productization-backlog.md), [P036](../proposals/036-ux-consolidation-and-navigation-simplification.md), and future work.
+Those remain [P032](../proposals/032-polish-stabilization-and-productization-backlog.md), the implemented [macOS operator navigation baseline](../reference/macos-operator-navigation.md), and future work.
 
 ### 3.4 Parallel infrastructure slice
 
@@ -314,7 +314,7 @@ Minimum rows:
 - late output after supersede,
 - duplicate startup/session.
 
-#### Step 8 - P076 / P080 recovery automation
+#### Step 8 - Auto-retry ledger / P080 recovery automation
 
 Only after the durable side-effect guard exists.
 
@@ -448,7 +448,7 @@ P073
 -> write-budget contract
 -> durable side-effect ledger
 -> P082
--> P076/P080
+-> auto-retry ledger / P080
 -> P079
 -> P031 closeout
 -> P038/P046

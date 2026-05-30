@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents.continuation_candidates.request.schema.json",
+  "title": "agents.continuation_candidates request",
+  "description": "P086: MCP request schema for agents.continuation_candidates (read-only).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id"],
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "description": "UUID of the Run to list continuation candidates for.",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  }
+}

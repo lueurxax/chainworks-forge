@@ -489,6 +489,26 @@ pub async fn list_canonical_by_run(
     Ok(out)
 }
 
+pub async fn consecutive_completed_no_diff_count_by_run(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<usize> {
+    let receipts = list_canonical_by_run(pool, run_id).await?;
+    let mut count = 0;
+    for readback in receipts {
+        let receipt = readback.receipt;
+        if receipt.completion_status != "complete" {
+            break;
+        }
+        if receipt.current_attempt_changed_path_count == 0 {
+            count += 1;
+            continue;
+        }
+        break;
+    }
+    Ok(count)
+}
+
 async fn readback_for_row(
     pool: &SqlitePool,
     row: &sqlx::sqlite::SqliteRow,

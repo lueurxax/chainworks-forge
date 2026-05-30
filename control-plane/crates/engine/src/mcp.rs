@@ -114,8 +114,12 @@ struct RegistryMcpServer {
     command: Option<String>,
     #[serde(default)]
     args: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "envs")]
     env: BTreeMap<String, String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
     #[serde(default)]
     provider: Option<String>,
     #[serde(default, rename = "type")]
@@ -267,6 +271,18 @@ fn resolve_mcp_servers_from_registry(
                 args: entry.args.clone(),
                 env: entry.env.clone(),
             }
+        } else if let Some(url) = entry.url.as_deref().filter(|url| !url.is_empty()) {
+            if matches!(entry.transport_type.as_deref(), Some("sse")) {
+                denied_extensions.push(extension_id.clone());
+                blocking_issues.push(format!(
+                    "MCP extension '{extension_id}' declares SSE transport, which is not supported by ACP session/new."
+                ));
+                continue;
+            }
+            ResolvedMcpServerTransport::Http {
+                url: url.to_string(),
+                headers: entry.headers.clone(),
+            }
         } else if let Some(platform_provider) = entry
             .provider
             .as_deref()
@@ -291,7 +307,8 @@ fn resolve_mcp_servers_from_registry(
         };
 
         if let Some(transport_type) = entry.transport_type.as_deref() {
-            if transport_type != "stdio" && transport_type != "platform" {
+            if transport_type != "stdio" && transport_type != "platform" && transport_type != "http"
+            {
                 warnings.push(format!(
                     "MCP extension '{extension_id}' declares transport type '{transport_type}', resolved from executable fields instead."
                 ));
@@ -574,6 +591,75 @@ mcp:
         let entry = servers.get("filesystem").unwrap();
         assert_eq!(entry.runtime_id.as_deref(), Some("fs-runtime"));
         assert_eq!(entry.command.as_deref(), Some("mcp-filesystem"));
+    }
+
+    #[test]
+    fn resolves_http_registry_entries() {
+        let registry: MachineMcpRegistry = serde_yaml::from_str(
+            r#"
+mcp:
+  backstage:
+    runtime_id: backstage
+    type: http
+    url: https://backstage.example.test/api/mcp
+    headers:
+      Authorization: Bearer secret
+"#,
+        )
+        .unwrap();
+
+        let resolution = resolve_mcp_servers_from_registry(
+            &["backstage".into()],
+            Some("profile-a"),
+            "claude",
+            &registry,
+        );
+
+        assert!(resolution.report.blocking_issues.is_empty());
+        assert_eq!(
+            resolution.report.predicted_effective_extensions,
+            ["backstage"]
+        );
+        assert_eq!(
+            resolution.report.predicted_effective_runtime_ids,
+            ["backstage"]
+        );
+        assert_eq!(resolution.payloads.len(), 1);
+        match &resolution.payloads[0].transport {
+            ResolvedMcpServerTransport::Http { url, headers } => {
+                assert_eq!(url, "https://backstage.example.test/api/mcp");
+                assert_eq!(
+                    headers.get("Authorization").map(String::as_str),
+                    Some("Bearer secret")
+                );
+            }
+            other => panic!("expected HTTP MCP transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_sse_registry_entries_before_session_new() {
+        let registry: MachineMcpRegistry = serde_yaml::from_str(
+            r#"
+mcp:
+  goland:
+    runtime_id: goland
+    type: sse
+    url: http://localhost:64343/sse
+"#,
+        )
+        .unwrap();
+
+        let resolution = resolve_mcp_servers_from_registry(
+            &["goland".into()],
+            Some("profile-a"),
+            "claude",
+            &registry,
+        );
+
+        assert!(resolution.payloads.is_empty());
+        assert_eq!(resolution.report.denied_extensions, ["goland"]);
+        assert!(resolution.report.blocking_issues[0].contains("SSE transport"));
     }
 
     #[test]

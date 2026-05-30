@@ -13,6 +13,8 @@ pub enum WorkItemKind {
     StartupRepair,
     TriggerNextStage,
     StewardAnalysis,
+    /// P086: claim and execute a queued agent_work_continuations row.
+    ProcessContinuation,
 }
 
 impl std::fmt::Display for WorkItemKind {
@@ -25,6 +27,7 @@ impl std::fmt::Display for WorkItemKind {
             WorkItemKind::StartupRepair => write!(f, "startup_repair"),
             WorkItemKind::TriggerNextStage => write!(f, "trigger_next_stage"),
             WorkItemKind::StewardAnalysis => write!(f, "steward_analysis"),
+            WorkItemKind::ProcessContinuation => write!(f, "process_continuation"),
         }
     }
 }
@@ -41,6 +44,7 @@ impl std::str::FromStr for WorkItemKind {
             "startup_repair" => Ok(WorkItemKind::StartupRepair),
             "trigger_next_stage" => Ok(WorkItemKind::TriggerNextStage),
             "steward_analysis" => Ok(WorkItemKind::StewardAnalysis),
+            "process_continuation" => Ok(WorkItemKind::ProcessContinuation),
             other => Err(format!("Unknown WorkItemKind: {other}")),
         }
     }

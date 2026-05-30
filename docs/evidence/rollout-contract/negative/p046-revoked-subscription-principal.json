@@ -1,0 +1,14 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "revoked_subscription_principal",
+  "description": "sessionStatusChanged continues emitting after principal operator-read authorization is revoked or authorization recheck fails transiently.",
+  "hold_condition": "sessionStatusChanged continues emitting after principal operator-read authorization is revoked or authorization recheck fails transiently.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_subscription_continues_after_revocation",
+  "fixture_input": {
+    "initial_principal_class": "Operator",
+    "revocation_step": "downgrade_to_observer",
+    "expected_result": "stream_terminates_with_authorization_recheck_failed_error"
+  }
+}

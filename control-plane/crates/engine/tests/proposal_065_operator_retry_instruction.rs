@@ -70,6 +70,11 @@ fn operator_caller() -> CallerContext {
         principal_class: PrincipalClass::Operator,
         caller_tool: "stages.retry".into(),
         request_id: None,
+        caller_class: None,
+        token_id: None,
+        mcp_idempotency_key: None,
+        mcp_idempotency_request_hash: None,
+        boundary_row_id: None,
     }
 }
 
@@ -80,6 +85,11 @@ fn agent_caller() -> CallerContext {
         principal_class: PrincipalClass::Agent,
         caller_tool: "stages.retry".into(),
         request_id: None,
+        caller_class: None,
+        token_id: None,
+        mcp_idempotency_key: None,
+        mcp_idempotency_request_hash: None,
+        boundary_row_id: None,
     }
 }
 
@@ -514,6 +524,13 @@ async fn p065_targeted_retry_with_instruction_creates_binding_and_child_delivery
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         },
     )
     .await
@@ -667,6 +684,9 @@ async fn p065_repo_helpers_round_trip() {
         Some("operator"),
         Some("stages.retry"),
         None,
+        None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -782,6 +802,9 @@ async fn p065_mark_failed_sets_reason() {
         Some("op-1"),
         Some("operator"),
         Some("stages.retry"),
+        None,
+        None,
+        None,
         None,
     )
     .await

@@ -52,6 +52,7 @@ The gate supports these claims:
 - MCP stdio rejects first-frame non-`initialize` with `-32002`, rejects `initialize` without or with an unknown `principal_token` with `-32000`, binds the resolved principal for session lifetime, and rejects mid-session reinitialize,
 - GraphQL HTTP rejects missing or unknown bearer tokens with HTTP 401 and a GraphQL-shaped error body,
 - GraphQL WebSocket rejects missing or unknown `connection_init` tokens and accepts valid ones via `on_connection_init`,
+- P046 GraphQL resolvers enforce operator-read authorization, scoping access to data for the owning run, and ID-based resolvers implement not-found-or-not-visible behavior for unauthorized lineage/generation ownership,
 - `tools/list` and `resources/list` are class-filtered (operator / agent / observer), including the Steward trio policy,
 - `tools/call` for a denied tool returns `-32601`; `resources/read` for a denied URI returns `-32002`,
 - every command-tool `tools/call` and every GraphQL mutation that invokes `CommandHandler` writes one `command_journal` row with `caller_surface`, non-null `caller_principal_id`, matching `caller_principal_class`, and `caller_tool` set to the tool or mutation name,

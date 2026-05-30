@@ -8,20 +8,24 @@
 //! 2. `packaging::enforce_loopback` — packaged modes rewrite `0.0.0.0`
 //!    overrides to `127.0.0.1` so a stolen bearer token is not usable
 //!    from the LAN (§7.4).
-//! 3. `supervisor::acquire_pid_lock` — advisory singleton per app-support
+//! 3. `supervisor::acquire_database_lock` — authoritative singleton per
+//!    SQLite DB file. This catches mixed launch paths, for example a
+//!    debug `target/debug/control-plane` pointed at the packaged DB and
+//!    the bundled helper trying to start on a fallback port.
+//! 4. `supervisor::acquire_pid_lock` — advisory singleton per app-support
 //!    root (§6.1): `DuplicateHealthy` → exit 0; `AnomalousHolder` →
 //!    exit 75 (`EX_TEMPFAIL`); `Acquired` → continue.
-//! 4. `supervisor::read_crash_budget` — ≥5 crashes within 60 s puts the
+//! 5. `supervisor::read_crash_budget` — ≥5 crashes within 60 s puts the
 //!    daemon into §8.7 failed-serve mode with
 //!    `FailureKind::CrashLoopBudgetExhausted` instead of a normal startup.
-//! 5. `db::migrate::run_preflight` — typed three-branch migration classifier.
+//! 6. `db::migrate::run_preflight` — typed three-branch migration classifier.
 //!    Any error maps (§8.4) to a `FailureKind` and the daemon drops into
 //!    failed-serve mode rather than panicking, so `/health`, `/ready`,
 //!    and `daemonStatus` still report the terminal condition.
-//! 6. `packaging::bind_with_fallback` — try preferred port, fall back to
+//! 7. `packaging::bind_with_fallback` — try preferred port, fall back to
 //!    ephemeral loopback in packaged modes; write the chosen port to
 //!    `daemon.port` so the Swift client can locate us (§7.3).
-//! 7. `packaging::write_build_sha` — record the embedded build SHA for
+//! 8. `packaging::write_build_sha` — record the embedded build SHA for
 //!    the Swift diagnostics bundle (§9.4).
 //!
 //! If any §8.4 terminal condition is hit, the daemon transitions the
@@ -144,6 +148,34 @@ async fn run_daemon() -> Result<()> {
     let reporter = LifecycleReporter::new(binary_schema_version, build_sha, events.clone());
     reporter.set_state(DaemonLifecycleState::Starting);
 
+    // ── DB singleton lock (all file-backed modes) ──────────────────────
+    let _database_lock = match supervisor::acquire_database_lock(&paths.database_url) {
+        Ok(Some(PidLockOutcome::Acquired(lock))) => {
+            info!(path = %lock.path().display(), "database singleton lock acquired");
+            Some(lock)
+        }
+        Ok(Some(PidLockOutcome::DuplicateHealthy { peer_pid })) => {
+            info!(
+                peer_pid,
+                "another daemon already owns this database — singleton policy, exit 0"
+            );
+            return Ok(());
+        }
+        Ok(Some(PidLockOutcome::AnomalousHolder { recorded_pid })) => {
+            error!(
+                recorded_pid,
+                database_url = %paths.database_url,
+                "database singleton lock anomalous: flock held but recorded PID is dead; exit {EX_TEMPFAIL}"
+            );
+            std::process::exit(EX_TEMPFAIL);
+        }
+        Ok(None) => None,
+        Err(e) => {
+            error!(err = %e, "database singleton lock acquisition errored");
+            return Err(anyhow::anyhow!("database singleton lock: {e}"));
+        }
+    };
+
     // ── §6.1 PID lock (packaged modes only) ────────────────────────────
     let _pid_lock = if mode.is_packaged() {
         match supervisor::acquire_pid_lock(&paths.pid_path()) {
@@ -188,6 +220,210 @@ async fn run_daemon() -> Result<()> {
         path = %paths.principals_path.display(),
         "Principal table loaded"
     );
+
+    // P081 Phase 3: Construct the shared immutable BoundaryPolicy service at startup.
+    // One instance is built here and shared (via Arc) across GraphQL, MCP, and approval paths.
+    // Request paths never reload or re-parse the fixture; only daemon restart rebuilds the service.
+    //
+    // CHAINWORKS_BOUNDARY_POLICY: startup-only mode override.
+    //   shadow           — (default) evaluate matrix but do not enforce; violations logged only
+    //   enforce          — matrix decisions are authoritative (requires Phase 4 exit evidence)
+    //   read_only_safe_mode — deny mutations; permit reads with embedded fixture
+    //   legacy/legacy_compat — disable P081 matrix; legacy guards remain authoritative
+    //
+    // CHAINWORKS_BOUNDARY_POLICY_PATH: path to a deployed fixture JSON file.
+    //   If set, daemon attempts to load and validate that fixture first.
+    //   If invalid, daemon falls back to embedded fixture + read_only_safe_mode.
+    let boundary_policy = std::sync::Arc::new({
+        let mode_override = match std::env::var("CHAINWORKS_BOUNDARY_POLICY") {
+            Err(_) => None,
+            Ok(v) => {
+                let parsed = auth::boundary::PolicyMode::from_env_value(&v);
+                if parsed.is_none() {
+                    warn!(
+                        value = %v,
+                        "CHAINWORKS_BOUNDARY_POLICY has unrecognized value; \
+                         entering read_only_safe_mode. Valid: enforce, shadow, \
+                         read_only_safe_mode, legacy_compat"
+                    );
+                }
+                // A set-but-unrecognized value is treated as read_only_safe_mode
+                // so a typo cannot silently fall back to shadow mode.
+                Some(parsed.unwrap_or(auth::boundary::PolicyMode::ReadOnlySafeMode))
+            }
+        };
+
+        // SEC-M001: validate CHAINWORKS_BOUNDARY_POLICY_PATH before reading.
+        // Reject relative paths, non-regular files, symlinks, and paths outside
+        // the trusted boundary fixture root to prevent config injection at startup.
+        // P081 malformed-fixture contract: if the env var is SET but the path is
+        // invalid, enter read_only_safe_mode rather than silently ignoring the var.
+        //
+        // Trusted root: CHAINWORKS_META_ROOT (or ~/.chainworks) plus /boundary/.
+        // Any absolute path that does not have the trusted root as a prefix is
+        // rejected to prevent an env/config injection from pointing the daemon at an
+        // arbitrary valid-but-untrusted fixture file.
+        let raw_fixture_path = std::env::var("CHAINWORKS_BOUNDARY_POLICY_PATH").ok();
+        let trusted_boundary_root: std::path::PathBuf = {
+            let meta_root = std::env::var("CHAINWORKS_META_ROOT")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|h| h.join(".chainworks")))
+                .unwrap_or_else(|| std::path::PathBuf::from(".chainworks"));
+            // Canonicalize best-effort; fall back to the raw joined path if it doesn't exist yet.
+            meta_root
+                .canonicalize()
+                .unwrap_or(meta_root)
+                .join("boundary")
+        };
+        let fixture_path: Option<String> = raw_fixture_path.as_deref().and_then(|p| {
+            let path = std::path::Path::new(p);
+            if !path.is_absolute() {
+                warn!(
+                    path = %p,
+                    "CHAINWORKS_BOUNDARY_POLICY_PATH is not absolute; will enter read_only_safe_mode"
+                );
+                return None;
+            }
+            // Reject if the path is a symlink (check before canonicalize to avoid following it).
+            #[cfg(unix)]
+            {
+                if let Ok(meta) = std::fs::symlink_metadata(path) {
+                    if meta.file_type().is_symlink() {
+                        warn!(
+                            path = %p,
+                            "CHAINWORKS_BOUNDARY_POLICY_PATH is a symlink; will enter read_only_safe_mode"
+                        );
+                        return None;
+                    }
+                }
+            }
+            // SEC-M001: enforce containment within the trusted boundary fixture root.
+            // Canonicalize the supplied path (resolves .. etc.) then check prefix.
+            let canonical = match std::fs::canonicalize(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        path = %p,
+                        err = %e,
+                        "CHAINWORKS_BOUNDARY_POLICY_PATH cannot be canonicalized; \
+                         will enter read_only_safe_mode"
+                    );
+                    return None;
+                }
+            };
+            if !canonical.starts_with(&trusted_boundary_root) {
+                warn!(
+                    path = %p,
+                    canonical = %canonical.display(),
+                    trusted_root = %trusted_boundary_root.display(),
+                    "CHAINWORKS_BOUNDARY_POLICY_PATH is outside trusted boundary fixture root; \
+                     will enter read_only_safe_mode"
+                );
+                return None;
+            }
+            // SEC-M001: use the validated canonical path for the actual read to close
+            // the TOCTOU window between validation and open.
+            Some(canonical.to_string_lossy().into_owned())
+        });
+        // True when the env var was set but the path failed validation above.
+        let fixture_path_set_but_rejected = raw_fixture_path.is_some() && fixture_path.is_none();
+
+        // SEC-M-002: Maximum boundary fixture size (1 MiB). Larger files trigger safe-mode
+        // fallback to prevent startup DoS from an oversized or special file.
+        const MAX_FIXTURE_FILE_BYTES: u64 = 1_048_576;
+
+        // P081 malformed-fixture contract: invalid path → safe_mode, before size check.
+        let policy = if fixture_path_set_but_rejected {
+            warn!(
+                "CHAINWORKS_BOUNDARY_POLICY_PATH was set but path validation failed; \
+                 entering read_only_safe_mode per P081 malformed-fixture contract"
+            );
+            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                auth::boundary::PolicyMode::ReadOnlySafeMode,
+            )
+            .expect("embedded fixture must always be valid")
+        } else {
+            match fixture_path {
+                Some(path) => {
+                    // SEC-M-002: Check file size and regular-file type before reading.
+                    let size_ok = std::fs::metadata(&path)
+                        .map(|m| m.is_file() && m.len() <= MAX_FIXTURE_FILE_BYTES)
+                        .unwrap_or(false);
+                    let read_result = if size_ok {
+                        std::fs::read_to_string(&path).map_err(|e| e.to_string())
+                    } else {
+                        Err(format!(
+                            "fixture file exceeds {} bytes or is not a regular file; entering safe-mode",
+                            MAX_FIXTURE_FILE_BYTES
+                        ))
+                    };
+                    match read_result {
+                        Ok(json) => {
+                            let policy = match mode_override.clone() {
+                                Some(mode) => auth::boundary::BoundaryPolicy::from_deployed_or_safe_mode_with_override(&json, mode),
+                                None => auth::boundary::BoundaryPolicy::from_deployed_or_safe_mode(&json),
+                            };
+                            info!(
+                                path = %path,
+                                mode = %policy.mode(),
+                                fixture_digest = %policy.fixture_digest(),
+                                "BoundaryPolicy service constructed from deployed fixture"
+                            );
+                            policy
+                        }
+                        Err(e) => {
+                            warn!(
+                                path = %path,
+                                err = %e,
+                                "BoundaryPolicy: could not read deployed fixture; falling back to embedded + read_only_safe_mode"
+                            );
+                            auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                                auth::boundary::PolicyMode::ReadOnlySafeMode,
+                            )
+                            .expect("embedded fixture must always be valid")
+                        }
+                    }
+                }
+                None => {
+                    // No deployed fixture path; use embedded fixture with optional mode override.
+                    // Default is shadow (matrix is advisory, legacy guards remain authoritative)
+                    // per docs/reference/boundary-first-api-auth-contract.md:133, until Phase 4
+                    // shadow-coverage gates are met. Enforce requires Phase 4 exit evidence and
+                    // CHAINWORKS_BOUNDARY_POLICY=enforce. ReadOnlySafeMode requires explicit opt-in
+                    // via CHAINWORKS_BOUNDARY_POLICY=read_only_safe_mode.
+                    let policy_mode = mode_override.unwrap_or(auth::boundary::PolicyMode::Shadow);
+                    match auth::boundary::BoundaryPolicy::from_embedded_with_mode(policy_mode) {
+                        Ok(policy) => {
+                            info!(
+                                mode = %policy.mode(),
+                                fixture_digest = %policy.fixture_digest(),
+                                "BoundaryPolicy service constructed from embedded fixture"
+                            );
+                            if matches!(policy.mode(), auth::boundary::PolicyMode::ReadOnlySafeMode)
+                            {
+                                warn!(
+                                    "BoundaryPolicy is in READ_ONLY_SAFE_MODE (explicitly configured). \
+                                     Mutations are denied; reads are served from the embedded fixture. \
+                                     Set CHAINWORKS_BOUNDARY_POLICY=shadow for advisory shadow mode \
+                                     or CHAINWORKS_BOUNDARY_POLICY=enforce after Phase 4 exit evidence."
+                                );
+                            }
+                            policy
+                        }
+                        Err(e) => {
+                            error!(err = %e, "BoundaryPolicy: embedded fixture error; entering read_only_safe_mode");
+                            auth::boundary::BoundaryPolicy::from_deployed_or_safe_mode(
+                                auth::boundary::EMBEDDED_FIXTURE_JSON,
+                            )
+                        }
+                    }
+                }
+            }
+        };
+        policy
+    });
+    // boundary_policy is shared (via Arc) into both McpServer and GraphQL schema below.
 
     // ── §6.2 crash-loop budget: exhausted → failed-serve ───────────────
     if mode.is_packaged() {
@@ -245,6 +481,56 @@ async fn run_daemon() -> Result<()> {
     let db_writer = Arc::new(db::writer::DbWriter::new(pool.clone()));
     db::writer::register_shared_writer(&pool, db_writer.clone()).await?;
 
+    // SEC-M-004: Verify the latest audit checkpoint window before constructing
+    // request-serving components. If tamper_suspected, replace boundary_policy
+    // with a read_only_safe_mode instance so state-changing calls are denied
+    // until an operator confirms or repairs the audit trail.
+    //
+    // This runs after pool open but before cmd_handler / GraphQL / MCP wiring,
+    // so the replacement Arc is the one injected into all consumers below.
+    let boundary_policy = {
+        use db::repos::audit_log::{verify_latest_checkpoint, AuditIntegrityState};
+        let integrity = verify_latest_checkpoint(&pool).await;
+        match &integrity {
+            AuditIntegrityState::TamperSuspected => {
+                error!(
+                    integrity_state = integrity.as_str(),
+                    "Audit checkpoint verification failed: tamper_suspected. \
+                     Entering read_only_safe_mode; state-changing calls denied until \
+                     operator repair or explicit emergency override."
+                );
+                std::sync::Arc::new(
+                    auth::boundary::BoundaryPolicy::from_embedded_with_mode(
+                        auth::boundary::PolicyMode::ReadOnlySafeMode,
+                    )
+                    .expect("embedded fixture must be valid"),
+                )
+            }
+            AuditIntegrityState::Degraded => {
+                warn!(
+                    integrity_state = integrity.as_str(),
+                    "Audit checkpoint verification degraded (covered rows unreadable). \
+                     Continuing with existing policy mode; operator inspection recommended."
+                );
+                boundary_policy
+            }
+            AuditIntegrityState::Verified => {
+                info!(
+                    integrity_state = integrity.as_str(),
+                    "Audit checkpoint verified"
+                );
+                boundary_policy
+            }
+            AuditIntegrityState::NoCheckpoints => {
+                info!(
+                    integrity_state = integrity.as_str(),
+                    "No audit checkpoints yet (normal for fresh install)"
+                );
+                boundary_policy
+            }
+        }
+    };
+
     // ── Steward runtime + control-plane wiring ─────────────────────────
     let steward_config_path = std::env::var("STEWARD_CONFIG_PATH")
         .ok()
@@ -280,14 +566,20 @@ async fn run_daemon() -> Result<()> {
     let acp = Arc::new(AcpRuntimeManager::new());
     let _storage_rollup_handle =
         spawn_storage_write_pressure_rollup(pool.clone(), db_writer.heartbeat.clone());
-    let cmd_handler = Arc::new(CommandHandler::new_with_acp_capacity_and_db_writer(
-        pool.clone(),
-        events.clone(),
-        work_queue.clone(),
-        acp.clone(),
-        domain::provider::InvokeAgentCapacityConfig::default(),
-        Some(db_writer.clone()),
-    ));
+    let _audit_checkpoint_handle = spawn_audit_checkpoint_task(pool.clone());
+    let cmd_handler = Arc::new(
+        CommandHandler::new_with_acp_capacity_and_db_writer(
+            pool.clone(),
+            events.clone(),
+            work_queue.clone(),
+            acp.clone(),
+            domain::provider::InvokeAgentCapacityConfig::default(),
+            Some(db_writer.clone()),
+        )
+        // P081 Phase 3: inject the shared BoundaryPolicy so command transactions
+        // can record accurate policy_mode and fixture_version in audit_log entries.
+        .with_boundary_policy(Arc::clone(&boundary_policy)),
+    );
     let orchestrator = Arc::new(Orchestrator::new_with_db_writer(
         pool.clone(),
         events.clone(),
@@ -381,6 +673,8 @@ async fn run_daemon() -> Result<()> {
             let _executor_watchdog_handle = spawn_background_executor_watchdog(
                 pool.clone(),
                 work_queue.clone(),
+                events.clone(),
+                db_writer.clone(),
                 reporter.clone(),
                 executor_handle,
             );
@@ -389,33 +683,71 @@ async fn run_daemon() -> Result<()> {
             if let Err(e) = packaging::write_build_sha(&paths) {
                 warn!(err = %e, "failed to write build-sha.txt (non-fatal)");
             }
-            let mcp = mcp_server::server::McpServer::new_with_storage_writer(
+            let mcp = mcp_server::server::McpServer::new_with_storage_writer_and_boundary_policy(
                 pool.clone(),
                 cmd_handler.clone(),
                 principal_table,
                 db_writer.heartbeat.clone(),
+                Arc::clone(&boundary_policy),
             );
             mcp.run_stdio().await?;
         }
         _ => {
             // Daemon mode: GraphQL + MCP HTTP on the same port.
-            let mcp = std::sync::Arc::new(mcp_server::server::McpServer::new_with_storage_writer(
-                pool.clone(),
-                cmd_handler.clone(),
-                principal_table.clone(),
-                db_writer.heartbeat.clone(),
-            ));
+            // P081 Phase 3: both servers receive the same shared immutable BoundaryPolicy instance.
+            let mcp = std::sync::Arc::new(
+                mcp_server::server::McpServer::new_with_storage_writer_and_boundary_policy(
+                    pool.clone(),
+                    cmd_handler.clone(),
+                    principal_table.clone(),
+                    db_writer.heartbeat.clone(),
+                    Arc::clone(&boundary_policy),
+                ),
+            );
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");
 
-            let schema = graphql_server::schema::build_schema_with_storage_writer(
-                pool.clone(),
-                cmd_handler.clone(),
-                events.clone(),
-                principal_table.clone(),
-                reporter.clone(),
-                db_writer.heartbeat.clone(),
-            );
+            let (schema, p046_live_handle) =
+                graphql_server::schema::build_schema_with_storage_writer_boundary_policy_and_handle(
+                    pool.clone(),
+                    cmd_handler.clone(),
+                    events.clone(),
+                    principal_table.clone(),
+                    reporter.clone(),
+                    db_writer.heartbeat.clone(),
+                    Arc::clone(&boundary_policy),
+                );
+            // P046: periodically reload principals.json so subscription auth rechecks
+            // observe revocation promptly, without requiring a daemon restart.
+            // Default interval is 2 seconds; override with CHAINWORKS_PRINCIPALS_RELOAD_SECS.
+            let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2);
+            let principals_path_for_reload = paths.principals_path.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(principals_reload_secs))
+                        .await;
+                    match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
+                        Ok(new_table) => {
+                            p046_live_handle.update(new_table).await;
+                            tracing::debug!("P046 principal table reloaded for live revocation");
+                        }
+                        Err(e) => {
+                            // Mark the auth source unavailable so running subscriptions
+                            // terminate fail-closed (authorization_recheck_failed) rather
+                            // than continuing under stale grants after a revocation write
+                            // that we could not observe.
+                            p046_live_handle.mark_unavailable().await;
+                            tracing::warn!(
+                                "P046 principal reload failed; auth source marked unavailable \
+                                 (subscriptions will fail-closed): {e:#}"
+                            );
+                        }
+                    }
+                }
+            });
 
             // §7.3 port fallback: bind the listener here so the
             // 4000→ephemeral fallback + `daemon.port` write runs before the
@@ -464,6 +796,8 @@ async fn run_daemon() -> Result<()> {
             let _executor_watchdog_handle = spawn_background_executor_watchdog(
                 pool.clone(),
                 work_queue.clone(),
+                events.clone(),
+                db_writer.clone(),
                 reporter.clone(),
                 executor_handle,
             );
@@ -582,6 +916,14 @@ async fn run_daemon() -> Result<()> {
                     std::process::exit(EX_TEMPFAIL);
                 }
             }
+
+            // P081 clean-shutdown audit checkpoint: flush the open window (any unchecked
+            // rows, even fewer than 1000) so the checkpoint chain is complete at exit.
+            match db::repos::audit_log::write_checkpoint_if_non_empty(&pool).await {
+                Ok(true) => info!("P081 clean-shutdown audit checkpoint written"),
+                Ok(false) => {}
+                Err(err) => warn!(err = %err, "P081 clean-shutdown audit checkpoint failed"),
+            }
         }
     }
 
@@ -601,6 +943,33 @@ fn spawn_xcode_broker_health_publisher(reporter: LifecycleReporter, pool: Arc<Xc
             ));
         }
     });
+}
+
+/// P081 Phase 1: Background audit checkpoint writer.
+///
+/// Polls every 30 seconds and writes a checkpoint whenever 1000 or more
+/// audit_log rows have accumulated since the last checkpoint window.
+/// Also stamps `checkpoint_id` on covered rows so retention cleanup can run.
+///
+/// Per the P081 contract: checkpoints are written every 1000 rows and at
+/// clean shutdown when the open window is non-empty.
+fn spawn_audit_checkpoint_task(pool: SqlitePool) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match db::repos::audit_log::write_checkpoint_if_needed(&pool).await {
+                Ok(true) => {
+                    info!("P081 audit checkpoint written");
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(err = %err, "P081 audit checkpoint write failed");
+                }
+            }
+        }
+    })
 }
 
 fn spawn_storage_write_pressure_rollup(
@@ -679,6 +1048,8 @@ fn xcode_broker_health_for_lifecycle(
 fn spawn_background_executor_watchdog(
     pool: SqlitePool,
     work_queue: WorkQueue,
+    events: engine::event_bus::EventSender,
+    db_writer: Arc<db::writer::DbWriter>,
     reporter: LifecycleReporter,
     executor_handle: tokio::task::JoinHandle<()>,
 ) -> tokio::task::JoinHandle<()> {
@@ -745,6 +1116,29 @@ fn spawn_background_executor_watchdog(
                 Err(error) => warn!(
                     error = %error,
                     "BackgroundExecutor watchdog failed to inspect stale running AdvanceRun work items"
+                ),
+            }
+
+            let p092_recovery = RecoveryService::new_with_db_writer(
+                pool.clone(),
+                work_queue.clone(),
+                events.clone(),
+                db_writer.clone(),
+            );
+            match p092_recovery
+                .run_p092_retry_payload_recovery_for_active_runs()
+                .await
+            {
+                Ok(0) => {}
+                Ok(repaired) => {
+                    warn!(
+                        repaired,
+                        "BackgroundExecutor watchdog repaired P092 retry payload recovery candidates"
+                    );
+                }
+                Err(error) => warn!(
+                    error = %error,
+                    "BackgroundExecutor watchdog failed to inspect P092 retry payload recovery candidates"
                 ),
             }
 

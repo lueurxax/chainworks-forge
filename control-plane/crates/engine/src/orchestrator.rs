@@ -6,9 +6,9 @@ use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
 
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
-    closeout, ideas, lead_conflict_mediations, projections, retry_stage_execution_authorities,
-    runs, stages, work_items, workflow_conflicts,
+    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
+    artifact_contracts, artifacts, closeout, escalation, ideas, lead_conflict_mediations,
+    projections, retry_stage_execution_authorities, runs, stages, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use domain::agent::{AgentFailureKind, AgentOutputSettlement, AgentStatus};
@@ -22,6 +22,7 @@ use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::events::DomainEvent;
 use domain::ids::{AgentExecutionId, ApprovalId, ArtifactId, RunId, StageExecutionId};
 use domain::proposal_gate_result::{ProposalGateResult, ProposalGateStatus};
+use domain::provider::ProviderFamily;
 use domain::retry_authority::{AdvanceRunPayloadV1, AdvanceRunTargetMode, RetryAuthorityState};
 use domain::run::RunStatus;
 use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
@@ -50,11 +51,45 @@ use db::write_class::WriteLane;
 use db::writer::{class_a_operation, DbWriter};
 use std::sync::Arc;
 
+const P058_LAUNCH_RECYCLE_STORM_WINDOW_SECONDS: i64 = 300;
+const P058_LAUNCH_RECYCLE_STORM_THRESHOLD: i64 = 3;
+
 pub struct Orchestrator {
     pool: SqlitePool,
     events: EventSender,
     work_queue: WorkQueue,
     db_writer: Arc<DbWriter>,
+    p058_force_primary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct P058EscalationProviderOverride {
+    reason: &'static str,
+    from_backend_profile_id: Option<String>,
+    from_provider: String,
+    agent_id: Option<String>,
+    backend_profile_id: String,
+    provider: String,
+    model: Option<String>,
+    effort: Option<String>,
+    max_turns: Option<i64>,
+    temperature: Option<f64>,
+    output_contract: Option<String>,
+    task_outputs: Option<Vec<String>>,
+    declared_outputs: Option<serde_json::Value>,
+    prompt: Option<String>,
+}
+
+fn p058_force_primary_from_env() -> bool {
+    std::env::var("CHAINWORKS_ESCALATION_FORCE_PRIMARY")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 impl Orchestrator {
@@ -74,6 +109,7 @@ impl Orchestrator {
             events,
             work_queue,
             db_writer,
+            p058_force_primary: p058_force_primary_from_env(),
         }
     }
 
@@ -920,6 +956,12 @@ impl Orchestrator {
                                 "All tasks finished — settling stage"
                             );
                             if kind == domain::stage::StageSettlementKind::Failed {
+                                if self
+                                    .schedule_p058_escalation_retry_for_stage(run_id, run, stage)
+                                    .await?
+                                {
+                                    return Ok(());
+                                }
                                 if self
                                     .schedule_auto_contract_output_retry_for_stage(
                                         run_id, run, stage,
@@ -3155,6 +3197,536 @@ impl Orchestrator {
         }
 
         Ok(false)
+    }
+
+    async fn schedule_p058_escalation_retry_for_stage(
+        &self,
+        run_id: RunId,
+        run: &domain::run::Run,
+        stage: &StageExecution,
+    ) -> Result<bool> {
+        let Some(plan) = crate::command_handler::compile_run_plan_from_snapshot(run)? else {
+            return Ok(false);
+        };
+        if plan.escalation_policies.is_empty() {
+            return Ok(false);
+        }
+
+        let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
+        let work_items_for_run = work_items::list_by_run(&self.pool, run_id).await?;
+        let matching_stages = stages::list_by_run(&self.pool, run_id).await?;
+
+        for execution in executions
+            .iter()
+            .filter(|execution| execution.status == AgentStatus::Failed)
+        {
+            let Some(meta) = escalation::find_execution_metadata_for_agent(
+                &self.pool,
+                &execution.id.to_string(),
+            )
+            .await?
+            else {
+                continue;
+            };
+            let Some(ledger) =
+                escalation::find_ledger_by_id(&self.pool, &meta.escalation_ledger_id).await?
+            else {
+                continue;
+            };
+            if ledger.run_id != run_id
+                || ledger.stage_id != stage.stage_id
+                || ledger.agent_id != execution.agent_id
+                || ledger.trigger_raw.is_none()
+            {
+                continue;
+            }
+            let Some(current_tier_id) = ledger.current_tier_id.as_deref() else {
+                continue;
+            };
+            let Some(policy) = plan
+                .escalation_policies
+                .iter()
+                .find(|policy| policy.policy_id == ledger.policy_id)
+            else {
+                continue;
+            };
+            let Some(current_tier) = policy
+                .tiers
+                .iter()
+                .find(|tier| tier.tier_id == current_tier_id)
+            else {
+                continue;
+            };
+            if self.p058_force_primary {
+                self.pause_p058_escalation_stage(
+                    run_id,
+                    stage,
+                    ledger.clone(),
+                    Some(policy.policy_id.as_str()),
+                    Some(current_tier.tier_id.as_str()),
+                    Some(current_tier.kind.as_str()),
+                    "escalation_kill_switch_engaged",
+                    "CHAINWORKS_ESCALATION_FORCE_PRIMARY is enabled; escalation retry suppressed.",
+                    "escalation/kill-switch-engaged",
+                    "orchestrator.P058EscalationKillSwitch",
+                    "escalation.paused",
+                )
+                .await?;
+                return Ok(true);
+            }
+            if matches!(ledger.status_raw.as_str(), "paused" | "exhausted")
+                || current_tier.kind == "pause"
+            {
+                self.pause_p058_escalation_stage(
+                    run_id,
+                    stage,
+                    ledger.clone(),
+                    Some(policy.policy_id.as_str()),
+                    Some(current_tier.tier_id.as_str()),
+                    Some(current_tier.kind.as_str()),
+                    ledger
+                        .pause_reason_raw
+                        .as_deref()
+                        .unwrap_or("escalation_chain_exhausted"),
+                    "Escalation chain is paused or exhausted; legacy retry suppressed.",
+                    "escalation/chain-exhausted",
+                    "orchestrator.P058EscalationPause",
+                    "escalation.paused",
+                )
+                .await?;
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %stage.stage_id,
+                    stage_execution_id = %stage.id,
+                    policy_id = %policy.policy_id,
+                    tier_id = %current_tier.tier_id,
+                    tier_kind = %current_tier.kind,
+                    pause_reason = ?ledger.pause_reason_raw,
+                    "P058 escalation chain is paused/exhausted; suppressing legacy retry"
+                );
+                return Ok(true);
+            }
+
+            if policy.max_chain_wall_clock_seconds > 0 {
+                let elapsed = Utc::now()
+                    .signed_duration_since(ledger.created_at)
+                    .num_seconds()
+                    .max(0) as u64;
+                if elapsed > policy.max_chain_wall_clock_seconds {
+                    self.pause_p058_escalation_stage(
+                        run_id,
+                        stage,
+                        ledger.clone(),
+                        Some(policy.policy_id.as_str()),
+                        Some(current_tier.tier_id.as_str()),
+                        Some(current_tier.kind.as_str()),
+                        "escalation_deadline_elapsed",
+                        "Escalation chain wall-clock deadline has elapsed.",
+                        "escalation/deadline-elapsed",
+                        "orchestrator.P058EscalationDeadline",
+                        "escalation.paused",
+                    )
+                    .await?;
+                    warn!(
+                        run_id = %run_id,
+                        stage_id = %stage.stage_id,
+                        elapsed_seconds = elapsed,
+                        max_seconds = policy.max_chain_wall_clock_seconds,
+                        "P058 escalation chain deadline elapsed; suppressing retry"
+                    );
+                    return Ok(true);
+                }
+            }
+            let now = Utc::now();
+            let recent_launches = escalation::count_recent_metas_by_ledger(
+                &self.pool,
+                &ledger.id,
+                now - chrono::Duration::seconds(P058_LAUNCH_RECYCLE_STORM_WINDOW_SECONDS),
+            )
+            .await?;
+            if recent_launches >= P058_LAUNCH_RECYCLE_STORM_THRESHOLD {
+                self.pause_p058_escalation_stage(
+                    run_id,
+                    stage,
+                    ledger.clone(),
+                    Some(policy.policy_id.as_str()),
+                    Some(current_tier.tier_id.as_str()),
+                    Some(current_tier.kind.as_str()),
+                    "escalation_recovery_inconsistent",
+                    "Escalation launch recycled three times within five minutes; retry chain paused for operator recovery.",
+                    "escalation/recovery-inconsistent",
+                    "orchestrator.P058EscalationLaunchRecycleStorm",
+                    "escalation.launch_recycle_storm",
+                )
+                .await?;
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %stage.stage_id,
+                    ledger_id = %ledger.id,
+                    recent_launches,
+                    window_seconds = P058_LAUNCH_RECYCLE_STORM_WINDOW_SECONDS,
+                    "P058 escalation launch recycle storm detected; suppressing retry"
+                );
+                return Ok(true);
+            }
+            if meta.capacity_probe_counter >= 3 {
+                self.pause_p058_escalation_stage(
+                    run_id,
+                    stage,
+                    ledger.clone(),
+                    Some(policy.policy_id.as_str()),
+                    Some(current_tier.tier_id.as_str()),
+                    Some(current_tier.kind.as_str()),
+                    "capacity_probe_failed",
+                    "Escalation capacity probe failed three consecutive times.",
+                    "escalation/capacity-probe-failed",
+                    "orchestrator.P058EscalationCapacityProbeFailed",
+                    "escalation.paused",
+                )
+                .await?;
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %stage.stage_id,
+                    capacity_probe_counter = meta.capacity_probe_counter,
+                    "P058 escalation capacity probe threshold reached; suppressing retry"
+                );
+                return Ok(true);
+            }
+
+            let runtime_facts =
+                agent_execution_runtime_facts::find_by_execution_id(&self.pool, execution.id)
+                    .await?;
+            if p058_requires_provider_force_detach(runtime_facts.as_ref()) {
+                self.pause_p058_escalation_stage(
+                    run_id,
+                    stage,
+                    ledger.clone(),
+                    Some(policy.policy_id.as_str()),
+                    Some(current_tier.tier_id.as_str()),
+                    Some(current_tier.kind.as_str()),
+                    "provider_session_force_detached",
+                    "Provider subprocess boundary is detached or unrecoverable; retry chain paused until operator recovery.",
+                    "escalation/provider-session-force-detached",
+                    "orchestrator.P058EscalationProviderForceDetach",
+                    "escalation.provider_session_force_detached",
+                )
+                .await?;
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %stage.stage_id,
+                    ledger_id = %ledger.id,
+                    agent_execution_id = %execution.id,
+                    "P058 escalation provider force-detach boundary detected; suppressing retry"
+                );
+                return Ok(true);
+            }
+
+            let stage_execution_id = stage.id.to_string();
+            let agent_execution_id = execution.id.to_string();
+            let Some(source_item) = p058_find_source_invoke_work_item(
+                &work_items_for_run,
+                &stage_execution_id,
+                &execution.agent_id,
+                &agent_execution_id,
+            ) else {
+                continue;
+            };
+
+            let mut retry_payload: serde_json::Value =
+                match serde_json::from_str(&source_item.payload_json) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        warn!(
+                            run_id = %run_id,
+                            stage_id = %stage.stage_id,
+                            agent_id = %execution.agent_id,
+                            source_work_item_id = %source_item.id,
+                            error = %error,
+                            "P058 escalation retry skipped because source payload is invalid"
+                        );
+                        continue;
+                    }
+                };
+
+            let Some(fallback) =
+                p058_escalation_tier_provider_fallback(run, current_tier, &retry_payload)
+            else {
+                continue;
+            };
+            let retry_reason = format!(
+                "p058_escalation_retry:{}:{}",
+                execution.agent_id, current_tier.tier_id
+            );
+            if stage.retry_reason.as_deref() == Some(retry_reason.as_str())
+                || matching_stages.iter().any(|candidate| {
+                    candidate.stage_id == stage.stage_id
+                        && candidate.iteration == stage.iteration
+                        && candidate.retry_reason.as_deref() == Some(retry_reason.as_str())
+                })
+            {
+                continue;
+            }
+
+            let next_attempt_number = matching_stages
+                .iter()
+                .filter(|candidate| candidate.stage_id == stage.stage_id)
+                .map(|candidate| candidate.attempt_number)
+                .max()
+                .unwrap_or(stage.attempt_number)
+                + 1;
+            let now = Utc::now();
+            let new_stage = StageExecution {
+                id: domain::ids::StageExecutionId::new(),
+                run_id,
+                stage_id: stage.stage_id.clone(),
+                label: stage.label.clone(),
+                status: StageStatus::Running,
+                iteration: stage.iteration,
+                attempt_number: next_attempt_number,
+                settlement_kind: None,
+                started_at: now,
+                completed_at: None,
+                owner_agent: stage.owner_agent.clone(),
+                provider: stage.provider.clone(),
+                model: stage.model.clone(),
+                stage_type: stage.stage_type.clone(),
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: Some(retry_reason.clone()),
+            };
+            let retry_work_item_id =
+                format!("p058-escalation-retry:{}:{}", new_stage.id, execution.id);
+            let retry_authority_id = format!("p091-retry-authority:{}", new_stage.id);
+
+            let Some(object) = retry_payload.as_object_mut() else {
+                continue;
+            };
+            object.insert("run_id".into(), serde_json::json!(run_id.to_string()));
+            object.insert("stage_id".into(), serde_json::json!(stage.stage_id));
+            object.insert(
+                "stage_execution_id".into(),
+                serde_json::json!(new_stage.id.to_string()),
+            );
+            object.insert(
+                "retry_authority_id".into(),
+                serde_json::json!(retry_authority_id.clone()),
+            );
+            object.insert(
+                "provider".into(),
+                serde_json::json!(fallback.provider.clone()),
+            );
+            object.insert(
+                "backend_profile_id".into(),
+                serde_json::json!(fallback.backend_profile_id.clone()),
+            );
+            object.insert("model".into(), serde_json::json!(fallback.model.clone()));
+            if let Some(agent_id) = fallback.agent_id.clone() {
+                object.insert("agent_id".into(), serde_json::json!(agent_id));
+            }
+            if let Some(output_contract) = fallback.output_contract.clone() {
+                object.insert("output_contract".into(), serde_json::json!(output_contract));
+            }
+            if let Some(task_outputs) = fallback.task_outputs.clone() {
+                object.insert("task_outputs".into(), serde_json::json!(task_outputs));
+            }
+            if let Some(declared_outputs) = fallback.declared_outputs.clone() {
+                object.insert("declared_outputs".into(), declared_outputs);
+            }
+            if let Some(prompt) = fallback.prompt.clone() {
+                object.insert("prompt".into(), serde_json::json!(prompt));
+            }
+            if let Some(effort) = fallback.effort.clone() {
+                object.insert("effort".into(), serde_json::json!(effort));
+            }
+            if let Some(max_turns) = fallback.max_turns {
+                object.insert("max_turns".into(), serde_json::json!(max_turns));
+            }
+            if let Some(temperature) = fallback.temperature {
+                object.insert("temperature".into(), serde_json::json!(temperature));
+            }
+            object.remove("p058_claimed");
+            object.insert(
+                "targeted_retry".into(),
+                serde_json::json!({
+                    "source_stage_execution_id": stage.id.to_string(),
+                    "source_agent_execution_id": execution.id.to_string(),
+                    "source_work_item_id": source_item.id,
+                    "retry_authority_id": retry_authority_id.clone(),
+                    "reason": "p058_escalation_retry",
+                    "escalation": {
+                        "ledger_id": ledger.id,
+                        "policy_id": ledger.policy_id,
+                        "tier_id": current_tier.tier_id,
+                        "tier_kind_raw": current_tier.kind,
+                        "trigger_raw": ledger.trigger_raw,
+                        "chain_attempt_index": ledger.chain_attempt_index,
+                    },
+                    "provider_fallback": {
+                        "reason": fallback.reason,
+                        "from_backend_profile_id": fallback.from_backend_profile_id,
+                        "from_provider": fallback.from_provider,
+                        "to_backend_profile_id": fallback.backend_profile_id,
+                        "to_provider": fallback.provider,
+                    }
+                }),
+            );
+
+            let tx_started = std::time::Instant::now();
+            let mut tx = self
+                .begin_orchestrator_transaction(
+                    "orchestrator.P058EscalationRetry",
+                    format!("orchestrator.P058EscalationRetry:{}", stage.id),
+                )
+                .await?;
+            stages::settle_tx(&mut tx, stage.id, StageSettlementKind::Skipped, now).await?;
+            stages::insert_tx(&mut tx, &new_stage).await?;
+            retry_stage_execution_authorities::create_active_targeted_agent_retry_tx(
+                &mut tx,
+                run_id,
+                &stage.stage_id,
+                new_stage.id,
+                None,
+                None,
+                retry_work_item_id.clone(),
+                Some(execution.id.to_string()),
+                now,
+            )
+            .await?;
+            work_items::enqueue_tx(
+                &mut tx,
+                &WorkItem {
+                    id: retry_work_item_id,
+                    kind: WorkItemKind::InvokeAgent,
+                    payload_json: serde_json::to_string(&retry_payload)?,
+                    status: WorkItemStatus::Pending,
+                    run_id: Some(run_id),
+                    stage_id: Some(stage.stage_id.clone()),
+                    created_at: now,
+                    scheduled_at: now,
+                    attempt_count: 0,
+                    last_error: None,
+                },
+            )
+            .await?;
+            sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
+                .bind(RunStatus::Running.to_string())
+                .bind(stage.stage_id.as_str())
+                .bind(run_id.to_string())
+                .execute(&mut **tx)
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("orchestrator.P058EscalationRetry", tx_started);
+
+            warn!(
+                run_id = %run_id,
+                stage_id = %stage.stage_id,
+                source_stage_execution_id = %stage.id,
+                retry_stage_execution_id = %new_stage.id,
+                agent_id = %execution.agent_id,
+                policy_id = %policy.policy_id,
+                tier_id = %current_tier.tier_id,
+                tier_kind = %current_tier.kind,
+                to_provider = %fallback.provider,
+                to_backend_profile_id = %fallback.backend_profile_id,
+                "Scheduled P058 escalation retry from durable current tier"
+            );
+            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                run_id,
+                stage_execution_id: stage.id,
+                status: StageStatus::Skipped,
+            });
+            let _ = self.events.send(DomainEvent::StageStatusChanged {
+                run_id,
+                stage_execution_id: new_stage.id,
+                status: StageStatus::Running,
+            });
+            let _ = self.events.send(DomainEvent::RunStatusChanged {
+                run_id,
+                status: RunStatus::Running,
+            });
+            projections::rebuild_all_for_run(&self.pool, run_id).await?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    async fn pause_p058_escalation_stage(
+        &self,
+        run_id: RunId,
+        stage: &StageExecution,
+        mut ledger: domain::escalation::EscalationLedger,
+        policy_id: Option<&str>,
+        tier_id: Option<&str>,
+        tier_kind: Option<&str>,
+        pause_reason: &str,
+        operator_action_hint: &str,
+        runbook_anchor: &str,
+        operation_name: &'static str,
+        event_kind_raw: &'static str,
+    ) -> Result<()> {
+        let now = Utc::now();
+        ledger.status_raw = "paused".to_string();
+        ledger.pause_reason_raw = Some(pause_reason.to_string());
+        ledger.operator_action_hint = Some(operator_action_hint.to_string());
+        ledger.runbook_anchor = Some(runbook_anchor.to_string());
+        ledger.updated_at = now;
+
+        let tx_started = std::time::Instant::now();
+        let mut tx = self
+            .begin_orchestrator_transaction(
+                operation_name,
+                format!("{operation_name}:{}", stage.id),
+            )
+            .await?;
+        escalation::update_ledger_tx(&mut tx, &ledger).await?;
+        escalation::insert_event_tx(
+            &mut tx,
+            &domain::escalation::EscalationEvent {
+                id: format!("p058-pause:{}:{}", ledger.id, now.timestamp_millis()),
+                escalation_ledger_id: ledger.id.clone(),
+                event_kind_raw: event_kind_raw.to_string(),
+                tier_id: tier_id.map(ToOwned::to_owned),
+                tier_kind_raw: tier_kind.map(ToOwned::to_owned),
+                trigger_raw: ledger.trigger_raw.clone(),
+                pause_reason_raw: Some(pause_reason.to_string()),
+                payload_json: Some(
+                    serde_json::json!({
+                        "policy_id": policy_id,
+                        "event_kind_raw": event_kind_raw,
+                        "pause_reason_raw": pause_reason,
+                        "tier_id": tier_id,
+                        "tier_kind_raw": tier_kind,
+                        "trigger_raw": ledger.trigger_raw.clone(),
+                    })
+                    .to_string(),
+                ),
+                redaction_version: Some("redaction_v1".to_string()),
+                created_at: now,
+            },
+        )
+        .await?;
+        stages::settle_tx(&mut tx, stage.id, StageSettlementKind::Failed, now).await?;
+        sqlx::query("UPDATE runs SET status = ?1, current_state = ?2 WHERE id = ?3")
+            .bind(RunStatus::Blocked.to_string())
+            .bind(stage.stage_id.as_str())
+            .bind(run_id.to_string())
+            .execute(&mut **tx)
+            .await?;
+        tx.commit().await?;
+        db::pool::log_write_transaction(operation_name, tx_started);
+        let _ = self.events.send(DomainEvent::StageStatusChanged {
+            run_id,
+            stage_execution_id: stage.id,
+            status: StageStatus::Failed,
+        });
+        let _ = self.events.send(DomainEvent::RunStatusChanged {
+            run_id,
+            status: RunStatus::Blocked,
+        });
+        projections::rebuild_all_for_run(&self.pool, run_id).await?;
+        Ok(())
     }
 
     async fn mark_code_writer_start_status_queued(&self, run_id: RunId) -> Result<()> {
@@ -6489,6 +7061,238 @@ fn same_provider_family_for_health_fallback(left: &str, right: &str) -> bool {
     )
 }
 
+fn p058_escalation_tier_provider_fallback(
+    run: &domain::run::Run,
+    tier: &workflow::plan::EscalationTierSnapshot,
+    retry_payload: &serde_json::Value,
+) -> Option<P058EscalationProviderOverride> {
+    let from_provider = retry_payload
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let from_backend_profile_id = retry_payload
+        .get("backend_profile_id")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+
+    if tier.kind == "same_backend_retry" {
+        return Some(P058EscalationProviderOverride {
+            reason: "p058_same_backend_retry",
+            from_backend_profile_id: from_backend_profile_id.clone(),
+            from_provider: from_provider.clone(),
+            backend_profile_id: from_backend_profile_id?,
+            provider: from_provider,
+            agent_id: retry_payload
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            model: retry_payload
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            effort: retry_payload
+                .get("effort")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            max_turns: retry_payload
+                .get("max_turns")
+                .and_then(serde_json::Value::as_i64),
+            temperature: retry_payload
+                .get("temperature")
+                .and_then(serde_json::Value::as_f64),
+            output_contract: retry_payload
+                .get("output_contract")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            task_outputs: retry_payload
+                .get("task_outputs")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+                        .collect()
+                }),
+            declared_outputs: retry_payload.get("declared_outputs").cloned(),
+            prompt: retry_payload
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+        });
+    }
+
+    let catalog: serde_json::Value =
+        serde_json::from_str(run.catalog_snapshot_json.as_deref()?).ok()?;
+
+    if tier.kind == "lead_mediation" {
+        let lead_agent = catalog.get("agents")?.as_array()?.iter().find(|agent| {
+            agent.get("system_role").and_then(serde_json::Value::as_str) == Some("lead")
+        })?;
+        let lead_agent_id = lead_agent.get("id")?.as_str()?.to_string();
+        let target_backend_profile_id = lead_agent.get("backend_profile")?.as_str()?.to_string();
+        let profile = catalog
+            .get("backend_profiles")?
+            .get(&target_backend_profile_id)?
+            .as_object()?;
+        let provider = profile.get("provider")?.as_str()?.to_string();
+        let lead_resolution_contract_id = lead_agent
+            .get("lead_resolution_contract")
+            .and_then(serde_json::Value::as_str)?
+            .to_string();
+        let lead_resolution_target_path = catalog
+            .get("artifacts")
+            .and_then(|artifacts| artifacts.get("lead_resolution"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("${CHAINWORKS_META_ROOT:-.chainworks}/escalation/lead-resolution.json")
+            .to_string();
+        let lead_contract = catalog
+            .get("contracts")
+            .and_then(|contracts| contracts.get(&lead_resolution_contract_id))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"format": "json"}));
+        let declared_outputs = serde_json::json!([{
+            "output_name": "lead_resolution",
+            "target_path": lead_resolution_target_path,
+            "schema": lead_contract,
+            "reuse_policy": serde_json::Value::Null,
+            "companion_output_name": serde_json::Value::Null,
+            "companion_path": serde_json::Value::Null,
+        }]);
+        let original_agent = retry_payload
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown_agent");
+        let prompt = format!(
+            "You are the system lead agent for a P058 escalation tier. \
+             The previous agent '{original_agent}' failed under escalation tier '{}'. \
+             Review the failure evidence available in the run context and return \
+             lead_resolution through CHAINWORKS_OUTPUT.",
+            tier.tier_id
+        );
+
+        return Some(P058EscalationProviderOverride {
+            reason: "p058_lead_mediation_tier",
+            from_backend_profile_id,
+            from_provider,
+            backend_profile_id: target_backend_profile_id,
+            provider,
+            agent_id: Some(lead_agent_id),
+            model: profile
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            effort: profile
+                .get("effort")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            max_turns: profile.get("max_turns").and_then(serde_json::Value::as_i64),
+            temperature: profile
+                .get("temperature")
+                .and_then(serde_json::Value::as_f64),
+            output_contract: Some(lead_resolution_contract_id),
+            task_outputs: Some(vec!["lead_resolution".to_string()]),
+            declared_outputs: Some(declared_outputs),
+            prompt: Some(prompt),
+        });
+    }
+
+    if tier.kind != "backend_profile" {
+        return None;
+    }
+
+    let target_backend_profile_id = tier.backend_profile_id.as_deref()?;
+    let profile = catalog
+        .get("backend_profiles")?
+        .get(target_backend_profile_id)?
+        .as_object()?;
+    let provider = profile.get("provider")?.as_str()?.to_string();
+
+    Some(P058EscalationProviderOverride {
+        reason: "p058_backend_profile_tier",
+        from_backend_profile_id,
+        from_provider,
+        backend_profile_id: target_backend_profile_id.to_string(),
+        provider,
+        agent_id: None,
+        model: profile
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        effort: profile
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        max_turns: profile.get("max_turns").and_then(serde_json::Value::as_i64),
+        temperature: profile
+            .get("temperature")
+            .and_then(serde_json::Value::as_f64),
+        output_contract: None,
+        task_outputs: None,
+        declared_outputs: None,
+        prompt: None,
+    })
+}
+
+async fn provider_family_quota_wait_active(
+    pool: &SqlitePool,
+    provider: &str,
+    model: Option<&str>,
+) -> Result<bool> {
+    let provider_family = ProviderFamily::canonicalize_known_alias(provider)
+        .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+    let now = Utc::now();
+    if agent_retry_budget_ledger::active_provider_family_quota_wait(
+        pool,
+        provider_family.as_str(),
+        model,
+        now,
+    )
+    .await?
+    .is_some()
+    {
+        return Ok(true);
+    }
+    if model.is_some() {
+        return Ok(
+            agent_retry_budget_ledger::active_provider_family_quota_wait(
+                pool,
+                provider_family.as_str(),
+                None,
+                now,
+            )
+            .await?
+            .is_some(),
+        );
+    }
+    Ok(false)
+}
+
+fn p058_find_source_invoke_work_item<'a>(
+    work_items: &'a [WorkItem],
+    stage_execution_id: &str,
+    agent_id: &str,
+    agent_execution_id: &str,
+) -> Option<&'a WorkItem> {
+    work_items
+        .iter()
+        .filter(|item| item.kind == WorkItemKind::InvokeAgent)
+        .filter_map(|item| {
+            let payload = serde_json::from_str::<serde_json::Value>(&item.payload_json).ok()?;
+            let claimed_agent_execution_id = payload
+                .pointer("/p058_claimed/agent_execution_id")
+                .and_then(|value| value.as_str());
+            let payload_stage_execution_id = payload
+                .get("stage_execution_id")
+                .and_then(|value| value.as_str());
+            let payload_agent_id = payload.get("agent_id").and_then(|value| value.as_str());
+            let matches = claimed_agent_execution_id == Some(agent_execution_id)
+                || (payload_stage_execution_id == Some(stage_execution_id)
+                    && payload_agent_id == Some(agent_id));
+            matches.then_some(item)
+        })
+        .max_by_key(|item| item.created_at)
+}
+
 fn is_code_writer_implementation_output_task(
     agent_id: &str,
     task_outputs: &[String],
@@ -6518,6 +7322,27 @@ fn provider_health_fallback_failure(facts: &domain::agent::AgentExecutionRuntime
             | Some(AgentFailureKind::TransportEpipe)
             | Some(AgentFailureKind::TransportProtocolError)
     ) || facts.output_settlement == AgentOutputSettlement::MissingRequiredOutputs
+}
+
+fn p058_requires_provider_force_detach(
+    facts: Option<&domain::agent::AgentExecutionRuntimeFacts>,
+) -> bool {
+    let Some(facts) = facts else {
+        return false;
+    };
+    matches!(
+        facts.supervision_classification.as_deref(),
+        Some(
+            "provider_session_force_detached" | "force_detach_required" | "shutdown_drain_timeout"
+        )
+    ) || matches!(
+        facts.failure_kind.as_ref(),
+        Some(
+            AgentFailureKind::TransportClosed
+                | AgentFailureKind::TransportEpipe
+                | AgentFailureKind::TransportProtocolError
+        )
+    )
 }
 
 fn run_local_health_fallback_profile_candidates(
@@ -7078,13 +7903,18 @@ fn build_task_prompt(
         parts.push(String::from(
             "Return each required output through the final `CHAINWORKS_OUTPUT` \
              object using the canonical path keys below; the engine will \
-             materialize canonical files after contract validation.",
+             materialize canonical files after contract validation. For large \
+             file/json outputs, write the output directly to the listed canonical \
+             path and return only a small manifest in `CHAINWORKS_OUTPUT`: \
+             `{ \"mode\": \"direct_file\", \"output_name\": \"<name>\", \
+             \"path\": \"<canonical path>\", \"digest\": \"sha256:<digest>\", \
+             \"size_bytes\": <bytes> }`.",
         ));
         parts.push(String::from(
             "Tool stdout is not an output channel. Only the final assistant \
              message is settled for `CHAINWORKS_OUTPUT`. Do not call shell \
-             `echo`, `printf`, or file-writing commands to return \
-             `CHAINWORKS_OUTPUT`.",
+             `echo` or `printf` to return `CHAINWORKS_OUTPUT`; write only the \
+             actual large output file itself when using direct-file mode.",
         ));
         for output_name in &task.outputs {
             let normalized = resolved_artifact_path_for_task(output_name, plan, run, task);
@@ -7129,11 +7959,12 @@ fn build_task_prompt(
             "CRITICAL: Each required output file must contain exactly one \
              top-level JSON object and nothing else.\n\
              - When returning outputs through `CHAINWORKS_OUTPUT`, the value \
-               for each canonical path is treated as that output file content.\n\
+               for each canonical path is treated as that output file content, \
+               unless it is the direct-file manifest shape documented above.\n\
              - Tool stdout is not an output channel; only the final assistant \
                message is settled.\n\
-             - Do not call shell `echo`, `printf`, or file-writing commands \
-               to return `CHAINWORKS_OUTPUT`.\n\
+             - Do not call shell `echo` or `printf` to return \
+               `CHAINWORKS_OUTPUT`.\n\
              - Do NOT wrap the JSON in code fences (```​ or ```json).\n\
              - Do NOT emit markdown, prose, or companion files unless they \
                are explicitly listed as required outputs.\n\
@@ -7209,7 +8040,7 @@ fn build_task_prompt(
                  - Do NOT write files outside the worktree root.\n\
                  - Read source from the worktree, not the original workspace.\n\
                  - Do not commit, push, or modify git state.\n\
-                 - Do not write run artifact outputs directly into the run meta-root; return them through `CHAINWORKS_OUTPUT`.\n\
+                 - Return run artifact outputs through `CHAINWORKS_OUTPUT`; for large outputs, write the canonical file directly and return the direct-file manifest.\n\
                  - Do not rely on implicit working directory."
             ));
         } else {
@@ -7486,10 +8317,10 @@ fn append_task_specific_guidance(
              contents, and continue with the smallest viable edit.",
         ));
         parts.push(String::from(
-            "Do not write run artifact outputs directly into the run meta-root \
-             with shell commands. Required outputs must be returned through the \
-             final `CHAINWORKS_OUTPUT` JSON object so the engine can validate and \
-             materialize them.",
+            "Required outputs must be returned through the final `CHAINWORKS_OUTPUT` \
+             JSON object so the engine can validate and materialize them. For \
+             large outputs, write the canonical file directly and return the \
+             direct-file manifest instead of embedding the full content.",
         ));
         parts.push(String::from(
             "Use the exact canonical output paths from Required Outputs as \
@@ -7499,7 +8330,8 @@ fn append_task_specific_guidance(
         parts.push(String::from(
             "Each `CHAINWORKS_OUTPUT` value must be the full JSON object for that \
              output contract, including every field listed in Structured Output \
-             Requirements. For `implementation_self_assessment_v2`, use \
+             Requirements, unless it is the direct-file manifest for a large \
+             canonical file. For `implementation_self_assessment_v2`, use \
              `implementation_complete`, `verification_green`, \
              `remaining_code_tasks`, `handoff_tasks`, `known_risks`, \
              `tests_run`, and `docs_impacted`; do not use legacy self-assessment \
@@ -7648,6 +8480,47 @@ mod tests {
         CompiledLoop, CompiledState, CompiledTask, CompiledTransition, DegradedOutputPolicy,
         OutputSchema, ResolvedAgent, RunPlan,
     };
+
+    struct EnvVarRestore {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    fn proposal_058_provider_force_detach_detects_detached_transport_boundary() {
+        let execution_id = AgentExecutionId::new();
+        let now = Utc::now();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(execution_id, now);
+        facts.failure_kind = Some(AgentFailureKind::TransportClosed);
+        assert!(p058_requires_provider_force_detach(Some(&facts)));
+
+        facts.failure_kind = None;
+        facts.supervision_classification = Some("shutdown_drain_timeout".into());
+        assert!(p058_requires_provider_force_detach(Some(&facts)));
+
+        facts.supervision_classification = None;
+        facts.failure_kind = Some(AgentFailureKind::MissingRequiredOutputs);
+        assert!(!p058_requires_provider_force_detach(Some(&facts)));
+        assert!(!p058_requires_provider_force_detach(None));
+    }
 
     #[test]
     fn approved_proposal_snapshot_path_is_workspace_relative() {
@@ -7877,6 +8750,7 @@ mod tests {
             dynamic_candidate_bindings: Vec::new(),
             run_plan_snapshot_format_version: None,
             closeout_readiness_mode: None,
+            escalation_policies: Vec::new(),
         }
     }
 
@@ -8544,6 +9418,1193 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn p058_escalation_retry_uses_durable_current_backend_profile_tier() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(64);
+        let orchestrator =
+            Orchestrator::new(pool.clone(), events.clone(), WorkQueue::new(pool.clone()));
+        let run_id = RunId::new();
+        let workflow_json = r#"{
+            "workflow": {"id": "p058_scheduler_retry"},
+            "initial_state": "review",
+            "states": {
+                "review": {
+                    "label": "Review",
+                    "owner": "proposal_reviewer_product_owner",
+                    "type": "end"
+                }
+            }
+        }"#;
+        let catalog_json = r#"{
+            "backend_profiles": {
+                "claude_product_high": {
+                    "provider": "claude_acp",
+                    "model": "sonnet",
+                    "effort": "medium",
+                    "max_turns": 12
+                },
+                "codex_architect_high": {
+                    "provider": "codex_acp",
+                    "model": "gpt-5.5",
+                    "effort": "xhigh",
+                    "max_turns": 16
+                },
+                "lead_profile": {
+                    "provider": "claude_acp",
+                    "model": "sonnet",
+                    "effort": "medium"
+                }
+            },
+            "permission_profiles": {"lead_perm": {}},
+            "contracts": {"lead_contract": {"format": "json"}},
+            "agents": [
+                {
+                    "id": "proposal_reviewer_product_owner",
+                    "backend_profile": "claude_product_high",
+                    "output_contract": "proposal_review_v1"
+                },
+                {
+                    "id": "lead_orchestrator",
+                    "system_role": "lead",
+                    "backend_profile": "lead_profile",
+                    "permission_profile": "lead_perm",
+                    "lead_resolution_contract": "lead_contract"
+                }
+            ],
+            "escalation_policies": [
+                {
+                    "policy_id": "reviewer_escalation",
+                    "schema_version": "escalation_policy_v1",
+                    "enabled_default": true,
+                    "applies_to": {"backend_profile_id": "claude_product_high"},
+                    "max_chain_attempts": 3,
+                    "max_chain_wall_clock_seconds": 1800,
+                    "triggers": ["contract_output_failure"],
+                    "tiers": [
+                        {"tier_id": "primary_retry", "kind": "same_backend_retry", "max_attempts": 1},
+                        {"tier_id": "codex_tier", "kind": "backend_profile", "backend_profile_id": "codex_architect_high", "max_attempts": 1}
+                    ]
+                }
+            ]
+        }"#;
+        let mut run = test_run(run_id);
+        run.workflow_snapshot_json = Some(workflow_json.into());
+        run.catalog_snapshot_json = Some(catalog_json.into());
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage_id = StageExecutionId::new();
+        let stage = StageExecution {
+            id: stage_id,
+            run_id,
+            stage_id: "review".into(),
+            label: "review".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let failed_exec_id = AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+                started_at, completed_at, owner_kind, owner_id,
+                escalation_policy_id, escalation_policy_hash, escalation_tier_id,
+                escalation_tier_kind_raw, escalation_trigger_raw, escalation_digest_version,
+                escalation_ledger_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'failed', ?7, ?8, 'stage_execution', ?2,
+                       'reviewer_escalation', 'sha256:p058-test', 'primary_retry',
+                       'same_backend_retry', 'contract_output_failure',
+                       'escalation_blocker_digest_v1', 'ledger-p058-scheduler')"#,
+        )
+        .bind(failed_exec_id.to_string())
+        .bind(stage_id.to_string())
+        .bind("proposal_reviewer_product_owner")
+        .bind("claude_acp")
+        .bind("claude")
+        .bind("sonnet")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(failed_exec_id, Utc::now());
+        facts.failure_kind = Some(AgentFailureKind::MissingRequiredOutputs);
+        facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+        agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        escalation::insert_ledger(
+            &pool,
+            &domain::escalation::EscalationLedger {
+                id: "ledger-p058-scheduler".into(),
+                run_id,
+                stage_id: "review".into(),
+                agent_id: "proposal_reviewer_product_owner".into(),
+                policy_id: "reviewer_escalation".into(),
+                policy_hash: "sha256:p058-test".into(),
+                status_raw: "active".into(),
+                current_tier_id: Some("codex_tier".into()),
+                current_tier_kind_raw: Some("backend_profile".into()),
+                chain_attempt_index: 1,
+                trigger_raw: Some("contract_output_failure".into()),
+                pause_reason_raw: None,
+                operator_action_hint: None,
+                runbook_anchor: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        escalation::insert_execution_metadata(
+            &pool,
+            &domain::escalation::EscalationExecutionMetadata {
+                agent_execution_id: failed_exec_id,
+                escalation_ledger_id: "ledger-p058-scheduler".into(),
+                tier_id: "primary_retry".into(),
+                tier_kind_raw: "same_backend_retry".into(),
+                tier_attempt_index: 0,
+                trigger_raw: Some("contract_output_failure".into()),
+                digest_version: Some("escalation_blocker_digest_v1".into()),
+                capacity_probe_counter: 0,
+                created_at: now,
+                updated_at: now,
+                would_select_tier_id: None,
+                would_select_trigger_raw: None,
+                would_select_decision_json: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        db::repos::work_items::enqueue(
+            &pool,
+            &db::work_item::WorkItem {
+                id: format!("p058-invoke:{stage_id}:0"),
+                kind: db::work_item::WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "review",
+                    "stage_execution_id": stage_id.to_string(),
+                    "agent_id": "proposal_reviewer_product_owner",
+                    "provider": "claude_acp",
+                    "backend_profile_id": "claude_product_high",
+                    "model": "sonnet",
+                    "effort": "medium",
+                    "max_turns": 12,
+                    "output_contract": "proposal_review_v1",
+                    "task_outputs": ["proposal_review_po"],
+                    "p058_claimed": {
+                        "agent_execution_id": failed_exec_id.to_string()
+                    }
+                })
+                .to_string(),
+                status: db::work_item::WorkItemStatus::Completed,
+                run_id: Some(run_id),
+                stage_id: Some("review".into()),
+                created_at: Utc::now(),
+                scheduled_at: Utc::now(),
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let scheduled = orchestrator
+            .schedule_p058_escalation_retry_for_stage(run_id, &run, &stage)
+            .await
+            .unwrap();
+
+        assert!(scheduled);
+        let stages = stages::list_by_run(&pool, run_id).await.unwrap();
+        let retry_stage = stages
+            .iter()
+            .find(|candidate| {
+                candidate.retry_reason.as_deref().is_some_and(|reason| {
+                    reason == "p058_escalation_retry:proposal_reviewer_product_owner:codex_tier"
+                })
+            })
+            .expect("P058 escalation retry stage should be created");
+        assert_eq!(retry_stage.status, StageStatus::Running);
+        let old_stage = stages
+            .iter()
+            .find(|candidate| candidate.id == stage_id)
+            .unwrap();
+        assert_eq!(old_stage.status, StageStatus::Skipped);
+
+        let retry_invokes: Vec<_> = db::repos::work_items::list_by_run(&pool, run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| {
+                item.kind == db::work_item::WorkItemKind::InvokeAgent
+                    && item.status == db::work_item::WorkItemStatus::Pending
+            })
+            .collect();
+        assert_eq!(retry_invokes.len(), 1);
+        let payload: serde_json::Value =
+            serde_json::from_str(&retry_invokes[0].payload_json).unwrap();
+        assert_eq!(payload["provider"], serde_json::json!("codex_acp"));
+        assert_eq!(
+            payload["backend_profile_id"],
+            serde_json::json!("codex_architect_high")
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/reason"),
+            Some(&serde_json::json!("p058_escalation_retry"))
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/escalation/tier_id"),
+            Some(&serde_json::json!("codex_tier"))
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/escalation/trigger_raw"),
+            Some(&serde_json::json!("contract_output_failure"))
+        );
+        assert_eq!(
+            payload.pointer("/targeted_retry/provider_fallback/reason"),
+            Some(&serde_json::json!("p058_backend_profile_tier"))
+        );
+    }
+
+    #[tokio::test]
+    async fn proposal_058_force_primary_kill_switch_blocks_escalation_retry() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(64);
+        let env = EnvVarRestore::set("CHAINWORKS_ESCALATION_FORCE_PRIMARY", "1");
+        let orchestrator =
+            Orchestrator::new(pool.clone(), events.clone(), WorkQueue::new(pool.clone()));
+        drop(env);
+        let run_id = RunId::new();
+        let workflow_json = r#"{
+            "workflow": {"id": "p058_force_primary"},
+            "initial_state": "review",
+            "states": {
+                "review": {
+                    "label": "Review",
+                    "owner": "proposal_reviewer_product_owner",
+                    "type": "end"
+                }
+            }
+        }"#;
+        let catalog_json = r#"{
+            "backend_profiles": {
+                "claude_product_high": {"provider": "claude_acp", "model": "sonnet"},
+                "lead_profile": {"provider": "claude_acp", "model": "sonnet"},
+                "codex_architect_high": {"provider": "codex_acp", "model": "gpt-5.5"}
+            },
+            "permission_profiles": {"lead_perm": {}},
+            "contracts": {"lead_contract": {"format": "json"}},
+            "agents": [
+                {
+                    "id": "proposal_reviewer_product_owner",
+                    "backend_profile": "claude_product_high",
+                    "output_contract": "proposal_review_v1"
+                },
+                {
+                    "id": "lead_orchestrator",
+                    "system_role": "lead",
+                    "backend_profile": "lead_profile",
+                    "permission_profile": "lead_perm",
+                    "lead_resolution_contract": "lead_contract"
+                }
+            ],
+            "escalation_policies": [
+                {
+                    "policy_id": "reviewer_escalation",
+                    "schema_version": "escalation_policy_v1",
+                    "enabled_default": true,
+                    "applies_to": {"backend_profile_id": "claude_product_high"},
+                    "max_chain_attempts": 3,
+                    "max_chain_wall_clock_seconds": 1800,
+                    "triggers": ["contract_output_failure"],
+                    "tiers": [
+                        {"tier_id": "primary_retry", "kind": "same_backend_retry", "max_attempts": 1},
+                        {"tier_id": "codex_tier", "kind": "backend_profile", "backend_profile_id": "codex_architect_high", "max_attempts": 1}
+                    ]
+                }
+            ]
+        }"#;
+        let mut run = test_run(run_id);
+        run.workflow_snapshot_json = Some(workflow_json.into());
+        run.catalog_snapshot_json = Some(catalog_json.into());
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage_id = StageExecutionId::new();
+        let stage = StageExecution {
+            id: stage_id,
+            run_id,
+            stage_id: "review".into(),
+            label: "review".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let failed_exec_id = AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+                started_at, completed_at, owner_kind, owner_id,
+                escalation_policy_id, escalation_policy_hash, escalation_tier_id,
+                escalation_tier_kind_raw, escalation_trigger_raw, escalation_digest_version,
+                escalation_ledger_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'failed', ?7, ?8, 'stage_execution', ?2,
+                       'reviewer_escalation', 'sha256:p058-force', 'primary_retry',
+                       'same_backend_retry', 'contract_output_failure',
+                       'escalation_blocker_digest_v1', 'ledger-p058-force')"#,
+        )
+        .bind(failed_exec_id.to_string())
+        .bind(stage_id.to_string())
+        .bind("proposal_reviewer_product_owner")
+        .bind("claude_acp")
+        .bind("claude")
+        .bind("sonnet")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let now = Utc::now();
+        escalation::insert_ledger(
+            &pool,
+            &domain::escalation::EscalationLedger {
+                id: "ledger-p058-force".into(),
+                run_id,
+                stage_id: "review".into(),
+                agent_id: "proposal_reviewer_product_owner".into(),
+                policy_id: "reviewer_escalation".into(),
+                policy_hash: "sha256:p058-force".into(),
+                status_raw: "active".into(),
+                current_tier_id: Some("codex_tier".into()),
+                current_tier_kind_raw: Some("backend_profile".into()),
+                chain_attempt_index: 1,
+                trigger_raw: Some("contract_output_failure".into()),
+                pause_reason_raw: None,
+                operator_action_hint: None,
+                runbook_anchor: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        escalation::insert_execution_metadata(
+            &pool,
+            &domain::escalation::EscalationExecutionMetadata {
+                agent_execution_id: failed_exec_id,
+                escalation_ledger_id: "ledger-p058-force".into(),
+                tier_id: "primary_retry".into(),
+                tier_kind_raw: "same_backend_retry".into(),
+                tier_attempt_index: 0,
+                trigger_raw: Some("contract_output_failure".into()),
+                digest_version: Some("escalation_blocker_digest_v1".into()),
+                capacity_probe_counter: 0,
+                created_at: now,
+                updated_at: now,
+                would_select_tier_id: None,
+                would_select_trigger_raw: None,
+                would_select_decision_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::repos::work_items::enqueue(
+            &pool,
+            &db::work_item::WorkItem {
+                id: format!("p058-force-invoke:{stage_id}:0"),
+                kind: db::work_item::WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "review",
+                    "stage_execution_id": stage_id.to_string(),
+                    "agent_id": "proposal_reviewer_product_owner",
+                    "provider": "claude_acp",
+                    "backend_profile_id": "claude_product_high",
+                    "model": "sonnet",
+                    "p058_claimed": {
+                        "agent_execution_id": failed_exec_id.to_string()
+                    }
+                })
+                .to_string(),
+                status: db::work_item::WorkItemStatus::Completed,
+                run_id: Some(run_id),
+                stage_id: Some("review".into()),
+                created_at: Utc::now(),
+                scheduled_at: Utc::now(),
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let handled = orchestrator
+            .schedule_p058_escalation_retry_for_stage(run_id, &run, &stage)
+            .await
+            .unwrap();
+
+        assert!(handled);
+        let refreshed_run = runs::find_by_id(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("run must remain readable");
+        assert_eq!(refreshed_run.status, RunStatus::Blocked);
+        let refreshed_ledger = escalation::find_ledger_by_id(&pool, "ledger-p058-force")
+            .await
+            .unwrap()
+            .expect("ledger must remain readable");
+        assert_eq!(refreshed_ledger.status_raw, "paused");
+        assert_eq!(
+            refreshed_ledger.pause_reason_raw.as_deref(),
+            Some("escalation_kill_switch_engaged")
+        );
+        let pending_invokes = db::repos::work_items::list_by_run(&pool, run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| {
+                item.kind == db::work_item::WorkItemKind::InvokeAgent
+                    && item.status == db::work_item::WorkItemStatus::Pending
+            })
+            .count();
+        assert_eq!(pending_invokes, 0);
+    }
+
+    #[tokio::test]
+    async fn proposal_058_chain_deadline_elapsed_blocks_escalation_retry() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(64);
+        let orchestrator =
+            Orchestrator::new(pool.clone(), events.clone(), WorkQueue::new(pool.clone()));
+        let run_id = RunId::new();
+        let workflow_json = r#"{
+            "workflow": {"id": "p058_deadline"},
+            "initial_state": "review",
+            "states": {
+                "review": {
+                    "label": "Review",
+                    "owner": "proposal_reviewer_product_owner",
+                    "type": "end"
+                }
+            }
+        }"#;
+        let catalog_json = r#"{
+            "backend_profiles": {
+                "claude_product_high": {"provider": "claude_acp", "model": "sonnet"},
+                "lead_profile": {"provider": "claude_acp", "model": "sonnet"},
+                "codex_architect_high": {"provider": "codex_acp", "model": "gpt-5.5"}
+            },
+            "permission_profiles": {"lead_perm": {}},
+            "contracts": {"lead_contract": {"format": "json"}},
+            "agents": [
+                {
+                    "id": "proposal_reviewer_product_owner",
+                    "backend_profile": "claude_product_high",
+                    "output_contract": "proposal_review_v1"
+                },
+                {
+                    "id": "lead_orchestrator",
+                    "system_role": "lead",
+                    "backend_profile": "lead_profile",
+                    "permission_profile": "lead_perm",
+                    "lead_resolution_contract": "lead_contract"
+                }
+            ],
+            "escalation_policies": [
+                {
+                    "policy_id": "reviewer_escalation",
+                    "schema_version": "escalation_policy_v1",
+                    "enabled_default": true,
+                    "applies_to": {"backend_profile_id": "claude_product_high"},
+                    "max_chain_attempts": 3,
+                    "max_chain_wall_clock_seconds": 10,
+                    "triggers": ["contract_output_failure"],
+                    "tiers": [
+                        {"tier_id": "primary_retry", "kind": "same_backend_retry", "max_attempts": 1},
+                        {"tier_id": "codex_tier", "kind": "backend_profile", "backend_profile_id": "codex_architect_high", "max_attempts": 1}
+                    ]
+                }
+            ]
+        }"#;
+        let mut run = test_run(run_id);
+        run.workflow_snapshot_json = Some(workflow_json.into());
+        run.catalog_snapshot_json = Some(catalog_json.into());
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage_id = StageExecutionId::new();
+        let stage = StageExecution {
+            id: stage_id,
+            run_id,
+            stage_id: "review".into(),
+            label: "review".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let failed_exec_id = AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+                started_at, completed_at, owner_kind, owner_id,
+                escalation_policy_id, escalation_policy_hash, escalation_tier_id,
+                escalation_tier_kind_raw, escalation_trigger_raw, escalation_digest_version,
+                escalation_ledger_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'failed', ?7, ?8, 'stage_execution', ?2,
+                       'reviewer_escalation', 'sha256:p058-deadline', 'primary_retry',
+                       'same_backend_retry', 'contract_output_failure',
+                       'escalation_blocker_digest_v1', 'ledger-p058-deadline')"#,
+        )
+        .bind(failed_exec_id.to_string())
+        .bind(stage_id.to_string())
+        .bind("proposal_reviewer_product_owner")
+        .bind("claude_acp")
+        .bind("claude")
+        .bind("sonnet")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let now = Utc::now();
+        let stale_created_at = now - chrono::Duration::seconds(11);
+        escalation::insert_ledger(
+            &pool,
+            &domain::escalation::EscalationLedger {
+                id: "ledger-p058-deadline".into(),
+                run_id,
+                stage_id: "review".into(),
+                agent_id: "proposal_reviewer_product_owner".into(),
+                policy_id: "reviewer_escalation".into(),
+                policy_hash: "sha256:p058-deadline".into(),
+                status_raw: "active".into(),
+                current_tier_id: Some("codex_tier".into()),
+                current_tier_kind_raw: Some("backend_profile".into()),
+                chain_attempt_index: 1,
+                trigger_raw: Some("contract_output_failure".into()),
+                pause_reason_raw: None,
+                operator_action_hint: None,
+                runbook_anchor: None,
+                created_at: stale_created_at,
+                updated_at: stale_created_at,
+            },
+        )
+        .await
+        .unwrap();
+        escalation::insert_execution_metadata(
+            &pool,
+            &domain::escalation::EscalationExecutionMetadata {
+                agent_execution_id: failed_exec_id,
+                escalation_ledger_id: "ledger-p058-deadline".into(),
+                tier_id: "primary_retry".into(),
+                tier_kind_raw: "same_backend_retry".into(),
+                tier_attempt_index: 0,
+                trigger_raw: Some("contract_output_failure".into()),
+                digest_version: Some("escalation_blocker_digest_v1".into()),
+                capacity_probe_counter: 0,
+                created_at: stale_created_at,
+                updated_at: stale_created_at,
+                would_select_tier_id: None,
+                would_select_trigger_raw: None,
+                would_select_decision_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::repos::work_items::enqueue(
+            &pool,
+            &db::work_item::WorkItem {
+                id: format!("p058-deadline-invoke:{stage_id}:0"),
+                kind: db::work_item::WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "review",
+                    "stage_execution_id": stage_id.to_string(),
+                    "agent_id": "proposal_reviewer_product_owner",
+                    "provider": "claude_acp",
+                    "backend_profile_id": "claude_product_high",
+                    "model": "sonnet",
+                    "p058_claimed": {
+                        "agent_execution_id": failed_exec_id.to_string()
+                    }
+                })
+                .to_string(),
+                status: db::work_item::WorkItemStatus::Completed,
+                run_id: Some(run_id),
+                stage_id: Some("review".into()),
+                created_at: stale_created_at,
+                scheduled_at: stale_created_at,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let handled = orchestrator
+            .schedule_p058_escalation_retry_for_stage(run_id, &run, &stage)
+            .await
+            .unwrap();
+
+        assert!(handled);
+        let refreshed_run = runs::find_by_id(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("run must remain readable");
+        assert_eq!(refreshed_run.status, RunStatus::Blocked);
+        let refreshed_ledger = escalation::find_ledger_by_id(&pool, "ledger-p058-deadline")
+            .await
+            .unwrap()
+            .expect("ledger must remain readable");
+        assert_eq!(refreshed_ledger.status_raw, "paused");
+        assert_eq!(
+            refreshed_ledger.pause_reason_raw.as_deref(),
+            Some("escalation_deadline_elapsed")
+        );
+        let pending_invokes = db::repos::work_items::list_by_run(&pool, run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| {
+                item.kind == db::work_item::WorkItemKind::InvokeAgent
+                    && item.status == db::work_item::WorkItemStatus::Pending
+            })
+            .count();
+        assert_eq!(pending_invokes, 0);
+    }
+
+    #[tokio::test]
+    async fn proposal_058_capacity_probe_threshold_blocks_escalation_retry() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(64);
+        let orchestrator =
+            Orchestrator::new(pool.clone(), events.clone(), WorkQueue::new(pool.clone()));
+        let run_id = RunId::new();
+        let workflow_json = r#"{
+            "workflow": {"id": "p058_capacity_probe"},
+            "initial_state": "review",
+            "states": {
+                "review": {
+                    "label": "Review",
+                    "owner": "proposal_reviewer_product_owner",
+                    "type": "end"
+                }
+            }
+        }"#;
+        let catalog_json = r#"{
+            "backend_profiles": {
+                "claude_product_high": {"provider": "claude_acp", "model": "sonnet"},
+                "lead_profile": {"provider": "claude_acp", "model": "sonnet"},
+                "codex_architect_high": {"provider": "codex_acp", "model": "gpt-5.5"}
+            },
+            "permission_profiles": {"lead_perm": {}},
+            "contracts": {"lead_contract": {"format": "json"}},
+            "agents": [
+                {
+                    "id": "proposal_reviewer_product_owner",
+                    "backend_profile": "claude_product_high",
+                    "output_contract": "proposal_review_v1"
+                },
+                {
+                    "id": "lead_orchestrator",
+                    "system_role": "lead",
+                    "backend_profile": "lead_profile",
+                    "permission_profile": "lead_perm",
+                    "lead_resolution_contract": "lead_contract"
+                }
+            ],
+            "escalation_policies": [
+                {
+                    "policy_id": "reviewer_escalation",
+                    "schema_version": "escalation_policy_v1",
+                    "enabled_default": true,
+                    "applies_to": {"backend_profile_id": "claude_product_high"},
+                    "max_chain_attempts": 3,
+                    "max_chain_wall_clock_seconds": 1800,
+                    "triggers": ["contract_output_failure"],
+                    "tiers": [
+                        {"tier_id": "primary_retry", "kind": "same_backend_retry", "max_attempts": 1},
+                        {"tier_id": "codex_tier", "kind": "backend_profile", "backend_profile_id": "codex_architect_high", "max_attempts": 1}
+                    ]
+                }
+            ]
+        }"#;
+        let mut run = test_run(run_id);
+        run.workflow_snapshot_json = Some(workflow_json.into());
+        run.catalog_snapshot_json = Some(catalog_json.into());
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage_id = StageExecutionId::new();
+        let stage = StageExecution {
+            id: stage_id,
+            run_id,
+            stage_id: "review".into(),
+            label: "review".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let failed_exec_id = AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+                started_at, completed_at, owner_kind, owner_id,
+                escalation_policy_id, escalation_policy_hash, escalation_tier_id,
+                escalation_tier_kind_raw, escalation_trigger_raw, escalation_digest_version,
+                escalation_ledger_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'failed', ?7, ?8, 'stage_execution', ?2,
+                       'reviewer_escalation', 'sha256:p058-capacity', 'primary_retry',
+                       'same_backend_retry', 'contract_output_failure',
+                       'escalation_blocker_digest_v1', 'ledger-p058-capacity')"#,
+        )
+        .bind(failed_exec_id.to_string())
+        .bind(stage_id.to_string())
+        .bind("proposal_reviewer_product_owner")
+        .bind("claude_acp")
+        .bind("claude")
+        .bind("sonnet")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let now = Utc::now();
+        escalation::insert_ledger(
+            &pool,
+            &domain::escalation::EscalationLedger {
+                id: "ledger-p058-capacity".into(),
+                run_id,
+                stage_id: "review".into(),
+                agent_id: "proposal_reviewer_product_owner".into(),
+                policy_id: "reviewer_escalation".into(),
+                policy_hash: "sha256:p058-capacity".into(),
+                status_raw: "active".into(),
+                current_tier_id: Some("codex_tier".into()),
+                current_tier_kind_raw: Some("backend_profile".into()),
+                chain_attempt_index: 1,
+                trigger_raw: Some("contract_output_failure".into()),
+                pause_reason_raw: None,
+                operator_action_hint: None,
+                runbook_anchor: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        escalation::insert_execution_metadata(
+            &pool,
+            &domain::escalation::EscalationExecutionMetadata {
+                agent_execution_id: failed_exec_id,
+                escalation_ledger_id: "ledger-p058-capacity".into(),
+                tier_id: "primary_retry".into(),
+                tier_kind_raw: "same_backend_retry".into(),
+                tier_attempt_index: 0,
+                trigger_raw: Some("contract_output_failure".into()),
+                digest_version: Some("escalation_blocker_digest_v1".into()),
+                capacity_probe_counter: 3,
+                created_at: now,
+                updated_at: now,
+                would_select_tier_id: None,
+                would_select_trigger_raw: None,
+                would_select_decision_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::repos::work_items::enqueue(
+            &pool,
+            &db::work_item::WorkItem {
+                id: format!("p058-capacity-invoke:{stage_id}:0"),
+                kind: db::work_item::WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "review",
+                    "stage_execution_id": stage_id.to_string(),
+                    "agent_id": "proposal_reviewer_product_owner",
+                    "provider": "claude_acp",
+                    "backend_profile_id": "claude_product_high",
+                    "model": "sonnet",
+                    "p058_claimed": {
+                        "agent_execution_id": failed_exec_id.to_string()
+                    }
+                })
+                .to_string(),
+                status: db::work_item::WorkItemStatus::Completed,
+                run_id: Some(run_id),
+                stage_id: Some("review".into()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let handled = orchestrator
+            .schedule_p058_escalation_retry_for_stage(run_id, &run, &stage)
+            .await
+            .unwrap();
+
+        assert!(handled);
+        let refreshed_run = runs::find_by_id(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("run must remain readable");
+        assert_eq!(refreshed_run.status, RunStatus::Blocked);
+        let refreshed_ledger = escalation::find_ledger_by_id(&pool, "ledger-p058-capacity")
+            .await
+            .unwrap()
+            .expect("ledger must remain readable");
+        assert_eq!(refreshed_ledger.status_raw, "paused");
+        assert_eq!(
+            refreshed_ledger.pause_reason_raw.as_deref(),
+            Some("capacity_probe_failed")
+        );
+        let pending_invokes = db::repos::work_items::list_by_run(&pool, run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| {
+                item.kind == db::work_item::WorkItemKind::InvokeAgent
+                    && item.status == db::work_item::WorkItemStatus::Pending
+            })
+            .count();
+        assert_eq!(pending_invokes, 0);
+    }
+
+    #[test]
+    fn proposal_058_lead_mediation_tier_resolves_system_lead_from_frozen_catalog_snapshot() {
+        let run_id = RunId::new();
+        let mut run = test_run(run_id);
+        run.catalog_snapshot_json = Some(
+            serde_json::json!({
+                "backend_profiles": {
+                    "claude_product_high": {
+                        "provider": "claude_acp",
+                        "model": "sonnet",
+                        "effort": "medium"
+                    },
+                    "lead_profile": {
+                        "provider": "codex_acp",
+                        "model": "gpt-5.5",
+                        "effort": "high",
+                        "max_turns": 9
+                    }
+                },
+                "contracts": {
+                    "lead_contract": {
+                        "contract_id": "lead_contract",
+                        "format": "json",
+                        "required_fields": ["decision"]
+                    }
+                },
+                "artifacts": {
+                    "lead_resolution": "${CHAINWORKS_META_ROOT:-.chainworks}/escalation/lead-resolution.json"
+                },
+                "agents": [
+                    {
+                        "id": "proposal_reviewer_product_owner",
+                        "backend_profile": "claude_product_high",
+                        "output_contract": "proposal_review_v1"
+                    },
+                    {
+                        "id": "lead_orchestrator",
+                        "system_role": "lead",
+                        "backend_profile": "lead_profile",
+                        "permission_profile": "lead_perm",
+                        "lead_resolution_contract": "lead_contract"
+                    }
+                ]
+            })
+            .to_string(),
+        );
+        let tier = workflow::plan::EscalationTierSnapshot {
+            tier_id: "lead_review".into(),
+            kind: "lead_mediation".into(),
+            backend_profile_id: None,
+            max_attempts: Some(1),
+        };
+        let retry_payload = serde_json::json!({
+            "agent_id": "proposal_reviewer_product_owner",
+            "provider": "claude_acp",
+            "backend_profile_id": "claude_product_high",
+            "model": "sonnet",
+            "output_contract": "proposal_review_v1",
+            "task_outputs": ["proposal_review_po"]
+        });
+
+        let fallback = p058_escalation_tier_provider_fallback(&run, &tier, &retry_payload)
+            .expect("lead mediation tier should resolve through frozen system lead");
+
+        assert_eq!(fallback.reason, "p058_lead_mediation_tier");
+        assert_eq!(fallback.agent_id.as_deref(), Some("lead_orchestrator"));
+        assert_eq!(fallback.backend_profile_id, "lead_profile");
+        assert_eq!(fallback.provider, "codex_acp");
+        assert_eq!(fallback.output_contract.as_deref(), Some("lead_contract"));
+        assert_eq!(
+            fallback.task_outputs.as_deref(),
+            Some(&["lead_resolution".to_string()][..])
+        );
+        assert_eq!(
+            fallback
+                .declared_outputs
+                .as_ref()
+                .and_then(|value| value.pointer("/0/output_name")),
+            Some(&serde_json::json!("lead_resolution"))
+        );
+        assert!(fallback
+            .prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("P058 escalation tier")));
+    }
+
+    #[tokio::test]
+    async fn proposal_058_pause_tier_blocks_run_and_suppresses_legacy_retry() {
+        let pool = test_pool().await;
+        let events = crate::event_bus::new_bus(64);
+        let orchestrator =
+            Orchestrator::new(pool.clone(), events.clone(), WorkQueue::new(pool.clone()));
+        let run_id = RunId::new();
+        let workflow_json = r#"{
+            "workflow": {"id": "p058_pause"},
+            "initial_state": "review",
+            "states": {
+                "review": {
+                    "label": "Review",
+                    "owner": "proposal_reviewer_product_owner",
+                    "type": "end"
+                }
+            }
+        }"#;
+        let catalog_json = r#"{
+            "backend_profiles": {
+                "claude_product_high": {"provider": "claude_acp", "model": "sonnet"},
+                "lead_profile": {"provider": "claude_acp", "model": "sonnet"}
+            },
+            "permission_profiles": {"lead_perm": {}},
+            "contracts": {"lead_contract": {"format": "json"}},
+            "agents": [
+                {
+                    "id": "proposal_reviewer_product_owner",
+                    "backend_profile": "claude_product_high",
+                    "output_contract": "proposal_review_v1"
+                },
+                {
+                    "id": "lead_orchestrator",
+                    "system_role": "lead",
+                    "backend_profile": "lead_profile",
+                    "permission_profile": "lead_perm",
+                    "lead_resolution_contract": "lead_contract"
+                }
+            ],
+            "escalation_policies": [
+                {
+                    "policy_id": "reviewer_escalation",
+                    "schema_version": "escalation_policy_v1",
+                    "enabled_default": true,
+                    "applies_to": {"backend_profile_id": "claude_product_high"},
+                    "max_chain_attempts": 2,
+                    "max_chain_wall_clock_seconds": 1800,
+                    "triggers": ["contract_output_failure"],
+                    "tiers": [
+                        {"tier_id": "primary_retry", "kind": "same_backend_retry", "max_attempts": 1},
+                        {"tier_id": "human_pause", "kind": "pause"}
+                    ]
+                }
+            ]
+        }"#;
+        let mut run = test_run(run_id);
+        run.workflow_snapshot_json = Some(workflow_json.into());
+        run.catalog_snapshot_json = Some(catalog_json.into());
+        ideas::insert(&pool, &test_idea(run.idea_id)).await.unwrap();
+        runs::insert(&pool, &run).await.unwrap();
+
+        let stage_id = StageExecutionId::new();
+        let stage = StageExecution {
+            id: stage_id,
+            run_id,
+            stage_id: "review".into(),
+            label: "review".into(),
+            status: StageStatus::Running,
+            iteration: 1,
+            attempt_number: 1,
+            settlement_kind: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            owner_agent: None,
+            provider: None,
+            model: None,
+            stage_type: None,
+            validation_failure_json: None,
+            evidence_packet_json: None,
+            recovery_snapshot_json: None,
+            retry_reason: None,
+        };
+        stages::insert(&pool, &stage).await.unwrap();
+
+        let failed_exec_id = AgentExecutionId::new();
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, provider_family, model, status,
+                started_at, completed_at, owner_kind, owner_id,
+                escalation_policy_id, escalation_policy_hash, escalation_tier_id,
+                escalation_tier_kind_raw, escalation_trigger_raw, escalation_digest_version,
+                escalation_ledger_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'failed', ?7, ?8, 'stage_execution', ?2,
+                       'reviewer_escalation', 'sha256:p058-pause', 'human_pause',
+                       'pause', 'contract_output_failure',
+                       'escalation_blocker_digest_v1', 'ledger-p058-pause')"#,
+        )
+        .bind(failed_exec_id.to_string())
+        .bind(stage_id.to_string())
+        .bind("proposal_reviewer_product_owner")
+        .bind("claude_acp")
+        .bind("claude")
+        .bind("sonnet")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = Utc::now();
+        escalation::insert_ledger(
+            &pool,
+            &domain::escalation::EscalationLedger {
+                id: "ledger-p058-pause".into(),
+                run_id,
+                stage_id: "review".into(),
+                agent_id: "proposal_reviewer_product_owner".into(),
+                policy_id: "reviewer_escalation".into(),
+                policy_hash: "sha256:p058-pause".into(),
+                status_raw: "paused".into(),
+                current_tier_id: Some("human_pause".into()),
+                current_tier_kind_raw: Some("pause".into()),
+                chain_attempt_index: 2,
+                trigger_raw: Some("contract_output_failure".into()),
+                pause_reason_raw: Some("escalation_chain_exhausted".into()),
+                operator_action_hint: Some("Extend the chain or accept terminal pause.".into()),
+                runbook_anchor: Some("escalation/chain-exhausted".into()),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        escalation::insert_execution_metadata(
+            &pool,
+            &domain::escalation::EscalationExecutionMetadata {
+                agent_execution_id: failed_exec_id,
+                escalation_ledger_id: "ledger-p058-pause".into(),
+                tier_id: "human_pause".into(),
+                tier_kind_raw: "pause".into(),
+                tier_attempt_index: 1,
+                trigger_raw: Some("contract_output_failure".into()),
+                digest_version: Some("escalation_blocker_digest_v1".into()),
+                capacity_probe_counter: 0,
+                created_at: now,
+                updated_at: now,
+                would_select_tier_id: None,
+                would_select_trigger_raw: None,
+                would_select_decision_json: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let handled = orchestrator
+            .schedule_p058_escalation_retry_for_stage(run_id, &run, &stage)
+            .await
+            .unwrap();
+
+        assert!(handled);
+        let refreshed_run = runs::find_by_id(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("run must remain readable");
+        assert_eq!(refreshed_run.status, RunStatus::Blocked);
+        let refreshed_stage = stages::find_by_id(&pool, stage_id)
+            .await
+            .unwrap()
+            .expect("stage must remain readable");
+        assert_eq!(refreshed_stage.status, StageStatus::Failed);
+        let pending_invokes = db::repos::work_items::list_by_run(&pool, run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|item| {
+                item.kind == db::work_item::WorkItemKind::InvokeAgent
+                    && item.status == db::work_item::WorkItemStatus::Pending
+            })
+            .count();
+        assert_eq!(
+            pending_invokes, 0,
+            "pause tier must not schedule legacy retry"
+        );
+    }
+
     fn compiled_state(
         id: &str,
         transitions: Vec<CompiledTransition>,
@@ -8817,7 +10878,7 @@ mod tests {
         assert!(prompt.contains("Tool stdout is not an output channel"));
         assert!(prompt.contains("Only the final assistant message is settled"));
         assert!(prompt.contains("Do not call shell `echo`"));
-        assert!(prompt.contains("Do not write run artifact outputs directly"));
+        assert!(prompt.contains("direct-file manifest"));
         assert!(prompt.contains("implementation_complete"));
         assert!(prompt.contains("remaining_code_tasks"));
         assert!(!prompt.contains("Write each output to its canonical path below"));

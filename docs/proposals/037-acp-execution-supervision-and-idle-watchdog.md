@@ -5,7 +5,7 @@
 | Date | 2026-04-10 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | [030-acp-second-wave-runtime-profiles-codex-auggie-junie.md](030-acp-second-wave-runtime-profiles-codex-auggie-junie.md), [035-atomic-transition-settlement-and-durable-resume-cursor.md](035-atomic-transition-settlement-and-durable-resume-cursor.md), [../reference/runtime-contract.md](../reference/runtime-contract.md), [../reference/execution-truth-and-recovery.md](../reference/execution-truth-and-recovery.md) |
+| Depends on | [../reference/acp-runtime-transport.md#implemented-transport-families](../reference/acp-runtime-transport.md#implemented-transport-families), [../reference/runtime-contract.md](../reference/runtime-contract.md), [../reference/execution-truth-and-recovery.md#atomic-transition-settlement-and-cursor-authority](../reference/execution-truth-and-recovery.md#atomic-transition-settlement-and-cursor-authority) |
 | Scope | Introduce one ACP-only execution supervision contract that detects idle hangs, performs one automatic fresh retry, and surfaces deterministic truth in receipts, reports, recovery, and operator UI. |
 | Goal | No ACP execution may remain indefinitely in `running` after progress has stopped. All ACP runtime families use the same watchdog contract and the same retry semantics. |
 

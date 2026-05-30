@@ -17,6 +17,7 @@ pub enum CapabilityToolId {
     ApprovalsList,
     ApprovalsResolve,
     StagesRetry,
+    StagesConsumeProviderQuotaHold,
     WorkflowConflictsResolve,
     WorkflowLoopBudgetExtend,
     LegacyDiscoveryOverrideCreate,
@@ -26,6 +27,7 @@ pub enum CapabilityToolId {
     StewardListAnalyses,
     StewardGetAnalysis,
     RuntimeHealth,
+    OperatorAlertsList,
     StorageHealth,
     StorageWritePressure,
     StorageEvidenceSpoolSummary,
@@ -50,6 +52,14 @@ pub enum CapabilityToolId {
     StorageProjectionsClearBacklog,
     /// P087: clear projection poison flag.
     StorageProjectionsClearPoison,
+    /// P086: read-only continuation history and current status for an agent execution.
+    AgentsContinuationStatus,
+    /// P086: read-only list of eligible continuation candidates for a run.
+    AgentsContinuationCandidates,
+    /// P086: issue a continuation command for an eligible code_writer AgentExecution.
+    AgentsContinueWork,
+    /// P076: read latest observe-only auto-retry ledger/catalog state.
+    AutomationAutoRetryLatest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]

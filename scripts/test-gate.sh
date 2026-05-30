@@ -166,6 +166,35 @@ PROPOSAL_036_TESTS=(
   "Chainworks ForgeTests/RunTimelineInspectorViewTests"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal036NavigationShellParity"
   "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal036DefinitionsSegmentedWrapper"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal036RunsApprovalTimelineAndSettingsReadinessFlow"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal036IdeasDeepLinkToRunsFlow"
+)
+
+PROPOSAL_093_TESTS=(
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testRuntimeTimelineAppendsChunksIntoOneLiveResponse()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testRuntimeTimelineBufferKeepsStableResponseIdentityWhileAppendingChunks()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testRuntimeTimelineCollapsesChunksOnlyAfterResponseEndsIntoSummaryCard()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testRuntimeTimelineTruncatedRawDetailDoesNotClaimFullAvailability()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testTimelineRowsUseP093ExpandableCardContract()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093RuntimeReadbackRequestsOwnedTimelineFields()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093RuntimeTimelineMissingRawDetailBytesStaysNil()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093SwiftResolvesRawDetailOnlyThroughDaemonResolver()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093TimelineUsesNewestFirstOrderAndAgentSelector()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093FormatterEnforcesBudgetsAndLRUCache()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093FormatterBudgetFallsBackWithInjectedClock()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093FormatterHandlesFencedBlocksAndJSON()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093CollapsedStreamingResponseUsesMetadataOnlyBody()"
+  "Chainworks ForgeTests/Proposal036UXConsolidationTests/testP093RawDetailHandleIsNotResolvedThroughSwiftFilesystem()"
+  "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
+  "Chainworks ForgeUITests/Chainworks_ForgeUITests/testProposal093TimelineCardExpansionRemoteProof"
+)
+
+PROPOSAL_086_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
+)
+
+PROPOSAL_046_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal046Tests"
 )
 
 PROPOSAL_037_TESTS=(
@@ -218,6 +247,11 @@ PROPOSAL_084_SWIFT_TESTS=(
 
 PROPOSAL_085_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal085Tests"
+)
+
+PROPOSAL_081_SWIFT_TESTS=(
+  "Chainworks ForgeTests/Proposal081ApprovalActionAttemptStoreTests"
+  "Chainworks ForgeTests/Proposal081GraphQLRedactionTests"
 )
 
 P060_PROPOSAL_REVISION_ID="P060-r16-2026-04-22"
@@ -589,7 +623,7 @@ PROPOSAL_029_MCP_TESTS=(
   "graphql-server test_graphql_rejects_missing_authorization_header"
   "graphql-server test_graphql_rejects_unknown_bearer_token"
   "graphql-server test_graphql_mutation_reads_principal_from_context"
-  "graphql-server test_graphql_observer_class_cannot_invoke_start_run"
+  "graphql-server test_graphql_observer_class_cannot_invoke_approval_mutation"
   "graphql-server test_graphql_ws_rejects_missing_connection_init_auth"
   "graphql-server test_graphql_ws_rejects_unknown_connection_init_token"
   "graphql-server test_graphql_ws_accepts_valid_connection_init_token"
@@ -627,7 +661,8 @@ PROPOSAL_029_MCP_TESTS=(
   "engine test_redact_approve_stage_preserves_run_and_stage_ids"
   "engine test_redact_reject_stage_redacts_comment"
   "engine test_redact_reject_stage_preserves_run_and_stage_ids"
-  "engine test_redact_retry_stage_preserves_all_fields"
+  "engine test_redact_retry_stage_redacts_operator_instruction"
+  "engine test_redact_retry_stage_preserves_structural_fields_without_instruction"
   "engine test_redact_cancel_run_preserves_run_id"
   "engine test_redact_reset_session_preserves_all_fields"
   "engine test_redact_run_steward_analysis_preserves_reason_and_artifact_base"
@@ -641,15 +676,12 @@ PROPOSAL_029_MCP_TESTS=(
   "mcp-server test_mcp_steward_get_analysis_response_omits_journal_id"
 
   # journal_id surfacing on GraphQL (graphql-server/src/schema.rs :: tests)
-  "graphql-server test_graphql_start_run_started_variant_includes_journal_id"
-  "graphql-server test_graphql_start_run_blocked_variant_includes_journal_id"
+  # startRun/retryStage/cancelRun moved to MCP; journalId on those covered by mcp-server tests above
   "graphql-server test_graphql_approve_stage_returns_payload_with_approval_and_journal_id"
-  "graphql-server test_graphql_retry_stage_returns_payload_with_retried_and_journal_id"
-  "graphql-server test_graphql_cancel_run_returns_payload_with_cancelled_and_journal_id"
   "graphql-server test_response_omits_journal_id_when_capability_check_fails"
 
-  # GraphQL blocked-startRun payload contract §4.4.b
-  "graphql-server graphql_start_run_blocked_payload_contract_tests"
+  # GraphQL delivery preflight contract §4.4.b (formerly graphql_start_run_blocked_payload_contract_tests)
+  "graphql-server delivery_preflight_graphql_readback_tests"
 
   # Cross-surface parity (engine/tests/cross_surface_parity.rs)
   "engine test_graphql_and_mcp_produce_identical_run_for_start_run"
@@ -1120,9 +1152,23 @@ should_use_unsigned_ui_tests() {
   return 0
 }
 
+should_use_adhoc_ui_tests() {
+  [[ "${CHAINWORKS_USE_ADHOC_UI_TESTS:-0}" == "1" ]]
+}
+
 append_xcodebuild_signing_args() {
   local gate_name="${1:-}"
   local includes_ui="${2:-0}"
+
+  if [[ "$includes_ui" == "1" ]] && should_use_adhoc_ui_tests; then
+    printf '%s\0' \
+      CODE_SIGNING_ALLOWED=YES \
+      CODE_SIGNING_REQUIRED=NO \
+      CODE_SIGN_IDENTITY=- \
+      CODE_SIGN_STYLE=Manual \
+      DEVELOPMENT_TEAM=
+    return 0
+  fi
 
   if [[ "$includes_ui" == "1" ]] && ! should_use_unsigned_ui_tests; then
     return 0
@@ -1159,7 +1205,7 @@ approved_remote_ui_hosts() {
 
 gate_requires_remote_ui_host() {
   case "${1:-}" in
-    ui-smoke|proposal-006|p006|proposal-012|p012|proposal-013|p013|proposal-014|p014|proposal-015|p015|proposal-022|p022|proposal-024|p024|proposal-036|p036|proposal-077-ui|p077-ui|full)
+    ui-smoke|proposal-006|p006|proposal-012|p012|proposal-013|p013|proposal-014|p014|proposal-015|p015|proposal-022|p022|proposal-024|p024|proposal-036|p036|proposal-077-ui|p077-ui|proposal-093|p093|full)
       return 0
       ;;
     *)
@@ -1182,8 +1228,10 @@ emit_forwarded_chainworks_env() {
   local -a allowed_chainworks_env=(
     CHAINWORKS_REMOTE_UI_TEST_HOSTS
 	    CHAINWORKS_USE_UNSIGNED_UI_TESTS
+    CHAINWORKS_USE_ADHOC_UI_TESTS
 	    CHAINWORKS_GUI_GATE_TIMEOUT_SECONDS
-	    CHAINWORKS_CODESIGN_KEYCHAIN
+    CHAINWORKS_CODESIGN_KEYCHAIN
+    CHAINWORKS_PREBUILT_CONTROL_PLANE_DAEMON
 	    CHAINWORKS_P013_UI_SUCCESS_GRACE_SECONDS
     CHAINWORKS_P013_UI_HARD_TIMEOUT_SECONDS
     CHAINWORKS_P015_UI_SUCCESS_GRACE_SECONDS
@@ -1290,7 +1338,7 @@ default_codesign_keychain() {
 }
 
 prepare_codesign_keychain() {
-  if should_use_unsigned_ui_tests; then
+  if should_use_unsigned_ui_tests || should_use_adhoc_ui_tests; then
     return 0
   fi
 
@@ -1358,6 +1406,30 @@ require_remote_ui_host() {
   printf 'approved remote hosts: %s\n' "$(IFS=', '; printf '%s' "${approved[*]}")" >&2
   printf 'observed host names: %s\n' "$(IFS=', '; printf '%s' "${observed[*]}")" >&2
   exit 3
+}
+
+is_approved_remote_ui_host() {
+  local approved host allowed
+  approved=()
+  while IFS= read -r host; do
+    approved+=("$host")
+  done < <(
+    approved_remote_ui_hosts \
+      | while IFS= read -r host; do
+          printf '%s\n' "$(normalize_host "$host")"
+        done \
+      | awk '!seen[$0]++'
+  )
+
+  while IFS= read -r host; do
+    for allowed in "${approved[@]}"; do
+      if [[ "$host" == "$allowed" ]]; then
+        return 0
+      fi
+    done
+  done < <(observed_host_names)
+
+  return 1
 }
 
 check_idle_environment() {
@@ -1938,19 +2010,48 @@ run_test_plan() {
   log "Result bundle: $result_bundle"
 }
 
+prepare_test_source_snapshot() {
+  local gate_name="$1"
+  local stamp="$2"
+  local snapshot="$TMP_BASE/source-snapshot"
+  local -a source_files=(
+    "Chainworks Forge/Views/RunsHomeView.swift"
+    "Chainworks Forge/Models/RunsWorkbenchPresentationModel.swift"
+    "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift"
+    "docs/evidence/macos-operator-navigation/dogfood-validation-2026-05-21.json"
+    "docs/evidence/macos-operator-navigation/remote-ui-accessibility-proof-2026-05-21.json"
+    "docs/evidence/macos-operator-navigation/rollout-readback-live-2026-05-21.json"
+  )
+
+  rm -rf "$snapshot"
+  mkdir -p "$snapshot"
+
+  local rel_path dest_dir
+  for rel_path in "${source_files[@]}"; do
+    dest_dir="$snapshot/$(dirname "$rel_path")"
+    mkdir -p "$dest_dir"
+    cp "$ROOT_DIR/$rel_path" "$snapshot/$rel_path"
+  done
+
+  printf '%s\n' "$snapshot"
+}
+
 run_targeted_tests() {
   local gate_name="$1"
   shift
 
-  local stamp derived_data result_bundle log_path automation_log_path previous_automation_log_path
+  local stamp derived_data result_bundle log_path source_snapshot automation_log_path previous_automation_log_path
   local -a signing_args=()
   stamp="$(make_stamp)"
   derived_data="$TMP_BASE/${gate_name}-${stamp}-DerivedData"
   result_bundle="$TMP_BASE/${gate_name}-${stamp}.xcresult"
   log_path="$TMP_BASE/${gate_name}-${stamp}.log"
   mkdir -p "$TMP_BASE"
+  source_snapshot="$(prepare_test_source_snapshot "$gate_name" "$stamp")"
 
   local cmd=(
+    env
+    "CHAINWORKS_TEST_SOURCE_ROOT=$source_snapshot"
     xcodebuild
     test
     -project "$PROJECT_PATH"
@@ -2180,6 +2281,23 @@ run_split_targeted_gate() {
   fi
 }
 
+run_non_ui_targeted_gate() {
+  local gate_name="$1"
+  shift
+
+  local non_ui_tests=()
+  local test_id
+  for test_id in "$@"; do
+    if [[ "$test_id" != Chainworks\ ForgeUITests/* ]]; then
+      non_ui_tests+=("$test_id")
+    fi
+  done
+
+  if [[ ${#non_ui_tests[@]} -gt 0 ]]; then
+    run_targeted_tests "${gate_name}-non-ui" "${non_ui_tests[@]}"
+  fi
+}
+
 run_full_suite() {
   local stamp derived_data result_bundle
   local -a signing_args=()
@@ -2232,6 +2350,7 @@ Available gates:
   proposal-029-mcp  Proposal 029 MCP northbound auth and capability gate
   proposal-031,p031  Thin GraphQL-only UI inventory/static guard/write-path guide gate
   proposal-036,p036  UX Consolidation and Navigation Simplification gate
+  proposal-093,p093  Live Agent Timeline UX and readability gate
   proposal-072,p072  UI action boundary gate: approval-only GraphQL UI mutations and MCP-only command routing
   proposal-077,p077  Proposal 077 closeout readiness gates (Rust domain/db/engine plus GraphQL/MCP readback parity; UI remote evidence separate)
   proposal-077-ui,p077-ui  Proposal 077 remote macOS compact/focus/backlink/accessibility runtime proof
@@ -2255,7 +2374,7 @@ Available gates:
   proposal-051|p051  Proposal 051 shared Xcode MCP bridge pool fixture/readback gate
   proposal-053    Proposal 053 bounded ACP artifact discovery gate
   proposal-057    Proposal 057 canonical artifact contracts and run-state projection gate
-  proposal-058    Proposal 058 ACP provider failure classification and artifact ownership gate
+  proposal-058    Proposal 058 ACP failure classification, artifact ownership, and escalation schema gate
   proposal-060|p060  Proposal 060 Phase 0a/0b control artifact wrapper gate
   proposal-060-baseline|p060-baseline
                   Proposal 060 proposal-review baseline control artifact gate
@@ -2276,16 +2395,28 @@ Available gates:
   proposal-065|p065  Proposal 065 operator retry instruction contract gate
   proposal-066|p066  Proposal 066 Phase 0 toolchain cache mapping scaffold gate
   proposal-075|p075  Proposal 075 Phase 1 local persistence write budget scaffold gate
+  proposal-076|p076  Proposal 076 auto-retry observation ledger schema and fixture proof gate
   proposal-054|p054  Proposal 054 implementation completeness and handoff contract gate
   proposal-054-v1-retirement|p054-v1-retirement
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
+  proposal-081|p081  Proposal 081 Phase 1 boundary-first API and auth contract matrix gate
   proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
+  proposal-086|p086|p086-continuation-preflight
+                  Proposal 086 Phase 0 preflight: migration shape, MCP/artifact schemas, and Rust unit tests
+  p086-continuation-readback
+                  Proposal 086 Phase 1 readback gate: operator readback fixture field coverage
+  p086-continuation-negative-fixtures
+                  Proposal 086 Phase 2 hold-condition gate: all negative fixtures present and not placeholder
+  p086-continuation-operator-report
+                  Proposal 086 Phase 1 operator-report gate: operator report field coverage
   proposal-087|p087  Proposal 087 read-path liveness and storage tiering gate
   proposal-082|p082  Proposal 082 recovery and retry state-machine matrix proof gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
   proposal-091|p091  Retained P091 targeted retry authority runtime proof gate
+  proposal-046|p046  Proposal 046 session GraphQL observability gate (read-only queries, subscription, authorization, redaction)
+  proposal-092|p092  Retained historical alias for P092 retry payload target invariants runtime proof gate
   full            Full xcodebuild test sign-off gate
 EOF
 }
@@ -2322,6 +2453,7 @@ case "$GATE" in
     guard_direct_run_insertion
     guard_xcode_cargo_cache_policy
     guard_plan_tag_sync
+    "$ROOT_DIR/scripts/check-boundary-coverage.sh"
     ;;
   build)
     check_idle_environment allow_app
@@ -2826,7 +2958,7 @@ PY
         fi
       done
       rm -f "$tmp_log"
-      cargo test --workspace 2>&1
+      RUST_MIN_STACK=8388608 cargo test --workspace -- --test-threads=4 2>&1
     )
     log "Proposal 029-MCP control-plane gate passed"
     ;;
@@ -2863,7 +2995,204 @@ PY
     fi
     guard_direct_run_insertion
     run_build "proposal-036"
-    run_targeted_tests "proposal-036" "${PROPOSAL_036_TESTS[@]}"
+    if is_approved_remote_ui_host; then
+      prepare_codesign_keychain
+      run_targeted_tests "proposal-036" "${PROPOSAL_036_TESTS[@]}"
+    else
+      run_non_ui_targeted_gate "proposal-036" "${PROPOSAL_036_TESTS[@]}"
+      log "proposal-036 UI smoke is remote-only; run the same gate on test@SMacBook.local for UI proof"
+    fi
+    ;;
+  proposal-093|p093)
+    check_idle_environment allow_app
+    guard_direct_run_insertion
+    run_build "proposal-093"
+    if is_approved_remote_ui_host; then
+      prepare_codesign_keychain
+      run_targeted_tests "proposal-093" "${PROPOSAL_093_TESTS[@]}"
+    else
+      run_non_ui_targeted_gate "proposal-093" "${PROPOSAL_093_TESTS[@]}"
+      log "proposal-093 UI smoke is remote-only; run the same gate on test@SMacBook.local for UI proof"
+    fi
+    (cd "$ROOT_DIR/control-plane" && cargo test -p graphql-server runtime_timeline_p093 --quiet)
+    ;;
+  proposal-046|p046)
+    log "Proposal 046 control-plane gate: session GraphQL observability (read-only queries, subscription, authorization, redaction)"
+    log "Proposal 046: verifying no root-level output artifacts are present"
+    for output_artifact in CHAINWORKS_OUTPUT chainworks_output.json tmp_chainworks_output.json; do
+      if [[ -e "$ROOT_DIR/$output_artifact" ]]; then
+        log "ERROR: stale output artifact exists outside the canonical meta-root: $ROOT_DIR/$output_artifact"
+        exit 1
+      fi
+    done
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p graphql-server --test proposal_046_session_graphql -- --test-threads=1 --nocapture
+    )
+    log "Proposal 046: running pinned retry-policy unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p graphql-server --lib -- p046_ --nocapture
+      cargo test -p db --lib -- p046_ --nocapture
+    )
+    log "Proposal 046 phase 1+2: verifying rollout contract fixture structure"
+    P046_READBACK="$ROOT_DIR/docs/evidence/rollout-contract/operator-readback/p046-session-graphql-full-surface.fixture.json"
+    if [[ ! -f "$P046_READBACK" ]]; then
+      log "ERROR: rollout readback fixture missing: $P046_READBACK"
+      exit 1
+    fi
+    log "Proposal 046: rollout readback fixture present"
+    log "Proposal 046: verifying negative fixtures exist"
+    P046_NEG_DIR="$ROOT_DIR/docs/evidence/rollout-contract/negative"
+    P046_REQUIRED_NEGATIVES=(
+      "p046-appkit-owns-graphql-task.json"
+      "p046-authorization-recheck-transient-open.json"
+      "p046-disabled-schema-client-unguarded.json"
+      "p046-imprecise-connection-schema.graphql"
+      "p046-missing-parent-run-authorization.json"
+      "p046-missing-run-filter-subscription.json"
+      "p046-raw-sensitive-generation-fields.graphql"
+      "p046-reset-mutation-present.graphql"
+      "p046-resync-churn.json"
+      "p046-reversible-derived-reference.json"
+      "p046-revoked-subscription-principal.json"
+      "p046-slow-consumer-no-disconnect.json"
+      "p046-swiftdata-persistence-leak.json"
+      "p046-unbounded-metric-labels.json"
+      "p046-unbounded-session-events.graphql"
+      "p046-unbounded-sqlite-retry.json"
+      "p046-unknown-event-type-redaction.json"
+      "p046-unredacted-event-details.json"
+    )
+    for neg_fixture in "${P046_REQUIRED_NEGATIVES[@]}"; do
+      if [[ ! -f "$P046_NEG_DIR/$neg_fixture" ]]; then
+        log "ERROR: required negative fixture missing: $P046_NEG_DIR/$neg_fixture"
+        exit 1
+      fi
+    done
+    log "Proposal 046: all negative fixtures present"
+    log "Proposal 046: verifying P046 metric inventory in source"
+    P046_METRICS=(
+      "session_graphql_query_total"
+      "session_graphql_query_duration_seconds"
+      "session_graphql_sqlite_retry_total"
+      "session_graphql_sqlite_retry_exhausted_total"
+      "session_status_subscription_event_total"
+      "session_status_subscription_emit_lag_seconds"
+      "session_status_subscription_lag_total"
+      "session_status_subscription_slow_consumer_disconnect_total"
+      "session_health_warning_total"
+      "session_event_redaction_total"
+      "session_graphql_disabled_schema_guard_total"
+      "session_graphql_reset_mutation_guard_total"
+      "session_graphql_observability_query_success_rate"
+    )
+    for metric in "${P046_METRICS[@]}"; do
+      # session_graphql_sqlite_retry_total and session_graphql_sqlite_retry_exhausted_total are
+      # db-crate-owned per the approved architecture contract (db::p046_retry). Search db/src/ too.
+      if ! grep -rq "$metric" \
+            "$ROOT_DIR/control-plane/crates/graphql-server/src/" \
+            "$ROOT_DIR/control-plane/crates/graphql-server/src/types/" \
+            "$ROOT_DIR/control-plane/crates/db/src/" \
+            2>/dev/null; then
+        log "ERROR: P046 metric '$metric' not found in graphql-server or db source"
+        exit 1
+      fi
+    done
+    log "Proposal 046: metric inventory check passed"
+    log "Proposal 046: running Swift guardrail tests"
+    run_targeted_tests "proposal-046-swift" "${PROPOSAL_046_SWIFT_TESTS[@]}"
+    log "Proposal 046: validating rollout contract semantics in readback fixture (all lanes)"
+    python3 - "$P046_READBACK" <<'PYEOF'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    data = json.load(f)
+lanes = data.get('parity_lanes', {})
+# All four required lanes must be present and must not be in bare 'hold' without waiver/na.
+required_lanes = ['graphql', 'run_report', 'mcp', 'release_receipt']
+accepted_statuses = {'pass', 'waived', 'not_applicable', 'fail', 'timeout', 'ready_for_phase3', 'pending_phase3_validation', 'not_applicable_phase3'}
+errors = []
+for lane in required_lanes:
+    lane_data = lanes.get(lane)
+    if lane_data is None:
+        errors.append(f"Lane '{lane}' is missing from parity_lanes")
+        continue
+    status = lane_data.get('rolloutContractStatus', 'missing')
+    if status == 'missing':
+        errors.append(f"Lane '{lane}' is missing rolloutContractStatus")
+    elif status == 'hold':
+        # hold is only acceptable if there is an explicit waiver
+        waiver = lane_data.get('rolloutContractWaiverState', 'none')
+        if not waiver or waiver == 'none':
+            errors.append(f"Lane '{lane}' is in hold without a waiver (rolloutContractWaiverState='{waiver}')")
+    elif status not in accepted_statuses and not status.startswith('ready') and not status.startswith('pending'):
+        errors.append(f"Lane '{lane}' has unrecognized rolloutContractStatus='{status}'")
+if errors:
+    for e in errors:
+        print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+print(f"All {len(required_lanes)} lanes validated: " + ", ".join(f"{l}={lanes[l].get('rolloutContractStatus')}" for l in required_lanes))
+PYEOF
+    if [[ $? -ne 0 ]]; then
+      log "ERROR: rollout readback fixture lane validation failed"
+      exit 1
+    fi
+    log "Proposal 046: verifying negative fixtures are non-empty"
+    for neg_fixture in "${P046_REQUIRED_NEGATIVES[@]}"; do
+      neg_path="$P046_NEG_DIR/$neg_fixture"
+      if [[ ! -s "$neg_path" ]]; then
+        log "ERROR: negative fixture is empty or zero-bytes: $neg_path"
+        exit 1
+      fi
+      # .graphql fixtures: check for GraphQL content keywords (type, query, etc.)
+      # .json fixtures: check JSON is non-empty and not a placeholder stub.
+      if [[ "$neg_fixture" == *.graphql ]]; then
+        if ! grep -qE '^\s*(type|query|mutation|subscription|interface|schema|directive|#)' "$neg_path" 2>/dev/null; then
+          log "ERROR: graphql negative fixture appears to lack real schema/query content: $neg_path"
+          exit 1
+        fi
+      else
+        if python3 -c "
+import json, sys
+with open('$neg_path') as f:
+    content = f.read().strip()
+if content in ('{}', '[]', ''):
+    sys.exit(1)
+# Check for obvious placeholder content
+data = json.loads(content)
+if isinstance(data, dict) and data.get('placeholder') == True:
+    sys.exit(1)
+" 2>/dev/null; then
+          :
+        else
+          log "ERROR: negative fixture appears to be placeholder-only: $neg_path"
+          exit 1
+        fi
+      fi
+    done
+    log "Proposal 046: negative fixture content check passed"
+    # Prove .graphql negative fixtures describe patterns absent from the production schema source.
+    # These checks verify fail-closed behavior: the anti-patterns are NOT present.
+    log "Proposal 046: verifying graphql negative fixtures fail-closed against source"
+    # p046-reset-mutation-present.graphql: no resetSession mutation function must appear in the schema.
+    # The guard comment (resetSession/equivalent) and the guard counter are intentional;
+    # only an actual fn reset_session resolver would violate the hold condition.
+    if grep -rq 'fn reset_session\b\|async fn reset_session\b' "$ROOT_DIR/control-plane/crates/graphql-server/src/" 2>/dev/null; then
+      log "ERROR: resetSession mutation resolver found in graphql-server (violates p046-reset-mutation-present.graphql hold)"
+      exit 1
+    fi
+    # p046-raw-sensitive-generation-fields.graphql: raw providerSessionId/bindingFingerprint/invocationOwnerKey
+    # must not be exposed as direct GraphQL fields on session generation types.
+    # Derived references (scoped_provider_session_ref, scoped_binding_ref) are the approved surface.
+    for raw_field in provider_session_id binding_fingerprint invocation_owner_key; do
+      if grep -rq "pub ${raw_field}:" "$ROOT_DIR/control-plane/crates/graphql-server/src/types/session.rs" 2>/dev/null; then
+        log "ERROR: raw sensitive field '${raw_field}' exposed as GraphQL field (violates p046-raw-sensitive-generation-fields.graphql hold)"
+        exit 1
+      fi
+    done
+    log "Proposal 046: graphql negative fixture fail-closed checks passed"
+    log "Proposal 046 gate passed"
     ;;
   proposal-037|p037)
     check_idle_environment allow_app
@@ -4850,16 +5179,25 @@ PY
     log "Proposal 053 control-plane gate passed"
     ;;
   proposal-058|p058)
-    log "Proposal 058 control-plane gate: ACP provider failure classification and session artifact ownership"
+    log "Proposal 058 gate: ACP failure classification, escalation schema, readback parity, and governed macOS read surface"
+    run_targeted_tests "proposal-058-swift" "Chainworks ForgeTests/Proposal058Tests"
     (
       cd "$ROOT_DIR/control-plane"
       cargo test -p domain --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
       cargo test -p engine proposal_058 --lib -- --test-threads=1 --nocapture &&
       cargo test -p db --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
-      CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR="$TMP_BASE/proposal-058-db-claim-target" cargo test -p db --test proposal_058_claim_start -- --test-threads=1 --nocapture &&
+      cargo test -p db --test proposal_058_claim_start -- --test-threads=1 --nocapture &&
       cargo test -p engine --test proposal_058_claim_start -- --test-threads=1 --nocapture &&
       cargo test -p graphql-server --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
-      CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR="$TMP_BASE/proposal-058-mcp-target" cargo test -p mcp-server --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
+      cargo test -p mcp-server --test proposal_058_runtime_facts -- --test-threads=1 --nocapture &&
+      cargo test -p engine --test proposal_058_escalation_schema -- --test-threads=1 --nocapture &&
+      cargo test -p workflow --test proposal_058_escalation_policy_schema -- --test-threads=1 --nocapture &&
+      cargo test -p db proposal_058_required_metric_names_are_declared --lib -- --test-threads=1 --nocapture &&
+      cargo test -p mcp-server runs_get_returns_escalation_readback --lib -- --test-threads=1 --nocapture &&
+      cargo test -p mcp-server runs_get_escalation_readback_event_payload_json_roundtrip --lib -- --test-threads=1 --nocapture &&
+      cargo test -p mcp-server runs_get_agent_principal_receives_summary_only_readback --lib -- --test-threads=1 --nocapture &&
+      cargo test -p mcp-server build_escalation_readback_truncates_events_beyond_cap --lib -- --test-threads=1 --nocapture &&
+      cargo test -p db payload_json_shape --lib -- --test-threads=1 --nocapture &&
       cargo check -p engine &&
       cargo check -p graphql-server &&
       cargo check -p mcp-server
@@ -4875,6 +5213,9 @@ required = [
     "artifact source-generation claims",
     "superseded_pending_retry",
     "GraphQL/MCP runtime-facts parity",
+    "escalation_policy_v1 schema",
+    "redaction_version",
+    "policy compile validation",
 ]
 for item in required:
     if item not in text:
@@ -5922,6 +6263,758 @@ PY
 
     log "Proposal 075 gate passed"
     ;;
+  proposal-076|p076)
+    # P076 fixture/contract/runtime proof gate.
+    # Proves: fixture presence, required field coverage, closed P076 enum domains,
+    # observe-only policy, 6 required top-level path echoes, version_negotiation
+    # shape, JSON-RPC error envelope for unsupported_version, budget_ref_v1 and
+    # observation_summary_v1 shapes, observation_id format, rollup dedupe proof,
+    # degraded-success/no_observation_history coverage, and negative fixture integrity
+    # (invalid enum rejection, missing required field, unknown field in closed schema).
+    log "Proposal 076 auto-retry observation ledger schema and fixture gate"
+    python3 - <<'PY'
+import json, re
+from pathlib import Path
+
+root = Path.cwd()
+
+P076_PATH_FIELDS = [
+    "ledger_path", "budget_state_path", "known_issue_catalog_path",
+    "generated_markdown_catalog_path", "lock_path", "rollup_report_path",
+]
+
+RETRY_ACTION_ENUM = {"none", "recommend_retry"}
+RETRY_RESULT_ENUM = {
+    "not_attempted", "not_allowed", "unknown", "accepted",
+    "rejected", "advanced", "reblocked", "failed", "timeout_ambiguous",
+}
+RETRY_RESULT_P076 = {"not_attempted", "not_allowed"}
+BLOCKER_CLASS_ENUM = {
+    "human_gate", "substantive_output_contract", "stale_execution_truth",
+    "projection_divergence", "provider_or_session_failure",
+    "retry_identifier_shape", "unknown",
+}
+POLICY_DECISION_ENUM = {
+    "observe_only", "collect_evidence", "human_gate", "cooldown_exhausted",
+    "budget_unavailable", "needs_systemic_fix", "needs_human_triage",
+    "retry_disabled_pending_idempotency_contract", "poll_timeout",
+    "skipped_lock_held", "skipped_backpressure",
+}
+KNOWN_ISSUE_STATUS_ENUM = {
+    "observed", "retrying_within_budget", "cooldown_exhausted",
+    "needs_systemic_fix", "needs_human_triage", "resolved_or_quiet", "archived",
+}
+READBACK_POLICY_STATUS_ENUM = {
+    "no_observation_history", "observed", "readback_degraded", "budget_unavailable",
+    "cooldown_exhausted", "needs_human_triage", "needs_systemic_fix",
+    "retry_disabled_pending_idempotency_contract",
+}
+BUDGET_STATUS_ENUM = {
+    "available", "cooldown", "budget_unavailable", "needs_human_triage",
+    "needs_systemic_fix", "disabled_pending_idempotency_contract",
+}
+DIAGNOSTIC_SEVERITY_ENUM = {"info", "warning", "error"}
+
+OBS_V1_REQUIRED = [
+    "schema_version", "observation_id", "canonical_record_hash", "observed_at",
+    "source", "daemon_ready", "policy_version", "writer_lock", "summary", "blocked_runs",
+]
+OBS_SUMMARY_KNOWN = set([
+    "observation_id", "observed_at", "run_id", "stage_id",
+    "blocker_signature_id", "blocker_class", "policy_decision",
+    "retry_action", "retry_result", "known_issue_status", "observation_path",
+    "stage_execution_id", "failure_summary", "next_systemic_action", "evidence_report_id",
+])
+
+OBS_SUMMARY_REQUIRED = [
+    "observation_id", "observed_at", "run_id", "stage_id",
+    "blocker_signature_id", "blocker_class", "policy_decision",
+    "retry_action", "retry_result", "known_issue_status", "observation_path",
+]
+
+RUN_SUMMARY_REQUIRED = [
+    "run_id", "auto_retry_policy_status", "auto_retry_policy_decision",
+    "auto_retry_observation_record_id", "auto_retry_observation_path",
+    "auto_retry_blocker_signature_id", "auto_retry_blocker_class",
+    "auto_retry_retry_budget_state", "auto_retry_last_retry_result",
+    "auto_retry_known_issue_status", "auto_retry_next_systemic_action",
+    "auto_retry_rollup_report_path", "auto_retry_human_gate_retry_attempt_total",
+    "auto_retry_budget_unavailable_reason", "auto_retry_backpressure_skip_count",
+    "auto_retry_readback_version", "oldest_planned_attempt_at",
+    "planned_attempt_age_seconds", "unknown_attempt_count", "required_operator_settlement",
+]
+
+BUDGET_REF_REQUIRED = [
+    "run_id", "blocker_signature_id", "status", "window_hours", "max_attempts",
+    "attempt_count", "remaining_attempts", "cooldown_until", "budget_state_path",
+]
+
+DIAGNOSTIC_V1_REQUIRED = ["code", "severity", "message"]
+DIAGNOSTIC_V1_KNOWN = {
+    "code", "severity", "message", "path", "run_id", "blocker_signature_id", "observation_id",
+}
+# Fields added to sample objects for fixture documentation (not part of the runtime schema)
+FIXTURE_METADATA_FIELDS = {"fixture_note"}
+
+AUTO_RETRY_READBACK_KNOWN = {
+    "schema_version", "generated_at", "version_negotiation",
+    "ledger_path", "budget_state_path", "known_issue_catalog_path",
+    "generated_markdown_catalog_path", "lock_path", "rollup_report_path",
+    "diagnostics", "observations", "latest_by_run",
+}
+
+RUN_SUMMARY_KNOWN = set(RUN_SUMMARY_REQUIRED)
+
+
+def is_rfc3339(s):
+    if not isinstance(s, str):
+        return False
+    return bool(re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', s))
+
+
+def is_absolute_path(s):
+    return isinstance(s, str) and s.startswith('/')
+
+
+def strict_validate_obs_summary(obs, label, allow_fixture_metadata=False):
+    """Strict-mode observation_summary_v1 validation (additionalProperties=false)."""
+    missing = [f for f in OBS_SUMMARY_REQUIRED if f not in obs]
+    if missing:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 missing required fields: {missing}")
+    known = OBS_SUMMARY_KNOWN | (FIXTURE_METADATA_FIELDS if allow_fixture_metadata else set())
+    extra = set(obs.keys()) - known
+    if extra:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 unknown fields (strict mode): {extra}")
+    for str_field in ["run_id", "stage_id", "blocker_signature_id"]:
+        val = obs.get(str_field)
+        if not isinstance(val, str):
+            raise SystemExit(f"proposal-076: {label} observation_summary_v1 {str_field} must be a non-null string, got {type(val).__name__!r}")
+    if obs.get("blocker_class") not in BLOCKER_CLASS_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 invalid blocker_class: {obs.get('blocker_class')!r}")
+    if obs.get("policy_decision") not in POLICY_DECISION_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 invalid policy_decision: {obs.get('policy_decision')!r}")
+    if obs.get("retry_action") not in RETRY_ACTION_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 invalid retry_action: {obs.get('retry_action')!r}")
+    if obs.get("retry_result") not in RETRY_RESULT_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 invalid retry_result: {obs.get('retry_result')!r}")
+    if obs.get("known_issue_status") not in KNOWN_ISSUE_STATUS_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 invalid known_issue_status: {obs.get('known_issue_status')!r}")
+    obs_id = obs.get("observation_id", "")
+    if not re.match(r'^ar_obs_\d{8}T\d{6}Z_[0-9a-f]{12}$', obs_id):
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 invalid observation_id format: {obs_id!r}")
+    if not is_rfc3339(obs.get("observed_at")):
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 observed_at must be RFC3339, got {obs.get('observed_at')!r}")
+    obs_path = obs.get("observation_path")
+    if not is_absolute_path(obs_path):
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 observation_path must be a non-null absolute path, got {obs_path!r}")
+    for nullable_str in ["stage_execution_id", "failure_summary", "next_systemic_action", "evidence_report_id"]:
+        val = obs.get(nullable_str)
+        if val is not None and not isinstance(val, str):
+            raise SystemExit(f"proposal-076: {label} observation_summary_v1 {nullable_str} must be string|null, got {type(val).__name__}")
+
+
+def permissive_validate_obs_summary(obs, label):
+    """Permissive-mode observation_summary_v1: required fields must be present; unknown fields tolerated with diagnostic.
+    Returns a list of diagnostic dicts for any unknown fields found (must be non-empty to prove diagnostic emission)."""
+    diagnostics = []
+    missing = [f for f in OBS_SUMMARY_REQUIRED if f not in obs]
+    if missing:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 (permissive) missing required fields: {missing}")
+    extra = set(obs.keys()) - OBS_SUMMARY_KNOWN
+    if extra:
+        diagnostics.append({
+            "code": "unknown_field_ignored",
+            "severity": "warning",
+            "message": f"Unknown fields ignored in permissive report mode: {sorted(extra)}",
+        })
+    if obs.get("blocker_class") not in BLOCKER_CLASS_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 (permissive) invalid blocker_class: {obs.get('blocker_class')!r}")
+    if obs.get("policy_decision") not in POLICY_DECISION_ENUM:
+        raise SystemExit(f"proposal-076: {label} observation_summary_v1 (permissive) invalid policy_decision: {obs.get('policy_decision')!r}")
+    return diagnostics
+
+
+BUDGET_REF_KNOWN = {
+    "run_id", "blocker_signature_id", "status", "window_hours", "max_attempts",
+    "attempt_count", "remaining_attempts", "cooldown_until", "budget_state_path",
+    "last_observation_id", "oldest_planned_attempt_at", "planned_attempt_age_seconds",
+    "unknown_attempt_count", "required_operator_settlement", "budget_unavailable_reason",
+}
+
+
+def validate_budget_ref_v1_scalars(br, label, allow_fixture_metadata=False):
+    """Validate budget_ref_v1 required fields, scalar types, and enum."""
+    for req in BUDGET_REF_REQUIRED:
+        if req not in br:
+            raise SystemExit(f"proposal-076: {label} budget_ref_v1 missing required field: {req}")
+    known = BUDGET_REF_KNOWN | (FIXTURE_METADATA_FIELDS if allow_fixture_metadata else set())
+    extra = set(br.keys()) - known
+    if extra:
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 unknown fields (strict mode): {extra}")
+    for str_field in ["run_id", "blocker_signature_id"]:
+        val = br.get(str_field)
+        if not isinstance(val, str):
+            raise SystemExit(f"proposal-076: {label} budget_ref_v1 {str_field} must be a non-null string, got {type(val).__name__!r}")
+    if not isinstance(br.get("window_hours"), int) or br["window_hours"] <= 0:
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 window_hours must be positive integer, got {br.get('window_hours')!r}")
+    if not isinstance(br.get("max_attempts"), int) or br["max_attempts"] < 0:
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 max_attempts must be non-negative integer, got {br.get('max_attempts')!r}")
+    if not isinstance(br.get("attempt_count"), int) or br["attempt_count"] < 0:
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 attempt_count must be non-negative integer, got {br.get('attempt_count')!r}")
+    if not isinstance(br.get("remaining_attempts"), int) or br["remaining_attempts"] < 0:
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 remaining_attempts must be non-negative integer, got {br.get('remaining_attempts')!r}")
+    if br.get("status") not in BUDGET_STATUS_ENUM:
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 invalid status: {br.get('status')!r}")
+    budget_state_path_val = br.get("budget_state_path")
+    if not is_absolute_path(budget_state_path_val):
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 budget_state_path must be absolute path, got {budget_state_path_val!r}")
+    cooldown_until_val = br.get("cooldown_until")
+    if cooldown_until_val is not None and not is_rfc3339(cooldown_until_val):
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 cooldown_until must be RFC3339|null, got {cooldown_until_val!r}")
+    last_obs_id_val = br.get("last_observation_id")
+    if last_obs_id_val is not None and not re.match(r'^ar_obs_\d{8}T\d{6}Z_[0-9a-f]{12}$', last_obs_id_val):
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 last_observation_id must be observation_id format or null, got {last_obs_id_val!r}")
+    oldest_planned_val = br.get("oldest_planned_attempt_at")
+    if oldest_planned_val is not None and not is_rfc3339(oldest_planned_val):
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 oldest_planned_attempt_at must be RFC3339|null, got {oldest_planned_val!r}")
+    planned_age_val = br.get("planned_attempt_age_seconds")
+    if planned_age_val is not None and (not isinstance(planned_age_val, int) or planned_age_val < 0):
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 planned_attempt_age_seconds must be non_negative_integer|null, got {planned_age_val!r}")
+    unknown_count_val = br.get("unknown_attempt_count")
+    if unknown_count_val is not None and (not isinstance(unknown_count_val, int) or unknown_count_val < 0):
+        raise SystemExit(f"proposal-076: {label} budget_ref_v1 unknown_attempt_count must be non_negative_integer|null, got {unknown_count_val!r}")
+    for nullable_str in ["required_operator_settlement", "budget_unavailable_reason"]:
+        val = br.get(nullable_str)
+        if val is not None and not isinstance(val, str):
+            raise SystemExit(f"proposal-076: {label} budget_ref_v1 {nullable_str} must be string|null, got {type(val).__name__}")
+
+
+def validate_diagnostic_v1(diag, label):
+    """Validate common_diagnostic_v1 required fields, closed shape, enum, and nullable scoped fields."""
+    for req in DIAGNOSTIC_V1_REQUIRED:
+        if req not in diag:
+            raise SystemExit(f"proposal-076: {label} common_diagnostic_v1 missing required field: {req}")
+    if diag.get("severity") not in DIAGNOSTIC_SEVERITY_ENUM:
+        raise SystemExit(f"proposal-076: {label} common_diagnostic_v1 invalid severity: {diag.get('severity')!r}")
+    extra = set(diag.keys()) - DIAGNOSTIC_V1_KNOWN
+    if extra:
+        raise SystemExit(f"proposal-076: {label} common_diagnostic_v1 unknown fields (closed shape): {extra}")
+    for nullable_str in ["path", "run_id", "blocker_signature_id", "observation_id"]:
+        val = diag.get(nullable_str)
+        if val is not None and not isinstance(val, str):
+            raise SystemExit(f"proposal-076: {label} common_diagnostic_v1 {nullable_str} must be string|null, got {type(val).__name__}")
+
+
+def require_auto_retry_readback(payload, label):
+    arb = payload.get("auto_retry_readback")
+    if not isinstance(arb, dict):
+        raise SystemExit(f"proposal-076: {label} missing auto_retry_readback")
+    if arb.get("schema_version") != "auto_retry_readback.v1":
+        raise SystemExit(f"proposal-076: {label} auto_retry_readback has invalid schema_version: {arb.get('schema_version')!r}")
+    if not is_rfc3339(arb.get("generated_at")):
+        raise SystemExit(f"proposal-076: {label} auto_retry_readback generated_at must be RFC3339, got {arb.get('generated_at')!r}")
+    extra_arb = set(arb.keys()) - AUTO_RETRY_READBACK_KNOWN
+    if extra_arb:
+        raise SystemExit(f"proposal-076: {label} auto_retry_readback has unknown fields (additionalProperties=false): {extra_arb}")
+    for pf in P076_PATH_FIELDS:
+        if not is_absolute_path(arb.get(pf)):
+            raise SystemExit(f"proposal-076: {label} auto_retry_readback path field {pf!r} must be absolute path, got {arb.get(pf)!r}")
+    vn = arb.get("version_negotiation")
+    if not isinstance(vn, dict):
+        raise SystemExit(f"proposal-076: {label} auto_retry_readback missing version_negotiation")
+    for vf in ["selected_version", "supported_versions", "unsupported_versions"]:
+        if vf not in vn:
+            raise SystemExit(f"proposal-076: {label} version_negotiation missing {vf}")
+    if not isinstance(vn.get("supported_versions"), list):
+        raise SystemExit(f"proposal-076: {label} version_negotiation.supported_versions must be an array")
+    if not isinstance(vn.get("unsupported_versions"), list):
+        raise SystemExit(f"proposal-076: {label} version_negotiation.unsupported_versions must be an array")
+    diagnostics = arb.get("diagnostics")
+    if not isinstance(diagnostics, list):
+        raise SystemExit(f"proposal-076: {label} auto_retry_readback diagnostics must be an array")
+    for diag in diagnostics:
+        validate_diagnostic_v1(diag, label)
+    observations = arb.get("observations")
+    if not isinstance(observations, list):
+        raise SystemExit(f"proposal-076: {label} observations must be an array")
+    for obs in observations:
+        strict_validate_obs_summary(obs, label)
+        if obs.get("retry_result") not in RETRY_RESULT_P076:
+            raise SystemExit(f"proposal-076: {label} P076 observation retry_result must be not_attempted or not_allowed, got {obs.get('retry_result')!r}")
+    latest = arb.get("latest_by_run")
+    if not isinstance(latest, list):
+        raise SystemExit(f"proposal-076: {label} latest_by_run must be an array")
+    for rs in latest:
+        for req in RUN_SUMMARY_REQUIRED:
+            if req not in rs:
+                raise SystemExit(f"proposal-076: {label} run_summary missing required field {req}")
+        extra_rs = set(rs.keys()) - RUN_SUMMARY_KNOWN
+        if extra_rs:
+            raise SystemExit(f"proposal-076: {label} run_summary unknown fields (additionalProperties=false): {extra_rs}")
+        total = rs.get("auto_retry_human_gate_retry_attempt_total")
+        if not isinstance(total, int) or total < 0:
+            raise SystemExit(f"proposal-076: {label} auto_retry_human_gate_retry_attempt_total must be non-negative integer")
+        skip_count = rs.get("auto_retry_backpressure_skip_count")
+        if not isinstance(skip_count, int) or skip_count < 0:
+            raise SystemExit(f"proposal-076: {label} auto_retry_backpressure_skip_count must be non-negative integer")
+        policy_status = rs.get("auto_retry_policy_status")
+        if policy_status not in READBACK_POLICY_STATUS_ENUM:
+            raise SystemExit(f"proposal-076: {label} run_summary invalid auto_retry_policy_status: {policy_status!r}")
+        policy_decision = rs.get("auto_retry_policy_decision")
+        if policy_decision is not None and policy_decision not in POLICY_DECISION_ENUM:
+            raise SystemExit(f"proposal-076: {label} run_summary invalid auto_retry_policy_decision: {policy_decision!r}")
+        blocker_class = rs.get("auto_retry_blocker_class")
+        if blocker_class is not None and blocker_class not in BLOCKER_CLASS_ENUM:
+            raise SystemExit(f"proposal-076: {label} run_summary invalid auto_retry_blocker_class: {blocker_class!r}")
+        budget_state = rs.get("auto_retry_retry_budget_state")
+        if budget_state is not None and budget_state not in BUDGET_STATUS_ENUM:
+            raise SystemExit(f"proposal-076: {label} run_summary invalid auto_retry_retry_budget_state: {budget_state!r}")
+        last_retry = rs.get("auto_retry_last_retry_result")
+        if last_retry is not None and last_retry not in RETRY_RESULT_ENUM:
+            raise SystemExit(f"proposal-076: {label} run_summary invalid auto_retry_last_retry_result: {last_retry!r}")
+        known_issue = rs.get("auto_retry_known_issue_status")
+        if known_issue is not None and known_issue not in KNOWN_ISSUE_STATUS_ENUM:
+            raise SystemExit(f"proposal-076: {label} run_summary invalid auto_retry_known_issue_status: {known_issue!r}")
+        oldest_planned = rs.get("oldest_planned_attempt_at")
+        if oldest_planned is not None and not is_rfc3339(oldest_planned):
+            raise SystemExit(f"proposal-076: {label} run_summary oldest_planned_attempt_at must be RFC3339|null, got {oldest_planned!r}")
+        for nni_field in ["planned_attempt_age_seconds", "unknown_attempt_count"]:
+            nni_val = rs.get(nni_field)
+            if nni_val is not None and (not isinstance(nni_val, int) or nni_val < 0):
+                raise SystemExit(f"proposal-076: {label} run_summary {nni_field} must be non_negative_integer|null, got {nni_val!r}")
+    return arb
+
+
+# --- Positive fixture ---
+fixture_path = root / "docs/evidence/rollout-contract/operator-readback/p076-full-surface.fixture.json"
+if not fixture_path.exists():
+    raise SystemExit("proposal-076: missing P076 operator-readback fixture")
+fixture = json.loads(fixture_path.read_text())
+
+# Assert fixture is scoped as hold (not release) until runtime phases are implemented
+if fixture.get("rollout_contract_decision") == "release":
+    raise SystemExit("proposal-076: rollout_contract_decision must not be 'release' for Phase 1 scaffolding; expected 'hold'")
+
+main_arb = require_auto_retry_readback(fixture, "run_report")
+lanes = fixture.get("parity_lanes") or {}
+
+# Assert no unauthorized graphql lane in parity_lanes (no GraphQL schema changes in P076)
+if "graphql" in lanes:
+    raise SystemExit("proposal-076: parity_lanes must not contain a 'graphql' key (P076 no-change-compatibility rule)")
+
+require_auto_retry_readback(lanes.get("mcp") or {}, "mcp")
+require_auto_retry_readback(lanes.get("release_receipt") or {}, "release_receipt")
+
+# Prove: no side-effecting retry in any lane
+for _label, _payload in [("run_report", fixture), ("mcp", lanes.get("mcp") or {}), ("release_receipt", lanes.get("release_receipt") or {})]:
+    for obs in (_payload.get("auto_retry_readback") or {}).get("observations", []):
+        if obs.get("retry_result") not in RETRY_RESULT_P076:
+            raise SystemExit(f"proposal-076: {_label} fixture has non-P076 retry_result {obs.get('retry_result')!r}")
+
+# Prove: human_gate observation with retry_action=none
+if not any(
+    obs.get("blocker_class") == "human_gate" and obs.get("retry_action") == "none"
+    for obs in main_arb.get("observations", [])
+):
+    raise SystemExit("proposal-076: fixture must prove human_gate observation with retry_action=none")
+
+# Prove: no_observation_history and readback_degraded in latest_by_run
+statuses = {rs.get("auto_retry_policy_status") for rs in main_arb.get("latest_by_run", [])}
+if "no_observation_history" not in statuses:
+    raise SystemExit("proposal-076: fixture must prove no_observation_history run in latest_by_run")
+if "readback_degraded" not in statuses:
+    raise SystemExit("proposal-076: fixture must prove readback_degraded run in latest_by_run (degraded-success)")
+
+# Prove: rollup grouping — at least 2 observations share a blocker_signature_id
+sig_counts = {}
+for obs in main_arb.get("observations", []):
+    sig = obs.get("blocker_signature_id")
+    if sig:
+        sig_counts[sig] = sig_counts.get(sig, 0) + 1
+if not any(v >= 2 for v in sig_counts.values()):
+    raise SystemExit("proposal-076: fixture must have >=2 observations with the same blocker_signature_id to prove rollup dedupe")
+
+# Prove: observe_only policy_decision present
+if not any(obs.get("policy_decision") == "observe_only" for obs in main_arb.get("observations", [])):
+    raise SystemExit("proposal-076: fixture must include at least one observe_only policy_decision observation")
+
+# Prove: unsupported_version_error_sample shape
+uv = fixture.get("unsupported_version_error_sample")
+if not isinstance(uv, dict):
+    raise SystemExit("proposal-076: fixture missing unsupported_version_error_sample")
+err_envelope = uv.get("error") or {}
+if err_envelope.get("code") != -32076:
+    raise SystemExit("proposal-076: unsupported_version error.code must be -32076 (JSON-RPC application error envelope)")
+if err_envelope.get("message") != "unsupported_version":
+    raise SystemExit("proposal-076: unsupported_version error.message must be 'unsupported_version'")
+err_data = err_envelope.get("data") or {}
+for ef in ["code", "supported_versions", "unsupported_versions", "requested_versions"]:
+    if ef not in err_data:
+        raise SystemExit(f"proposal-076: unsupported_version_error_sample error.data missing {ef}")
+
+# Prove: budget_ref_v1_sample shape + scalar types
+br = fixture.get("budget_ref_v1_sample")
+if not isinstance(br, dict):
+    raise SystemExit("proposal-076: fixture missing budget_ref_v1_sample")
+for req in BUDGET_REF_REQUIRED:
+    if req not in br:
+        raise SystemExit(f"proposal-076: budget_ref_v1_sample missing required field {req}")
+validate_budget_ref_v1_scalars(br, "budget_ref_v1_sample", allow_fixture_metadata=True)
+
+# Prove: observation_summary_v1_sample — strict validate (closed schema, enum domains, id format)
+# fixture_note is allowed as documentation metadata in sample objects
+os_sample = fixture.get("observation_summary_v1_sample")
+if not isinstance(os_sample, dict):
+    raise SystemExit("proposal-076: fixture missing observation_summary_v1_sample")
+strict_validate_obs_summary(os_sample, "observation_summary_v1_sample", allow_fixture_metadata=True)
+
+# Prove: strict_validation_proof shape
+svp = fixture.get("strict_validation_proof") or {}
+svp_input = svp.get("sample_input") or {}
+if svp.get("expected_outcome") != "rejected":
+    raise SystemExit("proposal-076: strict_validation_proof.expected_outcome must be 'rejected'")
+svp_extra = set(svp_input.keys()) - OBS_SUMMARY_KNOWN
+if not svp_extra:
+    raise SystemExit("proposal-076: strict_validation_proof.sample_input must contain unknown fields for strict rejection")
+
+# Prove: permissive_validation_proof shape — required fields present, unknown field present
+pvp = fixture.get("permissive_validation_proof") or {}
+pvp_input = pvp.get("sample_input") or {}
+if pvp.get("expected_outcome") != "accepted_with_diagnostic":
+    raise SystemExit("proposal-076: permissive_validation_proof.expected_outcome must be 'accepted_with_diagnostic'")
+pvp_missing = [f for f in OBS_SUMMARY_REQUIRED if f not in pvp_input]
+if pvp_missing:
+    raise SystemExit(f"proposal-076: permissive_validation_proof.sample_input missing required fields for permissive validation: {pvp_missing}")
+pvp_extra = set(pvp_input.keys()) - OBS_SUMMARY_KNOWN
+if not pvp_extra:
+    raise SystemExit("proposal-076: permissive_validation_proof.sample_input must contain an unknown additive field to prove permissive tolerance")
+pvp_diags = permissive_validate_obs_summary(pvp_input, "permissive_validation_proof")
+if not pvp_diags:
+    raise SystemExit("proposal-076: permissive_validate_obs_summary must emit at least one diagnostic for unknown fields (permissive_report mode must prove diagnostic emission, not silent tolerance)")
+
+# Prove: degraded_readback_sample shape (successful response with diagnostics, no partial-failure transport error)
+drs = fixture.get("degraded_readback_sample") or {}
+if drs.get("schema_version") != "auto_retry_readback.v1":
+    raise SystemExit("proposal-076: degraded_readback_sample must have schema_version=auto_retry_readback.v1")
+for pf in P076_PATH_FIELDS:
+    if not drs.get(pf):
+        raise SystemExit(f"proposal-076: degraded_readback_sample missing required path field: {pf}")
+drs_diags = drs.get("diagnostics") or []
+if not isinstance(drs_diags, list):
+    raise SystemExit("proposal-076: degraded_readback_sample diagnostics must be an array")
+for diag in drs_diags:
+    validate_diagnostic_v1(diag, "degraded_readback_sample")
+if not isinstance(drs.get("observations"), list):
+    raise SystemExit("proposal-076: degraded_readback_sample observations must be an array")
+if not isinstance(drs.get("latest_by_run"), list):
+    raise SystemExit("proposal-076: degraded_readback_sample latest_by_run must be an array")
+
+# --- Negative fixtures ---
+neg_dir = root / "docs/evidence/rollout-contract/negative"
+negative_fixtures = [
+    "p076-side-effect-retry-present.jsonl",
+    "p076-human-gate-retried.jsonl",
+    "p076-missing-schema-field.jsonl",
+    "p076-invalid-enum-strict.jsonl",
+    "p076-ledger-append-missing-newline.jsonl",
+    "p076-missing-budget-ref-schema.json",
+    "p076-missing-observation-summary-schema.json",
+    "p076-missing-readback-lock-path.json",
+    "p076-missing-readback-rollup-report-path.json",
+    "p076-budget-failure-retried.json",
+    "p076-backpressure-exceeded.json",
+    "p076-human-gate-starvation.json",
+    "p076-orphaned-planned-attempt-not-escalated.json",
+    "p076-pid-reuse-lock-liveness-gap.json",
+    "p076-poll-timeout-without-observation.json",
+    "p076-retry-timeout-duplicate-not-suppressed.json",
+    "p076-ledger-append-not-fsynced.json",
+    "p076-markdown-catalog-as-authority.json",
+    "p076-unsafe-stale-lock-recovery.json",
+    "p076-unknown-field-strict.json",
+]
+for nf in negative_fixtures:
+    if not (neg_dir / nf).exists():
+        raise SystemExit(f"proposal-076: missing negative fixture {nf}")
+
+# Validate: side-effect-retry-present has non-P076-compliant retry_result in blocked_runs
+se_found = False
+for line in (neg_dir / "p076-side-effect-retry-present.jsonl").read_text().splitlines():
+    if not line.strip():
+        continue
+    try:
+        rec = json.loads(line)
+        for br in rec.get("blocked_runs", []):
+            if br.get("retry_result") not in RETRY_RESULT_P076:
+                se_found = True
+    except Exception:
+        pass
+if not se_found:
+    raise SystemExit("proposal-076: p076-side-effect-retry-present.jsonl must have a blocked_run with retry_result not in {not_attempted, not_allowed}")
+
+# Validate: human-gate-retried has human_gate with non-not_attempted retry_result
+hg_found = False
+for line in (neg_dir / "p076-human-gate-retried.jsonl").read_text().splitlines():
+    if not line.strip():
+        continue
+    try:
+        rec = json.loads(line)
+        for br in rec.get("blocked_runs", []):
+            if br.get("blocker_class") == "human_gate" and br.get("retry_result") not in {None, "not_attempted"}:
+                hg_found = True
+    except Exception:
+        pass
+if not hg_found:
+    raise SystemExit("proposal-076: p076-human-gate-retried.jsonl must have a human_gate blocked_run with non-not_attempted retry_result")
+
+# Validate: ledger-append-missing-newline does NOT end with newline
+nl_bytes = (neg_dir / "p076-ledger-append-missing-newline.jsonl").read_bytes()
+if nl_bytes.endswith(b"\n"):
+    raise SystemExit("proposal-076: p076-ledger-append-missing-newline.jsonl must not end with newline (proves missing trailing newline violation)")
+
+# Validate: missing-readback-lock-path omits lock_path
+lock_fix = json.loads((neg_dir / "p076-missing-readback-lock-path.json").read_text())
+if "lock_path" in (lock_fix.get("auto_retry_readback") or {}):
+    raise SystemExit("proposal-076: p076-missing-readback-lock-path.json must omit lock_path from auto_retry_readback")
+
+# Validate: missing-readback-rollup-report-path omits rollup_report_path
+rollup_fix = json.loads((neg_dir / "p076-missing-readback-rollup-report-path.json").read_text())
+if "rollup_report_path" in (rollup_fix.get("auto_retry_readback") or {}):
+    raise SystemExit("proposal-076: p076-missing-readback-rollup-report-path.json must omit rollup_report_path from auto_retry_readback")
+
+# Validate: budget-failure-retried marker
+bf = json.loads((neg_dir / "p076-budget-failure-retried.json").read_text())
+if not bf.get("proves_budget_unavailable_should_block_retry"):
+    raise SystemExit("proposal-076: p076-budget-failure-retried.json missing proves_budget_unavailable_should_block_retry")
+
+# Validate: backpressure-exceeded marker
+bp = json.loads((neg_dir / "p076-backpressure-exceeded.json").read_text())
+if not bp.get("proves_missing_skipped_work_record"):
+    raise SystemExit("proposal-076: p076-backpressure-exceeded.json missing proves_missing_skipped_work_record")
+
+# Validate: pid-reuse-lock-liveness-gap markers
+pid = json.loads((neg_dir / "p076-pid-reuse-lock-liveness-gap.json").read_text())
+if not pid.get("proves_pid_reuse_risk"):
+    raise SystemExit("proposal-076: p076-pid-reuse-lock-liveness-gap.json missing proves_pid_reuse_risk")
+if not isinstance(pid.get("missing_liveness_fields"), list):
+    raise SystemExit("proposal-076: p076-pid-reuse-lock-liveness-gap.json missing_liveness_fields must be a list")
+
+# Validate: poll-timeout-without-observation marker
+pto = json.loads((neg_dir / "p076-poll-timeout-without-observation.json").read_text())
+if not pto.get("proves_missing_timeout_observation"):
+    raise SystemExit("proposal-076: p076-poll-timeout-without-observation.json missing proves_missing_timeout_observation")
+
+# Validate: unsafe-stale-lock-recovery marker
+slr = json.loads((neg_dir / "p076-unsafe-stale-lock-recovery.json").read_text())
+if not slr.get("proves_unsafe_stale_lock_recovery"):
+    raise SystemExit("proposal-076: p076-unsafe-stale-lock-recovery.json missing proves_unsafe_stale_lock_recovery")
+
+# Validate: unknown-field-strict rejection mode
+uf = json.loads((neg_dir / "p076-unknown-field-strict.json").read_text())
+if uf.get("unknown_field_rejection_mode") != "strict":
+    raise SystemExit("proposal-076: p076-unknown-field-strict.json must have unknown_field_rejection_mode='strict'")
+
+# Strict validator: p076-unknown-field-strict.json sample_record must contain a field
+# not in the observation_summary_v1 additionalProperties=false schema; also confirm
+# that running the strict validator against it would fail (extra fields detected)
+uf_sample = uf.get("sample_record") or {}
+uf_extra = set(uf_sample.keys()) - OBS_SUMMARY_KNOWN
+if not uf_extra:
+    raise SystemExit(
+        "proposal-076: p076-unknown-field-strict.json sample_record must contain at least one "
+        "field absent from the observation_summary_v1 schema (additionalProperties=false)"
+    )
+# Verify strict validator would reject it (the sample has required fields present too)
+uf_missing_required = [f for f in OBS_SUMMARY_REQUIRED if f not in uf_sample]
+if uf_missing_required:
+    raise SystemExit(
+        f"proposal-076: p076-unknown-field-strict.json sample_record must include all required "
+        f"observation_summary_v1 fields so strict rejection is for extra fields, not missing ones. "
+        f"Missing: {uf_missing_required}"
+    )
+# Invoke strict validator and confirm it raises for the unknown field (fail-closed proof)
+try:
+    strict_validate_obs_summary(uf_sample, "p076-unknown-field-strict-sample")
+    raise SystemExit(
+        "proposal-076: strict_validate_obs_summary failed to reject p076-unknown-field-strict.json "
+        "sample_record — fail-closed strict mode must reject unknown fields in additionalProperties=false schemas"
+    )
+except SystemExit as _e:
+    if "unknown fields" not in str(_e) and "strict mode" not in str(_e):
+        raise _e
+    # expected: strict rejection confirmed — fail-closed proof passes
+
+# Strict validator: p076-invalid-enum-strict.jsonl must have a blocked_run with
+# blocker_class outside the closed BLOCKER_CLASS_ENUM domain
+inv_enum_found = False
+for line in (neg_dir / "p076-invalid-enum-strict.jsonl").read_text().splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        rec = json.loads(line)
+        for br in rec.get("blocked_runs", []):
+            if br.get("blocker_class") not in BLOCKER_CLASS_ENUM:
+                inv_enum_found = True
+    except Exception:
+        pass
+if not inv_enum_found:
+    raise SystemExit(
+        "proposal-076: p076-invalid-enum-strict.jsonl must have a blocked_run with "
+        "blocker_class not in the closed enum domain"
+    )
+
+# Strict validator: p076-missing-schema-field.jsonl must have a record missing at
+# least one required auto_retry_observation_v1 top-level field
+missing_field_found = False
+for line in (neg_dir / "p076-missing-schema-field.jsonl").read_text().splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        rec = json.loads(line)
+        if any(req not in rec for req in OBS_V1_REQUIRED):
+            missing_field_found = True
+    except Exception:
+        pass
+if not missing_field_found:
+    raise SystemExit(
+        "proposal-076: p076-missing-schema-field.jsonl must have a record missing at least "
+        "one required auto_retry_observation_v1 field"
+    )
+
+# Active validator: p076-missing-observation-summary-schema.json observations must be
+# missing required observation_summary_v1 fields (proves strict validator would reject them)
+mobs_fix = json.loads((neg_dir / "p076-missing-observation-summary-schema.json").read_text())
+mobs_observations = mobs_fix.get("observations") or []
+if not mobs_observations:
+    raise SystemExit("proposal-076: p076-missing-observation-summary-schema.json must have at least one observation")
+mobs_obs = mobs_observations[0]
+mobs_missing = [f for f in OBS_SUMMARY_REQUIRED if f not in mobs_obs]
+if not mobs_missing:
+    raise SystemExit(
+        "proposal-076: p076-missing-observation-summary-schema.json observation must be missing "
+        "at least one required observation_summary_v1 field (proves strict validator rejects it)"
+    )
+
+# Active validator: p076-missing-budget-ref-schema.json observations must either be missing
+# required fields OR contain unknown fields (proves strict validator would reject them)
+mbr_fix = json.loads((neg_dir / "p076-missing-budget-ref-schema.json").read_text())
+mbr_observations = mbr_fix.get("observations") or []
+if not mbr_observations:
+    raise SystemExit("proposal-076: p076-missing-budget-ref-schema.json must have at least one observation")
+mbr_obs = mbr_observations[0]
+mbr_missing = [f for f in OBS_SUMMARY_REQUIRED if f not in mbr_obs]
+mbr_extra = set(mbr_obs.keys()) - OBS_SUMMARY_KNOWN
+if not mbr_missing and not mbr_extra:
+    raise SystemExit(
+        "proposal-076: p076-missing-budget-ref-schema.json observation must be missing required fields "
+        "or have unknown fields, proving the strict validator would detect a schema violation"
+    )
+
+print("proposal-076 all gate checks passed")
+PY
+    if ! rg -q "automation.auto_retry.latest" "$ROOT_DIR/control-plane/crates/mcp-server/src"; then
+      printf 'proposal-076: missing production automation.auto_retry.latest MCP readback tool\n' >&2
+      exit 1
+    fi
+    if [[ ! -x "$ROOT_DIR/scripts/chainworks/auto_retry_rollup.py" ]]; then
+      printf 'proposal-076: missing auto-retry rollup tooling\n' >&2
+      exit 1
+    fi
+    if [[ ! -x "$ROOT_DIR/scripts/chainworks/auto_retry_observe.py" ]]; then
+      printf 'proposal-076: missing observe-only auto-retry poll writer\n' >&2
+      exit 1
+    fi
+    if rg -q "stages_retry|stages\\.retry|runs_retry|tools/call|stages\\.approve|approvals\\.approve" "$ROOT_DIR/scripts/chainworks/auto_retry_observe.py"; then
+      printf 'proposal-076: observe-only poll writer must not contain retry/recovery/approval dispatch hooks\n' >&2
+      exit 1
+    fi
+    tmp_p076="$(mktemp -d "${TMPDIR:-/tmp}/p076-rollup.XXXXXX")"
+    mkdir -p "$tmp_p076/automation"
+    printf '%s\n' '{"schema_version":"auto-retry-observation.v1","observation_id":"ar_obs_20260523T100000Z_a1b2c3d4e5f6","observed_at":"2026-05-23T10:00:00Z","blocked_runs":[{"run_id":"run-a","stage_id":"state_9","blocker_signature_id":"sig-p076","blocker_class":"substantive_output_contract","policy_decision":"observe_only","retry_action":"none","retry_result":"not_attempted","failure_summary":"missing output","next_systemic_action":"inspect contract"}]}' '{"schema_version":"auto-retry-observation.v1","observation_id":"ar_obs_20260523T100100Z_b1b2c3d4e5f6","observed_at":"2026-05-23T10:01:00Z","blocked_runs":[{"run_id":"run-b","stage_id":"state_9","blocker_signature_id":"sig-p076","blocker_class":"substantive_output_contract","policy_decision":"observe_only","retry_action":"none","retry_result":"not_attempted","failure_summary":"missing output","next_systemic_action":"inspect contract"}]}' > "$tmp_p076/automation/auto-retry-observations.jsonl"
+    CHAINWORKS_META_ROOT="$tmp_p076" python3 "$ROOT_DIR/scripts/chainworks/auto_retry_rollup.py" --write-markdown >/dev/null
+    python3 - "$tmp_p076/automation/auto-retry-rollup.json" <<'PY'
+import json, sys
+payload = json.loads(open(sys.argv[1]).read())
+if payload.get("schema_version") != "auto-retry-rollup.v1":
+    raise SystemExit("proposal-076: rollup script emitted wrong schema_version")
+issues = payload.get("issues") or []
+if len(issues) != 1 or issues[0].get("observation_count") != 2:
+    raise SystemExit("proposal-076: rollup script did not dedupe repeated blocker_signature_id")
+PY
+    tmp_p076_observe="$(mktemp -d "${TMPDIR:-/tmp}/p076-observe.XXXXXX")"
+    cat > "$tmp_p076_observe/blocked-runs.json" <<'JSON'
+[
+  {
+    "run_id": "run-p076-writer-001",
+    "stage_id": "state_9_implementation_reviewed",
+    "blocker_class": "substantive_output_contract",
+    "blocker_signature_id": "sig-p076-writer",
+    "failure_class": "missing_required_output",
+    "failure_summary": "required output missing",
+    "safe_retry": true,
+    "retry_action": "recommend_retry",
+    "retry_result": "not_attempted",
+    "policy_decision": "observe_only",
+    "next_systemic_action": "inspect contract"
+  },
+  {
+    "run_id": "run-p076-human-gate-001",
+    "stage_id": "state_5_approval",
+    "blocker_class": "human_gate",
+    "blocker_signature_id": "sig-p076-human-gate",
+    "status_before": "waiting_approval",
+    "safe_retry": false,
+    "retry_action": "none",
+    "retry_result": "not_allowed",
+    "policy_decision": "human_gate",
+    "next_systemic_action": "wait for human approval"
+  }
+]
+JSON
+    CHAINWORKS_META_ROOT="$tmp_p076_observe" python3 "$ROOT_DIR/scripts/chainworks/auto_retry_observe.py" --blocked-runs-json "$tmp_p076_observe/blocked-runs.json" >/dev/null
+    python3 - "$tmp_p076_observe" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+ledger = root / "automation/auto-retry-observations.jsonl"
+budget = root / "automation/auto-retry-budget.json"
+catalog = root / "automation/auto-retry-known-issues.json"
+markdown = root / "automation/auto-retry-known-issues.md"
+rollup = root / "automation/auto-retry-rollup.json"
+for path in [ledger, budget, catalog, markdown, rollup]:
+    if not path.exists():
+        raise SystemExit(f"proposal-076: observe writer did not create {path.name}")
+raw = ledger.read_bytes()
+if not raw.endswith(b"\n"):
+    raise SystemExit("proposal-076: observe writer did not append newline-terminated JSONL")
+records = [json.loads(line) for line in ledger.read_text().splitlines() if line.strip()]
+if len(records) != 1:
+    raise SystemExit("proposal-076: observe writer must append exactly one observation per poll")
+record = records[0]
+if record.get("schema_version") != "auto-retry-observation.v1":
+    raise SystemExit("proposal-076: observe writer emitted wrong observation schema")
+if not str(record.get("canonical_record_hash", "")).startswith("sha256:"):
+    raise SystemExit("proposal-076: observe writer omitted canonical_record_hash")
+for row in record.get("blocked_runs", []):
+    if row.get("retry_result") not in {"not_attempted", "not_allowed"}:
+        raise SystemExit("proposal-076: observe writer recorded side-effect retry result")
+    if row.get("blocker_class") == "human_gate" and row.get("retry_action") != "none":
+        raise SystemExit("proposal-076: observe writer retried human gate")
+if json.loads(budget.read_text()).get("schema_version") != "auto-retry-budget.v1":
+    raise SystemExit("proposal-076: observe writer emitted wrong budget schema")
+if json.loads(catalog.read_text()).get("schema_version") != "auto-retry-known-issues.v1":
+    raise SystemExit("proposal-076: observe writer emitted wrong catalog schema")
+if json.loads(rollup.read_text()).get("issue_count") != 2:
+    raise SystemExit("proposal-076: observe writer rollup did not include both signatures")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p mcp-server p076_auto_retry_latest -- --nocapture
+    )
+    log "Proposal 076 gate passed"
+    ;;
   proposal-054-v1-retirement|p054-v1-retirement)
     if [[ -z "${DATABASE_URL:-}" ]]; then
       printf 'error: DATABASE_URL is required for proposal-054-v1-retirement\n' >&2
@@ -6201,6 +7294,339 @@ PY
     )
     run_targeted_tests "proposal-084" "${PROPOSAL_084_SWIFT_TESTS[@]}"
     log "Proposal 084 gate passed"
+    ;;
+  proposal-081|p081)
+    log "Proposal 081 gate: boundary-first API and auth contract matrix (Phase 1+2)"
+
+    log "P081: boundary coverage guardrail"
+    "$ROOT_DIR/scripts/check-boundary-coverage.sh"
+
+    log "P081: fixture JSON validity - verify boundary-first-api-auth-contract.json exists and is valid JSON"
+    python3 - <<'PY'
+import json, sys, pathlib
+root = pathlib.Path(sys.argv[0]).parent.parent if sys.argv[0] != "-" else pathlib.Path(".")
+import os
+root = pathlib.Path(os.environ.get("ROOT_DIR", "."))
+fixture_path = root / "docs/reference/boundary-first-api-auth-contract.json"
+if not fixture_path.exists():
+    raise SystemExit("P081: missing docs/reference/boundary-first-api-auth-contract.json")
+try:
+    fixture = json.loads(fixture_path.read_text())
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"P081: invalid JSON in boundary-first-api-auth-contract.json: {exc}") from exc
+if fixture.get("schema_version") != 1:
+    raise SystemExit(f"P081: expected schema_version 1, got {fixture.get('schema_version')}")
+if "matrix_id" not in fixture:
+    raise SystemExit("P081: boundary fixture missing matrix_id")
+if not fixture.get("rows"):
+    raise SystemExit("P081: boundary fixture rows array is empty")
+REQUIRED_ROW_IDS = [
+    "p081.ui_operator.graphql_query.read",
+    "p081.ui_operator.graphql_subscription.subscribe",
+    "p081.ui_operator.graphql_mutation.approval_action",
+    "p081.agent_operator.mcp_initialize.capability",
+    "p081.agent_operator.mcp_tools_list.discovery",
+    "p081.agent_operator.mcp_tools_call.command",
+    "p081.automation.mcp_tools_list.discovery",
+    "p081.automation.mcp_tools_call.command",
+    "p081.observer.mcp_tools_call.compact_read",
+    "p081.observer.graphql_query.read_only_opt_in",
+    "p081.developer_break_glass.debug_endpoint.disabled",
+]
+present_ids = {row["row_id"] for row in fixture["rows"]}
+for required in REQUIRED_ROW_IDS:
+    if required not in present_ids:
+        raise SystemExit(f"P081: required row '{required}' missing from fixture")
+print(f"P081: fixture valid - {len(fixture['rows'])} rows, all {len(REQUIRED_ROW_IDS)} required rows present")
+PY
+
+    log "P081: doc exists - verify boundary-first-api-auth-contract.md exists"
+    if [[ ! -f "$ROOT_DIR/docs/reference/boundary-first-api-auth-contract.md" ]]; then
+      die "P081: missing docs/reference/boundary-first-api-auth-contract.md"
+    fi
+
+    log "P081: operator readback and shadow coverage evidence fixtures"
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+matrix_path = root / "docs/reference/boundary-first-api-auth-contract.json"
+readback_path = root / "docs/evidence/rollout-contract/operator-readback/p081-full-surface.fixture.json"
+coverage_path = root / "docs/evidence/boundary-policy-shadow-coverage/report.json"
+canary_path = root / "docs/evidence/boundary-policy-shadow-coverage/boundary-policy-canaries.yaml"
+
+def load(path: pathlib.Path) -> dict:
+    if not path.exists():
+        raise SystemExit(f"P081: missing evidence fixture {path.relative_to(root)}")
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"P081: invalid JSON in {path.relative_to(root)}: {exc}") from exc
+
+readback = load(readback_path)
+fixture = load(matrix_path)
+present_ids = {row["row_id"] for row in fixture.get("rows") or []}
+if readback.get("schema_version") != "operator_readback_v1":
+    raise SystemExit("P081: operator readback fixture schema_version mismatch")
+if readback.get("proposal_id") != "proposal-081":
+    raise SystemExit("P081: operator readback fixture proposal_id mismatch")
+if readback.get("rollout_contract_status") != "pass":
+    raise SystemExit("P081: operator readback fixture must be pass")
+if "placeholder" in readback or "placeholder_pending_implementation_evidence" in json.dumps(readback):
+    raise SystemExit("P081: operator readback fixture still contains placeholder evidence")
+graphql = (readback.get("parity_lanes") or {}).get("graphql") or {}
+mcp = (readback.get("parity_lanes") or {}).get("mcp") or {}
+if not graphql.get("operatorAlerts"):
+    raise SystemExit("P081: GraphQL lane must include operatorAlerts proof")
+if (graphql.get("websocketPolicyReload") or {}).get("closeCode") != 4408:
+    raise SystemExit("P081: GraphQL lane must prove 4408 policy reload close code")
+if not (mcp.get("operator_alerts_list") or {}).get("alerts_include_safe_mode"):
+    raise SystemExit("P081: MCP lane must prove operator.alerts.list safe-mode alert")
+
+coverage = load(coverage_path)
+if not canary_path.exists():
+    raise SystemExit("P081: missing boundary-policy-canaries.yaml source artifact")
+canary_text = canary_path.read_text()
+if "schema_version: boundary_policy_canaries_v1" not in canary_text:
+    raise SystemExit("P081: boundary-policy-canaries.yaml schema_version mismatch")
+for required in present_ids:
+    if f"row_id: {required}" not in canary_text:
+        raise SystemExit(f"P081: boundary-policy-canaries.yaml missing row {required}")
+if "expected_decision: allow_redacted" not in canary_text:
+    raise SystemExit("P081: canary artifact must include allow_redacted observer proof")
+if coverage.get("schema_version") != "boundary_policy_shadow_coverage_report_v1":
+    raise SystemExit("P081: shadow coverage schema_version mismatch")
+if coverage.get("matrix_id") != fixture.get("matrix_id"):
+    raise SystemExit("P081: shadow coverage matrix_id mismatch")
+rows = coverage.get("rows") or []
+row_ids = {row.get("row_id") for row in rows}
+missing = sorted(present_ids - row_ids)
+if missing:
+    raise SystemExit(f"P081: shadow coverage missing matrix rows: {missing}")
+for row in rows:
+    if row.get("shadow_disagreement_count") != 0:
+        raise SystemExit(f"P081: shadow disagreement for {row.get('row_id')}")
+    if not row.get("canary_covered") and int(row.get("observation_count") or 0) < 10:
+        raise SystemExit(f"P081: row lacks canary coverage or 10 observations: {row.get('row_id')}")
+print("P081: operator readback and shadow coverage fixtures valid")
+PY
+
+    log "P081: structured boundary-policy canary validator"
+    python3 "$ROOT_DIR/scripts/validate-p081-canaries.py" --root "$ROOT_DIR" --self-test
+
+    log "P081: reliability proof inventory is gate-owned"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+inventory = {
+    "sqlite_contention": "SQLITE_CONTENTION_RETRY_EXHAUSTED",
+    "audit_outage": "E_AUDIT_UNAVAILABLE",
+    "subscription_gap_replay": "proposal_081_websocket_policy_reload_close_contract_is_explicit",
+    "safe_mode_exit_readback": "proposal_081_boundary_runtime_graphql_readback_is_bounded",
+    "sigterm_drain": "shutdown_drain_completes_within_deadline_exits_zero",
+    "denial_audit_backpressure": "audit_log.append",
+    "committed_unack_retry": "p081_idempotency_pending_sentinel_recovers_committed_unack_without_reexecution",
+}
+haystack = "\n".join(
+    path.read_text(errors="ignore")
+    for path in [
+        root / "scripts/test-gate.sh",
+        root / "control-plane/crates/graphql-server/src/schema.rs",
+        root / "control-plane/crates/graphql-server/src/server.rs",
+        root / "control-plane/crates/mcp-server/src/server.rs",
+        root / "control-plane/crates/db/src/repos/audit_log.rs",
+        root / "control-plane/crates/daemon/src/main.rs",
+    ]
+    if path.exists()
+)
+for name, token in inventory.items():
+    if token not in haystack:
+        raise SystemExit(f"P081: reliability proof inventory missing {name} token {token!r}")
+print("P081: reliability proof inventory valid")
+PY
+
+    log "P081: auth crate boundary module unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p auth boundary:: -- --nocapture
+    )
+
+    log "P081: auth crate CallerClass and CallerContext unit tests (Phase 2)"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p auth caller_class -- --nocapture
+    )
+
+    log "P081: db crate audit_log repo unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p db repos::audit_log:: -- --nocapture
+      cargo test -p db metrics::tests::proposal_081_required_metric_names_are_declared_and_recordable -- --nocapture
+      cargo test -p db repos::audit_log::tests::append_and_health_roundtrip -- --nocapture
+      cargo test -p db repos::audit_log::tests::p081_audit_budget_warning_and_safe_mode_emit_runtime_readback_and_metrics -- --nocapture
+      cargo test -p db repos::audit_log::tests::p081_audit_budget_recovery_exits_after_cleanup_and_half_open_probes -- --nocapture
+    )
+
+    log "P081: rollout metric labels and native-delivery semantics are gate-owned"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+metrics = (root / "control-plane/crates/db/src/metrics.rs").read_text()
+required_metric_tokens = [
+    '"boundary_policy_decision_latency_ms"',
+    '("transport", transport)',
+    '("caller_class", caller_class)',
+    '("mode", mode)',
+    '"boundary_commit_transaction_latency_ms"',
+    '("action_kind", action_kind)',
+    '("decision", decision)',
+    '"operator_alert_clear_latency_ms"',
+    '("alert_id", alert_id)',
+    '("severity", severity)',
+    'record_p081_audit_log_append_failure(event_type: &str, transport: &str, mode: &str)',
+    'event_type={event_type},transport={transport},mode={mode}',
+]
+for token in required_metric_tokens:
+    if token not in metrics:
+        raise SystemExit(f"P081: metrics.rs missing label/semantic token {token!r}")
+
+for rel in [
+    "control-plane/crates/graphql-server/src/schema.rs",
+    "control-plane/crates/mcp-server/src/tools/runtime.rs",
+    "control-plane/crates/mcp-server/src/server.rs",
+]:
+    content = (root / rel).read_text()
+    if 'increment_counter("audit_log_append_failure_total")' in content:
+        raise SystemExit(f"P081: {rel} still records bare audit_log_append_failure_total")
+    for stale in ["record_p081_operator_alert_native_delivery", "graphql_operator_alerts", "mcp_operator_alerts"]:
+        if stale in content and "operator_alert_native_delivery" in content:
+            raise SystemExit(f"P081: {rel} still records native-delivery as readback availability")
+
+notification = (root / "Chainworks Forge/Engine/NotificationService.swift").read_text()
+for token in [
+    'metricName = "operator_alert_native_delivery_total"',
+    'surface: "macos_notification_service"',
+    'result: "delivered"',
+    'result: "deduped"',
+    'result: "silenced"',
+]:
+    if token not in notification:
+        raise SystemExit(f"P081: NotificationService missing native metric token {token!r}")
+print("P081: rollout metric labels and native-delivery semantics valid")
+PY
+
+    log "P081: migration compile check - audit_log and audit_log_checkpoints migrations exist"
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/068_p081_audit_log.sql" ]]; then
+      die "P081: missing migration 068_p081_audit_log.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/069_p081_audit_log_checkpoints.sql" ]]; then
+      die "P081: missing migration 069_p081_audit_log_checkpoints.sql"
+    fi
+
+    log "P081: migration compile check - command_journal caller_class column migration exists (Phase 2)"
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/070_p081_caller_class.sql" ]]; then
+      die "P081: missing migration 070_p081_caller_class.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/071_p081_approval_idempotency.sql" ]]; then
+      die "P081: missing migration 071_p081_approval_idempotency.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/072_p081_fix_payload_length_check.sql" ]]; then
+      die "P081: missing migration 072_p081_fix_payload_length_check.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/073_p081_approval_idempotency_request_hash.sql" ]]; then
+      die "P081: missing migration 073_p081_approval_idempotency_request_hash.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/074_p081_mcp_command_idempotency.sql" ]]; then
+      die "P081: missing migration 074_p081_mcp_command_idempotency.sql"
+    fi
+    if [[ ! -f "$ROOT_DIR/control-plane/crates/db/migrations/075_p081_command_journal_idempotency.sql" ]]; then
+      die "P081: missing migration 075_p081_command_journal_idempotency.sql"
+    fi
+
+    log "P081: schema_version 3 bootstrap and unknown-version rejection tests (Phase 2)"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p auth bootstrap_emits_schema_version_3 -- --nocapture
+      cargo test -p auth v3_principal_table_rejects_unknown_schema_version -- --nocapture
+      cargo test -p auth v3_principal_table_derives_caller_class_not_stored -- --nocapture
+      cargo test -p auth p081_principals_file_rejects_hard_links_and_non_private_parent_dir -- --nocapture
+    )
+
+    log "P081: bounded GraphQL/MCP boundary runtime and operator alert readback tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p graphql-server proposal_081_boundary_runtime_graphql_readback_is_bounded -- --nocapture
+      cargo test -p graphql-server proposal_081_operator_alerts_surface_safe_mode_without_raw_audit_rows -- --nocapture
+      cargo test -p graphql-server proposal_081_observer_operator_alerts_redact_fields_without_graphql_errors -- --nocapture
+      cargo test -p graphql-server proposal_081_subscription_runtime_readback_exposes_cursor_gap_contract -- --nocapture
+      cargo test -p graphql-server proposal_081_runtime_subscription_payload_carries_cursor_generation_and_gap -- --nocapture
+      cargo test -p graphql-server proposal_081_audit_budget_safe_mode_denies_approval_mutation -- --nocapture
+      cargo test -p graphql-server proposal_081_websocket_policy_reload_close_contract_is_explicit -- --nocapture
+      cargo test -p graphql-server test_graphql_ws_rejects_missing_connection_init_auth -- --nocapture
+      cargo test -p graphql-server test_graphql_ws_rejects_non_ui_caller_with_forbidden_close -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server proposal_081_runtime_health_includes_boundary_runtime_readback -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server proposal_081_operator_alerts_list_exposes_safe_mode_alert -- --nocapture
+    )
+
+    log "P081: production daemon injects BoundaryPolicy through explicit constructors"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+main = (root / "control-plane/crates/daemon/src/main.rs").read_text()
+if "McpServer::new_with_storage_writer_and_boundary_policy" not in main:
+    raise SystemExit("P081: daemon must construct MCP server with explicit BoundaryPolicy constructor")
+if "graphql_server::schema::build_schema_with_storage_writer_and_boundary_policy" not in main:
+    raise SystemExit("P081: daemon must construct GraphQL schema with explicit BoundaryPolicy constructor")
+if re.search(r"McpServer::new_with_storage_writer\s*\(", main):
+    raise SystemExit("P081: production daemon must not use fail-open MCP constructor")
+if re.search(r"graphql_server::schema::build_schema\s*\(", main):
+    raise SystemExit("P081: production daemon must not use fail-open GraphQL schema constructor")
+print("P081: production daemon uses explicit BoundaryPolicy constructors")
+PY
+
+    log "P081: daemon shutdown drain reliability tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      cargo test -p daemon shutdown_drain_completes_within_deadline_exits_zero -- --nocapture
+      cargo test -p daemon shutdown_drain_exceeds_deadline_reports_timeout -- --nocapture
+    )
+
+    log "P081: MCP state-changing ideas.create is command-journaled and idempotency-linked"
+    (
+      cd "$ROOT_DIR/control-plane"
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_ideas_create_records_command_journal_and_idempotency_linkage -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_ideas_create_idempotency_replay_does_not_duplicate_command_commit -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_idempotency_storage_unavailable_fails_closed_with_sqlite_contention_code -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server p081_idempotency_pending_sentinel_recovers_committed_unack_without_reexecution -- --nocapture
+      RUST_MIN_STACK=8388608 cargo test -p mcp-server proposal_081_audit_budget_safe_mode_denies_state_changing_mcp_call -- --nocapture
+    )
+
+    log "P081: macOS accessibility contract source coverage"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+proposal = (root / "docs/proposals/081-boundary-first-api-auth-contract-matrix.md").read_text()
+reference = (root / "docs/reference/swift-macos-boundary-contract.md").read_text()
+tokens = [
+    "full_keyboard_access_redacted_nil_vs_ordinary_nil",
+    "increase_contrast_redaction_state",
+    "reduce_motion_alert_state",
+    "operator_alert_fires_and_clears_hidden_window",
+]
+for token in tokens:
+    if token not in proposal:
+        raise SystemExit(f"P081: proposal missing macOS accessibility proof token {token}")
+    if token not in reference:
+        raise SystemExit(f"P081: reference missing macOS accessibility proof token {token}")
+print("P081: macOS accessibility contract source coverage valid")
+PY
+
+    log "P081: Swift approval action attempt idempotency store"
+    run_targeted_tests "proposal-081-swift" "${PROPOSAL_081_SWIFT_TESTS[@]}"
+
+    log "Proposal 081 boundary-first API/auth gate passed"
     ;;
   full)
     check_idle_environment strict
@@ -7539,6 +8965,668 @@ PY
     )
     log "Proposal 091 gate passed"
     ;;
+  proposal-092|p092)
+    log "Proposal 092 retained gate: retry payload target invariants runtime proof"
+    python3 - "$ROOT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+reference = root / "docs/reference/rust-control-plane.md"
+gates_doc = root / "docs/reference/test-gates.md"
+runner = root / "scripts/test-gate.sh"
+
+def fail(message):
+    raise SystemExit(f"proposal-092: {message}")
+
+if not reference.exists():
+    fail("missing docs/reference/rust-control-plane.md")
+
+reference_text = reference.read_text()
+required_reference_terms = [
+    "Retry payload target invariants and recovery",
+    "Top-level routing fields describe the current run, stage, stage execution, target stage execution, and retry authority only.",
+    "targeted_retry.source_stage_execution_id",
+    "sanitize_targeted_retry_invoke_payload",
+    "auto-contract output retry and operator targeted retry",
+    "Post-invoke completion is authority/current-truth driven",
+    "retry_authority_target_agent_stage_mismatch",
+    "retry_authority_missing_for_targeted_invoke",
+    "Startup recovery runs this check before generic abandoned-invoke requeue",
+    "The daemon watchdog runs the same reconciliation after stale `AdvanceRun` inspection",
+    "CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_MODE",
+    "CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_DISABLED",
+    "CHAINWORKS_P092_RETRY_PAYLOAD_RECOVERY_BATCH_LIMIT",
+    "retry_payload_recovery_events",
+    "`candidates_total`, `repaired_total`, `excluded_total`",
+    "GraphQL attaches the latest durable event to `Run.retryAuthorityJson.retry_payload_recovery`",
+    "MCP `runs.get` exposes `retry_authority.retry_payload_recovery`",
+    "Missing-authority hard mismatch rows are represented as history entries with `authority_state = missing_authority`",
+    "retryPayloadRecovery",
+    "retry_payload_recovery",
+    "unknown_reason_code = true",
+    "valid_retry_invoke_completion_recovered",
+    "retry_payload_stale_target_stage_repaired",
+    "retry_payload_source_provenance_ignored_for_target",
+    "`./scripts/test-gate.sh proposal-092` / `p092`",
+    "retired proposal document is not the operational source of truth",
+]
+for term in required_reference_terms:
+    if term not in reference_text:
+        fail(f"docs/reference/rust-control-plane.md missing {term!r}")
+
+if "Proposal 092: Retry Authority Payload Target Invariants and Recovery" in reference_text:
+    fail("stable reference still reads like the retired proposal")
+
+if not gates_doc.exists():
+    fail("missing docs/reference/test-gates.md")
+gates_text = gates_doc.read_text()
+for term in [
+    "### `proposal-092|p092`",
+    "Retained historical alias",
+    "retry payload target invariants runtime proof",
+    "rust-control-plane.md#retry-payload-target-invariants-and-recovery",
+    "targeted retry sanitizer",
+    "post-invoke fail-closed behavior",
+    "bounded startup and live recovery entry points",
+    "durable `retry_payload_recovery_events` storage",
+    "configurable live batch limiting",
+    "explicit `excluded_total` diagnostics",
+    "GraphQL/MCP nullable missing-authority readback",
+    "GraphQL, MCP, and report readback schema placement",
+    "retired proposal document is not the source of operational truth",
+    "proposal-090|p090",
+    "retained Junie runtime-hardening",
+]:
+    if term not in gates_text:
+        fail(f"docs/reference/test-gates.md missing {term!r}")
+
+runner_text = runner.read_text()
+for term in [
+    "proposal-092|p092  Retained historical alias for P092 retry payload target invariants runtime proof gate",
+    "proposal-092|p092)",
+]:
+    if term not in runner_text:
+        fail(f"scripts/test-gate.sh missing {term!r}")
+
+print("proposal-092 readiness validation passed")
+PY
+    log "Proposal 092 retained runtime authority payload tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p domain --lib retry_authority
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p db p092_post_invoke -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p db p091_post_invoke_authority_target_mismatch_fails_closed -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p db --test proposal_092_retry_payload_recovery -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p engine auto_contract_output_retry_schedules_targeted_fallback_before_stage_blocks -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p engine --test integration test_retry_stage_with_agent_execution_id_schedules_single_invoke_attempt -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p engine --test integration p092_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p graphql-server --lib run_query_exposes_p091_retry_authority_history_and_repair_readback -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo test -p mcp-server --test proposal_091_retry_authority_readback retry_authority_history_and_current_readback_include_active_authority -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-092-gate cargo check -p daemon
+    )
+    log "Proposal 092 retained gate passed"
+    ;;
+  proposal-086|p086|p086-continuation-preflight)
+    log "Proposal 086 Phase 0 preflight: migration shape, MCP/artifact schemas, and Rust unit tests"
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def fail(msg):
+    raise SystemExit(f"proposal-086: {msg}")
+
+def load_json(path):
+    if not path.exists():
+        fail(f"missing {path.relative_to(root)}")
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {path.relative_to(root)}: {exc}")
+
+# 1. Migration file exists and contains required tables, indexes, and SHA-256 CHECK constraints
+migration = root / "control-plane/crates/db/migrations/065_p086_agent_work_continuations.sql"
+if not migration.exists():
+    fail("missing control-plane/crates/db/migrations/065_p086_agent_work_continuations.sql")
+sql = migration.read_text()
+
+required_tables = [
+    "agent_work_continuations",
+    "agent_external_side_effect_ledger",
+    "supervised_workers_continuation",
+]
+for table in required_tables:
+    if f"CREATE TABLE IF NOT EXISTS {table}" not in sql:
+        fail(f"migration missing CREATE TABLE IF NOT EXISTS {table}")
+
+required_indexes = [
+    "idx_awc_agent_created_at",
+    "idx_awc_run_status",
+    "idx_awc_stage",
+    "idx_awc_recon",
+    "idx_awc_admission",
+    "idx_awc_recovery",
+    "idx_ledger_cont_seq",
+    "idx_ledger_unresolved",
+    "idx_swc_heartbeat",
+    "idx_swc_generation",
+    "uniq_swc_active_continuation",
+]
+for idx in required_indexes:
+    if idx not in sql:
+        fail(f"migration missing required index: {idx}")
+
+if "NOT GLOB '*[^0-9a-f]*'" not in sql:
+    fail("migration missing SHA-256 NOT GLOB check constraints")
+for field in [
+    "attach_receipt_artifact_id",
+    "evidence_bundle_artifact_id",
+    "worktree_readback_artifact_id",
+    "continuation_report_artifact_id",
+]:
+    if field not in sql:
+        fail(f"migration missing P086 evidence readback column: {field}")
+
+provider_process_migration = root / "control-plane/crates/db/migrations/066_p086_supervised_worker_provider_process.sql"
+if not provider_process_migration.exists():
+    fail("missing control-plane/crates/db/migrations/066_p086_supervised_worker_provider_process.sql")
+provider_process_sql = provider_process_migration.read_text()
+for field in [
+    "provider_child_pid",
+    "provider_process_group_id",
+    "provider_process_uid",
+]:
+    if field not in provider_process_sql:
+        fail(f"migration 066 missing durable provider process field: {field}")
+
+metrics_migration = root / "control-plane/crates/db/migrations/067_p086_continuation_metric_events.sql"
+if not metrics_migration.exists():
+    fail("missing control-plane/crates/db/migrations/067_p086_continuation_metric_events.sql")
+metrics_sql = metrics_migration.read_text()
+for field in [
+    "p086_continuation_metric_events",
+    "metric_name",
+    "labels_json",
+    "continuation_id",
+    "idx_p086_metric_run_time",
+]:
+    if field not in metrics_sql:
+        fail(f"migration 067 missing durable P086 metric element: {field}")
+
+# 2. All six MCP schemas parse as valid JSON Schema; continue_work.response requires 'outcome'
+mcp_dir = root / "docs/reference/p086/schemas/mcp"
+required_mcp = [
+    "agents.continue_work.request.schema.json",
+    "agents.continue_work.response.schema.json",
+    "agents.continuation_status.request.schema.json",
+    "agents.continuation_status.response.schema.json",
+    "agents.continuation_candidates.request.schema.json",
+    "agents.continuation_candidates.response.schema.json",
+]
+for name in required_mcp:
+    schema = load_json(mcp_dir / name)
+    if name == "agents.continue_work.request.schema.json":
+        props = schema.get("properties") or {}
+        for field in [
+            "run_id",
+            "stage_execution_id",
+            "session_generation_id",
+            "provider_session_id",
+            "continuation_mode",
+            "operator_instruction",
+            "max_turns",
+            "max_wall_clock_seconds",
+            "blockers",
+        ]:
+            if field not in props:
+                fail(f"agents.continue_work.request.schema.json missing {field}")
+        schema_text = (mcp_dir / name).read_text()
+        if '"continuation_mode"' not in schema_text:
+            fail("agents.continue_work.request.schema.json must expose canonical continuation_mode")
+    if name == "agents.continue_work.response.schema.json":
+        required_props = schema.get("properties") or schema.get("oneOf") or {}
+        # Check 'outcome' appears anywhere in the schema text
+        schema_text = (mcp_dir / name).read_text()
+        if '"outcome"' not in schema_text:
+            fail(f"agents.continue_work.response.schema.json must require the 'outcome' field")
+        if "asynchronous admission response" not in schema_text:
+            fail("agents.continue_work.response.schema.json must document async admission/readback split")
+        forbidden_terminal_fields = [
+            "response_artifact_id",
+            "attach_receipt_artifact_id",
+            "evidence_bundle_artifact_id",
+            "worktree_readback_artifact_id",
+            "continuation_report_artifact_id",
+            "result_or_no_progress_artifact_id",
+        ]
+        for field in forbidden_terminal_fields:
+            if f'"{field}"' in schema_text:
+                fail(
+                    "agents.continue_work.response.schema.json must remain bounded admission output; "
+                    f"terminal field {field} belongs to continuation readback"
+                )
+        for field in ["failure_reason", "agent_execution_id", "queue_depth", "limit_scope"]:
+            if f'"{field}"' not in schema_text:
+                fail(f"agents.continue_work.response.schema.json must declare rejected error.data.{field}")
+
+reference_text = (root / "docs/reference/agent-work-continuation.md").read_text()
+for needle in [
+    "Output is an admission response, not a terminal execution response",
+    "Terminal fields are readback, not command output",
+    "agents.continue_work` returns a bounded admission response",
+]:
+    if needle not in reference_text:
+        fail(f"agent-work-continuation reference missing async MCP/readback contract clarification: {needle!r}")
+
+# 2b. Worker must route continuation through the ACP live-session reuse path and
+# must retain the canonical P086 mode-reset prompt contract.
+executor_rs = root / "control-plane/crates/engine/src/executor.rs"
+executor_text = executor_rs.read_text()
+if ".start_session(acp::ExecutionRequest" in executor_text:
+    fail("P086 worker must not call ACP start_session for live-handle continuation")
+if ".execute(acp::ExecutionRequest" not in executor_text:
+    fail("P086 worker must call ACP execute with reuse_existing_session=true")
+for needle in [
+    "# P086 Continuation Mode Reset",
+    "This is not a retry",
+    "Do not commit, push, release, publish, upload",
+    "provider_session_attach_receipt_v1",
+    "worktree_continuation_readback_v1",
+    "agent_continuation_evidence_bundle_v1",
+    "agent_continuation_report_v1",
+    "refresh_supervised_worker_heartbeat",
+    "reconcile_p086_continuation_from_evidence",
+    "p086_worktree_has_post_continuation_change",
+    "has_side_effect_ledger_row",
+    '"provider_send"',
+    "reconciled_from_post_continuation_worktree_evidence",
+    "post_continuation_change_without_provider_send_evidence",
+    "settle_p086_cancelled_after_provider_return",
+    "cancelled_after_provider_send",
+    "maybe_admit_p086_lead_auto_continuation",
+    "lead_continuation_decision_v1",
+    "lead_auto_orchestration",
+    "continuation_instruction",
+    "p086_reconciliation_transcript_evidence",
+    "continuation_reconciliation_transcript_evidence_total",
+    "explicit_transcript_absence",
+]:
+    if needle not in executor_text:
+        fail(f"P086 canonical prompt missing {needle!r}")
+
+# 2c. Admission must be catalog-gated and side-effect-safe, not just role-gated.
+agents_yaml = (root / "examples/agents/agents.yaml").read_text()
+for needle in [
+    "continuation_capability:",
+    "allowed_triggers:",
+    "live_handle_continuation:",
+    "require_no_unresolved_side_effects: true",
+]:
+    if needle not in agents_yaml:
+        fail(f"code_writer catalog missing P086 continuation capability needle {needle!r}")
+
+workflow_catalog = (root / "control-plane/crates/workflow/src/catalog.rs").read_text()
+if "pub struct ContinuationCapabilityYaml" not in workflow_catalog:
+    fail("workflow catalog must model continuation_capability in frozen snapshots")
+
+db_repo = (root / "control-plane/crates/db/src/repos/agent_work_continuations.rs").read_text()
+if "has_unresolved_side_effects_for_stage" not in db_repo or "FROM side_effects" not in db_repo:
+    fail("P086 admission must query unresolved P078 side_effects before accepting continuation")
+for needle in [
+    "list_stale_supervised_workers",
+    "mark_active_for_run_cancelling_tx",
+    "set_evidence_artifact_ids",
+    "list_needing_continuation_reconciliation",
+    "update_continuation_status_unless_cancelling",
+    "settle_with_artifacts_unless_cancelling",
+    "record_p086_continuation_metric_event",
+    "p086_continuation_metrics_summary_for_run",
+    "useful_progress_rate",
+    "average_time_saved_seconds",
+    "followup_validation_success_rate",
+    "provider_session_budget_input_tokens_total",
+    "provider_session_resurrection_attach_failure_total",
+    "rejected_lead_auto_agent_limit",
+    "rejected_lead_auto_stage_limit",
+]:
+    if needle not in db_repo:
+        fail(f"P086 DB repo missing recovery/readback helper {needle!r}")
+
+mcp_agents = (root / "control-plane/crates/mcp-server/src/tools/agents.rs").read_text()
+for needle in [
+    "continuation_capability_rejection",
+    "forbidden_stage_kind",
+    "unresolved_side_effects",
+    "live_session_required",
+    'PrincipalClass::Agent) && trigger_kind == "lead_auto"',
+    "validate_lead_auto_decision_payload",
+    "lead_auto_artifact_target_mismatch",
+    "lead_auto_safety_check_failed",
+    "lead_auto_instruction_hash_mismatch",
+    "continuation_mode",
+    "LeadAutoLimitExceeded",
+]:
+    if needle not in mcp_agents:
+        fail(f"P086 MCP admission missing fail-closed guard {needle!r}")
+
+recovery_text = (root / "control-plane/crates/engine/src/recovery.rs").read_text()
+for needle in [
+    "close_session(&worker.session_generation_id)",
+    "p086_reap_registered_provider_process_group",
+    "provider_process_group_id",
+    "provider_process_uid",
+    "registered_provider_process_group_signal",
+    "orphan_reap_attempted",
+    "orphan_reap_verified",
+    "stale_generation_reaped",
+    "stale_generation_reap_unverified",
+    "orphan_reap_signals_sent",
+    "orphan_reap_term_deadline_ms",
+    "orphan_reap_kill_deadline_ms",
+]:
+    if needle not in recovery_text:
+        fail(f"P086 startup recovery missing stale ACP reap proof field {needle!r}")
+
+graphql_schema = (root / "control-plane/crates/graphql-server/src/schema.rs").read_text()
+graphql_types = (root / "control-plane/crates/graphql-server/src/types/continuation.rs").read_text()
+graphql_test = root / "control-plane/crates/graphql-server/tests/proposal_086_continuation_readback.rs"
+if not graphql_test.exists():
+    fail("missing GraphQL P086 continuation readback test")
+for needle in [
+    "continuations(",
+    "continuation_metrics_summary",
+    "continuation_status",
+    "continuation_candidates",
+]:
+    if needle not in graphql_schema:
+        fail(f"GraphQL schema missing P086 readback field/helper {needle!r}")
+if "GqlContinuationMetricsSummary" not in graphql_types:
+    fail("GraphQL continuation types missing durable P086 metrics summary")
+for needle in [
+    "useful_progress_rate",
+    "average_time_saved_seconds",
+    "followup_validation_success_rate",
+    "provider_session_budget_input_tokens_total",
+    "provider_session_resurrection_attach_failure_total",
+]:
+    if needle not in graphql_types:
+        fail(f"GraphQL continuation metrics summary missing P086 KPI field {needle!r}")
+
+swift_read_boundary = (root / "Chainworks Forge/Support/P031ThinGraphQLReadBoundary.swift").read_text()
+swift_runs_home = (root / "Chainworks Forge/Views/RunsHomeView.swift").read_text()
+for needle in [
+    "continuations(runId: $runId)",
+    "continuationMetricsSummary(runId: $runId)",
+    "P086ContinuationReadbackPresentation",
+    "P086ContinuationReadbackPresenter",
+    "usefulProgressRate",
+    "averageTimeSavedSeconds",
+    "followupValidationSuccessRate",
+    "providerSessionBudgetInputTokensTotal",
+    "providerSessionResurrectionAttachFailureTotal",
+]:
+    if needle not in swift_read_boundary:
+        fail(f"Swift P031 read boundary missing passive P086 readback needle {needle!r}")
+for needle in [
+    "P086ContinuationReadbackCard",
+    "p086-continuation-readback-card",
+]:
+    if needle not in swift_runs_home:
+        fail(f"Runs UI missing passive P086 continuation readback needle {needle!r}")
+
+# 3. All five artifact schemas parse as valid JSON Schema with additionalProperties=false
+artifact_dir = root / "docs/reference/p086/schemas/artifacts"
+required_artifacts = [
+    "agent_continuation_evidence_bundle_v1.schema.json",
+    "agent_continuation_report_v1.schema.json",
+    "continuation_canonical_request_v1.schema.json",
+    "continuation_no_progress_report_v1.schema.json",
+    "continuation_response_snapshot_v1.schema.json",
+    "continuation_result_v1.schema.json",
+    "lead_continuation_decision_v1.schema.json",
+    "provider_session_attach_receipt_v1.schema.json",
+    "worktree_continuation_readback_v1.schema.json",
+]
+for name in required_artifacts:
+    schema = load_json(artifact_dir / name)
+    if schema.get("additionalProperties") is not False:
+        fail(f"artifact schema {name} must have additionalProperties=false at top level")
+
+response_schema = load_json(artifact_dir / "continuation_response_snapshot_v1.schema.json")
+response_required = set(response_schema["properties"]["payload"].get("required", []))
+if "response_artifact_id" not in response_required:
+    fail("continuation_response_snapshot_v1 must require payload.response_artifact_id")
+
+result_schema = load_json(artifact_dir / "continuation_result_v1.schema.json")
+tests_or_gates = result_schema["properties"]["payload"]["properties"]["tests_or_gates"]["items"]
+if tests_or_gates.get("type") != "object":
+    fail("continuation_result_v1 tests_or_gates items must be objects, not strings")
+if set(tests_or_gates.get("required", [])) != {"name", "status"}:
+    fail("continuation_result_v1 tests_or_gates rows must require name and status")
+
+no_progress_schema = load_json(artifact_dir / "continuation_no_progress_report_v1.schema.json")
+no_progress_payload_props = no_progress_schema["properties"]["payload"]["properties"]
+for field in ["response_fingerprint_sha256", "provider_transcript_artifact_ids"]:
+    if field not in no_progress_payload_props:
+        fail(f"continuation_no_progress_report_v1 payload missing emitted field {field}")
+
+if '"response_artifact_id": response_artifact_id' not in executor_text:
+    fail("P086 response snapshot must emit payload.response_artifact_id")
+if "serde_json::json!({" not in executor_text or '"name": name' not in executor_text or '"status": status' not in executor_text:
+    fail("P086 tests_or_gates extraction must emit schema-compatible object rows")
+
+print("proposal-086 Phase 0 preflight checks passed (migration, schemas)")
+PY
+    log "Proposal 086 Rust unit tests"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p domain "continuation"
+      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p db --test proposal_086_continuation_lifecycle
+      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p engine --lib p086
+      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p mcp-server "tools::agents"
+      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p graphql-server --test proposal_086_continuation_readback
+      CARGO_TARGET_DIR=target/proposal-086-gate cargo test -p daemon --test proposal_086_mcp_continuation_live_reuse
+    )
+    log "Proposal 086 Swift readback tests"
+    run_targeted_tests "proposal-086-swift-readback" "${PROPOSAL_086_SWIFT_TESTS[@]}"
+    log "Proposal 086 Phase 0 preflight gate passed"
+    ;;
+  p086-continuation-readback)
+    log "Proposal 086 Phase 1 readback gate: operator readback fixture field coverage"
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def fail(msg):
+    raise SystemExit(f"p086-continuation-readback: {msg}")
+
+fixture_path = root / "docs/evidence/rollout-contract/operator-readback/p086-continuation-full-surface.fixture.json"
+if not fixture_path.exists():
+    fail("missing docs/evidence/rollout-contract/operator-readback/p086-continuation-full-surface.fixture.json")
+
+try:
+    fixture = json.loads(fixture_path.read_text())
+except json.JSONDecodeError as exc:
+    fail(f"invalid JSON in p086-continuation-full-surface.fixture.json: {exc}")
+
+# Fails closed while the fixture contains a placeholder key or rollout_contract_status != "pass"
+if "placeholder" in fixture:
+    fail(
+        "fixture contains 'placeholder' key; p086-continuation-readback requires real Phase 1 "
+        "runtime evidence (50+ AgentExecutions across 10+ runs with MCP/GraphQL/run_report/release_receipt parity)"
+    )
+raw_fixture = json.dumps(fixture, sort_keys=True)
+for forbidden in [
+    "p086-fixture",
+    "11111111-1111",
+    "22222222-2222",
+    "33333333-3333",
+    "44444444-4444",
+    "55555555-5555",
+    "66666666-6666",
+    "77777777-7777",
+    "aaaaaaaaaaaaaaaa",
+    "bbbbbbbbbbbbbbbb",
+]:
+    if forbidden in raw_fixture:
+        fail(f"fixture still contains synthetic placeholder token: {forbidden}")
+provenance = fixture.get("evidence_provenance")
+if not isinstance(provenance, dict):
+    fail("fixture missing evidence_provenance object")
+for field in ["source_test", "source_gate", "generated_from", "generated_at"]:
+    if not provenance.get(field):
+        fail(f"fixture evidence_provenance missing {field}")
+
+required_fields = [
+    "evidence_provenance",
+    "rollout_contract_status", "rollout_contract_decision", "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state", "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode", "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions", "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane", "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code", "rollout_contract_action_id",
+    "rollout_contract_operator_message", "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision", "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps",
+    "continuation_id", "run_id", "stage_execution_id", "agent_execution_id",
+    "mode", "mode_raw", "trigger_kind", "trigger_kind_raw",
+    "lifecycle_status", "lifecycle_status_raw", "status_raw",
+    "failure_reason", "failure_reason_raw", "runtime_disabled_reason_code",
+    "request_fingerprint_sha256", "canonical_request_artifact_id",
+    "response_fingerprint_sha256", "response_artifact_id",
+    "conflict_count", "reconciliation_status",
+    "projection_lag_ms", "projection_lag_budget_ms", "projection_degraded",
+    "restart_recovery_stale_non_terminal_count",
+    "cancel_termination_proof_state", "orphan_acp_reap_outcome",
+    "provider_session_attach_receipt_id", "kill_switch_last_change",
+]
+for field in required_fields:
+    if field not in fixture:
+        fail(f"fixture missing required field: {field}")
+
+if fixture.get("rollout_contract_status") != "pass":
+    fail(
+        f"rollout_contract_status={fixture.get('rollout_contract_status')!r}; "
+        "p086-continuation-readback requires rollout_contract_status='pass' (Phase 1 evidence not yet materialized)"
+    )
+
+print("p086-continuation-readback passed")
+PY
+    log "Proposal 086 Phase 1 readback gate passed"
+    ;;
+  p086-continuation-negative-fixtures)
+    log "Proposal 086 Phase 2 hold-condition gate: all negative fixtures present and not placeholder"
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def fail(msg):
+    raise SystemExit(f"p086-continuation-negative-fixtures: {msg}")
+
+neg_dir = root / "docs/evidence/rollout-contract/p086/negative"
+required_fixtures = [
+    "admission-timeout-sweeper.json",
+    "artifact-schema-lint-failure.json",
+    "cancel-timeout-termination-unverified.json",
+    "duplicate-after-prompt-sent-no-resend.json",
+    "fingerprint-mismatch-same-key.json",
+    "lead-decision-missing-or-changed.json",
+    "malformed-hashes.json",
+    "mcp-schema-lint-failure.json",
+    "missing-log-correlation-key.json",
+    "pre-prompt-crash-after-lease.json",
+    "resurrection-before-attach-receipt.json",
+    "resurrection-before-orphan-reap.json",
+    "resurrection-unsupported-adapter.json",
+    "saturation-without-queue-drain.json",
+    "terminal-missing-result-artifact.json",
+    "worker-panic-recovery.json",
+]
+for name in required_fixtures:
+    path = neg_dir / name
+    if not path.exists():
+        fail(f"missing negative fixture: {name}")
+    try:
+        fixture = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {name}: {exc}")
+    status = fixture.get("status")
+    if status == "placeholder":
+        fail(
+            f"{name} still has status='placeholder'; "
+            "replace with real evidence (pass/fail/deferred_pending_phase2_worker)"
+        )
+    if status is None:
+        fail(f"{name} missing 'status' field")
+
+print(f"p086-continuation-negative-fixtures: all {len(required_fixtures)} fixtures present and valid")
+PY
+    log "Proposal 086 Phase 2 negative fixtures gate passed"
+    ;;
+  p086-continuation-operator-report)
+    log "Proposal 086 Phase 1 operator-report gate: operator report field coverage"
+    python3 - "$ROOT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def fail(msg):
+    raise SystemExit(f"p086-continuation-operator-report: {msg}")
+
+fixture_path = root / "docs/evidence/rollout-contract/operator-readback/p086-continuation-full-surface.fixture.json"
+if not fixture_path.exists():
+    fail("missing docs/evidence/rollout-contract/operator-readback/p086-continuation-full-surface.fixture.json")
+
+try:
+    fixture = json.loads(fixture_path.read_text())
+except json.JSONDecodeError as exc:
+    fail(f"invalid JSON in p086-continuation-full-surface.fixture.json: {exc}")
+
+# Fails closed while the fixture contains a placeholder key
+if "placeholder" in fixture:
+    fail(
+        "fixture contains 'placeholder' key; p086-continuation-operator-report requires real Phase 1 "
+        "operator run evidence (rollout_contract_status='pass', no placeholder key)"
+    )
+raw_fixture = json.dumps(fixture, sort_keys=True)
+for forbidden in ["p086-fixture", "11111111-1111", "aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"]:
+    if forbidden in raw_fixture:
+        fail(f"fixture still contains synthetic placeholder token: {forbidden}")
+if not isinstance(fixture.get("evidence_provenance"), dict):
+    fail("fixture missing evidence_provenance object")
+
+if fixture.get("rollout_contract_status") != "pass":
+    fail(
+        f"rollout_contract_status={fixture.get('rollout_contract_status')!r}; "
+        "operator report requires rollout_contract_status='pass'"
+    )
+
+required_operator_fields = [
+    "rollout_contract_status", "rollout_contract_decision",
+    "rollout_contract_hold_conditions", "rollout_contract_enforcement_mode",
+    "continuation_id", "run_id", "stage_execution_id", "agent_execution_id",
+    "mode", "trigger_kind", "lifecycle_status", "request_fingerprint_sha256",
+    "eligible", "lead_decision", "confirmation_required",
+]
+for field in required_operator_fields:
+    if field not in fixture:
+        fail(f"fixture missing required operator report field: {field}")
+
+print("p086-continuation-operator-report passed")
+PY
+    log "Proposal 086 Phase 1 operator report gate passed"
+    ;;
   proposal-085|p085)
     log "Proposal 085 gate: thin-client read-model parity and affordance contract"
     python3 - <<'PY'
@@ -7870,7 +9958,7 @@ PY
       run_p087_cargo_test() {
         local output status
         set +e
-        output=$(CARGO_TARGET_DIR=target/proposal-087-gate cargo test "$@" 2>&1)
+        output=$(RUST_MIN_STACK=8388608 CARGO_TARGET_DIR=target/proposal-087-gate cargo test "$@" 2>&1)
         status=$?
         set -e
         printf '%s\n' "$output"

@@ -1,0 +1,14 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "disabled_schema_client_unguarded",
+  "description": "SwiftUI or another governed client issues P046 GraphQL documents when schema/capability discovery says P046 fields are absent in an explicit rollback/disabled-schema build.",
+  "hold_condition": "SwiftUI or another governed client sends P046 documents when schema/capability discovery says P046 fields are absent.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_client_unguarded_disabled_schema",
+  "fixture_input": {
+    "feature_flag": "disabled",
+    "client_query_issued": "{ sessionLineages(runId: \"x\") { nodes { id } } }",
+    "expected_result": "graphql_validation_error_not_product_error"
+  }
+}

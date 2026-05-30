@@ -898,9 +898,23 @@ nonisolated enum StructuredPayloadProbe {
 struct MarkdownDocumentView: View {
     let content: String
     let localRoots: [URL]
+    let loadSynchronously: Bool
 
-    @State private var blocks: [MarkdownDocumentBlock] = []
-    @State private var isLoadingBlocks = true
+    @State private var blocks: [MarkdownDocumentBlock]
+    @State private var isLoadingBlocks: Bool
+
+    init(content: String, localRoots: [URL], loadSynchronously: Bool = false) {
+        self.content = content
+        self.localRoots = localRoots
+        self.loadSynchronously = loadSynchronously
+        if loadSynchronously {
+            _blocks = State(initialValue: MarkdownDocumentParser.parse(content, localRoots: localRoots))
+            _isLoadingBlocks = State(initialValue: false)
+        } else {
+            _blocks = State(initialValue: [])
+            _isLoadingBlocks = State(initialValue: true)
+        }
+    }
 
     var body: some View {
         Group {
@@ -924,9 +938,14 @@ struct MarkdownDocumentView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .task(id: renderTaskKey) {
-            isLoadingBlocks = true
-            blocks = await MarkdownDocumentLoader.load(content: content, localRoots: localRoots)
-            isLoadingBlocks = false
+            if loadSynchronously {
+                blocks = MarkdownDocumentParser.parse(content, localRoots: localRoots)
+                isLoadingBlocks = false
+            } else {
+                isLoadingBlocks = true
+                blocks = await MarkdownDocumentLoader.load(content: content, localRoots: localRoots)
+                isLoadingBlocks = false
+            }
         }
     }
 

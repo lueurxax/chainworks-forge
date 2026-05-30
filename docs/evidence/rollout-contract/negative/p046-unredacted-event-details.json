@@ -1,0 +1,14 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "unredacted_event_details",
+  "description": "Session event details containing prompt text, credentials, hidden reasoning, raw provider diagnostics, or absolute paths are returned unredacted in GraphQL.",
+  "hold_condition": "Session event details expose unredacted prompt, credential, hidden reasoning, raw provider diagnostics, or absolute paths.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_unredacted_event_details",
+  "fixture_input": {
+    "event_details_json": "{\"schemaVersion\":\"p046_event_details_redaction_v1\",\"rawPrompt\":\"sensitive prompt text here\"}",
+    "expected_graphql_field": "detailsJsonRedacted",
+    "expected_result": "null_with_redaction_warning"
+  }
+}

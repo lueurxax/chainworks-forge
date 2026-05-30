@@ -21,10 +21,25 @@ chainworks_default_cargo_target_dir() {
     fi
 }
 
+# Detect git worktrees and use a local target dir to prevent cache conflicts with the main
+# workspace. Worktrees differ in source (e.g. P058 adds escalation modules absent in main),
+# so a shared CARGO_TARGET_DIR built from main produces stale .rlib files for worktree builds,
+# causing "unresolved import" errors at Xcode embed time. Worktrees always live under
+# .chainworks/worktrees/; the main workspace path never contains that component.
+_chainworks_effective_root="${SRCROOT:-${chainworks_cargo_cache_repo_root}}"
+_chainworks_is_worktree=0
+if [[ "${_chainworks_effective_root}" == *"/.chainworks/worktrees/"* ]]; then
+    _chainworks_is_worktree=1
+fi
+
 if [[ -n "${CHAINWORKS_XCODE_CARGO_TARGET_DIR:-}" ]]; then
     export CARGO_TARGET_DIR="${CHAINWORKS_XCODE_CARGO_TARGET_DIR}"
 elif [[ -n "${CHAINWORKS_SHARED_CARGO_TARGET_DIR:-}" ]]; then
     export CARGO_TARGET_DIR="${CHAINWORKS_SHARED_CARGO_TARGET_DIR}"
+elif [[ "${_chainworks_is_worktree}" == "1" ]]; then
+    # Use a worktree-local target dir inside control-plane/target/ (already gitignored)
+    # to avoid .rlib cache collisions with the main workspace build.
+    export CARGO_TARGET_DIR="${_chainworks_effective_root}/control-plane/target/xcode-local"
 elif [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
     export CARGO_TARGET_DIR="$(chainworks_default_cargo_target_dir)"
 fi

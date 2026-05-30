@@ -1,5 +1,7 @@
+pub mod agents;
 pub mod approvals;
 pub mod artifacts;
+pub mod automation;
 pub mod effects;
 pub mod ideas;
 pub mod reports;
@@ -12,7 +14,7 @@ pub mod storage;
 use crate::protocol::McpTool;
 use domain::CapabilityToolId;
 
-pub fn all_capability_tool_ids() -> [CapabilityToolId; 38] {
+pub fn all_capability_tool_ids() -> [CapabilityToolId; 44] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -29,6 +31,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 38] {
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
         CapabilityToolId::StagesRetry,
+        CapabilityToolId::StagesConsumeProviderQuotaHold,
         CapabilityToolId::WorkflowConflictsResolve,
         CapabilityToolId::WorkflowLoopBudgetExtend,
         CapabilityToolId::LegacyDiscoveryOverrideCreate,
@@ -38,6 +41,7 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 38] {
         CapabilityToolId::StewardListAnalyses,
         CapabilityToolId::StewardGetAnalysis,
         CapabilityToolId::RuntimeHealth,
+        CapabilityToolId::OperatorAlertsList,
         CapabilityToolId::StorageHealth,
         CapabilityToolId::StorageWritePressure,
         CapabilityToolId::StorageEvidenceSpoolSummary,
@@ -52,6 +56,10 @@ pub fn all_capability_tool_ids() -> [CapabilityToolId; 38] {
         CapabilityToolId::StorageMaintenanceRepairSlot,
         CapabilityToolId::StorageProjectionsClearBacklog,
         CapabilityToolId::StorageProjectionsClearPoison,
+        CapabilityToolId::AgentsContinuationStatus,
+        CapabilityToolId::AgentsContinuationCandidates,
+        CapabilityToolId::AgentsContinueWork,
+        CapabilityToolId::AutomationAutoRetryLatest,
     ]
 }
 
@@ -88,6 +96,9 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
         "stages.retry" => Some(CapabilityToolId::StagesRetry),
+        "stages.consume_provider_quota_hold" => {
+            Some(CapabilityToolId::StagesConsumeProviderQuotaHold)
+        }
         "workflow_conflicts.resolve" => Some(CapabilityToolId::WorkflowConflictsResolve),
         "workflow_loop_budget.extend" => Some(CapabilityToolId::WorkflowLoopBudgetExtend),
         "legacy_discovery_override_create" => Some(CapabilityToolId::LegacyDiscoveryOverrideCreate),
@@ -97,6 +108,8 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
         "steward.list_analyses" => Some(CapabilityToolId::StewardListAnalyses),
         "steward.get_analysis" => Some(CapabilityToolId::StewardGetAnalysis),
         "runtime.health" => Some(CapabilityToolId::RuntimeHealth),
+        "boundary.runtime.get" => Some(CapabilityToolId::RuntimeHealth),
+        "operator.alerts.list" => Some(CapabilityToolId::OperatorAlertsList),
         "storage.health" => Some(CapabilityToolId::StorageHealth),
         "storage.write_pressure" => Some(CapabilityToolId::StorageWritePressure),
         "storage.evidence_spool_summary" => Some(CapabilityToolId::StorageEvidenceSpoolSummary),
@@ -116,6 +129,10 @@ pub fn capability_id_for(tool_name: &str) -> Option<CapabilityToolId> {
             Some(CapabilityToolId::StorageProjectionsClearBacklog)
         }
         "storage.projections.clear_poison" => Some(CapabilityToolId::StorageProjectionsClearPoison),
+        "agents.continuation_status" => Some(CapabilityToolId::AgentsContinuationStatus),
+        "agents.continuation_candidates" => Some(CapabilityToolId::AgentsContinuationCandidates),
+        "agents.continue_work" => Some(CapabilityToolId::AgentsContinueWork),
+        "automation.auto_retry.latest" => Some(CapabilityToolId::AutomationAutoRetryLatest),
         _ => None,
     }
 }
@@ -137,6 +154,7 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "approvals_list" => "approvals.list",
         "approvals_resolve" => "approvals.resolve",
         "stages_retry" => "stages.retry",
+        "stages_consume_provider_quota_hold" => "stages.consume_provider_quota_hold",
         "workflow_conflicts_resolve" => "workflow_conflicts.resolve",
         "workflow_loop_budget_extend" => "workflow_loop_budget.extend",
         "reports_get" => "reports.get",
@@ -145,6 +163,8 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "steward_list_analyses" => "steward.list_analyses",
         "steward_get_analysis" => "steward.get_analysis",
         "runtime_health" => "runtime.health",
+        "boundary_runtime_get" => "boundary.runtime.get",
+        "operator_alerts_list" => "operator.alerts.list",
         "effects_list" => "effects.list",
         "effects_inspect" => "effects.inspect",
         "effects_reconcile" => "effects.reconcile",
@@ -158,6 +178,10 @@ pub fn canonical_tool_name(tool_name: &str) -> &str {
         "storage_maintenance_repair_slot" => "storage.maintenance.repair_slot",
         "storage_projections_clear_backlog" => "storage.projections.clear_backlog",
         "storage_projections_clear_poison" => "storage.projections.clear_poison",
+        "agents_continuation_status" => "agents.continuation_status",
+        "agents_continuation_candidates" => "agents.continuation_candidates",
+        "agents_continue_work" => "agents.continue_work",
+        "automation_auto_retry_latest" => "automation.auto_retry.latest",
         _ => tool_name,
     }
 }
@@ -201,6 +225,9 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
             tool_spec_by_name(approvals::tool_specs(), "approvals.resolve")
         }
         CapabilityToolId::StagesRetry => tool_spec_by_name(stages::tool_specs(), "stages.retry"),
+        CapabilityToolId::StagesConsumeProviderQuotaHold => {
+            tool_spec_by_name(stages::tool_specs(), "stages.consume_provider_quota_hold")
+        }
         CapabilityToolId::WorkflowConflictsResolve => {
             tool_spec_by_name(stages::tool_specs(), "workflow_conflicts.resolve")
         }
@@ -225,6 +252,9 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         }
         CapabilityToolId::RuntimeHealth => {
             tool_spec_by_name(runtime::tool_specs(), "runtime.health")
+        }
+        CapabilityToolId::OperatorAlertsList => {
+            tool_spec_by_name(runtime::tool_specs(), "operator.alerts.list")
         }
         CapabilityToolId::StorageHealth => {
             tool_spec_by_name(storage::tool_specs(), "storage.health")
@@ -267,6 +297,18 @@ pub fn mcp_tool_for(id: CapabilityToolId) -> McpTool {
         CapabilityToolId::StorageProjectionsClearPoison => {
             tool_spec_by_name(storage::tool_specs(), "storage.projections.clear_poison")
         }
+        CapabilityToolId::AgentsContinuationStatus => {
+            tool_spec_by_name(agents::tool_specs(), "agents.continuation_status")
+        }
+        CapabilityToolId::AgentsContinuationCandidates => {
+            tool_spec_by_name(agents::tool_specs(), "agents.continuation_candidates")
+        }
+        CapabilityToolId::AgentsContinueWork => {
+            tool_spec_by_name(agents::tool_specs(), "agents.continue_work")
+        }
+        CapabilityToolId::AutomationAutoRetryLatest => {
+            tool_spec_by_name(automation::tool_specs(), "automation.auto_retry.latest")
+        }
     }
 }
 
@@ -282,6 +324,8 @@ pub fn all_tool_specs() -> Vec<McpTool> {
     specs.extend(runtime::tool_specs());
     specs.extend(effects::tool_specs());
     specs.extend(storage::tool_specs());
+    specs.extend(automation::tool_specs());
+    specs.extend(agents::tool_specs());
     specs
 }
 

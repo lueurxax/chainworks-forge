@@ -1,0 +1,28 @@
+{
+  "fixture_description": "P076 stale lock where liveness was checked using PID alone without process_start_time, creating a PID reuse vulnerability. Proves all required identity fields must be checked.",
+  "proves_pid_reuse_risk": true,
+  "violation": "stale_lock_liveness_check_used_pid_only_without_process_start_time",
+  "missing_liveness_fields": ["process_start_time", "boot_id_or_session_id"],
+  "present_liveness_fields": ["hostname", "pid"],
+  "hold_condition_triggered": "Stale-lock recovery can allow two writers to proceed or lacks PID-reuse-resistant liveness checks",
+  "required_liveness_fields": [
+    "hostname",
+    "boot_id_or_session_id",
+    "pid",
+    "process_start_time",
+    "command_identity",
+    "lock_token"
+  ],
+  "risk": "A process with the same PID as the previous holder could be incorrectly identified as the same lock holder, allowing two concurrent writers.",
+  "stale_lock_evidence": {
+    "lock_path": "/Users/user/Documents/Chainworks Forge/.chainworks/automation/auto-retry.lock",
+    "created_at": "2026-05-23T08:00:00Z",
+    "expires_after_seconds": 600,
+    "lock_token": "token-old-001",
+    "hostname": "test-host",
+    "pid": 12345,
+    "process_start_time": null,
+    "boot_id_or_session_id": null,
+    "command_identity": null
+  }
+}

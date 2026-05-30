@@ -826,14 +826,16 @@ fn test_compile_full_mvp_live_plan() {
     let s1 = &plan.states["state_1_idea_received"];
     assert_eq!(s1.owner.agent_id, "lead_orchestrator");
     assert_eq!(
-        s1.owner.provider, "gemini",
-        "lead_orchestrator uses strict structured-output Gemini profile"
+        s1.owner.provider, "codex",
+        "lead_orchestrator uses strict structured-output Codex profile"
     );
+    assert_eq!(s1.owner.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(s1.owner.effort.as_deref(), Some("high"));
 
     let s4 = &plan.states["state_4_proposal_reviewed"];
     assert_eq!(
-        s4.owner.provider, "gemini",
-        "state_4 owner=lead_orchestrator uses strict structured-output Gemini profile"
+        s4.owner.provider, "codex",
+        "state_4 owner=lead_orchestrator uses strict structured-output Codex profile"
     );
     assert_eq!(
         s4.system_task
@@ -850,15 +852,15 @@ fn test_compile_full_mvp_live_plan() {
         "agent_selection_plan_v1"
     );
 
-    // Verify code_writer -> Junie ACP
+    // Verify code_writer -> Claude ACP
     let s7 = &plan.states["state_7_implementation_started"];
     let cw_task = s7.tasks.iter().find(|t| t.agent.agent_id == "code_writer");
     assert!(cw_task.is_some(), "state_7 should have code_writer task");
-    assert_eq!(cw_task.unwrap().agent.provider, "junie");
+    assert_eq!(cw_task.unwrap().agent.provider, "claude");
     assert_eq!(
         cw_task.unwrap().agent.requested_mcp_server_ids,
-        Vec::<String>::new(),
-        "code_writer MCP intent comes from junie_code_editor_acp backend_profile"
+        vec!["xcode".to_string()],
+        "code_writer MCP intent comes from claude_builder_high backend_profile"
     );
 
     let proposal_writer = &plan.states["state_2_proposal_drafted"].owner;
@@ -2683,4 +2685,74 @@ agents:
     // Parallel tasks should NOT have selected_outputs_from.
     let par_tasks: Vec<_> = state.tasks.iter().filter(|t| t.phase == 0).collect();
     assert!(par_tasks.iter().all(|t| t.selected_outputs_from.is_none()));
+}
+
+// ── SEC-HIGH-002 regression: unknown agent references must fail compilation ──
+
+#[test]
+fn sec_high_002_missing_state_owner_fails_compile() {
+    // A workflow whose state owner references an agent that is not in the catalog
+    // must fail compilation rather than silently falling back to a placeholder.
+    let workflow_yaml = r#"
+initial_state: only_state
+states:
+  only_state:
+    label: "Only State"
+    type: end
+    owner: nonexistent_agent
+"#;
+    let catalog_yaml = r#"
+backend_profiles:
+  claude_opus:
+    provider: claude
+    model: claude-opus-4-7
+agents:
+  - id: different_agent
+    backend_profile: claude_opus
+    prompt: "Some other agent"
+"#;
+    let err = compile_result_from_strings(workflow_yaml, catalog_yaml)
+        .expect_err("compile must fail when state owner is not in the catalog");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("nonexistent_agent") && msg.contains("not found in catalog"),
+        "error message must name the missing agent and say 'not found in catalog', got: {msg}"
+    );
+}
+
+#[test]
+fn sec_high_002_missing_task_agent_fails_compile() {
+    // A workflow whose run-block task references an agent not in the catalog
+    // must fail compilation — not silently resolve to a placeholder.
+    let workflow_yaml = r#"
+initial_state: only_state
+states:
+  only_state:
+    label: "Only State"
+    type: end
+    owner: known_agent
+    run:
+      sequence:
+        - agent: known_agent
+          task: first_task
+        - agent: ghost_agent
+          task: second_task
+"#;
+    let catalog_yaml = r#"
+backend_profiles:
+  claude_opus:
+    provider: claude
+    model: claude-opus-4-7
+agents:
+  - id: known_agent
+    backend_profile: claude_opus
+    prompt: "Known agent"
+"#;
+    let err = compile_result_from_strings(workflow_yaml, catalog_yaml)
+        .expect_err("compile must fail when a task references a missing catalog agent");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ghost_agent") && msg.contains("not found in catalog"),
+        "error message must name the missing agent and say 'not found in catalog', got: {msg}"
+    );
 }

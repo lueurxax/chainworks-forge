@@ -1,0 +1,14 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "appkit_owns_graphql_task",
+  "description": "An AppKit class owns P046 GraphQL tasks, reset affordances, SwiftData writes, or session cache mutation.",
+  "hold_condition": "AppKit owns P046 GraphQL tasks, reset affordances, SwiftData writes, or session cache mutation.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_appkit_owns_graphql_task",
+  "fixture_input": {
+    "class_type": "NSViewController",
+    "owned_operations": ["graphql_session_query", "session_cache_write"],
+    "expected_result": "appkit_is_presentation_only_no_graphql_task_ownership"
+  }
+}

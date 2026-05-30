@@ -23,13 +23,16 @@ pub async fn record(
     caller_principal_class: Option<&str>,
     caller_tool: Option<&str>,
     request_id: Option<&str>,
+    caller_class: Option<&str>,
+    mcp_idempotency_key: Option<&str>,
+    boundary_row_id: Option<&str>,
 ) -> Result<()> {
     crate::execute_repository_write!(
         pool,
         "command_journal.record",
         sqlx::query(
-        r#"INSERT INTO command_journal (id, command_type, payload_json, result_status, run_id, created_at, caller_surface, caller_principal_id, caller_principal_class, caller_tool, request_id)
-           VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+        r#"INSERT INTO command_journal (id, command_type, payload_json, result_status, run_id, created_at, caller_surface, caller_principal_id, caller_principal_class, caller_tool, request_id, caller_class, mcp_idempotency_key, boundary_row_id)
+           VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
     )
         .bind(id)
         .bind(command_type)
@@ -41,6 +44,9 @@ pub async fn record(
         .bind(caller_principal_class)
         .bind(caller_tool)
         .bind(request_id)
+        .bind(caller_class)
+        .bind(mcp_idempotency_key)
+        .bind(boundary_row_id)
     )
     .context("record command journal entry")?;
     Ok(())
@@ -58,10 +64,13 @@ pub async fn record_tx(
     caller_principal_class: Option<&str>,
     caller_tool: Option<&str>,
     request_id: Option<&str>,
+    caller_class: Option<&str>,
+    mcp_idempotency_key: Option<&str>,
+    boundary_row_id: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
-        r#"INSERT INTO command_journal (id, command_type, payload_json, result_status, run_id, created_at, caller_surface, caller_principal_id, caller_principal_class, caller_tool, request_id)
-           VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+        r#"INSERT INTO command_journal (id, command_type, payload_json, result_status, run_id, created_at, caller_surface, caller_principal_id, caller_principal_class, caller_tool, request_id, caller_class, mcp_idempotency_key, boundary_row_id)
+           VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
     )
     .bind(id)
     .bind(command_type)
@@ -73,6 +82,9 @@ pub async fn record_tx(
     .bind(caller_principal_class)
     .bind(caller_tool)
     .bind(request_id)
+    .bind(caller_class)
+    .bind(mcp_idempotency_key)
+    .bind(boundary_row_id)
     .execute(&mut **tx)
     .await
     .context("record command journal entry")?;
@@ -89,6 +101,24 @@ pub async fn find_request_id(pool: &SqlitePool, id: &str) -> Result<Option<Strin
             .await
             .context("find journal request_id")?;
     Ok(row.and_then(|(request_id,)| request_id))
+}
+
+/// Look up the first completed command_journal entry by mcp_idempotency_key.
+/// Used for committed-unack recovery: when the idempotency record is still a
+/// pending sentinel after timeout, this confirms whether the command actually
+/// committed so the caller can return a recovery response instead of an error.
+pub async fn find_committed_by_idempotency_key(
+    pool: &SqlitePool,
+    idempotency_key: &str,
+) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM command_journal WHERE mcp_idempotency_key = ?1 AND result_status = 'completed' LIMIT 1",
+    )
+    .bind(idempotency_key)
+    .fetch_optional(pool)
+    .await
+    .context("find_committed_by_idempotency_key")?;
+    Ok(row.map(|(id,)| id))
 }
 
 /// Mark a journal entry as successfully completed.

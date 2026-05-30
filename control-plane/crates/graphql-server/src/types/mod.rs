@@ -1,9 +1,12 @@
 pub mod approval;
 pub mod artifact;
+pub mod continuation;
+pub mod escalation;
 pub mod idea;
 pub mod p031;
 pub mod run;
 pub mod scheduler;
+pub mod session;
 pub mod stage;
 pub mod steward;
 pub mod storage;

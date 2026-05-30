@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents.continuation_candidates.response.schema.json",
+  "title": "agents.continuation_candidates response",
+  "description": "P086: MCP response schema for agents.continuation_candidates (read-only).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "candidates"],
+  "properties": {
+    "run_id": {"type": "string"},
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "agent_execution_id", "run_id", "stage_execution_id",
+          "agent_role", "status", "eligible"
+        ],
+        "properties": {
+          "agent_execution_id": {"type": "string"},
+          "run_id": {"type": "string"},
+          "stage_execution_id": {"type": "string"},
+          "agent_role": {"type": "string"},
+          "provider_session_id": {"type": ["string", "null"]},
+          "status": {"type": "string"},
+          "eligible": {"type": "boolean"},
+          "disabled_reason": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}

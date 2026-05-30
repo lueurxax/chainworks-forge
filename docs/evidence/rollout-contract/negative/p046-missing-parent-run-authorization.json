@@ -1,0 +1,14 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "missing_parent_run_authorization",
+  "description": "ID-based resolver (sessionLineage, sessionGenerations, sessionEvents) returns data without first resolving parent run ownership and applying operator-read authorization for that run.",
+  "hold_condition": "Any P046 ID-based resolver returns data before resolving parent run ownership and applying operator-read authorization.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_missing_parent_run_authorization",
+  "fixture_input": {
+    "principal_class": "Observer",
+    "query": "{ sessionLineage(id: \"some-lineage-id\") { id } }",
+    "expected_error": "forbidden"
+  }
+}

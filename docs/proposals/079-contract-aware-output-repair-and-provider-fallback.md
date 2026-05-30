@@ -5,10 +5,10 @@
 | Date | 2026-04-30 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | P057/P058 output settlement and artifact claims, P063 MCP field shaping, P065 operator retry instructions, P076 auto-retry observation ledger |
-| Related | P017 workflow conflict mediation, P069 discovery diagnostics UI, `docs/reference/output-contracts-failure-evidence-and-recovery.md`, `docs/reference/artifact-discovery-and-settlement-optimization.md` |
+| Depends on | P057/P058 output settlement and artifact claims, P063 MCP field shaping, P065 operator retry instructions, [auto-retry observation ledger](../reference/auto-retry-observation-ledger.md) |
+| Related | P017 workflow conflict mediation, P069 discovery diagnostics UI, P095 two-phase agent invocation, `docs/reference/output-contracts-failure-evidence-and-recovery.md`, `docs/reference/artifact-discovery-and-settlement-optimization.md` |
 | Scope | Make missing/invalid required agent outputs recoverable inside the invocation lifecycle before a run becomes durably blocked. |
-| Non-goal | No automatic human approvals, no acceptance of invalid artifacts, no live-provider-only acceptance gate, and no replacement for P076 observation/cooldown policy. |
+| Non-goal | No automatic human approvals, no acceptance of invalid artifacts, no live-provider-only acceptance gate, and no replacement for the observe-only auto-retry ledger or cooldown policy. |
 
 ## 1. Problem
 
@@ -20,7 +20,7 @@ Chainworks runs repeatedly stall on output-contract failures:
 - contract enum/shape mismatches
 - proposal/review agents that complete useful reasoning but omit the required artifact envelope
 
-P076 correctly observes and deduplicates these signatures, but observation does not remove the root cause. Today, a run can become blocked even when the same provider session still has enough context to produce the missing artifact with a narrow corrective instruction.
+The implemented auto-retry ledger observes and deduplicates these signatures, but observation does not remove the root cause. Today, a run can become blocked even when the same provider session still has enough context to produce the missing artifact with a narrow corrective instruction.
 
 The expensive failure mode is:
 
@@ -49,7 +49,7 @@ That baseline is useful but not yet a complete proposal-level contract. The miss
 - repair attempt evidence/readback is not specified;
 - retry budget interaction is not specified;
 - provider mode mismatch is not classified separately from ordinary missing output;
-- P076 does not have a runtime owner to route repeated output-contract signatures to.
+- the auto-retry ledger does not have a runtime owner to route repeated output-contract signatures to.
 
 P079 makes this behavior explicit and bounded.
 
@@ -73,7 +73,7 @@ P079 makes this behavior explicit and bounded.
 - Do not infer operator approval from repaired output.
 - Do not rerun arbitrary implementation work inside the repair prompt.
 - Do not make live Claude/Gemini/Codex behavior part of the required gate.
-- Do not replace P076 observation ledger, retry cooldown, or known-issue catalog.
+- Do not replace the observe-only auto-retry ledger, retry cooldown, or known-issue catalog.
 - Do not change release side-effect retry safety; that belongs to the implemented durable side-effect ledger contract.
 - Do not broaden legacy artifact discovery beyond the declared output contract.
 
@@ -323,7 +323,7 @@ This evidence must be available through:
 - MCP `report://{run_id}`;
 - GraphQL run/stage diagnostic readback if the affected surface already exposes execution diagnostics.
 
-P076 may then classify repeated output failures as:
+The auto-retry ledger may then classify repeated output failures as:
 
 - `repair_unavailable`
 - `repair_rejected_invalid`
@@ -368,6 +368,23 @@ Future MCP follow-up may add targeted controls such as:
 
 Those are out of scope for P079 unless implementation discovers that automatic runtime repair needs an explicit operator command boundary.
 
+## Relationship to P095: Two-Phase Agent Invocation
+
+P095 defines output collection as the normal second model-facing phase after a
+work turn and server-owned deterministic readback. P079 remains a recovery path,
+not the default first attempt to collect output.
+
+The boundary is:
+
+- P095 output collection runs before P079 repair/fallback;
+- P079 repair applies only after output collection is missing, invalid, failed,
+  or unavailable;
+- same-session repair should not be used as the normal first mechanism for
+  producing required outputs;
+- provider fallback may be used after output collection fails, but it must not
+  replace deterministic readback or become a fresh implementation retry by
+  another name.
+
 ## 13. Acceptance Criteria
 
 - Eligible `proposal_writer`, `proposal_reviewer_*`, and `lead_orchestrator` invocations receive exactly one same-session corrective prompt before durable missing-output failure.
@@ -381,7 +398,7 @@ Those are out of scope for P079 unless implementation discovers that automatic r
 - Human approvals and workflow conflicts are never auto-resolved by repair/fallback.
 - Release agents are excluded from provider fallback in the initial slice.
 - Repair/fallback evidence is visible in MCP reports and does not require scraping raw logs.
-- P076 auto-retry rollups can distinguish repair/fallback outcomes from raw missing-output failures.
+- Auto-retry rollups can distinguish repair/fallback outcomes from raw missing-output failures.
 
 ## 14. Test Plan
 
@@ -428,7 +445,7 @@ The gate must use deterministic fixture ACP transports only. It must not require
 2. Enable same-session repair for the initial role allowlist.
 3. Add transcript/provider-envelope recovery.
 4. Add controlled provider fallback for proposal writer/reviewer/lead roles, including `lead_orchestrator` fallback from `gemini_reasoning_pro_high` to `claude_orchestrator_high`.
-5. Wire P076 classification to the new evidence fields.
+5. Wire auto-retry ledger classification to the new evidence fields.
 6. Replace the emergency hardcoded Junie-to-`claude_builder_high` current-frozen-run shim with governed P079 fallback policy overlay, then delete the provider-specific orchestrator branch.
 7. After two dogfood cycles, evaluate whether `docs_guardian` and selected `code_writer` status artifacts should join fallback coverage.
 
@@ -443,7 +460,7 @@ The gate must use deterministic fixture ACP transports only. It must not require
 | Same-session repair repeats provider plan-mode behavior | Junie strict structured output failures skip same-session repair and proceed directly to configured fallback. |
 | Retry budget becomes confusing | Repair and provider fallback use separate evidence counters and do not silently consume ordinary operator retry semantics. |
 | Release retry safety is weakened | Release agents are excluded; the implemented durable side-effect ledger owns side-effect reconciliation. |
-| P076 keeps retrying despite repair failure | P076 must consume repair/fallback outcome evidence and escalate recurring signatures instead of blind retry. |
+| Auto-retry keeps recommending retry despite repair failure | The auto-retry ledger must consume repair/fallback outcome evidence and escalate recurring signatures instead of blind retry. |
 
 ## 17. Open Questions
 

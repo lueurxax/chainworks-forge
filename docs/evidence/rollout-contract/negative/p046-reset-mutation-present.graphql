@@ -1,0 +1,6 @@
+# P046 negative fixture: schema exposes a session reset/control mutation.
+# Expected: gate fails with hold condition "GraphQL schema exposes resetSession or any equivalent session reset/control mutation."
+# This shape is FORBIDDEN by P046 and must be absent from the production schema.
+type Mutation {
+  resetSession(runId: ID!): Boolean
+}

@@ -39,10 +39,10 @@ Operator feedback retained for follow-up scope:
 
 - The workflow is not clear enough for release acceptance.
 - The current UI differs materially from the prior operator workflow.
-- The relevant UI concerns are tracked in the UI follow-up proposals, especially P036 for visual/navigation restoration and P085 for thin-client affordance parity.
+- At P031 closeout time, the relevant UI concerns were assigned to follow-up work now represented by [macOS operator navigation](../reference/macos-operator-navigation.md) and P085 thin-client affordance parity.
 
-This decision means the repeat audit should evaluate P031's technical thin-UI/read-boundary closeout independently from UI polish. The two `full-mvp-live` dogfood runs remain future operator-acceptance evidence for the follow-up UI polish proposals, not a claimed fact in this P031 technical closeout artifact.
+This decision means the repeat audit should evaluate P031's technical thin-UI/read-boundary closeout independently from UI polish. The two `full-mvp-live` dogfood runs remain operator-acceptance evidence for follow-up UI polish work, not a claimed fact in this P031 technical closeout artifact.
 
 ## Sign-Off
 
-Signed for P031 technical closeout with UI polish and full operator workflow dogfood deferred to follow-up proposals P036/P085.
+Signed for P031 technical closeout with UI polish and full operator workflow dogfood deferred to the follow-up macOS operator navigation and P085 work.

@@ -830,6 +830,11 @@ impl AcpSessionHandle {
         session.transport.session_id().to_string()
     }
 
+    pub async fn child_pid(&self) -> Option<u32> {
+        let session = self.inner.lock().await;
+        session.transport.child_pid()
+    }
+
     pub async fn is_live(&self) -> bool {
         let mut session = self.inner.lock().await;
         session.is_live()
@@ -877,6 +882,8 @@ mod tests {
             session_generation_id: Some("session-gen-1".into()),
             status: "failed".into(),
             failure_phase: Some("read_poll_elapsed_without_message".into()),
+            jsonrpc_error_code: None,
+            provider_error_message_redacted: None,
             started_at: "2026-05-16T00:00:00Z".into(),
             completed_at: Some("2026-05-16T00:05:00Z".into()),
             xcode_shim_injected: false,

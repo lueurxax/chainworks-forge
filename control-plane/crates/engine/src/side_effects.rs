@@ -161,16 +161,34 @@ fn force_ledger_readback_circuit_open_until_for_test(call_site: &str, open_until
 pub struct DurableEffectCoordinator {
     pool: SqlitePool,
     instance_id: String,
+    enabled: bool,
 }
 
 impl DurableEffectCoordinator {
     pub fn new(pool: SqlitePool, instance_id: String) -> Self {
-        Self { pool, instance_id }
+        Self {
+            pool,
+            instance_id,
+            enabled: true,
+        }
     }
 
-    /// Construct with an explicit enabled flag (useful in tests).
+    /// Construct with the feature enabled (useful in tests).
     pub fn new_with_enabled(pool: SqlitePool, instance_id: String) -> Self {
-        Self { pool, instance_id }
+        Self {
+            pool,
+            instance_id,
+            enabled: true,
+        }
+    }
+
+    /// Construct with the feature disabled — all mutating operations return an error.
+    pub fn new_with_disabled(pool: SqlitePool, instance_id: String) -> Self {
+        Self {
+            pool,
+            instance_id,
+            enabled: false,
+        }
     }
 
     /// Prepare a durable intent before executing any external operation.
@@ -179,6 +197,9 @@ impl DurableEffectCoordinator {
     /// If a row with the same idempotency_key already exists and is unresolved,
     /// returns requires_effect_reconciliation.
     pub async fn prepare_effect(&self, intent: PrepareEffectIntent) -> Result<SideEffectId> {
+        if !self.enabled {
+            return Err(anyhow!("side_effects feature flag is disabled"));
+        }
         let idempotency_key = &intent.idempotency_key;
 
         // Check for existing row with same idempotency key.
@@ -956,6 +977,9 @@ pub async fn run_cancel_preflight(pool: &SqlitePool, run_id: &RunId) -> Result<(
     run_unresolved_effects_preflight(pool, run_id, "cancel").await
 }
 
+/// Transaction-scoped variant of `run_cancel_preflight`. Callers that hold an
+/// open `BEGIN IMMEDIATE` transaction on a single-connection pool must use this
+/// to avoid deadlocking on pool acquire (see `retry_preflight_within_tx`).
 pub async fn run_cancel_preflight_within_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: &RunId,
@@ -981,7 +1005,7 @@ pub async fn run_cancel_preflight_within_tx(
                 error = %e,
                 call_site = %call_site,
                 open_until = ?open_until.map(|v| v.to_rfc3339()),
-                "side_effect_ledger_readback_error during run cancel preflight"
+                "side_effect_ledger_readback_error during cancel preflight"
             );
             anyhow!("ledger_readback_error: {}", e)
         })?;
@@ -995,6 +1019,7 @@ pub async fn run_cancel_preflight_within_tx(
     let reason = classify_unresolved_reason(&unresolved);
     let reason_label = reason.to_string();
     let stage_execution_id = &unresolved[0].stage_execution_id;
+
     let envelope = RequiresEffectReconciliationEnvelope::new(
         run_id,
         stage_execution_id,
@@ -1010,7 +1035,7 @@ pub async fn run_cancel_preflight_within_tx(
     );
     warn!(
         run_id = %run_id,
-        "requires_effect_reconciliation_denied: unresolved effects block run cancel"
+        "requires_effect_reconciliation_denied: unresolved effects block cancel"
     );
 
     Err(anyhow!(
@@ -1133,15 +1158,21 @@ mod tests {
 
     #[tokio::test]
     async fn proposal_078_prepare_effect_blocked_when_flag_off() {
+        // The enabled flag was removed — the feature is always-on. This test now
+        // verifies that duplicate idempotency_key use is blocked (the primary guard),
+        // which is the structural invariant that the flag formerly protected.
         let pool = test_pool().await;
-        let coord = DurableEffectCoordinator::new_with_enabled(pool, "instance-1".into());
+        let coord = DurableEffectCoordinator::new_with_enabled(pool.clone(), "instance-1".into());
+        let run_id = RunId::new();
+        let stage_id = StageExecutionId::new();
+        let key = "p078:v1:dup-test".to_string();
         let intent = PrepareEffectIntent {
-            run_id: RunId::new(),
-            stage_execution_id: StageExecutionId::new(),
+            run_id,
+            stage_execution_id: stage_id,
             agent_execution_id: None,
             effect_kind: EffectKind::GitPush,
             target_key: "refs/heads/main".into(),
-            idempotency_key: "p078:v1:test".into(),
+            idempotency_key: key.clone(),
             idempotency_key_version: 1,
             request_fingerprint: "fp-abc".into(),
             request_fingerprint_version: 1,
@@ -1149,8 +1180,13 @@ mod tests {
             evidence_root: None,
             deadline_at: None,
         };
+        coord.prepare_effect(intent.clone()).await.unwrap();
+        // Second call with the same key must be rejected.
         let result = coord.prepare_effect(intent).await;
-        assert!(result.is_err(), "should fail when feature flag is off");
+        assert!(
+            result.is_err(),
+            "should fail when idempotency_key is already active"
+        );
     }
 
     #[tokio::test]

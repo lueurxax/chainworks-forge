@@ -24,6 +24,7 @@ At the current baseline, the product includes:
 - YAML-defined workflows and agent catalogs,
 - a compiled execution engine with resume, approvals, loops, and artifact persistence,
 - GraphQL-only thin UI boundary ensuring governed SwiftUI workflow truth is read from server projections,
+- boundary-first API authorization and audit policy through a daemon-injected `BoundaryPolicy` shared by GraphQL, MCP, and approval actionability paths,
 - lead conflict mediation for same-run resolution of workflow conflicts,
 - capacity-aware scheduling, fairness, executor backpressure, SQLite write serialization, and host interruption recovery (Rust daemon),
 - DbWriter bounded MPSC executor with priority lanes, deadlines, busy-retry classification, heartbeat, lane-starvation watchdog, graceful shutdown drain with populated terminal-operation admission allowlist, Class B coalescing buffer (500 ms drain-all flush, 64-merge force-flush, 1024-key saturation reject), per-lane oldest-enqueued reporting on `WriteRejected`, evidence file spool module (canonical `evidence/runs/...` layout, run-id-bound write-time path ownership check, symlink-escape rejection, `0o600`/`0o700` POSIX modes, checksum + double `fsync` + atomic no-replace commit), bounded `sweep_evidence_orphans` walk that backfills `recovered_orphan` metadata for crash-orphaned evidence files, stream-hashes candidates, skips over-budget candidates before read, and is exposed via the `storage.reconcile_evidence_orphans` MCP tool, evidence spool metadata schema, storage write-pressure snapshots, typed operator-only GraphQL `storageHealth`, operator-only MCP `storage.health` / `storage.write_pressure` / `storage.evidence_spool_summary` diagnostics, fail-closed stale/degraded storage readback when live writer health is unavailable, and a fail-closed write-budget registry gate that rejects temporary rollout bypasses, production runtime transaction paths outside DbWriter-owned entrypoints, and operation-registry drift,
@@ -31,13 +32,14 @@ At the current baseline, the product includes:
 - live ACP-backed execution for real provider sessions,
 - ACP-only runtime transport with adapter-specific subprocess execution,
 - Junie `code_writer` runtime hardening with strict completion-boundary subtypes, engine-synthesized failure envelopes, staged per-output repair settlement, runtime preflight/remediation, and post-preflight provider launch capacity leasing,
-- targeted retry authority with exact stage-execution retry settlement, authority-history readback, and startup orphan retry repair,
+- targeted retry authority with exact stage-execution retry settlement, authority-history readback, startup orphan retry repair, and retry payload recovery diagnostics,
+- observe-only auto-retry observation ledger with JSONL observations, canonical known-issue catalog, MCP readback, and rollup tooling,
 - bounded artifact discovery and engine-owned settlement pipeline,
 - provider toolchain cache mapping for isolated Xcode and Go build roots,
 - per-agent MCP policy resolution with persisted requested/predicted/actual/denied truth,
 - canonical execution-truth, recovery, and report-read behavior for settled attempts,
 - provider settings, diagnostics, and frozen provider bindings,
-- an operator shell with run progress, recovery, comparison, artifact inspection, and approvals,
+- an operator shell with consolidated Runs, Ideas, Definitions, and Settings surfaces; run progress, recovery, comparison, artifact inspection, and approvals,
 - segmented run surfaces with deterministic pane routing, a focused timeline inspector, and shared hierarchical artifact browsing,
 - a proposal-loop feedback-fidelity layer with review-corpus bundling, backlog carry-forward, writer coverage, and targeted rereview,
 - an implemented Forge design-system and brand-application layer across shell, run, setup, and recovery surfaces,
@@ -52,7 +54,8 @@ At the current baseline, the product includes:
 - rejected implementation approval loopback to proposal refinement,
 - MVP benchmark/sign-off state and replayable `GO/HOLD` decision logic,
 - Forge Steward system-health analysis,
-- a stable design-kit authority for future visual changes.
+- a stable design-kit authority for future visual changes,
+- agent work continuation and lead-directed same-session resumption: `agents.continue_work`, `agents.continuation_status`, and `agents.continuation_candidates` MCP commands for eligible stage-owned `code_writer` agent executions, persisted continuation/side-effect ledger/supervised-worker/provider-process tables and durable metric events (SQLite migrations `065_p086_agent_work_continuations.sql`, `066_p086_supervised_worker_provider_process.sql`, and `067_p086_continuation_metric_events.sql`), materialized Draft 2020-12 JSON Schemas for canonical requests/responses and continuation artifacts, admission with `live_handle_continuation` and decision-artifact-validated `lead_auto`, frozen-catalog `continuation_capability` opt-in, release/publish/git-push/upload/distribution stage rejection, unresolved P078 side-effect rejection, and a background worker. `BackgroundExecutor` also inspects completed lead-agent artifacts for `lead_continuation_decision_v1`; a valid decision with matching `continuation_instruction` hash is admitted through the same durable continuation transaction and enqueues `WorkItemKind::ProcessContinuation` without a manual MCP call. `BackgroundExecutor` runs a continuation admission-timeout sweeper and processes `WorkItemKind::ProcessContinuation` items through `run_continuation_worker`, which walks the `accepted → queued → starting → running → prompt_sent → observing → worktree_observed → finalizing → succeeded | no_progress | failed` state machine, registers the live ACP provider pid/process-group for restart recovery, inserts the `provider_send` side-effect ledger row idempotently before the durable `prompt_sent` transition, builds the canonical P086 mode-reset prompt from admitted context, and sends it through the existing ACP live-session reuse path. Startup recovery uses the durable provider process binding to verify or fail-closed orphan ACP reap after daemon restart and records signal/deadline evidence for orphan reap attempts. Duplicate prompt replay reconciles only from post-continuation worktree evidence paired with a committed `provider_send` ledger row; mutation without provider-send evidence settles as `no_progress`. GraphQL exposes passive continuation status, candidate, run-history, and metrics-summary readback, including useful-progress/no-progress rates, trigger-specific success rates, follow-up validation success rate, average time saved, provider/session budget impact, and resurrection attach success/failure totals. The macOS Overview card renders those server-owned fields without adding UI command authority. Per-adapter `provider_session_resurrection` remains an explicit fail-closed unsupported mode until a provider declares attach/resume support.
 
 ## Canonical subsystem map
 
@@ -69,10 +72,14 @@ Use these reference docs as the current source of truth:
 | Per-agent MCP policy and runtime validation | [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) |
 | ACP runtime transport | [acp-runtime-transport.md](acp-runtime-transport.md) |
 | Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
-| Rust control plane, scheduler, and targeted retry authority | [rust-control-plane.md](rust-control-plane.md) |
+| Rust control plane, scheduler, targeted retry authority, and retry payload recovery | [rust-control-plane.md](rust-control-plane.md) |
+| Escalation policy and chain management | [escalation-policies.md](escalation-policies.md) |
+| Auto-retry observation ledger | [auto-retry-observation-ledger.md](auto-retry-observation-ledger.md) |
+| API/auth boundary matrix, audit, and idempotency | [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md), [swift-macos-boundary-contract.md](swift-macos-boundary-contract.md) |
 | Proposal-loop feedback fidelity | [proposal-loop-feedback-fidelity-and-rereview.md](proposal-loop-feedback-fidelity-and-rereview.md) |
 | Live provider-backed proposal loop | [live-provider-execution-slice.md](live-provider-execution-slice.md) |
 | Operator shell | [operator-experience.md](operator-experience.md) |
+| macOS operator navigation and read-model UX | [macos-operator-navigation.md](macos-operator-navigation.md) |
 | Run surface IA and artifact hierarchy | [run-surface-information-architecture-and-artifact-hierarchy.md](run-surface-information-architecture-and-artifact-hierarchy.md) |
 | Provider/settings platform | [provider-platform.md](provider-platform.md) |
 | Provider/model provenance | [provider-binding-truth.md](provider-binding-truth.md) |
@@ -90,6 +97,7 @@ Use these reference docs as the current source of truth:
 | UI/brand design authority | [chainworks_forge_design_kit_v1.md](chainworks_forge_design_kit_v1.md) |
 | UI action boundary | [ui-action-boundary.md](ui-action-boundary.md) |
 | GraphQL read contract | [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) |
+| Agent work continuation API contracts | [agent-work-continuation.md](agent-work-continuation.md) |
 
 ## Canonical product boundaries
 
@@ -119,6 +127,9 @@ Current baseline:
 - governed UI screens provide diagnostic identifiers and instructions for MCP-owned workflows when an action is external.
 
 That boundary is owned by [ui-action-boundary.md](ui-action-boundary.md), with read-shape details in [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md).
+P081 changes authorization, audit, idempotency, and actionability semantics for
+that boundary; it does not add non-approval UI mutations or move non-approval
+operator control off MCP.
 
 ### Provider boundary
 
@@ -184,7 +195,7 @@ The following flows should be treated as implemented system behavior:
 11. evidence-pack export for repo-backed runs,
 12. benchmark/sign-off evaluation and export,
 13. durable side-effect ledger, release settlement, and reconciliation,
-14. targeted retry authority, exact retry-stage settlement, and startup orphan retry repair.
+14. targeted retry authority, exact retry-stage settlement, startup orphan retry repair, and retry payload recovery diagnostics.
 
 ## Current review posture
 

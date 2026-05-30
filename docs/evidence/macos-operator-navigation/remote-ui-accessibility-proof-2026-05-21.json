@@ -1,0 +1,39 @@
+{
+  "schema_version": "p036_remote_ui_accessibility_proof_v1",
+  "proposal_id": "036",
+  "captured_at": "2026-05-21T07:30:00+03:00",
+  "remote_host": "test@SMacBook.local",
+  "remote_worktree": "/Users/test/chainworks-p036-proof-20260520-2258",
+  "remote_result_bundle": "/var/folders/hh/ztmrr5z96xnbxvlcxyf1vxsc0000gp/T/chainworks-test-gates/proposal-036-20260520-231711.xcresult",
+  "gate_command": "./scripts/test-gate.sh proposal-036",
+  "gate_status": "passed",
+  "covered_surfaces": [
+    "navigation",
+    "runs_inspection",
+    "global_approval_context",
+    "inline_approval_context",
+    "ideas_deep_link_to_runs",
+    "definitions_segment_switch",
+    "settings_readiness_route",
+    "heavy_tool_timeline_flow"
+  ],
+  "remote_ui_tests": [
+    "testProposal036NavigationShellParity",
+    "testProposal036DefinitionsSegmentedWrapper",
+    "testProposal036RunsApprovalTimelineAndSettingsReadinessFlow",
+    "testProposal036IdeasDeepLinkToRunsFlow"
+  ],
+  "accessibility_checks": [
+    "consolidated_sidebar_tabs_have_stable_identifiers",
+    "waiting_approval_attention_remains_textual_not_color_only",
+    "definitions_segments_have_discoverable_labels",
+    "timeline_rows_respect_reduce_motion_source_gate",
+    "settings_readiness_route_has_accessibility_identifier"
+  ],
+  "screenshots": [
+    "P036_NavigationShellParity",
+    "P036_DefinitionsSegmentedWrapper",
+    "P036_RunsApprovalTimelineSettingsFlow",
+    "P036_IdeasDeepLinkToRuns"
+  ]
+}

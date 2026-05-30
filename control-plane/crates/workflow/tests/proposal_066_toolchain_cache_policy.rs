@@ -33,6 +33,7 @@ fn minimal_agent_entry(id: &str) -> AgentEntry {
         prompt: None,
         notes: None,
         worktree_policy: None,
+        continuation_capability: None,
         required_tools: None,
         xcode_broker_required: None,
         xcode_shim_injection_signal: None,
@@ -131,6 +132,7 @@ fn p066_catalog_without_version_or_policy_is_legacy_v0() {
         backend_profiles: None,
         permission_profiles: None,
         agents: Some(vec![minimal_agent_entry("a1")]),
+        escalation_policies: None,
     };
     let result = validate_catalog_snapshot_format_version(&catalog).unwrap();
     assert!(!result, "no version + no policy = legacy_v0");
@@ -157,6 +159,7 @@ fn p066_catalog_with_policy_but_no_version_fails() {
         backend_profiles: None,
         permission_profiles: None,
         agents: Some(vec![entry]),
+        escalation_policies: None,
     };
     let result = validate_catalog_snapshot_format_version(&catalog);
     assert!(
@@ -179,6 +182,7 @@ fn p066_catalog_with_version_1_is_valid() {
         backend_profiles: None,
         permission_profiles: None,
         agents: Some(vec![minimal_agent_entry("a1")]),
+        escalation_policies: None,
     };
     let result = validate_catalog_snapshot_format_version(&catalog).unwrap();
     assert!(result, "version 1 = P066-aware snapshot");
@@ -198,6 +202,7 @@ fn p066_catalog_with_unsupported_version_fails() {
         backend_profiles: None,
         permission_profiles: None,
         agents: Some(vec![minimal_agent_entry("a1")]),
+        escalation_policies: None,
     };
     let result = validate_catalog_snapshot_format_version(&catalog);
     assert!(
@@ -225,6 +230,7 @@ fn p066_catalog_with_zero_version_fails() {
         backend_profiles: None,
         permission_profiles: None,
         agents: Some(vec![minimal_agent_entry("a1")]),
+        escalation_policies: None,
     };
     let result = validate_catalog_snapshot_format_version(&catalog);
     assert!(
@@ -298,6 +304,7 @@ fn p066_validate_policies_rejects_unsupported_version_in_catalog() {
         backend_profiles: None,
         permission_profiles: None,
         agents: Some(vec![entry]),
+        escalation_policies: None,
     };
     let result = validate_toolchain_cache_policies(&catalog);
     assert!(
@@ -320,6 +327,7 @@ fn p066_validate_policies_accepts_absent_policy() {
         backend_profiles: None,
         permission_profiles: None,
         agents: Some(vec![minimal_agent_entry("a1")]),
+        escalation_policies: None,
     };
     validate_toolchain_cache_policies(&catalog).expect("absent policy should pass validation");
 }

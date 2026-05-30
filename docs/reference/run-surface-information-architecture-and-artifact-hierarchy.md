@@ -8,7 +8,7 @@ Chainworks Forge already had the necessary run truth, but the operator shell was
 
 This document is the stable contract for:
 
-- the segmented run-shell structure in `Runs Home` and `Idea`,
+- the segmented run-shell structure in `Runs`,
 - deterministic pane routing for action-critical run states,
 - the focused timeline inspector as a subordinate workflow-map surface,
 - the shared canonical artifact hierarchy used for run browsing,
@@ -19,7 +19,7 @@ This document is the stable contract for:
 This reference covers:
 
 - `RunsHomeView` as the run-centric segmented inspection surface,
-- idea-side run progress as the idea-centric segmented operation surface,
+- Ideas compact run status strips as read-first idea context,
 - `RunSurfacePaneRouting` and pane-priority behavior,
 - `WorkflowMapView` plus `RunTimelineInspectorView`,
 - `RunArtifactHierarchy`, `RunArtifactHierarchyBuilder`, and `RunArtifactHierarchyView`,
@@ -29,23 +29,24 @@ It does not redefine:
 
 - execution truth or recovery authority in [execution-truth-and-recovery.md](execution-truth-and-recovery.md),
 - the broader operator shell baseline in [operator-experience.md](operator-experience.md),
+- the consolidated top-level navigation shell in [macos-operator-navigation.md](macos-operator-navigation.md),
 - workflow-topology semantics in [live-workflow-map.md](live-workflow-map.md),
 - or repo-backed delivery semantics in [full-mvp-delivery.md](full-mvp-delivery.md).
 
 ## Core Rules
 
-### Two run surfaces remain, and they are intentionally different
+### Runs owns run inspection; Ideas owns read-first context
 
-The product still has two run surfaces:
+The product keeps run context visible in two places, but only one surface owns run inspection:
 
-- `Runs Home` for inspection, diagnostics, report/export, and recovery-oriented work,
-- `Idea` for active progress watching, approvals, and quick operational control inside idea context.
+- `Runs` for inspection, diagnostics, approval context, reports, artifacts, recovery evidence, system readiness context, and active-agent Timeline readback.
+- `Ideas` for read-first idea context and compact projected run-status strips that route operators back to Runs.
 
-They do not collapse into one unified run screen, and they do not share the same pane set.
+Ideas does not expose executable create, configure, archive, launch, start-run, or local workflow-write controls.
 
-### Segmented panes replace the old long run-detail stack
+### Runs panes replace the old long run-detail stack
 
-Both run surfaces now follow the same shell pattern:
+Runs follows the shell pattern:
 
 - compact run header,
 - compact shell-owned action row,
@@ -54,18 +55,21 @@ Both run surfaces now follow the same shell pattern:
 
 The segmented switcher is in-place content replacement, not a new navigation hierarchy.
 
-### `Runs Home` owns the inspection-first pane set
+### `Runs` owns the inspection-first pane set
 
-The implemented `Runs Home` pane contract is:
+The implemented `Runs` pane contract is:
 
-- `Summary`
-- `Flow`
+- `Overview`
+- `Stages`
 - `Artifacts`
-- `Diagnostics`
+- `Approvals`
+- `Timeline`
+- `Reports`
+- `System`
 
-`Summary` keeps high-frequency run status, stage, cost, elapsed time, and shell-owned actions.
+`Overview` keeps high-frequency run status, stage, cost, elapsed time, rollout/readiness summary, and shell-owned diagnostic context.
 
-`Flow` owns the workflow-map-derived operator truth that used to be spread across the long stack:
+`Stages` owns the workflow-map-derived operator truth that used to be spread across the long stack:
 
 - topology,
 - summary chips and stage health counters,
@@ -74,26 +78,21 @@ The implemented `Runs Home` pane contract is:
 - loop/iteration telemetry,
 - focused timeline entry.
 
-`Artifacts` owns the canonical hierarchy browser plus promoted artifacts.
+`Artifacts` owns the canonical hierarchy browser plus promoted artifacts and authorized preview state.
 
-`Diagnostics` owns lower-frequency receipts, anomalies, recovery evidence, discovery settlement logs, and other deep technical inspection paths.
+`Approvals` owns inline approval rows and fail-closed P085 actionability. `Timeline` owns active-agent readback and summary behavior. `Reports` owns report metadata and payload availability. `System` owns daemon, scheduler, readiness, and recovery evidence.
 
-### `Idea` owns the operation-first pane set
+### Ideas owns compact projected status
 
-The implemented idea-side run progress pane contract is:
+Ideas shows daemon-backed idea metadata and compact status strips for:
 
-- `Summary`
-- `Progress`
-- `Artifacts`
-- `Approvals`
+- waiting approval,
+- blocked or failed,
+- running,
+- completed,
+- status unknown.
 
-`Summary` keeps the immediate run headline, next action, and run control.
-
-`Progress` owns stage progression, active execution focus, recent handoff context, loop state, and focused timeline entry.
-
-`Artifacts` reuses the same canonical hierarchy as `Runs Home`, but is consumed from the idea context.
-
-`Approvals` keeps pending approval context, rationale, and decision history as a first-class pane rather than permanent summary clutter.
+Interactive strips route to Runs. Read-only counts remain visually distinct.
 
 ### Action-critical states override stale pane memory
 
@@ -149,7 +148,7 @@ The implemented browsing lane is shared through one builder and one view model:
 - semantic buckets,
 - promoted artifacts.
 
-This keeps `Runs Home`, `Idea`, and shell-owned readers on the same grouping truth.
+This keeps Runs and shell-owned readers on the same grouping truth.
 
 ### Promoted artifacts stay first-class
 
@@ -180,7 +179,7 @@ In the current implementation, that continuity path is anchored by the run-owned
 The main implementation owners for this slice are:
 
 - `RunsHomeView`
-- `IdeaListView` / `WorkflowRunProgressView`
+- `ContentView` / daemon-backed Ideas surface
 - `RunSurfacePaneRouting`
 - `WorkflowMapView`
 - `RunTimelineInspectorView`
@@ -188,6 +187,7 @@ The main implementation owners for this slice are:
 - `RunArtifactHierarchyBuilder`
 - `RunArtifactHierarchyView`
 - `CompletedRunExportHub`
+- `RunsWorkbenchPresentationModel`
 
 These components implement the stable contract above; proposal-era wording should no longer be treated as the canonical source of truth.
 
@@ -196,6 +196,7 @@ These components implement the stable contract above; proposal-era wording shoul
 The split of authority is:
 
 - [operator-experience.md](operator-experience.md) owns the broader operator shell baseline and truthful action semantics,
+- [macos-operator-navigation.md](macos-operator-navigation.md) owns consolidated top-level navigation, route compatibility, Ideas read-first behavior, Definitions, Settings System Readiness, Timeline batching, metrics, and proof aliases,
 - this document owns the detailed segmented run-shell IA, focused timeline placement, hierarchy browsing rules, and metadata-demotion continuity,
 - [live-workflow-map.md](live-workflow-map.md) owns workflow-map state vocabulary and topology expectations,
 - [execution-truth-and-recovery.md](execution-truth-and-recovery.md) owns run truth, reports, and recovery precedence,

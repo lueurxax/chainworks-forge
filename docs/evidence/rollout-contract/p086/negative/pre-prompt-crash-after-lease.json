@@ -1,43 +1,20 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "rollout_contract_v1",
+  "fixture_kind": "negative",
+  "proposal_id": "P086",
+  "hold_condition": "pre_prompt_recovery",
+  "fixture_purpose": "Pre-prompt lease/crash evidence is durable: worker claim registers supervised ownership before leases/provider_send, and terminal settlement releases the supervised worker only after artifacts are materialized.",
+  "status": "pass",
+  "evidence_kind": "code_and_regression_test",
+  "evidence": {
+    "implemented": {
+      "claim_location": "control-plane/crates/db/src/repos/agent_work_continuations.rs::claim_for_continuation_worker",
+      "release_location": "control-plane/crates/db/src/repos/agent_work_continuations.rs::release_supervised_worker",
+      "mechanism": "The worker inserts supervised_workers_continuation on claim with heartbeat timestamp before runtime/worktree/provider_send side effects; terminal artifact settlement releases the worker row."
+    },
+    "tests": [
+      "cargo test -p db --test proposal_086_continuation_lifecycle p086_side_effect_lookup_and_worker_release_are_durable"
+    ]
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-086",
-    "p086",
-    "p086-continuation-preflight",
-    "p086-continuation-readback",
-    "p086-continuation-negative-fixtures",
-    "p086-continuation-operator-report"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:pre_prompt_crash_after_lease",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "expected_outcome": "stale_worker_has_durable_supervision_evidence"
 }

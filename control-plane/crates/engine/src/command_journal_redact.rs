@@ -28,6 +28,7 @@
 //! | `RejectStage`        | `comment`                      | **redact** |
 //! | `RetryStage`         | `run_id`, `stage_id`, etc.     | preserve   |
 //! | `RetryStage`         | `operator_instruction`         | **redact** |
+//! | `ConsumeProviderQuotaHold` | all fields               | preserve   |
 //! | `OverrideLegacyDiscoveryPolicy` | all fields            | preserve   |
 //! | `MainSyncRequest`    | all fields                     | preserve   |
 //! | `MainSyncRetry`      | all fields                     | preserve   |
@@ -76,6 +77,10 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
     // Exhaustive match — adding a new Command variant fails to compile here
     // until the author records an explicit matrix entry.
     match cmd {
+        Command::CreateIdea(_) => {
+            // Preserve operator-submitted idea title/body in the command journal:
+            // idea creation is itself the durable content being audited.
+        }
         Command::StartRun(_) => {
             if let Some(obj) = inner {
                 redact_field_if_present(obj, "delivery_configuration_json");
@@ -97,6 +102,9 @@ pub fn redact_for_journal(cmd: &Command, payload_json: &str) -> String {
             if let Some(obj) = inner {
                 redact_field_if_present(obj, "operator_instruction");
             }
+        }
+        Command::ConsumeProviderQuotaHold(_) => {
+            // Preserve run/stage/reason for operator audit of quota-hold overrides.
         }
         Command::ResolveWorkflowConflictTransition(_) => {
             // Operator conflict-resolution selections are audit material.
@@ -200,12 +208,13 @@ mod tests {
     use super::*;
     use domain::commands::{
         ApprovalResolutionDecision, ApproveStageCmd, CancelRunCmd, Command,
-        ExtendWorkflowLoopBudgetCmd, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
-        MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
-        MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
-        OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResetSessionCmd, ResolveApprovalCmd,
-        ResolveLeadMediationConfirmationCmd, ResolveWorkflowConflictTransitionCmd, RetryStageCmd,
-        RunStewardAnalysisCmd, StartRunCmd, WorkflowLoopBudgetExtensionCmd,
+        ConsumeProviderQuotaHoldCmd, ExtendWorkflowLoopBudgetCmd, KnowledgeCapsuleIgnoreCmd,
+        MainSyncMode, MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision,
+        MainSyncRepairStateCmd, MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd,
+        MainSyncTriggerReason, OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResetSessionCmd,
+        ResolveApprovalCmd, ResolveLeadMediationConfirmationCmd,
+        ResolveWorkflowConflictTransitionCmd, RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
+        WorkflowLoopBudgetExtensionCmd,
     };
     use domain::discovery::LegacyBroadDiscoveryPolicy;
     use domain::ids::{IdeaId, RunId, StageExecutionId};
@@ -533,6 +542,11 @@ mod tests {
                 legacy_discovery_override_reason: None,
                 operator_instruction: Some("Focus on X".into()),
             }),
+            Command::ConsumeProviderQuotaHold(ConsumeProviderQuotaHoldCmd {
+                run_id: RunId::new(),
+                stage_id: "s".into(),
+                reason: "operator confirmed cooldown elapsed".into(),
+            }),
             Command::ResolveWorkflowConflictTransition(ResolveWorkflowConflictTransitionCmd {
                 run_id: RunId::new(),
                 conflict_id: "conflict-1".into(),
@@ -617,6 +631,7 @@ mod tests {
                 rationale: Some("LGTM".into()),
                 run_id: RunId::new(),
                 stage_id: "state_6".into(),
+                idempotency_key: None,
             }),
             Command::ResolveApproval(ResolveApprovalCmd {
                 approval_id: domain::ids::ApprovalId::new(),
@@ -624,6 +639,7 @@ mod tests {
                 rationale: Some("Needs rework".into()),
                 run_id: RunId::new(),
                 stage_id: "state_3".into(),
+                idempotency_key: None,
             }),
         ];
 
@@ -641,10 +657,12 @@ mod tests {
         // discriminant is accounted for in the focused inventory.
         fn _exhaustiveness_reminder(c: &Command) {
             match c {
+                Command::CreateIdea(_) => {}
                 Command::StartRun(_) => {}
                 Command::ApproveStage(_) => {}
                 Command::RejectStage(_) => {}
                 Command::RetryStage(_) => {}
+                Command::ConsumeProviderQuotaHold(_) => {}
                 Command::ResolveWorkflowConflictTransition(_) => {}
                 Command::ExtendWorkflowLoopBudget(_) => {}
                 Command::OverrideLegacyDiscoveryPolicy(_) => {}

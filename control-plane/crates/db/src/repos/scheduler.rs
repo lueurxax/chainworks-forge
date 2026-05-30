@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
+use crate::repos::agent_retry_budget_ledger;
 use crate::writer::{
     begin_registered_immediate_transaction, execute_repository_transaction_operation,
     repository_transaction_operation,
@@ -970,6 +971,7 @@ struct PendingInvokeAgentWork {
     run_id: Option<String>,
     stage_execution_id: Option<String>,
     provider_family: Option<String>,
+    model: Option<String>,
     scheduled_at: DateTime<Utc>,
     requires_xcode_mcp: bool,
     startup_recovery_requeued: bool,
@@ -1044,11 +1046,14 @@ struct ActiveCounts {
     xcode_mcp: i64,
     by_run: BTreeMap<String, i64>,
     by_provider: BTreeMap<String, i64>,
+    provider_quota_wait_scopes: BTreeSet<String>,
 }
 
 impl ActiveCounts {
     async fn load(pool: &SqlitePool) -> Result<Self> {
         let mut counts = Self::default();
+        let now = Utc::now();
+        agent_retry_budget_ledger::mark_elapsed_provider_quota_waits(pool, now).await?;
 
         let global_agent_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM agent_executions WHERE status = 'running'")
@@ -1114,12 +1119,15 @@ impl ActiveCounts {
             let entry = counts.by_provider.entry(provider_family).or_insert(0);
             *entry = (*entry).max(count);
         }
+        counts.provider_quota_wait_scopes = load_provider_quota_wait_scopes(pool, now).await?;
 
         Ok(counts)
     }
 
     async fn load_tx(tx: &mut Transaction<'_, Sqlite>) -> Result<Self> {
         let mut counts = Self::default();
+        let now = Utc::now();
+        agent_retry_budget_ledger::mark_elapsed_provider_quota_waits_tx(tx, now).await?;
 
         let global_agent_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM agent_executions WHERE status = 'running'")
@@ -1185,9 +1193,79 @@ impl ActiveCounts {
             let entry = counts.by_provider.entry(provider_family).or_insert(0);
             *entry = (*entry).max(count);
         }
+        counts.provider_quota_wait_scopes = load_provider_quota_wait_scopes_tx(tx, now).await?;
 
         Ok(counts)
     }
+}
+
+async fn load_provider_quota_wait_scopes(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> Result<BTreeSet<String>> {
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT COALESCE(ae.provider_family, ae.provider) AS provider_family,
+                  lower(nullif(trim(ae.model), '')) AS model
+           FROM agent_retry_budget_ledger ledger
+           INNER JOIN agent_executions ae ON ae.id = ledger.agent_execution_id
+           WHERE ledger.failure_kind = 'provider_quota'
+             AND ledger.normal_budget_consumed = 0
+             AND ledger.state = 'waiting_for_reset'
+             AND ledger.retry_after IS NOT NULL
+             AND ledger.retry_after > ?1"#,
+    )
+    .bind(now.to_rfc3339())
+    .fetch_all(pool)
+    .await
+    .context("load provider quota wait families")?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let provider_family: String = row.get("provider_family");
+            let model: Option<String> = row.get("model");
+            (!provider_family.is_empty())
+                .then(|| provider_quota_wait_scope_key(&provider_family, model.as_deref()))
+        })
+        .collect())
+}
+
+async fn load_provider_quota_wait_scopes_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    now: DateTime<Utc>,
+) -> Result<BTreeSet<String>> {
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT COALESCE(ae.provider_family, ae.provider) AS provider_family,
+                  lower(nullif(trim(ae.model), '')) AS model
+           FROM agent_retry_budget_ledger ledger
+           INNER JOIN agent_executions ae ON ae.id = ledger.agent_execution_id
+           WHERE ledger.failure_kind = 'provider_quota'
+             AND ledger.normal_budget_consumed = 0
+             AND ledger.state = 'waiting_for_reset'
+             AND ledger.retry_after IS NOT NULL
+             AND ledger.retry_after > ?1"#,
+    )
+    .bind(now.to_rfc3339())
+    .fetch_all(&mut **tx)
+    .await
+    .context("load provider quota wait families")?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let provider_family: String = row.get("provider_family");
+            let model: Option<String> = row.get("model");
+            (!provider_family.is_empty())
+                .then(|| provider_quota_wait_scope_key(&provider_family, model.as_deref()))
+        })
+        .collect())
+}
+
+fn provider_quota_wait_scope_key(provider_family: &str, model: Option<&str>) -> String {
+    let normalized_model = model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "*".to_string());
+    format!("{provider_family}::{normalized_model}")
 }
 
 fn top_reason_for_item(
@@ -1212,6 +1290,18 @@ fn top_reason_for_item(
     }
 
     if let Some(provider_family) = item.provider_family.as_deref() {
+        if active
+            .provider_quota_wait_scopes
+            .contains(&provider_quota_wait_scope_key(provider_family, None))
+            || active
+                .provider_quota_wait_scopes
+                .contains(&provider_quota_wait_scope_key(
+                    provider_family,
+                    item.model.as_deref(),
+                ))
+        {
+            return "provider_quota_wait".to_string();
+        }
         if let Ok(family) = provider_family.parse::<ProviderFamily>() {
             if active
                 .by_provider
@@ -1325,6 +1415,7 @@ fn select_notification_summary(
 
 fn reason_priority(reason: &str) -> i64 {
     match reason {
+        "provider_quota_wait" => 7,
         "xcode_mcp_capacity" => 6,
         "run_capacity" => 5,
         "provider_capacity" => 4,
@@ -1512,6 +1603,7 @@ fn parse_invoke_agent_work_row(row: sqlx::sqlite::SqliteRow) -> Result<PendingIn
     let provider_family = payload["provider"]
         .as_str()
         .and_then(ProviderFamily::canonicalize_known_alias);
+    let model = payload["model"].as_str().map(str::to_string);
     let stage_execution_id = payload["stage_execution_id"].as_str().map(String::from);
     let scheduled_at = parse_datetime(row.get("scheduled_at"))?;
 
@@ -1519,6 +1611,7 @@ fn parse_invoke_agent_work_row(row: sqlx::sqlite::SqliteRow) -> Result<PendingIn
         run_id: row.get("run_id"),
         stage_execution_id,
         provider_family,
+        model,
         scheduled_at,
         requires_xcode_mcp: invoke_payload_requires_xcode_mcp(&payload),
         startup_recovery_requeued: payload.get("p061_startup_recovery").is_some(),

@@ -86,13 +86,11 @@ pub struct GqlAgentExecutionRuntimeFacts {
     pub ignored_late_output_count: i64,
     pub session_lineage_id: Option<ID>,
     pub session_generation_id: Option<ID>,
-    pub invocation_owner_key: Option<String>,
     pub session_reuse_scope: Option<String>,
     pub session_family_id: Option<String>,
     pub session_reuse_disposition: Option<String>,
     pub session_reuse_reason: Option<String>,
     pub session_reset_reason: Option<String>,
-    pub provider_session_id: Option<String>,
     pub active_session_generation_id: Option<ID>,
     pub active_generation_matches_execution: Option<bool>,
     pub generation_status: Option<String>,
@@ -139,11 +137,18 @@ pub struct GqlAgentExecution {
     pub id: ID,
     pub stage_execution_id: ID,
     pub agent_id: String,
+    pub agent_title: Option<String>,
     pub provider: String,
     pub model: Option<String>,
     pub status: String,
     pub started_at: String,
     pub completed_at: Option<String>,
+    pub stage_label: Option<String>,
+    pub task_label: Option<String>,
+    pub last_event_at: Option<String>,
+    pub event_count: Option<i64>,
+    pub selection_order: Option<i64>,
+    pub selection_unavailable_reason: Option<String>,
     pub backend_profile_id: Option<String>,
     pub requested_mcp_extensions_json: Option<String>,
     pub predicted_mcp_extensions_json: Option<String>,
@@ -159,6 +164,9 @@ pub struct GqlAgentExecution {
     pub session_lineage_id: Option<String>,
     pub session_generation_id: Option<String>,
     pub rehydrated_from_checkpoint_artifact_id: Option<String>,
+    /// Raw invocation owner key — kept in struct for runtime_facts derivation but
+    /// excluded from the GraphQL schema to satisfy the P046 sensitive-field boundary.
+    #[graphql(skip)]
     pub invocation_owner_key: Option<String>,
     pub session_reuse_scope: Option<String>,
     pub session_family_id: Option<String>,
@@ -167,6 +175,46 @@ pub struct GqlAgentExecution {
     /// P066: Toolchain cache mapping diagnostics. Always non-null — legacy rows
     /// are synthesized as mapping_state=legacy_row_unavailable.
     pub actual_toolchain_mapping_diagnostics: GqlToolchainMappingDiagnostics,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "RunStageTopologyOccurrence", rename_fields = "camelCase")]
+pub struct GqlRunStageTopologyOccurrence {
+    pub agent_id: String,
+    pub agent_title: String,
+    pub task_name: String,
+    pub status: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub execution_count: i64,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "RunStageTopologyTransition", rename_fields = "camelCase")]
+pub struct GqlRunStageTopologyTransition {
+    pub to_stage_id: String,
+    pub to_label: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "RunStageTopologyNode", rename_fields = "camelCase")]
+pub struct GqlRunStageTopologyNode {
+    pub stage_id: String,
+    pub label: String,
+    pub order: i64,
+    pub owner_agent_id: String,
+    pub owner_agent_title: String,
+    pub status: String,
+    pub is_current: bool,
+    pub iteration: Option<i64>,
+    pub attempt_number: Option<i64>,
+    pub approval_required: bool,
+    pub artifact_count: i64,
+    pub communication_count: i64,
+    pub occurrences: Vec<GqlRunStageTopologyOccurrence>,
+    pub transitions: Vec<GqlRunStageTopologyTransition>,
 }
 
 impl From<domain::agent::AgentExecution> for GqlAgentExecution {
@@ -178,11 +226,18 @@ impl From<domain::agent::AgentExecution> for GqlAgentExecution {
                 .expect("stage-scoped GraphQL agent execution requires stage_execution_id")
                 .to_string()),
             agent_id: execution.agent_id,
+            agent_title: None,
             provider: execution.provider,
             model: execution.model,
             status: execution.status.to_string(),
             started_at: execution.started_at.to_rfc3339(),
             completed_at: execution.completed_at.map(|t| t.to_rfc3339()),
+            stage_label: None,
+            task_label: None,
+            last_event_at: None,
+            event_count: None,
+            selection_order: None,
+            selection_unavailable_reason: None,
             backend_profile_id: execution.backend_profile_id,
             requested_mcp_extensions_json: execution.requested_mcp_extensions_json,
             predicted_mcp_extensions_json: execution.predicted_mcp_extensions_json,
@@ -682,8 +737,6 @@ impl GqlAgentExecutionRuntimeFacts {
         generation: Option<&SessionGeneration>,
         include_operator_debug: bool,
     ) -> Self {
-        let provider_session_id =
-            generation.and_then(|generation| generation.provider_session_id.clone());
         let generation_status = generation.map(|generation| {
             sessions::session_generation_status_to_str(&generation.status).to_string()
         });
@@ -780,13 +833,11 @@ impl GqlAgentExecutionRuntimeFacts {
             ignored_late_output_count: facts.ignored_late_output_count,
             session_lineage_id: execution.session_lineage_id.clone().map(ID),
             session_generation_id: execution.session_generation_id.clone().map(ID),
-            invocation_owner_key: execution.invocation_owner_key.clone(),
             session_reuse_scope: execution.session_reuse_scope.clone(),
             session_family_id: execution.session_family_id.clone(),
             session_reuse_disposition: execution.session_reuse_disposition.clone(),
             session_reuse_reason: facts.session_reuse_reason,
             session_reset_reason: execution.session_reset_reason.clone(),
-            provider_session_id,
             active_session_generation_id,
             active_generation_matches_execution,
             generation_status,
@@ -972,6 +1023,13 @@ mod tests {
             cached_input_tokens: None,
             transcript_artifact_id: None,
             actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
         };
 
         let gql = GqlAgentExecution::from(execution);

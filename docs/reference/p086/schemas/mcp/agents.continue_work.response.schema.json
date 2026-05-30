@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agents.continue_work.response.schema.json",
+  "title": "agents.continue_work response",
+  "description": "P086: asynchronous admission response schema for agents.continue_work. Terminal response/session/provider/artifact fields are exposed through continuation readback, not by blocking this command.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome"],
+  "properties": {
+    "outcome": {
+      "type": "string",
+      "enum": ["accepted", "replay", "rejected"],
+      "description": "Command admission outcome. accepted = new row enqueued; replay = idempotency match; rejected = admission error."
+    },
+    "continuation_id": {
+      "type": "string",
+      "description": "UUID of the agent_work_continuations row. Present on accepted and replay. Use continuation readback for terminal artifact fields."
+    },
+    "request_fingerprint_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex SHA-256 of the canonical request JSON."
+    },
+    "status": {
+      "type": "string",
+      "description": "Current status of the continuation row."
+    },
+    "error": {
+      "type": "object",
+      "description": "Present on rejected outcome.",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"type": "integer"},
+        "message": {"type": "string"},
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Bounded machine-readable rejection details. P086 v1 intentionally exposes no free-form extension map here.",
+          "properties": {
+            "actual_provider_session_id": {"type": ["string", "null"]},
+            "actual_run_id": {"type": "string"},
+            "actual_session_generation_id": {"type": ["string", "null"]},
+            "actual_stage_execution_id": {"type": "string"},
+            "agent_execution_id": {"type": "string"},
+            "agent_status": {"type": "string"},
+            "concurrency": {"type": "integer"},
+            "concurrency_max": {"type": "integer"},
+            "continuation_id": {"type": "string"},
+            "continuation_status": {"type": "string"},
+            "current_count": {"type": "integer"},
+            "detail": {"type": "string"},
+            "expected_provider_session_id": {"type": "string"},
+            "expected_run_id": {"type": "string"},
+            "expected_session_generation_id": {"type": "string"},
+            "expected_stage_execution_id": {"type": "string"},
+            "failure_reason": {"type": "string"},
+            "field": {"type": "string"},
+            "forbidden_stage_kind": {"type": "string"},
+            "idempotency_key": {"type": "string"},
+            "limit_scope": {
+              "type": "string",
+              "enum": ["agent_execution", "stage_execution"]
+            },
+            "max_count": {"type": "integer"},
+            "mode": {"type": "string"},
+            "queue_depth": {"type": "integer"},
+            "queue_depth_max": {"type": "integer"},
+            "run_id": {"type": "string"},
+            "stage_execution_id": {"type": "string"},
+            "stage_id": {"type": ["string", "null"]},
+            "stage_type": {"type": ["string", "null"]},
+            "trigger_kind": {"type": "string"}
+          }
+        }
+      }
+    }
+  }
+}

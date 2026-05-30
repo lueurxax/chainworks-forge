@@ -1,0 +1,14 @@
+{
+  "schema_version": "rollout_contract_v1",
+  "proposal_id": "046",
+  "negative_case": "reversible_derived_reference",
+  "description": "Derived reference (providerSessionRef, bindingProfileRef, invocationOwnerRef) equals, contains, or is trivially reversible to the raw sensitive value.",
+  "hold_condition": "Raw providerSessionId, bindingFingerprint, invocationOwnerKey, absolute workingDirectory, or reversible/scopeless derived references appear in P046 GraphQL schema or payload.",
+  "expected_decision": "fail",
+  "expected_failure_code": "p046_reversible_derived_reference",
+  "fixture_input": {
+    "raw_provider_session_id": "provider-session-secret-abc123",
+    "derived_ref": "provider-session-secret-abc123",
+    "expected_result": "derived_ref_must_not_equal_or_contain_raw_value"
+  }
+}

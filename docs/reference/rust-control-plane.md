@@ -21,9 +21,10 @@ The Rust control-plane daemon is a server-side parity replica of the orchestrati
 - approval waits and settlement
 - retries and restart reconciliation
 - cancellation flow
+- **escalation policy resolution, trigger classification, blocker digest calculation, and policy lifecycle management**
 - projection updates for read models
 - ACP runtime adapter coordination
-- command journaling and startup repair
+- escalation ledger persistence (domain enums, three SQLite tables, repo-layer redaction enforcement, `run_escalation_readback` GraphQL query) and P058 tier selection writer (`engine/src/shadow_escalation.rs`) populating `would_select_*` diagnostics while advancing durable ledger/event readback for owned active tiers
 
 The daemon runs alongside the desktop application on the same machine. During the current phase, the SwiftUI client remains the canonical user-facing owner. The daemon provides shadow truth through GraphQL and MCP, validated before any authority transfer.
 
@@ -43,7 +44,7 @@ It does not cover the SwiftUI operator shell or the implemented thin-client read
 
 ## Architecture
 
-The daemon is a single Rust binary built from an 8-crate workspace at `control-plane/`.
+The daemon is a single Rust binary built from a 9-crate workspace at `control-plane/`.
 
 ```text
                    GraphQL clients           MCP clients
@@ -82,8 +83,9 @@ The daemon is a single Rust binary built from an 8-crate workspace at `control-p
 
 | Crate | Path | Role |
 |---|---|---|
-| `domain` | `crates/domain/src/lib.rs` | Value types, status enums, commands, events. No I/O. |
-| `db` | `crates/db/src/lib.rs` | SQLite pool, migrations, repository modules, work item types. |
+| `domain` | `crates/domain/src/lib.rs` | Value types, status enums, commands, events, and escalation ledger models. No I/O. |
+| `db` | `crates/db/src/lib.rs` | SQLite pool, migrations, repository modules (including escalation), work item types. |
+| `auth` | `crates/auth/src/lib.rs` | Bearer principals, principal-table loading, caller-class derivation, and shared boundary authorization helpers. |
 | `workflow` | `crates/workflow/src/lib.rs` | YAML workflow definition parsing, agent catalog loading, `RunPlan` compilation, and `PhaseBLeadResolver` compatibility mapping. |
 | `acp` | `crates/acp/src/lib.rs` | ACP runtime manager, per-provider adapters, JSON-RPC 2.0 stdio transport. |
 | `engine` | `crates/engine/src/lib.rs` | Orchestrator, command handler, background executor, work queue, recovery service, event bus, mediation settlement, and run-start rollout-contract preflight. |
@@ -91,17 +93,22 @@ The daemon is a single Rust binary built from an 8-crate workspace at `control-p
 | `mcp-server` | `crates/mcp-server/src/lib.rs` | MCP JSON-RPC server with tool dispatch, resource reads, stdio and HTTP transports. |
 | `daemon` | `crates/daemon/src/main.rs` | Binary entry point. Wires all crates, runs startup recovery, enters mode dispatch. |
 
+Escalation policy resolution, trigger classification, ledger/event/metadata persistence, and Phase 2+ scheduler behavior are owned by the control plane. Schema, contracts, invariants, and rollout phasing are pinned in [escalation-policies.md](escalation-policies.md).
+
 ### Dependency flow
 
 ```text
-domain  <--  db  <--  workflow
-                  <--  acp
-                  <--  engine  <--  graphql-server
-                               <--  mcp-server
-                               <--  daemon
+domain  <--  db
+        <--  auth
+        <--  workflow
+        <--  acp
+
+db + auth + workflow + acp  -->  engine  -->  graphql-server
+                                        -->  mcp-server
+                                        -->  daemon
 ```
 
-`domain` has no dependencies on other workspace crates. `db` depends on `domain`. `engine` depends on `domain`, `db`, `workflow`, and `acp`. The server crates and `daemon` depend on `engine`.
+`domain` has no dependencies on other workspace crates. `db`, `auth`, `workflow`, and `acp` depend on `domain`. `engine` depends on `domain`, `db`, `auth`, `workflow`, and `acp`. The server crates and `daemon` depend on `engine`, and the boundary-facing server crates also depend directly on `auth` for principal and caller-class handling.
 
 ## Boundary shape
 
@@ -124,6 +131,9 @@ The `storageHealth` query exposes the current health state of the storage subsys
 
 **Implementation self-assessment summary extension:**
 The `Run` type includes a nullable `implementationSelfAssessmentSummary` field that exposes structured assessment truth (status, verification, code tasks, handoff tasks) without requiring raw artifact parsing.
+
+**Escalation chain readback (Phase 0-1):**
+A dedicated `runEscalationReadback` query exposes ledger chains, events, and execution metadata with per-array row caps (50 ledgers / 200 events / 100 execution metas) and `*_truncated`/`*_total` markers. Phase 2+ chain fields (`featureFlagState`, `wouldSelectTierId`, `policyDriftState`, `waitingRetryAfterUntil`, `escalationTraceJsonRedacted`, etc.) are wired into the SDL today but emit `null` until the Phase 2+ scheduler populates them. MCP `runs.get` returns the same payload for Operator principals and a summary projection (`paused_chain_count`, `has_active_escalation`, `chains_redacted: true`) for Agent/Observer principals. See [escalation-policies.md](escalation-policies.md) for the full readback shape and authorization contract.
 
 **Targeted retry authority readback:**
 The `Run` type includes `retryAuthorityJson`, `retryAuthorityHistoryJson`, and `p091OrphanRepairReadbackJson`. Stage summaries expose `terminalReason`, `retryAuthorityId`, `isRetryAuthoritative`, and `retryAuthorityState` from the projection layer.
@@ -169,6 +179,9 @@ Tools are namespaced:
 
 **Targeted Retry Authority Readback:**
 `runs.get` includes `retry_authority`, `retry_authority_history`, and `p091_orphan_repair_readback`. `reports.get` includes the same truth as `retryAuthority`, `retryAuthorityHistory`, and `p091OrphanRepairReadback`.
+
+**Escalation Readback (P058 Phase 1):**
+`runs.get` includes an `escalation_readback` projection at parity with the GraphQL `runEscalationReadback` query. Operator principals receive full chain detail (capped at 50 ledgers, 200 events/ledger, 100 execution-metadata rows/ledger with `*_truncated`/`*_total` markers); Agent and Observer principals receive a summary projection (`chains_redacted: true`) with `paused_chain_count` and `has_active_escalation` only. See [escalation-policies.md](escalation-policies.md) for the full contract.
 
 Resources follow two URI families:
 
@@ -269,7 +282,7 @@ The workflow compiler at `crates/workflow/src/compiler.rs` transforms a workflow
 - `variables` -- resolved workflow variables (YAML to JSON)
 - `artifact_paths` -- name-to-path-template map from the catalog's `artifacts:` section
 
-Each agent reference is resolved against backend profiles in the catalog to produce a `ResolvedAgent` with provider, model, effort, and system prompt.
+Each agent reference is resolved against backend profiles in the catalog to produce a `ResolvedAgent` with provider, model, effort, and system prompt. Unknown agent references — a state `owner` or a task `agent` that does not appear in the catalog — fail the compile rather than resolving to a placeholder binding, so a typo or stale reference cannot silently bypass catalog-defined provider, permission, and output-contract settings.
 
 Provider names are normalized: `claude_acp` becomes `claude`, `codex_acp` becomes `codex`, `gemini_cli_acp` becomes `gemini`.
 
@@ -282,6 +295,8 @@ State types:
 - **Compute state** -- creates a `StageExecution` with status `Running`, enqueues `InvokeAgent` work items for each task. If no explicit tasks, the owner agent runs as a single task.
 - **Manual gate** (`is_manual_gate`) -- creates a `StageExecution` with status `WaitingApproval` and an `Approval` record. The run pauses until the operator approves or rejects.
 - **End state** (`is_end`) -- marks the run `Completed`.
+
+Escalation pause reasons enter the same `StageExecution.status = Paused` lane with a structured `pause_reason` code, `operator_action_hint`, and `runbook_anchor` surfaced through GraphQL and MCP. The full pause-reason catalog and runbook anchors live in [escalation-policies.md](escalation-policies.md) and [docs/runbooks/escalation/](../runbooks/escalation/).
 
 ### Fan-out parallel tasks
 
@@ -420,6 +435,12 @@ required handoff files” from a generic provider timeout or a terminal permissi
 wait.
 
 ## Persistence model
+
+### Escalation Ledger
+Escalation state is persisted in three main tables:
+1. `escalation_ledger`: Tracks the current state, active tier, and aggregate counters for a chain.
+2. `escalation_execution_metadata`: Stores per-attempt attribution (tier_id, trigger, digest_version).
+3. `escalation_events`: A journal of transitions (tier_advanced, chain_exhausted, pause_reason).
 
 The system's persistence model is designed to keep SQLite as a compact canonical state, storing high-volume evidence in file-backed storage, and facilitating hot operator reads on projections or bounded snapshots.
 
@@ -609,12 +630,15 @@ queue-wait latency.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`, `062_p087_projection_freshness_healthy_window.sql`, `076_p058_escalation_schema.sql`, `077_p058_escalation_redaction_version.sql`, `078_p058_escalation_idempotency.sql`):
 
 | Table | Purpose |
 |---|---|
 | `ideas` | Idea backlog items with status, workspace path |
 | `runs` | Run lifecycle: status, workflow binding, current state, timestamps, cancellation |
+| `escalation_ledger` | Tracks the current state, active tier, and aggregate counters for an escalation chain |
+| `escalation_execution_metadata` | Stores per-attempt attribution (tier_id, trigger, digest_version) for escalation executions |
+| `escalation_events` | A journal of transitions (tier_advanced, chain_exhausted, pause_reason) for escalation chains |
 | `stage_executions` | Per-stage execution records with iteration and attempt tracking |
 | `agent_executions` | Per-agent invocation records (status, **actual_toolchain_mapping_diagnostics_json**, etc.) |
 | `workflow_conflicts` | Blocking graph-authority conflicts (run_id, fingerprint, status, reason, current_mediation_id) |
@@ -694,6 +718,10 @@ state, not only process logs.
 | `conflict_reason_to_action_outcome_total` | Counter event | `conflict_reason`, `action_class`, `terminal_status` | Counts outcomes (resolved, terminal, superseded) per conflict reason. |
 | `recovery_action_chosen_total` | Counter event | `conflict_reason`, `action_class`, `source_surface`, `result` | Counts chosen recovery actions (retry, clone, manual_fallback). |
 | `phase_c_validation_outcome_total` | Counter | `outcome` | Phase C validation results: `static_fail`, `preflight_fail`, `legacy_catalog_warning`, `pass`. |
+
+### Escalation Metrics (P058)
+
+The control plane declares the full P058 metric inventory in `db::metrics::P058_REQUIRED_METRICS`. Durable escalation ledger inserts emit `escalation_chains_started_total`; escalation event writes emit the relevant pause, exhausted-chain, repeated-digest, capacity, force-detach, drift, storm, retry-after, late-frame, and success-rate counters from redacted event metadata. Metrics that require wall-clock SLO samples, provider force-detach timings, or operator adjudication are emitted by their corresponding event producers rather than synthesized at read time.
 
 ## Work queue
 

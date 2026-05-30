@@ -76,7 +76,6 @@ Today the app exposes these top-level operator surfaces through the thin GraphQL
 
 - `Runs` for active, blocked, running, and completed runs, with inline approval context and an attention badge (GraphQL-only)
 - `Ideas` for browsing idea context with compact run status strips that deep-link into Runs (read-first; non-approval writes remain outside the governed thin UI write path)
-- `Approvals` for pending human decisions (DEBUG-only Phase 1 transitional surface; production builds route old `Approvals` deep links to Runs focused on waiting approval until the Phase 2c parity checklist passes; supported in-app via GraphQL write transport; diagnostic-only for external resolution)
 - `Definitions` for browsing the resolved Agent Catalog and Workflow Inspector through a segmented surface
 - `Settings` for provider configuration, diagnostics, remediation, and System Readiness (formerly Pilot Readiness)
 
@@ -109,14 +108,14 @@ The repository is past the scaffold stage. The implemented system now includes:
 - proof artifacts under [`docs/evidence`](docs/evidence)
 - stable proposal-loop feedback-fidelity documentation and proof under [`docs/reference`](docs/reference) and [`docs/evidence`](docs/evidence)
 - Local Persistence Write Budget and Evidence Spooling — DbWriter lanes/coalescing/shutdown primitives, evidence_spool_refs and storage_write_pressure_snapshots schemas, failed-stage evidence spooling, transcript spooling, storageHealth/MCP diagnostics with live heartbeat/drain/lock/WAL readback, diagnostics-bundle storage snapshots, and fail-closed write-bypass/raw-evidence gate coverage are implemented. Temporary rollout bypasses are retired; the remaining allowlist is limited to migrations, tests, startup repair, and evidence-spool orphan repair.
+- Agent work continuation and lead-directed same-session resumption — `agents.continue_work`, `agents.continuation_status`, and `agents.continuation_candidates` MCP commands for eligible stage-owned `code_writer` agent executions, with persisted continuation/side-effect ledger/supervised-worker/provider-process tables, durable metric events, materialized Draft 2020-12 JSON Schemas, and guarded admission for `live_handle_continuation`. `lead_auto` may be requested by Agent principals only with a validated lead decision artifact; `operator_mcp` remains Operator-only. Per-adapter `provider_session_resurrection` remains explicit and fail-closed for adapters that do not declare attach/resume support. The worker drives the `accepted → … → succeeded | no_progress | failed | cancelled` state machine with durable runtime/worktree/provider-send ledger rows, a live-handle attach receipt, heartbeat-backed supervised-worker ownership, cancellation cascade handling, duplicate-send reconciliation that requires provider-send evidence, worktree readback, evidence bundle, response snapshot, result/no-progress, operator report artifacts, passive GraphQL history/metrics readback, and a read-only macOS Overview card. `P086` names remain only as retained gate/schema/evidence aliases.
 
 Active proposal work is currently concentrated in:
 
 - [`docs/proposals/032-polish-stabilization-and-productization-backlog.md`](docs/proposals/032-polish-stabilization-and-productization-backlog.md)
-- [`docs/proposals/036-ux-consolidation-and-navigation-simplification.md`](docs/proposals/036-ux-consolidation-and-navigation-simplification.md)
 - [`docs/proposals/020-dynamic-cycle-addition.md`](docs/proposals/020-dynamic-cycle-addition.md)
 
-The canonical thin UI contract is [`docs/reference/query-projections-and-client-consumption-contract.md`](docs/reference/query-projections-and-client-consumption-contract.md). The specific contract for GraphQL-driven UI states, actionability, and fallback copy is [`docs/reference/thin-client-read-model-affordance-contract.md`](docs/reference/thin-client-read-model-affordance-contract.md). New UI proposals should build on these references rather than historical proposal text. The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.
+The canonical thin UI contract is [`docs/reference/query-projections-and-client-consumption-contract.md`](docs/reference/query-projections-and-client-consumption-contract.md). The consolidated macOS operator navigation contract is [`docs/reference/macos-operator-navigation.md`](docs/reference/macos-operator-navigation.md), and the specific contract for GraphQL-driven UI states, actionability, and fallback copy is [`docs/reference/thin-client-read-model-affordance-contract.md`](docs/reference/thin-client-read-model-affordance-contract.md). New UI proposals should build on these references rather than historical proposal text. The docs index at [`docs/README.md`](docs/README.md) is the canonical map of implemented references, active proposals, evidence, and historical review material.
 
 ## Implemented Today
 
@@ -139,7 +138,7 @@ The repository is no longer a scaffold. It already contains the core control-pla
   - report/export surfaces
 - provider platform slices:
   - provider settings
-  - System Readiness (formerly Pilot Readiness; now a Settings section per Proposal 036)
+  - System Readiness (formerly Pilot Readiness; now a Settings section in the consolidated operator shell)
   - ACP-oriented runtime dispatch and provider bindings
   - Goose compatibility diagnostics and remediation
   - frozen provider/model provenance truth
@@ -158,7 +157,7 @@ The repository is no longer a scaffold. It already contains the core control-pla
   - replayable `GO/HOLD` decision snapshots
   - approved-host current-head proof gates
 - layered test gates for fast runtime validation, remote UI smoke, and full sign-off
-- Proposal 036 foundation: four-tab navigation shell with old-route compatibility, `RunsWorkbenchPresentationModel` and shared deferred-state types, Definitions segmented surface over Agent Catalog and Workflow Inspector, System Readiness inside Settings, and timeline batching/Reduce Motion behavior behind the dogfood flag (Phase 2.5 dogfood and Phase 4 remote UI evidence still pending)
+- consolidated macOS operator shell: four-surface navigation, old-route compatibility, `RunsWorkbenchPresentationModel` and shared deferred-state types, Definitions segmented surface over Agent Catalog and Workflow Inspector, System Readiness/provider diagnostics inside Settings, active-agent Timeline projection in Runs, dogfood evidence, remote UI/accessibility proof, and rollout readback
 
 ## Repository Layout
 
@@ -272,6 +271,8 @@ Implemented-system references:
 - [`docs/reference/full-mvp-delivery.md`](docs/reference/full-mvp-delivery.md)
 - [`docs/reference/mvp-sign-off.md`](docs/reference/mvp-sign-off.md)
 - [`docs/reference/test-gates.md`](docs/reference/test-gates.md)
+- [`docs/reference/agent-work-continuation.md`](docs/reference/agent-work-continuation.md)
+- [`docs/reference/boundary-first-api-auth-contract.md`](docs/reference/boundary-first-api-auth-contract.md)
 
 Examples:
 

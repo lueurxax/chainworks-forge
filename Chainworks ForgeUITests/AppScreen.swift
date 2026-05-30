@@ -33,14 +33,16 @@ struct AppScreen {
         switch label {
         // P036 consolidated tab identifiers
         case "Runs":
-            return "tab-runs"
+            return "p036-sidebar-runs"
+        case "Ideas":
+            return "p036-sidebar-ideas"
         case "Definitions":
-            return "tab-definitions"
+            return "p036-sidebar-definitions"
+        case "Settings":
+            return "p036-sidebar-settings"
         // Legacy tab identifiers
         case "Runs Home":
             return "tab-runs-home"
-        case "Ideas":
-            return "tab-ideas"
         case "Approvals":
             return "tab-approvals"
         case "Agent Catalog":
@@ -49,8 +51,6 @@ struct AppScreen {
             return "tab-workflow-inspector"
         case "Pilot Readiness":
             return "tab-pilot-readiness"
-        case "Settings":
-            return "tab-provider-settings"
         default:
             return nil
         }
@@ -193,7 +193,9 @@ struct AppScreen {
             return identifiedAny("pilot-readiness-view").exists
                 || identifiedAny("pilot-readiness-title").exists
         case "Settings":
-            return identifiedAny("provider-settings-view").exists
+            return identifiedAny("settings-view").exists
+                || identifiedAny("system-readiness-view").exists
+                || identifiedAny("provider-settings-view").exists
                 || identifiedAny("provider-settings-title").exists
         default:
             return false
@@ -256,6 +258,16 @@ struct AppScreen {
 
     @discardableResult
     func selectTab(_ label: String, timeout: TimeInterval = 10) -> Bool {
+        if label == "Approvals" {
+            if expectedRootVisible(for: "Approvals") {
+                return true
+            }
+            guard selectTab("Runs", timeout: timeout) else {
+                return false
+            }
+            return expectedRootVisible(for: "Approvals") || expectedRootVisible(for: "Runs")
+        }
+
         _ = revealCompactNavigationIfNeeded()
         if expectedRootVisible(for: label) {
             return true

@@ -600,6 +600,13 @@ fn is_vague_evidence(value: &str) -> bool {
         )
 }
 
+fn is_code_writer_owner(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "code_writer" | "code-writer" | "code writer"
+    )
+}
+
 #[derive(Debug)]
 struct SummaryBuilder {
     artifact_path: String,
@@ -732,8 +739,15 @@ impl SummaryBuilder {
 
         let has_nonblocking_code_tail =
             !self.remaining_code_tasks.is_empty() && blocking_code_tasks == 0;
+        let has_red_nonblocking_code_writer_tail = self.verification_green == Some(false)
+            && self
+                .remaining_code_tasks
+                .iter()
+                .any(|task| !task.blocking && is_code_writer_owner(&task.owner));
 
         if blocking_code_tasks > 0 {
+            self.status = ImplementationSelfAssessmentStatus::NeedsCodeFixes;
+        } else if has_red_nonblocking_code_writer_tail {
             self.status = ImplementationSelfAssessmentStatus::NeedsCodeFixes;
         } else if self.implementation_complete == Some(true)
             && blocking_code_tasks == 0

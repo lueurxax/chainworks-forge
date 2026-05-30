@@ -241,6 +241,7 @@ mod tests {
             prompt: None,
             notes: None,
             worktree_policy: None,
+            continuation_capability: None,
             required_tools: None,
             xcode_broker_required: None,
             xcode_shim_injection_signal: None,
@@ -260,6 +261,7 @@ mod tests {
             backend_profiles: profiles,
             permission_profiles: None,
             agents: None,
+            escalation_policies: None,
         };
         (agents, catalog)
     }

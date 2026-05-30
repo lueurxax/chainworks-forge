@@ -106,7 +106,7 @@
     },
     {
       "path": "Chainworks Forge/Views/SettingsView.swift (System Readiness segment)",
-      "reason": "Pilot readiness diagnostics (formerly PilotReadinessView.swift, absorbed into SettingsView per proposal-036) remain outside P031 governed workflow read surfaces."
+      "reason": "Pilot readiness diagnostics (formerly PilotReadinessView.swift, now absorbed into SettingsView) remain outside P031 governed workflow read surfaces."
     },
     {
       "path": "Chainworks Forge/Views/PreflightReportView.swift",
