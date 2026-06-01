@@ -397,7 +397,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
     .await
     .unwrap();
 
-    let canonical = payload
+    let canonical = payload["reports"]
         .as_array()
         .unwrap()
         .iter()
@@ -468,7 +468,7 @@ async fn proposal_058_reports_get_includes_runtime_facts_with_snake_case_fields(
     )
     .await
     .unwrap();
-    let observer_canonical = observer_payload
+    let observer_canonical = observer_payload["reports"]
         .as_array()
         .unwrap()
         .iter()
@@ -592,7 +592,7 @@ async fn proposal_053_reports_get_projects_discovery_reconciliation_pending() {
     .await
     .unwrap();
 
-    let canonical = payload
+    let canonical = payload["reports"]
         .as_array()
         .unwrap()
         .iter()

@@ -13,6 +13,7 @@ pub enum CapabilityToolId {
     RunsMainSyncRepairState,
     RunsMainSyncRecordRecoveryDecision,
     RunsKnowledgeCapsuleIgnore,
+    RunsRetrofitCatalogSnapshot,
     RunsCancel,
     ApprovalsList,
     ApprovalsResolve,

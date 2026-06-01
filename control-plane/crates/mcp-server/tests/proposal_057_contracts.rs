@@ -137,7 +137,7 @@ async fn proposal_057_reports_get_exposes_canonical_statuses_and_overrides() {
     .await
     .unwrap();
 
-    let canonical = payload
+    let canonical = payload["reports"]
         .as_array()
         .unwrap()
         .iter()

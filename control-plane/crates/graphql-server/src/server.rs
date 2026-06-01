@@ -259,7 +259,7 @@ async fn p081_connection_init_data(
     }
 }
 
-async fn connection_init_data(
+pub async fn connection_init_data(
     value: serde_json::Value,
     table: auth::PrincipalTable,
 ) -> std::result::Result<async_graphql::Data, async_graphql::Error> {

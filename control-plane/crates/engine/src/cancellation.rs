@@ -4,7 +4,7 @@ use acp::AcpRuntimeManager;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::sync::Arc;
 
 use db::repos::{
@@ -103,6 +103,189 @@ pub fn p082_cancellation_settlement_log_for_readback(
     .context("serialize P082 cancellation settlement readback")
 }
 
+fn p082_string_at<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str()
+}
+
+fn p082_i64_at(value: &serde_json::Value, path: &[&str]) -> Option<i64> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_i64()
+}
+
+fn p082_bool_at(value: &serde_json::Value, path: &[&str]) -> Option<bool> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_bool()
+}
+
+fn p082_parse_requeue_id(id: &str) -> (Option<String>, Option<String>, Option<i64>) {
+    let Some(rest) = id.strip_prefix("p082-requeue:") else {
+        return (None, None, None);
+    };
+    let Some((before_generation, generation)) = rest.rsplit_once(':') else {
+        return (None, None, None);
+    };
+    let Some((command_id, work_item_id)) = before_generation.split_once(':') else {
+        return (None, None, generation.parse().ok());
+    };
+    (
+        Some(command_id.to_string()),
+        Some(work_item_id.to_string()),
+        generation.parse().ok(),
+    )
+}
+
+fn p082_r14_startup_summary(
+    repair_id: &str,
+    notes: Option<&str>,
+    requested_at: DateTime<Utc>,
+) -> serde_json::Value {
+    let notes_json = notes
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let (parsed_command_id, parsed_work_item_id, parsed_generation) =
+        p082_parse_requeue_id(repair_id);
+
+    let source_work_item_id = p082_string_at(&notes_json, &["source_work_item_id"])
+        .or_else(|| {
+            p082_string_at(
+                &notes_json,
+                &["p061_startup_recovery", "source_work_item_id"],
+            )
+        })
+        .map(str::to_string)
+        .or(parsed_work_item_id)
+        .unwrap_or_else(|| "unknown_source_work_item".to_string());
+    let source_command_journal_id = p082_string_at(&notes_json, &["source_command_journal_id"])
+        .or_else(|| {
+            p082_string_at(
+                &notes_json,
+                &["p061_startup_recovery", "source_command_journal_id"],
+            )
+        })
+        .map(str::to_string)
+        .or(parsed_command_id)
+        .unwrap_or_else(|| "unknown_command_journal".to_string());
+    let requeue_generation = p082_i64_at(&notes_json, &["requeue_generation"])
+        .or_else(|| {
+            p082_i64_at(
+                &notes_json,
+                &["p061_startup_recovery", "requeue_generation"],
+            )
+        })
+        .or(parsed_generation)
+        .unwrap_or(1);
+    let max_requeue_generation = p082_i64_at(&notes_json, &["max_requeue_generation"])
+        .or_else(|| {
+            p082_i64_at(
+                &notes_json,
+                &["p061_startup_recovery", "max_requeue_generation"],
+            )
+        })
+        .filter(|value| *value == 1)
+        .unwrap_or(1);
+    let stale_after_ms = p082_i64_at(&notes_json, &["stale_after_ms"])
+        .or_else(|| p082_i64_at(&notes_json, &["p061_startup_recovery", "stale_after_ms"]))
+        .unwrap_or(60_000);
+    let stale_cutoff = p082_string_at(&notes_json, &["stale_cutoff"])
+        .or_else(|| p082_string_at(&notes_json, &["p061_startup_recovery", "stale_cutoff"]))
+        .map(str::to_string)
+        .unwrap_or_else(|| requested_at.to_rfc3339());
+    let xcode_required = p082_bool_at(&notes_json, &["xcode_required"])
+        .or_else(|| p082_bool_at(&notes_json, &["p061_startup_recovery", "xcode_required"]))
+        .unwrap_or(false);
+    let next_retry_or_backoff_time = p082_string_at(&notes_json, &["next_retry_or_backoff_time"])
+        .or_else(|| {
+            p082_string_at(
+                &notes_json,
+                &["p061_startup_recovery", "next_retry_or_backoff_time"],
+            )
+        });
+    let backpressure_scope = p082_string_at(&notes_json, &["backpressure_scope"])
+        .or_else(|| {
+            p082_string_at(
+                &notes_json,
+                &["p061_startup_recovery", "backpressure_scope"],
+            )
+        })
+        .unwrap_or("run");
+
+    domain::recovery_matrix::build_startup_repair_summary(
+        repair_id,
+        &source_work_item_id,
+        &source_command_journal_id,
+        requeue_generation,
+        max_requeue_generation,
+        true,
+        stale_after_ms,
+        &stale_cutoff,
+        xcode_required,
+        next_retry_or_backoff_time,
+        backpressure_scope,
+    )
+}
+
+/// Returns true when the startup repair should be treated as active for this cancellation.
+/// A repair is historical (returns false → R11) only when the source work item is confirmed
+/// to be in a terminal state (completed/failed/cancelled) in the database.
+/// When the work item is not found, is pending, or is running, returns true (→ R14).
+/// This is conservative: prefer R14 over silently downgrading a non-standard cancellation to R11.
+async fn is_startup_repair_active_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    notes: Option<&str>,
+    run_id: &str,
+) -> Result<bool> {
+    let notes_json = notes
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    // Try to find the source_work_item_id from multiple storage formats used across
+    // different repair paths (p082_recovery_matrix_readback vs p061_startup_recovery).
+    let source_item_id = p082_string_at(
+        &notes_json,
+        &[
+            "p082_recovery_matrix_readback",
+            "recovery_startup_repair_summary",
+            "source_work_item_id",
+        ],
+    )
+    .or_else(|| {
+        p082_string_at(
+            &notes_json,
+            &["p061_startup_recovery", "source_work_item_id"],
+        )
+    })
+    .or_else(|| p082_string_at(&notes_json, &["source_work_item_id"]))
+    .map(str::to_string);
+
+    let Some(item_id) = source_item_id else {
+        // Cannot determine the source work item; conservative default: treat as active (R14).
+        return Ok(true);
+    };
+
+    // A repair is historical only when the work item is confirmed in a terminal state.
+    // Not-found items are treated as active (conservative).
+    let terminal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items WHERE id = ?1 AND run_id = ?2 AND status IN ('completed', 'failed', 'cancelled')",
+    )
+    .bind(&item_id)
+    .bind(run_id)
+    .fetch_one(&mut **tx)
+    .await
+    .context("check startup repair work item terminal state")?;
+
+    Ok(terminal_count == 0)
+}
+
 async fn p082_cancellation_readback_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: RunId,
@@ -141,29 +324,52 @@ async fn p082_cancellation_readback_tx(
         ));
     }
 
-    let startup_repair_count: i64 = sqlx::query_scalar(
-        r#"SELECT COUNT(*)
+    let startup_repair = sqlx::query(
+        r#"SELECT id, notes
            FROM startup_repairs
-           WHERE run_id = ?1"#,
+           WHERE run_id = ?1
+           ORDER BY repaired_at DESC, id ASC
+           LIMIT 1"#,
     )
     .bind(&run_id_string)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await
-    .context("count startup repairs for P082 cancellation readback")?;
-    if startup_repair_count > 0 {
-        return Ok(domain::recovery_matrix::build_readback_v1(
-            "P082-R14",
-            "cancelled",
-            "cancel",
-            domain::recovery_matrix::REASON_CANCEL_STARTUP_REPAIR_CONVERGED,
-            "Cancellation settled; startup repair converged idempotently with cancellation.",
-            "runs, startup_repairs, work_items, session_generations",
-            "runs, startup_repairs, work_items, sessions",
-            &run_id_string,
-            Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
-            "valid",
-            &requested_at.to_rfc3339(),
-        ));
+    .context("load startup repair for P082 cancellation readback")?;
+    if let Some(row) = startup_repair {
+        let repair_id: String = row.try_get("id")?;
+        let notes: Option<String> = row.try_get("notes")?;
+
+        // R14 only fires when the startup repair is actively racing with this
+        // cancellation: the work item created by the repair must still be pending.
+        // Historical startup repairs (where the repaired work item has already been
+        // claimed or completed) must route to R11 instead, otherwise any past repair
+        // would permanently classify future cancellations as R14.
+        let repair_active = is_startup_repair_active_tx(tx, notes.as_deref(), &run_id_string)
+            .await
+            .context("check startup repair active state for P082-R14")?;
+
+        if repair_active {
+            let summary = p082_r14_startup_summary(&repair_id, notes.as_deref(), requested_at);
+            return Ok(domain::recovery_matrix::set_readback_startup_repair(
+                domain::recovery_matrix::build_readback_v1(
+                    "P082-R14",
+                    "cancelled",
+                    "cancel",
+                    domain::recovery_matrix::REASON_CANCEL_STARTUP_REPAIR_CONVERGED,
+                    "Cancellation settled; startup repair converged idempotently with cancellation.",
+                    "runs, startup_repairs, work_items, session_generations",
+                    "runs, startup_repairs, work_items, sessions",
+                    &run_id_string,
+                    Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
+                    "valid",
+                    &requested_at.to_rfc3339(),
+                ),
+                summary,
+                Some(
+                    "Cancellation converged with an existing startup repair idempotency key; no duplicate repair work was created.",
+                ),
+            ));
+        }
     }
 
     Ok(domain::recovery_matrix::build_readback_v1(
@@ -342,6 +548,37 @@ async fn finalize_settlement(
     let log = run.cancellation_settlement_log.as_deref().unwrap_or("[]");
     let mut entries: Vec<CancellationSettlementEntry> =
         serde_json::from_str(log).context("parse cancellation settlement log")?;
+
+    if !side_effects::list_unresolved_for_run(pool, &run_id.to_string())
+        .await?
+        .is_empty()
+    {
+        let held_readback = p082_cancel_side_effect_reconciliation_readback(run_id, Utc::now());
+        if let Some(entry) = entries.iter_mut().find(|entry| {
+            entry
+                .p082_recovery_matrix_readback
+                .as_ref()
+                .and_then(|readback| readback.get("scenario_id"))
+                .and_then(|value| value.as_str())
+                == Some("P082-R13")
+        }) {
+            entry.p082_recovery_matrix_readback = Some(held_readback);
+            entry.terminal_status = "held".to_string();
+            entry.settled_at = Utc::now();
+        } else {
+            entries.push(p082_cancellation_entry_from_readback(
+                run_id,
+                Utc::now(),
+                held_readback,
+            ));
+        }
+        let settlement_log =
+            serde_json::to_string(&entries).context("serialize held cancellation log")?;
+        runs::update_cancellation_settlement_log(pool, run_id, &settlement_log).await?;
+        projections::rebuild_all_for_run(pool, run_id).await?;
+        return Ok(());
+    }
+
     let executions = agent_executions::list_by_run(pool, run_id).await?;
 
     for entry in &mut entries {
@@ -383,6 +620,26 @@ async fn finalize_settlement(
                                 },
                             )
                             .await?;
+                        }
+                    }
+                    // Update R11 readback source_identifier to cite the concrete
+                    // session_generations row written above so operators can verify
+                    // provider cleanup from the readback.
+                    if let Some(rb) = entry.p082_recovery_matrix_readback.as_mut() {
+                        if rb.get("scenario_id").and_then(|v| v.as_str()) == Some("P082-R11") {
+                            if let Some(obj) = rb.as_object_mut() {
+                                let run_part = obj
+                                    .get("source_identifier")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                obj.insert(
+                                    "source_identifier".to_string(),
+                                    serde_json::Value::String(format!(
+                                        "{run_part}:session_generations:{generation_id}"
+                                    )),
+                                );
+                            }
                         }
                     }
                 }

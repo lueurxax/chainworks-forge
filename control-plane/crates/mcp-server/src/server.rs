@@ -27,6 +27,15 @@ pub struct McpServer {
     pub principal_table: auth::PrincipalTable,
     events: Option<EventSender>,
     storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
+    // P081 Phase 3: shared immutable boundary policy service injected at daemon startup.
+    boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
+}
+
+fn embedded_shadow_boundary_policy() -> Arc<auth::boundary::BoundaryPolicy> {
+    Arc::new(
+        auth::boundary::BoundaryPolicy::from_embedded_with_mode(auth::boundary::PolicyMode::Shadow)
+            .expect("embedded P081 boundary fixture must be valid"),
+    )
 }
 
 async fn write_json_line<T: serde::Serialize>(stdout: &Arc<Mutex<tokio::io::Stdout>>, value: &T) {
@@ -159,6 +168,7 @@ impl McpServer {
             principal_table,
             events: None,
             storage_writer_heartbeat: None,
+            boundary_policy: Some(embedded_shadow_boundary_policy()),
         }
     }
 
@@ -174,6 +184,24 @@ impl McpServer {
             principal_table,
             events: None,
             storage_writer_heartbeat: Some(storage_writer_heartbeat),
+            boundary_policy: Some(embedded_shadow_boundary_policy()),
+        }
+    }
+
+    pub fn new_with_storage_writer_and_boundary_policy(
+        pool: SqlitePool,
+        cmd_handler: Arc<CommandHandler>,
+        principal_table: auth::PrincipalTable,
+        storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
+        boundary_policy: Arc<auth::boundary::BoundaryPolicy>,
+    ) -> Self {
+        Self {
+            pool,
+            cmd_handler,
+            principal_table,
+            events: None,
+            storage_writer_heartbeat: Some(storage_writer_heartbeat),
+            boundary_policy: Some(boundary_policy),
         }
     }
 
@@ -189,7 +217,14 @@ impl McpServer {
             principal_table,
             events: Some(events),
             storage_writer_heartbeat: None,
+            boundary_policy: Some(embedded_shadow_boundary_policy()),
         }
+    }
+
+    /// P081 Phase 3: attach the shared immutable boundary policy service.
+    pub fn with_boundary_policy(mut self, policy: Arc<auth::boundary::BoundaryPolicy>) -> Self {
+        self.boundary_policy = Some(policy);
+        self
     }
 
     pub async fn run_stdio(&self) -> Result<()> {
@@ -249,6 +284,25 @@ impl McpServer {
                     .unwrap_or(serde_json::Value::Null);
                 let token = params["clientInfo"]["principal_token"].as_str();
                 match token {
+                    // SEC-P081: apply the same length and character-set validation to the
+                    // stdio principal_token as extract_bearer_token applies to HTTP headers.
+                    // A raw token that fails validation is rejected as unauthorized so that
+                    // malformed or oversized values cannot reach resolve_bearer.
+                    Some(t) if !auth::validate_raw_token(t) => {
+                        tracing::warn!(
+                            "MCP stdio: principal_token failed format validation; rejecting"
+                        );
+                        write_json_line(
+                            &stdout,
+                            &JsonRpcResponse::error(
+                                request.id.clone(),
+                                -32000,
+                                "unauthorized".to_string(),
+                            ),
+                        )
+                        .await;
+                        break;
+                    }
                     Some(t) => match auth::resolve_bearer(t, &self.principal_table) {
                         Ok(p) => {
                             let is_operator = matches!(p.class, auth::PrincipalClass::Operator);
@@ -270,20 +324,24 @@ impl McpServer {
                             }
                         }
                         Err(_) => {
+                            // SEC-REQ-1: Collapse all unauthorized cases to a single
+                            // opaque string; do not distinguish missing vs unknown token.
                             let resp = JsonRpcResponse::error(
                                 request.id.clone(),
                                 -32000,
-                                "unauthorized: unknown token".to_string(),
+                                "unauthorized".to_string(),
                             );
                             write_json_line(&stdout, &resp).await;
                             break;
                         }
                     },
                     None => {
+                        // SEC-REQ-1: Opaque unauthorized response; do not reveal
+                        // that the token field was absent vs present-but-invalid.
                         let resp = JsonRpcResponse::error(
                             request.id.clone(),
                             -32000,
-                            "unauthorized: principal_token required on initialize".to_string(),
+                            "unauthorized".to_string(),
                         );
                         write_json_line(&stdout, &resp).await;
                         break;
@@ -327,7 +385,10 @@ impl McpServer {
         principal: &auth::Principal,
     ) -> JsonRpcResponse {
         let started = std::time::Instant::now();
-        let response = self.handle_request_inner(req, principal).await;
+        // Box::pin keeps the large handle_request_inner future off the caller's state machine.
+        // This prevents the complex MCP dispatch tree from inflating state machines of
+        // test functions that call handle_request multiple times sequentially.
+        let response = Box::pin(self.handle_request_inner(req, principal)).await;
         db::metrics::record_mcp_liveness_gate_duration(started.elapsed());
         response
     }
@@ -341,16 +402,95 @@ impl McpServer {
 
         match req.method.as_str() {
             "initialize" => {
+                // P081 Phase 4: evaluate BoundaryPolicy for mcp_initialize.
+                if let Some(policy) = &self.boundary_policy {
+                    let caller_class = auth::derive_caller_class_for_mcp(principal);
+                    match policy.evaluate(
+                        caller_class.as_str(),
+                        "mcp_initialize",
+                        Some("initialize"),
+                    ) {
+                        auth::boundary::PolicyDecision::Deny {
+                            reason_code,
+                            row_id,
+                            ..
+                        } => {
+                            tracing::debug!(
+                                caller_class = caller_class.as_str(),
+                                reason_code = %reason_code,
+                                row_id = ?row_id,
+                                "BoundaryPolicy: mcp_initialize denied; returning auth failure"
+                            );
+                            if let Err(e) = write_mcp_deny_audit(
+                                &self.pool,
+                                self.boundary_policy.as_deref(),
+                                principal,
+                                "mcp_initialize",
+                                "initialize",
+                                &reason_code,
+                                row_id.as_deref(),
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    error = %e,
+                                    "boundary deny audit write failed; failing closed (mcp_initialize)"
+                                );
+                                return JsonRpcResponse::error(
+                                    id,
+                                    -32000,
+                                    "unauthorized".to_string(),
+                                );
+                            }
+                            return JsonRpcResponse::error(
+                                id,
+                                -32004,
+                                format!("auth_failure: {reason_code}"),
+                            );
+                        }
+                        auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                            if let auth::boundary::PolicyDecision::Deny {
+                                reason_code,
+                                row_id,
+                                ..
+                            } = *matched_decision
+                            {
+                                tracing::debug!(
+                                    caller_class = caller_class.as_str(),
+                                    reason_code = %reason_code,
+                                    row_id = ?row_id,
+                                    "BoundaryPolicy shadow: matrix would deny mcp_initialize"
+                                );
+                            }
+                        }
+                        auth::boundary::PolicyDecision::Allow { .. }
+                        | auth::boundary::PolicyDecision::LegacyPassthrough => {}
+                    }
+                }
+
+                let boundary_policy_cap = self.boundary_policy.as_ref().map(|policy| {
+                    serde_json::json!({
+                        "matrix_id": "p081-boundary-matrix-v1",
+                        "schema_version": 1,
+                        "capability_schema_version": 1,
+                        "mode": policy.mode().as_str(),
+                        "denied_known_tool_code": -32004,
+                        "field_casing": "snake_case"
+                    })
+                });
+
                 let request_id = public_json_rpc_request_id(&id);
                 self.handle_hot_read_json_rpc(
                     id,
                     "initialize",
-                    async {
+                    async move {
+                        let mut capabilities = serde_json::json!({ "tools": {} });
+                        if let Some(cap) = boundary_policy_cap {
+                            capabilities["boundary_policy"] = cap;
+                        }
                         Ok(serde_json::json!({
                             "protocolVersion": "2024-11-05",
-                            "capabilities": {
-                                "tools": {}
-                            },
+                            "capabilities": capabilities,
                             "serverInfo": {
                                 "name": "chainworks-control-plane",
                                 "version": "0.1.0"
@@ -363,6 +503,94 @@ impl McpServer {
             }
 
             "tools/list" => {
+                // P081 Phase 3: evaluate BoundaryPolicy for mcp_tools_list.
+                if let Some(policy) = &self.boundary_policy {
+                    let caller_class = auth::derive_caller_class_for_mcp(principal);
+                    let started = std::time::Instant::now();
+                    let decision = policy.evaluate(
+                        caller_class.as_str(),
+                        "mcp_tools_list",
+                        Some("tools/list"),
+                    );
+                    let elapsed = started.elapsed();
+                    db::metrics::record_p081_boundary_decision_latency(
+                        "mcp_tools_list",
+                        caller_class.as_str(),
+                        policy.mode().as_str(),
+                        elapsed,
+                    );
+                    match decision {
+                        auth::boundary::PolicyDecision::Deny {
+                            reason_code,
+                            row_id,
+                            ..
+                        } => {
+                            tracing::debug!(
+                                caller_class = caller_class.as_str(),
+                                reason_code = %reason_code,
+                                row_id = ?row_id,
+                                "BoundaryPolicy: mcp_tools_list denied; returning empty list"
+                            );
+                            if let Err(e) = write_mcp_deny_audit(
+                                &self.pool,
+                                self.boundary_policy.as_deref(),
+                                principal,
+                                "mcp_tools_list",
+                                "tools/list",
+                                &reason_code,
+                                row_id.as_deref(),
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    error = %e,
+                                    "boundary deny audit write failed; failing closed (mcp_tools_list)"
+                                );
+                                return JsonRpcResponse::error(
+                                    id,
+                                    -32000,
+                                    "unauthorized".to_string(),
+                                );
+                            }
+                            return JsonRpcResponse::success(
+                                id,
+                                serde_json::json!({ "tools": [] }),
+                            );
+                        }
+                        auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                            if let auth::boundary::PolicyDecision::Deny {
+                                reason_code,
+                                row_id,
+                                ..
+                            } = *matched_decision
+                            {
+                                tracing::debug!(
+                                    caller_class = caller_class.as_str(),
+                                    reason_code = %reason_code,
+                                    row_id = ?row_id,
+                                    "BoundaryPolicy shadow: matrix would deny mcp_tools_list"
+                                );
+                                if principal.class == auth::PrincipalClass::Operator {
+                                    db::metrics::record_p081_boundary_policy_enforcement_parity(
+                                        "allow", "deny",
+                                    );
+                                    db::metrics::record_p081_boundary_shadow_disagreement(
+                                        "mcp_tools_list",
+                                        row_id.as_deref(),
+                                        caller_class.as_str(),
+                                        "tools/list",
+                                        "allow",
+                                        "deny",
+                                        Some(reason_code.as_str()),
+                                    );
+                                }
+                            }
+                        }
+                        auth::boundary::PolicyDecision::Allow { .. }
+                        | auth::boundary::PolicyDecision::LegacyPassthrough => {}
+                    }
+                }
+
                 let request_id = public_json_rpc_request_id(&id);
                 self.handle_hot_read_json_rpc(
                     id,
@@ -416,13 +644,133 @@ impl McpServer {
                     .with_error_request_id(Some(&request_id));
                 }
 
+                // P081 Phase 3: evaluate BoundaryPolicy for mcp_tools_call.
+                let mut policy_allowed_row_id: Option<String> = None;
+                if let Some(policy) = &self.boundary_policy {
+                    let caller_class = auth::derive_caller_class_for_mcp(principal);
+                    let started = std::time::Instant::now();
+                    let decision = policy.evaluate(
+                        caller_class.as_str(),
+                        "mcp_tools_call",
+                        Some(canonical_tool_name),
+                    );
+                    let elapsed = started.elapsed();
+                    db::metrics::record_p081_boundary_decision_latency(
+                        "mcp_tools_call",
+                        caller_class.as_str(),
+                        policy.mode().as_str(),
+                        elapsed,
+                    );
+                    match decision {
+                        auth::boundary::PolicyDecision::Deny {
+                            reason_code,
+                            row_id,
+                            ..
+                        } => {
+                            tracing::debug!(
+                                caller_class = caller_class.as_str(),
+                                transport = "mcp_tools_call",
+                                tool = %tool_name,
+                                reason_code = %reason_code,
+                                row_id = ?row_id,
+                                "BoundaryPolicy: mcp_tools_call denied; returning auth failure"
+                            );
+                            if let Err(e) = write_mcp_deny_audit(
+                                &self.pool,
+                                self.boundary_policy.as_deref(),
+                                principal,
+                                "mcp_tools_call",
+                                canonical_tool_name,
+                                &reason_code,
+                                row_id.as_deref(),
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    error = %e,
+                                    "boundary deny audit write failed; failing closed (mcp_tools_call)"
+                                );
+                                return JsonRpcResponse::error(
+                                    id,
+                                    -32000,
+                                    "unauthorized".to_string(),
+                                )
+                                .with_error_request_id(Some(&request_id));
+                            }
+                            return JsonRpcResponse::error(
+                                id,
+                                -32004,
+                                format!("auth_failure: {reason_code}"),
+                            )
+                            .with_error_request_id(Some(&request_id));
+                        }
+                        auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                            if let auth::boundary::PolicyDecision::Deny {
+                                reason_code,
+                                row_id,
+                                ..
+                            } = *matched_decision
+                            {
+                                tracing::debug!(
+                                    caller_class = caller_class.as_str(),
+                                    transport = "mcp_tools_call",
+                                    tool = %tool_name,
+                                    reason_code = %reason_code,
+                                    row_id = ?row_id,
+                                    "BoundaryPolicy shadow: matrix would deny this mcp_tools_call"
+                                );
+                                if principal.class == auth::PrincipalClass::Operator {
+                                    db::metrics::record_p081_boundary_policy_enforcement_parity(
+                                        "allow", "deny",
+                                    );
+                                    db::metrics::record_p081_boundary_shadow_disagreement(
+                                        "mcp_tools_call",
+                                        row_id.as_deref(),
+                                        caller_class.as_str(),
+                                        canonical_tool_name,
+                                        "allow",
+                                        "deny",
+                                        Some(reason_code.as_str()),
+                                    );
+                                }
+                            }
+                        }
+                        auth::boundary::PolicyDecision::Allow { row_id } => {
+                            policy_allowed_row_id = row_id;
+                        }
+                        auth::boundary::PolicyDecision::LegacyPassthrough => {}
+                    }
+                }
                 if !principal.tool_capabilities.contains(&tool_id) {
+                    // Known tool, allowed by boundary policy, but caller lacks token capability.
+                    // P081 AC25: durable deny audit required; fail closed if write fails.
+                    let caller_class = auth::derive_caller_class_for_mcp(&principal);
+                    if let Err(e) = write_mcp_deny_audit(
+                        &self.pool,
+                        self.boundary_policy.as_deref(),
+                        principal,
+                        "mcp_tools_call",
+                        canonical_tool_name,
+                        "CAPABILITY_OUT_OF_SCOPE",
+                        None,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, tool = %canonical_tool_name, "capability-denial audit write failed; returning fail-closed denial");
+                        return JsonRpcResponse::policy_denial(
+                            id,
+                            "E_AUDIT_UNAVAILABLE",
+                            caller_class.as_str(),
+                            None,
+                            "p081-boundary-matrix-v1",
+                        );
+                    }
                     if canonical_tool_name.starts_with("storage.") {
                         let result = tools::storage::typed_error(
                             canonical_tool_name,
                             tools::storage::ERR_UNAUTHORIZED,
                             "caller lacks storage diagnostics capability",
-                            Some(&request_id),
+                            None,
                         );
                         return JsonRpcResponse::success(
                             id,
@@ -434,27 +782,174 @@ impl McpServer {
                             }),
                         );
                     }
-                    return JsonRpcResponse::error(id, -32000, "unauthorized".to_string())
-                        .with_error_request_id(Some(&request_id));
+                    return JsonRpcResponse::policy_denial(
+                        id,
+                        "CAPABILITY_OUT_OF_SCOPE",
+                        caller_class.as_str(),
+                        None,
+                        "p081-boundary-matrix-v1",
+                    );
                 }
 
                 let tool_params = params["arguments"].clone();
 
-                match self
-                    .dispatch_tool(canonical_tool_name, tool_params, principal, &request_id)
-                    .await
-                {
-                    Ok(result) => JsonRpcResponse::success(
-                        id,
-                        serde_json::json!({
-                            "content": [{
-                                "type": "text",
-                                "text": serde_json::to_string(&result).unwrap_or_default()
-                            }]
-                        }),
+                if is_state_changing_call(canonical_tool_name, &tool_params) {
+                    match db::repos::audit_log::audit_budget_requires_safe_mode(&self.pool).await {
+                        Ok(true) => {
+                            let caller_class = auth::derive_caller_class_for_mcp(&principal);
+                            db::metrics::record_p081_audit_log_rate_limited(
+                                "mcp_tools_call",
+                                "AUDIT_BUDGET_EXHAUSTED",
+                            );
+                            return JsonRpcResponse::policy_denial(
+                                id,
+                                "AUDIT_BUDGET_EXHAUSTED",
+                                caller_class.as_str(),
+                                Some("p081.audit_budget.safe_mode"),
+                                "p081-boundary-matrix-v1",
+                            );
+                        }
+                        Err(e) => {
+                            db::metrics::record_p081_boundary_policy_evaluation_error(
+                                "mcp_tools_call",
+                                "audit_budget_health_unavailable",
+                            );
+                            tracing::error!(
+                                error = %e,
+                                "P081 audit-budget health unavailable; denying state-changing MCP call"
+                            );
+                            return JsonRpcResponse::error(
+                                id,
+                                -32000,
+                                "audit budget health unavailable".to_string(),
+                            );
+                        }
+                        Ok(false) => {}
+                    }
+                }
+
+                // P081 AC-13: MCP command idempotency enforcement.
+                // The transport validates and looks up the key before dispatch; the pending
+                // sentinel is inserted inside the command transaction so the idempotency claim,
+                // command_journal row, and durable domain writes share one write unit.
+                // Logic extracted to module-level helpers to keep this async fn's stack frame small.
+                let (idempotency_claimed_key, idempotency_claimed_hash) =
+                    if is_state_changing_call(canonical_tool_name, &tool_params) {
+                        match mcp_idempotency_precheck(
+                            &self.pool,
+                            id.clone(),
+                            canonical_tool_name,
+                            &tool_params,
+                            &principal,
+                            policy_allowed_row_id.as_deref(),
+                        )
+                        .await
+                        {
+                            IdempotencyOutcome::Proceed { key, hash } => (Some(key), Some(hash)),
+                            IdempotencyOutcome::Cached(resp) => return resp,
+                            IdempotencyOutcome::Denied(resp) => return resp,
+                        }
+                    } else if is_read_only_call(canonical_tool_name, &tool_params) {
+                        // Reject any idempotency key (snake_case or camelCase) on read-only tools.
+                        if extract_idempotency_key(&tool_params).is_some() {
+                            return JsonRpcResponse::error_with_data(
+                                id,
+                                -32602,
+                                "idempotency_key not accepted for read-only tools",
+                                serde_json::json!({
+                                    "code": "IDEMPOTENCY_KEY_NOT_ACCEPTED",
+                                    "tool_name": canonical_tool_name,
+                                }),
+                            );
+                        }
+                        (None, None)
+                    } else {
+                        (None, None)
+                    };
+
+                // P081 Phase 3: scope idempotency key and boundary row_id as task-locals so
+                // mcp_caller() inside dispatch_tool stamps them into CallerContext, which
+                // CommandJournalEntry::new() then persists in command_journal.
+                let dispatch_result = crate::request_context::scope_idempotency_key(
+                    idempotency_claimed_key.clone(),
+                    crate::request_context::scope_idempotency_request_hash(
+                        idempotency_claimed_hash.clone(),
+                        crate::request_context::scope_boundary_row_id(
+                            policy_allowed_row_id.clone(),
+                            self.dispatch_tool(canonical_tool_name, tool_params, principal, &request_id),
+                        ),
                     ),
-                    Err(e) => JsonRpcResponse::error(id, -32603, e.to_string())
-                        .with_error_request_id(Some(&request_id)),
+                )
+                .await;
+                match dispatch_result {
+                    Ok(result) => {
+                        // Update the pending idempotency claim with the committed result.
+                        // Extract journal_id from the result JSON to link the idempotency record
+                        // back to the command_journal row per P081 mcp_idempotency_contract.
+                        if let (Some(ref key), Some(_)) =
+                            (&idempotency_claimed_key, &idempotency_claimed_hash)
+                        {
+                            let result_json = serde_json::to_string(&result).unwrap_or_default();
+                            let journal_id = result
+                                .get("journal_id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            if let Some(err_resp) = mcp_idempotency_commit(
+                                &self.pool,
+                                id.clone(),
+                                canonical_tool_name,
+                                key,
+                                &result_json,
+                                journal_id.as_deref(),
+                            )
+                            .await
+                            {
+                                return err_resp;
+                            }
+                        }
+                        JsonRpcResponse::success(
+                            id,
+                            serde_json::json!({
+                                "content": [{
+                                    "type": "text",
+                                    "text": serde_json::to_string(&result).unwrap_or_default()
+                                }]
+                            }),
+                        )
+                    }
+                    Err(e) => {
+                        // SEC-P081-002: Log full error chain server-side; expose only INTERNAL
+                        // plus the ambient request_id for correlation.
+                        let rid = crate::request_context::current_request_id();
+                        let error_text = e.to_string();
+                        if error_text.starts_with("IDEMPOTENCY_IN_FLIGHT") {
+                            return JsonRpcResponse::error_with_data(
+                                id,
+                                -32603,
+                                "idempotency key has an in-flight request; retry after completion",
+                                serde_json::json!({
+                                    "code": "IDEMPOTENCY_IN_FLIGHT",
+                                    "tool_name": canonical_tool_name,
+                                    "request_id": rid,
+                                }),
+                            );
+                        }
+                        tracing::error!(
+                            error = %e,
+                            request_id = ?rid,
+                            tool = %canonical_tool_name,
+                            "mcp_tools_call: internal dispatch error"
+                        );
+                        // The pending idempotency claim is owned by the command transaction.
+                        // On rollback it disappears with the command writes; on a committed
+                        // failure it remains as committed-unack evidence and must not be
+                        // deleted by a racing transport retry.
+                        let data = serde_json::json!({
+                            "code": "INTERNAL",
+                            "request_id": rid,
+                        });
+                        JsonRpcResponse::error_with_data(id, -32603, "INTERNAL", data)
+                    }
                 }
             }
 
@@ -463,6 +958,68 @@ impl McpServer {
                 // Primary scheme matches the proposal contract:
                 //   run://{id}  idea://{id}  artifact://{id}  report://{run_id}
                 // The chainworks:// family is also kept for backward compatibility.
+                // SEC-HIGH-001: evaluate BoundaryPolicy for resources/list as a first-class action.
+                if let Some(policy) = &self.boundary_policy {
+                    let caller_class = auth::derive_caller_class_for_mcp(principal);
+                    let decision = policy.evaluate(
+                        caller_class.as_str(),
+                        "mcp_tools_list",
+                        Some("resources.list"),
+                    );
+                    match decision {
+                        auth::boundary::PolicyDecision::Deny {
+                            reason_code,
+                            row_id,
+                            ..
+                        } => {
+                            tracing::debug!(
+                                caller_class = caller_class.as_str(),
+                                reason_code = %reason_code,
+                                row_id = ?row_id,
+                                "BoundaryPolicy: resources/list denied"
+                            );
+                            if let Err(e) = write_mcp_deny_audit(
+                                &self.pool,
+                                self.boundary_policy.as_deref(),
+                                principal,
+                                "mcp_tools_list",
+                                "resources.list",
+                                &reason_code,
+                                row_id.as_deref(),
+                            )
+                            .await
+                            {
+                                tracing::error!(error = %e, "resources/list denial audit write failed; failing closed");
+                                return JsonRpcResponse::error(
+                                    id,
+                                    -32603,
+                                    "audit_store_failure".to_string(),
+                                );
+                            }
+                            return JsonRpcResponse::success(
+                                id,
+                                serde_json::json!({ "resources": [] }),
+                            );
+                        }
+                        auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                            if let auth::boundary::PolicyDecision::Deny {
+                                reason_code,
+                                row_id,
+                                ..
+                            } = *matched_decision
+                            {
+                                tracing::debug!(
+                                    caller_class = caller_class.as_str(),
+                                    reason_code = %reason_code,
+                                    row_id = ?row_id,
+                                    "BoundaryPolicy shadow: matrix would deny resources/list"
+                                );
+                            }
+                        }
+                        auth::boundary::PolicyDecision::Allow { .. }
+                        | auth::boundary::PolicyDecision::LegacyPassthrough => {}
+                    }
+                }
                 let filtered: Vec<_> =
                     auth::filter_resources(principal, &auth::all_resource_templates())
                         .into_iter()
@@ -474,6 +1031,54 @@ impl McpServer {
 
             "resources/templates/list" => {
                 // No parameterized resource templates yet.
+                // SEC-HIGH-001: evaluate BoundaryPolicy for resources/templates/list.
+                if let Some(policy) = &self.boundary_policy {
+                    let caller_class = auth::derive_caller_class_for_mcp(principal);
+                    let decision = policy.evaluate(
+                        caller_class.as_str(),
+                        "mcp_tools_list",
+                        Some("resources.templates.list"),
+                    );
+                    match decision {
+                        auth::boundary::PolicyDecision::Deny {
+                            reason_code,
+                            row_id,
+                            ..
+                        } => {
+                            tracing::debug!(
+                                caller_class = caller_class.as_str(),
+                                reason_code = %reason_code,
+                                row_id = ?row_id,
+                                "BoundaryPolicy: resources/templates/list denied"
+                            );
+                            if let Err(e) = write_mcp_deny_audit(
+                                &self.pool,
+                                self.boundary_policy.as_deref(),
+                                principal,
+                                "mcp_tools_list",
+                                "resources.templates.list",
+                                &reason_code,
+                                row_id.as_deref(),
+                            )
+                            .await
+                            {
+                                tracing::error!(error = %e, "resources/templates/list denial audit write failed; failing closed");
+                                return JsonRpcResponse::error(
+                                    id,
+                                    -32603,
+                                    "audit_store_failure".to_string(),
+                                );
+                            }
+                            return JsonRpcResponse::success(
+                                id,
+                                serde_json::json!({ "resourceTemplates": [] }),
+                            );
+                        }
+                        auth::boundary::PolicyDecision::Shadow { .. } => {}
+                        auth::boundary::PolicyDecision::Allow { .. }
+                        | auth::boundary::PolicyDecision::LegacyPassthrough => {}
+                    }
+                }
                 JsonRpcResponse::success(id, serde_json::json!({ "resourceTemplates": [] }))
             }
 
@@ -489,6 +1094,69 @@ impl McpServer {
                         );
                     }
                 };
+                // SEC-HIGH-001: evaluate BoundaryPolicy for resources/read as a first-class action.
+                if let Some(policy) = &self.boundary_policy {
+                    let caller_class = auth::derive_caller_class_for_mcp(principal);
+                    let decision = policy.evaluate(
+                        caller_class.as_str(),
+                        "mcp_tools_call",
+                        Some("resources.read"),
+                    );
+                    match decision {
+                        auth::boundary::PolicyDecision::Deny {
+                            reason_code,
+                            row_id,
+                            ..
+                        } => {
+                            tracing::debug!(
+                                caller_class = caller_class.as_str(),
+                                reason_code = %reason_code,
+                                row_id = ?row_id,
+                                "BoundaryPolicy: resources/read denied"
+                            );
+                            if let Err(e) = write_mcp_deny_audit(
+                                &self.pool,
+                                self.boundary_policy.as_deref(),
+                                principal,
+                                "mcp_tools_call",
+                                "resources.read",
+                                &reason_code,
+                                row_id.as_deref(),
+                            )
+                            .await
+                            {
+                                tracing::error!(error = %e, "resources/read denial audit write failed; failing closed");
+                                return JsonRpcResponse::error(
+                                    id,
+                                    -32603,
+                                    "audit_store_failure".to_string(),
+                                );
+                            }
+                            return JsonRpcResponse::error(
+                                id,
+                                -32004,
+                                format!("auth_failure: {reason_code}"),
+                            );
+                        }
+                        auth::boundary::PolicyDecision::Shadow { matched_decision } => {
+                            if let auth::boundary::PolicyDecision::Deny {
+                                reason_code,
+                                row_id,
+                                ..
+                            } = *matched_decision
+                            {
+                                tracing::debug!(
+                                    caller_class = caller_class.as_str(),
+                                    reason_code = %reason_code,
+                                    row_id = ?row_id,
+                                    "BoundaryPolicy shadow: matrix would deny resources/read"
+                                );
+                            }
+                        }
+                        auth::boundary::PolicyDecision::Allow { .. }
+                        | auth::boundary::PolicyDecision::LegacyPassthrough => {}
+                    }
+                }
                 let request_id = public_json_rpc_request_id(&id);
                 if auth::match_resource_uri(principal, &uri, resource_template_id_for_uri).is_none()
                 {
@@ -685,6 +1353,17 @@ impl McpServer {
                 db::repos::artifacts::list_by_run(&self.pool, run_id_parsed).await?;
             let (mcp_rollout_readback, run_report_rollout_readback) =
                 rollout_contract_readback_lanes_json(&self.pool, run_id_parsed).await?;
+            // Fetch p082 readbacks once and emit "report_resource" lane metrics.
+            // Pass the pre-fetched value into artifact_report_json so per-artifact
+            // lanes are not re-emitted for each artifact in the loop.
+            let p082_recovery_matrix_readbacks =
+                tools::reports::p082_recovery_matrix_readbacks_json(
+                    &self.pool,
+                    run_id_parsed,
+                    &principal.class,
+                    "report_resource",
+                )
+                .await?;
             let mut artifact_payloads = Vec::with_capacity(run_artifacts.len());
             for artifact in &run_artifacts {
                 artifact_payloads.push(
@@ -692,6 +1371,9 @@ impl McpServer {
                         &self.pool,
                         artifact,
                         Some(&run_report_rollout_readback),
+                        &principal.class,
+                        &run_proj.artifact_root,
+                        Some(&p082_recovery_matrix_readbacks),
                     )
                     .await?,
                 );
@@ -709,14 +1391,6 @@ impl McpServer {
                 tools::reports::retry_authority_current_json(&self.pool, run_id_parsed).await?;
             let p091_orphan_repair_readback =
                 tools::reports::p091_orphan_repair_readback_json(&self.pool, run_id_parsed).await?;
-            let p082_recovery_matrix_readbacks =
-                tools::reports::p082_recovery_matrix_readbacks_json(
-                    &self.pool,
-                    run_id_parsed,
-                    &principal.class,
-                    "report_resource",
-                )
-                .await?;
 
             return Ok(serde_json::json!({
                 "run_id": run_id,
@@ -764,6 +1438,22 @@ impl McpServer {
 
         if uri == "chainworks://runs" {
             let rows = projections::list_active_projection(&self.pool).await?;
+            if principal.class != auth::PrincipalClass::Operator {
+                let sanitized: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|row| {
+                        let mut v =
+                            serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.remove("workspace_root");
+                            obj.remove("artifact_root");
+                            obj.remove("chainworks_meta_root");
+                        }
+                        v
+                    })
+                    .collect();
+                return Ok(serde_json::to_value(sanitized)?);
+            }
             return Ok(serde_json::to_value(rows)?);
         }
 
@@ -795,6 +1485,24 @@ impl McpServer {
                 return Ok(serde_json::to_value(rows)?);
             } else if let Some(rid) = run_id.strip_suffix("/artifacts") {
                 let rows = projections::list_artifacts_projection(&self.pool, rid).await?;
+                if principal.class != auth::PrincipalClass::Operator {
+                    let sanitized: Vec<serde_json::Value> = rows
+                        .iter()
+                        .map(|row| {
+                            let mut v =
+                                serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+                            if let Some(obj) = v.as_object_mut() {
+                                obj.remove("file_path");
+                                obj.remove("source_agent_execution_id");
+                                obj.remove("source_stage_execution_id");
+                                obj.remove("source_session_generation_id");
+                                obj.remove("source_work_item_id");
+                            }
+                            v
+                        })
+                        .collect();
+                    return Ok(serde_json::to_value(sanitized)?);
+                }
                 return Ok(serde_json::to_value(rows)?);
             } else {
                 return self.read_canonical_run_resource(run_id, principal).await;
@@ -807,7 +1515,7 @@ impl McpServer {
     async fn read_canonical_run_resource(
         &self,
         run_id: &str,
-        _principal: &auth::Principal,
+        principal: &auth::Principal,
     ) -> anyhow::Result<serde_json::Value> {
         let run_id_parsed: domain::ids::RunId = run_id
             .parse::<uuid::Uuid>()
@@ -818,19 +1526,33 @@ impl McpServer {
             .ok_or_else(|| anyhow::anyhow!("Run not found: {run_id}"))?;
         let mut value = serde_json::to_value(run)?;
         if let Some(obj) = value.as_object_mut() {
-            if let Some(projection) =
-                db::repos::artifact_contracts::find_run_state_projection(&self.pool, run_id_parsed)
+            // SEC-HIGH-002: strip sensitive fields for non-Operator principals.
+            if principal.class != auth::PrincipalClass::Operator {
+                tools::runs::redact_run_for_non_operator(obj);
+            }
+            // active_artifact_index and run_state_projection include operator-only
+            // recovery diagnostics, local paths, and source IDs — Operator only.
+            if principal.class == auth::PrincipalClass::Operator {
+                if let Some(projection) =
+                    db::repos::artifact_contracts::find_run_state_projection(
+                        &self.pool,
+                        run_id_parsed,
+                    )
                     .await?
-            {
-                obj.insert("active_artifact_index".into(), projection.active_index_json);
-                obj.insert("run_state_projection".into(), projection.run_state_json);
-                obj.insert(
-                    "operator_overrides".into(),
-                    serde_json::to_value(
-                        db::repos::artifact_contracts::list_overrides(&self.pool, run_id_parsed)
+                {
+                    obj.insert("active_artifact_index".into(), projection.active_index_json);
+                    obj.insert("run_state_projection".into(), projection.run_state_json);
+                    obj.insert(
+                        "operator_overrides".into(),
+                        serde_json::to_value(
+                            db::repos::artifact_contracts::list_overrides(
+                                &self.pool,
+                                run_id_parsed,
+                            )
                             .await?,
-                    )?,
-                );
+                        )?,
+                    );
+                }
             }
             if let Some(row) = projections::find_run_projection(&self.pool, run_id).await? {
                 obj.insert("total_stages".into(), serde_json::json!(row.total_stages));
@@ -1032,7 +1754,7 @@ impl McpServer {
         let cmd = self.cmd_handler.as_ref();
 
         if tool_name.starts_with("ideas.") {
-            tools::ideas::execute(tool_name, params, pool, cmd).await
+            tools::ideas::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("runs.") {
             tools::runs::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name.starts_with("approvals.") {
@@ -1050,11 +1772,17 @@ impl McpServer {
         } else if tool_name.starts_with("steward.") {
             tools::steward::execute(tool_name, params, pool, cmd, principal).await
         } else if tool_name == "runtime.health" {
-            tools::runtime::execute(params, pool).await
+            tools::runtime::execute(params, pool, self.boundary_policy.as_deref()).await
         } else if tool_name.starts_with("effects.") {
             tools::effects::execute(tool_name, params, pool, principal).await
         } else if tool_name.starts_with("runtime.") {
-            tools::runtime::execute_with_name(tool_name, params, pool).await
+            tools::runtime::execute_with_name(
+                tool_name,
+                params,
+                pool,
+                self.boundary_policy.as_deref(),
+            )
+            .await
         } else if tool_name.starts_with("storage.") {
             tools::storage::execute_with_writer(
                 tool_name,
@@ -1068,10 +1796,570 @@ impl McpServer {
                 Some(request_id),
             )
             .await
+        } else if tool_name.starts_with("agents.") {
+            tools::agents::execute(tool_name, params, pool, principal).await
+        } else if tool_name.starts_with("automation.") {
+            tools::automation::execute(tool_name, params).await
+        } else if tool_name.starts_with("operator.") {
+            tools::runtime::execute_with_name(
+                tool_name,
+                params,
+                pool,
+                self.boundary_policy.as_deref(),
+            )
+            .await
         } else {
             Err(anyhow::anyhow!("Unknown tool namespace: {tool_name}"))
         }
     }
+}
+
+// ── P081 AC-13: MCP command idempotency helpers ──────────────────────────────
+
+/// Returns true if this tool is state-changing and requires an idempotency key.
+/// P081 AC-13: all tools that perform durable DB or filesystem writes must be
+/// listed here. storage.reconcile_evidence_orphans has a dry-run mode — see
+/// `is_state_changing_call` which does param-aware classification for it.
+fn is_state_changing_tool(tool_name: &str) -> bool {
+    matches!(
+        tools::canonical_tool_name(tool_name),
+        "runs.start"
+            | "runs.cancel"
+            | "runs.main_sync.request"
+            | "runs.main_sync.retry"
+            | "runs.main_sync.set_override"
+            | "runs.main_sync.repair_state"
+            | "runs.main_sync.record_recovery_decision"
+            | "runs.knowledge_capsule.ignore"
+            | "runs.retrofit_catalog_snapshot"
+            | "runs.settle_proposal_gate"
+            | "ideas.create"
+            | "stages.retry"
+            | "stages.consume_provider_quota_hold"
+            | "legacy_discovery_override_create"
+            | "workflow_conflicts.resolve"
+            | "workflow_loop_budget.extend"
+            | "artifacts.override_contract"
+            | "steward.run_analysis"
+            | "approvals.resolve"
+            | "effects.mark_conflict"
+            | "effects.mark_unrecoverable"
+            | "effects.clear_after_manual_verification"
+            | "storage.maintenance.repair_slot"
+            | "storage.projections.clear_backlog"
+            | "storage.projections.clear_poison"
+    )
+}
+
+/// Returns true if this call is state-changing given the supplied parameters.
+/// Wraps `is_state_changing_tool` and adds param-aware classification for tools
+/// that have both a read-only (dry-run) and a mutating (live) execution mode.
+fn is_state_changing_call(tool_name: &str, params: &serde_json::Value) -> bool {
+    if is_state_changing_tool(tool_name) {
+        return true;
+    }
+    // storage.reconcile_evidence_orphans: dryRun=false is state-changing.
+    // dryRun defaults to true when absent per the tool's own contract.
+    if tools::canonical_tool_name(tool_name) == "storage.reconcile_evidence_orphans" {
+        let dry_run = params
+            .get("dryRun")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        return !dry_run;
+    }
+    false
+}
+
+/// Returns true if this tool is unconditionally read-only and must reject any idempotency key.
+fn is_read_only_tool(tool_name: &str) -> bool {
+    matches!(
+        tools::canonical_tool_name(tool_name),
+        "runs.list"
+            | "runs.get"
+            | "ideas.list"
+            | "approvals.list"
+            | "reports.get"
+            | "steward.list_analyses"
+            | "steward.get_analysis"
+            | "runtime.health"
+            | "boundary.runtime.get"
+            | "storage.health"
+            | "storage.write_pressure"
+            | "storage.evidence_spool_summary"
+            | "effects.list"
+            | "effects.inspect"
+            | "effects.reconcile"
+    )
+}
+
+/// Returns true if this call is read-only given the supplied parameters.
+/// Extends `is_read_only_tool` with param-aware classification for tools that
+/// operate in both read-only (dry-run) and mutating (live) modes.
+fn is_read_only_call(tool_name: &str, params: &serde_json::Value) -> bool {
+    if is_read_only_tool(tool_name) {
+        return true;
+    }
+    // storage.reconcile_evidence_orphans: dryRun=true (the default) is read-only.
+    if tools::canonical_tool_name(tool_name) == "storage.reconcile_evidence_orphans" {
+        let dry_run = params
+            .get("dryRun")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        return dry_run;
+    }
+    false
+}
+
+/// Extract idempotency key from tool arguments, accepting both snake_case
+/// (`idempotency_key`) and camelCase (`idempotencyKey`) field names.
+fn extract_idempotency_key(tool_params: &serde_json::Value) -> Option<String> {
+    tool_params["idempotency_key"]
+        .as_str()
+        .or_else(|| tool_params["idempotencyKey"].as_str())
+        .map(|s| s.to_string())
+}
+
+/// Returns true if the string is a valid UUID (any version).
+/// P081 SEC: idempotency keys must be UUIDs to prevent unbounded strings from
+/// Validate that the idempotency key is a valid UUIDv7 per P081 mcp_idempotency_contract.
+/// UUIDv7 is required (not just any UUID) for replay handle format consistency.
+fn is_valid_uuid_key(s: &str) -> bool {
+    if s.len() > 36 {
+        return false;
+    }
+    match uuid::Uuid::parse_str(s) {
+        Ok(u) => u.get_version() == Some(uuid::Version::SortRand),
+        Err(_) => false,
+    }
+}
+
+/// Derives a non-sensitive token_id for canonical request hashing.
+/// Uses the ambient task-local token_id if present; otherwise returns empty
+/// string for backward compatibility.
+fn derive_token_id_for_idempotency(principal: &auth::Principal) -> String {
+    // token_id in the canonical hash is diagnostic-only per P081 §security_hardening_contract.
+    // Use the task-local derived token_id to avoid including the raw bearer token.
+    let _ = principal; // principal_id already included separately in the hash
+    crate::request_context::current_token_id().unwrap_or_default()
+}
+
+fn canonicalize_json_for_hash(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                if let Some(child) = map.get(key) {
+                    canonical.insert(key.clone(), canonicalize_json_for_hash(child));
+                }
+            }
+            serde_json::Value::Object(canonical)
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(canonicalize_json_for_hash)
+                .collect::<Vec<_>>(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+/// Compute canonical_request_hash for idempotency deduplication.
+/// The idempotency_key itself is excluded from the hash (it is retry metadata).
+/// Also strips camelCase idempotencyKey if present.
+/// Includes row_id per P081 mcp_idempotency_contract canonical_request_hash fields.
+fn compute_canonical_request_hash(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    caller_class: &str,
+    principal_id: &str,
+    token_id: &str,
+    row_id: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut args_sorted = arguments.clone();
+    if let serde_json::Value::Object(ref mut map) = args_sorted {
+        map.remove("idempotency_key");
+        map.remove("idempotencyKey");
+    }
+    let args_canonical = canonicalize_json_for_hash(&args_sorted);
+    let canonical = serde_json::json!({
+        "tool_name": tool_name,
+        "arguments": args_canonical,
+        "caller_class": caller_class,
+        "principal_id": principal_id,
+        "token_id": token_id,
+        "row_id": row_id,
+    });
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    format!("{digest:x}")
+}
+
+/// Outcome of the pre-dispatch idempotency precheck for state-changing MCP calls.
+enum IdempotencyOutcome {
+    /// Claim won; proceed to dispatch. Contains the key and hash for post-dispatch update.
+    Proceed { key: String, hash: String },
+    /// A committed duplicate was found; the cached response should be returned directly.
+    Cached(JsonRpcResponse),
+    /// The call must be denied (missing key, invalid key, conflict, storage error, etc.).
+    Denied(JsonRpcResponse),
+}
+
+/// Committed-unack recovery: when a pending sentinel record has aged past the in-flight
+/// timeout, query the command_journal to check whether the command actually committed.
+/// If found, synthesize a recovery response and update the idempotency record so future
+/// retries see a cached result. Extracted to keep async stack frames small.
+async fn mcp_idempotency_committed_unack_recovery(
+    pool: &sqlx::SqlitePool,
+    id: Option<serde_json::Value>,
+    canonical_tool_name: &str,
+    idempotency_key: &str,
+    rid: Option<String>,
+) -> IdempotencyOutcome {
+    match db::repos::command_journal::find_committed_by_idempotency_key(pool, idempotency_key).await
+    {
+        Ok(Some(journal_id)) => {
+            let recovery_json = serde_json::json!({
+                "_idempotency": "committed_unack_recovery",
+                "journal_id": journal_id,
+                "note": "command committed; original result unavailable; retry for fresh state",
+            })
+            .to_string();
+            let _ = db::repos::mcp_command_idempotency::update_result(
+                pool,
+                idempotency_key,
+                &recovery_json,
+                None,
+                Some(&journal_id),
+            )
+            .await;
+            IdempotencyOutcome::Cached(JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content": [{ "type": "text", "text": recovery_json }],
+                    "_idempotency": "committed_unack_recovery",
+                }),
+            ))
+        }
+        Ok(None) => IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
+            id,
+            -32603,
+            "prior request committed but result is unavailable; check system state",
+            serde_json::json!({
+                "code": "IDEMPOTENCY_COMMITTED_UNACK",
+                "tool_name": canonical_tool_name,
+                "request_id": rid,
+            }),
+        )),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                tool = %canonical_tool_name,
+                "committed-unack journal lookup failed; returning COMMITTED_UNACK"
+            );
+            IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
+                id,
+                -32603,
+                "prior request committed but result is unavailable; check system state",
+                serde_json::json!({
+                    "code": "IDEMPOTENCY_COMMITTED_UNACK",
+                    "tool_name": canonical_tool_name,
+                    "request_id": rid,
+                }),
+            ))
+        }
+    }
+}
+
+/// Execute the P081 idempotency lookup precheck for state-changing MCP calls.
+///
+/// `boundary_row_id` is threaded from the BoundaryPolicy Allow decision so it is
+/// included in the canonical_request_hash per P081 mcp_idempotency_contract. The
+/// first-attempt pending sentinel is claimed later inside the command transaction.
+///
+/// Extracted into a module-level async fn to keep the async state machine of the
+/// outer request handler small enough to avoid stack overflows.
+async fn mcp_idempotency_precheck(
+    pool: &sqlx::SqlitePool,
+    id: Option<serde_json::Value>,
+    canonical_tool_name: &str,
+    tool_params: &serde_json::Value,
+    principal: &auth::Principal,
+    boundary_row_id: Option<&str>,
+) -> IdempotencyOutcome {
+    let key_opt = extract_idempotency_key(tool_params);
+    let key_str = match key_opt {
+        None => {
+            return IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
+                id,
+                -32602,
+                "idempotency_key required for state-changing tools",
+                serde_json::json!({
+                    "code": "IDEMPOTENCY_KEY_REQUIRED",
+                    "tool_name": canonical_tool_name,
+                }),
+            ));
+        }
+        Some(k) => k,
+    };
+
+    if !is_valid_uuid_key(&key_str) {
+        return IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
+            id,
+            -32602,
+            "idempotency_key must be a valid UUID",
+            serde_json::json!({
+                "code": "IDEMPOTENCY_KEY_INVALID",
+                "tool_name": canonical_tool_name,
+            }),
+        ));
+    }
+
+    let caller_class = auth::derive_caller_class_for_mcp(principal);
+    let token_id = derive_token_id_for_idempotency(principal);
+    let canonical_hash = compute_canonical_request_hash(
+        canonical_tool_name,
+        tool_params,
+        caller_class.as_str(),
+        &principal.id,
+        &token_id,
+        boundary_row_id,
+    );
+
+    match db::repos::mcp_command_idempotency::find_by_key(pool, &key_str).await {
+        Ok(None) => IdempotencyOutcome::Proceed {
+            key: key_str,
+            hash: canonical_hash,
+        },
+        Ok(Some(record)) => {
+            if record.result_json == db::repos::mcp_command_idempotency::PENDING_SENTINEL {
+                let age_ms = chrono::Utc::now().timestamp_millis() - record.committed_at_ms;
+                let rid = crate::request_context::current_request_id();
+                if age_ms < 30_000 {
+                    IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
+                        id,
+                        -32603,
+                        "idempotency key has an in-flight request; retry after completion",
+                        serde_json::json!({
+                            "code": "IDEMPOTENCY_IN_FLIGHT",
+                            "tool_name": canonical_tool_name,
+                            "request_id": rid,
+                        }),
+                    ))
+                } else {
+                    mcp_idempotency_committed_unack_recovery(
+                        pool,
+                        id,
+                        canonical_tool_name,
+                        &key_str,
+                        rid,
+                    )
+                    .await
+                }
+            } else if record.canonical_request_hash == canonical_hash {
+                db::metrics::increment_counter("mcp_command_idempotency_replay_total");
+                let result: serde_json::Value =
+                    serde_json::from_str(&record.result_json).unwrap_or(serde_json::Value::Null);
+                IdempotencyOutcome::Cached(JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "content": [{ "type": "text", "text": serde_json::to_string(&result).unwrap_or_default() }],
+                        "_idempotency": "duplicate_ok"
+                    }),
+                ))
+            } else {
+                db::metrics::increment_counter("mcp_command_idempotency_conflict_total");
+                IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
+                    id,
+                    -32603,
+                    "idempotency conflict",
+                    serde_json::json!({
+                        "code": "IDEMPOTENCY_CONFLICT",
+                        "tool_name": canonical_tool_name,
+                    }),
+                ))
+            }
+        }
+        Err(e) => {
+            let rid = crate::request_context::current_request_id();
+            tracing::error!(
+                error = %e,
+                request_id = ?rid,
+                tool = %canonical_tool_name,
+                "idempotency lookup failed; failing closed before command dispatch"
+            );
+            IdempotencyOutcome::Denied(JsonRpcResponse::error_with_data(
+                id,
+                -32603,
+                "idempotency storage unavailable",
+                serde_json::json!({
+                    "code": "SQLITE_CONTENTION_RETRY_EXHAUSTED",
+                    "request_id": rid,
+                }),
+            ))
+        }
+    }
+}
+
+/// Update a pending idempotency claim with the committed result after successful dispatch.
+/// Returns an error response if the update fails (committed-unack), or None if the caller
+/// should proceed to return the success response.
+/// `journal_id` is extracted from the result JSON (the `journal_id` field that state-changing
+/// tools return) and stored in `mcp_command_idempotency.command_journal_id` for audit linkage.
+async fn mcp_idempotency_commit(
+    pool: &sqlx::SqlitePool,
+    id: Option<serde_json::Value>,
+    canonical_tool_name: &str,
+    key: &str,
+    result_json: &str,
+    journal_id: Option<&str>,
+) -> Option<JsonRpcResponse> {
+    let Some(journal_id) = journal_id else {
+        let rid = crate::request_context::current_request_id();
+        tracing::error!(
+            request_id = ?rid,
+            tool = %canonical_tool_name,
+            "state-changing MCP command returned success without journal_id; refusing to mark idempotency committed"
+        );
+        return Some(JsonRpcResponse::error_with_data(
+            id,
+            -32603,
+            "state-changing MCP command result did not include journal linkage",
+            serde_json::json!({
+                "code": "IDEMPOTENCY_JOURNAL_LINK_MISSING",
+                "request_id": rid,
+            }),
+        ));
+    };
+    match db::repos::mcp_command_idempotency::update_result(
+        pool,
+        key,
+        result_json,
+        None,
+        Some(journal_id),
+    )
+    .await
+    {
+        Ok(true) => None,
+        Ok(false) => {
+            // P081 security review H-003 fix: Ok(false) means no pending record was
+            // found after a successful command dispatch. This is an invariant violation
+            // (the pending record must exist because mcp_idempotency_precheck inserted
+            // it). Treating it as success would leave no replay record, breaking the
+            // committed-unack and retry contract. Fail closed.
+            let rid = crate::request_context::current_request_id();
+            tracing::error!(
+                request_id = ?rid,
+                tool = %canonical_tool_name,
+                "idempotency update_result returned Ok(false): pending record absent after commit; \
+                 failing closed to protect committed-unack contract"
+            );
+            Some(JsonRpcResponse::error_with_data(
+                id,
+                -32603,
+                "idempotency replay record missing after commit; check system state before retry",
+                serde_json::json!({
+                    "code": "IDEMPOTENCY_COMMITTED_UNACK",
+                    "request_id": rid,
+                }),
+            ))
+        }
+        Err(e) => {
+            let rid = crate::request_context::current_request_id();
+            tracing::error!(
+                error = %e,
+                request_id = ?rid,
+                tool = %canonical_tool_name,
+                "idempotency update_result failed after successful dispatch (committed-unack state)"
+            );
+            Some(JsonRpcResponse::error_with_data(
+                id,
+                -32603,
+                "idempotency result could not be stored; command committed — check system state before retry",
+                serde_json::json!({
+                    "code": "IDEMPOTENCY_COMMITTED_UNACK",
+                    "request_id": rid,
+                }),
+            ))
+        }
+    }
+}
+
+/// P081 AC25: Write exactly one durable audit_log row for a boundary denial at an
+/// MCP transport seam. Uses the standalone bounded `append` path (opens its own
+/// BEGIN IMMEDIATE transaction) so the denial is durably recorded before the
+/// error response is sent. Callers must fail closed when this returns Err.
+///
+/// Bearer tokens are never written; the principal_id and class come from the
+/// already-resolved Principal, not from any caller-supplied header.
+// matrix_row: p081.agent_operator.mcp_tools_call.command
+async fn write_mcp_deny_audit(
+    pool: &SqlitePool,
+    policy: Option<&auth::boundary::BoundaryPolicy>,
+    principal: &auth::Principal,
+    transport: &str,
+    action_attempted: &str,
+    reason_code: &str,
+    row_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let id = uuid::Uuid::now_v7().to_string();
+    let now = chrono::Utc::now();
+    let timestamp_ms = now.timestamp_millis();
+    // Use the ambient request id when inside an HTTP scope; fall back to a
+    // synthetic UUID for stdio paths where no HTTP request id is available.
+    let request_id = crate::request_context::current_request_id()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // SEC-P081-M002: read derived token_id from task-local; never the raw token.
+    let token_id = crate::request_context::current_token_id();
+    let mode = policy.map(|p| p.mode().as_str()).unwrap_or("legacy_compat");
+    let principal_class_str = principal.class.to_string();
+    let caller_class_str = auth::derive_caller_class_for_mcp(&principal);
+
+    let payload_raw = serde_json::json!({
+        "event": "boundary_decision",
+        "decision": "deny",
+        "transport": transport,
+        "action_attempted": action_attempted,
+        "reason_code": reason_code,
+    })
+    .to_string();
+    let (payload, _original_sha256, truncated) = db::repos::audit_log::build_envelope(&payload_raw);
+
+    let entry = db::repos::audit_log::AuditEntry {
+        id: &id,
+        request_id: &request_id,
+        timestamp_ms,
+        event_type: "boundary_decision",
+        principal_id: Some(principal.id.as_str()),
+        principal_class: Some(principal_class_str.as_str()),
+        caller_class: Some(caller_class_str.as_str()),
+        token_id: token_id.as_deref(),
+        transport,
+        action_attempted,
+        decision: "deny",
+        denial_reason_code: Some(reason_code),
+        row_id,
+        env_gate_state: None,
+        source_ip_hash_or_local_process_id: None,
+        boundary_policy_mode: mode,
+        fixture_version: "p081-boundary-matrix-v1",
+        payload: &payload,
+        // SEC-P081-M003: pass the raw payload so the repo computes sha256 independently.
+        original_payload_bytes: if truncated { Some(&payload_raw) } else { None },
+        diagnostic_truncated: truncated,
+        checkpoint_id: None,
+        created_at_ms: timestamp_ms,
+    };
+
+    db::repos::audit_log::append(pool, &entry)
+        .await
+        .map_err(|e| {
+            db::metrics::record_p081_audit_log_append_failure("boundary_decision", transport, mode);
+            e
+        })
 }
 
 fn resource_template_id_for_uri(uri: &str) -> Option<ResourceTemplateId> {
@@ -1330,19 +2618,20 @@ mod p029_capability_tests {
         let ag = Principal::new("ag", PrincipalClass::Agent);
         let names = tools_list_names_for(&ag);
         // Agents can create ideas and start runs but cannot approve, cancel,
-        // retry, or enter the steward surface.
+        // retry, or enter the steward/reports surface.
+        // SEC-004: reports.get is Operator-only (exposes operator diagnostics).
         for expected in [
             "ideas.create",
             "ideas.list",
             "runs.start",
             "runs.list",
             "runs.get",
-            "reports.get",
         ] {
             let expected = expected.replace('.', "_");
             assert!(names.contains(&expected), "agent missing {expected}");
         }
         for forbidden in [
+            "reports.get",
             "runs.main_sync.request",
             "runs.main_sync.retry",
             "runs.main_sync.set_override",
@@ -1371,13 +2660,13 @@ mod p029_capability_tests {
         let ob = Principal::new("ob", PrincipalClass::Observer);
         let names = tools_list_names_for(&ob);
         // Observer is read-only: sees list/get surfaces + approvals.list +
-        // steward readers. Must not see any command tool.
+        // steward readers. Must not see any command tool or operator-diagnostic tool.
+        // SEC-004: reports.get is Operator-only (exposes operator diagnostics).
         for expected in [
             "ideas.list",
             "runs.list",
             "runs.get",
             "approvals.list",
-            "reports.get",
             "steward.list_analyses",
             "steward.get_analysis",
         ] {
@@ -1385,6 +2674,7 @@ mod p029_capability_tests {
             assert!(names.contains(&expected), "observer missing {expected}");
         }
         for forbidden in [
+            "reports.get",
             "ideas.create",
             "runs.start",
             "runs.cancel",
@@ -1453,17 +2743,23 @@ mod p029_capability_tests {
         let ag = Principal::new("ag", PrincipalClass::Agent);
         assert!(!resources_read_allowed(&ag, "steward-analysis://abc-123"));
 
-        // Same agent CAN read run://, idea://, artifact://, report:// (allowed
-        // for all classes).
+        // Agent CAN read run://, idea://.
         assert!(resources_read_allowed(&ag, "run://r-1"));
         assert!(resources_read_allowed(&ag, "idea://i-1"));
+        // HIGH-001: report:// is Operator-only; Agent and Observer are denied.
+        assert!(!resources_read_allowed(&ag, "report://some-run-id"));
 
         // Unknown URI scheme also denied.
         assert!(!resources_read_allowed(&ag, "bogus://1"));
 
-        // Operator can read steward-analysis.
+        // Observer is also denied report://.
+        let ob = Principal::new("ob", PrincipalClass::Observer);
+        assert!(!resources_read_allowed(&ob, "report://some-run-id"));
+
+        // Operator can read steward-analysis and report://.
         let op = Principal::new("op", PrincipalClass::Operator);
         assert!(resources_read_allowed(&op, "steward-analysis://abc-123"));
+        assert!(resources_read_allowed(&op, "report://some-run-id"));
     }
 
     // ── Steward-specific capability tests ────────────────────────────
@@ -1545,8 +2841,8 @@ mod tests {
     use chrono::Utc;
     use db::pool::create_pool;
     use db::repos::{
-        artifact_contracts, artifacts, ideas, projections, rollout_contract_checks, runs, steward,
-        validation,
+        artifact_contracts, artifacts, ideas, projections, rollout_contract_checks, runs,
+        startup_repairs, steward, validation,
     };
     use domain::artifact::{Artifact, ArtifactFormat};
     use domain::artifact_contracts::{
@@ -1844,6 +3140,13 @@ mod tests {
                 cached_input_tokens: None,
                 transcript_artifact_id: None,
                 actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
             },
         )
         .await
@@ -2134,11 +3437,15 @@ mod tests {
         let idea_id = IdeaId::new();
         let run_id = RunId::new();
         ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
-        runs::insert(&pool, &make_run(run_id, idea_id))
-            .await
-            .unwrap();
-        let payload_path =
-            std::env::temp_dir().join(format!("failed-stage-evidence-report-{run_id}.json"));
+        // Use a real temp dir as artifact_root so read_failed_stage_evidence_safe
+        // passes the containment check (canonical_path must start_with artifact_root).
+        let artifact_dir = tempfile::TempDir::new().unwrap();
+        let mut run = make_run(run_id, idea_id);
+        run.artifact_root = artifact_dir.path().to_string_lossy().to_string();
+        runs::insert(&pool, &run).await.unwrap();
+        let payload_path = artifact_dir
+            .path()
+            .join(format!("failed-stage-evidence-report-{run_id}.json"));
         std::fs::write(
             &payload_path,
             serde_json::to_vec(&serde_json::json!({
@@ -2355,7 +3662,7 @@ mod tests {
     ) -> serde_json::Value {
         // P041 §6.5: exclude mcp_execution_truth (runtime-only) and
         // canonical_artifact_contracts (P057 system projection, not in golden fixtures).
-        let tool_reports = tool_value
+        let tool_reports = tool_value["reports"]
             .as_array()
             .cloned()
             .unwrap_or_default()
@@ -2372,7 +3679,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let tool_report_artifacts = report_artifact_names_from_reports(&tool_value);
+        let tool_report_artifacts = report_artifact_names_from_reports(&tool_value["reports"]);
         let resource_report_artifacts =
             report_artifact_names_from_reports(&resource_value["artifacts"]);
         serde_json::json!({
@@ -3088,7 +4395,10 @@ mod tests {
                             &server,
                             &operator_principal(),
                             "runs.cancel",
-                            serde_json::json!({ "run_id": run_id.to_string() }),
+                            serde_json::json!({
+                                "run_id": run_id.to_string(),
+                                "idempotency_key": uuid::Uuid::now_v7().to_string(),
+                            }),
                         )
                         .await;
 
@@ -3430,7 +4740,10 @@ mod tests {
             method: "tools/call".to_string(),
             params: Some(serde_json::json!({
                 "name": "steward.run_analysis",
-                "arguments": { "reason": "manual" },
+                "arguments": {
+                    "reason": "manual",
+                    "idempotency_key": uuid::Uuid::now_v7().to_string(),
+                },
             })),
         };
         let resp = server.handle_request(req, &operator_principal()).await;
@@ -3596,5 +4909,106 @@ mod tests {
             value.get("p082_recovery_matrix_readback").is_none(),
             "P082: report:// resource must NOT expose singular p082_recovery_matrix_readback"
         );
+    }
+
+    #[tokio::test]
+    async fn p082_report_resource_run_report_artifact_empty_for_non_operator() {
+        use domain::recovery_matrix;
+
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let repair_id = format!("p082-requeue:cj-server-authz:{run_id}:1");
+        let readback = recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled; requeue_generation=1.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            &now.to_rfc3339(),
+        );
+        let notes = serde_json::json!({ "p082_recovery_matrix_readback": readback }).to_string();
+        startup_repairs::record(
+            &pool,
+            &repair_id,
+            &run_id.to_string(),
+            "requeue_once",
+            now,
+            Some(&notes),
+        )
+        .await
+        .unwrap();
+        artifacts::insert(
+            &pool,
+            &Artifact {
+                id: ArtifactId::new(),
+                run_id,
+                stage_id: "state_12_workflow_complete".into(),
+                agent_id: "lead_orchestrator".into(),
+                name: "run_report".into(),
+                contract_id: "run_report_v1".into(),
+                format: ArtifactFormat::Json,
+                file_path: "/tmp/p082-report-resource-run-report.json".into(),
+                checksum_sha256: None,
+                size_bytes: Some(2),
+                provider: "system".into(),
+                model: None,
+                created_at: now,
+                is_pinned: false,
+                report_kind: Some("run_report".into()),
+                report_version: Some(1),
+                agent_execution_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        projections::rebuild_all_for_run(&pool, run_id)
+            .await
+            .unwrap();
+
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        for principal_class in [auth::PrincipalClass::Agent, auth::PrincipalClass::Observer] {
+            let principal = auth::Principal::new("non-operator", principal_class);
+            let value = server
+                .read_resource_for_principal(&format!("report://{run_id}"), &principal)
+                .await
+                .unwrap();
+            let top_level = value["p082_recovery_matrix_readbacks"]
+                .as_array()
+                .expect("report:// p082_recovery_matrix_readbacks must be an array");
+            assert!(
+                top_level.is_empty(),
+                "P082 SEC-HIGH-1: report:// top-level readbacks must be empty for non-Operators"
+            );
+
+            let artifacts = value["artifacts"].as_array().expect("artifacts array");
+            let run_report = artifacts
+                .iter()
+                .find(|artifact| artifact["name"] == serde_json::json!("run_report"))
+                .expect("run_report artifact present");
+            let artifact_readbacks = run_report["p082_recovery_matrix_readbacks"]
+                .as_array()
+                .expect("run_report artifact p082_recovery_matrix_readbacks must be an array");
+            assert!(
+                artifact_readbacks.is_empty(),
+                "P082 SEC-HIGH-1: report:// run_report artifact readbacks must be empty for non-Operators"
+            );
+        }
     }
 }

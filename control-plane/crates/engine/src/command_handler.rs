@@ -1,9 +1,12 @@
 use acp::AcpRuntimeManager;
 use anyhow::{anyhow, Context, Result};
+use auth;
 use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -12,9 +15,10 @@ use thiserror::Error as ThisError;
 use tracing::{info, warn};
 
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
-    artifact_contracts, closeout, code_writer_completion_receipts, command_journal, ideas,
-    legacy_discovery_overrides, projections, retry_operator_instructions,
+    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger,
+    approval_mutation_idempotency, approvals, artifact_contracts, audit_log, closeout,
+    code_writer_completion_receipts, command_journal, ideas, legacy_discovery_overrides,
+    mcp_command_idempotency, projections, retry_operator_instructions,
     retry_stage_execution_authorities, runs, scheduler, sessions, stages, work_items,
     workflow_conflicts,
 };
@@ -25,7 +29,8 @@ use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSet
 use domain::approval::ApprovalDecision;
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::commands::{
-    CallerContext, Command, ExtendWorkflowLoopBudgetCmd, ProposalGateSettlementAction,
+    ApprovalResolutionDecision, CallerContext, Command, ConsumeProviderQuotaHoldCmd,
+    ExtendWorkflowLoopBudgetCmd, ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd,
     SettleProposalGateCmd, WorkflowLoopBudgetExtensionCmd,
 };
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
@@ -34,9 +39,10 @@ use domain::ids::{ApprovalId, RunId};
 use domain::proposal_gate_result::{
     ProposalGateFailureClassification, ProposalGateLineage, ProposalGateResult, ProposalGateStatus,
 };
-use domain::provider::InvokeAgentCapacityConfig;
+use domain::provider::{InvokeAgentCapacityConfig, ProviderFamily};
 use domain::retry_authority::{
-    RetryAuthorityEntryKind, RetryAuthorityState, RetryStageExecutionAuthority,
+    sanitize_targeted_retry_invoke_payload, RetryAuthorityEntryKind, RetryAuthorityState,
+    RetryStageExecutionAuthority, TargetedRetryPayloadIdentity,
 };
 use domain::run::{Run, RunStatus};
 use domain::side_effect::FEATURE_P078_HEURISTIC_RETRY_GUARD_ENABLED;
@@ -58,9 +64,10 @@ use crate::event_bus::EventSender;
 use crate::preflight::{
     missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
 };
-use crate::side_effects::retry_preflight_within_tx;
+use crate::side_effects::{retry_preflight_within_tx, run_cancel_preflight_within_tx};
 use crate::synthesizers::closeout_readiness::{
-    synthesize_implementation_closeout_readiness_for_state9, SynthesizerInputs,
+    synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards, NoDiffConvergence,
+    SynthesizerInputs, NO_DIFF_CONVERGENCE_THRESHOLD,
 };
 use crate::work_queue::WorkQueue;
 
@@ -72,9 +79,16 @@ pub struct CommandHandler {
     acp: Option<Arc<AcpRuntimeManager>>,
     capacity_config: Arc<InvokeAgentCapacityConfig>,
     retry_stage_failure_injection: Option<Arc<dyn Fn(&str) -> Result<()> + Send + Sync>>,
+    /// P081 Phase 3: shared immutable boundary policy injected at daemon startup.
+    /// Used to record policy mode and fixture version in audit_log entries written
+    /// inside command transactions.
+    boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
 }
 
 pub enum CommandResult {
+    IdeaCreated {
+        idea: domain::idea::Idea,
+    },
     RunStarted {
         run_id: RunId,
     },
@@ -92,6 +106,12 @@ pub enum CommandResult {
         /// P065: binding id when operator instruction was attached.
         retry_instruction_binding_id: Option<String>,
     },
+    ProviderQuotaHoldConsumed {
+        run_id: RunId,
+        stage_id: String,
+        consumed_ledger_count: u64,
+        released_work_item_count: u64,
+    },
     WorkflowConflictTransitionSelected {
         run_id: RunId,
         conflict_id: String,
@@ -104,6 +124,12 @@ pub enum CommandResult {
         counter: String,
         previous_max: u64,
         new_max: u64,
+    },
+    CatalogSnapshotRetrofitted {
+        run_id: RunId,
+        previous_catalog_snapshot_hash: String,
+        new_catalog_snapshot_hash: String,
+        applied_policy_ids: Vec<String>,
     },
     LegacyDiscoveryOverrideCreated {
         override_id: String,
@@ -155,10 +181,44 @@ pub struct Commanded {
     pub journal_id: String,
 }
 
+/// Sentinel returned by the inner settlement-transaction idempotency check when a
+/// concurrent request already committed the same key between the outer pre-check and
+/// the settlement transaction. The caller in `handle` catches this and returns the
+/// original `Commanded { journal_id: command_journal_id }` without writing any new
+/// journal completion entry. This is intentionally private — callers outside this
+/// module must not construct or match on it directly.
+#[derive(Debug)]
+struct ConcurrentIdempotencyRaceReplay {
+    command_journal_id: String,
+    was_approved: bool,
+    approval_id: ApprovalId,
+}
+
+impl std::fmt::Display for ConcurrentIdempotencyRaceReplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "concurrent idempotency race replay for journal {}",
+            self.command_journal_id
+        )
+    }
+}
+
+impl std::error::Error for ConcurrentIdempotencyRaceReplay {}
+
 #[derive(Debug, ThisError)]
 pub enum ApprovalResolutionConflict {
+    /// Same caller + approval_id + action + idempotency_key replay after committed success.
+    /// The original result is returned without re-settling.
     #[error("Approval {approval_id} is not actionable (already resolved)")]
     AlreadyResolved {
+        approval_id: ApprovalId,
+        journal_id: String,
+    },
+    /// Approval is already terminal but the caller supplied a DIFFERENT idempotency key.
+    /// Per P081: APPROVAL_NOT_ACTIONABLE with zero settlement side effects.
+    #[error("Approval {approval_id} is terminal; a different idempotency key cannot re-settle it")]
+    ApprovalNotActionable {
         approval_id: ApprovalId,
         journal_id: String,
     },
@@ -168,6 +228,7 @@ impl ApprovalResolutionConflict {
     pub fn journal_id(&self) -> &str {
         match self {
             Self::AlreadyResolved { journal_id, .. } => journal_id,
+            Self::ApprovalNotActionable { journal_id, .. } => journal_id,
         }
     }
 }
@@ -183,6 +244,13 @@ struct CommandJournalEntry {
     caller_principal_class: Option<String>,
     caller_tool: Option<String>,
     request_id: Option<String>,
+    caller_class: Option<String>, // P081 Phase 2 - derived from CallerContext
+    // SEC-P081-M002: derived token_id for audit correlation, in-memory only (not persisted to DB).
+    token_id: Option<String>,
+    // P081 Phase 3: MCP idempotency key and boundary matrix row_id for command_journal linkage.
+    mcp_idempotency_key: Option<String>,
+    mcp_idempotency_request_hash: Option<String>,
+    boundary_row_id: Option<String>,
 }
 
 fn ensure_run_meta_root_exists(run: &Run) -> Result<()> {
@@ -755,6 +823,64 @@ fn workflow_snapshot_hash(raw: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn sanitized_audit_reason(reason: &str) -> Result<String> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("catalog snapshot retrofit reason is required");
+    }
+    if trimmed.len() > 2_000 {
+        anyhow::bail!("catalog snapshot retrofit reason exceeds 2000 bytes");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn remove_catalog_retrofit_allowed_fields(value: &mut serde_json::Value) -> Result<()> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("catalog snapshot JSON must be an object"))?;
+    object.remove("escalation_policies");
+    object.remove("backend_profiles");
+    Ok(())
+}
+
+fn validate_escalation_policy_only_catalog_retrofit(
+    previous_catalog_snapshot_json: &str,
+    new_catalog_snapshot_json: &str,
+    current_state: Option<&str>,
+    new_plan: &workflow::plan::RunPlan,
+) -> Result<Vec<String>> {
+    let mut previous: serde_json::Value = serde_json::from_str(previous_catalog_snapshot_json)
+        .context("parse previous catalog snapshot JSON")?;
+    let mut new: serde_json::Value = serde_json::from_str(new_catalog_snapshot_json)
+        .context("parse new catalog snapshot JSON")?;
+    remove_catalog_retrofit_allowed_fields(&mut previous)?;
+    remove_catalog_retrofit_allowed_fields(&mut new)?;
+    if previous != new {
+        anyhow::bail!(
+            "catalog snapshot retrofit rejected: current catalog differs outside escalation_policies/backend_profiles"
+        );
+    }
+
+    let current_state = current_state
+        .map(str::trim)
+        .filter(|state| !state.is_empty())
+        .ok_or_else(|| anyhow!("catalog snapshot retrofit requires a current workflow state"))?;
+    let applied_policy_ids = new_plan
+        .escalation_policies
+        .iter()
+        .filter(|policy| {
+            policy.enabled_default && policy.applies_to_stage_id.as_deref() == Some(current_state)
+        })
+        .map(|policy| policy.policy_id.clone())
+        .collect::<Vec<_>>();
+    if applied_policy_ids.is_empty() {
+        anyhow::bail!(
+            "catalog snapshot retrofit rejected: current catalog has no enabled escalation policy for current state {current_state}"
+        );
+    }
+    Ok(applied_policy_ids)
+}
+
 fn find_loop_budget_variable(snapshot: &serde_json::Value, counter: &str) -> Result<(String, u64)> {
     fn visit<'a>(value: &'a serde_json::Value, counter: &str) -> Option<&'a str> {
         let object = value.as_object()?;
@@ -856,10 +982,12 @@ struct PhaseBDogfoodMetricSnapshot {
 impl CommandJournalEntry {
     fn new(cmd: &Command, caller: &CallerContext) -> Self {
         let command_type = match cmd {
+            Command::CreateIdea(_) => "CreateIdea",
             Command::StartRun(_) => "StartRun",
             Command::ApproveStage(_) => "ApproveStage",
             Command::RejectStage(_) => "RejectStage",
             Command::RetryStage(_) => "RetryStage",
+            Command::ConsumeProviderQuotaHold(_) => "ConsumeProviderQuotaHold",
             Command::ResolveWorkflowConflictTransition(_) => "ResolveWorkflowConflictTransition",
             Command::ExtendWorkflowLoopBudget(_) => "ExtendWorkflowLoopBudget",
             Command::OverrideLegacyDiscoveryPolicy(_) => "OverrideLegacyDiscoveryPolicy",
@@ -869,6 +997,7 @@ impl CommandJournalEntry {
             Command::MainSyncRepairState(_) => "MainSyncRepairState",
             Command::MainSyncRecordRecoveryDecision(_) => "MainSyncRecordRecoveryDecision",
             Command::KnowledgeCapsuleIgnore(_) => "KnowledgeCapsuleIgnore",
+            Command::RetrofitCatalogSnapshot(_) => "RetrofitCatalogSnapshot",
             Command::CancelRun(_) => "CancelRun",
             Command::ResetSession(_) => "ResetSession",
             Command::RunStewardAnalysis(_) => "RunStewardAnalysis",
@@ -880,10 +1009,12 @@ impl CommandJournalEntry {
         let raw = serde_json::to_string(cmd).unwrap_or_default();
         let payload_json = crate::command_journal_redact::redact_for_journal(cmd, &raw);
         let run_id = match cmd {
+            Command::CreateIdea(_) => None,
             Command::StartRun(_) => None,
             Command::ApproveStage(c) => Some(c.run_id.to_string()),
             Command::RejectStage(c) => Some(c.run_id.to_string()),
             Command::RetryStage(c) => Some(c.run_id.to_string()),
+            Command::ConsumeProviderQuotaHold(c) => Some(c.run_id.to_string()),
             Command::ResolveWorkflowConflictTransition(c) => Some(c.run_id.to_string()),
             Command::ExtendWorkflowLoopBudget(c) => Some(c.run_id.to_string()),
             Command::OverrideLegacyDiscoveryPolicy(c) => Some(c.run_id.to_string()),
@@ -893,6 +1024,7 @@ impl CommandJournalEntry {
             Command::MainSyncRepairState(c) => Some(c.run_id.to_string()),
             Command::MainSyncRecordRecoveryDecision(c) => Some(c.run_id.to_string()),
             Command::KnowledgeCapsuleIgnore(c) => Some(c.run_id.to_string()),
+            Command::RetrofitCatalogSnapshot(c) => Some(c.run_id.to_string()),
             Command::CancelRun(c) => Some(c.run_id.to_string()),
             Command::ResetSession(c) => Some(c.run_id.to_string()),
             Command::RunStewardAnalysis(_) => None,
@@ -914,16 +1046,23 @@ impl CommandJournalEntry {
             caller_principal_class: Some(principal_class),
             caller_tool: Some(caller.caller_tool.clone()),
             request_id: caller.request_id.clone(),
+            caller_class: caller.caller_class.clone(),
+            token_id: caller.token_id.clone(),
+            mcp_idempotency_key: caller.mcp_idempotency_key.clone(),
+            mcp_idempotency_request_hash: caller.mcp_idempotency_request_hash.clone(),
+            boundary_row_id: caller.boundary_row_id.clone(),
         }
     }
 
     fn is_recorded_in_command_transaction(&self) -> bool {
         matches!(
             self.command_type,
-            "StartRun"
+            "CreateIdea"
+                | "StartRun"
                 | "ApproveStage"
                 | "RejectStage"
                 | "RetryStage"
+                | "ConsumeProviderQuotaHold"
                 | "ResolveWorkflowConflictTransition"
                 | "ExtendWorkflowLoopBudget"
                 | "OverrideLegacyDiscoveryPolicy"
@@ -932,8 +1071,69 @@ impl CommandJournalEntry {
                 | "ResolveLeadMediationConfirmation"
                 | "ResolveApproval"
                 | "SettleProposalGate"
+                | "RunStewardAnalysis"
+                | "MainSyncRequest"
+                | "MainSyncRetry"
+                | "MainSyncSetRunOverride"
+                | "MainSyncRepairState"
+                | "MainSyncRecordRecoveryDecision"
+                | "KnowledgeCapsuleIgnore"
+                | "RetrofitCatalogSnapshot"
         )
     }
+}
+
+async fn record_command_journal_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    journal: &CommandJournalEntry,
+) -> Result<()> {
+    if let Some(idempotency_key) = journal.mcp_idempotency_key.as_deref() {
+        let request_hash = journal
+            .mcp_idempotency_request_hash
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow!("MCP idempotency request hash missing for command write unit")
+            })?;
+        let tool_name = journal
+            .caller_tool
+            .as_deref()
+            .unwrap_or(journal.command_type);
+        let caller_fingerprint = journal
+            .caller_principal_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("MCP idempotency caller fingerprint missing"))?;
+        let claimed = mcp_command_idempotency::insert_pending_tx(
+            tx,
+            idempotency_key,
+            tool_name,
+            caller_fingerprint,
+            request_hash,
+            journal.boundary_row_id.as_deref(),
+        )
+        .await?;
+        if !claimed {
+            anyhow::bail!("IDEMPOTENCY_IN_FLIGHT: idempotency key already claimed or committed");
+        }
+    }
+
+    command_journal::record_tx(
+        tx,
+        &journal.id,
+        journal.command_type,
+        &journal.payload_json,
+        journal.run_id.as_deref(),
+        journal.created_at,
+        journal.caller_surface.as_deref(),
+        journal.caller_principal_id.as_deref(),
+        journal.caller_principal_class.as_deref(),
+        journal.caller_tool.as_deref(),
+        journal.request_id.as_deref(),
+        journal.caller_class.as_deref(),
+        journal.mcp_idempotency_key.as_deref(),
+        journal.boundary_row_id.as_deref(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))
 }
 
 const MAX_ROLLOUT_CONTRACT_PREFLIGHT_POLICY_JSON_BYTES: usize = 64 * 1024;
@@ -1203,6 +1403,29 @@ fn compile_run_plan_for_run(run: &Run) -> Result<Option<workflow::plan::RunPlan>
             )?)),
             _ => Ok(None),
         },
+    }
+}
+
+/// Compile a RunPlan exclusively from frozen snapshots stamped at run start.
+/// Returns `Ok(None)` when no frozen snapshots are available and never falls
+/// back to mutable on-disk YAML.
+pub fn compile_run_plan_from_snapshot(run: &Run) -> Result<Option<workflow::plan::RunPlan>> {
+    match (
+        run.workflow_snapshot_json.as_deref(),
+        run.catalog_snapshot_json.as_deref(),
+    ) {
+        (Some(workflow_snapshot_json), Some(catalog_snapshot_json))
+            if !workflow_snapshot_json.trim().is_empty()
+                && !catalog_snapshot_json.trim().is_empty() =>
+        {
+            let catalog_path = run.agent_catalog_yaml_path.as_deref().unwrap_or(".");
+            Ok(Some(workflow::compiler::compile_from_snapshot_json(
+                workflow_snapshot_json,
+                catalog_snapshot_json,
+                catalog_path,
+            )?))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -1691,6 +1914,7 @@ impl CommandHandler {
             acp: None,
             capacity_config: Arc::new(capacity_config),
             retry_stage_failure_injection: None,
+            boundary_policy: None,
         }
     }
 
@@ -1743,7 +1967,14 @@ impl CommandHandler {
             acp: Some(acp),
             capacity_config: Arc::new(capacity_config),
             retry_stage_failure_injection: None,
+            boundary_policy: None,
         }
+    }
+
+    /// P081 Phase 3: inject the shared immutable BoundaryPolicy for audit-log entries.
+    pub fn with_boundary_policy(mut self, policy: Arc<auth::boundary::BoundaryPolicy>) -> Self {
+        self.boundary_policy = Some(policy);
+        self
     }
 
     async fn begin_command_transaction(
@@ -1810,6 +2041,11 @@ impl CommandHandler {
         {
             anyhow::bail!("forbidden: RetryStage operator_instruction requires operator principal");
         }
+        if matches!(&cmd, Command::ConsumeProviderQuotaHold(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: ConsumeProviderQuotaHold requires operator principal");
+        }
         if matches!(&cmd, Command::ResolveWorkflowConflictTransition(_))
             && caller.principal_class != PrincipalClass::Operator
         {
@@ -1839,6 +2075,11 @@ impl CommandHandler {
         {
             anyhow::bail!("forbidden: Proposal 064 commands require operator principal");
         }
+        if matches!(&cmd, Command::RetrofitCatalogSnapshot(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: RetrofitCatalogSnapshot requires operator principal");
+        }
         if matches!(&cmd, Command::ResolveApproval(_))
             && caller.principal_class != PrincipalClass::Operator
         {
@@ -1866,12 +2107,226 @@ impl CommandHandler {
                 journal.caller_principal_class.as_deref(),
                 journal.caller_tool.as_deref(),
                 journal.request_id.as_deref(),
+                journal.caller_class.as_deref(),
+                journal.mcp_idempotency_key.as_deref(),
+                journal.boundary_row_id.as_deref(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
         }
 
+        // P081 Phase 5: idempotency short-circuit for ResolveApproval.
+        // SEC-P081-MED-001: Use a dedicated BEGIN IMMEDIATE transaction for the lookup
+        // to serialize against the settlement transaction and prevent concurrent retries
+        // from observing the absence of a record before the first commit lands.
+        if let Command::ResolveApproval(ref c) = cmd {
+            if let Some(ref key) = c.idempotency_key {
+                let action_name = match c.decision {
+                    ApprovalResolutionDecision::Approved => "approve",
+                    ApprovalResolutionDecision::Rejected => "reject",
+                };
+                let current_fp = {
+                    let canonical = format!(
+                        "{}\x1e{}",
+                        journal.caller_principal_id.as_deref().unwrap_or(""),
+                        journal.caller_class.as_deref().unwrap_or("")
+                    );
+                    let mut h = Sha256::new();
+                    h.update(canonical.as_bytes());
+                    format!("{:x}", h.finalize())
+                };
+                // SEC-P081-M002: canonical request hash covers action, approval_id,
+                // caller_class, and principal_id. Excludes request_id, timestamps, and
+                // retry metadata so retries with the same logical request compare equal.
+                let current_request_hash = {
+                    let canonical = format!(
+                        "{}\x1e{}\x1e{}\x1e{}",
+                        action_name,
+                        c.approval_id,
+                        journal.caller_class.as_deref().unwrap_or(""),
+                        journal.caller_principal_id.as_deref().unwrap_or(""),
+                    );
+                    let mut h = Sha256::new();
+                    h.update(canonical.as_bytes());
+                    format!("{:x}", h.finalize())
+                };
+                // Open a short-lived BEGIN IMMEDIATE to serialize against settlement.
+                match db::pool::begin_immediate_with_retry(&self.pool, "idempotency.check").await {
+                    Ok(mut check_tx) => {
+                        let lookup =
+                            approval_mutation_idempotency::find_by_key_tx(&mut check_tx, key).await;
+                        drop(check_tx); // release lock before settlement starts
+                        match lookup {
+                            Ok(Some(record)) => {
+                                // SEC-P081-M002: check request_hash first when present.
+                                // Same key + different canonical request → IDEMPOTENCY_CONFLICT.
+                                if let (Some(stored_hash), _) =
+                                    (&record.request_hash, &current_request_hash)
+                                {
+                                    if stored_hash != &current_request_hash {
+                                        return Err(anyhow::anyhow!("IDEMPOTENCY_CONFLICT"));
+                                    }
+                                }
+                                if record.approval_id == c.approval_id.to_string()
+                                    && record.action == action_name
+                                    && record.caller_fingerprint == current_fp
+                                {
+                                    let replay_result = match c.decision {
+                                        ApprovalResolutionDecision::Approved => {
+                                            CommandResult::StageApproved {
+                                                approval_id: c.approval_id,
+                                            }
+                                        }
+                                        ApprovalResolutionDecision::Rejected => {
+                                            CommandResult::StageRejected {
+                                                approval_id: c.approval_id,
+                                            }
+                                        }
+                                    };
+                                    // P081 Defect8: write approval_idempotency_duplicate audit row.
+                                    // Best-effort: inability to write must not block returning the cached result.
+                                    {
+                                        db::metrics::record_p081_approval_idempotency_duplicate(
+                                            action_name,
+                                            journal.caller_class.as_deref().unwrap_or("unknown"),
+                                        );
+                                        let audit_id = uuid::Uuid::now_v7().to_string();
+                                        let now_ms = chrono::Utc::now().timestamp_millis();
+                                        let key_digest = {
+                                            let mut h = Sha256::new();
+                                            h.update(key.as_bytes());
+                                            let full = h.finalize();
+                                            full[..8]
+                                                .iter()
+                                                .map(|b| format!("{:02x}", b))
+                                                .collect::<String>()
+                                        };
+                                        let raw_payload = serde_json::json!({
+                                            "idempotency_key_digest": key_digest,
+                                            "approval_id": record.approval_id,
+                                            "action": action_name,
+                                        })
+                                        .to_string();
+                                        let (stored_payload, _, truncated) =
+                                            audit_log::build_envelope(&raw_payload);
+                                        let transport = match journal.caller_surface.as_deref() {
+                                            Some("mcp") => "mcp_tools_call",
+                                            _ => "graphql_mutation",
+                                        };
+                                        // P081 Defect4: audit_log CHECK requires non-empty request_id.
+                                        // Fall back to the journal id (unique, non-empty) rather than "".
+                                        let effective_request_id = journal
+                                            .request_id
+                                            .as_deref()
+                                            .filter(|s| !s.is_empty())
+                                            .unwrap_or(&journal.id);
+                                        let (dup_policy_mode, dup_fixture_ver) =
+                                            match &self.boundary_policy {
+                                                Some(p) => (
+                                                    p.mode().to_string(),
+                                                    p.fixture_digest().to_string(),
+                                                ),
+                                                None => (
+                                                    "legacy_compat".to_string(),
+                                                    "embedded".to_string(),
+                                                ),
+                                            };
+                                        let entry = audit_log::AuditEntry {
+                                            id: &audit_id,
+                                            request_id: effective_request_id,
+                                            timestamp_ms: now_ms,
+                                            event_type: "approval_idempotency_duplicate",
+                                            principal_id: journal.caller_principal_id.as_deref(),
+                                            principal_class: journal
+                                                .caller_principal_class
+                                                .as_deref(),
+                                            caller_class: journal.caller_class.as_deref(),
+                                            token_id: journal.token_id.as_deref(),
+                                            transport,
+                                            action_attempted: action_name,
+                                            decision: "allow",
+                                            denial_reason_code: None,
+                                            row_id: None,
+                                            env_gate_state: None,
+                                            source_ip_hash_or_local_process_id: None,
+                                            boundary_policy_mode: &dup_policy_mode,
+                                            fixture_version: &dup_fixture_ver,
+                                            payload: &stored_payload,
+                                            original_payload_bytes: if truncated {
+                                                Some(&raw_payload)
+                                            } else {
+                                                None
+                                            },
+                                            diagnostic_truncated: truncated,
+                                            checkpoint_id: None,
+                                            created_at_ms: now_ms,
+                                        };
+                                        if let Err(e) = audit_log::append(&self.pool, &entry).await
+                                        {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "approval_idempotency_duplicate audit write failed (best-effort); returning cached result"
+                                            );
+                                        }
+                                    }
+                                    return Ok(Commanded {
+                                        result: replay_result,
+                                        journal_id: record.command_journal_id,
+                                    });
+                                }
+                                return Err(anyhow::anyhow!("IDEMPOTENCY_CONFLICT"));
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "approval_mutation_idempotency lookup failed; failing closed"
+                                );
+                                return Err(anyhow::anyhow!(
+                                    "IDEMPOTENCY_LOOKUP_ERROR: storage error during idempotency check"
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "failed to open idempotency check transaction; failing closed"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "IDEMPOTENCY_LOOKUP_ERROR: could not open check transaction"
+                        ));
+                    }
+                }
+            }
+        }
+
         let result = self.execute_command(cmd, &journal, &caller).await;
+
+        // P081: Handle concurrent idempotency race replay from inner settlement transaction.
+        // When two requests with the same key race past the pre-check, the second one's
+        // settlement transaction finds the first one's committed record and returns this
+        // sentinel. Convert it to Ok(Commanded) with the ORIGINAL journal_id so callers
+        // get a consistent idempotent response. The fresh journal entry for this request
+        // was never committed (the settlement transaction was rolled back), so we must not
+        // call complete_entry / fail_entry for it — returning early avoids that.
+        if let Err(ref e) = result {
+            if let Some(replay) = e.downcast_ref::<ConcurrentIdempotencyRaceReplay>() {
+                let replay_result = if replay.was_approved {
+                    CommandResult::StageApproved {
+                        approval_id: replay.approval_id,
+                    }
+                } else {
+                    CommandResult::StageRejected {
+                        approval_id: replay.approval_id,
+                    }
+                };
+                return Ok(Commanded {
+                    result: replay_result,
+                    journal_id: replay.command_journal_id.clone(),
+                });
+            }
+        }
 
         // Completion/failure are best-effort — log errors but don't fail the command
         if !journal.is_recorded_in_command_transaction() {
@@ -1913,6 +2368,31 @@ impl CommandHandler {
     ) -> Result<CommandResult> {
         let journal_id = journal.id.as_str();
         match cmd {
+            Command::CreateIdea(c) => {
+                let idea = domain::idea::Idea {
+                    id: domain::ids::IdeaId::new(),
+                    title: c.title,
+                    body: c.body,
+                    workspace_root_path: c.workspace_root_path,
+                    project_key: c.project_key,
+                    status: domain::idea::IdeaStatus::Draft,
+                    created_at: Utc::now(),
+                    archived_at: None,
+                };
+                let mut tx = self
+                    .begin_command_transaction("command.CreateIdea", journal.id.clone())
+                    .await?;
+                record_command_journal_tx(&mut tx, journal).await?;
+                ideas::insert_tx(&mut tx, &idea).await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await.context("commit create idea command")?;
+                Ok(CommandResult::IdeaCreated { idea })
+            }
+            Command::ConsumeProviderQuotaHold(c) => {
+                return self
+                    .consume_provider_quota_hold(c, journal, journal_id)
+                    .await;
+            }
             Command::StartRun(c) => {
                 let now = Utc::now();
                 let run_id = RunId::new();
@@ -2010,21 +2490,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.StartRun", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
                 let idea = if let Some(idea) = ideas::find_by_id_tx(&mut tx, c.idea_id).await? {
                     idea
                 } else {
@@ -2263,21 +2729,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.ApproveStage", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
                 let pending = approvals::list_by_run_tx(&mut tx, c.run_id).await?;
                 let approval = if let Some(approval) = pending.into_iter().find(|a| {
                     a.stage_id == c.stage_id
@@ -2393,21 +2845,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.RejectStage", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
                 let pending = approvals::list_by_run_tx(&mut tx, c.run_id).await?;
                 let approval = if let Some(approval) = pending.into_iter().find(|a| {
                     a.stage_id == c.stage_id
@@ -2548,21 +2986,7 @@ impl CommandHandler {
                 let mut retry_tx = self
                     .begin_command_transaction("command.RetryStage", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut retry_tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut retry_tx, journal).await?;
                 self.maybe_inject_retry_stage_failure("record_journal")?;
 
                 let run_stages = stages::list_by_run_tx(&mut retry_tx, c.run_id).await?;
@@ -3032,21 +3456,7 @@ impl CommandHandler {
                         journal.id.clone(),
                     )
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
 
                 let run = runs::find_by_id_tx(&mut tx, c.run_id)
                     .await?
@@ -3320,21 +3730,7 @@ impl CommandHandler {
                         journal.id.clone(),
                     )
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
 
                 let run = runs::find_by_id_tx(&mut tx, run_id)
                     .await?
@@ -3397,6 +3793,170 @@ impl CommandHandler {
                 })
             }
 
+            Command::RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd {
+                run_id,
+                expected_catalog_snapshot_hash,
+                reason,
+                scope: _,
+            }) => {
+                let reason = sanitized_audit_reason(&reason)?;
+                let now = Utc::now();
+                let tx_started = Instant::now();
+                let mut tx = self
+                    .begin_command_transaction(
+                        "command.RetrofitCatalogSnapshot",
+                        journal.id.clone(),
+                    )
+                    .await?;
+                record_command_journal_tx(&mut tx, journal).await?;
+
+                let run = runs::find_by_id_tx(&mut tx, run_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Run {run_id} not found"))?;
+                if run.status != RunStatus::Blocked {
+                    anyhow::bail!(
+                        "catalog snapshot retrofit requires blocked run; current status is {}",
+                        run.status
+                    );
+                }
+                if work_items::has_pending_or_running_by_run_tx(&mut tx, run_id).await? {
+                    anyhow::bail!(
+                        "catalog snapshot retrofit rejected: run has pending/running work items"
+                    );
+                }
+                let previous_catalog_snapshot_hash = run
+                    .catalog_snapshot_hash
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("Run {run_id} has no frozen catalog snapshot hash"))?
+                    .to_string();
+                if previous_catalog_snapshot_hash != expected_catalog_snapshot_hash {
+                    anyhow::bail!(
+                        "catalog snapshot hash mismatch: expected {}, found {}",
+                        expected_catalog_snapshot_hash,
+                        previous_catalog_snapshot_hash
+                    );
+                }
+                let previous_catalog_snapshot_json = run
+                    .catalog_snapshot_json
+                    .as_deref()
+                    .filter(|raw| !raw.trim().is_empty())
+                    .ok_or_else(|| anyhow!("Run {run_id} has no frozen catalog snapshot JSON"))?;
+                let workflow_yaml_path = run
+                    .workflow_yaml_path
+                    .as_deref()
+                    .filter(|path| !path.trim().is_empty())
+                    .ok_or_else(|| anyhow!("Run {run_id} has no workflow YAML path"))?;
+                let agent_catalog_yaml_path = run
+                    .agent_catalog_yaml_path
+                    .as_deref()
+                    .filter(|path| !path.trim().is_empty())
+                    .ok_or_else(|| anyhow!("Run {run_id} has no agent catalog YAML path"))?;
+                let new_plan =
+                    workflow::compiler::compile(workflow_yaml_path, agent_catalog_yaml_path)
+                        .context(
+                            "compile current workflow/catalog for catalog snapshot retrofit",
+                        )?;
+                if let Some(frozen_workflow_hash) = run.workflow_snapshot_hash.as_deref() {
+                    if frozen_workflow_hash != new_plan.workflow_snapshot_hash {
+                        anyhow::bail!(
+                            "catalog snapshot retrofit rejected: workflow snapshot hash changed from {} to {}",
+                            frozen_workflow_hash,
+                            new_plan.workflow_snapshot_hash
+                        );
+                    }
+                }
+                if previous_catalog_snapshot_hash == new_plan.catalog_snapshot_hash {
+                    anyhow::bail!(
+                        "catalog snapshot retrofit rejected: current catalog hash is unchanged"
+                    );
+                }
+                let applied_policy_ids = validate_escalation_policy_only_catalog_retrofit(
+                    previous_catalog_snapshot_json,
+                    &new_plan.catalog_snapshot_json,
+                    run.current_state.as_deref(),
+                    &new_plan,
+                )?;
+                let new_catalog_snapshot_hash = new_plan.catalog_snapshot_hash.clone();
+
+                sqlx::query(
+                    "UPDATE runs SET catalog_snapshot_json = ?1, catalog_snapshot_hash = ?2 WHERE id = ?3",
+                )
+                .bind(&new_plan.catalog_snapshot_json)
+                .bind(&new_catalog_snapshot_hash)
+                .bind(run_id.to_string())
+                .execute(&mut **tx)
+                .await
+                .context("persist retrofitted catalog snapshot")?;
+                db::repos::workflow_conflicts::record_phase_c_validation_outcome_tx(
+                    &mut tx,
+                    run_id,
+                    "pass",
+                    "catalog_snapshot_retrofit",
+                    now,
+                )
+                .await?;
+                let audit_note = serde_json::json!({
+                    "reason": reason,
+                    "scope": "escalation_policy_only",
+                    "previous_catalog_snapshot_hash": previous_catalog_snapshot_hash.clone(),
+                    "new_catalog_snapshot_hash": new_catalog_snapshot_hash.clone(),
+                    "applied_policy_ids": applied_policy_ids.clone(),
+                });
+                let raw_audit_payload = audit_note.to_string();
+                let (stored_audit_payload, _payload_sha, audit_truncated) =
+                    audit_log::build_envelope(&raw_audit_payload);
+                let (policy_mode, fixture_ver) = match &self.boundary_policy {
+                    Some(p) => (p.mode().to_string(), p.fixture_digest().to_string()),
+                    None => ("legacy_compat".to_string(), "embedded".to_string()),
+                };
+                let audit_request_id = journal
+                    .request_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(journal.id.as_str());
+                let audit_id = uuid::Uuid::now_v7().to_string();
+                let audit_entry = audit_log::AuditEntry {
+                    id: &audit_id,
+                    request_id: audit_request_id,
+                    timestamp_ms: now.timestamp_millis(),
+                    event_type: "run_catalog_snapshot_retrofit",
+                    principal_id: journal.caller_principal_id.as_deref(),
+                    principal_class: journal.caller_principal_class.as_deref(),
+                    caller_class: journal.caller_class.as_deref(),
+                    token_id: journal.token_id.as_deref(),
+                    transport: "mcp_tools_call",
+                    action_attempted: "runs.retrofit_catalog_snapshot",
+                    decision: "allow",
+                    denial_reason_code: None,
+                    row_id: Some("p081.agent_operator.mcp_tools_call.command"),
+                    env_gate_state: None,
+                    source_ip_hash_or_local_process_id: None,
+                    boundary_policy_mode: &policy_mode,
+                    fixture_version: &fixture_ver,
+                    payload: &stored_audit_payload,
+                    original_payload_bytes: if audit_truncated {
+                        Some(&raw_audit_payload)
+                    } else {
+                        None
+                    },
+                    diagnostic_truncated: audit_truncated,
+                    checkpoint_id: None,
+                    created_at_ms: now.timestamp_millis(),
+                };
+                audit_log::append_tx(&mut tx, &audit_entry).await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.RetrofitCatalogSnapshot", tx_started);
+                projections::rebuild_all_for_run(&self.pool, run_id).await?;
+
+                Ok(CommandResult::CatalogSnapshotRetrofitted {
+                    run_id,
+                    previous_catalog_snapshot_hash,
+                    new_catalog_snapshot_hash,
+                    applied_policy_ids,
+                })
+            }
+
             Command::OverrideLegacyDiscoveryPolicy(c) => {
                 let run = runs::find_by_id(&self.pool, c.run_id)
                     .await?
@@ -3452,21 +4012,7 @@ impl CommandHandler {
                         journal.id.clone(),
                     )
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
                 let created =
                     legacy_discovery_overrides::create_for_pending_retry_tx(&mut tx, &input)
                         .await?;
@@ -3490,21 +4036,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.CancelRun", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
 
                 let run = if let Some(run) = runs::find_by_id_tx(&mut tx, c.run_id).await? {
                     run
@@ -3536,10 +4068,9 @@ impl CommandHandler {
                     return Err(error);
                 }
 
-                // P082-R13: Cancel proceeds even when unresolved side effects exist.
-                // begin_settlement_tx detects side effects via p082_cancellation_readback_tx
-                // and records R13 held-state in the settlement log. Side effects are NOT
-                // touched by cancellation — they require explicit operator reconciliation.
+                // P082-R13: cancellation may start while side effects are unresolved, but
+                // final settlement stays held/cancelling until the side-effect ledger is
+                // reconciled. Side effects are NOT touched by cancellation.
                 let settlement = cancellation::begin_settlement_tx(
                     &mut tx,
                     c.run_id,
@@ -3588,17 +4119,34 @@ impl CommandHandler {
                     .artifact_base
                     .or_else(|| std::env::var("CHAINWORKS_META_ROOT").ok())
                     .unwrap_or_else(|| ".chainworks".into());
-                self.work_queue
-                    .enqueue(
-                        WorkItemKind::StewardAnalysis,
-                        None,
-                        None,
-                        serde_json::json!({
+                let now = Utc::now();
+                let tx_started = Instant::now();
+                let mut tx = self
+                    .begin_command_transaction("command.RunStewardAnalysis", journal.id.clone())
+                    .await?;
+                record_command_journal_tx(&mut tx, journal).await?;
+                work_items::enqueue_tx(
+                    &mut tx,
+                    &WorkItem {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        kind: WorkItemKind::StewardAnalysis,
+                        payload_json: serde_json::to_string(&serde_json::json!({
                             "reason": c.reason,
                             "artifact_base": artifact_base,
-                        }),
-                    )
-                    .await?;
+                        }))?,
+                        status: WorkItemStatus::Pending,
+                        run_id: None,
+                        stage_id: None,
+                        created_at: now,
+                        scheduled_at: now,
+                        attempt_count: 0,
+                        last_error: None,
+                    },
+                )
+                .await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.RunStewardAnalysis", tx_started);
                 Ok(CommandResult::StewardAnalysisQueued)
             }
 
@@ -3616,21 +4164,7 @@ impl CommandHandler {
                         journal.id.clone(),
                     )
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
 
                 // Validate the confirmation exists and is pending
                 let confirmation = db::repos::lead_mediation_confirmations::find_by_id_tx(
@@ -3890,21 +4424,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.ResetSession", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
 
                 let mut generation_ids_to_close = Vec::new();
 
@@ -3999,12 +4519,14 @@ impl CommandHandler {
 
             // ── P072: Converged approval resolution by approval_id ──────
             Command::ResolveApproval(c) => {
-                use domain::commands::ApprovalResolutionDecision;
-
                 let now = Utc::now();
                 let decision = match c.decision {
                     ApprovalResolutionDecision::Approved => ApprovalDecision::Granted,
                     ApprovalResolutionDecision::Rejected => ApprovalDecision::Rejected,
+                };
+                let action_name = match c.decision {
+                    ApprovalResolutionDecision::Approved => "approve",
+                    ApprovalResolutionDecision::Rejected => "reject",
                 };
 
                 let has_post_tasks = if decision == ApprovalDecision::Granted {
@@ -4018,23 +4540,9 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.ResolveApproval", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
 
-                // Verify the approval exists and is still actionable.
+                // P081: check terminal state BEFORE command_journal::record_tx so that
+                // denied/terminal attempts create zero command_journal rows.
                 let approval = approvals::find_by_id_tx(&mut tx, c.approval_id).await?;
                 let approval = match approval {
                     Some(a)
@@ -4046,60 +4554,228 @@ impl CommandHandler {
                         a
                     }
                     Some(_) => {
-                        let error = ApprovalResolutionConflict::AlreadyResolved {
+                        // P081 committed-unack replay: if the caller supplied an idempotency key,
+                        // check whether the record for this key was committed by the first attempt
+                        // (visible under the same BEGIN IMMEDIATE transaction). If found and the
+                        // key matches caller+action, return the original result without writing
+                        // new side effects. This closes the race between concurrent retries that
+                        // both passed the precheck before the first attempt committed.
+                        if let Some(ref key) = c.idempotency_key {
+                            let caller_fp = {
+                                let canonical = format!(
+                                    "{}\x1e{}",
+                                    journal.caller_principal_id.as_deref().unwrap_or(""),
+                                    journal.caller_class.as_deref().unwrap_or("")
+                                );
+                                let mut h = Sha256::new();
+                                h.update(canonical.as_bytes());
+                                format!("{:x}", h.finalize())
+                            };
+                            if let Ok(Some(record)) =
+                                approval_mutation_idempotency::find_by_key_tx(&mut tx, key).await
+                            {
+                                if record.approval_id == c.approval_id.to_string()
+                                    && record.action == action_name
+                                    && record.caller_fingerprint == caller_fp
+                                {
+                                    drop(tx);
+                                    db::pool::log_write_transaction(
+                                        "command.ResolveApproval",
+                                        tx_started,
+                                    );
+                                    db::metrics::record_p081_boundary_commit_transaction_latency(
+                                        "graphql_mutation",
+                                        action_name,
+                                        "idempotency_replay",
+                                        tx_started.elapsed(),
+                                    );
+                                    // P081 fix: return sentinel with original journal_id so
+                                    // the outer handle() returns Commanded { journal_id:
+                                    // record.command_journal_id } instead of the fresh,
+                                    // never-committed journal id for this request.
+                                    let was_approved =
+                                        matches!(c.decision, ApprovalResolutionDecision::Approved);
+                                    return Err(anyhow::Error::new(
+                                        ConcurrentIdempotencyRaceReplay {
+                                            command_journal_id: record.command_journal_id.clone(),
+                                            was_approved,
+                                            approval_id: c.approval_id,
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                        drop(tx);
+                        db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                        db::metrics::record_p081_boundary_commit_transaction_latency(
+                            "graphql_mutation",
+                            action_name,
+                            "terminal_rejected",
+                            tx_started.elapsed(),
+                        );
+                        // P081: approval is terminal but the idempotency key didn't match
+                        // (different key, or no key supplied). This is NOT a same-key replay —
+                        // it's a new attempt to re-settle a terminal approval, which is forbidden.
+                        // Return APPROVAL_NOT_ACTIONABLE (not AlreadyResolved) per P081 contract.
+                        return Err(ApprovalResolutionConflict::ApprovalNotActionable {
                             approval_id: c.approval_id,
                             journal_id: journal.id.clone(),
-                        };
-                        command_journal::fail_entry_tx(
-                            &mut tx,
-                            &journal.id,
-                            Utc::now(),
-                            &error.to_string(),
-                        )
-                        .await?;
-                        tx.commit().await?;
-                        db::pool::log_write_transaction("command.ResolveApproval", tx_started);
-                        return Err(error.into());
+                        }
+                        .into());
                     }
                     None => {
-                        let error = anyhow!("Approval {} not found", c.approval_id);
-                        command_journal::fail_entry_tx(
-                            &mut tx,
-                            &journal.id,
-                            Utc::now(),
-                            &error.to_string(),
-                        )
-                        .await?;
-                        tx.commit().await?;
+                        drop(tx);
                         db::pool::log_write_transaction("command.ResolveApproval", tx_started);
-                        return Err(error);
+                        db::metrics::record_p081_boundary_commit_transaction_latency(
+                            "graphql_mutation",
+                            action_name,
+                            "not_found",
+                            tx_started.elapsed(),
+                        );
+                        return Err(anyhow!("Approval {} not found", c.approval_id));
                     }
                 };
                 if approval.run_id != c.run_id || approval.stage_id != c.stage_id {
-                    let error = anyhow!(
+                    let err = anyhow!(
                         "Approval {} provenance mismatch: command run/stage {}:{} but approval belongs to {}:{}",
-                        c.approval_id,
-                        c.run_id,
-                        c.stage_id,
-                        approval.run_id,
-                        approval.stage_id
+                        c.approval_id, c.run_id, c.stage_id, approval.run_id, approval.stage_id
                     );
-                    command_journal::fail_entry_tx(
-                        &mut tx,
-                        &journal.id,
-                        Utc::now(),
-                        &error.to_string(),
-                    )
-                    .await?;
-                    tx.commit().await?;
+                    drop(tx);
                     db::pool::log_write_transaction("command.ResolveApproval", tx_started);
-                    return Err(error);
+                    db::metrics::record_p081_boundary_commit_transaction_latency(
+                        "graphql_mutation",
+                        action_name,
+                        "provenance_mismatch",
+                        tx_started.elapsed(),
+                    );
+                    return Err(err);
                 }
                 let authoritative_run_id = approval.run_id;
                 let authoritative_stage_id = approval.stage_id.clone();
 
+                // Approval is actionable: record in command_journal inside the transaction.
+                record_command_journal_tx(&mut tx, journal).await?;
+
                 approvals::resolve_tx(&mut tx, approval.id, decision.clone(), now, c.rationale)
                     .await?;
+
+                // P081 Phase 5: idempotency record in same transaction as settlement.
+                if let Some(ref key) = c.idempotency_key {
+                    // SEC-P081-001: Use SHA-256 over canonical fields separated by RS (0x1E)
+                    // so principal ids containing '/' cannot collide with caller_class.
+                    let caller_fp = {
+                        let canonical = format!(
+                            "{}\x1e{}",
+                            journal.caller_principal_id.as_deref().unwrap_or(""),
+                            journal.caller_class.as_deref().unwrap_or("")
+                        );
+                        let mut h = Sha256::new();
+                        h.update(canonical.as_bytes());
+                        format!("{:x}", h.finalize())
+                    };
+                    // SEC-P081-M002: canonical request hash for conflict detection.
+                    let req_hash = {
+                        let canonical = format!(
+                            "{}\x1e{}\x1e{}\x1e{}",
+                            action_name,
+                            c.approval_id,
+                            journal.caller_class.as_deref().unwrap_or(""),
+                            journal.caller_principal_id.as_deref().unwrap_or(""),
+                        );
+                        let mut h = Sha256::new();
+                        h.update(canonical.as_bytes());
+                        format!("{:x}", h.finalize())
+                    };
+                    let record = approval_mutation_idempotency::build_record(
+                        key,
+                        &c.approval_id.to_string(),
+                        action_name,
+                        &caller_fp,
+                        journal.request_id.as_deref(),
+                        Some(&req_hash),
+                        &journal.id,
+                        None,
+                    );
+                    approval_mutation_idempotency::insert_tx(&mut tx, &record)
+                        .await
+                        .map_err(|e| {
+                            // A UNIQUE constraint violation means a concurrent request with the same
+                            // idempotency_key committed first. Map to IDEMPOTENCY_CONFLICT so callers
+                            // get the documented error code rather than a generic failure.
+                            let msg = e.to_string();
+                            if msg.contains("UNIQUE") || msg.contains("unique") {
+                                anyhow::anyhow!("IDEMPOTENCY_CONFLICT")
+                            } else {
+                                anyhow::anyhow!("idempotency insert failed: {e}")
+                            }
+                        })?;
+                }
+
+                // P081 Phase 3: audit_log row for the allowed approval resolution.
+                // Committed in the same write unit as command_journal and settlement.
+                {
+                    let audit_id = uuid::Uuid::now_v7().to_string();
+                    let action_attempted = match c.decision {
+                        ApprovalResolutionDecision::Approved => "approveApproval",
+                        ApprovalResolutionDecision::Rejected => "rejectApproval",
+                    };
+                    let transport = match caller.surface {
+                        domain::commands::CallerSurface::Graphql => "graphql_mutation",
+                        domain::commands::CallerSurface::Mcp => "mcp_tools_call",
+                    };
+                    let audit_payload = serde_json::json!({
+                        "approval_id": c.approval_id.to_string(),
+                        "run_id": authoritative_run_id.to_string(),
+                        "stage_id": authoritative_stage_id,
+                        "decision": action_name,
+                    })
+                    .to_string();
+                    let (policy_mode, fixture_ver) = match &self.boundary_policy {
+                        Some(p) => (p.mode().to_string(), p.fixture_digest().to_string()),
+                        None => ("legacy_compat".to_string(), "embedded".to_string()),
+                    };
+                    let ts_ms = now.timestamp_millis();
+                    // Use journal.id as synthetic request_id when caller didn't supply one,
+                    // since the CHECK constraint requires length > 0.
+                    let audit_request_id = journal
+                        .request_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(journal.id.as_str());
+                    let audit_entry = audit_log::AuditEntry {
+                        id: &audit_id,
+                        request_id: audit_request_id,
+                        timestamp_ms: ts_ms,
+                        event_type: "approval_resolved",
+                        principal_id: journal.caller_principal_id.as_deref(),
+                        principal_class: journal.caller_principal_class.as_deref(),
+                        caller_class: journal.caller_class.as_deref(),
+                        token_id: journal.token_id.as_deref(),
+                        transport,
+                        action_attempted,
+                        decision: "allow",
+                        denial_reason_code: None,
+                        row_id: Some(match transport {
+                            "graphql_mutation" => {
+                                "p081.ui_operator.graphql_mutation.approval_action"
+                            }
+                            _ => "p081.agent_operator.mcp_tools_call.command",
+                        }),
+                        env_gate_state: None,
+                        source_ip_hash_or_local_process_id: None,
+                        boundary_policy_mode: &policy_mode,
+                        fixture_version: &fixture_ver,
+                        payload: &audit_payload,
+                        original_payload_bytes: None,
+                        diagnostic_truncated: false,
+                        checkpoint_id: None,
+                        created_at_ms: ts_ms,
+                    };
+                    audit_log::append_tx(&mut tx, &audit_entry).await.map_err(|e| {
+                        tracing::warn!(error = %e, "audit_log append failed in ResolveApproval");
+                        e.context("audit_log append failed: failing closed per P081")
+                    })?;
+                }
 
                 let mut stage_status_event = None;
                 let mut should_enqueue_advance = decision == ApprovalDecision::Granted;
@@ -4205,6 +4881,12 @@ impl CommandHandler {
                 command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
                 tx.commit().await?;
                 db::pool::log_write_transaction("command.ResolveApproval", tx_started);
+                db::metrics::record_p081_boundary_commit_transaction_latency(
+                    "graphql_mutation",
+                    action_name,
+                    "committed",
+                    tx_started.elapsed(),
+                );
                 self.work_queue
                     .publish_scheduler_notification(scheduler_refresh);
                 if let Some((stage_execution_id, status)) = stage_status_event {
@@ -4308,21 +4990,7 @@ impl CommandHandler {
                 let mut tx = self
                     .begin_command_transaction("command.SettleProposalGate", journal.id.clone())
                     .await?;
-                command_journal::record_tx(
-                    &mut tx,
-                    &journal.id,
-                    journal.command_type,
-                    &journal.payload_json,
-                    journal.run_id.as_deref(),
-                    journal.created_at,
-                    journal.caller_surface.as_deref(),
-                    journal.caller_principal_id.as_deref(),
-                    journal.caller_principal_class.as_deref(),
-                    journal.caller_tool.as_deref(),
-                    journal.request_id.as_deref(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+                record_command_journal_tx(&mut tx, journal).await?;
                 command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
                 tx.commit().await?;
                 db::pool::log_write_transaction("command.SettleProposalGate", tx_started);
@@ -4387,22 +5055,42 @@ impl CommandHandler {
                         _ => None,
                     };
 
+                let consecutive_no_diff_code_writer_attempts =
+                    code_writer_completion_receipts::consecutive_completed_no_diff_count_by_run(
+                        &self.pool, run.id,
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        warn!(
+                            run_id = %run_id_str,
+                            error = %error,
+                            "failed to resolve no-diff code_writer convergence; continuing without runtime guard"
+                        );
+                        0
+                    });
+
                 // Synthesize closeout readiness.
                 let synth_result =
-                    synthesize_implementation_closeout_readiness_for_state9(SynthesizerInputs {
-                        run_id: &run_id_str,
-                        stage_id: &c.stage_id,
-                        gate_result: &gate_result,
-                        mode_result: &mode_result,
-                        implementation_review_status: implementation_review_status.as_deref(),
-                        self_assessment: self_assessment_ref,
-                        accepted_risks: &c.accepted_risks,
-                        loop_budget_remaining,
-                        fingerprint: Some(closeout_fingerprint),
-                        fingerprint_latency_exceeded,
-                        controlled_reports_green,
-                        previous_blocker_digest: prior_blocker_digest.as_deref(),
-                    });
+                    synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards(
+                        SynthesizerInputs {
+                            run_id: &run_id_str,
+                            stage_id: &c.stage_id,
+                            gate_result: &gate_result,
+                            mode_result: &mode_result,
+                            implementation_review_status: implementation_review_status.as_deref(),
+                            self_assessment: self_assessment_ref,
+                            accepted_risks: &c.accepted_risks,
+                            loop_budget_remaining,
+                            fingerprint: Some(closeout_fingerprint),
+                            fingerprint_latency_exceeded,
+                            controlled_reports_green,
+                            previous_blocker_digest: prior_blocker_digest.as_deref(),
+                        },
+                        Some(NoDiffConvergence {
+                            consecutive_attempts: consecutive_no_diff_code_writer_attempts,
+                            threshold: NO_DIFF_CONVERGENCE_THRESHOLD,
+                        }),
+                    );
 
                 // Atomically activate gate + readiness generations, then rebuild projections.
                 let closeout_tx_result =
@@ -4426,6 +5114,202 @@ impl CommandHandler {
                 })
             }
         }
+    }
+
+    async fn consume_provider_quota_hold(
+        &self,
+        c: ConsumeProviderQuotaHoldCmd,
+        journal: &CommandJournalEntry,
+        journal_id: &str,
+    ) -> Result<CommandResult> {
+        let reason = c.reason.trim();
+        if reason.is_empty() {
+            anyhow::bail!("reason is required");
+        }
+        if reason.chars().count() > 1000 {
+            anyhow::bail!("reason must be 1000 characters or fewer");
+        }
+
+        let now = Utc::now();
+        let tx_started = Instant::now();
+        let mut tx = self
+            .begin_command_transaction("command.ConsumeProviderQuotaHold", journal.id.clone())
+            .await?;
+        record_command_journal_tx(&mut tx, journal).await?;
+
+        let run = runs::find_by_id_tx(&mut tx, c.run_id)
+            .await?
+            .ok_or_else(|| anyhow!("Run {} not found", c.run_id));
+        let run = match run {
+            Ok(run) => run,
+            Err(error) => {
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    &error.to_string(),
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+                return Err(error);
+            }
+        };
+        if run.status != RunStatus::Running {
+            let error = anyhow!(
+                "Run {} is {} and has no running pending quota invoke to release",
+                c.run_id,
+                run.status
+            );
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &error.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+            return Err(error);
+        }
+
+        let run_stages = stages::list_by_run_tx(&mut tx, c.run_id).await?;
+        let latest_stage = run_stages
+            .iter()
+            .filter(|stage| stage.stage_id == c.stage_id)
+            .max_by_key(|stage| stage.started_at);
+        let latest_stage = match latest_stage {
+            Some(stage) => stage,
+            None => {
+                let error = anyhow!("Stage {} not found", c.stage_id);
+                command_journal::fail_entry_tx(
+                    &mut tx,
+                    &journal.id,
+                    Utc::now(),
+                    &error.to_string(),
+                )
+                .await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+                return Err(error);
+            }
+        };
+        if latest_stage.status != StageStatus::Running {
+            let error = anyhow!(
+                "Stage {} latest attempt is {} and has no running pending quota invoke to release",
+                c.stage_id,
+                latest_stage.status
+            );
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &error.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+            return Err(error);
+        }
+
+        let pending_items =
+            work_items::list_pending_invoke_agents_for_run_stage_tx(&mut tx, c.run_id, &c.stage_id)
+                .await?;
+        let mut candidates: Vec<(WorkItem, String, Option<String>)> = Vec::new();
+        for item in pending_items {
+            let last_error = item.last_error.as_deref().unwrap_or_default();
+            if !last_error.starts_with("provider_quota_wait") {
+                continue;
+            }
+            let payload: serde_json::Value = serde_json::from_str(&item.payload_json)
+                .with_context(|| format!("parse InvokeAgent payload for {}", item.id))?;
+            let provider = payload
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("InvokeAgent work item {} has no provider", item.id))?;
+            let provider_family = ProviderFamily::canonicalize_known_alias(provider)
+                .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+            let model = payload
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            candidates.push((item, provider_family, model));
+        }
+        if candidates.is_empty() {
+            let error = anyhow!(
+                "No pending InvokeAgent provider_quota_wait found for run {} stage {}",
+                c.run_id,
+                c.stage_id
+            );
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &error.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+            return Err(error);
+        }
+
+        let mut consumed_keys: Vec<(String, Option<String>, bool)> = Vec::new();
+        let mut consumed_ledger_count = 0_u64;
+        for (_, provider_family, model) in &candidates {
+            if consumed_keys.iter().any(|(seen_family, seen_model, _)| {
+                seen_family == provider_family && seen_model == model
+            }) {
+                continue;
+            }
+            let consumed =
+                agent_retry_budget_ledger::consume_active_provider_family_quota_for_operator_override_tx(
+                    &mut tx,
+                    provider_family,
+                    model.as_deref(),
+                    now,
+                    journal_id,
+                )
+                .await?;
+            consumed_ledger_count += consumed;
+            consumed_keys.push((provider_family.clone(), model.clone(), consumed > 0));
+        }
+
+        if consumed_ledger_count == 0 {
+            let error = anyhow!(
+                "No active provider quota hold found for pending InvokeAgent in run {} stage {}",
+                c.run_id,
+                c.stage_id
+            );
+            command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), &error.to_string())
+                .await?;
+            tx.commit().await?;
+            db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+            return Err(error);
+        }
+
+        let mut released_work_item_count = 0_u64;
+        for (item, provider_family, model) in candidates {
+            let quota_consumed_for_item =
+                consumed_keys
+                    .iter()
+                    .any(|(seen_family, seen_model, consumed)| {
+                        *consumed && seen_family == &provider_family && seen_model == &model
+                    });
+            if quota_consumed_for_item
+                && work_items::release_pending_invoke_agent_quota_wait_tx(&mut tx, &item.id, now)
+                    .await?
+            {
+                released_work_item_count += 1;
+            }
+        }
+
+        let scheduler_refresh = scheduler::refresh_queue_summaries_for_notification_tx(
+            &mut tx,
+            &self.capacity_config,
+            now,
+            "command.ConsumeProviderQuotaHold",
+            0,
+        )
+        .await?;
+        command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+        tx.commit().await?;
+        db::pool::log_write_transaction("command.ConsumeProviderQuotaHold", tx_started);
+        self.work_queue
+            .publish_scheduler_notification(scheduler_refresh);
+
+        Ok(CommandResult::ProviderQuotaHoldConsumed {
+            run_id: c.run_id,
+            stage_id: c.stage_id,
+            consumed_ledger_count,
+            released_work_item_count,
+        })
     }
 
     async fn retry_stage_latest_attempt(
@@ -4504,21 +5388,7 @@ impl CommandHandler {
         let mut retry_tx = self
             .begin_command_transaction("command.RetryStage", journal.id.clone())
             .await?;
-        command_journal::record_tx(
-            &mut retry_tx,
-            &journal.id,
-            journal.command_type,
-            &journal.payload_json,
-            journal.run_id.as_deref(),
-            journal.created_at,
-            journal.caller_surface.as_deref(),
-            journal.caller_principal_id.as_deref(),
-            journal.caller_principal_class.as_deref(),
-            journal.caller_tool.as_deref(),
-            journal.request_id.as_deref(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+        record_command_journal_tx(&mut retry_tx, journal).await?;
         apply_quota_retry_budget_for_stage_tx(
             &mut retry_tx,
             run_id,
@@ -5073,18 +5943,6 @@ impl CommandHandler {
                 "retry_authority_id".into(),
                 serde_json::json!(retry_authority_id.clone()),
             );
-            object.insert(
-                "source_stage_execution_id".into(),
-                serde_json::json!(old_stage.id.to_string()),
-            );
-            object.insert(
-                "source_agent_execution_id".into(),
-                serde_json::json!(agent_execution_id.to_string()),
-            );
-            object.insert(
-                "source_work_item_id".into(),
-                serde_json::json!(source_item.id.clone()),
-            );
             object.remove("p058_claimed");
             object.insert(
                 "targeted_retry".into(),
@@ -5151,21 +6009,7 @@ impl CommandHandler {
         let mut retry_tx = self
             .begin_command_transaction("command.RetryAgentExecution", journal.id.clone())
             .await?;
-        command_journal::record_tx(
-            &mut retry_tx,
-            &journal.id,
-            journal.command_type,
-            &journal.payload_json,
-            journal.run_id.as_deref(),
-            journal.created_at,
-            journal.caller_surface.as_deref(),
-            journal.caller_principal_id.as_deref(),
-            journal.caller_principal_class.as_deref(),
-            journal.caller_tool.as_deref(),
-            journal.request_id.as_deref(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+        record_command_journal_tx(&mut retry_tx, journal).await?;
         apply_quota_retry_budget_for_stage_tx(
             &mut retry_tx,
             run_id,
@@ -5299,21 +6143,7 @@ impl CommandHandler {
         let mut tx = self
             .begin_command_transaction(context, journal.id.clone())
             .await?;
-        command_journal::record_tx(
-            &mut tx,
-            &journal.id,
-            journal.command_type,
-            &journal.payload_json,
-            journal.run_id.as_deref(),
-            journal.created_at,
-            journal.caller_surface.as_deref(),
-            journal.caller_principal_id.as_deref(),
-            journal.caller_principal_class.as_deref(),
-            journal.caller_tool.as_deref(),
-            journal.request_id.as_deref(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+        record_command_journal_tx(&mut tx, journal).await?;
         command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
         tx.commit().await?;
         db::pool::log_write_transaction(context, tx_started);
@@ -5330,21 +6160,7 @@ impl CommandHandler {
         let mut tx = self
             .begin_command_transaction(context, journal.id.clone())
             .await?;
-        command_journal::record_tx(
-            &mut tx,
-            &journal.id,
-            journal.command_type,
-            &journal.payload_json,
-            journal.run_id.as_deref(),
-            journal.created_at,
-            journal.caller_surface.as_deref(),
-            journal.caller_principal_id.as_deref(),
-            journal.caller_principal_class.as_deref(),
-            journal.caller_tool.as_deref(),
-            journal.request_id.as_deref(),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("command journal insert failed: {e}"))?;
+        record_command_journal_tx(&mut tx, journal).await?;
         command_journal::fail_entry_tx(&mut tx, &journal.id, Utc::now(), error).await?;
         tx.commit().await?;
         db::pool::log_write_transaction(context, tx_started);
@@ -5806,6 +6622,11 @@ reviewer_override:
             caller_principal_class: Some("operator".into()),
             caller_tool: Some("runs.start".into()),
             request_id: None,
+            caller_class: None,
+            token_id: None,
+            mcp_idempotency_key: None,
+            mcp_idempotency_request_hash: None,
+            boundary_row_id: None,
         };
         let caller = CallerContext::mcp(
             "operator-1",
@@ -5859,6 +6680,11 @@ reviewer_override:
             caller_principal_class: Some("operator".into()),
             caller_tool: Some("runs.start".into()),
             request_id: None,
+            caller_class: None,
+            token_id: None,
+            mcp_idempotency_key: None,
+            mcp_idempotency_request_hash: None,
+            boundary_row_id: None,
         };
         let caller = CallerContext::mcp(
             "operator-1",
@@ -5901,6 +6727,11 @@ reviewer_override:
             caller_principal_class: Some("operator".into()),
             caller_tool: Some("runs.start".into()),
             request_id: None,
+            caller_class: None,
+            token_id: None,
+            mcp_idempotency_key: None,
+            mcp_idempotency_request_hash: None,
+            boundary_row_id: None,
         };
         let caller = CallerContext::mcp(
             "operator-1",

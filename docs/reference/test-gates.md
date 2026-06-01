@@ -2210,6 +2210,7 @@ Scope:
 - All canonical reason codes are documented and defined in `control-plane/crates/domain/src/recovery_matrix.rs`
 - `p082_rejected_command_error_v1` typed envelope contract and backward-compatible legacy plain-text fallback rules are documented and implemented
 - Exact readback lane placement is enforced: `runs.get` exposes both singular `p082_recovery_matrix_readback` and plural `p082_recovery_matrix_readbacks`; `reports.get` exposes plural only; singular must be absent from reports.get
+- Principal-class gating is enforced on every P082 readback lane (`runs.get`, `reports.get`, `report://{run_id}`, and the `run_report` artifact embedded in `reports.get`): non-operator principals (agent, observer) receive an empty plural readback and a null singular readback while the lane field names remain present
 - Rollout fixture `docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json` exists with schema_version `p082_operator_readback_fixture_v1`, all five readback lanes, nested subcontracts, Xcode startup grace row, startup_requeue_exhausted row, cancel-then-late-output row, and fixture assertions naming all reason codes and scenario IDs
 - All 16 negative fixtures in `docs/evidence/rollout-contract/negative/p082-*.json` exist with `schema_version=p082_negative_fixture_v1` and required fields
 - DB, engine, and MCP readback tests compile and pass under CARGO_TARGET_DIR=target/proposal-082-gate

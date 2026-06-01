@@ -1,15 +1,16 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::SqlitePool;
+use std::path::{Path, PathBuf};
 
 use db::repos::{
-    artifact_contracts, closeout, code_writer_completion_receipts, legacy_discovery_overrides,
-    projections, rollout_contract_checks, runs, side_effects,
+    artifact_contracts, closeout, code_writer_completion_receipts, escalation,
+    legacy_discovery_overrides, projections, rollout_contract_checks, runs, side_effects,
 };
 use domain::commands::{
-    CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
+    CancelRunCmd, CatalogSnapshotRetrofitScope, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
     MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
     MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
-    ProposalGateSettlementAction, SettleProposalGateCmd, StartRunCmd,
+    ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd, SettleProposalGateCmd, StartRunCmd,
 };
 use domain::ids::{IdeaId, RunId};
 use domain::risk_lineage::RiskAcceptanceLineage;
@@ -18,6 +19,36 @@ use engine::command_handler::CommandHandler;
 use crate::protocol::McpTool;
 use crate::request_context::mcp_caller;
 
+/// SEC-HIGH-002: Remove sensitive fields from a serialized Run for non-Operator principals.
+/// Strips absolute filesystem paths, delivery/preflight configs, workflow/catalog snapshots,
+/// branch internals, and operator-only override fields to enforce least-privilege on Agent
+/// and Observer callers.
+pub fn redact_run_for_non_operator(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    for field in &[
+        "workspace_root",
+        "artifact_root",
+        "workflow_yaml_path",
+        "agent_catalog_yaml_path",
+        "worktree_root",
+        "base_branch",
+        "base_revision",
+        "target_branch",
+        "delivery_configuration_json",
+        "delivery_preflight_json",
+        "workflow_snapshot_json",
+        "catalog_snapshot_json",
+        "workflow_snapshot_hash",
+        "catalog_snapshot_hash",
+        "drift_detected_at",
+        "drift_details_json",
+        "chainworks_meta_root",
+        "review_routing_json",
+        "cancellation_settlement_log",
+    ] {
+        obj.remove(*field);
+    }
+}
+
 pub fn tool_specs() -> Vec<McpTool> {
     vec![
         McpTool {
@@ -25,7 +56,7 @@ pub fn tool_specs() -> Vec<McpTool> {
             description: "Start a new run for an idea".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "required": ["idea_id", "workflow_id", "workflow_title", "workspace_root", "artifact_root", "workflow_yaml_path", "agent_catalog_yaml_path"],
+                "required": ["idea_id", "workflow_id", "workflow_title", "workspace_root", "artifact_root", "workflow_yaml_path", "agent_catalog_yaml_path", "idempotency_key"],
                 "properties": {
                     "idea_id": { "type": "string", "description": "ID of the idea" },
                     "workflow_id": { "type": "string" },
@@ -34,6 +65,7 @@ pub fn tool_specs() -> Vec<McpTool> {
                     "artifact_root": { "type": "string" },
                     "workflow_yaml_path": { "type": "string", "description": "Path to workflow YAML file (enables state-machine execution)" },
                     "agent_catalog_yaml_path": { "type": "string", "description": "Path to agent catalog YAML file" },
+                    "idempotency_key": { "type": "string", "description": "Caller-supplied idempotency key for replay safety. Stored in the command journal as request_id." },
                     "delivery_configuration_json": { "type": "string", "description": "Frozen delivery configuration JSON for repo-backed runs" },
                     "review_routing_json": { "type": "string", "description": "Review routing options JSON for P060 dynamic reviewer selection" },
                     "rollout_contract_preflight_policy_json": {
@@ -67,9 +99,35 @@ pub fn tool_specs() -> Vec<McpTool> {
             description: "Cancel a run".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "required": ["run_id"],
+                "required": ["run_id", "idempotency_key"],
                 "properties": {
-                    "run_id": { "type": "string" }
+                    "run_id": { "type": "string" },
+                    "idempotency_key": { "type": "string", "description": "Caller-supplied idempotency key for cancel deduplication (P082)" }
+                }
+            }),
+        },
+        McpTool {
+            name: "runs.retrofit_catalog_snapshot".to_string(),
+            description: "Emergency operator repair: replace a blocked run's frozen catalog snapshot from the current catalog YAML with audit/hash guardrails".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["run_id", "expected_catalog_snapshot_hash", "reason", "idempotency_key"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "expected_catalog_snapshot_hash": {
+                        "type": "string",
+                        "description": "The current frozen catalog snapshot hash expected by the operator; mismatch fails closed."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["escalation_policy_only"],
+                        "description": "Emergency retrofit scope. Only escalation_policy_only is currently supported."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Operator audit reason for retrofitting the frozen catalog snapshot."
+                    },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 for safe repair." }
                 }
             }),
         },
@@ -268,6 +326,12 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'agent_catalog_yaml_path'"))?
                 .to_string();
+            // HIGH-002: idempotency_key is required so callers can perform safe replay.
+            // Stored in the command journal as request_id for cross-surface correlation.
+            let idempotency_key = params["idempotency_key"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
+                .to_string();
             let delivery_configuration_json = params["delivery_configuration_json"]
                 .as_str()
                 .map(String::from);
@@ -277,7 +341,20 @@ pub async fn execute(
                 .as_str()
                 .map(String::from);
 
-            let caller = mcp_caller(&principal.id, &principal.class, "runs.start");
+            // SEC-001: validate and, when possible, canonicalize caller-supplied paths before
+            // any filesystem read. Existing workspaces are root-confined so symlinks cannot
+            // smuggle workflow/catalog/artifact paths outside the selected workspace.
+            let (workspace_root, artifact_root, workflow_yaml_path, agent_catalog_yaml_path) =
+                canonicalize_run_start_paths(
+                    &workspace_root,
+                    &artifact_root,
+                    &workflow_yaml_path,
+                    &agent_catalog_yaml_path,
+                )?;
+
+            // Propagate idempotency_key as request_id so the command journal records it
+            // for cross-surface correlation and replay detection.
+            let caller = mcp_caller(principal, "runs.start").with_request_id(idempotency_key);
             let cmd = Command::StartRun(StartRunCmd {
                 idea_id,
                 workflow_id,
@@ -316,7 +393,7 @@ pub async fn execute(
                     serde_json::Value::String(commanded.journal_id),
                 );
             }
-            attach_implementation_self_assessment_summary(pool, value).await
+            attach_implementation_self_assessment_summary(pool, value, true).await
         }
 
         "runs.get" => {
@@ -329,44 +406,57 @@ pub async fn execute(
                 Some(run) => {
                     let mut value = serde_json::to_value(&run)?;
                     if let Some(obj) = value.as_object_mut() {
-                        if let Some(projection) =
-                            db::repos::artifact_contracts::find_run_state_projection(pool, run_id)
-                                .await?
-                        {
+                        // SEC-HIGH-002: strip sensitive fields for non-Operator principals.
+                        if principal.class != auth::PrincipalClass::Operator {
+                            redact_run_for_non_operator(obj);
+                        }
+                        // active_artifact_index and run_state_projection include operator-only
+                        // recovery diagnostics, local paths, and source IDs — Operator only.
+                        if principal.class == auth::PrincipalClass::Operator {
+                            if let Some(projection) =
+                                db::repos::artifact_contracts::find_run_state_projection(pool, run_id)
+                                    .await?
+                            {
+                                obj.insert(
+                                    "active_artifact_index".into(),
+                                    projection.active_index_json,
+                                );
+                                obj.insert("run_state_projection".into(), projection.run_state_json);
+                                obj.insert(
+                                    "operator_overrides".into(),
+                                    serde_json::to_value(
+                                        db::repos::artifact_contracts::list_overrides(pool, run_id)
+                                            .await?,
+                                    )?,
+                                );
+                            }
+                        }
+                        // legacy_discovery_overrides contain internal routing — Operator only.
+                        if principal.class == auth::PrincipalClass::Operator {
                             obj.insert(
-                                "active_artifact_index".into(),
-                                projection.active_index_json,
-                            );
-                            obj.insert("run_state_projection".into(), projection.run_state_json);
-                            obj.insert(
-                                "operator_overrides".into(),
+                                "legacy_discovery_overrides".into(),
                                 serde_json::to_value(
-                                    db::repos::artifact_contracts::list_overrides(pool, run_id)
-                                        .await?,
+                                    legacy_discovery_overrides::list_by_run(pool, run_id).await?,
                                 )?,
                             );
+                            obj.insert(
+                                "retry_authority".into(),
+                                crate::tools::reports::retry_authority_current_json(pool, run_id)
+                                    .await?,
+                            );
+                            obj.insert(
+                                "retry_authority_history".into(),
+                                crate::tools::reports::retry_authority_history_json(pool, run_id)
+                                    .await?,
+                            );
+                            obj.insert(
+                                "p091_orphan_repair_readback".into(),
+                                crate::tools::reports::p091_orphan_repair_readback_json(
+                                    pool, run_id,
+                                )
+                                .await?,
+                            );
                         }
-                        obj.insert(
-                            "legacy_discovery_overrides".into(),
-                            serde_json::to_value(
-                                legacy_discovery_overrides::list_by_run(pool, run_id).await?,
-                            )?,
-                        );
-                        obj.insert(
-                            "retry_authority".into(),
-                            crate::tools::reports::retry_authority_current_json(pool, run_id)
-                                .await?,
-                        );
-                        obj.insert(
-                            "retry_authority_history".into(),
-                            crate::tools::reports::retry_authority_history_json(pool, run_id)
-                                .await?,
-                        );
-                        obj.insert(
-                            "p091_orphan_repair_readback".into(),
-                            crate::tools::reports::p091_orphan_repair_readback_json(pool, run_id)
-                                .await?,
-                        );
                         obj.insert(
                             "p082_recovery_matrix_readback".into(),
                             crate::tools::reports::p082_recovery_matrix_readback_json(
@@ -387,7 +477,10 @@ pub async fn execute(
                             .await?,
                         );
                     }
-                    let value = attach_implementation_self_assessment_summary(pool, value).await?;
+                    let is_operator = principal.class == auth::PrincipalClass::Operator;
+                    let value =
+                        attach_implementation_self_assessment_summary(pool, value, is_operator)
+                            .await?;
                     // P077 BLK-004: attach closeout_readiness_summary parity on runs.get.
                     attach_closeout_readiness_summary(pool, value).await
                 }
@@ -396,8 +489,28 @@ pub async fn execute(
         }
 
         "runs.list" => {
-            let items = projections::list_all_projection(pool).await?;
-            Ok(serde_json::to_value(items)?)
+            let is_operator = principal.class == auth::PrincipalClass::Operator;
+            let items = projections::list_active_projection(pool).await?;
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                let mut value = serde_json::to_value(item)?;
+                if !is_operator {
+                    if let Some(obj) = value.as_object_mut() {
+                        for field in &[
+                            "workspace_root",
+                            "artifact_root",
+                            "chainworks_meta_root",
+                            "implementationCompletion",
+                            "closeout_readiness_summary",
+                            "implementation_closeout_readiness_summary",
+                        ] {
+                            obj.remove(*field);
+                        }
+                    }
+                }
+                values.push(value);
+            }
+            Ok(serde_json::Value::Array(values))
         }
 
         "runs.cancel" => {
@@ -405,11 +518,73 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
                 .parse()?;
-            let caller = mcp_caller(&principal.id, &principal.class, "runs.cancel");
+            let idempotency_key = params["idempotency_key"].as_str().map(String::from);
+            let mut caller = mcp_caller(principal, "runs.cancel");
+            if let Some(idempotency_key) = idempotency_key {
+                caller = caller.with_request_id(idempotency_key);
+            }
             let cmd = Command::CancelRun(CancelRunCmd { run_id });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             Ok(serde_json::json!({
                 "cancelled": true,
+                "journal_id": commanded.journal_id,
+            }))
+        }
+
+        "runs.retrofit_catalog_snapshot" => {
+            let run_id: RunId = params["run_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
+                .parse()?;
+            let expected_catalog_snapshot_hash = params["expected_catalog_snapshot_hash"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'expected_catalog_snapshot_hash'"))?
+                .to_string();
+            let reason = params["reason"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+                .to_string();
+            let scope = match params["scope"].as_str().unwrap_or("escalation_policy_only") {
+                "escalation_policy_only" => CatalogSnapshotRetrofitScope::EscalationPolicyOnly,
+                other => anyhow::bail!("unsupported catalog snapshot retrofit scope: {other}"),
+            };
+            let idempotency_key = params["idempotency_key"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
+                .to_string();
+            let caller = mcp_caller(principal, "runs.retrofit_catalog_snapshot")
+                .with_request_id(idempotency_key);
+            let commanded = cmd_handler
+                .handle(
+                    Command::RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd {
+                        run_id,
+                        expected_catalog_snapshot_hash,
+                        reason,
+                        scope,
+                    }),
+                    caller,
+                )
+                .await?;
+            let (previous_catalog_snapshot_hash, new_catalog_snapshot_hash, applied_policy_ids) =
+                match &commanded.result {
+                    engine::command_handler::CommandResult::CatalogSnapshotRetrofitted {
+                        previous_catalog_snapshot_hash,
+                        new_catalog_snapshot_hash,
+                        applied_policy_ids,
+                        ..
+                    } => (
+                        previous_catalog_snapshot_hash.clone(),
+                        new_catalog_snapshot_hash.clone(),
+                        applied_policy_ids.clone(),
+                    ),
+                    _ => anyhow::bail!("Unexpected command result"),
+                };
+            Ok(serde_json::json!({
+                "retrofitted": true,
+                "run_id": run_id.to_string(),
+                "previous_catalog_snapshot_hash": previous_catalog_snapshot_hash,
+                "new_catalog_snapshot_hash": new_catalog_snapshot_hash,
+                "applied_policy_ids": applied_policy_ids,
                 "journal_id": commanded.journal_id,
             }))
         }
@@ -425,7 +600,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
                 .to_string();
-            let caller = mcp_caller(&principal.id, &principal.class, "runs.main_sync.request");
+            let caller = mcp_caller(principal, "runs.main_sync.request");
             cmd_handler
                 .handle(
                     Command::MainSyncRequest(MainSyncRequestCmd {
@@ -451,7 +626,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
                 .to_string();
-            let caller = mcp_caller(&principal.id, &principal.class, "runs.main_sync.retry");
+            let caller = mcp_caller(principal, "runs.main_sync.retry");
             cmd_handler
                 .handle(
                     Command::MainSyncRetry(MainSyncRetryCmd {
@@ -477,11 +652,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
                 .to_string();
-            let caller = mcp_caller(
-                &principal.id,
-                &principal.class,
-                "runs.main_sync.set_override",
-            );
+            let caller = mcp_caller(principal, "runs.main_sync.set_override");
             cmd_handler
                 .handle(
                     Command::MainSyncSetRunOverride(MainSyncSetRunOverrideCmd {
@@ -499,11 +670,7 @@ pub async fn execute(
 
         "runs.main_sync.repair_state" => {
             let run_id = parse_run_id(&params)?;
-            let caller = mcp_caller(
-                &principal.id,
-                &principal.class,
-                "runs.main_sync.repair_state",
-            );
+            let caller = mcp_caller(principal, "runs.main_sync.repair_state");
             cmd_handler
                 .handle(
                     Command::MainSyncRepairState(MainSyncRepairStateCmd {
@@ -528,11 +695,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'summary'"))?
                 .to_string();
-            let caller = mcp_caller(
-                &principal.id,
-                &principal.class,
-                "runs.main_sync.record_recovery_decision",
-            );
+            let caller = mcp_caller(principal, "runs.main_sync.record_recovery_decision");
             cmd_handler
                 .handle(
                     Command::MainSyncRecordRecoveryDecision(MainSyncRecordRecoveryDecisionCmd {
@@ -558,11 +721,7 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
                 .to_string();
-            let caller = mcp_caller(
-                &principal.id,
-                &principal.class,
-                "runs.knowledge_capsule.ignore",
-            );
+            let caller = mcp_caller(principal, "runs.knowledge_capsule.ignore");
             cmd_handler
                 .handle(
                     Command::KnowledgeCapsuleIgnore(KnowledgeCapsuleIgnoreCmd {
@@ -726,7 +885,7 @@ pub async fn execute(
                 other => anyhow::bail!("invalid proposal gate settlement action '{other}'"),
             };
 
-            let caller = mcp_caller(&principal.id, &principal.class, "runs.settle_proposal_gate");
+            let caller = mcp_caller(principal, "runs.settle_proposal_gate");
             let commanded = cmd_handler
                 .handle(
                     Command::SettleProposalGate(SettleProposalGateCmd {
@@ -815,9 +974,110 @@ fn parse_main_sync_recovery_decision(value: &str) -> Result<MainSyncRecoveryDeci
     }
 }
 
+/// SEC-001: Validate that a caller-supplied filesystem path does not contain path traversal
+/// sequences, null bytes, or Windows-style separators that could escape the intended root.
+fn validate_run_start_path(field: &str, path: &str) -> anyhow::Result<()> {
+    if path.contains('\0') {
+        anyhow::bail!("runs.start: field '{field}' contains a null byte");
+    }
+    if path.contains('\\') {
+        anyhow::bail!("runs.start: field '{field}' contains a backslash separator");
+    }
+    for component in path.split('/') {
+        if component == ".." {
+            anyhow::bail!("runs.start: field '{field}' contains a path traversal component '..'");
+        }
+    }
+    if path.contains("://") {
+        anyhow::bail!("runs.start: field '{field}' contains a URI scheme separator");
+    }
+    Ok(())
+}
+
+fn canonicalize_run_start_paths(
+    workspace_root: &str,
+    artifact_root: &str,
+    workflow_yaml_path: &str,
+    agent_catalog_yaml_path: &str,
+) -> anyhow::Result<(String, String, String, String)> {
+    validate_run_start_path("workspace_root", workspace_root)?;
+    validate_run_start_path("artifact_root", artifact_root)?;
+    validate_run_start_path("workflow_yaml_path", workflow_yaml_path)?;
+    validate_run_start_path("agent_catalog_yaml_path", agent_catalog_yaml_path)?;
+
+    let workspace_path = Path::new(workspace_root);
+    // MEDIUM-001: fail-closed when workspace_root does not exist.
+    if !workspace_path.exists() {
+        anyhow::bail!(
+            "runs.start: workspace_root '{}' does not exist; create the directory before starting a run",
+            workspace_root
+        );
+    }
+    let canonical_workspace = std::fs::canonicalize(workspace_path)
+        .with_context(|| format!("runs.start: canonicalize workspace_root '{workspace_root}'"))?;
+    let artifact = canonicalize_run_start_child_path(
+        "artifact_root",
+        artifact_root,
+        &canonical_workspace,
+        true,
+    )?;
+    let workflow = canonicalize_run_start_child_path(
+        "workflow_yaml_path",
+        workflow_yaml_path,
+        &canonical_workspace,
+        false,
+    )?;
+    let catalog = canonicalize_run_start_child_path(
+        "agent_catalog_yaml_path",
+        agent_catalog_yaml_path,
+        &canonical_workspace,
+        false,
+    )?;
+    Ok((
+        canonical_workspace.to_string_lossy().to_string(),
+        artifact.to_string_lossy().to_string(),
+        workflow.to_string_lossy().to_string(),
+        catalog.to_string_lossy().to_string(),
+    ))
+}
+
+fn canonicalize_run_start_child_path(
+    field: &str,
+    raw: &str,
+    canonical_workspace: &Path,
+    allow_missing_leaf: bool,
+) -> anyhow::Result<PathBuf> {
+    let path = Path::new(raw);
+    let canonical = if path.exists() {
+        std::fs::canonicalize(path)
+            .with_context(|| format!("runs.start: canonicalize field '{field}'"))?
+    } else if allow_missing_leaf {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("runs.start: field '{field}' has no parent"))?;
+        let leaf = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("runs.start: field '{field}' has no leaf"))?;
+        if !parent.exists() {
+            anyhow::bail!("runs.start: field '{field}' parent does not exist");
+        }
+        std::fs::canonicalize(parent)
+            .with_context(|| format!("runs.start: canonicalize parent for field '{field}'"))?
+            .join(leaf)
+    } else {
+        anyhow::bail!("runs.start: field '{field}' does not exist");
+    };
+
+    if !canonical.starts_with(canonical_workspace) {
+        anyhow::bail!("runs.start: field '{field}' escapes canonical workspace_root");
+    }
+    Ok(canonical)
+}
+
 async fn attach_implementation_self_assessment_summary(
     pool: &SqlitePool,
     mut value: serde_json::Value,
+    is_operator: bool,
 ) -> Result<serde_json::Value> {
     let run_id = value
         .get("id")
@@ -837,34 +1097,50 @@ async fn attach_implementation_self_assessment_summary(
         }
         None => None,
     };
-    let rollout_contract_readback = match run_id {
-        Some(run_id) => rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
-            pool,
-            run_id.inner(),
-        )
-        .await?
-        .map(|check| check.operator_readback_json_for_lane("mcp")),
-        None => None,
-    };
-    let code_writer_completion_receipts = match run_id {
-        Some(run_id) => {
-            let receipts = code_writer_completion_receipts::list_by_run(pool, run_id).await?;
-            let canonical_receipts =
-                code_writer_completion_receipts::list_canonical_by_run(pool, run_id).await?;
-            Some((
-                serde_json::to_value(&receipts)?,
-                serde_json::to_value(
-                    domain::code_writer_completion::project_implementation_completion(
-                        &canonical_receipts,
-                    ),
-                )?,
-            ))
+
+    // HIGH-002: rollout_contract_readback, code_writer_completion_receipts, and
+    // side_effect_readback carry operator-only evidence paths and workflow material.
+    // Only fetch and attach these for Operator principals.
+    let rollout_contract_readback = if is_operator {
+        match run_id {
+            Some(run_id) => rollout_contract_checks::find_terminal_rollout_contract_check_for_run(
+                pool,
+                run_id.inner(),
+            )
+            .await?
+            .map(|check| check.operator_readback_json_for_lane("mcp")),
+            None => None,
         }
-        None => None,
+    } else {
+        None
     };
-    let side_effect_readback = match run_id {
-        Some(run_id) => Some(build_side_effect_readback(pool, run_id).await?),
-        None => None,
+    let code_writer_completion_receipts = if is_operator {
+        match run_id {
+            Some(run_id) => {
+                let receipts = code_writer_completion_receipts::list_by_run(pool, run_id).await?;
+                let canonical_receipts =
+                    code_writer_completion_receipts::list_canonical_by_run(pool, run_id).await?;
+                Some((
+                    serde_json::to_value(&receipts)?,
+                    serde_json::to_value(
+                        domain::code_writer_completion::project_implementation_completion(
+                            &canonical_receipts,
+                        ),
+                    )?,
+                ))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let side_effect_readback = if is_operator {
+        match run_id {
+            Some(run_id) => Some(build_side_effect_readback(pool, run_id).await?),
+            None => None,
+        }
+    } else {
+        None
     };
 
     if let Some(object) = value.as_object_mut() {
@@ -872,35 +1148,59 @@ async fn attach_implementation_self_assessment_summary(
             "implementation_self_assessment_summary".to_string(),
             summary.unwrap_or(serde_json::Value::Null),
         );
-        object.insert(
-            "code_writer_completion_receipts".to_string(),
-            code_writer_completion_receipts
-                .as_ref()
-                .map(|(receipts, _)| receipts.clone())
-                .unwrap_or(serde_json::Value::Null),
-        );
-        object.insert(
-            "implementationCompletion".to_string(),
-            code_writer_completion_receipts
-                .map(|(_, implementation_completion)| implementation_completion)
-                .unwrap_or_else(|| {
-                    serde_json::to_value(
-                        domain::code_writer_completion::project_implementation_completion(&[]),
-                    )
-                    .unwrap_or(serde_json::Value::Null)
-                }),
-        );
-        object.insert(
-            "rollout_contract_readback".to_string(),
-            rollout_contract_readback.unwrap_or(serde_json::Value::Null),
-        );
-        object.insert(
-            "side_effect_readback".to_string(),
-            side_effect_readback.unwrap_or(serde_json::Value::Null),
-        );
+        if is_operator {
+            object.insert(
+                "code_writer_completion_receipts".to_string(),
+                code_writer_completion_receipts
+                    .as_ref()
+                    .map(|(receipts, _)| receipts.clone())
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            object.insert(
+                "implementationCompletion".to_string(),
+                code_writer_completion_receipts
+                    .map(|(_, implementation_completion)| implementation_completion)
+                    .unwrap_or_else(|| {
+                        serde_json::to_value(
+                            domain::code_writer_completion::project_implementation_completion(&[]),
+                        )
+                        .unwrap_or(serde_json::Value::Null)
+                    }),
+            );
+            object.insert(
+                "rollout_contract_readback".to_string(),
+                rollout_contract_readback.unwrap_or(serde_json::Value::Null),
+            );
+            object.insert(
+                "side_effect_readback".to_string(),
+                side_effect_readback.unwrap_or(serde_json::Value::Null),
+            );
+        }
     }
 
     Ok(value)
+}
+
+/// SEC-004: Non-Operator escalation summary — exposes paused_chain_count and has_active_escalation
+/// without leaking dominant_pause_reason_raw or other operator-only chain internals.
+pub async fn build_escalation_readback_summary_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let paused_count = escalation::count_paused_ledgers_by_run(pool, run_id).await?;
+    let triggered_count = escalation::count_triggered_ledgers_by_run(pool, run_id).await?;
+    let has_active = triggered_count > 0;
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "paused_chain_count".into(),
+        serde_json::Value::Number(paused_count.into()),
+    );
+    map.insert(
+        "has_active_escalation".into(),
+        serde_json::Value::Bool(has_active),
+    );
+    map.insert("chains_redacted".into(), serde_json::Value::Bool(true));
+    Ok(map)
 }
 
 async fn build_side_effect_readback(pool: &SqlitePool, run_id: RunId) -> Result<serde_json::Value> {
@@ -1116,17 +1416,26 @@ mod tests {
     }
 
     fn test_workflow_yaml_path() -> String {
-        format!(
+        // Canonicalize to resolve `..` components so validate_run_start_path accepts it.
+        let raw = format!(
             "{}/../../../examples/workflows/workflow.yaml",
             env!("CARGO_MANIFEST_DIR")
-        )
+        );
+        std::fs::canonicalize(&raw)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&raw))
+            .to_string_lossy()
+            .to_string()
     }
 
     fn test_agent_catalog_yaml_path() -> String {
-        format!(
+        let raw = format!(
             "{}/../../../examples/agents/agents.yaml",
             env!("CARGO_MANIFEST_DIR")
-        )
+        );
+        std::fs::canonicalize(&raw)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&raw))
+            .to_string_lossy()
+            .to_string()
     }
 
     fn make_command_handler(pool: sqlx::SqlitePool) -> CommandHandler {
@@ -1249,6 +1558,14 @@ mod tests {
             start_schema["properties"]["review_routing_json"]["type"],
             "string"
         );
+        // HIGH-002: idempotency_key must be required in the runs.start spec.
+        assert_eq!(
+            start_schema["required"]
+                .as_array()
+                .map(|arr| arr.iter().any(|v| v == "idempotency_key")),
+            Some(true),
+            "runs.start must require idempotency_key"
+        );
 
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
@@ -1269,14 +1586,23 @@ mod tests {
         );
         let review_routing_json =
             r#"{"mode":"legacy_fixed","force_include":[],"force_exclude":[]}"#.to_string();
+        // MEDIUM-001: workspace_root must be an existing directory; yaml paths must be
+        // canonical descendants. Use the control-plane root where examples/ already lives.
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("control-plane workspace root");
+        // artifact_root parent (workspace_root) must exist; leaf need not.
+        let artifact_root = workspace_root.join(".test_chainworks_artifacts_tmp");
         let params = serde_json::json!({
             "idea_id": idea_id.to_string(),
             "workflow_id": "wf-start",
             "workflow_title": "Start Run",
-            "workspace_root": "/tmp/ws",
-            "artifact_root": "/tmp/art",
+            "workspace_root": workspace_root.to_string_lossy(),
+            "artifact_root": artifact_root.to_string_lossy(),
             "workflow_yaml_path": test_workflow_yaml_path(),
             "agent_catalog_yaml_path": test_agent_catalog_yaml_path(),
+            "idempotency_key": uuid::Uuid::new_v4().to_string(),
             "delivery_configuration_json": delivery_json,
             "review_routing_json": review_routing_json
         });

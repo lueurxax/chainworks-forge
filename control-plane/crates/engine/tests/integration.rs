@@ -9,7 +9,7 @@ use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
     code_writer_completion_receipts, ideas, projections, retry_operator_instructions,
     retry_payload_recovery_events, retry_stage_execution_authorities, runs, sessions, side_effects,
-    stages, work_items, workflow_conflicts,
+    stages, startup_repairs, work_items, workflow_conflicts,
 };
 use domain::agent::{
     AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
@@ -15839,6 +15839,171 @@ async fn p017_mediation_cancel_run_cascade() {
         mediation_again.status,
         domain::mediation::LeadMediationStatus::Canceled,
         "second cancellation must not change terminal mediation"
+    );
+}
+
+#[tokio::test]
+async fn p082_cancel_run_with_unresolved_side_effect_stays_cancelling_until_reconciled() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id))
+        .await
+        .expect("insert idea");
+    let run_id = RunId::new();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .expect("insert run");
+    let stage_id = StageExecutionId::new();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Running))
+        .await
+        .expect("insert stage");
+    let agent_execution = make_agent_execution(stage_id, AgentStatus::Running);
+    agent_executions::insert(&pool, &agent_execution)
+        .await
+        .expect("insert running agent execution");
+
+    side_effects::insert(&pool, &make_p091_side_effect(run_id, stage_id))
+        .await
+        .expect("insert unresolved side effect");
+
+    engine::cancellation::begin_settlement(&pool, run_id, now)
+        .await
+        .expect("begin settlement");
+
+    let run = runs::find_by_id(&pool, run_id)
+        .await
+        .expect("load run")
+        .expect("run exists");
+    assert_eq!(
+        run.status,
+        RunStatus::Cancelling,
+        "P082-R13: unresolved side effects keep cancellation in cancelling until reconciliation"
+    );
+
+    let log: serde_json::Value = serde_json::from_str(
+        run.cancellation_settlement_log
+            .as_deref()
+            .expect("cancellation settlement log"),
+    )
+    .expect("parse cancellation settlement log");
+    let readback = log
+        .as_array()
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.get("p082_recovery_matrix_readback"))
+        .expect("P082 cancellation readback");
+    assert_eq!(
+        readback["scenario_id"], "P082-R13",
+        "P082-R13 readback must be persisted for side-effect-held cancellation"
+    );
+    assert_eq!(
+        readback["recovery_reason_code"],
+        domain::recovery_matrix::REASON_CANCEL_SIDE_EFFECT_RECONCILIATION_REQUIRED,
+        "P082-R13 reason code must be durable"
+    );
+    assert_eq!(
+        readback["recovery_side_effect_blocking_status"], "unresolved_side_effect_entries",
+        "P082-R13 readback must explain the side-effect hold"
+    );
+}
+
+#[tokio::test]
+async fn p082_r14_begin_settlement_persists_startup_repair_summary() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id))
+        .await
+        .expect("insert idea");
+    let run_id = RunId::new();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .expect("insert run");
+
+    let source_work_item_id = "p082-r14-active-work";
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: source_work_item_id.into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "state_impl",
+                "stage_execution_id": StageExecutionId::new().to_string(),
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("state_impl".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .expect("insert active startup repair work item");
+
+    let repair_id = format!("p082-requeue:cj-r14:{source_work_item_id}:1");
+    let notes = serde_json::json!({
+        "source_work_item_id": source_work_item_id,
+        "source_command_journal_id": "cj-r14",
+        "requeue_generation": 1,
+        "max_requeue_generation": 1,
+        "stale_after_ms": 60000,
+        "stale_cutoff": now.to_rfc3339(),
+        "xcode_required": false,
+        "backpressure_scope": "run"
+    })
+    .to_string();
+    startup_repairs::record(
+        &pool,
+        &repair_id,
+        &run_id.to_string(),
+        "startup_requeue",
+        now,
+        Some(&notes),
+    )
+    .await
+    .expect("record startup repair");
+
+    engine::cancellation::begin_settlement(&pool, run_id, now)
+        .await
+        .expect("begin settlement");
+
+    let run = runs::find_by_id(&pool, run_id)
+        .await
+        .expect("load run")
+        .expect("run exists");
+    let log: serde_json::Value = serde_json::from_str(
+        run.cancellation_settlement_log
+            .as_deref()
+            .expect("cancellation settlement log"),
+    )
+    .expect("parse cancellation settlement log");
+    let readback = log
+        .as_array()
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry.get("p082_recovery_matrix_readback"))
+        .expect("P082 cancellation readback");
+    assert_eq!(
+        readback["scenario_id"], "P082-R14",
+        "active startup repair must converge through P082-R14"
+    );
+    assert_eq!(
+        readback["recovery_reason_code"],
+        domain::recovery_matrix::REASON_CANCEL_STARTUP_REPAIR_CONVERGED,
+        "P082-R14 reason code must be durable"
+    );
+    assert_eq!(
+        readback["recovery_startup_repair_summary"]["source_work_item_id"], source_work_item_id,
+        "P082-R14 must persist the startup repair source work item"
+    );
+    assert_eq!(
+        readback["recovery_startup_repair_summary"]["startup_repair_id"], repair_id,
+        "P082-R14 must persist the startup repair idempotency key"
     );
 }
 

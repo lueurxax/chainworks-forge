@@ -285,6 +285,27 @@ impl PrincipalTable {
         table
     }
 
+    /// Fixture with a custom token. Used in cross-crate integration tests that need
+    /// to verify bearer token validation at the GraphQL WebSocket layer.
+    pub fn test_fixture_with_token(token: impl Into<String>) -> Self {
+        PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: token.into(),
+                id: "test-operator".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: Some(GraphqlPolicy {
+                        allow_queries: true,
+                        allow_subscriptions: true,
+                        allowed_mutations: approval_mutations(),
+                    }),
+                    mcp: None,
+                }),
+                ..Default::default()
+            }],
+        }
+    }
+
     /// Observer-class fixture for cross-crate tests that need a non-operator token.
     /// Token length meets the 32-byte minimum required by extract_bearer_token.
     pub fn test_fixture_observer() -> Self {
@@ -1002,7 +1023,7 @@ fn default_tool_capabilities(class: &PrincipalClass) -> BTreeSet<CapabilityToolI
         .collect()
 }
 
-fn all_tool_capabilities() -> [CapabilityToolId; 44] {
+fn all_tool_capabilities() -> [CapabilityToolId; 45] {
     [
         CapabilityToolId::IdeasCreate,
         CapabilityToolId::IdeasList,
@@ -1015,6 +1036,7 @@ fn all_tool_capabilities() -> [CapabilityToolId; 44] {
         CapabilityToolId::RunsMainSyncRepairState,
         CapabilityToolId::RunsMainSyncRecordRecoveryDecision,
         CapabilityToolId::RunsKnowledgeCapsuleIgnore,
+        CapabilityToolId::RunsRetrofitCatalogSnapshot,
         CapabilityToolId::RunsCancel,
         CapabilityToolId::ApprovalsList,
         CapabilityToolId::ApprovalsResolve,
@@ -1072,6 +1094,7 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
             matches!(class, PrincipalClass::Operator)
         }
         CapabilityToolId::RunsKnowledgeCapsuleIgnore => matches!(class, PrincipalClass::Operator),
+        CapabilityToolId::RunsRetrofitCatalogSnapshot => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::RunsCancel => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::ApprovalsList => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
@@ -1086,7 +1109,9 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::LegacyDiscoveryOverrideCreate => {
             matches!(class, PrincipalClass::Operator)
         }
-        CapabilityToolId::ReportsGet => true,
+        // SEC-004: reports.get exposes operator diagnostics (retry authority, workflow conflict,
+        // P082 recovery readbacks, P091 repair state, etc.) — Operator-only.
+        CapabilityToolId::ReportsGet => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::ArtifactsOverrideContract => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StewardRunAnalysis => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StewardListAnalyses => {
@@ -1181,7 +1206,10 @@ fn resource_allowed_for_class(class: &PrincipalClass, id: ResourceTemplateId) ->
         ResourceTemplateId::RunEntity => true,
         ResourceTemplateId::IdeaEntity => true,
         ResourceTemplateId::ArtifactEntity => true,
-        ResourceTemplateId::ReportEntity => true,
+        ResourceTemplateId::ReportEntity => {
+            // HIGH-001: report:// exposes execution evidence and artifact payloads — Operator-only.
+            matches!(class, PrincipalClass::Operator)
+        }
         ResourceTemplateId::StewardAnalysisEntity => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
         }
@@ -1226,6 +1254,7 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
             Some(CapabilityToolId::RunsMainSyncRecordRecoveryDecision)
         }
         "runs.knowledge_capsule.ignore" => Some(CapabilityToolId::RunsKnowledgeCapsuleIgnore),
+        "runs.retrofit_catalog_snapshot" => Some(CapabilityToolId::RunsRetrofitCatalogSnapshot),
         "runs.cancel" => Some(CapabilityToolId::RunsCancel),
         "approvals.list" => Some(CapabilityToolId::ApprovalsList),
         "approvals.resolve" => Some(CapabilityToolId::ApprovalsResolve),
@@ -1367,7 +1396,8 @@ mod tests {
     fn observer_read_only() {
         let p = Principal::new("ob", PrincipalClass::Observer);
         assert!(is_tool_allowed(&p, "runs.list"));
-        assert!(is_tool_allowed(&p, "reports.get"));
+        // SEC-004: reports.get is Operator-only (exposes operator diagnostics).
+        assert!(!is_tool_allowed(&p, "reports.get"));
         assert!(!is_tool_allowed(&p, "ideas.create"));
         assert!(!is_tool_allowed(&p, "runs.start"));
     }
@@ -1473,7 +1503,8 @@ mod tests {
         assert!(is_resource_allowed(&ob, ResourceTemplateId::RunEntity));
         assert!(is_resource_allowed(&ob, ResourceTemplateId::IdeaEntity));
         assert!(is_resource_allowed(&ob, ResourceTemplateId::ArtifactEntity));
-        assert!(is_resource_allowed(&ob, ResourceTemplateId::ReportEntity));
+        // HIGH-001: report:// is Operator-only — Observer must be denied.
+        assert!(!is_resource_allowed(&ob, ResourceTemplateId::ReportEntity));
         assert!(is_resource_allowed(
             &ob,
             ResourceTemplateId::StewardAnalysisEntity

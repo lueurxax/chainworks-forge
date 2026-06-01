@@ -111,8 +111,8 @@ Both the singular and plural fields must be present:
 
 ### MCP `reports.get`
 
-- `p082_recovery_matrix_readbacks` — plural only
-- The singular `p082_recovery_matrix_readback` field **must be absent** from `reports.get`
+- `p082_recovery_matrix_readbacks` — plural; present at the result level and on each aggregated report entry (`reports[].p082_recovery_matrix_readbacks`)
+- The singular `p082_recovery_matrix_readback` field **must be absent** from `reports.get` at every level
 
 ### `report://{run_id}` resource
 
@@ -134,6 +134,10 @@ Both the singular and plural fields must be present:
 - `p082RecoveryMatrixReadbackJson` — camelCase; diagnostic-only; tolerant; not required
 - `p082RecoveryMatrixReadbacksJson` — camelCase; diagnostic-only; tolerant; not required
 - GraphQL readback is advisory. It must never be a required readback lane without an explicit contract amendment and tolerant test coverage.
+
+### Principal-Class Gating
+
+All P082 readback lanes are gated to operator principals. Non-operator principals (agent, observer) receive an empty `p082_recovery_matrix_readbacks` array and a null singular `p082_recovery_matrix_readback`. This applies to `runs.get`, `reports.get`, `report://{run_id}`, and the `run_report` artifact embedded inside `reports.get`. Lane field names remain present in every response shape; only the row payload is suppressed for non-operator principals.
 
 ---
 
@@ -185,7 +189,7 @@ Backward-compatible parsing rule: validate JSON and schema before use; fall back
 | `schema_version` | string | Always `"p082_retry_identifier_guidance_v1"` |
 | `command` | string | The command that was rejected |
 | `provided_identifier` | string | The identifier value the operator supplied |
-| `provided_identifier_kind` | string | Kind of the supplied identifier (e.g. `stage_execution_id`) |
+| `provided_identifier_kind` | string | Kind of the supplied identifier (e.g. `stage_execution_uuid`) |
 | `expected_identifier_kind` | string | Kind that was required (e.g. `workflow_stage_id`) |
 | `valid_identifier_examples` | array of strings | One or more valid examples for the expected kind |
 | `no_mutation` | boolean | Always `true`; confirms no state was mutated |
@@ -199,7 +203,7 @@ Backward-compatible parsing rule: validate JSON and schema before use; fall back
 | `source_work_item_id` | string | The work item associated with the superseded execution |
 | `source_session_generation_id` | string | The session generation that was superseded or cancelled |
 | `active_session_generation_id` | string | The current active session generation ID |
-| `claim_state` | string | `superseded`, `closed` |
+| `claim_state` | string | `superseded`, `closed`, `ignored` |
 | `output_settlement` | string | `quarantined`, `ignored` |
 | `ignored_late_output_count` | integer | Total count of ignored late outputs for this execution |
 | `source_work_item_terminal_status` | string | Terminal status of the superseded work item |
@@ -213,7 +217,7 @@ Backward-compatible parsing rule: validate JSON and schema before use; fall back
 | `schema_version` | string | Always `"p082_startup_repair_summary_v1"` |
 | `startup_repair_id` | string | The `startup_repairs.id` idempotency key |
 | `source_work_item_id` | string | The work item being repaired |
-| `source_command_journal_id` | string or null | The originating command journal row, when applicable |
+| `source_command_journal_id` | string | Non-empty `command_journal.id` of the originating command (required) |
 | `requeue_generation` | integer | Generation count for this requeue (1 for the first) |
 | `max_requeue_generation` | integer | Maximum allowed generation (1) |
 | `replayed` | boolean | `true` when this repair was replayed from an existing idempotency key |

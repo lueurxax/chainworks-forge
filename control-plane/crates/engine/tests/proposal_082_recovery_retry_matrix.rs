@@ -10,6 +10,7 @@ use domain::recovery_matrix;
 #[test]
 fn p082_engine_all_reason_codes_present() {
     let required = [
+        "resume_claim_status",
         "startup_requeue_once",
         "startup_requeue_exhausted",
         "invalid_stage_for_retry",
@@ -629,7 +630,10 @@ fn p082_r01_readback_has_repaired_status_and_retry_decision() {
         rb["recovery_reason_code"].as_str().unwrap(),
         recovery_matrix::REASON_STARTUP_REQUEUE_ONCE
     );
-    assert_eq!(rb["recovery_projection_integrity"].as_str().unwrap(), "valid");
+    assert_eq!(
+        rb["recovery_projection_integrity"].as_str().unwrap(),
+        "valid"
+    );
     let s = rb["recovery_startup_repair_summary"].as_object().unwrap();
     assert_eq!(s["max_requeue_generation"].as_i64(), Some(1));
     assert!(recovery_matrix::validate_readback_v1_shape(&rb));
@@ -652,8 +656,11 @@ fn p082_r02_no_mutation_decision_for_rejected_retry() {
         "valid",
         "2026-05-21T00:00:00Z",
     );
-    assert_eq!(rb["recovery_decision"].as_str().unwrap(), "no_mutation",
-        "P082-R02: rejected retry must use no_mutation decision to prevent state change");
+    assert_eq!(
+        rb["recovery_decision"].as_str().unwrap(),
+        "no_mutation",
+        "P082-R02: rejected retry must use no_mutation decision to prevent state change"
+    );
     assert_eq!(rb["scenario_status"].as_str().unwrap(), "rejected");
     assert!(recovery_matrix::validate_readback_v1_shape(&rb));
 }
@@ -684,7 +691,9 @@ fn p082_r03_late_output_settlement_active_projection_unchanged() {
         "P082-R03: output_settlement must be ignored for superseded late output"
     );
     assert_eq!(
-        settlement["source_work_item_terminal_status"].as_str().unwrap(),
+        settlement["source_work_item_terminal_status"]
+            .as_str()
+            .unwrap(),
         "completed",
         "P082-R03: source work item must be terminal after late output settlement"
     );
@@ -840,14 +849,22 @@ fn p082_r16_startup_requeue_exhausted_uses_held_status_not_repaired() {
         Some("Startup requeue exhausted: generation 1 was already consumed. Use existing recovery inspection or cancellation paths to clear the hold."),
     );
     // R16 must be held, not repaired — held prevents duplicate work scheduling.
-    assert_eq!(rb["scenario_status"].as_str().unwrap(), "held",
-        "P082-R16: scenario_status must be held (not repaired) to prevent duplicate scheduling");
-    assert_eq!(rb["recovery_reason_code"].as_str().unwrap(),
-        recovery_matrix::REASON_STARTUP_REQUEUE_EXHAUSTED);
+    assert_eq!(
+        rb["scenario_status"].as_str().unwrap(),
+        "held",
+        "P082-R16: scenario_status must be held (not repaired) to prevent duplicate scheduling"
+    );
+    assert_eq!(
+        rb["recovery_reason_code"].as_str().unwrap(),
+        recovery_matrix::REASON_STARTUP_REQUEUE_EXHAUSTED
+    );
     // replayed=true in the summary proves this is a replay of an exhausted generation.
     let s = rb["recovery_startup_repair_summary"].as_object().unwrap();
-    assert_eq!(s["replayed"].as_bool(), Some(true),
-        "P082-R16: replayed must be true when idempotency key was already observed");
+    assert_eq!(
+        s["replayed"].as_bool(),
+        Some(true),
+        "P082-R16: replayed must be true when idempotency key was already observed"
+    );
     // operator_message must be non-null for held states.
     assert!(!rb["recovery_operator_message"].is_null(),
         "P082-R16: recovery_operator_message must be non-null for startup_requeue_exhausted held state");
@@ -891,7 +908,9 @@ fn p082_r17_cancelled_provider_late_output_marks_cancelled_session() {
         "P082-R17: output_settlement must be ignored for cancelled provider late output"
     );
     assert_eq!(
-        settlement["source_work_item_terminal_status"].as_str().unwrap(),
+        settlement["source_work_item_terminal_status"]
+            .as_str()
+            .unwrap(),
         "failed",
         "P082-R17: source work item must be terminal (failed/completed) after settlement"
     );
@@ -930,10 +949,14 @@ fn p082_r07_side_effect_blocking_status_prevents_retry_route() {
         "retry",
         "P082-R07: retry must not be offered while side effects are unresolved (fail-closed)"
     );
-    assert!(!rb["recovery_side_effect_blocking_status"].is_null(),
-        "P082-R07: blocking_status must be non-null to surface side-effect hold to operators");
-    assert!(!rb["recovery_operator_message"].is_null(),
-        "P082-R07: operator_message must be non-null for side-effect held state");
+    assert!(
+        !rb["recovery_side_effect_blocking_status"].is_null(),
+        "P082-R07: blocking_status must be non-null to surface side-effect hold to operators"
+    );
+    assert!(
+        !rb["recovery_operator_message"].is_null(),
+        "P082-R07: operator_message must be non-null for side-effect held state"
+    );
 }
 
 // ── P082-R15: Crash-loop replay idempotency: same key must replay, not duplicate ─
@@ -944,25 +967,48 @@ fn p082_r15_crash_loop_same_key_must_not_create_duplicate() {
     let repair_id = "p082-requeue:cj-r15-loop:wi-r15-loop:1";
     // First pass: generate R01 readback (repair succeeded)
     let r01_summary = recovery_matrix::build_startup_repair_summary(
-        repair_id, "wi-r15-loop", "cj-r15-loop", 1, 1, false, 60_000, now, false, None, "global",
+        repair_id,
+        "wi-r15-loop",
+        "cj-r15-loop",
+        1,
+        1,
+        false,
+        60_000,
+        now,
+        false,
+        None,
+        "global",
     );
     let r01_rb = recovery_matrix::set_readback_startup_repair(
         recovery_matrix::build_readback_v1(
-            "P082-R01", "repaired", "retry",
+            "P082-R01",
+            "repaired",
+            "retry",
             recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
             "Startup repair requeued the work item.",
             "startup_repairs, work_items, command_journal",
             "startup_repairs, work_items",
             repair_id,
             Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-            "valid", now,
+            "valid",
+            now,
         ),
         r01_summary,
         None,
     );
     // Second crash pass: same idempotency key observed — replayed=true (R15)
     let r15_summary = recovery_matrix::build_startup_repair_summary(
-        repair_id, "wi-r15-loop", "cj-r15-loop", 1, 1, true, 60_000, now, false, None, "global",
+        repair_id,
+        "wi-r15-loop",
+        "cj-r15-loop",
+        1,
+        1,
+        true,
+        60_000,
+        now,
+        false,
+        None,
+        "global",
     );
     let r15_rb = recovery_matrix::set_readback_startup_repair(
         recovery_matrix::build_readback_v1(
@@ -986,12 +1032,256 @@ fn p082_r15_crash_loop_same_key_must_not_create_duplicate() {
     );
     // R15 must be repaired with replayed=true, not a new repair.
     assert_eq!(r15_rb["scenario_id"].as_str().unwrap(), "P082-R15");
-    let s15 = r15_rb["recovery_startup_repair_summary"].as_object().unwrap();
-    assert_eq!(s15["replayed"].as_bool(), Some(true),
-        "P082-R15: crash-loop replay must have replayed=true in startup_repair_summary");
+    let s15 = r15_rb["recovery_startup_repair_summary"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        s15["replayed"].as_bool(),
+        Some(true),
+        "P082-R15: crash-loop replay must have replayed=true in startup_repair_summary"
+    );
     // Original R01 must not have replayed=true (it was the first repair).
-    let s01 = r01_rb["recovery_startup_repair_summary"].as_object().unwrap();
-    assert_eq!(s01["replayed"].as_bool(), Some(false),
-        "P082-R01: original repair must have replayed=false");
+    let s01 = r01_rb["recovery_startup_repair_summary"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        s01["replayed"].as_bool(),
+        Some(false),
+        "P082-R01: original repair must have replayed=false"
+    );
     assert!(recovery_matrix::validate_readback_v1_shape(&r15_rb));
+}
+
+// ── P082-R04: Duplicate session/startup claim ─────────────────────────────
+
+#[test]
+fn p082_r04_duplicate_session_owner_uses_inspect_decision() {
+    let rb = recovery_matrix::build_readback_v1(
+        "P082-R04",
+        "held",
+        "inspect_duplicate_owner",
+        recovery_matrix::REASON_DUPLICATE_OWNER_REPAIRED,
+        "Duplicate session startup claim detected; one active owner preserved.",
+        "session_lineages, session_generations, session_events, work_items",
+        "sessions, work_items",
+        "sg-active-r04-001",
+        Some("session_events.details_json.p082_recovery_matrix_readback"),
+        "valid",
+        "2026-05-21T00:00:00Z",
+    );
+    assert_eq!(rb["scenario_id"].as_str().unwrap(), "P082-R04");
+    assert_eq!(
+        rb["recovery_decision"].as_str().unwrap(),
+        "inspect_duplicate_owner"
+    );
+    assert_eq!(
+        rb["recovery_reason_code"].as_str().unwrap(),
+        recovery_matrix::REASON_DUPLICATE_OWNER_REPAIRED
+    );
+    assert!(recovery_matrix::validate_readback_v1_shape(&rb));
+}
+
+// ── P082-R05: Stale ACP startup with Xcode grace requires operator message ─
+
+#[test]
+fn p082_r05_stale_acp_startup_xcode_requires_non_null_operator_message() {
+    assert!(
+        recovery_matrix::ALL_REASON_CODES.contains(&recovery_matrix::REASON_STARTUP_STALLED),
+        "P082-R05: startup_stalled must be in ALL_REASON_CODES"
+    );
+    let xcode_summary = recovery_matrix::build_startup_repair_summary(
+        "p082-requeue:cj-r05:wi-r05:1",
+        "wi-r05",
+        "cj-r05",
+        1,
+        1,
+        false,
+        720_000,
+        "2026-05-21T00:12:00Z",
+        true,
+        Some("2026-05-21T00:12:00Z"),
+        "global",
+    );
+    assert_eq!(
+        xcode_summary["xcode_required"].as_bool(),
+        Some(true),
+        "P082-R05: xcode_required must be true for Xcode startup grace path"
+    );
+    let rb = recovery_matrix::set_readback_startup_repair(
+        recovery_matrix::build_readback_v1(
+            "P082-R05",
+            "pending",
+            "wait",
+            recovery_matrix::REASON_STARTUP_STALLED,
+            "Stale ACP startup: no provider session after grace period. Xcode startup required.",
+            "work_items, session_generations, session_events, startup_recovery_readbacks",
+            "work_items, sessions, startup_repairs",
+            "wi-r05",
+            Some("work_items.payload_json.p061_startup_recovery"),
+            "valid",
+            "2026-05-21T00:00:00Z",
+        ),
+        xcode_summary,
+        Some("Xcode startup grace exceeded. Inspect Xcode broker and session startup. Grace: 12 minutes."),
+    );
+    assert_eq!(rb["scenario_id"].as_str().unwrap(), "P082-R05");
+    assert!(
+        !rb["recovery_operator_message"].is_null(),
+        "P082-R05: recovery_operator_message must be non-null for Xcode startup grace"
+    );
+    assert!(recovery_matrix::validate_readback_v1_shape(&rb));
+}
+
+// ── P082-R10: Duplicate mediation attempt ────────────────────────────────
+
+#[test]
+fn p082_r10_duplicate_mediation_owner_uses_inspect_duplicate_decision() {
+    let rb = recovery_matrix::build_readback_v1(
+        "P082-R10",
+        "rejected",
+        "inspect_duplicate_owner",
+        recovery_matrix::REASON_DUPLICATE_MEDIATION_OWNER_REJECTED,
+        "Duplicate mediation attempt: active fingerprint already has an owner.",
+        "lead_conflict_mediations, lead_mediation_confirmations, workflow_conflicts, agent_executions",
+        "lead_conflict_mediations, lead_mediation_confirmations",
+        "mediation-fingerprint-r10-001",
+        Some("lead_conflict_mediations.validation_errors_json.p082_recovery_matrix_readback"),
+        "valid",
+        "2026-05-21T00:00:00Z",
+    );
+    assert_eq!(rb["scenario_id"].as_str().unwrap(), "P082-R10");
+    assert_eq!(
+        rb["recovery_reason_code"].as_str().unwrap(),
+        recovery_matrix::REASON_DUPLICATE_MEDIATION_OWNER_REJECTED
+    );
+    assert!(recovery_matrix::validate_readback_v1_shape(&rb));
+}
+
+// ── P082-R12: Cancel with pending approval preserves approval state ────────
+
+#[test]
+fn p082_r12_cancel_with_pending_approval_must_not_auto_resolve() {
+    let rb = recovery_matrix::build_readback_v1(
+        "P082-R12",
+        "cancelled",
+        "cancel",
+        recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_PRESERVED,
+        "Cancellation settled without auto-resolving the pending approval decision.",
+        "runs, approvals, approval_inbox",
+        "runs, approvals",
+        "run-r12",
+        Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
+        "valid",
+        "2026-05-21T00:00:00Z",
+    );
+    assert_eq!(rb["scenario_id"].as_str().unwrap(), "P082-R12");
+    assert_eq!(
+        rb["scenario_status"].as_str().unwrap(),
+        "cancelled",
+        "P082-R12: scenario_status must be cancelled, not rejected or pending"
+    );
+    assert_eq!(rb["recovery_decision"].as_str().unwrap(), "cancel");
+    assert_eq!(
+        rb["recovery_reason_code"].as_str().unwrap(),
+        recovery_matrix::REASON_CANCEL_PENDING_APPROVAL_PRESERVED
+    );
+    assert!(recovery_matrix::validate_readback_v1_shape(&rb));
+}
+
+// ── P082-R13: Cancel with unresolved side effects holds for reconciliation ─
+
+#[test]
+fn p082_r13_cancel_with_side_effects_uses_reconcile_decision() {
+    let rb = recovery_matrix::set_readback_side_effect_hold(
+        recovery_matrix::build_readback_v1(
+            "P082-R13",
+            "held",
+            "reconcile_side_effects",
+            recovery_matrix::REASON_CANCEL_SIDE_EFFECT_RECONCILIATION_REQUIRED,
+            "Cancellation held: unresolved side effects must be reconciled before final settlement.",
+            "runs, side_effects, side_effect_attempts, side_effect_settlements",
+            "runs, side_effects",
+            "run-r13",
+            Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T00:00:00Z",
+        ),
+        "unresolved_side_effect_entries",
+        "Cancellation held: unresolved side-effect ledger entries exist. Reconcile before final settlement.",
+    );
+    assert_eq!(rb["scenario_id"].as_str().unwrap(), "P082-R13");
+    assert_eq!(
+        rb["scenario_status"].as_str().unwrap(),
+        "held",
+        "P082-R13: scenario_status must be held while side effects remain unresolved"
+    );
+    assert_eq!(
+        rb["recovery_decision"].as_str().unwrap(),
+        "reconcile_side_effects"
+    );
+    assert_ne!(
+        rb["recovery_decision"].as_str().unwrap(),
+        "retry",
+        "P082-R13: retry must not be offered while cancellation side effects are unresolved"
+    );
+    assert!(
+        !rb["recovery_operator_message"].is_null(),
+        "P082-R13: recovery_operator_message must be non-null for side-effect held state"
+    );
+    assert!(recovery_matrix::validate_readback_v1_shape(&rb));
+}
+
+// ── P082 Fixture: every p082_recovery_matrix_readback_v1 in the fixture validates ──
+
+/// Load the p082-full-surface.fixture.json and validate every readback object
+/// through validate_readback_v1_shape so schema drift is caught at gate time.
+#[test]
+fn p082_full_surface_fixture_all_readbacks_pass_schema_validation() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let fixture_path = std::path::Path::new(manifest_dir).join(
+        "../../../docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json",
+    );
+    let fixture_text = std::fs::read_to_string(&fixture_path).unwrap_or_else(|err| {
+        panic!(
+            "P082 fixture must be readable at {}: {err}",
+            fixture_path.display()
+        )
+    });
+    let fixture: serde_json::Value = serde_json::from_str(&fixture_text)
+        .expect("p082-full-surface.fixture.json must be valid JSON");
+
+    fn walk_and_validate(value: &serde_json::Value, path: &str, failures: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("schema_version").and_then(|v| v.as_str())
+                    == Some("p082_recovery_matrix_readback_v1")
+                {
+                    if !domain::recovery_matrix::validate_readback_v1_shape(value) {
+                        let scenario = map
+                            .get("scenario_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        failures.push(format!("{path} (scenario_id={scenario})"));
+                    }
+                }
+                for (key, child) in map {
+                    walk_and_validate(child, &format!("{path}.{key}"), failures);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    walk_and_validate(child, &format!("{path}[{i}]"), failures);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut failures = Vec::new();
+    walk_and_validate(&fixture, "$", &mut failures);
+    assert!(
+        failures.is_empty(),
+        "P082 fixture: the following readback objects failed validate_readback_v1_shape:\n{}",
+        failures.join("\n")
+    );
 }

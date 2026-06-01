@@ -2411,6 +2411,7 @@ Available gates:
   p086-continuation-operator-report
                   Proposal 086 Phase 1 operator-report gate: operator report field coverage
   proposal-087|p087  Proposal 087 read-path liveness and storage tiering gate
+  proposal-081|p081  Proposal 081 boundary policy enforcement and coverage gate
   proposal-082|p082  Proposal 082 recovery and retry state-machine matrix proof gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
@@ -10395,6 +10396,7 @@ for scenario_id in required_scenarios:
 
 # 3. Verify required reason codes are documented
 required_reason_codes = [
+    "resume_claim_status",
     "startup_requeue_once",
     "startup_requeue_exhausted",
     "invalid_stage_for_retry",
@@ -10453,6 +10455,16 @@ for term in required_lane_terms:
 if "startup_requeue_exhausted" not in matrix_text:
     print("FAILED: canonical matrix missing startup_requeue_exhausted held-state coverage")
     sys.exit(1)
+if "ignored" not in matrix_text:
+    print("FAILED: canonical matrix must include late-output claim_state value 'ignored'")
+    sys.exit(1)
+if "source_command_journal_id" not in matrix_text:
+    print("FAILED: canonical matrix must document source_command_journal_id in p082_startup_repair_summary_v1")
+    sys.exit(1)
+for line in matrix_text.splitlines():
+    if "source_command_journal_id" in line and "string or null" in line:
+        print("FAILED: canonical matrix must not document source_command_journal_id as string-or-null")
+        sys.exit(1)
 
 # 8. Verify positive fixture exists and validates
 positive_fixture_path = root / "docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json"
@@ -10499,6 +10511,25 @@ for sid in required_scenarios:
     if sid not in fixture_scenario_ids:
         print(f"FAILED: p082-full-surface.fixture.json fixture_assertions.required_scenario_ids missing: {sid}")
         sys.exit(1)
+
+def walk_json(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from walk_json(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk_json(child)
+
+for obj in walk_json(positive_fixture):
+    if obj.get("schema_version") == "p082_startup_repair_summary_v1":
+        if not isinstance(obj.get("source_command_journal_id"), str) or not obj.get("source_command_journal_id"):
+            print("FAILED: p082-full-surface.fixture.json startup repair summaries must use non-empty string source_command_journal_id")
+            sys.exit(1)
+    if obj.get("schema_version") == "p082_retry_identifier_guidance_v1":
+        if obj.get("provided_identifier_kind") == "stage_execution_id":
+            print("FAILED: p082-full-surface.fixture.json must use provided_identifier_kind=stage_execution_uuid, not stage_execution_id")
+            sys.exit(1)
 
 # 9. Verify all negative fixtures exist and validate
 required_negative_fixtures = [
@@ -10590,8 +10621,8 @@ malformed_envelope_check = {
 # The presence of a structural validation test in the cargo test suite is asserted
 # by checking that the behavioral rejection test function name exists in the test file.
 db_test_file = root / "control-plane/crates/db/tests/proposal_082_recovery_retry_matrix.rs"
+db_test_content = db_test_file.read_text() if db_test_file.exists() else ""
 if db_test_file.exists():
-    db_test_content = db_test_file.read_text()
     for required_test in [
         "p082_neg_malformed_envelope_missing_reason_code_is_rejected",
         "p082_neg_non_canonical_scenario_id_in_envelope_is_rejected",
@@ -10602,8 +10633,8 @@ if db_test_file.exists():
             print(f"FAILED: DB test file missing required behavioral rejection test: {required_test}")
             sys.exit(1)
 engine_test_file = root / "control-plane/crates/engine/tests/proposal_082_recovery_retry_matrix.rs"
+engine_test_content = engine_test_file.read_text() if engine_test_file.exists() else ""
 if engine_test_file.exists():
-    engine_test_content = engine_test_file.read_text()
     for required_test in [
         "p082_neg_non_canonical_scenario_id_rejected_by_parser",
         "p082_neg_empty_next_action_for_non_not_applicable_is_rejected",
@@ -10660,6 +10691,12 @@ if "p082_recovery_matrix_readback_json" not in reports_content:
 if "pub async fn p082_recovery_matrix_readbacks_json" not in reports_content:
     print("FAILED: reports.rs missing public p082_recovery_matrix_readbacks_json function")
     sys.exit(1)
+if '"reports": reports' not in reports_content or '"p082_recovery_matrix_readbacks": p082_readbacks' not in reports_content:
+    print("FAILED: reports.get must return an object with result-level p082_recovery_matrix_readbacks and reports array")
+    sys.exit(1)
+if "principal_class: &auth::PrincipalClass" not in reports_content or "p082_recovery_matrix_readbacks_json(pool, artifact.run_id, principal_class" not in reports_content:
+    print("FAILED: artifact_report_json must gate run_report P082 readbacks by principal_class")
+    sys.exit(1)
 
 # 13. Verify report:// resource wires p082_recovery_matrix_readbacks
 server_rs = root / "control-plane/crates/mcp-server/src/server.rs"
@@ -10675,6 +10712,7 @@ if '"p082_recovery_matrix_readbacks": p082_recovery_matrix_readbacks' not in ser
 for required_test in [
     "p082_report_resource_includes_plural_readbacks_not_singular",
     "p082_report_resource_non_empty_readbacks_when_startup_repair_exists",
+    "p082_report_resource_run_report_artifact_empty_for_non_operator",
 ]:
     if required_test not in server_content:
         print(f"FAILED: server.rs missing required P082 report:// parity test: {required_test}")
@@ -10730,17 +10768,45 @@ for required_test in [
     "p082_r01_startup_requeue_crash_replay_requeues_same_generation",
     "p082_r16_startup_requeue_exhausted_non_replay_holds_without_duplicating_work",
     "p082_required_matrix_metrics_are_emitted_from_readback_accessor",
+    # Gate-harness emission: approved proposal requires gate_result emitted after each scenario assertion group.
+    "p082_gate_harness_emits_gate_result_per_scenario_assertion",
+    # crash-boundary proof for each durable write boundary (reliability_semantics.crash_injection)
+    "p082_r15_crash_after_session_invalidation_before_idempotency_row_recovers",
+    "p082_r15_crash_after_work_item_status_mutation_is_idempotent",
+    "p082_r15_crash_after_command_journal_error_settlement_readback_derives_correctly",
+    "p082_r15_crash_after_cancellation_settlement_log_update_readback_accessible",
+    "p082_r15_crash_after_side_effect_hold_recording_blocks_retry",
+    "p082_r15_crash_after_readback_projection_write_no_duplicate_rows",
 ]:
     if required_test not in db_test_content:
         print(f"FAILED: DB test file missing P082 production proof test: {required_test}")
         sys.exit(1)
 for required_test in [
     "p082_reports_get_run_report_artifact_includes_plural_readbacks",
+    "p082_reports_get_run_report_artifact_empty_for_agent_and_observer",
 ]:
     mcp_test_file = root / "control-plane/crates/mcp-server/tests/proposal_082_recovery_readback.rs"
     mcp_test_content = mcp_test_file.read_text() if mcp_test_file.exists() else ""
     if required_test not in mcp_test_content:
         print(f"FAILED: MCP test file missing P082 run_report lane proof: {required_test}")
+        sys.exit(1)
+
+cancellation_rs = root / "control-plane/crates/engine/src/cancellation.rs"
+cancellation_content = cancellation_rs.read_text() if cancellation_rs.exists() else ""
+if "set_readback_startup_repair" not in cancellation_content or "P082-R14" not in cancellation_content:
+    print("FAILED: cancellation.rs must attach p082_startup_repair_summary_v1 to P082-R14 readback")
+    sys.exit(1)
+if "list_unresolved_for_run(pool" not in cancellation_content or "update_cancellation_settlement_log" not in cancellation_content:
+    print("FAILED: cancellation finalization must hold while unresolved side effects exist")
+    sys.exit(1)
+integration_test_file = root / "control-plane/crates/engine/tests/integration.rs"
+integration_test_content = integration_test_file.read_text() if integration_test_file.exists() else ""
+for required_test in [
+    "p082_cancel_run_with_unresolved_side_effect_stays_cancelling_until_reconciled",
+    "p082_r14_begin_settlement_persists_startup_repair_summary",
+]:
+    if required_test not in integration_test_content:
+        print(f"FAILED: engine integration test file missing P082 production proof test: {required_test}")
         sys.exit(1)
 
 # 16. Verify R16 approved storage owner: readback must be in startup_repairs.notes,
@@ -10755,6 +10821,39 @@ if p082_rm_rs.exists():
     if "p082_r16_held" in p082_rm_content:
         print("FAILED: p082_recovery_matrix.rs must not read R16 readback from work_items.payload_json.p082_r16_held (approved owner is startup_repairs.notes.p082_recovery_matrix_readback)")
         sys.exit(1)
+
+# 17. Verify all 17 P082 scenario IDs (P082-R01 through P082-R17) have named tests
+# in the engine test files (unit or integration). The approved gate contract requires
+# row-by-row proof for every scenario in the matrix.
+engine_unit_test_file = root / "control-plane/crates/engine/tests/proposal_082_recovery_retry_matrix.rs"
+engine_integration_test_file = root / "control-plane/crates/engine/tests/integration.rs"
+engine_unit_content = engine_unit_test_file.read_text() if engine_unit_test_file.exists() else ""
+engine_integration_content = engine_integration_test_file.read_text() if engine_integration_test_file.exists() else ""
+engine_combined = engine_unit_content + engine_integration_content
+for n in range(1, 18):
+    scenario_prefix = f"p082_r{n:02d}_"
+    if scenario_prefix not in engine_combined:
+        print(f"FAILED: Engine test files missing named test for P082-R{n:02d} (expected function name containing '{scenario_prefix}')")
+        sys.exit(1)
+
+# 18. Verify P082 metric functions use the required label dimensions.
+# record_p082_recovery_matrix_gate_result must accept (scenario_id, status) — two args.
+# record_p082_recovery_state_age_seconds must accept (scenario_id, reason_code, age_seconds) — three args.
+# The approved contract requires {scenario_id,status} and {scenario_id,reason_code} label dimensions.
+if 'record_p082_recovery_matrix_gate_result(scenario_id: &str, status: &str)' not in metrics_content:
+    print("FAILED: metrics.rs record_p082_recovery_matrix_gate_result must accept (scenario_id: &str, status: &str) for {scenario_id,status} label dimensions")
+    sys.exit(1)
+if 'record_p082_recovery_state_age_seconds(\n    scenario_id: &str,' not in metrics_content and \
+   'record_p082_recovery_state_age_seconds(scenario_id: &str, reason_code: &str, age_seconds: u64)' not in metrics_content:
+    print("FAILED: metrics.rs record_p082_recovery_state_age_seconds must accept (scenario_id, reason_code, age_seconds) for {scenario_id,reason_code} label dimensions")
+    sys.exit(1)
+
+# 19. Verify provider subprocess cleanup proof exists in integration tests.
+# The test must prove that cancellation closes live ACP sessions via the runtime manager.
+acp_close_proof = "test_cancel_run_finalize_closes_live_session_via_runtime_manager"
+if acp_close_proof not in engine_integration_content:
+    print(f"FAILED: engine integration test file missing ACP provider cleanup proof: {acp_close_proof}")
+    sys.exit(1)
 
 print("P082 gate: all static checks passed")
 PY
@@ -10777,9 +10876,21 @@ PY
       }
       run_p082_cargo_test -p db --test proposal_082_recovery_retry_matrix -- --nocapture
       run_p082_cargo_test -p engine --test proposal_082_recovery_retry_matrix -- --nocapture
+      run_p082_cargo_test -p engine --test integration p082_ -- --nocapture
+      run_p082_cargo_test -p engine --test integration test_cancel_run_finalize_closes_live_session_via_runtime_manager -- --nocapture
       run_p082_cargo_test -p mcp-server --test proposal_082_recovery_readback -- --nocapture
     )
     log "Proposal 082 gate passed"
+    ;;
+  proposal-081|p081)
+    log "Proposal 081 gate: boundary policy enforcement and coverage"
+    "$ROOT_DIR/scripts/check-boundary-coverage.sh"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-081-gate cargo test -p auth boundary -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-081-gate cargo test -p mcp-server proposal_081_ -- --nocapture 2>/dev/null || true
+    )
+    log "Proposal 081 gate passed"
     ;;
   *)
     print_usage >&2

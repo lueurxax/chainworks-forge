@@ -12528,7 +12528,20 @@ You are continuing the same Chainworks agent execution through an existing live 
         // P082-R03/R17: after commit, persist late output settlement readback to
         // stage_executions.recovery_snapshot_json so the accessor can surface it.
         if has_ignored_late_output {
-            let cancelled_provider = result_status == AgentStatus::Cancelled;
+            // P082-R17 requires durable cancelled-run evidence from the DB rather than
+            // provider result_status alone, so a completed late response from a cancelled
+            // provider session is not misreported as P082-R03.
+            let run_has_durable_cancellation = db::repos::runs::find_by_id(
+                &self.pool,
+                artifact_claim_key.run_id,
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|r| r.cancellation_requested_at.is_some())
+            .unwrap_or(false);
+            let cancelled_provider =
+                result_status == AgentStatus::Cancelled || run_has_durable_cancellation;
             let scenario_id = if cancelled_provider {
                 "P082-R17"
             } else {
@@ -13809,7 +13822,10 @@ You are continuing the same Chainworks agent execution through an existing live 
         let p082_readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&self.pool, run.id)
             .await
             .unwrap_or_default();
-        db::repos::p082_recovery_matrix::emit_readback_lane_metrics(&p082_readbacks, "release_receipt");
+        db::repos::p082_recovery_matrix::emit_readback_lane_metrics(
+            &p082_readbacks,
+            "release_receipt",
+        );
         let receipt = match DeliveryReceiptBuilder::build_receipt(
             run,
             delivery_config,
