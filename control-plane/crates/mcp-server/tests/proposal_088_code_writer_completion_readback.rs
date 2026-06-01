@@ -372,7 +372,7 @@ async fn proposal_088_mcp_report_exposes_code_writer_completion_receipts() {
     )
     .await
     .unwrap();
-    let reports = result.as_array().expect("reports array");
+    let reports = result["reports"].as_array().expect("reports array");
     let mcp_truth = reports
         .iter()
         .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))

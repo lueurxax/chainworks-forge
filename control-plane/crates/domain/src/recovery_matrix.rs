@@ -131,6 +131,50 @@ pub fn parse_command_journal_error_envelope(error: &str) -> Option<serde_json::V
     Some(v)
 }
 
+fn sanitize_p082_json(value: serde_json::Value) -> (serde_json::Value, bool) {
+    match value {
+        serde_json::Value::String(raw) => {
+            let sanitized = crate::error_sanitizer::sanitize_error_for_storage(&raw, 2048);
+            let changed = sanitized != raw;
+            (serde_json::Value::String(sanitized), changed)
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            let items = items
+                .into_iter()
+                .map(|item| {
+                    let (sanitized, item_changed) = sanitize_p082_json(item);
+                    changed |= item_changed;
+                    sanitized
+                })
+                .collect();
+            (serde_json::Value::Array(items), changed)
+        }
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            let mut sanitized_map = serde_json::Map::new();
+            for (key, value) in map {
+                let (sanitized, value_changed) = sanitize_p082_json(value);
+                changed |= value_changed;
+                sanitized_map.insert(key, sanitized);
+            }
+            if changed
+                && sanitized_map
+                    .get("diagnostic_redaction")
+                    .and_then(|value| value.as_str())
+                    == Some("none")
+            {
+                sanitized_map.insert(
+                    "diagnostic_redaction".to_string(),
+                    serde_json::Value::String("partial".to_string()),
+                );
+            }
+            (serde_json::Value::Object(sanitized_map), changed)
+        }
+        other => (other, false),
+    }
+}
+
 /// Build a `p082_rejected_command_error_v1` JSON string suitable for writing
 /// to `command_journal.error`.
 ///
@@ -143,6 +187,20 @@ pub fn build_rejected_command_error_envelope(
     operator_safe_summary: &str,
     readback: serde_json::Value,
 ) -> String {
+    let reason_code = if ALL_REASON_CODES.contains(&reason_code) {
+        reason_code
+    } else {
+        REASON_RESUME_CLAIM_STATUS
+    };
+    let command_type = crate::error_sanitizer::sanitize_error_for_storage(command_type, 128);
+    let operator_safe_summary =
+        crate::error_sanitizer::sanitize_error_for_storage(operator_safe_summary, 2048);
+    let (readback, _) = sanitize_p082_json(readback);
+    let readback = if validate_readback_v1_shape(&readback) {
+        readback
+    } else {
+        serde_json::Value::Null
+    };
     serde_json::json!({
         "schema_version": SCHEMA_REJECTED_COMMAND_ERROR_V1,
         "reason_code": reason_code,
@@ -679,6 +737,18 @@ pub fn validate_readback_v1_shape(rb: &serde_json::Value) -> bool {
     if !object_string_or_null(obj, "recovery_side_effect_blocking_status") {
         return false;
     }
+    // P082-R07 and P082-R13 in held status require a non-empty side-effect blocking status
+    // because operator decision gates on this field for held side-effect rows.
+    if status == "held"
+        && matches!(scenario_id, "P082-R07" | "P082-R13")
+        && obj
+            .get("recovery_side_effect_blocking_status")
+            .and_then(|v| v.as_str())
+            .map(str::is_empty)
+            .unwrap_or(true)
+    {
+        return false;
+    }
     if !validate_retry_identifier_guidance(
         obj.get("recovery_retry_identifier_guidance")
             .unwrap_or(&serde_json::Value::Null),
@@ -810,6 +880,37 @@ mod tests {
         assert_eq!(
             v["reason_code"].as_str().unwrap(),
             REASON_INVALID_STAGE_FOR_RETRY
+        );
+    }
+
+    #[test]
+    fn build_rejected_command_error_envelope_sanitizes_summary_and_readback_strings() {
+        let readback = build_readback_v1(
+            "P082-R02",
+            "rejected",
+            "no_mutation",
+            REASON_INVALID_STAGE_FOR_RETRY,
+            "No mutation was performed; api_key=abc sk-test must not leak.",
+            "command_journal",
+            "command_journal",
+            "cmd-002",
+            Some("command_journal.error.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T00:00:00Z",
+        );
+        let envelope = build_rejected_command_error_envelope(
+            REASON_INVALID_STAGE_FOR_RETRY,
+            "RetryStage",
+            "Rejected retry with token sk-test and api_key=abc",
+            readback,
+        );
+        assert!(!envelope.contains("sk-test"));
+        assert!(!envelope.contains("api_key=abc"));
+        let parsed = parse_command_journal_error_envelope(&envelope)
+            .expect("sanitized envelope should still parse");
+        assert_eq!(
+            parsed["p082_recovery_matrix_readback"]["diagnostic_redaction"],
+            serde_json::json!("partial")
         );
     }
 

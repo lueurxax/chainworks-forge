@@ -242,7 +242,7 @@ async fn retry_authority_history_and_current_readback_include_active_authority()
     )
     .await
     .unwrap();
-    let reports = report_payload.as_array().expect("reports array");
+    let reports = report_payload["reports"].as_array().expect("reports array");
     let mcp_truth = reports
         .iter()
         .find(|report| report["report_kind"] == serde_json::json!("mcp_execution_truth"))

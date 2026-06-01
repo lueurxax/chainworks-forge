@@ -447,10 +447,23 @@ pub async fn requeue_running_preclaimed_invoke_for_stage_tx(
     stage_id: &str,
 ) -> Result<usize> {
     let rows = sqlx::query(
-        r#"SELECT id, payload_json
-           FROM work_items
-           WHERE run_id = ?1 AND stage_id = ?2 AND kind = ?3 AND status = ?4
-           ORDER BY scheduled_at ASC, rowid ASC"#,
+        r#"SELECT wi.id, wi.payload_json
+           FROM work_items wi
+           LEFT JOIN agent_executions ae
+             ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+           LEFT JOIN agent_execution_runtime_facts facts
+             ON facts.agent_execution_id = ae.id
+           WHERE wi.run_id = ?1 AND wi.stage_id = ?2 AND wi.kind = ?3 AND wi.status = ?4
+             AND NOT (
+               json_type(wi.payload_json, '$.targeted_retry') IS NOT NULL
+               AND ae.status = 'completed'
+               AND facts.output_settlement IN (
+                 'valid_outputs_from_completed_execution',
+                 'valid_outputs_from_failed_execution'
+               )
+               AND COALESCE(facts.valid_required_outputs, 0) > 0
+             )
+           ORDER BY wi.scheduled_at ASC, wi.rowid ASC"#,
     )
     .bind(run_id.to_string())
     .bind(stage_id)
@@ -1313,10 +1326,23 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
     reason: &str,
 ) -> Result<u64> {
     let rows = sqlx::query(
-        r#"SELECT id, payload_json
-           FROM work_items
-           WHERE kind = ?1 AND status = ?2
-           ORDER BY scheduled_at ASC, rowid ASC"#,
+        r#"SELECT wi.id, wi.payload_json
+           FROM work_items wi
+           LEFT JOIN agent_executions ae
+             ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+           LEFT JOIN agent_execution_runtime_facts facts
+             ON facts.agent_execution_id = ae.id
+           WHERE wi.kind = ?1 AND wi.status = ?2
+             AND NOT (
+               json_type(wi.payload_json, '$.targeted_retry') IS NOT NULL
+               AND ae.status = 'completed'
+               AND facts.output_settlement IN (
+                 'valid_outputs_from_completed_execution',
+                 'valid_outputs_from_failed_execution'
+               )
+               AND COALESCE(facts.valid_required_outputs, 0) > 0
+             )
+           ORDER BY wi.scheduled_at ASC, wi.rowid ASC"#,
     )
     .bind(WorkItemKind::InvokeAgent.to_string())
     .bind(WorkItemStatus::Running.to_string())
@@ -1339,12 +1365,50 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let source_command_journal_id = match p082_source_command_journal_id_from_payload(&payload)
-        {
-            Some(journal_id) => journal_id,
-            None => p082_latest_command_journal_id_for_run_tx(tx, &run_id_for_repair)
-                .await?
-                .unwrap_or_else(|| "unavailable".to_string()),
+        let source_command_journal_id_opt =
+            match p082_source_command_journal_id_from_payload(&payload) {
+                Some(journal_id) => Some(journal_id),
+                None => p082_latest_command_journal_id_for_run_tx(tx, &run_id_for_repair).await?,
+            };
+        let Some(source_command_journal_id) = source_command_journal_id_opt else {
+            // No command journal entry can be resolved for this work item.
+            // P082-R01 requires a real command_journal.id; skip the startup repair record
+            // and do a plain requeue without P082 metadata. Still strip p058_claimed so the
+            // retried execution gets a fresh claim, and stamp p061_startup_recovery for parity.
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("p058_claimed");
+                object.insert(
+                    "p061_startup_recovery".to_string(),
+                    serde_json::json!({
+                        "requeued_at": scheduled_at_rfc3339.clone(),
+                        "reason": reason,
+                        "source_work_item_id": item_id,
+                        "requeue_generation": 1,
+                        "max_requeue_generation": 1,
+                    }),
+                );
+            }
+            let updated = sqlx::query(
+                r#"UPDATE work_items
+                   SET status = ?1,
+                       payload_json = ?2,
+                       started_at = NULL,
+                       completed_at = NULL,
+                       failed_at = NULL,
+                       last_error = ?3
+                   WHERE id = ?4 AND status = ?5"#,
+            )
+            .bind(&pending)
+            .bind(serde_json::to_string(&payload)?)
+            .bind(reason)
+            .bind(&item_id)
+            .bind(&running)
+            .execute(&mut **tx)
+            .await
+            .context("requeue running InvokeAgent work item on startup (no journal)")?
+            .rows_affected();
+            requeued += updated;
+            continue;
         };
         // P082-R01: build the startup repair idempotency key and summary.
         // Key format: p082-requeue:{command_journal.id}:{source_work_item_id}:1.
@@ -1423,13 +1487,12 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
                                 "next_retry_or_backoff_time".to_string(),
                                 serde_json::Value::String(scheduled_at_rfc3339.clone()),
                             );
-                            let _ = sqlx::query(
-                                "UPDATE startup_repairs SET notes = ?1 WHERE id = ?2",
-                            )
-                            .bind(notes_json.to_string())
-                            .bind(&repair_id)
-                            .execute(&mut **tx)
-                            .await;
+                            let _ =
+                                sqlx::query("UPDATE startup_repairs SET notes = ?1 WHERE id = ?2")
+                                    .bind(notes_json.to_string())
+                                    .bind(&repair_id)
+                                    .execute(&mut **tx)
+                                    .await;
                         }
                     }
                 }
@@ -1482,6 +1545,9 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
             // UPDATE startup_repairs.notes with the R16 readback so Source 1 of the
             // readbacks_for_run accessor surfaces it from the approved storage owner
             // (startup_repairs.notes.p082_recovery_matrix_readback).
+            // replayed=true: the same exhausted key was re-observed (semantically correct).
+            // Source 10 (R15 classifier) guards against misclassification by checking
+            // recovery_reason_code != startup_requeue_exhausted before emitting R15.
             let held_summary = domain::recovery_matrix::build_startup_repair_summary(
                 &repair_id,
                 &item_id,
@@ -1515,14 +1581,12 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
             let r16_notes = serde_json::json!({
                 "p082_recovery_matrix_readback": held_readback,
             });
-            sqlx::query(
-                "UPDATE startup_repairs SET notes = ?1 WHERE id = ?2",
-            )
-            .bind(r16_notes.to_string())
-            .bind(&repair_id)
-            .execute(&mut **tx)
-            .await
-            .context("update startup_repairs notes for P082-R16 held state")?;
+            sqlx::query("UPDATE startup_repairs SET notes = ?1 WHERE id = ?2")
+                .bind(r16_notes.to_string())
+                .bind(&repair_id)
+                .execute(&mut **tx)
+                .await
+                .context("update startup_repairs notes for P082-R16 held state")?;
             crate::metrics::increment_counter_with_label(
                 "p082_recovery_idempotency_replay_total",
                 "P082-R16:startup_requeue_exhausted",
@@ -1874,11 +1938,13 @@ pub async fn requeue_stale_starting_invoke_agent_sessions_tx(
 ) -> Result<u64> {
     let rows = sqlx::query(
         r#"SELECT wi.id,
+                  wi.run_id,
                   wi.payload_json,
                   COALESCE(wi.started_at, wi.scheduled_at) AS work_started_at,
                   ae.session_generation_id AS session_generation_id,
                   sg.lineage_id AS session_lineage_id,
-                  sg.created_at AS generation_created_at
+                  sg.created_at AS generation_created_at,
+                  sg.invocation_owner_key AS invocation_owner_key
            FROM work_items wi
            INNER JOIN agent_executions ae
              ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
@@ -1906,7 +1972,13 @@ pub async fn requeue_stale_starting_invoke_agent_sessions_tx(
 
     for row in rows {
         let item_id: String = row.get("id");
+        let run_id_for_repair: String = row.get("run_id");
         let payload_json: String = row.get("payload_json");
+        let owner_key: String = row
+            .try_get::<Option<String>, _>("invocation_owner_key")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let mut payload = serde_json::from_str::<serde_json::Value>(&payload_json)
             .unwrap_or_else(|_| serde_json::json!({}));
         let xcode_required = payload
@@ -2013,6 +2085,79 @@ pub async fn requeue_stale_starting_invoke_agent_sessions_tx(
         .context("requeue stale starting InvokeAgent work item")?
         .rows_affected();
         requeued += updated;
+
+        // Write a durable P082-R05 readback so the repair is visible after the
+        // session generation moves to 'invalidated' and the live Source 8 query
+        // no longer finds the row.
+        let stale_after_ms = if xcode_required {
+            12 * 60 * 1_000_i64
+        } else {
+            3 * 60 * 1_000_i64
+        };
+        let repair_id = format!("p082-stale-startup:{session_generation_id}");
+        let operator_message = if xcode_required {
+            Some(format!(
+                "Xcode startup grace exceeded 12 minutes (cutoff: {stale_cutoff_rfc3339}); \
+                 session generation {session_generation_id} invalidated and work item requeued for retry. \
+                 Next check: daemon scheduler next cycle (no manual intervention required)."
+            ))
+        } else {
+            None
+        };
+        // Resolve the source command journal id: check payload first, then fall back to
+        // the most recent command journal entry for the run. p082_startup_repair_summary_v1
+        // requires a non-empty command_journal.id — "unavailable" violates the contract.
+        let source_cj_id_opt = match p082_source_command_journal_id_from_payload(&payload) {
+            Some(id) => Some(id),
+            None => p082_latest_command_journal_id_for_run_tx(tx, &run_id_for_repair).await?,
+        };
+        let (source_cj_id, integrity) = match source_cj_id_opt {
+            Some(ref id) => (id.clone(), "valid"),
+            None => ("no-journal-found".to_string(), "unavailable"),
+        };
+        let summary = domain::recovery_matrix::build_startup_repair_summary(
+            &repair_id,
+            &item_id,
+            &source_cj_id,
+            1,
+            1,
+            false,
+            stale_after_ms,
+            &stale_cutoff_rfc3339,
+            xcode_required,
+            None,
+            "startup",
+        );
+        let p082_readback = domain::recovery_matrix::set_readback_startup_repair(
+            domain::recovery_matrix::build_readback_v1(
+                "P082-R05",
+                "repaired",
+                "retry",
+                domain::recovery_matrix::REASON_STARTUP_STALLED,
+                "Stale ACP startup repaired; session generation invalidated and work item requeued.",
+                "startup_repairs, session_generations, session_events, work_items",
+                "work_items, sessions, startup_repairs",
+                &repair_id,
+                Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+                integrity,
+                &scheduled_at_rfc3339,
+            ),
+            summary,
+            operator_message.as_deref(),
+        );
+        let notes = serde_json::json!({
+            "p082_recovery_matrix_readback": p082_readback,
+        });
+        super::startup_repairs::record_tx(
+            &mut **tx,
+            &repair_id,
+            &run_id_for_repair,
+            "p082_stale_startup_repair",
+            scheduled_at,
+            Some(&notes.to_string()),
+        )
+        .await
+        .context("write P082-R05 startup repair readback")?;
     }
     Ok(requeued)
 }

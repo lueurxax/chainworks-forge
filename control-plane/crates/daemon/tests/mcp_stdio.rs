@@ -13,10 +13,12 @@ fn mcp_mode_keeps_stdout_protocol_clean_for_initialize() {
 
     let db_path = temp_db_path("mcp-stdio");
     let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let principal_path = write_principal_fixture("mcp-stdio-principals");
 
     let mut child = Command::new(binary)
         .env("MODE", "mcp")
         .env("DATABASE_URL", database_url)
+        .env("CHAINWORKS_AUTH_PRINCIPALS_PATH", &principal_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -47,6 +49,7 @@ fn mcp_mode_keeps_stdout_protocol_clean_for_initialize() {
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(principal_path);
 }
 
 #[test]
@@ -56,10 +59,12 @@ fn test_mcp_stdio_rejects_first_frame_other_than_initialize() {
 
     let db_path = temp_db_path("mcp-stdio-preinit");
     let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let principal_path = write_principal_fixture("mcp-stdio-preinit-principals");
 
     let mut child = Command::new(binary)
         .env("MODE", "mcp")
         .env("DATABASE_URL", database_url)
+        .env("CHAINWORKS_AUTH_PRINCIPALS_PATH", &principal_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -88,6 +93,7 @@ fn test_mcp_stdio_rejects_first_frame_other_than_initialize() {
 
     assert_child_exits(&mut child, Duration::from_secs(2));
     let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(principal_path);
 }
 
 #[test]
@@ -97,10 +103,12 @@ fn test_mcp_stdio_rejects_initialize_without_principal_token() {
 
     let db_path = temp_db_path("mcp-stdio-missing-token");
     let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let principal_path = write_principal_fixture("mcp-stdio-missing-token-principals");
 
     let mut child = Command::new(binary)
         .env("MODE", "mcp")
         .env("DATABASE_URL", database_url)
+        .env("CHAINWORKS_AUTH_PRINCIPALS_PATH", &principal_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -130,6 +138,7 @@ fn test_mcp_stdio_rejects_initialize_without_principal_token() {
 
     assert_child_exits(&mut child, Duration::from_secs(2));
     let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(principal_path);
 }
 
 #[test]
