@@ -623,28 +623,33 @@ async fn run_daemon() -> Result<()> {
         }
     }
     let _maintenance_reaper = db::repos::maintenance::spawn_maintenance_reaper(pool.clone());
-    match daemon::storage_startup::run_startup_evidence_orphan_sweep(&pool).await {
-        Ok(summary) => {
-            info!(
-                roots_inspected = summary.roots_inspected,
-                roots_missing = summary.roots_missing,
-                scanned_files = summary.scanned_files,
-                already_indexed = summary.already_indexed,
-                recovered_orphans = summary.recovered_orphans,
-                skipped_files = summary.skipped_files,
-                bytes_read = summary.bytes_read,
-                truncated = summary.truncated,
-                errors = summary.errors,
-                "P075 startup evidence orphan sweep complete"
-            );
+    tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            match daemon::storage_startup::run_startup_evidence_orphan_sweep(&pool).await {
+                Ok(summary) => {
+                    info!(
+                        roots_inspected = summary.roots_inspected,
+                        roots_missing = summary.roots_missing,
+                        scanned_files = summary.scanned_files,
+                        already_indexed = summary.already_indexed,
+                        recovered_orphans = summary.recovered_orphans,
+                        skipped_files = summary.skipped_files,
+                        bytes_read = summary.bytes_read,
+                        truncated = summary.truncated,
+                        errors = summary.errors,
+                        "P075 startup evidence orphan sweep complete"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        err = %err,
+                        "P075 startup evidence orphan sweep could not enumerate active runs"
+                    );
+                }
+            }
         }
-        Err(err) => {
-            warn!(
-                err = %err,
-                "P075 startup evidence orphan sweep could not enumerate active runs"
-            );
-        }
-    }
+    });
     let host_interruption_service =
         HostInterruptionService::with_capacity_config_runtime_cleanup_and_db_writer(
             pool.clone(),
@@ -1081,6 +1086,12 @@ fn spawn_background_executor_watchdog(
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(300),
         );
+        let stale_targeted_advance_after = chrono::Duration::seconds(
+            std::env::var("CHAINWORKS_TARGETED_ADVANCE_RUN_STALE_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(60),
+        );
         let scheduler_health_stale_after = chrono::Duration::seconds(
             std::env::var("CHAINWORKS_SCHEDULER_HEALTH_STALE_SECS")
                 .ok()
@@ -1091,6 +1102,64 @@ fn spawn_background_executor_watchdog(
         loop {
             tokio::time::sleep(interval).await;
             let now = chrono::Utc::now();
+            match work_items::complete_targeted_advance_runs_with_existing_invokes(
+                &pool,
+                now,
+                "watchdog_targeted_advance_existing_invoke",
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(completed) => {
+                    warn!(
+                        completed,
+                        "BackgroundExecutor watchdog completed targeted AdvanceRun work items whose InvokeAgent already exists"
+                    );
+                    if let Err(error) = work_queue.refresh_scheduler_projection().await {
+                        warn!(
+                            error = %error,
+                            "BackgroundExecutor watchdog failed to refresh scheduler projection after targeted AdvanceRun completion"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "BackgroundExecutor watchdog failed to complete targeted AdvanceRun rows with existing invokes"
+                    );
+                }
+            }
+
+            let targeted_stale_before = now - stale_targeted_advance_after;
+            match work_items::requeue_stale_running_targeted_advance_items(
+                &pool,
+                targeted_stale_before,
+                now,
+                "watchdog_stale_targeted_advance_run",
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(requeued) => {
+                    warn!(
+                        requeued,
+                        "BackgroundExecutor watchdog requeued stale targeted AdvanceRun work items"
+                    );
+                    if let Err(error) = work_queue.refresh_scheduler_projection().await {
+                        warn!(
+                            error = %error,
+                            "BackgroundExecutor watchdog failed to refresh scheduler projection after stale targeted AdvanceRun requeue"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "BackgroundExecutor watchdog failed to requeue stale targeted AdvanceRun rows"
+                    );
+                }
+            }
+
             let stale_before = now - stale_advance_after;
             match work_items::requeue_stale_running_advance_items(
                 &pool,

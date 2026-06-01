@@ -351,6 +351,7 @@ pub enum AcpCompletionCaptureSource {
     TerminalFinalResponse,
     StreamedUpdateTail,
     CappedStream,
+    ProviderSessionStoreTaskComplete,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

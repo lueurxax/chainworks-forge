@@ -2129,7 +2129,9 @@ fn lease_reserved_status(
             "Reserved brokered Xcode MCP lease '{lease_id}' for runtime '{runtime_id}' targeting Xcode pid {} workspace '{}'",
             snapshot.xcode_pid, snapshot.workspace_identity
         ),
-        None => format!("Reserved brokered Xcode MCP lease '{lease_id}' for runtime '{runtime_id}'"),
+        None => {
+            format!("Reserved brokered Xcode MCP lease '{lease_id}' for runtime '{runtime_id}'")
+        }
     }
 }
 

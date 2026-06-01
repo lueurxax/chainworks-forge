@@ -1263,6 +1263,9 @@ fn capability_tool_id_for_name(name: &str) -> Option<CapabilityToolId> {
             Some(CapabilityToolId::StagesConsumeProviderQuotaHold)
         }
         "workflow_conflicts.resolve" => Some(CapabilityToolId::WorkflowConflictsResolve),
+        "workflow_loop_budget.extend" | "workflow_loop_budget_extend" => {
+            Some(CapabilityToolId::WorkflowLoopBudgetExtend)
+        }
         "legacy_discovery_override_create" => Some(CapabilityToolId::LegacyDiscoveryOverrideCreate),
         "reports.get" => Some(CapabilityToolId::ReportsGet),
         "artifacts.override_contract" => Some(CapabilityToolId::ArtifactsOverrideContract),
@@ -1380,6 +1383,7 @@ mod tests {
         assert!(is_tool_allowed(&p, "runs.main_sync.request"));
         assert!(is_tool_allowed(&p, "approvals.resolve"));
         assert!(is_tool_allowed(&p, "stages.retry"));
+        assert!(is_tool_allowed(&p, "workflow_loop_budget.extend"));
     }
 
     #[test]
@@ -2414,12 +2418,15 @@ mod tests {
         let table = PrincipalTable {
             entries: vec![PrincipalEntry {
                 token: "tok-agent-mcp".into(),
-                id: "agent-mcp".into(),
-                class: PrincipalClass::Agent,
+                id: "operator-mcp".into(),
+                class: PrincipalClass::Operator,
                 surface_policies: Some(SurfacePolicies {
                     graphql: None,
                     mcp: Some(McpPolicy {
-                        allowed_tools: vec!["runs.list".into()],
+                        allowed_tools: vec![
+                            "runs.list".into(),
+                            "workflow_loop_budget.extend".into(),
+                        ],
                     }),
                 }),
                 ..Default::default()
@@ -2431,9 +2438,13 @@ mod tests {
             is_tool_allowed(&principal, "runs.list"),
             "allowed tool must be present"
         );
+        assert!(
+            is_tool_allowed(&principal, "workflow_loop_budget.extend"),
+            "workflow_loop_budget.extend must be a recognized MCP capability"
+        );
         // HIGH-001: non-empty tool list → resource capabilities keep class defaults.
         assert!(!principal.resource_capabilities.is_empty(),
-            "agent principal with non-empty allowed_tools must retain class-default resource capabilities");
+            "operator principal with non-empty allowed_tools must retain class-default resource capabilities");
     }
 
     /// SEC-001 (tools only): A principal with surface_policies but no mcp stanza must have

@@ -353,6 +353,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Max time without meaningful agent progress while the transport remains alive.
 /// Keepalive/status-only ACP messages reset transport idleness, but not progress.
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(300);
+const CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT: Duration = Duration::from_secs(900);
 const PROMPT_PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(15);
 const CLAUDE_LOCAL_ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CLAUDE_LOCAL_ACTIVITY_MAX_READ_BYTES: u64 = 1024 * 1024;
@@ -394,6 +395,37 @@ struct ClaudeLocalActivitySummary {
     last_prompts: u64,
     type_counts: HashMap<String, u64>,
     last_event_type: Option<String>,
+    last_assistant_message_id: Option<String>,
+    last_assistant_stop_reason: Option<String>,
+    last_assistant_incomplete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcpSilenceDeadlineDecision {
+    Continue,
+    WarnGrace,
+    Timeout,
+}
+
+fn claude_silent_after_activity_timeout_decision(
+    has_observed_local_activity: bool,
+    elapsed: Duration,
+    warning_recorded: bool,
+) -> AcpSilenceDeadlineDecision {
+    if !has_observed_local_activity {
+        return if elapsed >= PROGRESS_TIMEOUT {
+            AcpSilenceDeadlineDecision::Timeout
+        } else {
+            AcpSilenceDeadlineDecision::Continue
+        };
+    }
+    if elapsed >= CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT {
+        AcpSilenceDeadlineDecision::Timeout
+    } else if elapsed >= PROGRESS_TIMEOUT && !warning_recorded {
+        AcpSilenceDeadlineDecision::WarnGrace
+    } else {
+        AcpSilenceDeadlineDecision::Continue
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -515,6 +547,29 @@ impl ClaudeLocalActivityMonitor {
             "assistant" => {
                 self.summary.assistant_messages += 1;
                 self.summary.last_event_type = Some("assistant".to_string());
+                self.summary.last_assistant_message_id = entry
+                    .get("message")
+                    .and_then(|message| message.get("id"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        entry
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    });
+                let stop_reason = entry
+                    .get("message")
+                    .and_then(|message| message.get("stop_reason"))
+                    .or_else(|| entry.get("stop_reason"));
+                if let Some(stop_reason) = stop_reason {
+                    self.summary.last_assistant_stop_reason = Some(match stop_reason {
+                        Value::Null => "null".to_string(),
+                        Value::String(value) => value.clone(),
+                        other => other.to_string(),
+                    });
+                    self.summary.last_assistant_incomplete = stop_reason.is_null();
+                }
                 relevant = true;
             }
             "last-prompt" | "last_prompt" => {
@@ -607,7 +662,7 @@ impl ClaudeLocalActivityMonitor {
 
     fn summary_for_error(&self) -> String {
         format!(
-            "local_event_count={}, assistant_messages={}, tool_uses={}, tool_results={}, background_tasks_started={}, background_tasks_finished={}, open_tool_uses={}, open_background_tasks={}, last_event_type={}",
+            "local_event_count={}, assistant_messages={}, tool_uses={}, tool_results={}, background_tasks_started={}, background_tasks_finished={}, open_tool_uses={}, open_background_tasks={}, last_event_type={}, last_assistant_message_id={}, last_assistant_stop_reason={}, last_assistant_incomplete={}",
             self.summary.event_count,
             self.summary.assistant_messages,
             self.summary.tool_uses,
@@ -616,10 +671,16 @@ impl ClaudeLocalActivityMonitor {
             self.summary.background_tasks_finished,
             self.open_tool_use_count(),
             self.open_background_task_count(),
+            self.summary.last_event_type.as_deref().unwrap_or("none"),
             self.summary
-                .last_event_type
+                .last_assistant_message_id
                 .as_deref()
-                .unwrap_or("none")
+                .unwrap_or("none"),
+            self.summary
+                .last_assistant_stop_reason
+                .as_deref()
+                .unwrap_or("none"),
+            self.summary.last_assistant_incomplete
         )
     }
 
@@ -1452,6 +1513,26 @@ fn selected_completion_text(
     }
 }
 
+pub(crate) fn recovered_completion_text_capture_metadata(
+    text: &str,
+    source: AcpCompletionCaptureSource,
+) -> AcpCompletionTextCaptureMetadata {
+    let Some(capture) = bounded_completion_text(strip_ansi(text)) else {
+        return AcpCompletionTextCaptureMetadata {
+            capture_status: AcpCompletionCaptureStatus::Absent,
+            capture_source: None,
+            captured_text: None,
+            raw_byte_limit: COMPLETION_CAPTURE_RAW_BYTE_LIMIT as u64,
+            captured_byte_count: 0,
+            completion_text_truncated: false,
+            extraction_input_truncated: false,
+            extraction_input_sha256: None,
+            absence_reason: Some(AcpCompletionAbsenceReason::EmptyAfterSanitization),
+        };
+    };
+    selected_completion_text(&capture, source).metadata
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -1546,7 +1627,7 @@ fn observe_mcp_actuals(
     })
 }
 
-fn extract_output_envelopes(
+pub(crate) fn extract_output_envelopes(
     stream_text: &str,
     expected_outputs: &[ExpectedOutputSpec],
 ) -> Vec<DiscoveredArtifact> {
@@ -2999,6 +3080,26 @@ fn note_claude_local_activity_receipt_event(
     Some(summary)
 }
 
+fn note_claude_silence_grace_receipt_event(
+    runtime_receipt: &mut RuntimeReceiptTracker,
+    monitor: Option<&ClaudeLocalActivityMonitor>,
+    phase: &str,
+    elapsed: Duration,
+) -> Option<String> {
+    let summary = note_claude_local_activity_receipt_event(runtime_receipt, monitor)?;
+    runtime_receipt.push_event(
+        "provider_local_activity_silence_grace_started",
+        Some(format!(
+            "phase={}, elapsed_s={}, grace_timeout_s={}, {}",
+            phase,
+            elapsed.as_secs(),
+            CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+            summary
+        )),
+    );
+    Some(summary)
+}
+
 impl AcpTransportSession {
     async fn record_prompt_progress(
         &self,
@@ -3694,6 +3795,7 @@ impl AcpTransportSession {
         let mut xcode_shim_warning_events = Vec::new();
         let mut seen_xcode_warning_keys = HashSet::new();
         let mut failure_phase: Option<String> = None;
+        let mut claude_local_activity_silence_warning_recorded = false;
 
         'streaming: loop {
             poll_claude_local_activity_watchdog(
@@ -3711,81 +3813,155 @@ impl AcpTransportSession {
                 max_instant_option(last_acp_activity, last_provider_local_activity);
             let idle = effective_last_activity.elapsed();
             if idle >= IDLE_TIMEOUT {
-                let classification = claude_local_activity
+                let has_observed_claude_activity = claude_local_activity
                     .as_ref()
-                    .map(|monitor| {
-                        if monitor.has_observed_activity() {
-                            "provider_stream_silent_with_local_activity"
-                        } else {
-                            "provider_stream_silent_no_local_activity"
-                        }
-                    })
-                    .unwrap_or("idle_hang_before_first_progress");
-                failure_phase = Some("idle_timeout".to_string());
-                let local_summary = note_claude_local_activity_receipt_event(
-                    &mut runtime_receipt,
-                    claude_local_activity.as_ref(),
-                )
-                .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
-                self.last_runtime_receipt = Some(runtime_receipt.build(
-                    &self.provider,
-                    self.model.as_ref(),
-                    &self.session_id,
-                    req.session_generation_id.as_ref(),
-                    self.xcode_shim_injected,
-                    self.requires_xcode_host_execution,
-                    "failed",
-                    failure_phase.clone(),
-                ));
-                return Err(anyhow::anyhow!(
-                    "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
-                    IDLE_TIMEOUT.as_secs(),
-                    self.session_id,
-                    last_acp_activity.elapsed().as_secs(),
-                    last_provider_local_activity
-                        .map(|instant| instant.elapsed().as_secs().to_string())
-                        .unwrap_or_else(|| "none".to_string())
-                ));
+                    .is_some_and(|monitor| monitor.has_observed_activity());
+                match claude_silent_after_activity_timeout_decision(
+                    has_observed_claude_activity,
+                    idle,
+                    claude_local_activity_silence_warning_recorded,
+                ) {
+                    AcpSilenceDeadlineDecision::WarnGrace => {
+                        claude_local_activity_silence_warning_recorded = true;
+                        let local_summary = note_claude_silence_grace_receipt_event(
+                            &mut runtime_receipt,
+                            claude_local_activity.as_ref(),
+                            "idle_timeout",
+                            idle,
+                        )
+                        .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
+                        warn!(
+                            session_id = %self.session_id,
+                            elapsed_s = idle.as_secs(),
+                            grace_timeout_s = CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+                            local_summary = %local_summary,
+                            "Claude ACP stream silent after local activity; entering grace window"
+                        );
+                    }
+                    AcpSilenceDeadlineDecision::Continue => {}
+                    AcpSilenceDeadlineDecision::Timeout => {
+                        let classification = claude_local_activity
+                            .as_ref()
+                            .map(|monitor| {
+                                if monitor.has_observed_activity() {
+                                    "provider_stream_silent_with_local_activity"
+                                } else {
+                                    "provider_stream_silent_no_local_activity"
+                                }
+                            })
+                            .unwrap_or("idle_hang_before_first_progress");
+                        failure_phase = Some("idle_timeout".to_string());
+                        let local_summary = note_claude_local_activity_receipt_event(
+                            &mut runtime_receipt,
+                            claude_local_activity.as_ref(),
+                        )
+                        .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
+                        self.last_runtime_receipt = Some(runtime_receipt.build(
+                            &self.provider,
+                            self.model.as_ref(),
+                            &self.session_id,
+                            req.session_generation_id.as_ref(),
+                            self.xcode_shim_injected,
+                            self.requires_xcode_host_execution,
+                            "failed",
+                            failure_phase.clone(),
+                        ));
+                        return Err(anyhow::anyhow!(
+                            "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
+                            if has_observed_claude_activity {
+                                CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs()
+                            } else {
+                                IDLE_TIMEOUT.as_secs()
+                            },
+                            self.session_id,
+                            last_acp_activity.elapsed().as_secs(),
+                            last_provider_local_activity
+                                .map(|instant| instant.elapsed().as_secs().to_string())
+                                .unwrap_or_else(|| "none".to_string())
+                        ));
+                    }
+                }
             }
             let effective_last_progress =
                 max_instant_option(last_acp_progress, last_provider_local_progress);
             let progress_idle = effective_last_progress.elapsed();
             if progress_idle >= PROGRESS_TIMEOUT {
-                let classification = claude_local_activity
+                let has_observed_claude_activity = claude_local_activity
                     .as_ref()
-                    .map(|monitor| {
-                        if monitor.has_observed_activity() {
-                            "provider_stream_silent_with_local_activity"
-                        } else {
-                            "provider_stream_silent_no_local_activity"
-                        }
-                    })
-                    .unwrap_or("idle_hang_before_first_progress");
-                failure_phase = Some("progress_timeout".to_string());
-                let local_summary = note_claude_local_activity_receipt_event(
-                    &mut runtime_receipt,
-                    claude_local_activity.as_ref(),
-                )
-                .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
-                self.last_runtime_receipt = Some(runtime_receipt.build(
-                    &self.provider,
-                    self.model.as_ref(),
-                    &self.session_id,
-                    req.session_generation_id.as_ref(),
-                    self.xcode_shim_injected,
-                    self.requires_xcode_host_execution,
-                    "failed",
-                    failure_phase.clone(),
-                ));
-                return Err(anyhow::anyhow!(
-                    "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={}, {local_summary})",
-                    PROGRESS_TIMEOUT.as_secs(),
-                    self.session_id
-                ));
+                    .is_some_and(|monitor| monitor.has_observed_activity());
+                match claude_silent_after_activity_timeout_decision(
+                    has_observed_claude_activity,
+                    progress_idle,
+                    claude_local_activity_silence_warning_recorded,
+                ) {
+                    AcpSilenceDeadlineDecision::WarnGrace => {
+                        claude_local_activity_silence_warning_recorded = true;
+                        let local_summary = note_claude_silence_grace_receipt_event(
+                            &mut runtime_receipt,
+                            claude_local_activity.as_ref(),
+                            "progress_timeout",
+                            progress_idle,
+                        )
+                        .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
+                        warn!(
+                            session_id = %self.session_id,
+                            elapsed_s = progress_idle.as_secs(),
+                            grace_timeout_s = CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+                            local_summary = %local_summary,
+                            "Claude ACP stream silent after local activity; entering grace window"
+                        );
+                    }
+                    AcpSilenceDeadlineDecision::Continue => {}
+                    AcpSilenceDeadlineDecision::Timeout => {
+                        let classification = claude_local_activity
+                            .as_ref()
+                            .map(|monitor| {
+                                if monitor.has_observed_activity() {
+                                    "provider_stream_silent_with_local_activity"
+                                } else {
+                                    "provider_stream_silent_no_local_activity"
+                                }
+                            })
+                            .unwrap_or("idle_hang_before_first_progress");
+                        failure_phase = Some("progress_timeout".to_string());
+                        let local_summary = note_claude_local_activity_receipt_event(
+                            &mut runtime_receipt,
+                            claude_local_activity.as_ref(),
+                        )
+                        .unwrap_or_else(|| "provider_local_activity=unavailable".to_string());
+                        self.last_runtime_receipt = Some(runtime_receipt.build(
+                            &self.provider,
+                            self.model.as_ref(),
+                            &self.session_id,
+                            req.session_generation_id.as_ref(),
+                            self.xcode_shim_injected,
+                            self.requires_xcode_host_execution,
+                            "failed",
+                            failure_phase.clone(),
+                        ));
+                        return Err(anyhow::anyhow!(
+                            "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={}, {local_summary})",
+                            if has_observed_claude_activity {
+                                CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs()
+                            } else {
+                                PROGRESS_TIMEOUT.as_secs()
+                            },
+                            self.session_id
+                        ));
+                    }
+                }
             }
             let read_wait = if claude_local_activity.is_some() {
-                let remaining_idle = IDLE_TIMEOUT.saturating_sub(idle);
-                let remaining_progress = PROGRESS_TIMEOUT.saturating_sub(progress_idle);
+                let deadline = if claude_local_activity
+                    .as_ref()
+                    .is_some_and(|monitor| monitor.has_observed_activity())
+                {
+                    CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT
+                } else {
+                    PROGRESS_TIMEOUT
+                };
+                let remaining_idle = deadline.saturating_sub(idle);
+                let remaining_progress = deadline.saturating_sub(progress_idle);
                 remaining_idle
                     .min(remaining_progress)
                     .min(CLAUDE_LOCAL_ACTIVITY_POLL_INTERVAL)
@@ -3860,61 +4036,140 @@ impl AcpTransportSession {
                                 max_instant_option(last_acp_activity, last_provider_local_activity);
                             let idle = effective_last_activity.elapsed();
                             if idle >= IDLE_TIMEOUT {
-                                let classification = claude_local_activity
+                                let has_observed_claude_activity = claude_local_activity
                                     .as_ref()
-                                    .map(|monitor| {
-                                        if monitor.has_observed_activity() {
-                                            "provider_stream_silent_with_local_activity"
-                                        } else {
-                                            "provider_stream_silent_no_local_activity"
-                                        }
-                                    })
-                                    .unwrap_or("idle_hang_before_first_progress");
-                                failure_phase = Some("idle_timeout".to_string());
-                                let local_summary = note_claude_local_activity_receipt_event(
-                                    &mut runtime_receipt,
-                                    claude_local_activity.as_ref(),
-                                )
-                                .unwrap_or_else(|| {
-                                    "provider_local_activity=unavailable".to_string()
-                                });
-                                break Err(anyhow::anyhow!(
-                                    "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
-                                    IDLE_TIMEOUT.as_secs(),
-                                    session_id,
-                                    last_acp_activity.elapsed().as_secs(),
-                                    last_provider_local_activity
-                                        .map(|instant| instant.elapsed().as_secs().to_string())
-                                        .unwrap_or_else(|| "none".to_string())
-                                ));
+                                    .is_some_and(|monitor| monitor.has_observed_activity());
+                                match claude_silent_after_activity_timeout_decision(
+                                    has_observed_claude_activity,
+                                    idle,
+                                    claude_local_activity_silence_warning_recorded,
+                                ) {
+                                    AcpSilenceDeadlineDecision::WarnGrace => {
+                                        claude_local_activity_silence_warning_recorded = true;
+                                        let local_summary =
+                                            note_claude_silence_grace_receipt_event(
+                                                &mut runtime_receipt,
+                                                claude_local_activity.as_ref(),
+                                                "idle_timeout",
+                                                idle,
+                                            )
+                                            .unwrap_or_else(|| {
+                                                "provider_local_activity=unavailable".to_string()
+                                            });
+                                        warn!(
+                                            session_id = %session_id,
+                                            elapsed_s = idle.as_secs(),
+                                            grace_timeout_s = CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+                                            local_summary = %local_summary,
+                                            "Claude ACP stream silent after local activity; entering grace window"
+                                        );
+                                    }
+                                    AcpSilenceDeadlineDecision::Continue => {}
+                                    AcpSilenceDeadlineDecision::Timeout => {
+                                        let classification = claude_local_activity
+                                            .as_ref()
+                                            .map(|monitor| {
+                                                if monitor.has_observed_activity() {
+                                                    "provider_stream_silent_with_local_activity"
+                                                } else {
+                                                    "provider_stream_silent_no_local_activity"
+                                                }
+                                            })
+                                            .unwrap_or("idle_hang_before_first_progress");
+                                        failure_phase = Some("idle_timeout".to_string());
+                                        let local_summary =
+                                            note_claude_local_activity_receipt_event(
+                                                &mut runtime_receipt,
+                                                claude_local_activity.as_ref(),
+                                            )
+                                            .unwrap_or_else(|| {
+                                                "provider_local_activity=unavailable".to_string()
+                                            });
+                                        break Err(anyhow::anyhow!(
+                                            "ACP session idle timeout: {classification}; no message for {}s (session={}, last_acp_activity_age_s={}, last_provider_local_activity_age_s={}, {local_summary})",
+                                            if has_observed_claude_activity {
+                                                CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT
+                                                    .as_secs()
+                                            } else {
+                                                IDLE_TIMEOUT.as_secs()
+                                            },
+                                            session_id,
+                                            last_acp_activity.elapsed().as_secs(),
+                                            last_provider_local_activity
+                                                .map(|instant| instant
+                                                    .elapsed()
+                                                    .as_secs()
+                                                    .to_string())
+                                                .unwrap_or_else(|| "none".to_string())
+                                        ));
+                                    }
+                                }
                             }
                             let effective_last_progress =
                                 max_instant_option(last_acp_progress, last_provider_local_progress);
                             let progress_idle = effective_last_progress.elapsed();
                             if progress_idle >= PROGRESS_TIMEOUT {
-                                let classification = claude_local_activity
+                                let has_observed_claude_activity = claude_local_activity
                                     .as_ref()
-                                    .map(|monitor| {
-                                        if monitor.has_observed_activity() {
-                                            "provider_stream_silent_with_local_activity"
-                                        } else {
-                                            "provider_stream_silent_no_local_activity"
-                                        }
-                                    })
-                                    .unwrap_or("idle_hang_before_first_progress");
-                                failure_phase = Some("progress_timeout".to_string());
-                                let local_summary = note_claude_local_activity_receipt_event(
-                                    &mut runtime_receipt,
-                                    claude_local_activity.as_ref(),
-                                )
-                                .unwrap_or_else(|| {
-                                    "provider_local_activity=unavailable".to_string()
-                                });
-                                break Err(anyhow::anyhow!(
-                                    "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={}, {local_summary})",
-                                    PROGRESS_TIMEOUT.as_secs(),
-                                    session_id
-                                ));
+                                    .is_some_and(|monitor| monitor.has_observed_activity());
+                                match claude_silent_after_activity_timeout_decision(
+                                    has_observed_claude_activity,
+                                    progress_idle,
+                                    claude_local_activity_silence_warning_recorded,
+                                ) {
+                                    AcpSilenceDeadlineDecision::WarnGrace => {
+                                        claude_local_activity_silence_warning_recorded = true;
+                                        let local_summary =
+                                            note_claude_silence_grace_receipt_event(
+                                                &mut runtime_receipt,
+                                                claude_local_activity.as_ref(),
+                                                "progress_timeout",
+                                                progress_idle,
+                                            )
+                                            .unwrap_or_else(|| {
+                                                "provider_local_activity=unavailable".to_string()
+                                            });
+                                        warn!(
+                                            session_id = %session_id,
+                                            elapsed_s = progress_idle.as_secs(),
+                                            grace_timeout_s = CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT.as_secs(),
+                                            local_summary = %local_summary,
+                                            "Claude ACP stream silent after local activity; entering grace window"
+                                        );
+                                    }
+                                    AcpSilenceDeadlineDecision::Continue => {}
+                                    AcpSilenceDeadlineDecision::Timeout => {
+                                        let classification = claude_local_activity
+                                            .as_ref()
+                                            .map(|monitor| {
+                                                if monitor.has_observed_activity() {
+                                                    "provider_stream_silent_with_local_activity"
+                                                } else {
+                                                    "provider_stream_silent_no_local_activity"
+                                                }
+                                            })
+                                            .unwrap_or("idle_hang_before_first_progress");
+                                        failure_phase = Some("progress_timeout".to_string());
+                                        let local_summary =
+                                            note_claude_local_activity_receipt_event(
+                                                &mut runtime_receipt,
+                                                claude_local_activity.as_ref(),
+                                            )
+                                            .unwrap_or_else(|| {
+                                                "provider_local_activity=unavailable".to_string()
+                                            });
+                                        break Err(anyhow::anyhow!(
+                                            "ACP session progress timeout: {classification}; no meaningful progress for {}s (session={}, {local_summary})",
+                                            if has_observed_claude_activity {
+                                                CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT
+                                                    .as_secs()
+                                            } else {
+                                                PROGRESS_TIMEOUT.as_secs()
+                                            },
+                                            session_id
+                                        ));
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -4941,6 +5196,54 @@ mod tests {
     }
 
     #[test]
+    fn claude_local_activity_summary_exposes_incomplete_assistant_turn() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let transcript_path = tempdir.path().join("session.jsonl");
+        let mut file = std::fs::File::create(&transcript_path).expect("transcript");
+        let mut monitor = ClaudeLocalActivityMonitor::new_for_path(transcript_path);
+        writeln!(
+            file,
+            r#"{{"type":"assistant","message":{{"id":"msg_1","stop_reason":null,"content":[{{"type":"text","text":"Now I'll write the proposal JSON."}}]}}}}"#
+        )
+        .expect("write assistant event");
+        file.flush().expect("flush assistant event");
+
+        monitor.poll(Instant::now()).expect("poll");
+
+        let summary = monitor.summary_for_error();
+        assert!(summary.contains("last_assistant_stop_reason=null"));
+        assert!(summary.contains("last_assistant_incomplete=true"));
+    }
+
+    #[test]
+    fn claude_observed_activity_timeout_policy_warns_before_grace_failure() {
+        assert_eq!(
+            claude_silent_after_activity_timeout_decision(true, PROGRESS_TIMEOUT, false,),
+            AcpSilenceDeadlineDecision::WarnGrace
+        );
+        assert_eq!(
+            claude_silent_after_activity_timeout_decision(
+                true,
+                PROGRESS_TIMEOUT + Duration::from_secs(1),
+                true,
+            ),
+            AcpSilenceDeadlineDecision::Continue
+        );
+        assert_eq!(
+            claude_silent_after_activity_timeout_decision(
+                true,
+                CLAUDE_POST_LOCAL_ACTIVITY_SILENCE_GRACE_TIMEOUT,
+                true,
+            ),
+            AcpSilenceDeadlineDecision::Timeout
+        );
+        assert_eq!(
+            claude_silent_after_activity_timeout_decision(false, PROGRESS_TIMEOUT, false),
+            AcpSilenceDeadlineDecision::Timeout
+        );
+    }
+
+    #[test]
     fn runtime_receipt_marks_permission_timeout_without_post_grant_event() {
         let started_wall = chrono::Utc::now();
         let started_mono = Instant::now();
@@ -5572,7 +5875,9 @@ mod tests {
         assert_eq!(extract_agent_message_chunk(&tool), None);
         assert_eq!(
             extract_agent_message_chunk(&message).as_deref(),
-            Some("{\"CHAINWORKS_OUTPUT\":{\"tests_result\":{\"status\":\"not_run\",\"commands\":[]}}}")
+            Some(
+                "{\"CHAINWORKS_OUTPUT\":{\"tests_result\":{\"status\":\"not_run\",\"commands\":[]}}}"
+            )
         );
     }
 
@@ -5811,6 +6116,95 @@ mod tests {
             artifacts[0].source_kind,
             DiscoveredArtifactSourceKind::ChainworksOutput
         );
+    }
+
+    #[test]
+    fn mixed_path_keyed_and_direct_file_chainworks_output_entries_are_extracted() {
+        let progress_path = "/Users/user/Documents/Chainworks Forge/.chainworks/runs/run-1/implementation/progress.md";
+        let self_assessment_path = "/Users/user/Documents/Chainworks Forge/.chainworks/runs/run-1/implementation/self-assessment.json";
+        let changed_files_path = "/Users/user/Documents/Chainworks Forge/.chainworks/runs/run-1/implementation/changed-files.json";
+        let tests_path = "/Users/user/Documents/Chainworks Forge/.chainworks/runs/run-1/implementation/tests.json";
+        let expected_outputs = vec![
+            ExpectedOutputSpec {
+                output_name: "implementation_progress".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: progress_path.to_string(),
+                companion_of: None,
+                display_label: "Implementation progress".to_string(),
+                contract_id: Some("implementation_progress".to_string()),
+                required: true,
+                reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+                max_bytes: 16 * 1024,
+                aggregate_acceptance_cap_bytes: 128 * 1024,
+                authorized_roots: vec![],
+                source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+            },
+            ExpectedOutputSpec {
+                output_name: "implementation_self_assessment".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: self_assessment_path.to_string(),
+                companion_of: None,
+                display_label: "Implementation self assessment".to_string(),
+                contract_id: Some("implementation_self_assessment_v2".to_string()),
+                required: true,
+                reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+                max_bytes: 64 * 1024,
+                aggregate_acceptance_cap_bytes: 128 * 1024,
+                authorized_roots: vec![],
+                source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+            },
+            ExpectedOutputSpec {
+                output_name: "changed_files_manifest".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: changed_files_path.to_string(),
+                companion_of: None,
+                display_label: "Changed files".to_string(),
+                contract_id: Some("changed_files_manifest".to_string()),
+                required: true,
+                reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+                max_bytes: 64 * 1024,
+                aggregate_acceptance_cap_bytes: 128 * 1024,
+                authorized_roots: vec![],
+                source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+            },
+            ExpectedOutputSpec {
+                output_name: "tests_result".to_string(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: tests_path.to_string(),
+                companion_of: None,
+                display_label: "Tests result".to_string(),
+                contract_id: Some("tests_result".to_string()),
+                required: true,
+                reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+                max_bytes: 16 * 1024,
+                aggregate_acceptance_cap_bytes: 128 * 1024,
+                authorized_roots: vec![],
+                source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+            },
+        ];
+        let stream = serde_json::json!({
+            "CHAINWORKS_OUTPUT": {
+                progress_path: {"status": "complete", "summary": "done"},
+                self_assessment_path: {"implementation_complete": true, "verification_green": true, "remaining_code_tasks": []},
+                changed_files_path: {"mode": "direct_file", "output_name": "changed_files_manifest", "path": changed_files_path, "digest": "sha256:abc", "size_bytes": 3},
+                tests_path: {"status": "complete", "summary": "tests passed"}
+            }
+        })
+        .to_string();
+
+        let artifacts = extract_output_envelopes(&format!("done {stream}"), &expected_outputs);
+
+        for expected in [
+            progress_path,
+            self_assessment_path,
+            changed_files_path,
+            tests_path,
+        ] {
+            assert!(
+                artifacts.iter().any(|artifact| artifact.name == expected),
+                "missing path-keyed output {expected}: {artifacts:?}"
+            );
+        }
     }
 
     #[test]

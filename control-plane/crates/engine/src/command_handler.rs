@@ -85,6 +85,21 @@ pub struct CommandHandler {
     boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
 }
 
+fn ensure_run_can_be_retried(run: &Run) -> Result<()> {
+    if run.status.is_terminal()
+        || run.status == RunStatus::Cancelling
+        || run.cancellation_requested_at.is_some()
+        || run.cancellation_settled_at.is_some()
+    {
+        anyhow::bail!(
+            "Run {} is {} / cancellation-settled and cannot be retried",
+            run.id,
+            run.status
+        );
+    }
+    Ok(())
+}
+
 pub enum CommandResult {
     IdeaCreated {
         idea: domain::idea::Idea,
@@ -3014,6 +3029,18 @@ impl CommandHandler {
                 let run = runs::find_by_id_tx(&mut retry_tx, c.run_id)
                     .await?
                     .ok_or_else(|| anyhow!("Run {} not found", c.run_id))?;
+                if let Err(error) = ensure_run_can_be_retried(&run) {
+                    command_journal::fail_entry_tx(
+                        &mut retry_tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    retry_tx.commit().await?;
+                    db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    return Err(error);
+                }
                 ensure_run_meta_root_exists(&run)?;
                 let completed_current_stage_on_blocked_run =
                     if old_stage.status == StageStatus::Completed {
@@ -5333,10 +5360,11 @@ impl CommandHandler {
             .copied()
             .max_by_key(|s| s.started_at)
             .ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
+        ensure_run_can_be_retried(&run)?;
         let completed_current_stage_on_blocked_run = if old_stage.status == StageStatus::Completed {
-            let run = runs::find_by_id(&self.pool, run_id)
-                .await?
-                .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
             run.status == RunStatus::Blocked
                 && (run.current_state.as_deref() == Some(stage_id)
                     || old_stage.stage_id == stage_id)
@@ -5538,9 +5566,7 @@ impl CommandHandler {
         let run = runs::find_by_id(&self.pool, run_id)
             .await?
             .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
-        if run.status.is_terminal() {
-            return Err(anyhow!("Run {} is already in terminal state", run_id));
-        }
+        ensure_run_can_be_retried(&run)?;
 
         let target_exec = agent_executions::find_by_id(&self.pool, agent_execution_id)
             .await?

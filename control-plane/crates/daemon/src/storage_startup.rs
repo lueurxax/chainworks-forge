@@ -30,12 +30,12 @@ pub async fn run_startup_evidence_orphan_sweep(
     let mut roots = BTreeSet::new();
     for run in runs {
         if !run.artifact_root.trim().is_empty() {
-            roots.insert(run.artifact_root);
+            roots.insert((run.artifact_root, run.id.to_string()));
         }
     }
 
     let mut summary = StartupEvidenceOrphanSweepSummary::default();
-    for root in roots {
+    for (root, run_id) in roots {
         let path = Path::new(&root);
         if !path.exists() {
             summary.roots_missing += 1;
@@ -45,7 +45,7 @@ pub async fn run_startup_evidence_orphan_sweep(
         match db::evidence_spool::sweep_evidence_orphans(
             pool,
             path,
-            None,
+            Some(&run_id),
             db::evidence_spool::SWEEP_DEFAULT_MAX_FILES,
             db::evidence_spool::SWEEP_DEFAULT_MAX_BYTES,
             false,

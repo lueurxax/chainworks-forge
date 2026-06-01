@@ -1,0 +1,40 @@
+{
+  "applicability": "required",
+  "commands": {
+    "allowlist": []
+  },
+  "decision_vocabulary": [
+    "pass",
+    "fail"
+  ],
+  "gate_aliases": [
+    "proposal-086",
+    "p086",
+    "proposal-086-resurrection"
+  ],
+  "hold_conditions": [
+    "placeholder negative fixture"
+  ],
+  "metrics": {
+    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
+  },
+  "migrations": {
+    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
+    "not_applicable": true
+  },
+  "operator_report_fields": [
+    "rollout_contract_status"
+  ],
+  "placeholder_fixture_kind": "negative:terminal_idempotency_ledger_concurrent_replay_prompt_related",
+  "readback_fields": [
+    "rollout_contract_status"
+  ],
+  "readback_lanes": [
+    "run_report"
+  ],
+  "rollback_disposition": {
+    "data_loss_risk": "none",
+    "mode": "not_applicable"
+  },
+  "schema_version": "rollout_contract_v1"
+}

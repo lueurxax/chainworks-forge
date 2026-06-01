@@ -44,7 +44,7 @@ These are not active workstreams:
 - **Durable side-effect ledger / P078**.
   - Treated as implemented baseline in [rust-control-plane.md](reference/rust-control-plane.md).
   - Release settlement, retry blocking, and reconciliation remain outside normal retry/continuation.
-- **P058** configurable agent escalation chains.
+- **Configurable agent escalation chains**.
   - Implemented baseline: `escalation_policy_v1` schema, durable ledger/metadata/events tables, GraphQL `runEscalationReadback`, MCP `runs.get` parity, redaction tiers, safe kill-switch defaults, scheduler-owned tier advancement, and governed macOS read surfaces.
   - Operational truth lives in [escalation-policies.md](reference/escalation-policies.md).
   - Scheduler behavior remains scoped to contract-output repair/fallback and must not include release agents or bypass durable side-effect safety.
@@ -95,9 +95,9 @@ After the current recovery/output/ownership block stabilizes:
 - **P093** live agent timeline UX and readability.
   - Improve active-agent timeline readability over existing control-plane readback.
   - Do not recreate Swift-local orchestration state.
-- **P096** P058 release evidence and macOS runtime proof.
-  - Produce remote UI/accessibility/contrast/reduced-motion, multi-window/scene restoration, long-run metric trend, and operational drill artifacts for P058 broad-release decisions.
-  - Do not reopen P058 implementation behavior; this is release proof only.
+- **P096** escalation release evidence and macOS runtime proof.
+  - Produce remote UI/accessibility/contrast/reduced-motion, multi-window/scene restoration, long-run metric trend, and operational drill artifacts for escalation broad-release decisions.
+  - Do not reopen implemented escalation behavior; this is release proof only.
 - **P038** MCP-only run compaction, if artifact noise remains high.
   - Must respect implemented storage/write-budget and side-effect evidence preservation.
   - GraphQL is readback only; compaction is MCP-only.

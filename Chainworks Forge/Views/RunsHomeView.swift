@@ -366,15 +366,26 @@ struct RunsHomeView: View {
                     switch selectedRunDetailTab {
                     case .overview:
                         if let header = workbench.summaryHeader {
-                            P036RunDetailSummaryCard(
-                                header: header,
-                                onCheckSystemReadiness: {
-                                    NotificationCenter.default.post(
-                                        name: .chainworksOpenSystemReadiness,
-                                        object: nil
-                                    )
-                                }
+                            if workbench.closeoutReadiness != nil {
+                                P036RunDetailSummaryCard(
+                                    header: header,
+                                    onCheckRunReadiness: activateCloseoutReadinessFromCompactSignal
+                                )
+                            } else {
+                                P036RunDetailSummaryCard(
+                                    header: header,
+                                    onCheckRunReadiness: nil
+                                )
+                            }
+                        }
+
+                        if let closeoutReadiness = workbench.closeoutReadiness {
+                            P077CloseoutReadinessCard(
+                                presentation: closeoutReadiness,
+                                closeoutFocus: $closeoutReadinessFocus,
+                                onReturnToCloseoutReadiness: focusCloseoutPrimaryUnblock
                             )
+                            .id(P077CloseoutReadinessAnchor.card)
                         }
 
                         if !workbench.inlineApprovals.isEmpty {
@@ -3136,7 +3147,6 @@ private struct P093TimelineCodeBlock: View {
 private struct P031RunDetailSummaryCard: View {
     let header: RunsWorkbenchPresentationModel.SummaryHeader
     let onCompactCloseoutActivated: () -> Void
-    let onCheckSystemReadiness: () -> Void
 
     var body: some View {
         P031CalloutCard(
@@ -3151,17 +3161,6 @@ private struct P031RunDetailSummaryCard: View {
                 )
                 if let errorDescription = header.errorDescription {
                     ForgeWarningBanner.error(errorDescription)
-                }
-
-                if header.status == "blocked" || header.status == "failed" {
-                    Button {
-                        onCheckSystemReadiness()
-                    } label: {
-                        Label("Check system readiness", systemImage: "stethoscope")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
                 }
             }
         }
@@ -5568,7 +5567,7 @@ private struct P036SystemReadinessCard: View {
 
 private struct P036RunDetailSummaryCard: View {
     let header: RunsWorkbenchPresentationModel.SummaryHeader
-    let onCheckSystemReadiness: () -> Void
+    let onCheckRunReadiness: (() -> Void)?
     @State private var copyFeedback: String?
 
     var body: some View {
@@ -5586,11 +5585,15 @@ private struct P036RunDetailSummaryCard: View {
                 }
                 Spacer()
 
-                Button(action: onCheckSystemReadiness) {
-                        Label("Check readiness", systemImage: "checkmark.shield")
+                if let onCheckRunReadiness {
+                    Button(action: onCheckRunReadiness) {
+                        Label("Check run readiness", systemImage: "checkmark.shield")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Show closeout readiness for this run")
+                    .accessibilityLabel("Show closeout readiness for this run")
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
             }
         }
         .padding(20)

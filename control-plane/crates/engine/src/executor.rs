@@ -358,7 +358,14 @@ async fn resolve_escalation_chain_candidate(
     stage_id: &str,
     agent_id: &str,
     backend_profile_id_override: Option<&str>,
-) -> Result<Option<(domain::escalation::EscalationLedger, String, String)>> {
+) -> Result<
+    Option<(
+        domain::escalation::EscalationLedger,
+        String,
+        String,
+        Option<EscalationBackendProfileOverride>,
+    )>,
+> {
     let Some(run) = db::repos::runs::find_by_id(pool, run_id).await? else {
         return Ok(None);
     };
@@ -438,6 +445,16 @@ async fn resolve_escalation_chain_candidate(
         )
     };
 
+    let tier_snapshot = policy_snapshot
+        .tiers
+        .iter()
+        .find(|tier| tier.tier_id == resolved_tier_id);
+    let backend_override = tier_snapshot
+        .filter(|tier| tier.kind == "backend_profile")
+        .map(|tier| resolve_escalation_backend_profile_override(&run, tier))
+        .transpose()?
+        .flatten();
+
     let now = chrono::Utc::now();
     let ledger_candidate = domain::escalation::EscalationLedger {
         id: uuid::Uuid::new_v4().to_string(),
@@ -462,7 +479,228 @@ async fn resolve_escalation_chain_candidate(
         ledger_candidate,
         resolved_tier_id,
         resolved_tier_kind_raw,
+        backend_override,
     )))
+}
+
+type EscalationChainCandidate = (
+    domain::escalation::EscalationLedger,
+    String,
+    String,
+    Option<EscalationBackendProfileOverride>,
+);
+
+#[derive(Debug, Clone)]
+struct EscalationBackendProfileOverride {
+    backend_profile_id: String,
+    provider: String,
+    model: Option<String>,
+    effort: Option<String>,
+    max_turns: Option<u32>,
+    temperature: Option<f64>,
+}
+
+fn resolve_escalation_backend_profile_override(
+    run: &domain::run::Run,
+    tier: &workflow::plan::EscalationTierSnapshot,
+) -> Result<Option<EscalationBackendProfileOverride>> {
+    let Some(target_backend_profile_id) = tier.backend_profile_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(catalog_snapshot_json) = run.catalog_snapshot_json.as_deref() else {
+        return Ok(None);
+    };
+    let catalog: AgentCatalogFile = serde_json::from_str(catalog_snapshot_json)
+        .context("parse frozen catalog snapshot for escalation backend override")?;
+    let Some(profiles) = catalog.backend_profiles.as_ref() else {
+        return Ok(None);
+    };
+    let Some(profile) = profiles.get(target_backend_profile_id) else {
+        return Ok(None);
+    };
+    let provider = ProviderFamily::canonicalize_alias(&profile.provider).with_context(|| {
+        format!(
+            "escalation tier '{}' references backend_profile '{}' with unknown provider '{}'",
+            tier.tier_id, target_backend_profile_id, profile.provider
+        )
+    })?;
+
+    Ok(Some(EscalationBackendProfileOverride {
+        backend_profile_id: target_backend_profile_id.to_string(),
+        provider,
+        model: profile.model.clone(),
+        effort: profile.effort.clone(),
+        max_turns: profile.max_turns,
+        temperature: profile.temperature,
+    }))
+}
+
+enum ProviderQuotaEscalationResolution {
+    Available(EscalationChainCandidate),
+    FallbackQuotaWait {
+        provider_family: String,
+        wait: agent_retry_budget_ledger::ProviderFamilyQuotaWait,
+    },
+    None,
+}
+
+async fn resolve_provider_quota_escalation_candidate(
+    pool: &SqlitePool,
+    run_id: RunId,
+    stage_id: &str,
+    agent_id: &str,
+    backend_profile_id_override: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ProviderQuotaEscalationResolution> {
+    let Some(run) = db::repos::runs::find_by_id(pool, run_id).await? else {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    };
+    let Some(plan) = crate::command_handler::compile_run_plan_from_snapshot(&run)? else {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    };
+    if plan.escalation_policies.is_empty() {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    }
+
+    let backend_profile_id: Option<String> =
+        backend_profile_id_override.map(String::from).or_else(|| {
+            plan.states
+                .get(stage_id)
+                .and_then(|state| state.owner.backend_profile_id.clone())
+        });
+    let Some(resolved) = workflow::escalation_policy::resolve_policy_for_agent(
+        &plan.escalation_policies,
+        stage_id,
+        agent_id,
+        backend_profile_id.as_deref(),
+    ) else {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    };
+    let Some(policy_snapshot) = plan
+        .escalation_policies
+        .iter()
+        .find(|policy| policy.policy_id == resolved.policy_id)
+    else {
+        return Err(anyhow::anyhow!(
+            "escalation_policy_resolution_internal_error: resolved policy {} is absent from frozen plan",
+            resolved.policy_id
+        ));
+    };
+    if !policy_snapshot
+        .triggers
+        .iter()
+        .any(|trigger| trigger == "provider_quota_exhausted")
+    {
+        return Ok(ProviderQuotaEscalationResolution::None);
+    }
+
+    let mut first_fallback_wait: Option<(
+        String,
+        agent_retry_budget_ledger::ProviderFamilyQuotaWait,
+    )> = None;
+    for tier in &policy_snapshot.tiers {
+        if tier.kind == "pause" {
+            break;
+        }
+        if tier.kind != "backend_profile" {
+            continue;
+        }
+        let Some(backend_override) = resolve_escalation_backend_profile_override(&run, tier)?
+        else {
+            continue;
+        };
+        let provider_family = ProviderFamily::canonicalize_known_alias(&backend_override.provider)
+            .unwrap_or_else(|| backend_override.provider.clone());
+        let candidate_wait = provider_quota_retry_wait_active(
+            pool,
+            &provider_family,
+            backend_override.model.as_deref(),
+            now,
+        )
+        .await?;
+        if let Some(wait) = candidate_wait {
+            first_fallback_wait.get_or_insert((provider_family, wait));
+            continue;
+        }
+
+        let ledger = domain::escalation::EscalationLedger {
+            id: uuid::Uuid::new_v4().to_string(),
+            run_id,
+            stage_id: stage_id.to_string(),
+            agent_id: agent_id.to_string(),
+            policy_id: resolved.policy_id.clone(),
+            policy_hash: resolved.policy_hash.clone(),
+            status_raw: "active".to_string(),
+            current_tier_id: Some(tier.tier_id.clone()),
+            current_tier_kind_raw: Some(tier.kind.clone()),
+            chain_attempt_index: 0,
+            trigger_raw: Some("provider_quota_exhausted".to_string()),
+            pause_reason_raw: None,
+            operator_action_hint: None,
+            runbook_anchor: None,
+            created_at: now,
+            updated_at: now,
+        };
+        return Ok(ProviderQuotaEscalationResolution::Available((
+            ledger,
+            tier.tier_id.clone(),
+            tier.kind.clone(),
+            Some(backend_override),
+        )));
+    }
+
+    if let Some((provider_family, wait)) = first_fallback_wait {
+        Ok(ProviderQuotaEscalationResolution::FallbackQuotaWait {
+            provider_family,
+            wait,
+        })
+    } else {
+        Ok(ProviderQuotaEscalationResolution::None)
+    }
+}
+
+fn apply_escalation_backend_override(
+    payload: &mut serde_json::Value,
+    backend_override: &EscalationBackendProfileOverride,
+) -> (String, Option<String>, String) {
+    let provider = backend_override.provider.clone();
+    let model = backend_override.model.clone();
+    let backend_profile_id = backend_override.backend_profile_id.clone();
+    payload["provider"] = serde_json::json!(provider.clone());
+    payload["backend_profile_id"] = serde_json::json!(backend_profile_id.clone());
+    match backend_override.model.as_deref() {
+        Some(model) => payload["model"] = serde_json::json!(model),
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("model");
+            }
+        }
+    }
+    match backend_override.effort.as_deref() {
+        Some(effort) => payload["effort"] = serde_json::json!(effort),
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("effort");
+            }
+        }
+    }
+    match backend_override.max_turns {
+        Some(max_turns) => payload["max_turns"] = serde_json::json!(max_turns),
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("max_turns");
+            }
+        }
+    }
+    match backend_override.temperature {
+        Some(temperature) => payload["temperature"] = serde_json::json!(temperature),
+        None => {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("temperature");
+            }
+        }
+    }
+    (provider, model, backend_profile_id)
 }
 
 pub async fn claim_next_invoke_agent_with_start(
@@ -584,11 +822,16 @@ async fn invoke_item_has_start_capacity(
             return Ok(false);
         }
     }
-    let provider_family =
+    let mut provider_family =
         ProviderFamily::canonicalize_known_alias(provider).unwrap_or_else(|| provider.to_string());
-    let model = payload.get("model").and_then(|value| value.as_str());
+    let model = payload
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(String::from);
+    let model_ref = model.as_deref();
+    let now = chrono::Utc::now();
     if let Some(wait) =
-        provider_quota_retry_wait_active(pool, &provider_family, model, chrono::Utc::now()).await?
+        provider_quota_retry_wait_active(pool, &provider_family, model_ref, now).await?
     {
         let stage_execution_id = payload
             .get("stage_execution_id")
@@ -600,8 +843,8 @@ async fn invoke_item_has_start_capacity(
                     pool,
                     stage_execution_id,
                     &provider_family,
-                    model,
-                    chrono::Utc::now(),
+                    model_ref,
+                    now,
                 )
                 .await?
             {
@@ -614,9 +857,65 @@ async fn invoke_item_has_start_capacity(
                     "Operator retry consumed active provider-family quota wait"
                 );
             } else {
-                record_provider_quota_wait_on_pending_item(pool, item, &provider_family, &wait)
-                    .await?;
-                return Ok(false);
+                match resolve_provider_quota_escalation_candidate(
+                    pool,
+                    item.run_id
+                        .ok_or_else(|| anyhow::anyhow!("InvokeAgent work item missing run_id"))?,
+                    payload
+                        .get("stage_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                    payload
+                        .get("agent_id")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| payload.get("stage_id").and_then(|value| value.as_str()))
+                        .unwrap_or_default(),
+                    payload
+                        .get("backend_profile_id")
+                        .and_then(|value| value.as_str()),
+                    now,
+                )
+                .await?
+                {
+                    ProviderQuotaEscalationResolution::Available(candidate) => {
+                        if let Some(backend_override) = candidate.3.as_ref() {
+                            provider_family = ProviderFamily::canonicalize_known_alias(
+                                &backend_override.provider,
+                            )
+                            .unwrap_or_else(|| backend_override.provider.clone());
+                            info!(
+                                work_item_id = %item.id,
+                                blocked_provider_family = %provider,
+                                selected_provider_family = %provider_family,
+                                selected_backend_profile_id = %backend_override.backend_profile_id,
+                                "Provider quota wait bypassed by escalation backend"
+                            );
+                        }
+                    }
+                    ProviderQuotaEscalationResolution::FallbackQuotaWait {
+                        provider_family,
+                        wait,
+                    } => {
+                        record_provider_quota_wait_on_pending_item(
+                            pool,
+                            item,
+                            &provider_family,
+                            &wait,
+                        )
+                        .await?;
+                        return Ok(false);
+                    }
+                    ProviderQuotaEscalationResolution::None => {
+                        record_provider_quota_wait_on_pending_item(
+                            pool,
+                            item,
+                            &provider_family,
+                            &wait,
+                        )
+                        .await?;
+                        return Ok(false);
+                    }
+                }
             }
         } else {
             record_provider_quota_wait_on_pending_item(pool, item, &provider_family, &wait).await?;
@@ -893,12 +1192,12 @@ async fn claim_invoke_agent_work_item_with_start(
         .and_then(|value| value.as_str())
         .unwrap_or(&stage_id)
         .to_string();
-    let provider = payload
+    let mut provider = payload
         .get("provider")
         .and_then(|value| value.as_str())
         .ok_or_else(|| anyhow::anyhow!("InvokeAgent payload missing provider"))?
         .to_string();
-    let model = payload
+    let mut model = payload
         .get("model")
         .and_then(|value| value.as_str())
         .map(String::from);
@@ -907,7 +1206,7 @@ async fn claim_invoke_agent_work_item_with_start(
         .and_then(|value| value.as_str())
         .unwrap_or(&stage_id)
         .to_string();
-    let payload_backend_profile_id = payload
+    let mut payload_backend_profile_id = payload
         .get("backend_profile_id")
         .and_then(|value| value.as_str())
         .map(String::from);
@@ -925,17 +1224,56 @@ async fn claim_invoke_agent_work_item_with_start(
         owner_execution_lineage_id: &owner_execution_lineage_id,
     });
 
-    let esc_candidate = resolve_escalation_chain_candidate(
-        pool,
-        run_id,
-        &stage_id,
-        &agent_id,
-        payload_backend_profile_id.as_deref(),
-    )
-    .await
-    .with_context(|| {
-        format!("P058 escalation chain resolution failed for run={run_id} stage={stage_id}")
-    })?;
+    let provider_family =
+        ProviderFamily::canonicalize_known_alias(&provider).unwrap_or_else(|| provider.clone());
+    let quota_candidate =
+        if provider_quota_retry_wait_active(pool, &provider_family, model.as_deref(), now)
+            .await?
+            .is_some()
+        {
+            match resolve_provider_quota_escalation_candidate(
+                pool,
+                run_id,
+                &stage_id,
+                &agent_id,
+                payload_backend_profile_id.as_deref(),
+                now,
+            )
+            .await?
+            {
+                ProviderQuotaEscalationResolution::Available(candidate) => Some(candidate),
+                ProviderQuotaEscalationResolution::FallbackQuotaWait { .. }
+                | ProviderQuotaEscalationResolution::None => None,
+            }
+        } else {
+            None
+        };
+
+    let esc_candidate = match quota_candidate {
+        Some(candidate) => Some(candidate),
+        None => resolve_escalation_chain_candidate(
+            pool,
+            run_id,
+            &stage_id,
+            &agent_id,
+            payload_backend_profile_id.as_deref(),
+        )
+        .await
+        .with_context(|| {
+            format!("P058 escalation chain resolution failed for run={run_id} stage={stage_id}")
+        })?,
+    };
+
+    if let Some(backend_override) = esc_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.3.as_ref())
+    {
+        let (override_provider, override_model, override_backend_profile_id) =
+            apply_escalation_backend_override(&mut payload, backend_override);
+        provider = override_provider;
+        model = override_model;
+        payload_backend_profile_id = Some(override_backend_profile_id);
+    }
 
     let artifact_claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
         run_id,
@@ -997,31 +1335,37 @@ async fn claim_invoke_agent_work_item_with_start(
         return Ok(None);
     }
 
-    let (esc_policy_id, esc_policy_hash, esc_ledger_id, esc_tier_id, esc_tier_kind_raw) =
-        if let Some(ref candidate) = esc_candidate {
-            match escalation_repo::insert_or_ignore_ledger_tx(&mut tx, &candidate.0).await {
-                Ok(ledger_id) => (
-                    Some(candidate.0.policy_id.clone()),
-                    Some(candidate.0.policy_hash.clone()),
-                    Some(ledger_id),
-                    Some(candidate.1.clone()),
-                    Some(candidate.2.clone()),
-                ),
-                Err(error) => {
-                    if let Some(drift) =
-                        error.downcast_ref::<escalation_repo::EscalationPolicyDrift>()
-                    {
-                        let ledger_id = drift.ledger_id.clone();
-                        drop(tx);
-                        escalation_repo::open_drift_pause(pool, &ledger_id).await?;
-                        return Ok(None);
-                    }
-                    return Err(error);
+    let (
+        esc_policy_id,
+        esc_policy_hash,
+        esc_ledger_id,
+        esc_tier_id,
+        esc_tier_kind_raw,
+        esc_trigger_raw,
+    ) = if let Some(ref candidate) = esc_candidate {
+        match escalation_repo::insert_or_ignore_ledger_tx(&mut tx, &candidate.0).await {
+            Ok(ledger_id) => (
+                Some(candidate.0.policy_id.clone()),
+                Some(candidate.0.policy_hash.clone()),
+                Some(ledger_id),
+                Some(candidate.1.clone()),
+                Some(candidate.2.clone()),
+                candidate.0.trigger_raw.clone(),
+            ),
+            Err(error) => {
+                if let Some(drift) = error.downcast_ref::<escalation_repo::EscalationPolicyDrift>()
+                {
+                    let ledger_id = drift.ledger_id.clone();
+                    drop(tx);
+                    escalation_repo::open_drift_pause(pool, &ledger_id).await?;
+                    return Ok(None);
                 }
+                return Err(error);
             }
-        } else {
-            (None, None, None, None, None)
-        };
+        }
+    } else {
+        (None, None, None, None, None, None)
+    };
 
     agent_executions::insert_tx(
         &mut tx,
@@ -1071,7 +1415,7 @@ async fn claim_invoke_agent_work_item_with_start(
             escalation_policy_hash: esc_policy_hash,
             escalation_tier_id: esc_tier_id.clone(),
             escalation_tier_kind_raw: esc_tier_kind_raw.clone(),
-            escalation_trigger_raw: None,
+            escalation_trigger_raw: esc_trigger_raw.clone(),
             escalation_digest_version: None,
             escalation_ledger_id: esc_ledger_id.clone(),
         },
@@ -1091,7 +1435,7 @@ async fn claim_invoke_agent_work_item_with_start(
                 tier_id: tier_id.clone(),
                 tier_kind_raw: tier_kind_raw.clone(),
                 tier_attempt_index,
-                trigger_raw: None,
+                trigger_raw: esc_trigger_raw.clone(),
                 digest_version: None,
                 capacity_probe_counter: 0,
                 created_at: now,
@@ -1269,6 +1613,14 @@ pub struct BackgroundExecutor {
 struct BackgroundStewardAgentExecutor {
     acp: Arc<AcpRuntimeManager>,
     runtime_inputs: Arc<crate::steward::config::StewardRuntimeInputs>,
+}
+
+fn advance_run_process_timeout() -> Duration {
+    std::env::var("CHAINWORKS_ADVANCE_RUN_PROCESS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(45))
 }
 
 #[async_trait::async_trait]
@@ -1552,9 +1904,11 @@ fn build_declared_output_discovery_settlement_with_filesystem(
             continue;
         }
 
+        let direct_file_ref_artifact =
+            find_direct_file_ref_artifact_for_spec(discovered_artifacts, spec);
         let envelope = find_provider_envelope_for_spec(discovered_artifacts, spec);
         let exact_path = find_exact_path_artifact_for_spec(discovered_artifacts, spec);
-        let direct_file_ref = envelope.and_then(|artifact| {
+        let direct_file_ref = direct_file_ref_artifact.and_then(|artifact| {
             read_direct_file_ref_output(spec, artifact, pre_prompt_expected_outputs, filesystem)
         });
         let candidate = if let Some(candidate) = direct_file_ref {
@@ -2353,6 +2707,25 @@ fn find_provider_envelope_for_spec<'a>(
     })
 }
 
+fn find_direct_file_ref_artifact_for_spec<'a>(
+    discovered_artifacts: &'a [acp::DiscoveredArtifact],
+    spec: &ExpectedOutputSpec,
+) -> Option<&'a acp::DiscoveredArtifact> {
+    discovered_artifacts.iter().find(|artifact| {
+        artifact.source_path.is_none()
+            && matches!(
+                artifact.source_kind,
+                acp::DiscoveredArtifactSourceKind::ProviderEnvelope
+                    | acp::DiscoveredArtifactSourceKind::ChainworksOutput
+            )
+            && direct_file_ref_manifest_matches(
+                &artifact.content,
+                &spec.output_name,
+                &spec.target_path,
+            )
+    })
+}
+
 fn find_exact_path_artifact_for_spec<'a>(
     discovered_artifacts: &'a [acp::DiscoveredArtifact],
     spec: &ExpectedOutputSpec,
@@ -2448,7 +2821,14 @@ fn read_direct_file_ref_output(
         ExpectedPathBaselineStatus::Absent => OutputDiscoveryReason::ExactPathNew,
         ExpectedPathBaselineStatus::RegularContentCaptured => {
             if previous.content_digest.as_deref() == Some(digest.as_str()) {
-                return None;
+                if manifest.digest.as_ref().is_none_or(|manifest_digest| {
+                    normalize_sha256_digest(manifest_digest) != digest
+                }) || manifest
+                    .size_bytes
+                    .is_none_or(|expected| expected != bytes.len() as u64)
+                {
+                    return None;
+                }
             }
             OutputDiscoveryReason::ExactPathChanged
         }
@@ -2521,6 +2901,11 @@ fn direct_file_ref_manifest(content: &[u8], output_name: &str) -> Option<DirectF
         digest,
         size_bytes,
     })
+}
+
+fn direct_file_ref_manifest_matches(content: &[u8], output_name: &str, target_path: &str) -> bool {
+    direct_file_ref_manifest(content, output_name)
+        .is_some_and(|manifest| manifest.path == target_path)
 }
 
 fn normalize_sha256_digest(value: &str) -> String {
@@ -6246,7 +6631,9 @@ You are continuing the same Chainworks agent execution through an existing live 
         };
         let terminal_reason = if post_continuation_change && provider_send_recorded {
             if transcript_absence_reason.is_some() {
-                Some("reconciled_from_post_continuation_worktree_evidence_with_explicit_transcript_absence")
+                Some(
+                    "reconciled_from_post_continuation_worktree_evidence_with_explicit_transcript_absence",
+                )
             } else {
                 Some("reconciled_from_post_continuation_worktree_and_transcript_evidence")
             }
@@ -7548,8 +7935,118 @@ You are continuing the same Chainworks agent execution through an existing live 
                                 }
                             }
                         });
+                    } else if matches!(kind, WorkItemKind::AdvanceRun) {
+                        let executor = Arc::clone(self);
+                        tokio::spawn(async move {
+                            let timeout = advance_run_process_timeout();
+                            let process_item_id = item_id.clone();
+                            let process_kind = kind.clone();
+                            let process_executor = Arc::clone(&executor);
+                            let process_handle =
+                                tokio::spawn(
+                                    async move { process_executor.process_item(item).await },
+                                );
+
+                            let process_result = match tokio::time::timeout(timeout, process_handle)
+                                .await
+                            {
+                                Ok(Ok(result)) => result,
+                                Ok(Err(join_error)) => Err(anyhow::anyhow!(
+                                    "advance_run task join error: {join_error}"
+                                )),
+                                Err(_) => {
+                                    let reason = format!(
+                                        "advance_run_process_timeout_after_{}s",
+                                        timeout.as_secs()
+                                    );
+                                    match executor
+                                        .work_queue
+                                        .requeue_running_advance_item(&process_item_id, &reason)
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            warn!(
+                                                item_id = %process_item_id,
+                                                kind = %process_kind,
+                                                timeout_secs = timeout.as_secs(),
+                                                "AdvanceRun work item timed out and was requeued"
+                                            );
+                                        }
+                                        Ok(false) => {
+                                            error!(
+                                                item_id = %process_item_id,
+                                                kind = %process_kind,
+                                                timeout_secs = timeout.as_secs(),
+                                                "AdvanceRun work item timed out but was no longer running"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                item_id = %process_item_id,
+                                                kind = %process_kind,
+                                                error = %e,
+                                                timeout_secs = timeout.as_secs(),
+                                                "Failed to requeue timed-out AdvanceRun work item"
+                                            );
+                                        }
+                                    }
+                                    return;
+                                }
+                            };
+
+                            match process_result {
+                                Ok(()) => {
+                                    if let Err(e) =
+                                        executor.work_queue.complete(&process_item_id).await
+                                    {
+                                        error!(item_id = %process_item_id, kind = %process_kind, error = %e, "Failed to complete AdvanceRun work item");
+                                    }
+                                }
+                                Err(e) if is_work_item_requeued(&e) => {
+                                    info!(item_id = %process_item_id, kind = %process_kind, reason = %e, "AdvanceRun work item requeued");
+                                }
+                                Err(e) if is_transient_persistence_contention_error(&e) => {
+                                    let message = e.to_string();
+                                    match executor
+                                        .work_queue
+                                        .requeue_after_transient_persistence_contention(
+                                            &process_item_id,
+                                            &message,
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => {
+                                            warn!(item_id = %process_item_id, kind = %process_kind, error = %message, "AdvanceRun work item requeued after transient SQLite contention");
+                                        }
+                                        Ok(false) => {
+                                            if let Err(e2) = executor
+                                                .work_queue
+                                                .fail(&process_item_id, &message)
+                                                .await
+                                            {
+                                                error!(item_id = %process_item_id, error = %e2, "Failed to mark AdvanceRun work item failed after transient contention requeue no-op");
+                                            }
+                                        }
+                                        Err(e2) => {
+                                            error!(item_id = %process_item_id, error = %e2, "Failed to requeue AdvanceRun work item after transient SQLite contention");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(item_id = %process_item_id, kind = %process_kind, error = %e, "AdvanceRun work item failed");
+                                    if let Err(e2) = executor
+                                        .work_queue
+                                        .fail(&process_item_id, &e.to_string())
+                                        .await
+                                    {
+                                        error!(item_id = %process_item_id, error = %e2, "Failed to mark AdvanceRun work item failed");
+                                    }
+                                }
+                            }
+                        });
                     } else {
-                        match self.process_item(item).await {
+                        let process_result = self.process_item(item).await;
+                        match process_result {
                             Ok(()) => {
                                 if let Err(e) = self.work_queue.complete(&item_id).await {
                                     if is_transient_persistence_contention_error(&e) {
@@ -12839,6 +13336,9 @@ You are continuing the same Chainworks agent execution through an existing live 
             {
                 continue;
             }
+            if discovered_artifact_is_declared_direct_file_ref(discovered, declared_outputs) {
+                continue;
+            }
             if should_ignore_undeclared_envelope_artifact(&discovered.name) {
                 warn!(
                     stage_id = %stage_id,
@@ -13701,11 +14201,7 @@ You are continuing the same Chainworks agent execution through an existing live 
         let bytes = serde_json::to_vec_pretty(&manifest)?;
         let manifest_relative_path = format!(
             "evidence/runs/{}/stages/{}/agents/{}/receipt/side-effects/{}/{}/evidence-manifest.json",
-            run.id,
-            stage_execution_id,
-            agent_id,
-            effect_kind,
-            evidence_root_slug
+            run.id, stage_execution_id, agent_id, effect_kind, evidence_root_slug
         );
         let manifest_spool = db::evidence_spool::write_spool_file(
             artifact_root,
@@ -14142,6 +14638,20 @@ fn should_suppress_duplicate_approved_proposal_output(
 
 fn should_ignore_undeclared_envelope_artifact(name: &str) -> bool {
     name == APPROVED_PROPOSAL_OUTPUT_NAME
+}
+
+fn discovered_artifact_is_declared_direct_file_ref(
+    discovered: &acp::DiscoveredArtifact,
+    declared_outputs: &[DeclaredOutput],
+) -> bool {
+    discovered.source_path.is_none()
+        && declared_outputs.iter().any(|declared| {
+            direct_file_ref_manifest_matches(
+                &discovered.content,
+                &declared.output_name,
+                &declared.target_path,
+            )
+        })
 }
 
 fn filter_duplicate_approved_proposal_declared_artifacts(
@@ -16439,6 +16949,9 @@ fn p088_capture_source(source: &acp::AcpCompletionCaptureSource) -> String {
         }
         acp::AcpCompletionCaptureSource::StreamedUpdateTail => "streamed_update_tail".to_string(),
         acp::AcpCompletionCaptureSource::CappedStream => "session_update_stream".to_string(),
+        acp::AcpCompletionCaptureSource::ProviderSessionStoreTaskComplete => {
+            "provider_session_store_task_complete".to_string()
+        }
     }
 }
 
@@ -20246,6 +20759,134 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn mixed_path_keyed_inline_outputs_survive_direct_file_manifest_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let progress_path = tmp.path().join("implementation/progress.md");
+        let self_assessment_path = tmp.path().join("implementation/self-assessment.json");
+        let changed_files_path = tmp.path().join("implementation/changed-files.json");
+        let tests_path = tmp.path().join("implementation/tests.json");
+        std::fs::create_dir_all(changed_files_path.parent().unwrap()).unwrap();
+        let changed_bytes = br#"{"files":["control-plane/crates/engine/src/executor.rs"]}"#;
+        std::fs::write(&changed_files_path, changed_bytes).unwrap();
+
+        let declared = vec![
+            DeclaredOutput {
+                output_name: "implementation_progress".to_string(),
+                target_path: progress_path.to_string_lossy().into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "implementation_self_assessment".to_string(),
+                target_path: self_assessment_path.to_string_lossy().into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "changed_files_manifest".to_string(),
+                target_path: changed_files_path.to_string_lossy().into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+            DeclaredOutput {
+                output_name: "tests_result".to_string(),
+                target_path: tests_path.to_string_lossy().into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            },
+        ];
+        let specs =
+            build_expected_output_specs(&declared, tmp.path().to_str().unwrap(), None, None, false);
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata: Vec<_> = specs
+            .iter()
+            .map(|spec| PrePromptExpectedOutputMetadata::absent(spec, &metadata_context))
+            .collect();
+        let discovered = vec![
+            acp::DiscoveredArtifact {
+                name: progress_path.to_string_lossy().into_owned(),
+                content: b"progress complete".to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+            },
+            acp::DiscoveredArtifact {
+                name: self_assessment_path.to_string_lossy().into_owned(),
+                content: br#"{"implementation_complete":true,"verification_green":true,"remaining_code_tasks":[]}"#.to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+            },
+            acp::DiscoveredArtifact {
+                name: changed_files_path.to_string_lossy().into_owned(),
+                content: serde_json::to_vec(&serde_json::json!({
+                    "mode": "direct_file",
+                    "output_name": "changed_files_manifest",
+                    "path": changed_files_path.to_string_lossy(),
+                    "digest": sha256_digest(changed_bytes),
+                    "size_bytes": changed_bytes.len()
+                }))
+                .unwrap(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+            },
+            acp::DiscoveredArtifact {
+                name: tests_path.to_string_lossy().into_owned(),
+                content: br#"{"status":"complete","summary":"passed"}"#.to_vec(),
+                source_path: None,
+                source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+            },
+        ];
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &declared,
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+
+        for output_name in [
+            "implementation_progress",
+            "implementation_self_assessment",
+            "changed_files_manifest",
+            "tests_result",
+        ] {
+            let decision = settlement
+                .decisions
+                .iter()
+                .find(|decision| decision.output_name == output_name)
+                .unwrap();
+            assert_eq!(
+                decision.status,
+                OutputDiscoveryStatus::Accepted,
+                "{output_name} should be accepted: {decision:?}"
+            );
+        }
+        assert_eq!(captured.len(), 4);
+        assert_eq!(
+            captured
+                .iter()
+                .find(|output| output.declared.output_name == "implementation_progress")
+                .and_then(|output| output.machine_bytes.as_deref()),
+            Some(&b"progress complete"[..])
+        );
+    }
+
+    #[test]
     fn direct_file_ref_manifest_accepts_changed_canonical_file_output() {
         let tmp = tempfile::tempdir().unwrap();
         let output_path = tmp.path().join("proposals/current/proposal.json");
@@ -20405,6 +21046,199 @@ plain progress line without gate evidence";
             Some(&output_bytes[..])
         );
         assert!(validation.failure_class.is_none());
+    }
+
+    #[test]
+    fn direct_file_ref_manifest_accepts_path_keyed_manifest_by_inner_output_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("implementation/progress.md");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        let output_bytes = b"## Progress\n\n- Implemented direct-file settlement.\n";
+        std::fs::write(&output_path, output_bytes).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "implementation_progress".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(tmp.path().to_str().unwrap()),
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata = vec![PrePromptExpectedOutputMetadata::absent(
+            &specs[0],
+            &metadata_context,
+        )];
+        let manifest = serde_json::json!({
+            "mode": "direct_file",
+            "output_name": "implementation_progress",
+            "path": output_path.to_string_lossy(),
+            "digest": sha256_digest(output_bytes),
+            "size_bytes": output_bytes.len()
+        });
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "path-keyed-output-entry".to_string(),
+            content: serde_json::to_vec(&manifest).unwrap(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        }];
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Accepted
+        );
+        assert_eq!(
+            settlement.decisions[0].reason,
+            OutputDiscoveryReason::ExactPathNew
+        );
+        assert_eq!(
+            settlement.decisions[0].diagnostics.get("output_mode"),
+            Some(&"direct_file_ref".to_string())
+        );
+        assert_eq!(
+            captured[0].machine_bytes.as_deref(),
+            Some(&output_bytes[..])
+        );
+        assert!(validation.failure_class.is_none());
+    }
+
+    #[test]
+    fn direct_file_ref_manifest_accepts_digest_proven_unchanged_canonical_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("reviews/proposal/feedback-coverage.json");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        let output_bytes =
+            br#"{"addressed_feedback":["a"],"unaddressed_feedback":[],"coverage_notes":"done"}"#;
+        std::fs::write(&output_path, output_bytes).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "proposal_feedback_coverage".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id: "proposal_feedback_coverage_v1".to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec![
+                    "addressed_feedback".to_string(),
+                    "unaddressed_feedback".to_string(),
+                    "coverage_notes".to_string(),
+                ],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(tmp.path().to_str().unwrap()),
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 2,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let digest = sha256_digest(output_bytes);
+        let mut pre_prompt = PrePromptExpectedOutputMetadata::absent(&specs[0], &metadata_context);
+        pre_prompt.existed = true;
+        pre_prompt.file_type = "file".to_string();
+        pre_prompt.size_bytes = Some(output_bytes.len() as u64);
+        pre_prompt.content_digest = Some(digest.clone());
+        pre_prompt.baseline_status = ExpectedPathBaselineStatus::RegularContentCaptured;
+        let manifest = serde_json::json!({
+            "mode": "direct_file",
+            "output_name": "proposal_feedback_coverage",
+            "path": output_path.to_string_lossy(),
+            "digest": digest,
+            "size_bytes": output_bytes.len()
+        });
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: output_path.to_string_lossy().into_owned(),
+            content: serde_json::to_vec(&manifest).unwrap(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        }];
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &[pre_prompt]);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        assert_eq!(
+            settlement.decisions[0].status,
+            OutputDiscoveryStatus::Accepted
+        );
+        assert_eq!(
+            captured[0].machine_bytes.as_deref(),
+            Some(&output_bytes[..])
+        );
+        assert!(validation.failure_class.is_none());
+    }
+
+    #[test]
+    fn direct_file_ref_manifest_is_not_treated_as_undeclared_envelope_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("reviews/proposal/feedback-coverage.json");
+        let declared = DeclaredOutput {
+            output_name: "proposal_feedback_coverage".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let manifest = serde_json::json!({
+            "mode": "direct_file",
+            "output_name": "proposal_feedback_coverage",
+            "path": output_path.to_string_lossy(),
+            "digest": "sha256:abc",
+            "size_bytes": 42
+        });
+        let discovered = acp::DiscoveredArtifact {
+            name: output_path.to_string_lossy().into_owned(),
+            content: serde_json::to_vec(&manifest).unwrap(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        };
+
+        assert!(discovered_artifact_is_declared_direct_file_ref(
+            &discovered,
+            &[declared]
+        ));
     }
 
     #[test]

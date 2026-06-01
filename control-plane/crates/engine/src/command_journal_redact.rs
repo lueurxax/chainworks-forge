@@ -661,6 +661,12 @@ mod tests {
                 stage_id: "state_3".into(),
                 idempotency_key: None,
             }),
+            Command::RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd {
+                run_id: RunId::new(),
+                expected_catalog_snapshot_hash: "b".repeat(64),
+                reason: "operator-approved emergency retrofit".into(),
+                scope: Default::default(),
+            }),
         ];
 
         for cmd in &samples {

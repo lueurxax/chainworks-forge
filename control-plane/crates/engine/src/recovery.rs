@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use acp::AcpRuntimeManager;
 use db::repos::{
@@ -32,7 +32,7 @@ use domain::code_writer_completion::{
 use domain::escalation::EscalationEvent;
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::retry_authority::{RetryAuthorityState, RetryPayloadRecoveryEvent};
-use domain::run::Run;
+use domain::run::{Run, RunStatus};
 use domain::stage::{StageSettlementKind, StageStatus};
 use sqlx::Row;
 
@@ -292,6 +292,13 @@ fn p092_recovery_reason_code(stale_fields: &[&'static str]) -> &'static str {
     } else {
         "valid_retry_invoke_completion_recovered"
     }
+}
+
+fn p088_startup_receipt_recovery_max_files() -> usize {
+    std::env::var("CHAINWORKS_P088_STARTUP_RECEIPT_RECOVERY_MAX_FILES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(256)
 }
 
 #[cfg(test)]
@@ -724,9 +731,17 @@ impl RecoveryService {
     }
 
     pub async fn run_startup_repair(&self) -> Result<RecoverySummary> {
+        let cancelled_terminal_invariant_repairs =
+            self.repair_cancelled_run_terminal_invariants().await?;
+        if cancelled_terminal_invariant_repairs > 0 {
+            warn!(
+                repaired = cancelled_terminal_invariant_repairs,
+                "Startup recovery restored cancelled run terminal invariants"
+            );
+        }
         let active_runs = runs::list_active(&self.pool).await?;
         let runs_inspected = active_runs.len();
-        let mut runs_repaired = 0usize;
+        let mut runs_repaired = cancelled_terminal_invariant_repairs as usize;
         let mut work_items_requeued = 0usize;
         let now = Utc::now();
         for run in &active_runs {
@@ -890,6 +905,19 @@ impl RecoveryService {
             warn!(
                 completed = completed_invoke_agents,
                 "Startup recovery completed InvokeAgent work items whose agent executions already had valid outputs"
+            );
+        }
+        let failed_invoke_agents =
+            work_items::fail_running_invoke_agents_with_terminal_failed_outputs_on_startup(
+                &self.pool,
+                "startup_repair_terminal_agent_missing_outputs",
+            )
+            .await?;
+        if failed_invoke_agents > 0 {
+            work_items_requeued += failed_invoke_agents as usize;
+            warn!(
+                failed = failed_invoke_agents,
+                "Startup recovery failed InvokeAgent work items whose agent executions were already terminal without valid outputs"
             );
         }
         let requeued_invoke_agents = work_items::requeue_running_invoke_agent_on_startup(
@@ -1095,6 +1123,139 @@ impl RecoveryService {
         })
     }
 
+    async fn repair_cancelled_run_terminal_invariants(&self) -> Result<u64> {
+        let rows = sqlx::query(
+            r#"
+            SELECT r.id
+            FROM runs r
+            LEFT JOIN run_state_projections rsp ON rsp.run_id = r.id
+            WHERE r.cancellation_settled_at IS NOT NULL
+              AND (
+                    r.status <> 'cancelled'
+                 OR COALESCE(json_extract(rsp.run_state_json, '$.status'), '') <> 'cancelled'
+                 OR EXISTS (
+                        SELECT 1
+                          FROM retry_stage_execution_authorities rsa
+                         WHERE rsa.run_id = r.id
+                           AND rsa.authority_state = 'active'
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM work_items wi
+                         WHERE wi.run_id = r.id
+                           AND wi.status IN ('pending', 'running')
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM stage_executions se
+                         WHERE se.run_id = r.id
+                           AND se.status IN ('pending', 'running')
+                    )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM agent_executions ae
+                          JOIN stage_executions se ON se.id = ae.stage_execution_id
+                         WHERE se.run_id = r.id
+                           AND ae.status = 'running'
+                    )
+              )
+            ORDER BY r.started_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("load cancelled run terminal invariant repair candidates")?;
+
+        let mut repaired = 0_u64;
+        for row in rows {
+            let run_id_raw: String = row.get("id");
+            let run_id: domain::ids::RunId = run_id_raw
+                .parse()
+                .map_err(|e| anyhow!("invalid run id {run_id_raw}: {e}"))?;
+            let now = Utc::now();
+            let mut tx = self
+                .begin_transaction(
+                    "startup_repair.cancelled_run_terminal_invariant",
+                    format!("cancelled-run-terminal-invariant:{run_id}"),
+                )
+                .await?;
+
+            let Some(run) = runs::find_by_id_tx(&mut tx, run_id).await? else {
+                tx.commit().await?;
+                continue;
+            };
+            if run.cancellation_settled_at.is_none() {
+                tx.commit().await?;
+                continue;
+            }
+
+            runs::update_status_tx(&mut tx, run_id, RunStatus::Cancelled).await?;
+            agent_executions::cancel_running_by_run_tx(&mut tx, run_id, now).await?;
+            sqlx::query(
+                r#"
+                UPDATE work_items
+                   SET status = ?1,
+                       completed_at = COALESCE(completed_at, ?2),
+                       last_error = COALESCE(last_error, ?3)
+                 WHERE run_id = ?4
+                   AND status IN (?5, ?6)
+                "#,
+            )
+            .bind(WorkItemStatus::Cancelled.to_string())
+            .bind(now.to_rfc3339())
+            .bind("startup_repair_cancelled_run_terminal_invariant")
+            .bind(run_id.to_string())
+            .bind(WorkItemStatus::Pending.to_string())
+            .bind(WorkItemStatus::Running.to_string())
+            .execute(&mut **tx)
+            .await
+            .context("cancel pending/running work items for cancelled run")?;
+            sqlx::query(
+                r#"
+                UPDATE stage_executions
+                   SET status = ?1,
+                       settlement_kind = COALESCE(settlement_kind, ?2),
+                       completed_at = COALESCE(completed_at, ?3)
+                 WHERE run_id = ?4
+                   AND status IN (?5, ?6)
+                "#,
+            )
+            .bind(StageStatus::Skipped.to_string())
+            .bind(StageSettlementKind::Skipped.to_string())
+            .bind(now.to_rfc3339())
+            .bind(run_id.to_string())
+            .bind(StageStatus::Pending.to_string())
+            .bind(StageStatus::Running.to_string())
+            .execute(&mut **tx)
+            .await
+            .context("settle pending/running stages for cancelled run")?;
+            sqlx::query(
+                r#"
+                UPDATE retry_stage_execution_authorities
+                   SET authority_state = ?1,
+                       terminal_reason = COALESCE(terminal_reason, ?2),
+                       updated_at = ?3
+                 WHERE run_id = ?4
+                   AND authority_state = ?5
+                "#,
+            )
+            .bind(RetryAuthorityState::Terminalized.to_string())
+            .bind("cancelled_run_terminal_invariant_repair")
+            .bind(now.to_rfc3339())
+            .bind(run_id.to_string())
+            .bind(RetryAuthorityState::Active.to_string())
+            .execute(&mut **tx)
+            .await
+            .context("terminalize retry authorities for cancelled run")?;
+
+            tx.commit().await?;
+            projections::rebuild_all_for_run(&self.pool, run_id).await?;
+            repaired += 1;
+        }
+
+        Ok(repaired)
+    }
+
     async fn repair_p086_stale_continuation_workers(&self) -> Result<usize> {
         let current_generation = format!("daemon-{}", std::process::id());
         let stale_before = (Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
@@ -1287,13 +1448,33 @@ impl RecoveryService {
     }
 
     async fn recover_p088_completion_receipt_artifacts(&self, run: &Run) -> Result<usize> {
+        let max_files = p088_startup_receipt_recovery_max_files();
+        if max_files == 0 {
+            debug!(
+                run_id = %run.id,
+                "P088 startup completion receipt artifact recovery disabled by max-files=0"
+            );
+            return Ok(0);
+        }
+
         let p088_root = Path::new(&run.artifact_root).join("evidence").join("p088");
         if !p088_root.exists() {
             return Ok(0);
         }
 
         let mut recovered = 0usize;
+        let mut inspected = 0usize;
         for entry in std::fs::read_dir(&p088_root)? {
+            if inspected >= max_files {
+                warn!(
+                    run_id = %run.id,
+                    root = %p088_root.display(),
+                    inspected = inspected,
+                    max_files = max_files,
+                    "P088 startup completion receipt artifact recovery truncated to keep daemon startup bounded"
+                );
+                break;
+            }
             let Ok(entry) = entry else {
                 continue;
             };
@@ -1301,6 +1482,7 @@ impl RecoveryService {
             if !path.exists() {
                 continue;
             }
+            inspected += 1;
             let raw = match std::fs::read_to_string(&path) {
                 Ok(raw) => raw,
                 Err(e) => {
@@ -1319,7 +1501,7 @@ impl RecoveryService {
                 continue;
             }
             if artifact.receipt.run_id != run.id {
-                warn!(
+                debug!(
                     run_id = %run.id,
                     artifact_run_id = %artifact.receipt.run_id,
                     path = %path.display(),
@@ -2381,6 +2563,21 @@ impl RecoveryService {
                     );
                 }
                 return Ok(requeued);
+            }
+
+            let completed_targeted_advance =
+                work_items::complete_targeted_advance_runs_with_existing_invokes(
+                    &self.pool,
+                    now,
+                    "startup_repair_targeted_advance_existing_invoke",
+                )
+                .await?;
+            if completed_targeted_advance > 0 {
+                info!(
+                    run_id = %run.id,
+                    completed = %completed_targeted_advance,
+                    "Startup recovery completed targeted AdvanceRun work items whose InvokeAgent already exists"
+                );
             }
 
             let mut requeued_targeted_advance = 0_u64;

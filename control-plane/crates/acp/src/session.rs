@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::json;
 use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
@@ -12,8 +13,9 @@ use crate::adapters::XcodeShimGrantCleanup;
 use crate::adapters::{CleanupPathPolicy, CleanupPathSpec};
 use crate::transport::{AcpSessionConfig, AcpTransportSession};
 use crate::{
-    AcpCloseDiagnostic, AcpExecutionError, AcpPromptProgressSink, AcpRuntimeReceipt,
-    ExecutionRequest, ExecutionResult, NoopAcpPromptProgressSink, ProviderSessionStoreCapture,
+    AcpCloseDiagnostic, AcpCompletionCaptureSource, AcpExecutionError, AcpPromptProgressSink,
+    AcpRuntimeReceipt, AcpRuntimeReceiptEvent, ExecutionRequest, ExecutionResult,
+    NoopAcpPromptProgressSink, ProviderSessionStoreCapture,
 };
 use domain::ids::AgentExecutionId;
 
@@ -178,6 +180,14 @@ impl AcpSession {
         let prompt_result = match prompt_result {
             Ok(prompt_result) => prompt_result,
             Err(error) => {
+                self.xcode_shim_grants
+                    .iter()
+                    .for_each(|grant| grant.set_active_prompt(false));
+                if let Some(result) =
+                    self.recover_codex_task_complete_after_prompt_error(req, error.to_string())
+                {
+                    return Ok(result);
+                }
                 if let Some(receipt) = self.transport.runtime_receipt().cloned() {
                     let message = error.to_string();
                     return Err(
@@ -347,6 +357,64 @@ impl AcpSession {
 
     pub fn is_live(&mut self) -> bool {
         !self.transport.is_closed() && matches!(self.transport.try_wait(), Ok(None))
+    }
+
+    fn recover_codex_task_complete_after_prompt_error(
+        &self,
+        req: &ExecutionRequest,
+        error_message: String,
+    ) -> Option<ExecutionResult> {
+        if req.provider.trim().to_ascii_lowercase() != "codex" {
+            return None;
+        }
+        let recovery = recover_codex_task_complete_from_cleanup_paths(&self.cleanup_paths, req)?;
+        let mcp_observation = self.transport.mcp_observation();
+        let actual_mcp_extensions = mcp_observation
+            .as_ref()
+            .map(|observation| observation.actual_extensions.clone())
+            .unwrap_or_default();
+        let actual_mcp_runtime_ids = mcp_observation
+            .as_ref()
+            .map(|observation| observation.actual_runtime_ids.clone())
+            .unwrap_or_default();
+        let runtime_receipt = recovered_task_complete_runtime_receipt(
+            self.transport.runtime_receipt().cloned(),
+            &error_message,
+        );
+
+        Some(ExecutionResult {
+            agent_execution_id: req.agent_execution_id.unwrap_or_else(AgentExecutionId::new),
+            status: domain::agent::AgentStatus::Completed,
+            artifact_paths: Vec::new(),
+            discovered_artifacts: recovery.discovered_artifacts,
+            pre_prompt_expected_outputs: Vec::new(),
+            transcript_text: Some(recovery.text),
+            completion_text_capture: recovery.completion_text_capture,
+            cost_cents: None,
+            usage: None,
+            provider_session_id: Some(self.transport.session_id().to_string()),
+            reused_existing_session: false,
+            session_generation_id: None,
+            mcp_observation,
+            actual_mcp_extensions,
+            actual_mcp_runtime_ids,
+            mcp_session_startup_latency_ms: self.transport.mcp_session_startup_latency_ms(),
+            xcode_shim_warning_events: Vec::new(),
+            close_diagnostic: None,
+            provider_session_store_capture: None,
+            acp_pre_initialize_local_latency_ms: Some(
+                self.transport.acp_pre_initialize_local_latency_ms(),
+            ),
+            acp_initialize_latency_ms: Some(self.transport.acp_initialize_latency_ms()),
+            acp_session_new_latency_ms: Some(self.transport.acp_session_new_latency_ms()),
+            acp_prompt_duration_ms: None,
+            acp_pre_prompt_metadata_latency_ms: None,
+            acp_pre_prompt_metadata_timeout: false,
+            acp_pre_prompt_metadata_digest_bytes: 0,
+            legacy_broad_discovery_snapshot: None,
+            runtime_receipt,
+            runtime_tool_path_preflight_json: None,
+        })
     }
 }
 
@@ -583,6 +651,163 @@ fn provider_slug_for_capture(provider: &str) -> String {
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+#[derive(Clone, Debug)]
+struct CodexTaskCompleteRecovery {
+    text: String,
+    discovered_artifacts: Vec<crate::DiscoveredArtifact>,
+    completion_text_capture: crate::AcpCompletionTextCaptureMetadata,
+}
+
+fn recover_codex_task_complete_from_cleanup_paths(
+    cleanup_paths: &[CleanupPathSpec],
+    req: &ExecutionRequest,
+) -> Option<CodexTaskCompleteRecovery> {
+    cleanup_paths
+        .iter()
+        .filter(|spec| spec.policy == CleanupPathPolicy::StageCodexSessionStore)
+        .find_map(|spec| recover_codex_task_complete_from_runtime_home(&spec.path, req))
+}
+
+fn recover_codex_task_complete_from_runtime_home(
+    runtime_home: &Path,
+    req: &ExecutionRequest,
+) -> Option<CodexTaskCompleteRecovery> {
+    let text = latest_codex_task_complete_text(runtime_home)?;
+    let discovered_artifacts =
+        crate::transport::extract_output_envelopes(&text, &req.expected_outputs);
+    if discovered_artifacts.is_empty() {
+        return None;
+    }
+    let completion_text_capture = crate::transport::recovered_completion_text_capture_metadata(
+        &text,
+        AcpCompletionCaptureSource::ProviderSessionStoreTaskComplete,
+    );
+    Some(CodexTaskCompleteRecovery {
+        text,
+        discovered_artifacts,
+        completion_text_capture,
+    })
+}
+
+fn latest_codex_task_complete_text(runtime_home: &Path) -> Option<String> {
+    let mut latest = None;
+    for root_name in ["sessions", "archived_sessions"] {
+        let root = runtime_home.join(root_name);
+        if !root.exists() {
+            continue;
+        }
+        for file in jsonl_files_under(&root) {
+            latest = latest_codex_task_complete_text_in_file(&file).or(latest);
+        }
+    }
+    latest
+}
+
+fn jsonl_files_under(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(path) = stack.pop() {
+        visited += 1;
+        if visited > 20_000 {
+            warn!(
+                root = %root.display(),
+                "Codex task-complete recovery stopped after scan limit"
+            );
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file()
+                && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn latest_codex_task_complete_text_in_file(path: &Path) -> Option<String> {
+    const LINE_CAP_BYTES: usize = 16 * 1024 * 1024;
+    let file = fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut latest = None;
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        if line.len() > LINE_CAP_BYTES || !line.contains("CHAINWORKS_OUTPUT") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(text) = codex_session_line_agent_message(&value) {
+            latest = Some(text.to_string());
+        }
+    }
+    latest
+}
+
+fn codex_session_line_agent_message(value: &serde_json::Value) -> Option<&str> {
+    let payload = value.get("payload")?;
+    match (
+        value.get("type").and_then(serde_json::Value::as_str),
+        payload.get("type").and_then(serde_json::Value::as_str),
+    ) {
+        (Some("event_msg"), Some("task_complete")) => payload
+            .get("last_agent_message")
+            .and_then(serde_json::Value::as_str),
+        (Some("event_msg"), Some("agent_message")) => {
+            payload.get("message").and_then(serde_json::Value::as_str)
+        }
+        _ => None,
+    }
+}
+
+fn recovered_task_complete_runtime_receipt(
+    receipt: Option<AcpRuntimeReceipt>,
+    original_error: &str,
+) -> Option<AcpRuntimeReceipt> {
+    let mut receipt = receipt?;
+    let original_failure_phase = receipt.failure_phase.clone();
+    receipt.status = "completed".to_string();
+    receipt.failure_phase = None;
+    let at_ms = receipt
+        .last_events
+        .last()
+        .map(|event| event.at_ms.saturating_add(1))
+        .unwrap_or(0);
+    receipt
+        .handshake
+        .terminal_response_at_ms
+        .get_or_insert(at_ms);
+    receipt.last_events.push(AcpRuntimeReceiptEvent {
+        at_ms,
+        kind: "provider_session_store_task_complete_recovered".to_string(),
+        detail: Some(format!(
+            "original_failure_phase={}; original_error={}",
+            original_failure_phase.unwrap_or_else(|| "unknown".to_string()),
+            original_error
+        )),
+    });
+    receipt.counters.agent_message_chunk_count =
+        receipt.counters.agent_message_chunk_count.saturating_add(1);
+    receipt.counters.meaningful_progress_count =
+        receipt.counters.meaningful_progress_count.saturating_add(1);
+    Some(receipt)
 }
 
 fn claude_projects_root() -> PathBuf {
@@ -931,6 +1156,93 @@ mod tests {
 
         let capture = stage_codex_session_store(&runtime_home).unwrap();
         assert!(capture.is_none());
+    }
+
+    #[test]
+    fn codex_task_complete_recovery_extracts_last_agent_message_outputs() {
+        let temp = tempdir().unwrap();
+        let runtime_home = temp.path().join("runtime-home");
+        let output_path = runtime_home.join("audit/proposal-vs-implementation.json");
+        let output_path_string = output_path.to_string_lossy().into_owned();
+        let session_line = serde_json::json!({
+            "timestamp": "2026-05-31T08:30:25.238Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "turn-1",
+                "last_agent_message": serde_json::json!({
+                    "CHAINWORKS_OUTPUT": {
+                        output_path_string.as_str(): {
+                            "status": "needs_code_fixes",
+                            "matches_proposal": false,
+                            "missing_items": []
+                        }
+                    }
+                }).to_string()
+            }
+        });
+        write_file(
+            &runtime_home.join("sessions/2026/05/31/rollout-2026-05-31.jsonl"),
+            &format!("{session_line}\n"),
+        );
+        let req = ExecutionRequest {
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "state_9_implementation_reviewed".into(),
+            attempt_number: 1,
+            agent_execution_id: None,
+            agent_id: "proposal_implementation_auditor".into(),
+            provider: "codex".into(),
+            model: Some("gpt-5.5".into()),
+            effort: None,
+            workspace_root: temp.path().to_string_lossy().into_owned(),
+            prompt: "audit".into(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: vec![domain::discovery::ExpectedOutputSpec {
+                output_name: "audit_report".into(),
+                output_role: domain::discovery::ExpectedOutputRole::Machine,
+                target_path: output_path_string.clone(),
+                companion_of: None,
+                display_label: "Audit report".into(),
+                contract_id: Some("audit_report_v1".into()),
+                required: true,
+                reuse_policy: domain::discovery::OutputReusePolicy::MustProduce,
+                max_bytes: 128 * 1024,
+                aggregate_acceptance_cap_bytes: 256 * 1024,
+                authorized_roots: Vec::new(),
+                source_generation_owner: domain::discovery::SourceGenerationOwner::Agent,
+            }],
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: None,
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: None,
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
+        };
+
+        let recovery = recover_codex_task_complete_from_runtime_home(&runtime_home, &req)
+            .expect("Codex task_complete recovery expected");
+
+        assert_eq!(recovery.discovered_artifacts.len(), 1);
+        assert_eq!(recovery.discovered_artifacts[0].name, output_path_string);
+        assert_eq!(
+            recovery.completion_text_capture.capture_source,
+            Some(AcpCompletionCaptureSource::ProviderSessionStoreTaskComplete)
+        );
+        assert!(recovery.text.contains("\"CHAINWORKS_OUTPUT\""));
     }
 
     #[test]

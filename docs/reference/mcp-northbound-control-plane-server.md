@@ -324,7 +324,7 @@ Both checks are required, so a future change that wants to narrow a specific pri
 | `ideas.list` | yes | yes | yes |
 | `runs.start` | yes | no | no | (SEC-001: caller-supplied filesystem paths — Operator-only.) |
 | `runs.list` | yes | yes | yes | (SEC-003: local filesystem path fields — `workspace_root`, `artifact_root`, `chainworks_meta_root` — are redacted from each projection row for non-Operator callers.) |
-| `runs.get` | yes | yes | yes | (P058 Phase 1: operator-only snapshot fields (`workflow_snapshot_json`, `catalog_snapshot_json`, `delivery_*_json`, `drift_details_json`, and local filesystem paths) are stripped for non-Operator callers, and `escalation_readback` collapses to the summary projection (`chains_redacted: true`); see [escalation-policies.md](escalation-policies.md).) |
+| `runs.get` | yes | yes | yes | (Escalation readback: operator-only snapshot fields (`workflow_snapshot_json`, `catalog_snapshot_json`, `delivery_*_json`, `drift_details_json`, and local filesystem paths) are stripped for non-Operator callers, and `escalation_readback` collapses to the summary projection (`chains_redacted: true`); see [escalation-policies.md](escalation-policies.md).) |
 | `runs.cancel` | yes | no | no |
 | `approvals.list` | yes | no | yes | (Mixed inbox: stage approvals + lead mediation confirmations) |
 | `approvals.resolve` | yes | no | no | (Resolves stage approvals or lead mediation confirmations) |
