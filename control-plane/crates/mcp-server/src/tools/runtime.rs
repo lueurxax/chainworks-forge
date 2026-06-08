@@ -1,6 +1,11 @@
 use anyhow::{anyhow, Result};
 use auth::boundary::{BoundaryPolicy, PolicyMode};
 use chrono::Utc;
+use domain::tool_policy::{
+    DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES, DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+    DEFAULT_TOOL_OUTPUT_MAX_LINES, GENERATED_ROOT_DENYLIST, TOOL_GUARD_VERSION,
+    TOOL_POLICY_VERSION,
+};
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::sync::{Mutex, OnceLock};
@@ -243,6 +248,15 @@ pub async fn execute(
         "hotReadGuard": {
             "status": "available",
             "trackedSurfaces": hot_read_circuit_rows
+        },
+        "toolOutputGuard": {
+            "status": "available",
+            "policyVersion": TOOL_POLICY_VERSION,
+            "guardVersion": TOOL_GUARD_VERSION,
+            "generatedRootDenylist": GENERATED_ROOT_DENYLIST,
+            "maxOutputBytes": DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+            "maxOutputLines": DEFAULT_TOOL_OUTPUT_MAX_LINES,
+            "maxCumulativeOutputBytes": DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES
         }
     }))
 }

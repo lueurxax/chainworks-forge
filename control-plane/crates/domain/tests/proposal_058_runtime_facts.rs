@@ -24,6 +24,10 @@ fn proposal_058_failure_and_settlement_enums_round_trip_snake_case() {
             AgentFailureKind::ProviderInternalError,
             "provider_internal_error",
         ),
+        (
+            AgentFailureKind::ToolOutputBudgetExceeded,
+            "tool_output_budget_exceeded",
+        ),
         (AgentFailureKind::TransportEpipe, "transport_epipe"),
         (
             AgentFailureKind::TransportProtocolError,

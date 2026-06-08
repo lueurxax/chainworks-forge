@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use domain::tool_policy::{
+    DEFAULT_TOOL_OUTPUT_MAX_BYTES, DEFAULT_TOOL_OUTPUT_MAX_LINES, GENERATED_ROOT_DENYLIST,
+    TOOL_GUARD_VERSION, TOOL_POLICY_VERSION,
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -167,8 +171,147 @@ fn prepare_runtime_home(workspace_root: &str) -> Result<PathBuf> {
     for subdir in &["bin", "tmp", ".cache/clang/ModuleCache"] {
         std::fs::create_dir_all(runtime_home.join(subdir)).ok();
     }
+    install_safe_search_wrappers(&runtime_home)?;
 
     Ok(runtime_home)
+}
+
+fn install_safe_search_wrappers(runtime_home: &Path) -> Result<()> {
+    let bin = runtime_home.join("bin");
+    std::fs::create_dir_all(&bin).with_context(|| format!("create bin dir: {}", bin.display()))?;
+    for tool in ["rg", "find"] {
+        let wrapper_path = bin.join(tool);
+        std::fs::write(&wrapper_path, safe_search_wrapper_script(tool)).with_context(|| {
+            format!(
+                "write safe search wrapper for {tool}: {}",
+                wrapper_path.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&wrapper_path)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&wrapper_path, permissions)?;
+        }
+    }
+    Ok(())
+}
+
+fn safe_search_wrapper_script(tool: &str) -> String {
+    let denylist = GENERATED_ROOT_DENYLIST.join(", ").replace('"', "\\\"");
+    format!(
+        r#"#!/bin/bash
+set -o pipefail
+TOOL="{tool}"
+POLICY_VERSION="{policy_version}"
+GUARD_VERSION="{guard_version}"
+MAX_LINES={max_lines}
+MAX_BYTES={max_bytes}
+DENYLIST="{denylist}"
+
+error_text() {{
+  cat >&2 <<EOF
+tool_output_budget_preflight_denied:
+Broad repository search must use bounded search and exclude generated/build roots.
+Use a narrower query or the safe search tool.
+Excluded roots include control-plane/target/**, **/target/**, **/.build/**, DerivedData, node_modules.
+policy_version=${{POLICY_VERSION}} guard_version=${{GUARD_VERSION}}
+EOF
+}}
+
+find_real_tool() {{
+  local self_dir candidate IFS=:
+  self_dir="$(cd "$(dirname "$0")" && pwd)"
+  for dir in $PATH; do
+    [ -z "$dir" ] && dir="."
+    candidate="$dir/$TOOL"
+    if [ -x "$candidate" ] && [ "$(cd "$dir" 2>/dev/null && pwd)" != "$self_dir" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}}
+
+has_generated_exclude() {{
+  local joined=" $* "
+  case "$joined" in
+    *--glob*|*" -g "*|*"-g!"*|*" -path "*|*" -prune "*|*--exclude*) ;;
+    *) return 1 ;;
+  esac
+  case "$joined" in
+    *control-plane/target*|*target/***|*/target*|*.build*|*DerivedData*|*deriveddata*|*node_modules*|*.git*|*.swiftpm*|*.forge-codex-acp*|*.junie*|*.claude*|*.codex*|*.xcresult*|*.dSYM*|*.dsym*|*build/***|*dist/***) return 0 ;;
+    *) return 1 ;;
+  esac
+}}
+
+is_repo_root_cwd() {{
+  [ -d .git ] || [ -d control-plane ] || [ -f "Chainworks Forge.xcodeproj/project.pbxproj" ]
+}}
+
+rg_is_broad() {{
+  local saw_pattern=0 skip_next=0 root_count=0 top_count=0 arg root
+  for arg in "$@"; do
+    case "$arg" in --files|--type-list) saw_pattern=1 ;; esac
+  done
+  for arg in "$@"; do
+    if [ "$skip_next" -eq 1 ]; then skip_next=0; continue; fi
+    case "$arg" in
+      -g|--glob|--iglob|--type|-t|--type-not|-T|-e|--regexp|-f|--file|--sort|--max-count|-m|--max-filesize) skip_next=1; continue ;;
+      --glob=*|--iglob=*|--type=*|--type-not=*|--regexp=*|--file=*|--max-count=*|--max-filesize=*) continue ;;
+      -*) continue ;;
+    esac
+    if [ "$saw_pattern" -eq 0 ]; then saw_pattern=1; continue; fi
+    root="${{arg#./}}"; root="${{root%/}}"
+    root_count=$((root_count + 1))
+    case "$root" in
+      ""|.|'$PWD'|'${{PWD}}') return 0 ;;
+      control-plane|docs|scripts|examples|"Chainworks Forge"|"Chainworks ForgeTests"|"Chainworks ForgeUITests") top_count=$((top_count + 1)) ;;
+    esac
+  done
+  [ "$root_count" -eq 0 ] && is_repo_root_cwd && return 0
+  [ "$top_count" -ge 2 ] && return 0
+  return 1
+}}
+
+find_is_broad() {{
+  local root_count=0 arg root
+  for arg in "$@"; do
+    case "$arg" in
+      --) continue ;;
+      -*|'('|')'|'!') break ;;
+    esac
+    root="${{arg#./}}"; root="${{root%/}}"
+    root_count=$((root_count + 1))
+    case "$root" in
+      ""|.|'$PWD'|'${{PWD}}'|control-plane) return 0 ;;
+    esac
+  done
+  [ "$root_count" -eq 0 ] && is_repo_root_cwd && return 0
+  return 1
+}}
+
+if ! has_generated_exclude "$@"; then
+  if [ "$TOOL" = "rg" ] && rg_is_broad "$@"; then error_text; exit 96; fi
+  if [ "$TOOL" = "find" ] && find_is_broad "$@"; then error_text; exit 96; fi
+fi
+
+REAL_TOOL="$(find_real_tool)" || {{ echo "tool_output_budget_preflight_denied: unable to locate real $TOOL outside Chainworks wrapper" >&2; exit 96; }}
+
+"$REAL_TOOL" "$@" 2>&1 \
+  | awk -v max="$MAX_LINES" 'NR <= max {{ print; next }} NR == max + 1 {{ print "tool_output_budget_exceeded: output truncated by Chainworks safe-search guard" }}' \
+  | head -c "$MAX_BYTES"
+status=${{PIPESTATUS[0]}}
+exit "$status"
+"#,
+        tool = tool,
+        policy_version = TOOL_POLICY_VERSION,
+        guard_version = TOOL_GUARD_VERSION,
+        max_lines = DEFAULT_TOOL_OUTPUT_MAX_LINES,
+        max_bytes = DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+        denylist = denylist
+    )
 }
 
 /// Sanitize config.toml for the isolated runtime.
@@ -428,6 +571,43 @@ multi_agent = true
         assert!(!sanitized.contains("model_migrations"));
         assert!(sanitized.contains("[notice]"));
         assert!(sanitized.contains("hide_full_access_warning"));
+    }
+
+    #[test]
+    fn runtime_home_installs_safe_search_wrappers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_home = tmp.path().join(".forge-codex-acp").join("session-guard");
+        std::fs::create_dir_all(&runtime_home).unwrap();
+
+        install_safe_search_wrappers(&runtime_home).unwrap();
+
+        for tool in ["rg", "find"] {
+            let wrapper = runtime_home.join("bin").join(tool);
+            let script = std::fs::read_to_string(&wrapper).unwrap();
+            assert!(script.contains("tool_output_budget_preflight_denied"));
+            assert!(script.contains(TOOL_POLICY_VERSION));
+            assert!(script.contains(TOOL_GUARD_VERSION));
+            assert!(script.contains("control-plane/target/**"));
+            assert!(script.contains("head -c"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&wrapper).unwrap().permissions().mode() & 0o111,
+                    0o111
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn safe_search_wrapper_script_denies_broad_root_searches() {
+        let script = safe_search_wrapper_script("rg");
+
+        assert!(script.contains("rg_is_broad"));
+        assert!(script.contains("find_is_broad"));
+        assert!(script.contains("MAX_LINES"));
+        assert!(script.contains("MAX_BYTES"));
     }
 
     #[test]

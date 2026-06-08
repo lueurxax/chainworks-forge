@@ -128,6 +128,26 @@ pub async fn ensure_policy(
                 .await;
             }
 
+            if active_generation_has_tool_output_budget_failure(pool, &active_generation.id).await?
+            {
+                invalidate_generation(
+                    pool,
+                    &lineage,
+                    &active_generation,
+                    TOOL_OUTPUT_BUDGET_EXCEEDED_REASON,
+                )
+                .await?;
+                return create_generation(
+                    pool,
+                    lineage,
+                    input,
+                    SessionReuseDisposition::FreshAfterInvalidation,
+                    Some(TOOL_OUTPUT_BUDGET_EXCEEDED_REASON.to_string()),
+                    None,
+                )
+                .await;
+            }
+
             let scope = lineage.session_reuse_scope.as_str();
             if scope == "none" {
                 invalidate_generation(
@@ -400,6 +420,27 @@ pub async fn ensure_policy_tx(
                 .await;
             }
 
+            if active_generation_has_tool_output_budget_failure_tx(tx, &active_generation.id)
+                .await?
+            {
+                invalidate_generation_tx(
+                    tx,
+                    &lineage,
+                    &active_generation,
+                    TOOL_OUTPUT_BUDGET_EXCEEDED_REASON,
+                )
+                .await?;
+                return create_generation_tx(
+                    tx,
+                    lineage,
+                    input,
+                    SessionReuseDisposition::FreshAfterInvalidation,
+                    Some(TOOL_OUTPUT_BUDGET_EXCEEDED_REASON.to_string()),
+                    None,
+                )
+                .await;
+            }
+
             let scope = lineage.session_reuse_scope.as_str();
             if scope == "none" {
                 invalidate_generation_tx(
@@ -581,6 +622,7 @@ pub async fn ensure_policy_tx(
 
 const PREVIOUS_MISSING_REQUIRED_OUTPUTS_REASON: &str = "previous_missing_required_outputs";
 const CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON: &str = "claude_long_context_credits_required";
+const TOOL_OUTPUT_BUDGET_EXCEEDED_REASON: &str = "tool_output_budget_exceeded";
 
 pub async fn invalidate_generation_after_missing_required_outputs(
     pool: &SqlitePool,
@@ -647,8 +689,15 @@ pub async fn invalidate_generation_after_missing_required_outputs_tx(
 fn runtime_facts_require_session_invalidation(facts: &AgentExecutionRuntimeFacts) -> bool {
     matches!(
         &facts.failure_kind,
-        Some(AgentFailureKind::MissingRequiredOutputs)
+        Some(AgentFailureKind::MissingRequiredOutputs | AgentFailureKind::ToolOutputBudgetExceeded)
     ) || facts.output_settlement == AgentOutputSettlement::MissingRequiredOutputs
+        || facts
+            .supervision_classification
+            .as_deref()
+            .is_some_and(|classification| {
+                classification.contains("tool_output_budget_exceeded")
+                    || classification.contains("codex_unbounded_tool_output")
+            })
 }
 
 async fn active_generation_has_missing_required_outputs_failure(
@@ -688,6 +737,62 @@ async fn active_generation_has_missing_required_outputs_failure_tx(
              AND (
                facts.failure_kind = 'missing_required_outputs'
                OR facts.output_settlement = 'missing_required_outputs'
+             )
+           LIMIT 1"#,
+    )
+    .bind(generation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.is_some())
+}
+
+async fn active_generation_has_tool_output_budget_failure(
+    pool: &SqlitePool,
+    generation_id: &str,
+) -> Result<bool> {
+    let row = sqlx::query(
+        r#"SELECT 1
+           FROM agent_executions ae
+           INNER JOIN agent_execution_runtime_facts facts
+             ON facts.agent_execution_id = ae.id
+           WHERE ae.session_generation_id = ?1
+             AND ae.status = 'failed'
+             AND (
+               facts.failure_kind = 'tool_output_budget_exceeded'
+               OR COALESCE(facts.supervision_classification, '') LIKE '%tool_output_budget_exceeded%'
+               OR COALESCE(facts.supervision_classification, '') LIKE '%codex_unbounded_tool_output%'
+               OR COALESCE(facts.failure_kind_raw_debug, '') LIKE '%tool_output_budget_exceeded%'
+               OR COALESCE(facts.failure_kind_raw_debug, '') LIKE '%codex_unbounded_tool_output%'
+               OR COALESCE(facts.failure_message_redacted, '') LIKE '%tool_output_budget_exceeded%'
+               OR COALESCE(facts.failure_message_redacted, '') LIKE '%codex_unbounded_tool_output%'
+             )
+           LIMIT 1"#,
+    )
+    .bind(generation_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+async fn active_generation_has_tool_output_budget_failure_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    generation_id: &str,
+) -> Result<bool> {
+    let row = sqlx::query(
+        r#"SELECT 1
+           FROM agent_executions ae
+           INNER JOIN agent_execution_runtime_facts facts
+             ON facts.agent_execution_id = ae.id
+           WHERE ae.session_generation_id = ?1
+             AND ae.status = 'failed'
+             AND (
+               facts.failure_kind = 'tool_output_budget_exceeded'
+               OR COALESCE(facts.supervision_classification, '') LIKE '%tool_output_budget_exceeded%'
+               OR COALESCE(facts.supervision_classification, '') LIKE '%codex_unbounded_tool_output%'
+               OR COALESCE(facts.failure_kind_raw_debug, '') LIKE '%tool_output_budget_exceeded%'
+               OR COALESCE(facts.failure_kind_raw_debug, '') LIKE '%codex_unbounded_tool_output%'
+               OR COALESCE(facts.failure_message_redacted, '') LIKE '%tool_output_budget_exceeded%'
+               OR COALESCE(facts.failure_message_redacted, '') LIKE '%codex_unbounded_tool_output%'
              )
            LIMIT 1"#,
     )
@@ -1078,7 +1183,8 @@ mod tests {
     };
 
     use super::{
-        ensure_policy, invalidate_generation_after_missing_required_outputs, SessionPolicyInput,
+        ensure_policy, invalidate_generation_after_missing_required_outputs,
+        runtime_facts_require_session_invalidation, SessionPolicyInput,
     };
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -1535,6 +1641,21 @@ mod tests {
         );
         assert_eq!(decision.generation.generation, 2);
         assert!(!decision.should_reuse_live_session);
+    }
+
+    #[test]
+    fn tool_output_budget_failure_requires_session_invalidation() {
+        let now = chrono::Utc::now();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(AgentExecutionId::new(), now);
+
+        assert!(!runtime_facts_require_session_invalidation(&facts));
+
+        facts.failure_kind = Some(AgentFailureKind::ToolOutputBudgetExceeded);
+        assert!(runtime_facts_require_session_invalidation(&facts));
+
+        facts.failure_kind = None;
+        facts.supervision_classification = Some("codex_unbounded_tool_output".into());
+        assert!(runtime_facts_require_session_invalidation(&facts));
     }
 
     #[tokio::test]
