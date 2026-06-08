@@ -2112,6 +2112,8 @@ agents:
 
       Be exact and evidence-based.
 
+      Keep discovery bounded: inspect changed files, proposal-relevant paths, and test evidence first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.
+
       Output only the audit contract and set status to implemented only when the implementation truly matches the approved proposal."
   - id: security_checker
     title: Security Checker
@@ -2199,6 +2201,8 @@ agents:
       Focus on correctness, readability, maintainability, surprising side effects, regression risk, and missing tests.
 
       Do not propose gold-plating; prioritize issues that would make the release unsafe or expensive to maintain.
+
+      Keep discovery bounded: inspect changed files and implicated paths first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.
 
       Output only the structured pre-push review contract."
   - id: build_archive_and_push_connect
@@ -2312,6 +2316,8 @@ agents:
       Challenge the current explanation and test whether the evidence really supports it.
 
       Be adversarial toward weak reasoning, not toward people.
+
+      Keep discovery bounded: inspect implicated run dossiers and cited files first; do not run broad rg/find over repo or worktree roots unless generated/build roots are excluded and output is capped.
 
       Keep criticism concrete and evidence-linked."
   - id: agent_retrospective_interviewer

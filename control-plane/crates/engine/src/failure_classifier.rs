@@ -12,6 +12,7 @@ pub enum RuntimeFailureObservation {
         supervision_classification: Option<String>,
     },
     ProviderToolSessionControlFailure,
+    ToolOutputBudgetExceeded,
     ProviderInternalError,
     TransportEpipe,
     TransportProtocolError,
@@ -75,6 +76,13 @@ pub fn classify_observation(
             retry_after: None,
             transport_error_code: Some("CODEX_TOOL_SESSION_CONTROL_FAILURE".into()),
             supervision_classification: Some("codex_tool_session_control_failure".into()),
+        },
+        ToolOutputBudgetExceeded => RuntimeFailureClassification {
+            failure_kind: AgentFailureKind::ToolOutputBudgetExceeded,
+            operator_action_hint: OperatorActionHint::InspectLogs,
+            retry_after: None,
+            transport_error_code: Some("TOOL_OUTPUT_BUDGET_EXCEEDED".into()),
+            supervision_classification: Some("tool_output_budget_exceeded".into()),
         },
         ProviderInternalError => RuntimeFailureClassification {
             failure_kind: AgentFailureKind::ProviderInternalError,
@@ -188,9 +196,14 @@ pub fn observation_from_acp_error_message(message: &str) -> RuntimeFailureObserv
             supervision_classification: Some("provider_stream_silent_no_local_activity".into()),
         };
     }
+    if lower.contains("tool_output_budget_exceeded")
+        || lower.contains("tool_output_budget_preflight_denied")
+        || lower.contains("codex_unbounded_tool_output")
+    {
+        return RuntimeFailureObservation::ToolOutputBudgetExceeded;
+    }
     if lower.contains("codex_tool_session_control_failure")
         || lower.contains("codex_tool_stdin_closed")
-        || lower.contains("codex_unbounded_tool_output")
         || lower.contains("codex_turn_aborted_after_open_process")
     {
         return RuntimeFailureObservation::ProviderToolSessionControlFailure;
@@ -638,6 +651,30 @@ mod tests {
             ),
             RuntimeFailureObservation::McpPermissionModalStall
         );
+    }
+
+    #[test]
+    fn bounded_tool_output_classifies_before_provider_internal_fallback() {
+        for message in [
+            "tool_output_budget_preflight_denied: Broad repository search must use bounded search",
+            "Codex tool/session control failure: tool_output_budget_exceeded",
+            "Codex tool/session control failure: codex_unbounded_tool_output",
+        ] {
+            let observation = observation_from_acp_error_message(message);
+            assert_eq!(
+                observation,
+                RuntimeFailureObservation::ToolOutputBudgetExceeded
+            );
+            let classification = classify_observation(observation);
+            assert_eq!(
+                classification.failure_kind,
+                AgentFailureKind::ToolOutputBudgetExceeded
+            );
+            assert_eq!(
+                classification.supervision_classification.as_deref(),
+                Some("tool_output_budget_exceeded")
+            );
+        }
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub mod session;
 pub mod side_effect;
 pub mod stage;
 pub mod steward;
+pub mod tool_policy;
 pub mod toolchain;
 pub mod toolchain_diagnostics;
 pub mod validation;
