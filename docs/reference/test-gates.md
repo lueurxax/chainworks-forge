@@ -1468,9 +1468,9 @@ Important:
 
 ### `proposal-058|p058`
 
-Regression gate for ACP provider failure classification, session artifact ownership, and P058 configurable escalation chain proof.
+Regression gate for ACP provider failure classification, session artifact ownership, and configurable escalation-chain proof.
 
-The original ACP-classification proposal has been implemented and retired; the gate name remains `proposal-058` because Rust test targets and the historical proof lane use that identifier. This gate also covers the P058 configurable escalation chains schema, readback, metrics inventory, and owned tier-selection behavior.
+The original ACP-classification proposal and the configurable escalation-chain proposal have been implemented and retired; the gate name remains `proposal-058|p058` because Swift/Rust test targets, migration symbols, and historical proof lanes use that identifier. This gate covers the implemented escalation policy schema, readback, metrics inventory, macOS read surface, and owned tier-selection behavior documented in [escalation-policies.md](escalation-policies.md).
 
 Scope:
 
@@ -1493,7 +1493,7 @@ Scope:
 - tier selection writes (`agent_execution_runtime_facts.would_select_*`) populated from the frozen `RunPlan` policy at agent-execution completion (`engine/src/shadow_escalation.rs`)
 - durable scheduler readback fields derived from redacted `escalation_events` (`waiting_retry_after_until`, `escalation_trace_json_redacted`, `external_acknowledgement_ref`, `feature_flag_state`, and per-attempt `digest_inputs`)
 - governed macOS read-surface components compile and are covered by focused Swift tests (`EscalationStatusCapsule`, `EscalationBannerStack`, `EscalationLineageView`, `EscalationPauseCard`, `EscalationTraceTimeline`, `DriftReviewSheet`, MenuBarExtra overflow routing, retained shared adapters, command disabled-state parity, actual drift sheet tier/trigger/max-attempt inputs, compact banner co-occurrence summarization, non-collapsed lineage disclosures, pause-card ultra-narrow fallback, SF Symbol availability, drift diff presentation, and read-only trace pasteboard copy)
-- full P058 metric inventory declaration plus production emission from ledger/event writes for the metrics backed by durable escalation state
+- full escalation metric inventory declaration plus production emission from ledger/event writes for the metrics backed by durable escalation state
 - idempotency-key uniqueness enforced by migration `078_p058_escalation_idempotency.sql` (one chain per `run_id`/`stage_id`/`agent_id`/`policy_id`; one execution-metadata row per `ledger_id`/`tier_id`/`tier_attempt_index`)
 
 Use when:
@@ -1510,7 +1510,7 @@ Host policy:
 
 - local Rust and macOS Swift test toolchains required
 - no live provider account, simulator, daemon process, UI target, network, or real quota exhaustion required
-- remote visual/runtime, Full Keyboard Access, contrast/reduced-motion, and live operational drill evidence is owned by P096, not this implementation gate
+- remote visual/runtime, Full Keyboard Access, contrast/reduced-motion, and live operational drill evidence is owned by [P096](../proposals/096-p058-release-evidence-and-macos-runtime-proof.md), not this implementation gate
 
 Command:
 

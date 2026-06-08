@@ -131,6 +131,16 @@ impl WorkQueue {
         Ok(requeued)
     }
 
+    pub async fn requeue_running_advance_item(&self, id: &str, reason: &str) -> Result<bool> {
+        let requeued =
+            work_items::requeue_running_advance_work_item_by_id(&self.pool, id, Utc::now(), reason)
+                .await?;
+        if requeued > 0 {
+            self.refresh_scheduler_projection().await?;
+        }
+        Ok(requeued > 0)
+    }
+
     pub async fn refresh_scheduler_projection(&self) -> Result<()> {
         self.refresh_scheduler_projection_with_capacity(&self.capacity_config)
             .await

@@ -772,6 +772,13 @@ pub trait AcpAdapter: Send + Sync {
         true
     }
 
+    /// Whether this adapter can start a fresh ACP subprocess attached to a
+    /// recorded provider-native session id and prove the requested session
+    /// before a prompt is sent. Default is fail-closed.
+    fn supports_provider_session_resurrection(&self) -> bool {
+        false
+    }
+
     fn capability_probe_timeout(&self) -> Duration {
         crate::transport::handshake_timeout_for_provider(self.provider_name())
     }

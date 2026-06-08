@@ -896,7 +896,9 @@ mod tests {
             get_p058_metric_sample_count("provider_session_kill_latency_seconds")
                 > kill_latency_samples_before
         );
-        assert!(get_counter("escalation_pause_total:provider_session_force_detached") > pause_before);
+        assert!(
+            get_counter("escalation_pause_total:provider_session_force_detached") > pause_before
+        );
         assert!(
             get_counter("chain_exhausted_total_by_terminal_tier_kind:same_backend_retry")
                 > exhausted_before

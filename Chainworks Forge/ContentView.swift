@@ -361,6 +361,7 @@ struct ContentView: View {
 
 private struct P036MainShell<Content: View>: View {
     @Binding var selectedTab: ContentView.Tab
+    @AppStorage("p036.mainNavigationCollapsed") private var isNavigationCollapsed = false
 
     let pendingApprovals: Int
     let blockedRuns: Int
@@ -375,6 +376,8 @@ private struct P036MainShell<Content: View>: View {
                     pendingApprovals: pendingApprovals,
                     blockedRuns: blockedRuns,
                     runningRuns: runningRuns,
+                    isCollapsed: isNavigationCollapsed,
+                    onToggleCollapsed: { isNavigationCollapsed.toggle() },
                     onSelect: selectTab
                 )
                 Divider()
@@ -1015,57 +1018,36 @@ private struct P036ShellSidebar: View {
     let pendingApprovals: Int
     let blockedRuns: Int
     let runningRuns: Int
+    let isCollapsed: Bool
+    let onToggleCollapsed: () -> Void
     let onSelect: (ContentView.Tab) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 10) {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(ForgeColor.Brand.accent)
-                        .frame(width: 28, height: 28)
-                        .overlay {
-                            Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundStyle(.white)
-                        }
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("Chainworks Forge")
-                            .font(.headline)
-                        Text("Run control plane")
-                            .font(ForgeTypography.micro)
-                            .foregroundStyle(ForgeColor.Text.secondary)
-                    }
-                }
-                if pendingApprovals > 0 || blockedRuns > 0 || runningRuns > 0 {
-                    HStack(spacing: 6) {
-                        if pendingApprovals > 0 {
-                            sidebarCount("Approvals", pendingApprovals, ForgeStatusColor.approval)
-                        }
-                        if blockedRuns > 0 {
-                            sidebarCount("Blocked", blockedRuns, ForgeStatusColor.error)
-                        }
-                        if runningRuns > 0 {
-                            sidebarCount("Running", runningRuns, ForgeStatusColor.running)
-                        }
-                    }
-                }
+        VStack(alignment: isCollapsed ? .center : .leading, spacing: isCollapsed ? 14 : 18) {
+            if isCollapsed {
+                compactHeader
+            } else {
+                expandedHeader
             }
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Workspace")
-                    .font(ForgeTypography.micro.weight(.semibold))
-                    .foregroundStyle(ForgeColor.Text.tertiary)
-                    .textCase(.uppercase)
+            VStack(alignment: isCollapsed ? .center : .leading, spacing: 8) {
+                if !isCollapsed {
+                    Text("Workspace")
+                        .font(ForgeTypography.micro.weight(.semibold))
+                        .foregroundStyle(ForgeColor.Text.tertiary)
+                        .textCase(.uppercase)
+                }
                 sidebarButton(.runs, icon: "square.stack.3d.up", count: pendingApprovals)
                 sidebarButton(.ideas, icon: "lightbulb")
             }
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Catalog")
-                    .font(ForgeTypography.micro.weight(.semibold))
-                    .foregroundStyle(ForgeColor.Text.tertiary)
-                    .textCase(.uppercase)
+            VStack(alignment: isCollapsed ? .center : .leading, spacing: 8) {
+                if !isCollapsed {
+                    Text("Catalog")
+                        .font(ForgeTypography.micro.weight(.semibold))
+                        .foregroundStyle(ForgeColor.Text.tertiary)
+                        .textCase(.uppercase)
+                }
                 sidebarButton(.definitions, icon: "square.grid.2x2")
                 sidebarButton(.settings, icon: "slider.horizontal.3")
             }
@@ -1073,9 +1055,77 @@ private struct P036ShellSidebar: View {
             Spacer()
         }
         .padding(14)
-        .frame(minWidth: 230, idealWidth: 230, maxWidth: 230, maxHeight: .infinity, alignment: .topLeading)
+        .frame(
+            minWidth: isCollapsed ? 64 : 230,
+            idealWidth: isCollapsed ? 64 : 230,
+            maxWidth: isCollapsed ? 64 : 230,
+            maxHeight: .infinity,
+            alignment: isCollapsed ? .top : .topLeading
+        )
         .background(ForgeColor.Surface.elevated)
         .accessibilityIdentifier("p036-branded-sidebar")
+    }
+
+    private var expandedHeader: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                appIcon
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Chainworks Forge")
+                        .font(.headline)
+                    Text("Run control plane")
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                }
+                Spacer()
+                collapseButton
+            }
+            if pendingApprovals > 0 || blockedRuns > 0 || runningRuns > 0 {
+                HStack(spacing: 6) {
+                    if pendingApprovals > 0 {
+                        sidebarCount("Approvals", pendingApprovals, ForgeStatusColor.approval)
+                    }
+                    if blockedRuns > 0 {
+                        sidebarCount("Blocked", blockedRuns, ForgeStatusColor.error)
+                    }
+                    if runningRuns > 0 {
+                        sidebarCount("Running", runningRuns, ForgeStatusColor.running)
+                    }
+                }
+            }
+        }
+    }
+
+    private var compactHeader: some View {
+        VStack(spacing: 10) {
+            appIcon
+            collapseButton
+        }
+    }
+
+    private var appIcon: some View {
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(ForgeColor.Brand.accent)
+            .frame(width: 28, height: 28)
+            .overlay {
+                Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+    }
+
+    private var collapseButton: some View {
+        Button(action: onToggleCollapsed) {
+            Image(systemName: isCollapsed ? "sidebar.left" : "sidebar.leading")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 28, height: 28)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(ForgeColor.Text.secondary)
+        .background(ForgeColor.Surface.muted, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .help(isCollapsed ? "Expand navigation" : "Collapse navigation")
+        .accessibilityLabel(isCollapsed ? "Expand navigation" : "Collapse navigation")
+        .accessibilityIdentifier("p036-main-navigation-collapse-button")
     }
 
     @ViewBuilder
@@ -1083,24 +1133,38 @@ private struct P036ShellSidebar: View {
         Button {
             onSelect(tab)
         } label: {
-            HStack(spacing: 9) {
+            HStack(spacing: isCollapsed ? 0 : 9) {
                 Image(systemName: icon)
                     .frame(width: 16)
-                Text(tab.rawValue)
-                    .font(.subheadline.weight(selectedTab == tab ? .semibold : .regular))
-                Spacer()
-                if count > 0 {
-                    Text("\(count)")
-                        .font(ForgeTypography.micro.weight(.semibold))
-                        .foregroundStyle(ForgeStatusColor.approval)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(ForgeStatusColor.approval.opacity(0.16), in: Capsule())
+                    .overlay(alignment: .topTrailing) {
+                        if isCollapsed && count > 0 {
+                            Text("\(count)")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(ForgeStatusColor.approval)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(ForgeColor.Surface.elevated, in: Capsule())
+                                .offset(x: 10, y: -8)
+                        }
+                    }
+                if !isCollapsed {
+                    Text(tab.rawValue)
+                        .font(.subheadline.weight(selectedTab == tab ? .semibold : .regular))
+                    Spacer()
+                    if count > 0 {
+                        Text("\(count)")
+                            .font(ForgeTypography.micro.weight(.semibold))
+                            .foregroundStyle(ForgeStatusColor.approval)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(ForgeStatusColor.approval.opacity(0.16), in: Capsule())
+                    }
                 }
             }
             .foregroundStyle(selectedTab == tab ? ForgeColor.Text.primary : ForgeColor.Text.secondary)
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
+            .frame(width: isCollapsed ? 38 : nil, height: isCollapsed ? 38 : nil)
             .background(
                 selectedTab == tab ? ForgeColor.Brand.accentMuted : Color.clear,
                 in: RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -1111,6 +1175,8 @@ private struct P036ShellSidebar: View {
             }
         }
         .buttonStyle(.plain)
+        .help(tab.rawValue)
+        .accessibilityLabel(tab.rawValue)
         .accessibilityIdentifier("p036-sidebar-\(tab.rawValue.lowercased())")
     }
 

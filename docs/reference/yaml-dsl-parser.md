@@ -180,7 +180,7 @@ Defines which agents execute within a state:
 - `task: String` — task description
 - `inputs: [String]?` — input artifact references
 - `outputs: [String]?` — output artifact references
-- `output_policies: [String: OutputPolicyDefinition]?` — per-output settlement and reuse policies (P057/P058)
+- `output_policies: [String: OutputPolicyDefinition]?` — per-output settlement and reuse policies
 
 #### `OutputPolicyDefinition`
 

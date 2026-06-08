@@ -2748,6 +2748,8 @@ struct P031RunStageTopologyReadModel: Decodable, Equatable, Sendable {
   let isCurrent: Bool
   let iteration: Int?
   let attemptNumber: Int?
+  let startedAt: String?
+  let completedAt: String?
   let approvalRequired: Bool
   let artifactCount: Int
   let communicationCount: Int
@@ -2764,6 +2766,8 @@ struct P031RunStageTopologyReadModel: Decodable, Equatable, Sendable {
     case isCurrent
     case iteration
     case attemptNumber
+    case startedAt
+    case completedAt
     case approvalRequired
     case artifactCount
     case communicationCount
@@ -3244,6 +3248,8 @@ enum P031GraphQLDocuments {
         isCurrent
         iteration
         attemptNumber
+        startedAt
+        completedAt
         approvalRequired
         artifactCount
         communicationCount
@@ -5670,6 +5676,9 @@ struct P031StageTopologyPresentation: Equatable, Sendable {
   let isCurrent: Bool
   let iterationText: String?
   let attemptText: String?
+  let startedLabel: String?
+  let completedLabel: String?
+  let durationLabel: String?
   let approvalRequired: Bool
   let artifactCount: Int
   let communicationCount: Int
@@ -7126,6 +7135,17 @@ enum P031StageTopologyPresenter {
   ) -> P031StageTopologyPresentation {
     let iterationText: String? = node.iteration.map { "Iteration \($0)" }
     let attemptText: String? = node.attemptNumber.map { "Attempt \($0)" }
+    let startedAt = P031ReadBoundaryDateParser.date(from: node.startedAt)
+    let completedAt = P031ReadBoundaryDateParser.date(from: node.completedAt)
+    let startedLabel = startedAt.map { "Started \(P031ThinPresentationFormatting.compactTimestamp($0))" }
+    let completedLabel = completedAt.map {
+      "\(terminalTimestampVerb(for: node.status)) \(P031ThinPresentationFormatting.compactTimestamp($0))"
+    }
+    let durationLabel = P031ThinPresentationFormatting.durationLabel(
+      startedAt: startedAt,
+      completedAt: completedAt,
+      now: Date()
+    )
     return P031StageTopologyPresentation(
       stageID: node.stageID,
       ordinal: node.order,
@@ -7137,6 +7157,9 @@ enum P031StageTopologyPresenter {
       isCurrent: node.isCurrent,
       iterationText: iterationText,
       attemptText: attemptText,
+      startedLabel: startedLabel,
+      completedLabel: completedLabel,
+      durationLabel: durationLabel,
       approvalRequired: node.approvalRequired,
       artifactCount: node.artifactCount,
       communicationCount: node.communicationCount,
@@ -7166,6 +7189,20 @@ enum P031StageTopologyPresenter {
         )
       }
     )
+  }
+
+  nonisolated private static func terminalTimestampVerb(for status: String) -> String {
+    let normalized = status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if normalized.contains("fail") || normalized.contains("block") || normalized.contains("error") {
+      return "Failed"
+    }
+    if normalized.contains("cancel") {
+      return "Canceled"
+    }
+    if normalized.contains("skip") {
+      return "Skipped"
+    }
+    return "Done"
   }
 }
 
@@ -7855,6 +7892,15 @@ private enum P031ThinPresentationFormatting {
     return formatter
   }()
 
+  nonisolated private static let compactTimestampFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "HH:mm"
+    return formatter
+  }()
+
   nonisolated static func freshnessSnapshot(
     currentFreshness: P031FreshnessSnapshot,
     checkedAt: Date,
@@ -7911,6 +7957,10 @@ private enum P031ThinPresentationFormatting {
 
   nonisolated static func timestamp(_ date: Date) -> String {
     timestampFormatter.string(from: date)
+  }
+
+  nonisolated static func compactTimestamp(_ date: Date) -> String {
+    compactTimestampFormatter.string(from: date)
   }
 
   nonisolated static func durationLabel(

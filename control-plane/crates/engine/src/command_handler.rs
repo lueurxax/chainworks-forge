@@ -25,17 +25,19 @@ use db::repos::{
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
 use db::writer::{class_a_operation, DbWriter};
-use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
+use domain::agent::{
+    AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement, AgentStatus,
+};
 use domain::approval::ApprovalDecision;
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::commands::{
     ApprovalResolutionDecision, CallerContext, Command, ConsumeProviderQuotaHoldCmd,
-    ExtendWorkflowLoopBudgetCmd, ProposalGateSettlementAction, SettleProposalGateCmd,
-    WorkflowLoopBudgetExtensionCmd,
+    ExtendWorkflowLoopBudgetCmd, ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd,
+    RetryStageCmd, SettleProposalGateCmd, WorkflowLoopBudgetExtensionCmd,
 };
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
-use domain::ids::{ApprovalId, RunId};
+use domain::ids::{AgentExecutionId, ApprovalId, RunId};
 use domain::proposal_gate_result::{
     ProposalGateFailureClassification, ProposalGateLineage, ProposalGateResult, ProposalGateStatus,
 };
@@ -84,6 +86,21 @@ pub struct CommandHandler {
     boundary_policy: Option<Arc<auth::boundary::BoundaryPolicy>>,
 }
 
+fn ensure_run_can_be_retried(run: &Run) -> Result<()> {
+    if run.status.is_terminal()
+        || run.status == RunStatus::Cancelling
+        || run.cancellation_requested_at.is_some()
+        || run.cancellation_settled_at.is_some()
+    {
+        anyhow::bail!(
+            "Run {} is {} / cancellation-settled and cannot be retried",
+            run.id,
+            run.status
+        );
+    }
+    Ok(())
+}
+
 pub enum CommandResult {
     IdeaCreated {
         idea: domain::idea::Idea,
@@ -123,6 +140,12 @@ pub enum CommandResult {
         counter: String,
         previous_max: u64,
         new_max: u64,
+    },
+    CatalogSnapshotRetrofitted {
+        run_id: RunId,
+        previous_catalog_snapshot_hash: String,
+        new_catalog_snapshot_hash: String,
+        applied_policy_ids: Vec<String>,
     },
     LegacyDiscoveryOverrideCreated {
         override_id: String,
@@ -816,6 +839,64 @@ fn workflow_snapshot_hash(raw: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn sanitized_audit_reason(reason: &str) -> Result<String> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("catalog snapshot retrofit reason is required");
+    }
+    if trimmed.len() > 2_000 {
+        anyhow::bail!("catalog snapshot retrofit reason exceeds 2000 bytes");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn remove_catalog_retrofit_allowed_fields(value: &mut serde_json::Value) -> Result<()> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("catalog snapshot JSON must be an object"))?;
+    object.remove("escalation_policies");
+    object.remove("backend_profiles");
+    Ok(())
+}
+
+fn validate_escalation_policy_only_catalog_retrofit(
+    previous_catalog_snapshot_json: &str,
+    new_catalog_snapshot_json: &str,
+    current_state: Option<&str>,
+    new_plan: &workflow::plan::RunPlan,
+) -> Result<Vec<String>> {
+    let mut previous: serde_json::Value = serde_json::from_str(previous_catalog_snapshot_json)
+        .context("parse previous catalog snapshot JSON")?;
+    let mut new: serde_json::Value = serde_json::from_str(new_catalog_snapshot_json)
+        .context("parse new catalog snapshot JSON")?;
+    remove_catalog_retrofit_allowed_fields(&mut previous)?;
+    remove_catalog_retrofit_allowed_fields(&mut new)?;
+    if previous != new {
+        anyhow::bail!(
+            "catalog snapshot retrofit rejected: current catalog differs outside escalation_policies/backend_profiles"
+        );
+    }
+
+    let current_state = current_state
+        .map(str::trim)
+        .filter(|state| !state.is_empty())
+        .ok_or_else(|| anyhow!("catalog snapshot retrofit requires a current workflow state"))?;
+    let applied_policy_ids = new_plan
+        .escalation_policies
+        .iter()
+        .filter(|policy| {
+            policy.enabled_default && policy.applies_to_stage_id.as_deref() == Some(current_state)
+        })
+        .map(|policy| policy.policy_id.clone())
+        .collect::<Vec<_>>();
+    if applied_policy_ids.is_empty() {
+        anyhow::bail!(
+            "catalog snapshot retrofit rejected: current catalog has no enabled escalation policy for current state {current_state}"
+        );
+    }
+    Ok(applied_policy_ids)
+}
+
 fn find_loop_budget_variable(snapshot: &serde_json::Value, counter: &str) -> Result<(String, u64)> {
     fn visit<'a>(value: &'a serde_json::Value, counter: &str) -> Option<&'a str> {
         let object = value.as_object()?;
@@ -932,6 +1013,7 @@ impl CommandJournalEntry {
             Command::MainSyncRepairState(_) => "MainSyncRepairState",
             Command::MainSyncRecordRecoveryDecision(_) => "MainSyncRecordRecoveryDecision",
             Command::KnowledgeCapsuleIgnore(_) => "KnowledgeCapsuleIgnore",
+            Command::RetrofitCatalogSnapshot(_) => "RetrofitCatalogSnapshot",
             Command::CancelRun(_) => "CancelRun",
             Command::ResetSession(_) => "ResetSession",
             Command::RunStewardAnalysis(_) => "RunStewardAnalysis",
@@ -958,6 +1040,7 @@ impl CommandJournalEntry {
             Command::MainSyncRepairState(c) => Some(c.run_id.to_string()),
             Command::MainSyncRecordRecoveryDecision(c) => Some(c.run_id.to_string()),
             Command::KnowledgeCapsuleIgnore(c) => Some(c.run_id.to_string()),
+            Command::RetrofitCatalogSnapshot(c) => Some(c.run_id.to_string()),
             Command::CancelRun(c) => Some(c.run_id.to_string()),
             Command::ResetSession(c) => Some(c.run_id.to_string()),
             Command::RunStewardAnalysis(_) => None,
@@ -1011,6 +1094,7 @@ impl CommandJournalEntry {
                 | "MainSyncRepairState"
                 | "MainSyncRecordRecoveryDecision"
                 | "KnowledgeCapsuleIgnore"
+                | "RetrofitCatalogSnapshot"
         )
     }
 }
@@ -1373,6 +1457,11 @@ fn requires_effect_reconciliation_error(stage: &StageExecution) -> anyhow::Error
         stage.stage_id,
         stage.id
     )
+}
+
+fn is_implicit_targeted_retry_stage(stage_id: &str) -> bool {
+    matches!(stage_id, "state_9_implementation_reviewed")
+        || stage_id.ends_with("_implementation_reviewed")
 }
 
 pub(crate) fn find_source_invoke_work_item<'a>(
@@ -2004,6 +2093,11 @@ impl CommandHandler {
         ) && caller.principal_class != PrincipalClass::Operator
         {
             anyhow::bail!("forbidden: Proposal 064 commands require operator principal");
+        }
+        if matches!(&cmd, Command::RetrofitCatalogSnapshot(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: RetrofitCatalogSnapshot requires operator principal");
         }
         if matches!(&cmd, Command::ResolveApproval(_))
             && caller.principal_class != PrincipalClass::Operator
@@ -2907,6 +3001,26 @@ impl CommandHandler {
                         .await;
                 }
 
+                if c.legacy_discovery_override_policy.is_none() {
+                    if let Some(agent_execution_id) = self
+                        .implicit_targeted_retry_candidate(c.run_id, &c.stage_id)
+                        .await?
+                    {
+                        return self
+                            .retry_agent_execution(
+                                c.run_id,
+                                &c.stage_id,
+                                agent_execution_id,
+                                c.consume_quota_budget_now,
+                                journal_id,
+                                journal,
+                                validated_instruction.as_deref(),
+                                &caller,
+                            )
+                            .await;
+                    }
+                }
+
                 let now = Utc::now();
                 let retry_tx_started = Instant::now();
                 let mut retry_tx = self
@@ -2940,6 +3054,18 @@ impl CommandHandler {
                 let run = runs::find_by_id_tx(&mut retry_tx, c.run_id)
                     .await?
                     .ok_or_else(|| anyhow!("Run {} not found", c.run_id))?;
+                if let Err(error) = ensure_run_can_be_retried(&run) {
+                    command_journal::fail_entry_tx(
+                        &mut retry_tx,
+                        &journal.id,
+                        Utc::now(),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    retry_tx.commit().await?;
+                    db::pool::log_write_transaction("command.RetryStage", retry_tx_started);
+                    return Err(error);
+                }
                 ensure_run_meta_root_exists(&run)?;
                 let completed_current_stage_on_blocked_run =
                     if old_stage.status == StageStatus::Completed {
@@ -3620,6 +3746,170 @@ impl CommandHandler {
                     counter: result.counter,
                     previous_max: result.previous_max,
                     new_max: result.new_max,
+                })
+            }
+
+            Command::RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd {
+                run_id,
+                expected_catalog_snapshot_hash,
+                reason,
+                scope: _,
+            }) => {
+                let reason = sanitized_audit_reason(&reason)?;
+                let now = Utc::now();
+                let tx_started = Instant::now();
+                let mut tx = self
+                    .begin_command_transaction(
+                        "command.RetrofitCatalogSnapshot",
+                        journal.id.clone(),
+                    )
+                    .await?;
+                record_command_journal_tx(&mut tx, journal).await?;
+
+                let run = runs::find_by_id_tx(&mut tx, run_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Run {run_id} not found"))?;
+                if run.status != RunStatus::Blocked {
+                    anyhow::bail!(
+                        "catalog snapshot retrofit requires blocked run; current status is {}",
+                        run.status
+                    );
+                }
+                if work_items::has_pending_or_running_by_run_tx(&mut tx, run_id).await? {
+                    anyhow::bail!(
+                        "catalog snapshot retrofit rejected: run has pending/running work items"
+                    );
+                }
+                let previous_catalog_snapshot_hash = run
+                    .catalog_snapshot_hash
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("Run {run_id} has no frozen catalog snapshot hash"))?
+                    .to_string();
+                if previous_catalog_snapshot_hash != expected_catalog_snapshot_hash {
+                    anyhow::bail!(
+                        "catalog snapshot hash mismatch: expected {}, found {}",
+                        expected_catalog_snapshot_hash,
+                        previous_catalog_snapshot_hash
+                    );
+                }
+                let previous_catalog_snapshot_json = run
+                    .catalog_snapshot_json
+                    .as_deref()
+                    .filter(|raw| !raw.trim().is_empty())
+                    .ok_or_else(|| anyhow!("Run {run_id} has no frozen catalog snapshot JSON"))?;
+                let workflow_yaml_path = run
+                    .workflow_yaml_path
+                    .as_deref()
+                    .filter(|path| !path.trim().is_empty())
+                    .ok_or_else(|| anyhow!("Run {run_id} has no workflow YAML path"))?;
+                let agent_catalog_yaml_path = run
+                    .agent_catalog_yaml_path
+                    .as_deref()
+                    .filter(|path| !path.trim().is_empty())
+                    .ok_or_else(|| anyhow!("Run {run_id} has no agent catalog YAML path"))?;
+                let new_plan =
+                    workflow::compiler::compile(workflow_yaml_path, agent_catalog_yaml_path)
+                        .context(
+                            "compile current workflow/catalog for catalog snapshot retrofit",
+                        )?;
+                if let Some(frozen_workflow_hash) = run.workflow_snapshot_hash.as_deref() {
+                    if frozen_workflow_hash != new_plan.workflow_snapshot_hash {
+                        anyhow::bail!(
+                            "catalog snapshot retrofit rejected: workflow snapshot hash changed from {} to {}",
+                            frozen_workflow_hash,
+                            new_plan.workflow_snapshot_hash
+                        );
+                    }
+                }
+                if previous_catalog_snapshot_hash == new_plan.catalog_snapshot_hash {
+                    anyhow::bail!(
+                        "catalog snapshot retrofit rejected: current catalog hash is unchanged"
+                    );
+                }
+                let applied_policy_ids = validate_escalation_policy_only_catalog_retrofit(
+                    previous_catalog_snapshot_json,
+                    &new_plan.catalog_snapshot_json,
+                    run.current_state.as_deref(),
+                    &new_plan,
+                )?;
+                let new_catalog_snapshot_hash = new_plan.catalog_snapshot_hash.clone();
+
+                sqlx::query(
+                    "UPDATE runs SET catalog_snapshot_json = ?1, catalog_snapshot_hash = ?2 WHERE id = ?3",
+                )
+                .bind(&new_plan.catalog_snapshot_json)
+                .bind(&new_catalog_snapshot_hash)
+                .bind(run_id.to_string())
+                .execute(&mut **tx)
+                .await
+                .context("persist retrofitted catalog snapshot")?;
+                db::repos::workflow_conflicts::record_phase_c_validation_outcome_tx(
+                    &mut tx,
+                    run_id,
+                    "pass",
+                    "catalog_snapshot_retrofit",
+                    now,
+                )
+                .await?;
+                let audit_note = serde_json::json!({
+                    "reason": reason,
+                    "scope": "escalation_policy_only",
+                    "previous_catalog_snapshot_hash": previous_catalog_snapshot_hash.clone(),
+                    "new_catalog_snapshot_hash": new_catalog_snapshot_hash.clone(),
+                    "applied_policy_ids": applied_policy_ids.clone(),
+                });
+                let raw_audit_payload = audit_note.to_string();
+                let (stored_audit_payload, _payload_sha, audit_truncated) =
+                    audit_log::build_envelope(&raw_audit_payload);
+                let (policy_mode, fixture_ver) = match &self.boundary_policy {
+                    Some(p) => (p.mode().to_string(), p.fixture_digest().to_string()),
+                    None => ("legacy_compat".to_string(), "embedded".to_string()),
+                };
+                let audit_request_id = journal
+                    .request_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(journal.id.as_str());
+                let audit_id = uuid::Uuid::now_v7().to_string();
+                let audit_entry = audit_log::AuditEntry {
+                    id: &audit_id,
+                    request_id: audit_request_id,
+                    timestamp_ms: now.timestamp_millis(),
+                    event_type: "run_catalog_snapshot_retrofit",
+                    principal_id: journal.caller_principal_id.as_deref(),
+                    principal_class: journal.caller_principal_class.as_deref(),
+                    caller_class: journal.caller_class.as_deref(),
+                    token_id: journal.token_id.as_deref(),
+                    transport: "mcp_tools_call",
+                    action_attempted: "runs.retrofit_catalog_snapshot",
+                    decision: "allow",
+                    denial_reason_code: None,
+                    row_id: Some("p081.agent_operator.mcp_tools_call.command"),
+                    env_gate_state: None,
+                    source_ip_hash_or_local_process_id: None,
+                    boundary_policy_mode: &policy_mode,
+                    fixture_version: &fixture_ver,
+                    payload: &stored_audit_payload,
+                    original_payload_bytes: if audit_truncated {
+                        Some(&raw_audit_payload)
+                    } else {
+                        None
+                    },
+                    diagnostic_truncated: audit_truncated,
+                    checkpoint_id: None,
+                    created_at_ms: now.timestamp_millis(),
+                };
+                audit_log::append_tx(&mut tx, &audit_entry).await?;
+                command_journal::complete_entry_tx(&mut tx, &journal.id, Utc::now()).await?;
+                tx.commit().await?;
+                db::pool::log_write_transaction("command.RetrofitCatalogSnapshot", tx_started);
+                projections::rebuild_all_for_run(&self.pool, run_id).await?;
+
+                Ok(CommandResult::CatalogSnapshotRetrofitted {
+                    run_id,
+                    previous_catalog_snapshot_hash,
+                    new_catalog_snapshot_hash,
+                    applied_policy_ids,
                 })
             }
 
@@ -4996,6 +5286,240 @@ impl CommandHandler {
         })
     }
 
+    pub async fn auto_resume_elapsed_quota_ledgers(&self, now: DateTime<Utc>) -> Result<usize> {
+        let candidates =
+            agent_retry_budget_ledger::list_reset_elapsed_auto_retry_candidates(&self.pool, now)
+                .await?;
+        let mut scheduled = 0_usize;
+        for candidate in candidates {
+            let skip_reason = self
+                .quota_auto_retry_skip_reason(&candidate)
+                .await
+                .with_context(|| {
+                    format!("preflight quota ledger auto retry {}", candidate.ledger_id)
+                })?;
+            if let Some(reason) = skip_reason {
+                warn!(
+                    ledger_id = %candidate.ledger_id,
+                    run_id = %candidate.run_id,
+                    stage_execution_id = %candidate.stage_execution_id,
+                    stage_id = %candidate.stage_id,
+                    agent_execution_id = %candidate.agent_execution_id,
+                    retry_after = %candidate.retry_after,
+                    skip_reason = reason,
+                    "Quota ledger auto retry skipped"
+                );
+                continue;
+            }
+
+            let cmd = Command::RetryStage(RetryStageCmd {
+                run_id: candidate.run_id,
+                stage_id: candidate.stage_id.clone(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            });
+            let caller = CallerContext::mcp(
+                "chainworks-daemon",
+                &PrincipalClass::Operator,
+                "quota_ledger_auto_resume",
+            )
+            .with_request_id(format!("quota-ledger-auto-resume:{}", candidate.ledger_id));
+            let mut journal = CommandJournalEntry::new(&cmd, &caller);
+            journal.id = format!("quota-ledger-auto-retry-{}", candidate.ledger_id);
+            let journal_id = journal.id.clone();
+
+            match self
+                .retry_stage_latest_attempt(
+                    candidate.run_id,
+                    &candidate.stage_id,
+                    false,
+                    &journal_id,
+                    &journal,
+                    "quota_ledger_reset_elapsed_auto_retry",
+                    None,
+                    &caller,
+                    Some(&candidate.ledger_id),
+                )
+                .await
+            {
+                Ok(_) => {
+                    scheduled += 1;
+                    info!(
+                        ledger_id = %candidate.ledger_id,
+                        run_id = %candidate.run_id,
+                        stage_execution_id = %candidate.stage_execution_id,
+                        stage_id = %candidate.stage_id,
+                        agent_execution_id = %candidate.agent_execution_id,
+                        retry_after = %candidate.retry_after,
+                        journal_id = %journal_id,
+                        "Quota ledger reset elapsed; scheduled automatic stage retry"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        ledger_id = %candidate.ledger_id,
+                        run_id = %candidate.run_id,
+                        stage_execution_id = %candidate.stage_execution_id,
+                        stage_id = %candidate.stage_id,
+                        agent_execution_id = %candidate.agent_execution_id,
+                        error = %error,
+                        "Quota ledger auto retry failed pre-commit"
+                    );
+                }
+            }
+        }
+        Ok(scheduled)
+    }
+
+    async fn quota_auto_retry_skip_reason(
+        &self,
+        candidate: &agent_retry_budget_ledger::QuotaLedgerAutoRetryCandidate,
+    ) -> Result<Option<&'static str>> {
+        let Some(run) = runs::find_by_id(&self.pool, candidate.run_id).await? else {
+            return Ok(Some("run_not_blocked"));
+        };
+        if run.status != RunStatus::Blocked {
+            return Ok(Some("run_not_blocked"));
+        }
+        if run.current_state.as_deref() != Some(candidate.stage_id.as_str()) {
+            return Ok(Some("stage_not_current"));
+        }
+
+        let Some(source_stage) =
+            stages::find_by_id(&self.pool, candidate.stage_execution_id).await?
+        else {
+            return Ok(Some("stage_not_current"));
+        };
+        if source_stage.run_id != candidate.run_id || source_stage.stage_id != candidate.stage_id {
+            return Ok(Some("stage_not_current"));
+        }
+
+        let latest_stage = stages::list_by_run(&self.pool, candidate.run_id)
+            .await?
+            .into_iter()
+            .filter(|stage| stage.stage_id == candidate.stage_id)
+            .max_by_key(|stage| stage.started_at);
+        if latest_stage.as_ref().map(|stage| stage.id) != Some(candidate.stage_execution_id) {
+            return Ok(Some("stage_not_current"));
+        }
+
+        if !matches!(
+            source_stage.status,
+            StageStatus::Failed | StageStatus::Blocked | StageStatus::Completed
+        ) {
+            return Ok(Some("stage_not_retryable"));
+        }
+
+        let active_work_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM work_items
+               WHERE run_id = ?1
+                 AND status IN ('pending', 'running')"#,
+        )
+        .bind(candidate.run_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if active_work_count > 0 {
+            return Ok(Some("live_work_present"));
+        }
+
+        let running_agent_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM agent_executions ae
+               LEFT JOIN stage_executions se ON se.id = ae.stage_execution_id
+               WHERE (se.run_id = ?1 OR ae.owner_id = ?1)
+                 AND ae.status = 'running'"#,
+        )
+        .bind(candidate.run_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if running_agent_count > 0 {
+            return Ok(Some("live_work_present"));
+        }
+
+        Ok(None)
+    }
+
+    async fn implicit_targeted_retry_candidate(
+        &self,
+        run_id: RunId,
+        stage_id: &str,
+    ) -> Result<Option<AgentExecutionId>> {
+        if !is_implicit_targeted_retry_stage(stage_id) {
+            return Ok(None);
+        }
+
+        let Some(run) = runs::find_by_id(&self.pool, run_id).await? else {
+            return Ok(None);
+        };
+        if run.status != RunStatus::Blocked || run.current_state.as_deref() != Some(stage_id) {
+            return Ok(None);
+        }
+
+        let latest_stage = stages::list_by_run(&self.pool, run_id)
+            .await?
+            .into_iter()
+            .filter(|stage| stage.stage_id == stage_id)
+            .max_by_key(|stage| stage.started_at);
+        let Some(latest_stage) = latest_stage else {
+            return Ok(None);
+        };
+        if !matches!(
+            latest_stage.status,
+            StageStatus::Failed | StageStatus::Blocked
+        ) {
+            return Ok(None);
+        }
+
+        let executions = agent_executions::find_by_stage(&self.pool, latest_stage.id).await?;
+        let failed = executions
+            .iter()
+            .filter(|execution| execution.status == AgentStatus::Failed)
+            .collect::<Vec<_>>();
+        if failed.len() != 1 {
+            return Ok(None);
+        }
+
+        let candidate = failed[0];
+        let run_work_items = work_items::list_by_run(&self.pool, run_id).await?;
+        let Some(source_item) = find_source_invoke_work_item(
+            &run_work_items,
+            &latest_stage.id.to_string(),
+            &candidate.agent_id,
+            &candidate.id.to_string(),
+        ) else {
+            warn!(
+                run_id = %run_id,
+                stage_id = %stage_id,
+                stage_execution_id = %latest_stage.id,
+                agent_execution_id = %candidate.id,
+                agent_id = %candidate.agent_id,
+                "Implicit targeted retry candidate skipped because source InvokeAgent work item was not found"
+            );
+            return Ok(None);
+        };
+        if matches!(
+            source_item.status,
+            WorkItemStatus::Pending | WorkItemStatus::Running
+        ) {
+            return Ok(None);
+        }
+
+        info!(
+            run_id = %run_id,
+            stage_id = %stage_id,
+            stage_execution_id = %latest_stage.id,
+            agent_execution_id = %candidate.id,
+            agent_id = %candidate.agent_id,
+            source_work_item_id = %source_item.id,
+            "RetryStage selected implicit targeted agent retry for blocked implementation review"
+        );
+        Ok(Some(candidate.id))
+    }
+
     async fn retry_stage_latest_attempt(
         &self,
         run_id: RunId,
@@ -5006,6 +5530,7 @@ impl CommandHandler {
         retry_reason: &str,
         validated_instruction: Option<&str>,
         caller: &CallerContext,
+        auto_retry_ledger_id: Option<&str>,
     ) -> Result<CommandResult> {
         let run_stages = stages::list_by_run(&self.pool, run_id).await?;
         let matching_stages = run_stages
@@ -5017,10 +5542,11 @@ impl CommandHandler {
             .copied()
             .max_by_key(|s| s.started_at)
             .ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
+        let run = runs::find_by_id(&self.pool, run_id)
+            .await?
+            .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
+        ensure_run_can_be_retried(&run)?;
         let completed_current_stage_on_blocked_run = if old_stage.status == StageStatus::Completed {
-            let run = runs::find_by_id(&self.pool, run_id)
-                .await?
-                .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
             run.status == RunStatus::Blocked
                 && (run.current_state.as_deref() == Some(stage_id)
                     || old_stage.stage_id == stage_id)
@@ -5081,6 +5607,14 @@ impl CommandHandler {
             journal_id,
         )
         .await?;
+        if let Some(ledger_id) = auto_retry_ledger_id {
+            agent_retry_budget_ledger::mark_reset_elapsed_retry_scheduled_tx(
+                &mut retry_tx,
+                ledger_id,
+                journal_id,
+            )
+            .await?;
+        }
         stages::settle_tx(
             &mut retry_tx,
             old_stage.id,
@@ -5222,9 +5756,7 @@ impl CommandHandler {
         let run = runs::find_by_id(&self.pool, run_id)
             .await?
             .ok_or_else(|| anyhow!("Run {} not found", run_id))?;
-        if run.status.is_terminal() {
-            return Err(anyhow!("Run {} is already in terminal state", run_id));
-        }
+        ensure_run_can_be_retried(&run)?;
 
         let target_exec = agent_executions::find_by_id(&self.pool, agent_execution_id)
             .await?

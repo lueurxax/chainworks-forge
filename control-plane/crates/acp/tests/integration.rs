@@ -1010,6 +1010,79 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    /// Write a Codex-like fixture that records a native session-store
+    /// task_complete event containing CHAINWORKS_OUTPUT, then exits without
+    /// sending a terminal ACP session/prompt response.
+    pub fn create_codex_task_complete_without_terminal_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_codex_task_complete_without_terminal.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json, os
+from pathlib import Path
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+cwd = msg.get("params", {}).get("cwd", "/tmp")
+session_id = "codex-fixture-session-store-terminal"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+target_path = os.path.join(cwd, "audit", "proposal-vs-implementation.json")
+payload = {
+    "CHAINWORKS_OUTPUT": {
+        target_path: {
+            "status": "needs_code_fixes",
+            "matches_proposal": False,
+            "missing_items": []
+        }
+    }
+}
+session_line = {
+    "timestamp": "2026-05-31T08:30:25.238Z",
+    "type": "event_msg",
+    "payload": {
+        "type": "task_complete",
+        "turn_id": "turn-1",
+        "last_agent_message": json.dumps(payload, separators=(",", ":"))
+    }
+}
+session_path = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "05" / "31" / "rollout.jsonl"
+session_path.parent.mkdir(parents=True, exist_ok=True)
+session_path.write_text(json.dumps(session_line) + "\n")
+
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server script that keeps a single session alive
     /// across two prompt turns and exits only after `session/close`.
     pub fn create_reuse_script(tmpdir: &std::path::Path) -> String {
@@ -4053,7 +4126,10 @@ async fn xcode_mcp_bridge_pool_warmup_refreshes_first_connect_deadline() {
         .unwrap();
 
     assert!(
-        pool.cleanup_first_connect_timeouts().await.unwrap().is_empty(),
+        pool.cleanup_first_connect_timeouts()
+            .await
+            .unwrap()
+            .is_empty(),
         "successful broker warmup must not leave the reserved lease expired before provider session/new"
     );
 }
@@ -5615,7 +5691,10 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
     let result = adapter.execute(req).await.unwrap();
     assert_eq!(result.status, AgentStatus::Completed);
     assert!(
-        result.artifact_paths.iter().any(|path| path == &typed_path_string),
+        result
+            .artifact_paths
+            .iter()
+            .any(|path| path == &typed_path_string),
         "changed typed expected output should be reported even when the legacy path list is stale: {:?}",
         result.artifact_paths
     );
@@ -6040,6 +6119,97 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
             .is_some_and(|text| text.contains("CHAINWORKS_OUTPUT")),
         "stream transcript should preserve the emitted JSON envelope"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_task_complete_session_store_recovers_missing_acp_terminal_response() {
+    use acp::adapters::codex::CodexAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::{AcpCompletionCaptureSource, ExecutionRequest};
+    use domain::agent::AgentStatus;
+    use domain::discovery::{
+        ExpectedOutputRole, ExpectedOutputSpec, OutputReusePolicy, SourceGenerationOwner,
+    };
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_codex_task_complete_without_terminal_script(tmp.path());
+    let adapter = CodexAdapter::new_with_binary(script);
+    let audit_path = tmp
+        .path()
+        .join("audit/proposal-vs-implementation.json")
+        .to_string_lossy()
+        .into_owned();
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "state_9_implementation_reviewed".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "proposal_implementation_auditor".into(),
+        provider: "codex".into(),
+        model: Some("gpt-5.5".into()),
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "audit".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: vec![ExpectedOutputSpec {
+            output_name: "audit_report".into(),
+            output_role: ExpectedOutputRole::Machine,
+            target_path: audit_path.clone(),
+            companion_of: None,
+            display_label: "Audit report".into(),
+            contract_id: Some("audit_report_v1".into()),
+            required: true,
+            reuse_policy: OutputReusePolicy::MustProduce,
+            max_bytes: 128 * 1024,
+            aggregate_acceptance_cap_bytes: 256 * 1024,
+            authorized_roots: Vec::new(),
+            source_generation_owner: SourceGenerationOwner::Agent,
+        }],
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(
+        result.completion_text_capture.capture_source,
+        Some(AcpCompletionCaptureSource::ProviderSessionStoreTaskComplete)
+    );
+    assert!(result.runtime_receipt.as_ref().is_some_and(|receipt| {
+        receipt.status == "completed"
+            && receipt
+                .last_events
+                .iter()
+                .any(|event| event.kind == "provider_session_store_task_complete_recovered")
+    }));
+    assert!(result.discovered_artifacts.iter().any(|artifact| {
+        artifact.name == audit_path
+            && serde_json::from_slice::<serde_json::Value>(&artifact.content)
+                .ok()
+                .and_then(|value| value.get("status").cloned())
+                == Some(serde_json::json!("needs_code_fixes"))
+    }));
 }
 
 /// AcpRuntimeManager should keep a live session handle and reuse it for a

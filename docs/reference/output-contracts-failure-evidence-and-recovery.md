@@ -494,7 +494,7 @@ evidence. The raw bounded meta-root and exact-path discovery logs live in `agent
 
 ### Source-generation claims own active artifact writes
 
-Post-P058 artifact-producing `InvokeAgent` executions write through a source-generation
+Artifact-producing `InvokeAgent` executions write through a source-generation
 claim. The active claim records:
 
 - run id,

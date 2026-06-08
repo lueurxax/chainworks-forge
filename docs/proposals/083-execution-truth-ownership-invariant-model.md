@@ -12,6 +12,29 @@
 
 ---
 
+## Current Implementation Approval Contract
+
+The active Chainworks run proposal revision is `P083-r68-refined-r66-score-lift`.
+The latest proposal review summary approved that revision with `blocker_count=0` and aggregate score `9.3`.
+Implementation may start after the human implementation approval gate is granted.
+
+The following hardening requirements are mandatory implementation scope. They may not be marked non-blocking, deferred, or handoff unless a separate approved successor proposal explicitly owns the exact item and the operator approves that scope reduction.
+P083 is not implementation-complete, closeout-ready, or release-ready until all of them are implemented and proven:
+
+1. GraphQL SDL inventory for lifecycle mutations: enumerate lifecycle mutation signatures with non-null `CallerRequestId`, shared typed denial union or error-code enum mirrored in MCP, and explicit nullability for every field.
+2. MCP tool inventory and shared denial vocabulary: list every P083 MCP tool with JSON Schema 2020-12 input/output, `additionalProperties=false`, canonical schema path, and denial vocabulary shared with GraphQL.
+3. `artifact_lineage.report_kind` backfill posture: either implement an additive backfill for pre-existing active report rows or provide executable evidence that no such rows exist before enforcing bounded `report_kind` values.
+4. Schema-version evolution policy: define append-only `schema_version` semantics, same-version additive-safe field policy, version bump rules, prior-version readability, and unknown-schema diagnostic behavior.
+5. SwiftData isolation boundary: pin MainActor access for projection-only `ModelContext`, a `@ModelActor` or equivalent adapter for non-main access, and Sendable snapshots before crossing back to SwiftUI roots.
+6. Command idempotency intent hashing: define per-command logical fields and canonical JSON serialization with sorted keys, UTF-8, and no whitespace before `intent_hash` calculation.
+7. Failed-terminal retry policy per lifecycle command: add a centralized per-command `failed_terminal_retry_policy` table and fixtures proving when a new same-intent request may or may not acquire a new lease.
+8. Atomic late-output counter increments: specify and test atomic counter increment and cap enforcement for concurrent late-output writers, including overflow latch behavior.
+9. External side-effect composition for idempotent commands: for every idempotent lifecycle command with external effects, name planned rows, receipt rows, and crash-between-commit-and-external-action fixtures.
+10. Durable monotonic clock contract: define `boot_id`, baseline sample semantics, monotonic-to-wall-clock conversion, restart/reboot comparison, clock rollback handling, stale baseline fallback, and fixtures.
+11. Minimum command lease TTL policy: raise the global minimum lease TTL or define per-command `recommended_min_ttl_seconds` with rollout lint warnings below recommendation, especially for `provider_session.shutdown`.
+
+The P083 proof gate must fail when any item above lacks the code, schema, migration, metric, UI, readback, or fixture evidence required by its outcome.
+
 ## 1. Problem
 
 Execution truth keeps leaking across layers:

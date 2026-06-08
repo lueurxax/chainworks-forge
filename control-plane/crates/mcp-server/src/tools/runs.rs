@@ -7,10 +7,10 @@ use db::repos::{
     legacy_discovery_overrides, projections, rollout_contract_checks, runs, side_effects,
 };
 use domain::commands::{
-    CancelRunCmd, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
+    CancelRunCmd, CatalogSnapshotRetrofitScope, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
     MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
     MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
-    ProposalGateSettlementAction, SettleProposalGateCmd, StartRunCmd,
+    ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd, SettleProposalGateCmd, StartRunCmd,
 };
 use domain::ids::{IdeaId, RunId};
 use domain::risk_lineage::RiskAcceptanceLineage;
@@ -74,6 +74,31 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "properties": {
                     "run_id": { "type": "string" },
                     "idempotency_key": { "type": "string", "description": "Caller-supplied idempotency key for replay safety. Stored in the command journal as request_id." }
+                }
+            }),
+        },
+        McpTool {
+            name: "runs.retrofit_catalog_snapshot".to_string(),
+            description: "Emergency operator repair: replace a blocked run's frozen catalog snapshot from the current catalog YAML with audit/hash guardrails".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["run_id", "expected_catalog_snapshot_hash", "reason", "idempotency_key"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "expected_catalog_snapshot_hash": {
+                        "type": "string",
+                        "description": "The current frozen catalog snapshot hash expected by the operator; mismatch fails closed."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["escalation_policy_only"],
+                        "description": "Emergency retrofit scope. Only escalation_policy_only is currently supported."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Operator audit reason for retrofitting the frozen catalog snapshot."
+                    },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 for safe repair." }
                 }
             }),
         },
@@ -448,6 +473,64 @@ pub async fn execute(
             let commanded = cmd_handler.handle(cmd, caller).await?;
             Ok(serde_json::json!({
                 "cancelled": true,
+                "journal_id": commanded.journal_id,
+            }))
+        }
+
+        "runs.retrofit_catalog_snapshot" => {
+            let run_id: RunId = params["run_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
+                .parse()?;
+            let expected_catalog_snapshot_hash = params["expected_catalog_snapshot_hash"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'expected_catalog_snapshot_hash'"))?
+                .to_string();
+            let reason = params["reason"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
+                .to_string();
+            let scope = match params["scope"].as_str().unwrap_or("escalation_policy_only") {
+                "escalation_policy_only" => CatalogSnapshotRetrofitScope::EscalationPolicyOnly,
+                other => anyhow::bail!("unsupported catalog snapshot retrofit scope: {other}"),
+            };
+            let idempotency_key = params["idempotency_key"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
+                .to_string();
+            let caller = mcp_caller(&principal, "runs.retrofit_catalog_snapshot")
+                .with_request_id(idempotency_key);
+            let commanded = cmd_handler
+                .handle(
+                    Command::RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd {
+                        run_id,
+                        expected_catalog_snapshot_hash,
+                        reason,
+                        scope,
+                    }),
+                    caller,
+                )
+                .await?;
+            let (previous_catalog_snapshot_hash, new_catalog_snapshot_hash, applied_policy_ids) =
+                match &commanded.result {
+                    engine::command_handler::CommandResult::CatalogSnapshotRetrofitted {
+                        previous_catalog_snapshot_hash,
+                        new_catalog_snapshot_hash,
+                        applied_policy_ids,
+                        ..
+                    } => (
+                        previous_catalog_snapshot_hash.clone(),
+                        new_catalog_snapshot_hash.clone(),
+                        applied_policy_ids.clone(),
+                    ),
+                    _ => anyhow::bail!("Unexpected command result"),
+                };
+            Ok(serde_json::json!({
+                "retrofitted": true,
+                "run_id": run_id.to_string(),
+                "previous_catalog_snapshot_hash": previous_catalog_snapshot_hash,
+                "new_catalog_snapshot_hash": new_catalog_snapshot_hash,
+                "applied_policy_ids": applied_policy_ids,
                 "journal_id": commanded.journal_id,
             }))
         }

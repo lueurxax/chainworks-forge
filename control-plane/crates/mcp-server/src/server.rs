@@ -1689,6 +1689,7 @@ fn is_state_changing_tool(tool_name: &str) -> bool {
             | "runs.main_sync.repair_state"
             | "runs.main_sync.record_recovery_decision"
             | "runs.knowledge_capsule.ignore"
+            | "runs.retrofit_catalog_snapshot"
             | "runs.settle_proposal_gate"
             | "ideas.create"
             | "stages.retry"

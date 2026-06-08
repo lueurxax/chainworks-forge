@@ -83,6 +83,30 @@ pub async fn ensure_policy(
 
     if let Some(active_generation) = active {
         if active_generation.status == SessionGenerationStatus::Active {
+            if active_generation_has_claude_long_context_credits_failure(
+                pool,
+                &active_generation.id,
+            )
+            .await?
+            {
+                invalidate_generation(
+                    pool,
+                    &lineage,
+                    &active_generation,
+                    CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON,
+                )
+                .await?;
+                return create_generation(
+                    pool,
+                    lineage,
+                    input,
+                    SessionReuseDisposition::FreshAfterInvalidation,
+                    Some(CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON.to_string()),
+                    None,
+                )
+                .await;
+            }
+
             if active_generation_has_missing_required_outputs_failure(pool, &active_generation.id)
                 .await?
             {
@@ -331,6 +355,30 @@ pub async fn ensure_policy_tx(
 
     if let Some(active_generation) = active {
         if active_generation.status == SessionGenerationStatus::Active {
+            if active_generation_has_claude_long_context_credits_failure_tx(
+                tx,
+                &active_generation.id,
+            )
+            .await?
+            {
+                invalidate_generation_tx(
+                    tx,
+                    &lineage,
+                    &active_generation,
+                    CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON,
+                )
+                .await?;
+                return create_generation_tx(
+                    tx,
+                    lineage,
+                    input,
+                    SessionReuseDisposition::FreshAfterInvalidation,
+                    Some(CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON.to_string()),
+                    None,
+                )
+                .await;
+            }
+
             if active_generation_has_missing_required_outputs_failure_tx(tx, &active_generation.id)
                 .await?
             {
@@ -532,6 +580,7 @@ pub async fn ensure_policy_tx(
 }
 
 const PREVIOUS_MISSING_REQUIRED_OUTPUTS_REASON: &str = "previous_missing_required_outputs";
+const CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON: &str = "claude_long_context_credits_required";
 
 pub async fn invalidate_generation_after_missing_required_outputs(
     pool: &SqlitePool,
@@ -639,6 +688,58 @@ async fn active_generation_has_missing_required_outputs_failure_tx(
              AND (
                facts.failure_kind = 'missing_required_outputs'
                OR facts.output_settlement = 'missing_required_outputs'
+             )
+           LIMIT 1"#,
+    )
+    .bind(generation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.is_some())
+}
+
+async fn active_generation_has_claude_long_context_credits_failure(
+    pool: &SqlitePool,
+    generation_id: &str,
+) -> Result<bool> {
+    let row = sqlx::query(
+        r#"SELECT 1
+           FROM agent_executions ae
+           INNER JOIN agent_execution_runtime_facts facts
+             ON facts.agent_execution_id = ae.id
+           WHERE ae.session_generation_id = ?1
+             AND ae.status = 'failed'
+             AND ae.provider IN ('claude', 'claude_acp')
+             AND facts.failure_kind = 'provider_quota'
+             AND (
+               COALESCE(facts.failure_kind_raw_debug, '') LIKE '%claude_long_context_credits_required%'
+               OR COALESCE(facts.failure_kind_raw_debug, '') LIKE '%Usage credits are required for long context requests%'
+               OR COALESCE(facts.failure_message_redacted, '') LIKE '%Usage credits are required for long context requests%'
+             )
+           LIMIT 1"#,
+    )
+    .bind(generation_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+async fn active_generation_has_claude_long_context_credits_failure_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    generation_id: &str,
+) -> Result<bool> {
+    let row = sqlx::query(
+        r#"SELECT 1
+           FROM agent_executions ae
+           INNER JOIN agent_execution_runtime_facts facts
+             ON facts.agent_execution_id = ae.id
+           WHERE ae.session_generation_id = ?1
+             AND ae.status = 'failed'
+             AND ae.provider IN ('claude', 'claude_acp')
+             AND facts.failure_kind = 'provider_quota'
+             AND (
+               COALESCE(facts.failure_kind_raw_debug, '') LIKE '%claude_long_context_credits_required%'
+               OR COALESCE(facts.failure_kind_raw_debug, '') LIKE '%Usage credits are required for long context requests%'
+               OR COALESCE(facts.failure_message_redacted, '') LIKE '%Usage credits are required for long context requests%'
              )
            LIMIT 1"#,
     )
@@ -1431,6 +1532,139 @@ mod tests {
         assert_eq!(
             decision.disposition,
             SessionReuseDisposition::FreshAfterInvalidation
+        );
+        assert_eq!(decision.generation.generation, 2);
+        assert!(!decision.should_reuse_live_session);
+    }
+
+    #[tokio::test]
+    async fn claude_long_context_credits_failure_invalidates_generation_before_reuse() {
+        let pool = test_pool().await;
+        seed_run(&pool).await;
+        let now = chrono::Utc::now();
+        let lineage = SessionLineage {
+            id: "lineage-long-context-credits".into(),
+            run_id: "00000000-0000-0000-0000-000000000001".into(),
+            agent_id: "proposal_writer".into(),
+            lineage_id: "proposal-loop".into(),
+            session_reuse_scope: "same_agent_family_within_run".into(),
+            session_family_id: Some("proposal-loop".into()),
+            active_generation_id: Some("generation-long-context-credits".into()),
+            created_at: now,
+            closed_at: None,
+        };
+        sessions::insert_lineage(&pool, &lineage).await.unwrap();
+        sessions::insert_generation(
+            &pool,
+            &SessionGeneration {
+                id: "generation-long-context-credits".into(),
+                lineage_id: lineage.id.clone(),
+                generation: 1,
+                invocation_owner_key: "owner".into(),
+                provider_session_id: Some("provider-session".into()),
+                binding_fingerprint: "fingerprint".into(),
+                rehydrated_from_checkpoint_artifact_id: None,
+                working_directory: "/tmp/ws".into(),
+                workspace_mode: "read_only".into(),
+                runtime_provider: "claude".into(),
+                runtime_model: "sonnet".into(),
+                status: SessionGenerationStatus::Active,
+                turn_count: 2,
+                estimated_input_tokens: 0,
+                latest_cached_input_tokens: None,
+                latest_output_tokens: None,
+                latest_model_context_window: None,
+                cumulative_prompt_tokens: 0,
+                cumulative_cost_cents: 0,
+                created_at: now,
+                last_activity_at: None,
+                ended_at: None,
+                end_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let agent_execution_id = AgentExecutionId::new();
+        agent_executions::insert(
+            &pool,
+            &AgentExecution {
+                id: agent_execution_id,
+                stage_execution_id: None,
+                agent_id: "proposal_writer".into(),
+                provider: "claude".into(),
+                model: Some("sonnet".into()),
+                started_at: now,
+                completed_at: Some(now),
+                status: AgentStatus::Failed,
+                owner_execution_lineage_id: Some("owner".into()),
+                session_lineage_id: Some(lineage.id.clone()),
+                session_generation_id: Some("generation-long-context-credits".into()),
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: Some("owner".into()),
+                session_reuse_scope: Some("same_agent_family_within_run".into()),
+                session_family_id: Some("proposal-loop".into()),
+                session_reuse_disposition: Some("reused".into()),
+                session_reset_reason: None,
+                backend_profile_id: None,
+                requested_mcp_extensions_json: None,
+                predicted_mcp_extensions_json: None,
+                predicted_mcp_runtime_ids_json: None,
+                actual_mcp_extensions_json: None,
+                actual_mcp_runtime_ids_json: None,
+                denied_mcp_extensions_json: None,
+                mcp_blocking_issues_json: None,
+                actual_mcp_observation_json: None,
+                actual_xcode_runtime_observation_json: None,
+                mcp_session_startup_latency_ms: None,
+                owner_kind: Some("lead_conflict_mediation".into()),
+                owner_id: Some("mediation-owner".into()),
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
+                total_cost_cents: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+        facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+        facts.failure_kind_raw_debug = Some("claude_long_context_credits_required".to_string());
+        facts.failure_message_redacted =
+            Some("Usage credits are required for long context requests.".to_string());
+        agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .unwrap();
+
+        let decision = ensure_policy(&pool, base_input()).await.unwrap();
+
+        let prior = sessions::find_generation_by_id(&pool, "generation-long-context-credits")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prior.status, SessionGenerationStatus::Invalidated);
+        assert_eq!(
+            prior.end_reason.as_deref(),
+            Some("claude_long_context_credits_required")
+        );
+        assert_eq!(
+            decision.disposition,
+            SessionReuseDisposition::FreshAfterInvalidation
+        );
+        assert_eq!(
+            decision.session_reset_reason.as_deref(),
+            Some("claude_long_context_credits_required")
         );
         assert_eq!(decision.generation.generation, 2);
         assert!(!decision.should_reuse_live_session);

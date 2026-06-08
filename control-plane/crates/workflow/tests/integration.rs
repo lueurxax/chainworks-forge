@@ -826,16 +826,16 @@ fn test_compile_full_mvp_live_plan() {
     let s1 = &plan.states["state_1_idea_received"];
     assert_eq!(s1.owner.agent_id, "lead_orchestrator");
     assert_eq!(
-        s1.owner.provider, "codex",
-        "lead_orchestrator uses strict structured-output Codex profile"
+        s1.owner.provider, "gemini",
+        "lead_orchestrator uses strict structured-output Gemini profile"
     );
-    assert_eq!(s1.owner.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(s1.owner.model.as_deref(), Some("gemini-3.1-pro-preview"));
     assert_eq!(s1.owner.effort.as_deref(), Some("high"));
 
     let s4 = &plan.states["state_4_proposal_reviewed"];
     assert_eq!(
-        s4.owner.provider, "codex",
-        "state_4 owner=lead_orchestrator uses strict structured-output Codex profile"
+        s4.owner.provider, "gemini",
+        "state_4 owner=lead_orchestrator uses strict structured-output Gemini profile"
     );
     assert_eq!(
         s4.system_task
@@ -854,6 +854,36 @@ fn test_compile_full_mvp_live_plan() {
 
     // Verify code_writer -> Claude ACP
     let s7 = &plan.states["state_7_implementation_started"];
+    assert!(
+        plan.escalation_policies.iter().any(|policy| {
+            policy.policy_id == "lead_implementation_start_quota_escalation"
+                && policy.applies_to_stage_id.as_deref() == Some("state_7_implementation_started")
+        }),
+        "state_7 lead escalation policy should be frozen into the run plan"
+    );
+    for (policy_id, backend_profile_id) in [
+        ("code_writer_quota_escalation", "claude_builder_high"),
+        ("proposal_writer_quota_escalation", "codex_writer_high"),
+        ("gemini_reviewer_quota_escalation", "gemini_review_pro"),
+        ("claude_reviewer_quota_escalation", "claude_product_high"),
+        ("codex_reviewer_quota_escalation", "codex_architect_high"),
+        (
+            "implementation_auditor_quota_escalation",
+            "codex_audit_high",
+        ),
+        ("security_checker_quota_escalation", "claude_security_high"),
+        ("prepush_reviewer_quota_escalation", "claude_prepush_medium"),
+        ("docs_guardian_quota_escalation", "gemini_docs_flash"),
+    ] {
+        assert!(
+            plan.escalation_policies.iter().any(|policy| {
+                policy.policy_id == policy_id
+                    && policy.applies_to_backend_profile_id.as_deref()
+                        == Some(backend_profile_id)
+            }),
+            "{policy_id} should be frozen into the run plan for backend_profile {backend_profile_id}"
+        );
+    }
     let cw_task = s7.tasks.iter().find(|t| t.agent.agent_id == "code_writer");
     assert!(cw_task.is_some(), "state_7 should have code_writer task");
     assert_eq!(cw_task.unwrap().agent.provider, "claude");

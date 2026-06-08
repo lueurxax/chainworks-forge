@@ -2,7 +2,7 @@
 
 Stable reference for the execution-truth, settlement, and recovery contract.
 
-P058 layers a chain-level escalation contract on top of agent-level execution truth: tier advancement, trigger classification, ledger persistence, and recovery semantics are owned by the Rust control plane. See [escalation-policies.md](escalation-policies.md) for policy schema, pause-reason catalog, and rollout phasing. The escalation-specific invariants relevant to recovery readers are pinned in *Escalation chain invariants* below.
+Configurable escalation policies layer a chain-level contract on top of agent-level execution truth: tier advancement, trigger classification, ledger persistence, and recovery semantics are owned by the Rust control plane. See [escalation-policies.md](escalation-policies.md) for policy schema, pause-reason catalog, and rollout state. The escalation-specific invariants relevant to recovery readers are pinned in *Escalation chain invariants* below.
 
 ## Purpose
 
@@ -459,7 +459,7 @@ High-signal proof owners include:
 - `ResumeManagerTests` for interrupted-run classification and approval restore behavior,
 - `RecoveryCoordinatorTests` for narrow recovery action ownership,
 - failed-stage evidence and report/recovery fallback suites,
-- `./scripts/test-gate.sh proposal-058` for Rust ACP runtime facts, claim/start ownership,
+- retained escalation proof gate for Rust ACP runtime facts, claim/start ownership,
   source-generation artifact ownership, GraphQL/MCP readback parity, and provider-quota
   retry ledger behavior.
 

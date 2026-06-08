@@ -1470,6 +1470,9 @@ final class Proposal036UXConsolidationTests: XCTestCase {
                     isCurrent: true,
                     iterationText: "Iteration 1",
                     attemptText: "Attempt 2",
+                    startedLabel: "Started 08:03",
+                    completedLabel: nil,
+                    durationLabel: "Duration: 2m 4s",
                     approvalRequired: true,
                     artifactCount: 3,
                     communicationCount: 4,
@@ -1516,6 +1519,8 @@ final class Proposal036UXConsolidationTests: XCTestCase {
         XCTAssertEqual(stage?.ownerAgentTitle, "Proposal Writer")
         XCTAssertEqual(stage?.status, "active")
         XCTAssertEqual(stage?.isCurrent, true)
+        XCTAssertEqual(stage?.startedLabel, "Started 08:03")
+        XCTAssertEqual(stage?.durationLabel, "Duration: 2m 4s")
         XCTAssertEqual(stage?.artifactCount, 3)
         XCTAssertEqual(stage?.occurrences.first?.taskName, "Draft proposal")
         XCTAssertEqual(stage?.transitions.first?.toLabel, "Proposal reviewed")
@@ -1583,6 +1588,9 @@ final class Proposal036UXConsolidationTests: XCTestCase {
             isCurrent: isCurrent,
             iterationText: nil,
             attemptText: "Attempt 1",
+            startedLabel: isCurrent ? "Started 08:00" : "Started 07:55",
+            completedLabel: isCurrent ? nil : "Done 08:05",
+            durationLabel: isCurrent ? nil : "Duration: 10m 0s",
             approvalRequired: stageID.contains("approval") || stageID.contains("manual_release"),
             artifactCount: ordinal == 12 ? 1 : 0,
             communicationCount: 0,

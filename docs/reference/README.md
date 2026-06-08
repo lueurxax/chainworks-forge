@@ -2,7 +2,7 @@
 
 Implementation-oriented reference docs for Chainworks Forge.
 
-If you need a current-head orientation first, start with [current-system-baseline.md](current-system-baseline.md), then read the relevant subsystem documents below.
+If you need a current-head orientation first, start with [current-system-baseline.md](current-system-baseline.md). Its code-derived inventory names the implementation owners to check when behavior landed outside proposal closeout; then read the relevant subsystem documents below.
 
 ## Foundation Layer
 
@@ -34,7 +34,7 @@ If you need a current-head orientation first, start with [current-system-baselin
 - [rust-control-plane.md](rust-control-plane.md) — Rust + SQLite local control-plane daemon: architecture, crate layout, workflow engine, ACP transport, persistence model, side-effect ledger, targeted retry authority and retry payload recovery, boundary shape, configuration, capacity-aware scheduling, DbWriter gateway, write serialization, evidence spooling, provider toolchain homes, **mediation settlement**, and generated-state housekeeping
 - [escalation-policies.md](escalation-policies.md) — Configurable agent escalation chains, policy definition, runtime behavior, and operational controls
 - [local-daemon-lifecycle-supervision-and-packaging.md](local-daemon-lifecycle-supervision-and-packaging.md) — Local daemon lifecycle, supervision, health/readiness, packaged-mode paths, SQLite startup safety, failed-serve behavior, diagnostics, and packaging proof lanes
-- [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) — Bearer auth, caller-scoped capability filtering, per-command audit journaling, **mixed inbox (stage approvals + mediation confirmations)**, and `journal_id` surfacing on MCP + GraphQL northbound surfaces
+- [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) — Bearer auth, caller-scoped capability filtering, full current MCP capability registry, per-command audit journaling, **mixed inbox (stage approvals + mediation confirmations)**, and `journal_id` surfacing on MCP + GraphQL northbound surfaces
 - [agent-work-continuation.md](agent-work-continuation.md) — Agent work continuation API contracts: `agents.continue_work` / `agents.continuation_status` / `agents.continuation_candidates` MCP commands, read-only GraphQL continuation status/candidate/history/metrics surfaces, and materialized JSON Schemas under [`p086/schemas/`](p086/schemas) for canonical request/response envelopes and continuation artifacts
 - [auto-retry-observation-ledger.md](auto-retry-observation-ledger.md) — Observe-only auto-retry ledger, known-issue catalog, MCP readback, rollup tooling, and retained proof-gate aliases
 - [ui-action-boundary.md](ui-action-boundary.md) — Governed SwiftUI action boundary: GraphQL reads/subscriptions plus approval mutations; non-approval operations are MCP-only

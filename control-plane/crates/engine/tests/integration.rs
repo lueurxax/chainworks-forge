@@ -6,11 +6,12 @@ use std::sync::{
 use chrono::Utc;
 use db::pool::create_pool;
 use db::repos::{
-    agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts, artifacts,
-    code_writer_completion_receipts, ideas, projections, retry_operator_instructions,
-    retry_payload_recovery_events, retry_stage_execution_authorities, runs, sessions, side_effects,
-    stages, work_items, workflow_conflicts,
+    agent_execution_runtime_facts, agent_executions, agent_retry_budget_ledger, approvals,
+    artifact_contracts, artifacts, code_writer_completion_receipts, ideas, projections,
+    retry_operator_instructions, retry_payload_recovery_events, retry_stage_execution_authorities,
+    runs, sessions, side_effects, stages, work_items, workflow_conflicts,
 };
+use db::work_item::{WorkItemKind, WorkItemStatus};
 use domain::agent::{
     AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
     AgentStatus, OperatorActionHint,
@@ -20,8 +21,8 @@ use domain::artifact::{Artifact, ArtifactFormat};
 use domain::commands::{
     ApprovalResolutionDecision, ApproveStageCmd, CallerContext, Command,
     OverrideLegacyDiscoveryPolicyCmd, RejectStageCmd, ResolveApprovalCmd,
-    ResolveWorkflowConflictTransitionCmd, RetryStageCmd, RunStewardAnalysisCmd, StartRunCmd,
-    WorkflowLoopBudgetExtensionCmd,
+    ResolveWorkflowConflictTransitionCmd, RetrofitCatalogSnapshotCmd, RetryStageCmd,
+    RunStewardAnalysisCmd, StartRunCmd, WorkflowLoopBudgetExtensionCmd,
 };
 use domain::discovery::LegacyBroadDiscoveryPolicy;
 use domain::idea::{Idea, IdeaStatus};
@@ -32,18 +33,19 @@ use domain::retry_authority::{
 use domain::retry_instruction::RetryInstructionScopeKind;
 use domain::run::{Run, RunStatus};
 use domain::side_effect::{EffectKind, SideEffect, SideEffectId, SideEffectStatus};
-use domain::stage::{StageExecution, StageStatus};
+use domain::stage::{StageExecution, StageSettlementKind, StageStatus};
 use domain::workflow_conflict::{
     candidate_transition_hash, CandidateTransitionEvaluation, CandidateTransitionResult,
     WorkflowConflictReason, WorkflowConflictRecord, WorkflowConflictStatus,
     WorkflowTransitionCursorRecord,
 };
 use domain::PrincipalClass;
-use engine::command_handler::CommandHandler;
+use engine::command_handler::{CommandHandler, CommandResult};
 use engine::event_bus;
 use engine::orchestrator::Orchestrator;
 use engine::recovery::RecoveryService;
 use engine::work_queue::WorkQueue;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 static CODEX_CONFIG_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -231,6 +233,27 @@ fn make_command_handler(pool: sqlx::SqlitePool) -> Arc<CommandHandler> {
     Arc::new(CommandHandler::new(pool, events, work_queue))
 }
 
+fn operator_mcp_caller(tool: &str) -> CallerContext {
+    CallerContext {
+        surface: domain::commands::CallerSurface::Mcp,
+        principal_id: "operator-test".into(),
+        principal_class: PrincipalClass::Operator,
+        caller_tool: tool.into(),
+        request_id: None,
+        caller_class: None,
+        token_id: None,
+        mcp_idempotency_key: None,
+        mcp_idempotency_request_hash: None,
+        boundary_row_id: None,
+    }
+}
+
+fn sha256_hex(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn test_workflow_yaml_path() -> String {
     format!(
         "{}/../../../examples/workflows/workflow.yaml",
@@ -296,6 +319,87 @@ fn make_agent_execution(
         escalation_digest_version: None,
         escalation_ledger_id: None,
     }
+}
+
+#[tokio::test]
+async fn governed_catalog_snapshot_retrofit_updates_blocked_run_escalation_policy_only() {
+    let pool = test_pool().await;
+    let handler = make_command_handler(pool.clone());
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+
+    let workflow_path = format!(
+        "{}/../../../examples/workflows/full-mvp-live.yaml",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let catalog_path = test_agent_catalog_yaml_path();
+    let current_plan = workflow::compiler::compile(&workflow_path, &catalog_path).unwrap();
+    let mut old_catalog_snapshot: serde_json::Value =
+        serde_json::from_str(&current_plan.catalog_snapshot_json).unwrap();
+    old_catalog_snapshot
+        .as_object_mut()
+        .unwrap()
+        .remove("escalation_policies");
+    let old_catalog_snapshot_json = serde_json::to_string(&old_catalog_snapshot).unwrap();
+    let old_catalog_snapshot_hash = sha256_hex(&old_catalog_snapshot_json);
+
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.workflow_id = "full_mvp_live".into();
+    run.workflow_title = "Full MVP Live".into();
+    run.current_state = Some("state_7_implementation_started".into());
+    run.workflow_yaml_path = Some(workflow_path);
+    run.agent_catalog_yaml_path = Some(catalog_path);
+    run.workflow_snapshot_hash = Some(current_plan.workflow_snapshot_hash.clone());
+    run.workflow_snapshot_json = Some(current_plan.workflow_snapshot_json.clone());
+    run.catalog_snapshot_hash = Some(old_catalog_snapshot_hash.clone());
+    run.catalog_snapshot_json = Some(old_catalog_snapshot_json);
+    runs::insert(&pool, &run).await.unwrap();
+
+    let commanded = handler
+        .handle(
+            Command::RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd {
+                run_id,
+                expected_catalog_snapshot_hash: old_catalog_snapshot_hash.clone(),
+                reason: "backfill P058 escalation policy for a pre-policy blocked run".into(),
+                scope: Default::default(),
+            }),
+            operator_mcp_caller("runs.retrofit_catalog_snapshot"),
+        )
+        .await
+        .unwrap();
+
+    let CommandResult::CatalogSnapshotRetrofitted {
+        previous_catalog_snapshot_hash,
+        new_catalog_snapshot_hash,
+        applied_policy_ids,
+        ..
+    } = commanded.result
+    else {
+        panic!("unexpected command result");
+    };
+    assert_eq!(previous_catalog_snapshot_hash, old_catalog_snapshot_hash);
+    assert_eq!(
+        new_catalog_snapshot_hash,
+        current_plan.catalog_snapshot_hash
+    );
+    assert_eq!(
+        applied_policy_ids,
+        vec!["lead_implementation_start_quota_escalation".to_string()]
+    );
+
+    let loaded = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(
+        loaded.catalog_snapshot_hash.as_deref(),
+        Some(current_plan.catalog_snapshot_hash.as_str())
+    );
+    let updated_plan = workflow::compiler::compile_from_snapshot_json(
+        loaded.workflow_snapshot_json.as_deref().unwrap(),
+        loaded.catalog_snapshot_json.as_deref().unwrap(),
+        loaded.agent_catalog_yaml_path.as_deref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(updated_plan.escalation_policies.len(), 1);
 }
 
 fn make_workflow_conflict(
@@ -4387,6 +4491,201 @@ async fn test_override_legacy_discovery_policy_rolls_back_journal_on_duplicate_f
 }
 
 #[tokio::test]
+async fn quota_ledger_elapsed_auto_resume_schedules_stage_retry_once() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("implementation".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(old_stage_exec_id, run_id, StageStatus::Failed);
+    stage.stage_id = "implementation".into();
+    stage.attempt_number = 1;
+    stage.completed_at = Some(Utc::now() - chrono::Duration::minutes(5));
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let mut agent = make_agent_execution(old_stage_exec_id, AgentStatus::Failed);
+    agent.agent_id = "code_writer".into();
+    agent.completed_at = Some(Utc::now() - chrono::Duration::minutes(5));
+    agent_executions::insert(&pool, &agent).await.unwrap();
+
+    let retry_after = Utc::now() - chrono::Duration::minutes(1);
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent.id, Utc::now());
+    facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+    facts.retry_after = Some(retry_after);
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        old_stage_exec_id,
+        agent.id,
+        Some(retry_after),
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let scheduled = handler
+        .auto_resume_elapsed_quota_ledgers(Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(scheduled, 1);
+
+    let old_after = stages::find_by_id(&pool, old_stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old_after.status, StageStatus::Skipped);
+
+    let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    let retry_stage = all_stages
+        .iter()
+        .find(|s| s.stage_id == "implementation" && s.attempt_number == 2)
+        .expect("elapsed quota ledger should create retry attempt");
+    assert_eq!(retry_stage.status, StageStatus::Pending);
+    assert_eq!(
+        retry_stage.retry_reason.as_deref(),
+        Some("quota_ledger_reset_elapsed_auto_retry")
+    );
+
+    let authority = retry_stage_execution_authorities::find_active_by_run_stage(
+        &pool,
+        run_id,
+        "implementation",
+    )
+    .await
+    .unwrap()
+    .expect("auto retry should create an active retry authority");
+    assert_eq!(authority.target_stage_execution_id, retry_stage.id);
+
+    let pending = work_items::list_by_status(&pool, WorkItemStatus::Pending)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, WorkItemKind::AdvanceRun);
+    assert!(pending[0]
+        .payload_json
+        .contains("quota_ledger_reset_elapsed_auto_retry"));
+
+    let mut tx = pool.begin().await.unwrap();
+    let consumed = agent_retry_budget_ledger::find_by_id_tx(&mut tx, &ledger.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(consumed.normal_budget_consumed);
+    assert_eq!(consumed.state, "reset_elapsed_retry_scheduled");
+    assert!(consumed.early_retry_journal_id.is_some());
+
+    let scheduled_again = handler
+        .auto_resume_elapsed_quota_ledgers(Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(scheduled_again, 0);
+
+    let retry_stage_count = stages::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.stage_id == "implementation" && s.attempt_number > 1)
+        .count();
+    assert_eq!(retry_stage_count, 1, "auto retry must be idempotent");
+}
+
+#[tokio::test]
+async fn quota_ledger_elapsed_auto_resume_skips_when_run_has_active_work() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("implementation".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(old_stage_exec_id, run_id, StageStatus::Failed);
+    stage.stage_id = "implementation".into();
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let mut agent = make_agent_execution(old_stage_exec_id, AgentStatus::Failed);
+    agent.agent_id = "code_writer".into();
+    agent.completed_at = Some(Utc::now() - chrono::Duration::minutes(5));
+    agent_executions::insert(&pool, &agent).await.unwrap();
+
+    let retry_after = Utc::now() - chrono::Duration::minutes(1);
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent.id, Utc::now());
+    facts.failure_kind = Some(AgentFailureKind::ProviderQuota);
+    facts.retry_after = Some(retry_after);
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+    let ledger = agent_retry_budget_ledger::upsert_quota_failure(
+        &pool,
+        run_id,
+        old_stage_exec_id,
+        agent.id,
+        Some(retry_after),
+    )
+    .await
+    .unwrap();
+
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "active-work-for-run".into(),
+            kind: WorkItemKind::AdvanceRun,
+            payload_json: serde_json::json!({
+                "schema_version": "advance_run_payload.v1",
+                "run_id": run_id.to_string(),
+                "stage_id": "implementation"
+            })
+            .to_string(),
+            status: WorkItemStatus::Pending,
+            run_id: Some(run_id),
+            stage_id: Some("implementation".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 0,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let scheduled = handler
+        .auto_resume_elapsed_quota_ledgers(Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(scheduled, 0);
+
+    let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(
+        all_stages
+            .iter()
+            .filter(|s| s.stage_id == "implementation")
+            .count(),
+        1
+    );
+
+    let mut tx = pool.begin().await.unwrap();
+    let unconsumed = agent_retry_budget_ledger::find_by_id_tx(&mut tx, &ledger.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(!unconsumed.normal_budget_consumed);
+    assert_eq!(unconsumed.state, "reset_elapsed");
+}
+
+#[tokio::test]
 async fn test_retry_stage_targets_latest_matching_attempt() {
     let pool = test_pool().await;
 
@@ -4740,6 +5039,177 @@ async fn test_retry_stage_with_agent_execution_id_schedules_single_invoke_attemp
     assert_eq!(
         payload.pointer("/targeted_retry/source_work_item_id"),
         Some(&serde_json::json!(source_work_item_id))
+    );
+}
+
+#[tokio::test]
+async fn test_retry_stage_on_blocked_implementation_review_targets_single_failed_agent_by_default()
+{
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("state_9_implementation_reviewed".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut old_stage = make_stage(old_stage_exec_id, run_id, StageStatus::Failed);
+    old_stage.stage_id = "state_9_implementation_reviewed".into();
+    old_stage.label = "Implementation Review".into();
+    old_stage.attempt_number = 3;
+    stages::insert(&pool, &old_stage).await.unwrap();
+
+    let mut successful_security = make_agent_execution(old_stage_exec_id, AgentStatus::Completed);
+    successful_security.agent_id = "security_checker".into();
+    successful_security.completed_at = Some(Utc::now());
+    agent_executions::insert(&pool, &successful_security)
+        .await
+        .unwrap();
+
+    let mut successful_docs = make_agent_execution(old_stage_exec_id, AgentStatus::Completed);
+    successful_docs.agent_id = "docs_guardian".into();
+    successful_docs.completed_at = Some(Utc::now());
+    agent_executions::insert(&pool, &successful_docs)
+        .await
+        .unwrap();
+
+    let mut failed_auditor = make_agent_execution(old_stage_exec_id, AgentStatus::Failed);
+    failed_auditor.agent_id = "proposal_implementation_auditor".into();
+    failed_auditor.provider = "codex_acp".into();
+    failed_auditor.completed_at = Some(Utc::now());
+    let failed_auditor_id = failed_auditor.id;
+    agent_executions::insert(&pool, &failed_auditor)
+        .await
+        .unwrap();
+    agent_execution_runtime_facts::upsert(
+        &pool,
+        &AgentExecutionRuntimeFacts {
+            agent_execution_id: failed_auditor_id,
+            failure_kind: Some(AgentFailureKind::ProviderTimeout),
+            output_settlement: AgentOutputSettlement::MissingRequiredOutputs,
+            ..AgentExecutionRuntimeFacts::defaults_for(failed_auditor_id, Utc::now())
+        },
+    )
+    .await
+    .unwrap();
+
+    let source_work_item_id = format!("p058-invoke:{old_stage_exec_id}:2");
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: source_work_item_id.clone(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "state_9_implementation_reviewed",
+                "stage_execution_id": old_stage_exec_id.to_string(),
+                "task_name": "audit_implementation",
+                "agent_id": "proposal_implementation_auditor",
+                "provider": "codex_acp",
+                "model": "gpt-5.5",
+                "task_index": 2,
+                "total_tasks": 4,
+                "declared_outputs": [],
+                "p058_claimed": {
+                    "agent_execution_id": failed_auditor_id.to_string()
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Completed,
+            run_id: Some(run_id),
+            stage_id: Some("state_9_implementation_reviewed".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "state_9_implementation_reviewed".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let old = stages::find_by_id(&pool, old_stage_exec_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.status, StageStatus::Skipped);
+
+    let all_stages = stages::list_by_run(&pool, run_id).await.unwrap();
+    let retry_stage = all_stages
+        .iter()
+        .find(|stage| {
+            stage.stage_id == "state_9_implementation_reviewed" && stage.attempt_number == 4
+        })
+        .expect("implicit targeted retry should create the next implementation review attempt");
+    assert_eq!(retry_stage.status, StageStatus::Running);
+    assert_eq!(
+        retry_stage.retry_reason.as_deref(),
+        Some("operator_targeted_retry:proposal_implementation_auditor")
+    );
+
+    let pending_items = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.status == db::work_item::WorkItemStatus::Pending)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pending_items.len(),
+        1,
+        "default retry should enqueue only the failed review agent"
+    );
+    assert_eq!(
+        pending_items[0].kind,
+        db::work_item::WorkItemKind::InvokeAgent
+    );
+    let payload: serde_json::Value = serde_json::from_str(&pending_items[0].payload_json).unwrap();
+    assert_eq!(
+        payload["agent_id"],
+        serde_json::json!("proposal_implementation_auditor")
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/source_agent_execution_id"),
+        Some(&serde_json::json!(failed_auditor_id.to_string()))
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/source_work_item_id"),
+        Some(&serde_json::json!(source_work_item_id))
+    );
+
+    let authority = retry_stage_execution_authorities::find_active_by_run_stage(
+        &pool,
+        run_id,
+        "state_9_implementation_reviewed",
+    )
+    .await
+    .unwrap()
+    .expect("implicit targeted retry should create a targeted retry authority");
+    assert_eq!(
+        authority.entry_kind,
+        RetryAuthorityEntryKind::TargetedAgentRetry
+    );
+    assert_eq!(
+        authority.source_agent_execution_id.as_deref(),
+        Some(failed_auditor_id.to_string().as_str())
     );
 }
 
@@ -6164,6 +6634,154 @@ async fn test_retry_stage_rejects_active_latest_attempt() {
         result.is_err(),
         "retry must reject while the latest stage attempt is still active"
     );
+}
+
+#[tokio::test]
+async fn retry_stage_rejects_cancelled_run_even_when_stage_is_blocked() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("flaky_stage".into());
+    run.cancellation_requested_at = Some(Utc::now() - chrono::Duration::minutes(10));
+    run.cancellation_settled_at = Some(Utc::now() - chrono::Duration::minutes(9));
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut blocked = make_stage(StageExecutionId::new(), run_id, StageStatus::Blocked);
+    blocked.stage_id = "flaky_stage".into();
+    blocked.attempt_number = 1;
+    stages::insert(&pool, &blocked).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let result = handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "flaky_stage".into(),
+                consume_quota_budget_now: true,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!("cancelled run retry must be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("cannot be retried"),
+        "unexpected error: {err}"
+    );
+    let stages_after = stages::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(
+        stages_after.len(),
+        1,
+        "rejected retry must not create a new stage attempt"
+    );
+    let stored_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(stored_run.status, RunStatus::Blocked);
+    assert!(stored_run.cancellation_settled_at.is_some());
+}
+
+#[tokio::test]
+async fn startup_repair_restores_cancelled_run_terminal_invariant() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+    let settled_at = Utc::now() - chrono::Duration::hours(1);
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("flaky_stage".into());
+    run.cancellation_requested_at = Some(settled_at - chrono::Duration::minutes(1));
+    run.cancellation_settled_at = Some(settled_at);
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut retry_stage = make_stage(stage_execution_id, run_id, StageStatus::Running);
+    retry_stage.stage_id = "flaky_stage".into();
+    retry_stage.attempt_number = 2;
+    retry_stage.retry_reason = Some("operator_retry".into());
+    stages::insert(&pool, &retry_stage).await.unwrap();
+
+    let work_queue = WorkQueue::new(pool.clone());
+    work_queue
+        .enqueue(
+            db::work_item::WorkItemKind::AdvanceRun,
+            Some(run_id),
+            Some("flaky_stage".into()),
+            serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "flaky_stage",
+                "target_stage_execution_id": stage_execution_id.to_string(),
+                "retry_authority_id": format!("p091-retry-authority:{stage_execution_id}"),
+                "enqueue_reason": "retry_stage"
+            }),
+        )
+        .await
+        .unwrap();
+    retry_stage_execution_authorities::create_active(
+        &pool,
+        &RetryStageExecutionAuthority {
+            id: format!("p091-retry-authority:{stage_execution_id}"),
+            run_id,
+            stage_id: "flaky_stage".into(),
+            target_stage_execution_id: stage_execution_id,
+            entry_kind: RetryAuthorityEntryKind::FullStageRetry,
+            source_command_journal_id: Some("retry-journal".into()),
+            source_retry_work_item_id: Some(stage_execution_id.to_string()),
+            source_invoke_work_item_id: None,
+            source_agent_execution_id: None,
+            authority_state: RetryAuthorityState::Active,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            terminal_reason: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::repos::projections::rebuild_all_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let stale_projection = artifact_contracts::find_run_state_projection(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("stale projection");
+    assert_eq!(stale_projection.run_state_json["status"], "blocked");
+
+    let events = event_bus::new_bus(64);
+    let recovery = RecoveryService::new(pool.clone(), work_queue, events);
+    recovery.run_startup_repair().await.unwrap();
+
+    let repaired_run = runs::find_by_id(&pool, run_id).await.unwrap().unwrap();
+    assert_eq!(repaired_run.status, RunStatus::Cancelled);
+    let repaired_stage = stages::find_by_id(&pool, stage_execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired_stage.status, StageStatus::Skipped);
+    assert_eq!(
+        repaired_stage.settlement_kind,
+        Some(StageSettlementKind::Skipped)
+    );
+    let active_authority =
+        retry_stage_execution_authorities::find_active_by_run_stage(&pool, run_id, "flaky_stage")
+            .await
+            .unwrap();
+    assert!(active_authority.is_none());
+    let projection = artifact_contracts::find_run_state_projection(&pool, run_id)
+        .await
+        .unwrap()
+        .expect("repaired projection");
+    assert_eq!(projection.run_state_json["status"], "cancelled");
 }
 
 #[tokio::test]

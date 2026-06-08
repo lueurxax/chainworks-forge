@@ -51,7 +51,7 @@ MCP readback may exist for agents, CLI/operator-debug tooling, automation, and a
 
 ### 2.3 Control-plane discovery truth remains authoritative
 
-P069 may request additional GraphQL projection fields, but it must not create a second discovery decision model in Swift. The bounded discovery and P058 settlement truth remains authoritative.
+P069 may request additional GraphQL projection fields, but it must not create a second discovery decision model in Swift. The bounded discovery and implemented output-settlement truth in [output contracts, failure evidence, and recovery](../reference/output-contracts-failure-evidence-and-recovery.md) remains authoritative.
 
 ---
 
