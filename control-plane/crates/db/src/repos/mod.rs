@@ -22,6 +22,7 @@ pub mod lead_mediation_confirmations;
 pub mod legacy_discovery_overrides;
 pub mod maintenance;
 pub mod mcp_command_idempotency;
+pub mod output_contract_repair;
 pub mod p077_rollout;
 pub mod projection_invalidation;
 pub mod projections;

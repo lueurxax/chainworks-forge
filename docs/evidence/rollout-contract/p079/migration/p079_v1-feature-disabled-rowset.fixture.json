@@ -1,0 +1,48 @@
+{
+  "fixture_id": "p079-v1-feature-disabled-rowset",
+  "description": "Verifies behavior when feature flags are not present in the policy. Runs executed without CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED should produce status=skipped rows (not be absent), so operators can see that repair was evaluated but not engaged.",
+  "migration": "079_p079_output_contract_repair.sql",
+  "scenario": "feature_flag_disabled",
+  "given": {
+    "policy_feature_flags": [],
+    "initial_failure_class": "missing_required_outputs",
+    "expected_status": "skipped",
+    "expected_presentation_category": "skipped",
+    "expected_recommended_next_action": "none"
+  },
+  "sample_row": {
+    "repair_attempt_id": "rep-feature-disabled-001",
+    "schema_version": "output_contract_repair.v1",
+    "run_id": "run-feature-disabled-001",
+    "stage_execution_id": "stage-001",
+    "agent_execution_id": "agent-001",
+    "session_generation_id": "session-001",
+    "role": "lead_orchestrator",
+    "provider_family": "gemini",
+    "adapter_family": "gemini",
+    "required_output_mode": "strict_structured",
+    "initial_failure_class": "missing_required_outputs",
+    "status": "skipped",
+    "presentation_category": "skipped",
+    "recommended_next_action": "none",
+    "final_output_settlement": null,
+    "policy_feature_flags_json": "[]",
+    "repair_budget_consumed": 0,
+    "fallback_budget_consumed": 0,
+    "evidence_version": 1,
+    "projection_integrity": "fresh",
+    "projection_rebuild_attempts": 0
+  },
+  "assertions": [
+    {
+      "field": "status",
+      "expected": "skipped",
+      "description": "Feature-disabled runs record skipped status so operators can distinguish from not_attempted"
+    },
+    {
+      "field": "policy_feature_flags_json",
+      "expected": "[]",
+      "description": "Empty policy flags array serialized correctly"
+    }
+  ]
+}

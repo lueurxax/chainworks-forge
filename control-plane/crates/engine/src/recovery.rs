@@ -13,9 +13,9 @@ use tracing::{info, warn};
 use acp::AcpRuntimeManager;
 use db::repos::{
     agent_execution_runtime_facts, agent_executions, approvals, artifact_contracts,
-    code_writer_completion_receipts, escalation, projections, retry_payload_recovery_events,
-    retry_stage_execution_authorities, runs, sessions, side_effects, stages, startup_repairs,
-    work_items, workflow_conflicts,
+    code_writer_completion_receipts, escalation, output_contract_repair as ocr_repo, projections,
+    retry_payload_recovery_events, retry_stage_execution_authorities, runs, sessions, side_effects,
+    stages, startup_repairs, work_items, workflow_conflicts,
 };
 use db::work_item::{WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
@@ -1016,6 +1016,21 @@ impl RecoveryService {
             }
             if repaired_run {
                 runs_repaired += 1;
+            }
+        }
+
+        // P079 REL-r2-2: reclaim expired repair/fallback leases left from a prior
+        // daemon instance that crashed or was shut down.
+        match self.run_p079_lease_sweep().await {
+            Ok(reclaimed) if reclaimed > 0 => {
+                warn!(
+                    reclaimed = reclaimed,
+                    "Startup recovery reclaimed expired P079 repair/fallback leases"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "P079 lease TTL sweep failed during startup recovery");
             }
         }
 
@@ -2739,6 +2754,75 @@ impl RecoveryService {
                 details.join(", ")
             ))
         }
+    }
+
+    /// Reclaim all P079 leases whose TTL has expired (REL-r2-2).
+    ///
+    /// Called on daemon startup. Budget rules:
+    ///  - `reserved` lease: budget NOT consumed; result = unavailable; reason = ttl_expired_reserved
+    ///  - `prompt_sent` lease: budget IS consumed; result = failed_transport; reason = ttl_expired_prompt_sent
+    ///
+    /// Each reclamation is atomic (event + lease in one transaction). On error, logs
+    /// and continues so a single bad row doesn't block recovery of others.
+    pub async fn run_p079_lease_sweep(&self) -> Result<usize> {
+        let now_iso = Utc::now().to_rfc3339();
+        let expired = match ocr_repo::list_expired_active_leases(&self.pool, &now_iso).await {
+            Ok(leases) => leases,
+            Err(e) => {
+                warn!(error = %e, "P079 lease sweep: failed to list expired leases; skipping sweep");
+                return Ok(0);
+            }
+        };
+
+        let mut reclaimed = 0usize;
+        for lease in &expired {
+            let reclaim_ts = Utc::now().to_rfc3339();
+            let (reason, event_status, event_presentation, budget_consumed) =
+                match lease.lease_state {
+                    domain::output_contract_repair::LeaseState::Reserved => {
+                        ("ttl_expired_reserved", "blocked", "blocked", false)
+                    }
+                    domain::output_contract_repair::LeaseState::PromptSent => {
+                        ("ttl_expired_prompt_sent", "failed", "failed", true)
+                    }
+                    domain::output_contract_repair::LeaseState::Settled => continue,
+                };
+
+            match ocr_repo::reclaim_expired_lease_and_event(
+                &self.pool,
+                &lease.lease_key,
+                &lease.repair_event_id,
+                event_status,
+                event_presentation,
+                "manual_investigation",
+                reason,
+                budget_consumed,
+                &reclaim_ts,
+            )
+            .await
+            {
+                Ok(()) => {
+                    reclaimed += 1;
+                    warn!(
+                        lease_key = %lease.lease_key,
+                        repair_event_id = %lease.repair_event_id,
+                        prior_state = %lease.lease_state,
+                        reclamation_reason = %reason,
+                        budget_consumed = budget_consumed,
+                        "P079 lease TTL sweep: reclaimed expired lease"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        lease_key = %lease.lease_key,
+                        repair_event_id = %lease.repair_event_id,
+                        error = %e,
+                        "P079 lease TTL sweep: reclamation failed (CAS or already terminal)"
+                    );
+                }
+            }
+        }
+        Ok(reclaimed)
     }
 }
 

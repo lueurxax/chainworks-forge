@@ -1,0 +1,35 @@
+{
+  "fixture_id": "p079-graphql-sdl-parity",
+  "description": "Schema-level assertions for P079 GraphQL SDL parity (api-contract-r4-001, api-contract-r4-002). Validates that the output_contract_repair readback surface uses snake_case field names in MCP/run-report and camelCase in GraphQL SDL.",
+  "contract": "api-contract-r4-001, api-contract-r4-002",
+  "status": "partial_implementation",
+  "note": "AgentExecution.outputContractRepair GraphQL field is implemented in graphql-server/src/types/stage.rs as Json<serde_json::Value> (dynamic JSON scalar), not as the typed OutputContractRepairEvidence SDL surface specified in graphql_sdl_appendix. MCP and run-report snake_case readback is implemented. Full SDL parity (typed GraphQL object with named enum fields per api-contract-r4-001/r4-002) is deferred until the runtime lane is wired. When typed SDL is added the 'status' must change to 'implemented'.",
+  "current_implementation": {
+    "graphql_field_exists": true,
+    "graphql_return_type": "Json<serde_json::Value>",
+    "typed_sdl_surface": false,
+    "mcp_snake_case_readback": true,
+    "projection_parity_test": true
+  },
+  "expected_graphql_field": {
+    "parent_type": "AgentExecution",
+    "field_name": "outputContractRepair",
+    "return_type": "OutputContractRepairEvidence",
+    "nullable": true
+  },
+  "expected_mcp_shape": {
+    "field_name": "output_contract_repair",
+    "schema_version": "output_contract_repair.v1",
+    "pk_field": "repair_attempt_id"
+  },
+  "schema_assertions": {
+    "no_redeclared_builtin_scalars": true,
+    "snake_case_in_mcp": true,
+    "camel_case_in_graphql": true,
+    "required_output_binding_pk_field": "name",
+    "budget_max_fields_present": ["repair_max_per_invocation", "fallback_max_per_invocation"],
+    "transcript_recovery_subtype_field": "result_subtype",
+    "closed_status_values": ["not_attempted", "in_progress", "recovered", "blocked", "skipped", "cancelled", "failed"],
+    "closed_presentation_category_values": ["informational", "recovered", "blocked", "skipped", "failed", "cancelled"]
+  }
+}

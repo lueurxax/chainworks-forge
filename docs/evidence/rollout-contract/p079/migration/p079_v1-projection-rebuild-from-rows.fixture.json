@@ -1,0 +1,51 @@
+{
+  "fixture_id": "p079-v1-projection-rebuild-from-rows",
+  "description": "Asserts projection_rebuild_attempts mechanics: after projection_integrity becomes 'stale', increment projection_rebuild_attempts up to PROJECTION_REBUILD_MAX_ATTEMPTS (12); at ceiling set projection_integrity='permanently_stale'. REL-r2-9.",
+  "migration": "079_p079_output_contract_repair.sql",
+  "constants": {
+    "PROJECTION_REBUILD_MAX_ATTEMPTS": 12,
+    "projection_schema_version": "output_contract_repair_events_v1"
+  },
+  "transitions": [
+    {
+      "step": "initial",
+      "projection_integrity": "fresh",
+      "projection_rebuild_attempts": 0,
+      "projection_stale_since": null
+    },
+    {
+      "step": "first_stale",
+      "projection_integrity": "stale",
+      "projection_rebuild_attempts": 0,
+      "projection_stale_since": "2026-05-30T10:00:00Z",
+      "trigger": "upstream content change detected"
+    },
+    {
+      "step": "rebuild_attempt_1",
+      "projection_integrity": "stale",
+      "projection_rebuild_attempts": 1,
+      "trigger": "rebuild attempted but failed"
+    },
+    {
+      "step": "rebuild_attempt_12_ceiling",
+      "projection_integrity": "permanently_stale",
+      "projection_rebuild_attempts": 12,
+      "trigger": "12th consecutive rebuild failure triggers permanent stale"
+    }
+  ],
+  "assertions": [
+    {
+      "description": "projection_rebuild_attempts is NOT NULL and defaults to 0",
+      "sql": "SELECT projection_rebuild_attempts FROM output_contract_repair_events WHERE repair_attempt_id = 'X'",
+      "expected_default": 0
+    },
+    {
+      "description": "projection_integrity CHECK constraint rejects invalid values",
+      "invalid_values": ["unknown", "rebuilding", ""]
+    },
+    {
+      "description": "permanently_stale is a terminal state — no further rebuild attempts",
+      "terminal": true
+    }
+  ]
+}

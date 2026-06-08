@@ -10980,7 +10980,10 @@ sys.exit(0)
 #[cfg(unix)]
 #[tokio::test]
 async fn invoke_agent_repairs_missing_required_output_in_same_live_session() {
-    use acp::adapters::claude::ClaudeAgentAdapter;
+    use acp::adapters::{
+        claude::ClaudeAgentAdapter, AcpAdapter, AcpLaunchSpec, AcpSessionNewSpec,
+        LaunchResourceGuard,
+    };
     use acp::AcpRuntimeManager;
     use engine::executor::BackgroundExecutor;
     use std::os::unix::fs::PermissionsExt;
@@ -11042,9 +11045,35 @@ sys.exit(0)
     perms.set_mode(0o755);
     std::fs::set_permissions(&script, perms).unwrap();
 
-    let fixture_adapter = Arc::new(ClaudeAgentAdapter::new_with_binary(
-        script.to_str().unwrap(),
-    )) as Arc<dyn acp::adapters::AcpAdapter>;
+    struct FixtureNamedClaudeAdapter {
+        inner: ClaudeAgentAdapter,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpAdapter for FixtureNamedClaudeAdapter {
+        fn provider_name(&self) -> &str {
+            "fixture"
+        }
+
+        fn prepare_launch_spec(
+            &self,
+            req: &acp::ExecutionRequest,
+            resources: &mut LaunchResourceGuard,
+        ) -> anyhow::Result<AcpLaunchSpec> {
+            self.inner.prepare_launch_spec(req, resources)
+        }
+
+        fn prepare_session_new_spec(
+            &self,
+            req: &acp::ExecutionRequest,
+        ) -> anyhow::Result<AcpSessionNewSpec> {
+            self.inner.prepare_session_new_spec(req)
+        }
+    }
+
+    let fixture_adapter = Arc::new(FixtureNamedClaudeAdapter {
+        inner: ClaudeAgentAdapter::new_with_binary(script.to_str().unwrap()),
+    }) as Arc<dyn acp::adapters::AcpAdapter>;
     let acp = Arc::new(AcpRuntimeManager::new_with_adapters(vec![fixture_adapter]));
 
     let idea_id = IdeaId::new();
@@ -11074,6 +11103,11 @@ sys.exit(0)
         events,
     );
 
+    // Enable P079 repair for the duration of this test. The test uses provider
+    // "fixture", the only same-session repair path allowed until production
+    // providers expose enforceable sandbox/permission restrictions.
+    let _p079_flag = EnvVarRestore::set("CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED", "true");
+
     work_queue
         .enqueue(
             db::work_item::WorkItemKind::InvokeAgent,
@@ -11084,11 +11118,12 @@ sys.exit(0)
                 "stage_id": "contract_repair_stage",
                 "stage_execution_id": stage_exec_id.to_string(),
                 "agent_id": "lead_orchestrator",
-                "provider": "claude",
+                "provider": "fixture",
                 "prompt": "aggregate implementation reviews",
                 "legacy_broad_discovery_policy": "workflow_opt_in",
                 "session_reuse_scope": "same_agent_family_within_run",
                 "session_family_id": "contract-repair",
+                "caller_principal_id": "test_operator",
                 "declared_outputs": [{
                     "output_name": "implementation_review_summary",
                     "target_path": output_path.to_string_lossy(),
@@ -11126,9 +11161,12 @@ sys.exit(0)
         .unwrap()
         .expect("runtime facts should be persisted");
     assert!(facts.valid_required_outputs);
+    // P079: repair-sourced settlement must be ValidOutputsFromRepair, not
+    // ValidOutputsFromCompletedExecution — the typed distinction is required by the
+    // proposal acceptance criteria and the output_contract_repair evidence schema.
     assert_eq!(
         facts.output_settlement,
-        domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution
+        domain::agent::AgentOutputSettlement::ValidOutputsFromRepair
     );
 
     let lineage =
@@ -12730,6 +12768,7 @@ impl acp::adapters::AcpAdapter for P088StaleImplementationActiveAdapter {
                     detail: Some("com.agentclientprotocol.rpc.JsonRpcNotification,diff".into()),
                 },
             ],
+            p079_unsafe_continuation: false,
         };
 
         Err(acp::AcpExecutionError::new(
@@ -15435,6 +15474,8 @@ fn test_execution_request_carries_chainworks_meta_root() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
     assert_eq!(
         req.chainworks_meta_root.as_deref(),

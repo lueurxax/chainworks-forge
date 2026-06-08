@@ -893,6 +893,7 @@ mod tests {
             permission_roundtrips: Vec::new(),
             first_events: Vec::new(),
             last_events: Vec::new(),
+            p079_unsafe_continuation: false,
         }
     }
 

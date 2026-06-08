@@ -403,6 +403,8 @@ async fn p086_mcp_continue_work_reuses_live_acp_session_and_materializes_termina
             mediation_record_id: None,
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
+
+            p079_repair_canonical_paths: None,
         })
         .await
         .unwrap();

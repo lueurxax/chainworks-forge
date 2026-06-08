@@ -303,7 +303,11 @@ async fn latest_execution_has_valid_terminal_outputs(
     };
     Ok(facts.failure_kind.is_none()
         && facts.valid_required_outputs
-        && facts.output_settlement == AgentOutputSettlement::ValidOutputsFromCompletedExecution)
+        && matches!(
+            facts.output_settlement,
+            AgentOutputSettlement::ValidOutputsFromCompletedExecution
+                | AgentOutputSettlement::ValidOutputsFromRepair
+        ))
 }
 
 #[cfg(test)]

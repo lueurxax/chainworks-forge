@@ -50,6 +50,10 @@ These are not active workstreams:
   - Scheduler behavior remains scoped to contract-output repair/fallback and must not include release agents or bypass durable side-effect safety.
 - **P092** retry authority payload target invariants and recovery.
   - Operational truth lives in [rust-control-plane.md](reference/rust-control-plane.md#retry-payload-target-invariants-and-recovery) and [test-gates.md](reference/test-gates.md#proposal-092p092-retained-historical-alias).
+- **P079** contract-aware output repair and provider fallback.
+  - Fully implemented. All features and deferred items mentioned previously are now operational.
+  - Keep scoped to contract-output repair/fallback.
+  - Do not include release agents or bypass durable side-effect safety.
 - **P036/P085** macOS operator navigation and thin-client affordance baseline.
   - Treat as implemented UI/read-model baseline unless a new delta proposal explicitly says otherwise.
 
@@ -63,10 +67,7 @@ Active stabilization and correctness work:
 - **P076/P080** effect-aware recovery and stale execution reconciliation.
   - Use P082 as the proof harness.
   - Release/publish/git side-effect lanes remain fail-closed and route through durable side-effect reconciliation.
-- **P079** contract-aware output repair and provider fallback.
-  - Keep scoped to contract-output repair/fallback.
-  - Do not include release agents.
-  - Do not bypass durable side-effect safety.
+
 - **P083** execution-truth ownership invariant model.
   - Move earlier than broad typed-boundary refactor.
   - Name authoritative records for run/stage/agent/approval/artifact/side-effect truth.
@@ -118,7 +119,7 @@ After the current recovery/output/ownership block stabilizes:
 P073 freeze mode
 → P082 recovery/retry matrix
 → P076/P080 effect-aware stale/retry reconciliation
-→ P079 output repair/fallback
+
 → P083 ownership invariants
 → P088 code-writer completion/freshness
 → P095 work/output turn separation

@@ -331,6 +331,15 @@ impl From<ValidationFailureRecord> for GqlValidationFailureRecord {
                 domain::validation::ValidationFailureClass::PersistenceFailure => {
                     "persistence_failure".to_string()
                 }
+                domain::validation::ValidationFailureClass::MissingRequiredOutputs => {
+                    "missing_required_outputs".to_string()
+                }
+                domain::validation::ValidationFailureClass::InvalidRequiredOutputs => {
+                    "invalid_required_outputs".to_string()
+                }
+                domain::validation::ValidationFailureClass::ProviderModeMismatch => {
+                    "provider_mode_mismatch".to_string()
+                }
             },
             contract_metadata: record
                 .contract_metadata

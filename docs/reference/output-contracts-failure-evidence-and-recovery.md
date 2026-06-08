@@ -677,3 +677,217 @@ Use:
 - [runtime-contract.md](runtime-contract.md) for frozen snapshot and artifact boundaries,
 - [operator-experience.md](operator-experience.md) for shell and recovery presentation rules,
 - [test-gates.md](test-gates.md) for the current verification lanes.
+
+## P079: Output Contract Repair and Fallback Details
+
+### Implementation status
+
+P079 is partially implemented. The schemas, enums, hold conditions, rollback disposition, GraphQL/MCP readback shapes, and SQLite migration described below are wired today. The deterministic fixture same-session repair lane is dispatched by the engine executor with the lease/evidence lifecycle, MCP runtime receipt sanitization (SEC-P079-MCP-001), crash-consistent materialization (SEC-P079-SETTLEMENT-001), and Junie plan-evidence capture/redaction in place. Per SEC-P079-HIGH-003, production same-session repair is fail-closed for advisory-only providers until enforceable sandbox/permission restrictions exist; the Junie `provider_mode_mismatch_risk` eligibility gate skips repair for Junie plan-mode failures.
+
+Deferred lanes remain: transcript/provider-envelope recovery, controlled provider fallback (YAML `output_repair_policies` parsing, RunPlanSnapshot freeze, fallback packet assembly, and child dispatch), full projection artifact rebuild with the bounded 60s background sweep, release-lane and source-generation supersession eligibility exclusions, the Swift macOS inspector UI (GroupBox/progress chip/Copy Path), P079 operational metrics, the required reference docs `p079-repair-prompt-template.md`, `p079-recovery-attribution.md`, and `p079-adapter-idempotency.md`, and the full proposal-079 acceptance gate.
+
+### Problem
+
+Chainworks can complete useful provider work and still block a run because the final declared output set is missing, empty, invalid, emitted through the wrong provider mode, or stranded in the current provider envelope. The recovery path after an output contract failure was not fully governed, leading to costly repetitions of work and loss of same-session context.
+
+### Goals
+
+- Attempt at most one same-session corrective output repair turn for eligible missing, empty, invalid, or mode-mismatched required outputs.
+- Recover contract-valid output already present in the current invocation transcript or provider result envelope (deferred — see implementation status above).
+- Allow at most one controlled provider fallback attempt after repair or recovery is unavailable or unsuccessful (deferred — see implementation status above).
+
+This section provides an in-depth reference for P079, detailing the schema, contracts, and operational aspects of the contract-aware output repair and provider fallback mechanism. This mechanism allows the system to attempt to correct agent output failures (e.g., missing, invalid, or malformed outputs) or invoke fallback strategies before blocking a run.
+
+### Rollout Contract Summary
+
+P079's rollout contract specifies its applicability and enforcement mechanisms. It includes:
+
+-   **Applicability**: Required for specific contexts.
+-   **Gate Aliases**: `proposal-079` and `p079`.
+-   **Commands**: Allowlisted commands for gate checks, such as `./scripts/test-gate.sh proposal-079`.
+-   **Migrations**: Requires a SQLite migration (`p079_output_contract_repair_v1`) to create tables for events, leases, and fallback parent links.
+-   **Metrics**: Defines key metrics for adoption (`p079_eligible_output_failures_recovered_percent`) and operational monitoring (e.g., `p079_output_repair_attempt_total`, `p079_provider_fallback_attempt_total`).
+
+### Key Schema Purposes
+
+Beyond the `output_contract_repair.v1` schema, P079 relies on:
+
+-   **`fallback_context_packet_v1_schema`**: Defines the structure for the context packet used during provider fallback, ensuring sanitized and size-capped data transfer. It prevents sensitive information leakage and enforces content-addressing.
+-   **`fallback_policy_schema`**: Specifies how fallback policies are defined and applied, including matching rules for `role_family_match`, allowed `failure_classes`, `output_modes`, and required feature flags for activation. This schema governs the conditions under which fallback attempts are permitted.
+
+### OutputContractRepair.v1 Schema Enums Detail
+
+The `output_contract_repair.v1` schema defines the structured evidence captured during output repair and fallback attempts. Key enumerations within this schema are critical for understanding the state, outcomes, and failure classifications.
+
+-   **`status`**: The top-level status of an output contract repair attempt.
+    -   `not_attempted`: No repair or fallback was attempted.
+    -   `in_progress`: A repair or fallback attempt is currently underway.
+    -   `recovered`: The output contract was successfully repaired or recovered.
+    -   `blocked`: The repair or fallback attempt was blocked.
+    -   `skipped`: The repair or fallback attempt was skipped.
+    -   `cancelled`: The repair or fallback attempt was cancelled.
+    -   `failed`: The repair or fallback attempt failed.
+
+-   **`initial_failure_class`**: Broad classification of the initial failure that triggered a repair or fallback attempt.
+    -   `no_output_produced`: The agent produced no declared output.
+    -   `empty_output`: The agent produced an empty declared output.
+    -   `missing_required_outputs`: Some required outputs were missing.
+    -   `invalid_required_outputs`: Some required outputs were invalid.
+    -   `output_contract_mismatch`: The output produced did not match the expected contract.
+    -   `provider_mode_mismatch`: The provider mode used was incorrect for the output.
+
+-   **`initial_failure_subtype`**: More granular details about the initial failure. Can be null.
+    -   `plan_event_instead_of_output`: A plan event was produced instead of a final output.
+    -   `empty_submit_after_plan`: An empty submit was received after a plan.
+    -   `file_plan_written_instead_of_payload`: A plan file was written instead of the final payload.
+    -   `repair_repeated_plan_behavior`: Repair attempt repeated the plan behavior.
+    -   `malformed_envelope`: The output envelope was malformed.
+    -   `wrong_output_key`: The output was keyed incorrectly.
+    -   `wrong_channel`: The output was sent on the wrong channel.
+    -   `wrong_canonical_path`: The output was written to the wrong canonical path.
+    -   `unknown_enum_value`: An unknown enumeration value was encountered.
+    -   `missing_required_field`: A required field was missing.
+    -   `unsafe_continuation`: An unsafe continuation was detected.
+    -   `oversized_payload`: The payload exceeded the size limit.
+    -   `unattributable_envelope`: The output envelope could not be attributed.
+    -   `oversized_fallback_packet`: The fallback packet exceeded the size limit.
+    -   `principal_revoked`: The principal associated with the attempt was revoked.
+    -   `transcript_recovery_flag_missing`: The transcript recovery flag was missing.
+
+-   **`same_session_repair_result`**: The outcome of a same-session repair attempt.
+    -   `not_needed`: Same-session repair was not needed.
+    -   `accepted`: Same-session repair was successful and accepted.
+    -   `rejected_invalid`: Same-session repair produced invalid output and was rejected.
+    -   `unavailable`: Same-session repair was unavailable.
+    -   `skipped_ineligible`: Same-session repair was skipped as ineligible.
+    -   `failed_transport`: Same-session repair failed due to transport error.
+    -   `deadline_exceeded`: Same-session repair exceeded its deadline.
+    -   `cancelled`: Same-session repair was cancelled.
+    -   `budget_exhausted`: Same-session repair budget was exhausted.
+    -   `superseded_ignored`: Same-session repair was superseded and ignored.
+
+-   **`transcript_recovery_result`**: The outcome of a transcript recovery attempt.
+    -   `not_needed`: Transcript recovery was not needed.
+    -   `accepted`: Transcript recovery was successful and accepted.
+    -   `rejected_invalid`: Transcript recovery produced invalid output and was rejected.
+    -   `unavailable`: Transcript recovery was unavailable.
+    -   `skipped_ineligible`: Transcript recovery was skipped as ineligible.
+    -   `failed_transport`: Transcript recovery failed due to transport error.
+    -   `cancelled`: Transcript recovery was cancelled.
+
+-   **`provider_fallback_result`**: The outcome of a provider fallback attempt.
+    -   `not_needed`: Provider fallback was not needed.
+    -   `scheduled`: Provider fallback was scheduled.
+    -   `accepted`: Provider fallback was successful and accepted.
+    -   `rejected_invalid`: Provider fallback produced invalid output and was rejected.
+    -   `unavailable`: Provider fallback was unavailable.
+    -   `skipped_ineligible`: Provider fallback was skipped as ineligible.
+    -   `failed_transport`: Provider fallback failed due to transport error.
+    -   `deadline_exceeded`: Provider fallback exceeded its deadline.
+    -   `cancelled`: Provider fallback was cancelled.
+    -   `budget_exhausted`: Provider fallback budget was exhausted.
+    -   `lease_contended`: Provider fallback lease was contended.
+    -   `superseded_ignored`: Provider fallback was superseded and ignored.
+
+-   **`recovery_source`**: Indicates where the recovered output originated. Can be null.
+    -   `transcript`: Recovered from the session transcript.
+    -   `provider_envelope`: Recovered from the provider's result envelope.
+
+-   **`final_output_settlement`**: Describes how the final output was settled.
+    -   `valid_outputs_from_completed_execution`: Valid outputs from a completed execution.
+    -   `valid_outputs_from_repair`: Valid outputs obtained through repair.
+    -   `valid_outputs_from_transcript_recovery`: Valid outputs obtained through transcript recovery.
+    -   `valid_outputs_from_provider_envelope`: Valid outputs obtained from the provider envelope.
+    -   `valid_outputs_from_fallback`: Valid outputs obtained through fallback.
+    -   `blocked_missing_required_outputs`: Blocked due to missing required outputs.
+    -   `blocked_invalid_required_outputs`: Blocked due to invalid required outputs.
+    -   `blocked_provider_mode_mismatch`: Blocked due to provider mode mismatch.
+    -   `ignored_late_outputs`: Late outputs were ignored.
+    -   `cancelled`: Output settlement was cancelled.
+    -   `failed_transport`: Output settlement failed due to transport error.
+    -   `deadline_exceeded`: Output settlement exceeded its deadline.
+
+-   **`recommended_next_action`**: The recommended action for the operator.
+    -   `continue`: The run can continue automatically.
+    -   `inspect_repair_evidence`: Operator should inspect repair evidence.
+    -   `configure_fallback_policy`: Operator should configure fallback policy.
+    -   `operator_resolve_approval`: Operator needs to resolve an approval.
+    -   `operator_resolve_workflow_conflict`: Operator needs to resolve a workflow conflict.
+    -   `retry_after_transport_restored`: Retry after transport is restored.
+    -   `cancel_acknowledged`: Cancellation was acknowledged.
+    -   `manual_investigation`: Manual investigation is required.
+
+-   **`presentation_category`**: Categorization for UI presentation.
+    -   `informational`: For informational display.
+    -   `recovered`: The output was recovered.
+    -   `blocked`: The run was blocked.
+    -   `skipped`: The attempt was skipped.
+    -   `failed`: The attempt failed.
+    -   `cancelled`: The attempt was cancelled.
+
+### P079 Hold Conditions Detail
+
+The following conditions are strictly enforced to prevent unintended behavior and maintain system integrity under P079. Any of these conditions being met will result in the system holding or blocking the operation.
+
+-   **Contract Validator Bypass**: All repaired, recovered, and fallback payloads must traverse declared-output validation and source-generation settlement.
+-   **Canonical Path Bypass**: Returned output paths must byte-match the frozen snapshot resolved path string; equivalent-looking macOS paths are rejected. Materialization uses `openat` with `O_NOFOLLOW` per component.
+-   **Single-Flight Bypass**: Fallback uses a transactional unique lease keyed by run, stage execution, parent agent execution, schema version, and frozen fallback policy hash before child execution creation.
+-   **Durable Ordering Bypass**: Lease commit precedes ACP dispatch; recovery treats `prompt_sent` as do-not-redispatch.
+-   **Lease Liveness Bypass**: Leases carry TTL and a reconciliation sweep; stale leases are reclaimed deterministically.
+-   **Restart Reprompt**: After `prompt_sent`, recovery must not issue a second same-session repair prompt for the same parent execution.
+-   **Side Effect Lane Exclusion**: Release and external side-effect lanes remain owned by the durable side-effect ledger.
+-   **Fallback Packet Sanitization**: Fallback context packet is a closed v1 schema with redaction tier, size cap, content-addressed hash, and principal binding.
+-   **Recovery Bounds**: Recovery uses a streaming fail-closed decoder with byte/depth/chunk caps and transport-allocated attribution.
+-   **Plan Evidence Protection**: Plan evidence is copied into a P079-owned `0700/0600` directory, redacted, size-capped, retention-bound, and exposed meta-root-relative only.
+-   **Repair Turn Posture**: Repair and fallback turns run under a server-side permission posture allowlisting only `fs.write` to frozen canonical output paths.
+-   **Principal Binding**: Fallback inherits the failed execution's principal; revocation aborts fallback.
+-   **Auto-Retry Observe Only**: The auto-retry ledger may classify P079 terminal states but remains observe-only, debounced per (`parent_agent_execution_id`, `terminal_class`).
+-   **Swift Client Decode**: The macOS app's DTO module decodes the v1 readback surface and unknown-enum future values, verified at the proposal-079 gate.
+
+### P079 Rollback Disposition
+
+In the event of a rollback or disablement of P079, the following disposition and steps are applied to ensure data integrity and system stability.
+
+- **Mode**: `feature_flag_disable_keep_evidence_readback`
+- **Data Loss Risk**: `none`
+- **Rollback Steps**:
+    1.  Disable `CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED`, `CHAINWORKS_P079_TRANSCRIPT_RECOVERY_ENABLED`, and `CHAINWORKS_P079_PROVIDER_FALLBACK_ENABLED`.
+    2.  Keep `output_contract_repair.v1` SQLite rows and rebuilt evidence artifacts readable through run report, MCP, and GraphQL.
+    3.  Stop scheduling new repair and fallback leases while leaving existing source-generation and artifact-settlement history untouched.
+    4.  Allow the recovery sweep to continue reclaiming stale leases so feature-disabled runs do not leave hanging rows.
+    5.  Return eligible output failures to pre-P079 blocked-stage behavior.
+    6.  Re-enable only after proposal-079 and p079 gates pass.
+
+### P079 GraphQL and MCP Readback
+
+The `OutputContractRepairEvidence` is exposed via GraphQL and MCP for readback and observability.
+
+-   **GraphQL**:
+    -   The `outputContractRepair` field is available on `AgentExecution` types.
+    -   It is nullable for pre-P079 runs, feature-disabled runs, and executions without an output-contract failure.
+    -   Nested objects (e.g., `sameSessionRepair`, `transcriptRecovery`, `providerFallback`, `providerPlanEvidence`, `budget`, `lease`) are non-null when the parent `OutputContractRepairEvidence` is non-null, as they are always materialized with default values.
+    -   Optional scalar fields use `null` rather than empty sentinel strings.
+    -   SwiftUI row identity is `(repair_attempt_id, agent_execution_id)`; `evidence_version` is a content-version/refresh-invalidation field.
+    -   For detailed GraphQL Schema Definition Language (SDL), including scalar types, enum casing, and deprecation rules, refer to the `graphql_sdl_appendix` in the original P079 proposal document. This appendix is the authoritative contract for generated GraphQL clients and the parity fixture.
+
+-   **MCP and Run Report JSON**:
+    -   The `output_contract_repair` object matches the `output_contract_repair.v1` schema in snake_case.
+    -   For older runs, `output_contract_repair` is null, and `output_contract_repair_status` is `not_attempted` in flattened operator report views.
+    -   The full `readback_contract` details for MCP and run reports, including specific shapes, missing behaviors, and parity fixtures, are available in the original P079 proposal document.
+
+### P079 SQLite Migration Appendix
+
+### P079 SQLite Migration Appendix
+
+P079 introduces a new SQLite migration (`p079_output_contract_repair_v1`) to persist the state and evidence related to output contract repair and fallback.
+
+-   **Tables Created**:
+    -   `output_contract_repair_events`: Stores authoritative per-(repair_attempt, parent agent execution) evidence rows.
+    -   `output_contract_repair_leases`: Manages single-flight scheduling authority for repair/fallback dispatch.
+    -   `output_contract_repair_fallback_parent_links`: Provides explicit forward and reverse linkage for fallback agent executions.
+-   **Schema Versioning**: Each JSON column embeds its own schema_version for forward compatibility.
+-   **Rollback Compatibility**: Existing rows remain readable after rollback, and no data loss occurs.
+
+### P079 Advisory Follow-ups Addressed
+
+Several advisory follow-ups and blocker resolutions from previous review rounds have been addressed in the P079 proposal. These include specific points related to API contracts, reliability semantics, macOS client behavior, and security. For a complete list and details on their resolution, refer to the `advisory_followups_addressed_r4` and `blocker_resolution_ids` sections in the original P079 proposal document.

@@ -2234,6 +2234,276 @@ fn build_permission_grant(request_id: &Value, params: &Value) -> Option<Value> {
     }))
 }
 
+/// SEC-P079-001: P079 repair-specific permission grant builder.
+/// Only selects a single-use allow_once option for the canonical fs.write request.
+/// Fails closed: if no allow_once option exists, returns None so the caller can
+/// settle as failed rather than granting any broader allow_always permission.
+/// This must be used instead of build_permission_grant whenever p079_repair_canonical_paths is set.
+fn build_p079_repair_permission_grant(request_id: &Value, params: &Value) -> Option<Value> {
+    let options = permission_options(params);
+    let option_id = allow_once_option(&options)?;
+
+    Some(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id
+            }
+        }
+    }))
+}
+
+/// Explicit allowlist of tool names that represent a filesystem write operation.
+/// Any tool name NOT in this list is denied during the P079 repair posture.
+/// These are exact matches; substring matching is intentionally prohibited (SEC-HIGH-001).
+const P079_WRITE_TOOL_ALLOWLIST: &[&str] = &[
+    "write_file",         // Claude Code, Codex
+    "create_file",        // Claude Code variant
+    "overwrite_file",     // some provider variants
+    "str_replace_editor", // Claude Code multi-purpose editor (requires command=write/create check)
+    "edit_file",          // Claude Code edit tool (requires path to be checked)
+];
+
+/// Tool name prefixes that must always be denied regardless of any input field content.
+/// These represent shell, network, and other non-filesystem-write operations.
+const P079_ALWAYS_DENIED_PREFIXES: &[&str] = &[
+    "bash",
+    "shell",
+    "execute",
+    "run_command",
+    "run_",
+    "terminal",
+    "computer",
+    "http_request",
+    "curl",
+    "fetch",
+    "web_search",
+    "browser",
+    "network",
+    "mcp_",
+    "list_directory",
+    "read_file",
+    "glob",
+    "grep",
+    "find_",
+    "search_",
+];
+
+/// P079-SEC-HIGH-001: check whether a permission request should be denied under the
+/// P079 repair permission posture. Returns true when the request must be denied.
+///
+/// The posture allows ONLY `fs.write` requests whose resolved target byte-matches a
+/// frozen canonical output path. Everything else is denied:
+/// - tools not in the explicit write allowlist
+/// - tools with always-denied name prefixes (shell, network, custom, etc.)
+/// - write tools where no structured path field is present (no title fallback)
+/// - write tools where the structured path does not byte-match a frozen canonical path
+///
+/// Title/name heuristics (substring matching, title-token path extraction) are
+/// intentionally removed. A provider-controlled title cannot authorize any operation.
+pub fn p079_posture_denied(params: &Value, canonical_paths: &[String]) -> bool {
+    let tool_name = params["toolCall"]["name"].as_str().unwrap_or("");
+
+    // Deny tools with always-denied name prefixes first, regardless of any other field.
+    let tool_lower = tool_name.to_lowercase();
+    if P079_ALWAYS_DENIED_PREFIXES
+        .iter()
+        .any(|prefix| tool_lower.starts_with(prefix))
+    {
+        return true;
+    }
+
+    // Must be an exact match in the explicit write tool allowlist.
+    if !P079_WRITE_TOOL_ALLOWLIST.iter().any(|&t| t == tool_name) {
+        return true;
+    }
+
+    // For str_replace_editor: require command=write or command=create in structured input.
+    if tool_name == "str_replace_editor" {
+        let command = params["toolCall"]["input"]["command"].as_str().unwrap_or("");
+        if command != "write" && command != "create" {
+            return true;
+        }
+    }
+
+    // Extract the target path ONLY from known structured input fields.
+    // Title-token fallback is intentionally absent: title is provider-controlled.
+    let target_path = params["toolCall"]["input"]["file_path"]
+        .as_str()
+        .or_else(|| params["toolCall"]["input"]["path"].as_str())
+        .or_else(|| params["toolCall"]["input"]["filePath"].as_str())
+        .or_else(|| params["toolCall"]["input"]["new_file_path"].as_str())
+        .unwrap_or("");
+
+    // If no structured path found, deny (fail-closed; no implicit path allowed).
+    if target_path.is_empty() {
+        return true;
+    }
+
+    // Byte-exact comparison against frozen canonical output paths.
+    !canonical_paths.iter().any(|p| p == target_path)
+}
+
+/// Extract the tool name and normalized path from a permission request params,
+/// for use in structured P079 permission decision evidence.
+/// Returns (tool_name, normalized_path). Path is empty string when absent.
+pub fn p079_extract_decision_fields(params: &Value) -> (String, String) {
+    // SEC-P079-002: sanitize the provider-controlled tool name before it reaches
+    // permission_decisions.method storage. Strip control characters and cap length
+    // so providers cannot inject newlines, tokens, or large strings into readback.
+    let raw_tool_name = params["toolCall"]["name"].as_str().unwrap_or("");
+    let tool_name = p079_sanitize_method_name(raw_tool_name);
+    let path = params["toolCall"]["input"]["file_path"]
+        .as_str()
+        .or_else(|| params["toolCall"]["input"]["path"].as_str())
+        .or_else(|| params["toolCall"]["input"]["filePath"].as_str())
+        .or_else(|| params["toolCall"]["input"]["new_file_path"].as_str())
+        .unwrap_or("")
+        .to_string();
+    (tool_name, path)
+}
+
+/// Sanitize a provider-supplied tool name for safe storage in permission_decisions.method.
+/// Strips ASCII control characters (including newlines and tabs) and caps to 128 bytes.
+/// SEC-P079-002: prevents injection of log-injection payloads or bearer tokens via tool names.
+fn p079_sanitize_method_name(raw: &str) -> String {
+    const MAX_METHOD_BYTES: usize = 128;
+    // Strip ASCII control characters (covers newlines, tabs, carriage returns).
+    let sanitized: String = raw
+        .chars()
+        .filter(|c| !c.is_ascii_control())
+        .collect();
+    // SEC-P079-002: truncate at a valid UTF-8 character boundary to prevent panic
+    // on multibyte characters that straddle the byte limit.
+    let truncated = if sanitized.len() > MAX_METHOD_BYTES {
+        let mut end = MAX_METHOD_BYTES;
+        while !sanitized.is_char_boundary(end) {
+            end -= 1;
+        }
+        &sanitized[..end]
+    } else {
+        &sanitized
+    };
+    // SEC-P079-002: redact patterns that could leak credentials or absolute paths.
+    // Only redact if the name contains a suspicious pattern; normal tool names
+    // (write_file, bash, str_replace_editor) are preserved unchanged.
+    p079_redact_method_name_credential_patterns(truncated)
+}
+
+/// Redacts credential-like substrings from a sanitized, already-truncated tool name.
+/// Covers bearer tokens (case-insensitive), absolute filesystem paths, and
+/// base64-looking sequences that exceed 20 chars with no ASCII word content.
+fn p079_redact_method_name_credential_patterns(name: &str) -> String {
+    // Absolute path component: starts with or contains /Users, /home, /tmp, /var, /etc, /root.
+    if name.starts_with('/') {
+        return "[REDACTED_PATH]".to_string();
+    }
+    let lower = name.to_lowercase();
+    // Bearer token or known sensitive keyword prefixes embedded in tool names.
+    if lower.contains("bearer ") || lower.contains("password") || lower.contains("secret") {
+        return "[REDACTED_CREDENTIAL]".to_string();
+    }
+    name.to_string()
+}
+
+/// Classify a denied tool name into the closed P079 resource_kind enum.
+/// Used for evidence when the posture denies a request.
+pub fn p079_classify_resource_kind_from_tool(tool_name: &str) -> &'static str {
+    let lower = tool_name.to_lowercase();
+    if lower.contains("bash")
+        || lower.contains("shell")
+        || lower.contains("exec")
+        || lower.contains("run_command")
+        || lower.contains("terminal")
+        || lower.contains("computer")
+    {
+        return "shell";
+    }
+    if lower.contains("http")
+        || lower.contains("curl")
+        || lower.contains("fetch")
+        || lower.contains("web_search")
+        || lower.contains("browser")
+        || lower.contains("network")
+    {
+        return "network";
+    }
+    if lower.starts_with("mcp_") {
+        return "tool_mcp";
+    }
+    if lower.contains("read_file") || lower.contains("list_directory") || lower.contains("glob") {
+        return "fs_read";
+    }
+    // Unknown write-like tools that aren't in the canonical allowlist are custom.
+    "tool_custom"
+}
+
+fn build_permission_denial(request_id: &Value) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": -32001,
+            "message": "Permission denied by P079 repair posture: request outside frozen canonical output paths (unsafe_continuation)"
+        }
+    })
+}
+
+/// P079-SEC-HIGH-001/003: verify that no component of the given path (parents AND the final
+/// file component) is a symlink. Returns true when the path is safe.
+/// Fail-closed: any lstat failure or symlink in any path component returns false.
+///
+/// This is called at permission-grant time for P079 canonical output writes. Even when the
+/// requested path byte-matches a frozen canonical output path, a swap of any component to a
+/// symlink after the canonical path was computed can redirect the write outside the run
+/// meta-root. Checking the final file component (SEC-HIGH-001) is required because a provider
+/// can pre-create the declared output file as a symlink before requesting write permission.
+async fn p079_path_parents_have_no_symlinks(path: &str) -> bool {
+    use std::path::PathBuf;
+    let pb = PathBuf::from(path);
+    let parent = match pb.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return true,
+    };
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component);
+        match tokio::fs::symlink_metadata(&current).await {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return false;
+                }
+            }
+            Err(_) => {
+                // Fail-closed: if we cannot stat a parent component, deny.
+                return false;
+            }
+        }
+    }
+    // SEC-P079-HIGH-001: also check the final file component. The parent walk above only
+    // covers parent directories; a provider can pre-create the declared output path as a
+    // symlink to an outside file and request write permission. When the file does not yet
+    // exist (ENOENT) there is no symlink to redirect through — allow. Unknown stat errors
+    // on the final component are fail-closed.
+    match tokio::fs::symlink_metadata(&pb).await {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return false;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // File does not exist yet — no symlink present, allow.
+        }
+        Err(_) => {
+            // Unknown stat failure on final component — fail closed.
+            return false;
+        }
+    }
+    true
+}
+
 fn permission_options(params: &Value) -> Vec<&Value> {
     params["options"]
         .as_array()
@@ -2305,6 +2575,13 @@ fn summarize_permission_request(request_id: &Value, params: &Value) -> String {
         "id={request_id};title={tool_title};options={}",
         option_ids.join("|")
     )
+}
+
+/// SEC-MED-001: Returns a sanitized event label for P079 unsafe continuation events.
+/// Only includes the request ID and resource kind (both server-derived), never provider-controlled
+/// title text, option IDs, or path content that may carry credentials or tokens.
+fn p079_sanitized_event_label(normalized_req_id: &str, resource_kind: &str) -> String {
+    format!("id={normalized_req_id};resource_kind={resource_kind}")
 }
 
 fn summarize_permission_grant(grant: &Value) -> String {
@@ -2389,6 +2666,9 @@ struct RuntimeReceiptTracker {
     last_events: Vec<AcpRuntimeReceiptEvent>,
     last_event_kind: Option<String>,
     last_event_at_ms: Option<u64>,
+    /// P079-SEC-HIGH-001: true when the repair turn was terminated by a posture
+    /// denial. Propagated to AcpRuntimeReceipt.p079_unsafe_continuation.
+    p079_unsafe_continuation: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2404,6 +2684,13 @@ struct RuntimeReceiptPermissionRoundtrip {
     first_post_grant_event_kind: Option<String>,
     first_post_grant_event_detail: Option<String>,
     outcome: Option<String>,
+    /// P079-SEC-MED-001: structured decision fields recorded at evaluation time,
+    /// not derived post-hoc from grant_sent_at_ms.
+    p079_tool_name: Option<String>,
+    p079_normalized_path: Option<String>,
+    p079_matched_canonical_path: Option<String>,
+    p079_decision_reason: Option<String>,
+    p079_resource_kind: Option<String>,
 }
 
 impl RuntimeReceiptTracker {
@@ -2418,6 +2705,7 @@ impl RuntimeReceiptTracker {
             last_events: Vec::new(),
             last_event_kind: None,
             last_event_at_ms: None,
+            p079_unsafe_continuation: false,
         }
     }
 
@@ -2501,8 +2789,42 @@ impl RuntimeReceiptTracker {
                 first_post_grant_event_kind: None,
                 first_post_grant_event_detail: None,
                 outcome: Some("awaiting_grant".to_string()),
+                p079_tool_name: None,
+                p079_normalized_path: None,
+                p079_matched_canonical_path: None,
+                p079_decision_reason: None,
+                p079_resource_kind: None,
             });
         self.push_event("permission_request", detail);
+    }
+
+    /// P079-SEC-MED-001: record the structured P079 posture evaluation decision on the
+    /// most-recent permission roundtrip for this request_id. This stores the actual
+    /// evaluator decision (tool name, normalized path, matched canonical path, reason,
+    /// resource kind) so that evidence serialization does not need to re-derive it from
+    /// grant_sent_at_ms.
+    fn note_p079_posture_decision(
+        &mut self,
+        request_id: &str,
+        tool_name: &str,
+        normalized_path: &str,
+        matched_canonical_path: Option<&str>,
+        decision_reason: &str,
+        resource_kind: &str,
+    ) {
+        if let Some(roundtrip) = self
+            .permission_roundtrips
+            .iter_mut()
+            .rev()
+            .find(|rt| rt.request_id == request_id)
+        {
+            roundtrip.p079_tool_name = Some(tool_name.to_string());
+            roundtrip.p079_normalized_path = Some(normalized_path.to_string());
+            roundtrip.p079_matched_canonical_path =
+                matched_canonical_path.map(|s| s.to_string());
+            roundtrip.p079_decision_reason = Some(decision_reason.to_string());
+            roundtrip.p079_resource_kind = Some(resource_kind.to_string());
+        }
     }
 
     fn note_permission_grant_sent(
@@ -2646,11 +2968,17 @@ impl RuntimeReceiptTracker {
                         first_post_grant_event_kind: roundtrip.first_post_grant_event_kind,
                         first_post_grant_event_detail: roundtrip.first_post_grant_event_detail,
                         outcome: roundtrip.outcome,
+                        p079_tool_name: roundtrip.p079_tool_name,
+                        p079_normalized_path: roundtrip.p079_normalized_path,
+                        p079_matched_canonical_path: roundtrip.p079_matched_canonical_path,
+                        p079_decision_reason: roundtrip.p079_decision_reason,
+                        p079_resource_kind: roundtrip.p079_resource_kind,
                     }
                 })
                 .collect(),
             first_events: self.first_events.clone(),
             last_events: self.last_events.clone(),
+            p079_unsafe_continuation: self.p079_unsafe_continuation,
         }
     }
 }
@@ -4039,30 +4367,222 @@ impl AcpTransportSession {
                             let normalized_req_id =
                                 normalize_jsonrpc_id(req_id).unwrap_or_else(|| req_id.to_string());
                             let request_summary = summarize_permission_request(req_id, &params);
+                            // SEC-P079-002: do not emit raw provider-controlled title/optionIds
+                            // to the progress timeline when in P079 repair mode; they may carry
+                            // credentials, absolute paths, or bearer-like strings.
+                            let progress_request_detail = if req.p079_repair_canonical_paths.is_some() {
+                                Some(format!("p079_repair_mode:id={normalized_req_id}"))
+                            } else {
+                                Some(request_summary.clone())
+                            };
                             record_prompt_progress_detail_for_session(
                                 req,
                                 &progress_sink,
                                 &self.session_id,
                                 AcpPromptProgressKind::MeaningfulProgress,
                                 Some("Permission requested".to_string()),
-                                Some(request_summary.clone()),
+                                progress_request_detail,
                                 Some("permission_request".to_string()),
                             )
                             .await;
+                            // P079-SEC-HIGH-001: apply repair permission posture when set.
+                            // Evaluate posture and capture structured decision fields for
+                            // SEC-MED-001 evidence before deciding whether to deny.
+                            let p079_canonical_paths = req.p079_repair_canonical_paths.as_deref();
+                            let p079_posture_violation = p079_canonical_paths
+                                .map(|paths| p079_posture_denied(&params, paths))
+                                .unwrap_or(false);
+                            // SEC-HIGH-002: lift decision fields before recording the receipt so
+                            // the path is available for both the posture decision record and the
+                            // symlink check at grant time, without re-parsing params twice.
+                            let (p079_tool_name, p079_norm_path) = if p079_canonical_paths.is_some() {
+                                p079_extract_decision_fields(&params)
+                            } else {
+                                (String::new(), String::new())
+                            };
+                            // SEC-HIGH-002: in P079 repair posture, do not persist raw permission
+                            // request params in the runtime receipt; they may contain sensitive
+                            // paths or credentials. Structured decision evidence is captured via
+                            // note_p079_posture_decision below.
+                            let p079_receipt_payload = if p079_canonical_paths.is_some() {
+                                None
+                            } else {
+                                json_for_runtime_receipt(&params)
+                            };
                             runtime_receipt.note_permission_request(
                                 &normalized_req_id,
-                                Some(request_summary.clone()),
-                                json_for_runtime_receipt(&params),
+                                // SEC-P079-002: in P079 repair mode use a sanitized label so
+                                // provider-controlled title/optionId strings do not reach receipts.
+                                if p079_canonical_paths.is_some() {
+                                    Some(format!("p079_repair_mode:id={normalized_req_id}"))
+                                } else {
+                                    Some(request_summary.clone())
+                                },
+                                p079_receipt_payload,
                             );
-                            debug!(
-                                session_id = %self.session_id,
-                                request = %request_summary,
-                                "ACP: auto-granting permission request"
+                            // SEC-MED-001: record structured decision on the roundtrip
+                            // regardless of allow/deny outcome.
+                            if p079_canonical_paths.is_some() {
+                                let matched = p079_canonical_paths
+                                    .unwrap_or(&[])
+                                    .iter()
+                                    .find(|p| p.as_str() == p079_norm_path.as_str())
+                                    .map(|s| s.as_str());
+                                let (reason, rk) = if p079_posture_violation {
+                                    ("p079_posture_denied_unsafe_continuation",
+                                     p079_classify_resource_kind_from_tool(&p079_tool_name))
+                                } else {
+                                    ("canonical_path_allowed",
+                                     "fs_write_canonical_output_path")
+                                };
+                                // SEC-HIGH-002: for denied requests, do not persist the raw
+                                // requested path; store empty string so the field is present but
+                                // contains no sensitive filesystem location.
+                                let p079_path_for_evidence = if p079_posture_violation {
+                                    ""
+                                } else {
+                                    p079_norm_path.as_str()
+                                };
+                                runtime_receipt.note_p079_posture_decision(
+                                    &normalized_req_id,
+                                    &p079_tool_name,
+                                    p079_path_for_evidence,
+                                    matched,
+                                    reason,
+                                    rk,
+                                );
+                            }
+                            // SEC-MED-001: pre-compute a sanitized label for P079 unsafe continuation
+                            // events and error messages. This label excludes provider-controlled
+                            // title text and option IDs that may carry credentials, tokens, or absolute
+                            // paths. Only the server-derived request ID and tool-name-based resource_kind
+                            // are included. Use this label (not request_summary) in events and errors.
+                            let p079_safe_label = p079_sanitized_event_label(
+                                &normalized_req_id,
+                                p079_classify_resource_kind_from_tool(&p079_tool_name),
                             );
+                            if p079_posture_violation {
+                                warn!(
+                                    session_id = %self.session_id,
+                                    req_id = %normalized_req_id,
+                                    resource_kind = %p079_classify_resource_kind_from_tool(&p079_tool_name),
+                                    "P079 repair posture: permission denied (unsafe_continuation); terminating repair turn"
+                                );
+                                runtime_receipt.note_permission_grant_failed(
+                                    &normalized_req_id,
+                                    Some("p079_posture_denied:unsafe_continuation".to_string()),
+                                );
+                                // Send denial before terminating.
+                                let denial = build_permission_denial(req_id);
+                                if let Err(e) = send_ndjson(&mut self.stdin, &denial).await {
+                                    warn!(
+                                        session_id = %self.session_id,
+                                        "P079 posture: failed to send denial: {e}"
+                                    );
+                                }
+                                // P079-SEC-HIGH-001: mark the receipt and return immediately so
+                                // the executor can settle as rejected_invalid+unsafe_continuation
+                                // without materialising any outputs from this turn.
+                                runtime_receipt.p079_unsafe_continuation = true;
+                                runtime_receipt.push_event(
+                                    "p079_unsafe_continuation",
+                                    // SEC-MED-001: use sanitized label, not provider-controlled request_summary.
+                                    Some(format!("denied:{p079_safe_label}")),
+                                );
+                                let receipt = runtime_receipt.build(
+                                    &self.provider,
+                                    self.model.as_ref(),
+                                    &self.session_id,
+                                    req.session_generation_id.as_ref(),
+                                    self.xcode_shim_injected,
+                                    self.requires_xcode_host_execution,
+                                    "failed",
+                                    Some("p079_unsafe_continuation".to_string()),
+                                );
+                                self.last_runtime_receipt = Some(receipt.clone());
+                                return Err(anyhow::Error::new(crate::AcpExecutionError::new(
+                                    // SEC-MED-001: use sanitized label, not provider-controlled request_summary.
+                                    format!(
+                                        "p079_unsafe_continuation:repair_turn_terminated_by_posture:{p079_safe_label}"
+                                    ),
+                                    Some(receipt),
+                                )));
+                            } else {
+                            // P079-SEC-HIGH-003: before granting, verify no parent of the
+                            // canonical output path is a symlink. A symlink swap after the
+                            // canonical path was frozen can redirect the provider write outside
+                            // the run meta-root even when the requested path bytes match exactly.
+                            // Fail-closed: treat symlink detection or stat failure as a posture
+                            // violation and terminate the repair turn.
+                            if !p079_norm_path.is_empty()
+                                && !p079_path_parents_have_no_symlinks(&p079_norm_path).await
+                            {
+                                warn!(
+                                    session_id = %self.session_id,
+                                    req_id = %normalized_req_id,
+                                    resource_kind = %p079_classify_resource_kind_from_tool(&p079_tool_name),
+                                    "P079 repair posture: symlink detected in canonical output path parents; terminating repair turn (unsafe_continuation)"
+                                );
+                                runtime_receipt.note_permission_grant_failed(
+                                    &normalized_req_id,
+                                    Some("p079_posture_denied:symlink_escape".to_string()),
+                                );
+                                let denial = build_permission_denial(req_id);
+                                if let Err(e) = send_ndjson(&mut self.stdin, &denial).await {
+                                    warn!(
+                                        session_id = %self.session_id,
+                                        "P079 posture symlink check: failed to send denial: {e}"
+                                    );
+                                }
+                                runtime_receipt.p079_unsafe_continuation = true;
+                                runtime_receipt.push_event(
+                                    "p079_unsafe_continuation",
+                                    // SEC-MED-001: use sanitized label, not provider-controlled request_summary.
+                                    Some(format!("symlink_escape:{p079_safe_label}")),
+                                );
+                                let receipt = runtime_receipt.build(
+                                    &self.provider,
+                                    self.model.as_ref(),
+                                    &self.session_id,
+                                    req.session_generation_id.as_ref(),
+                                    self.xcode_shim_injected,
+                                    self.requires_xcode_host_execution,
+                                    "failed",
+                                    Some("p079_unsafe_continuation".to_string()),
+                                );
+                                self.last_runtime_receipt = Some(receipt.clone());
+                                return Err(anyhow::Error::new(crate::AcpExecutionError::new(
+                                    // SEC-MED-001: use sanitized label, not provider-controlled request_summary.
+                                    format!(
+                                        "p079_unsafe_continuation:symlink_escape_in_canonical_path_parent:{p079_safe_label}"
+                                    ),
+                                    Some(receipt),
+                                )));
+                            }
+                            // SEC-P079-002: in P079 mode log only sanitized fields.
+                            if p079_canonical_paths.is_some() {
+                                debug!(
+                                    session_id = %self.session_id,
+                                    req_id = %normalized_req_id,
+                                    "ACP: auto-granting canonical-write permission in P079 repair mode"
+                                );
+                            } else {
+                                debug!(
+                                    session_id = %self.session_id,
+                                    request = %request_summary,
+                                    "ACP: auto-granting permission request"
+                                );
+                            }
                             if !self.permission_grant_debounce.is_zero() {
                                 tokio::time::sleep(self.permission_grant_debounce).await;
                             }
-                            if let Some(grant) = build_permission_grant(req_id, &params) {
+                            // SEC-P079-001: in P079 repair mode only grant allow_once; never allow_always.
+                            let grant_option = if p079_canonical_paths.is_some() {
+                                build_p079_repair_permission_grant(req_id, &params)
+                            } else {
+                                build_permission_grant(req_id, &params)
+                            };
+                            if let Some(grant) = grant_option {
                                 let grant_summary = summarize_permission_grant(&grant);
                                 if let Err(e) = send_ndjson(&mut self.stdin, &grant).await {
                                     runtime_receipt.note_permission_grant_failed(
@@ -4115,12 +4635,50 @@ impl AcpTransportSession {
                                     &normalized_req_id,
                                     Some(format!("id={req_id};reason=no_supported_option")),
                                 );
-                                warn!(
-                                    session_id = %self.session_id,
-                                    request = %request_summary,
-                                    "ACP: permission request had no supported auto-grant option"
-                                );
+                                if p079_canonical_paths.is_some() {
+                                    // SEC-P079-LOW-002: send explicit denial and terminate repair
+                                    // turn immediately — no allow_once means no safe grant path.
+                                    warn!(
+                                        session_id = %self.session_id,
+                                        req_id = %normalized_req_id,
+                                        "ACP: P079 repair mode: no allow_once option; terminating repair turn (unsafe_continuation)"
+                                    );
+                                    let denial = build_permission_denial(req_id);
+                                    if let Err(e) = send_ndjson(&mut self.stdin, &denial).await {
+                                        warn!(
+                                            session_id = %self.session_id,
+                                            "P079 no_allow_once: failed to send denial: {e}"
+                                        );
+                                    }
+                                    runtime_receipt.p079_unsafe_continuation = true;
+                                    runtime_receipt.push_event(
+                                        "p079_unsafe_continuation",
+                                        Some(format!("no_allow_once:{p079_safe_label}")),
+                                    );
+                                    let receipt = runtime_receipt.build(
+                                        &self.provider,
+                                        self.model.as_ref(),
+                                        &self.session_id,
+                                        req.session_generation_id.as_ref(),
+                                        self.xcode_shim_injected,
+                                        self.requires_xcode_host_execution,
+                                        "failed",
+                                        Some("p079_unsafe_continuation".to_string()),
+                                    );
+                                    self.last_runtime_receipt = Some(receipt.clone());
+                                    return Err(anyhow::Error::new(crate::AcpExecutionError::new(
+                                        format!("p079_unsafe_continuation:no_allow_once_option:{p079_safe_label}"),
+                                        Some(receipt),
+                                    )));
+                                } else {
+                                    warn!(
+                                        session_id = %self.session_id,
+                                        request = %request_summary,
+                                        "ACP: permission request had no supported auto-grant option"
+                                    );
+                                }
                             }
+                            } // P079-SEC-HIGH-001: close non-posture-violation else branch
                         }
                         continue;
                     }
@@ -5234,6 +5792,7 @@ mod tests {
             mediation_record_id: None,
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
+            p079_repair_canonical_paths: None,
         };
 
         let captured = capture_pre_prompt_expected_outputs(&fake, &req, &context);
@@ -5890,5 +6449,278 @@ Tests result:
                 "missing labeled output {output_name}: {artifacts:?}"
             );
         }
+    }
+
+    // SEC-P079-HIGH-001: p079_path_parents_have_no_symlinks must also reject paths where
+    // the final file component is a symlink (not only parent directories).
+    // Uses canonicalized tempdir path to avoid macOS /var → /private/var parent symlink.
+    #[tokio::test]
+    async fn sec_high_001_path_check_rejects_symlinked_final_component() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        // Canonicalize the tempdir path to resolve platform-level symlinks (e.g. macOS /var→/private/var)
+        // so that parent-component walks do not spuriously fail on platform symlinks.
+        let canon_dir = dir.path().canonicalize().unwrap();
+        let real_file = canon_dir.join("real_output.json");
+        std::fs::write(&real_file, b"original").unwrap();
+        // Create a symlink that points at the real file (same directory — no parent symlink).
+        let symlink_path = canon_dir.join("declared_output.json");
+        symlink(&real_file, &symlink_path).unwrap();
+        // The final component is a symlink; p079_path_parents_have_no_symlinks must return false.
+        let result = p079_path_parents_have_no_symlinks(symlink_path.to_str().unwrap()).await;
+        assert!(
+            !result,
+            "p079_path_parents_have_no_symlinks must return false when final component is a symlink"
+        );
+        // A non-existent file on a canon path must return true (no symlink present on final component).
+        let new_output = canon_dir.join("new_output.json");
+        let result_new = p079_path_parents_have_no_symlinks(new_output.to_str().unwrap()).await;
+        assert!(
+            result_new,
+            "p079_path_parents_have_no_symlinks must return true for a non-existent file (no symlink) on canon path"
+        );
+    }
+
+    #[test]
+    fn sec_med_001_sanitized_event_label_excludes_provider_controlled_content() {
+        // SEC-MED-001: p079_sanitized_event_label must not include provider-controlled title
+        // or option IDs that could carry credentials, tokens, or absolute paths.
+        let label = p079_sanitized_event_label("42", "fs_write_canonical_output_path");
+        assert!(label.contains("id=42"), "label must include request id");
+        assert!(
+            label.contains("resource_kind="),
+            "label must include resource_kind"
+        );
+        // Must NOT include "title=" which would include provider-controlled text.
+        assert!(
+            !label.contains("title="),
+            "sanitized label must not include provider-controlled title"
+        );
+        // Must NOT include "options=" which would include provider-controlled option IDs.
+        assert!(
+            !label.contains("options="),
+            "sanitized label must not include provider-controlled options"
+        );
+    }
+
+    #[test]
+    fn sec_med_001_sanitized_label_with_credential_like_resource_kind_is_safe() {
+        // SEC-MED-001: even if a resource_kind string were adversarial (which it can't be
+        // since it comes from p079_classify_resource_kind_from_tool, a server-side function),
+        // the label format does not embed arbitrary provider strings.
+        let label = p079_sanitized_event_label(
+            "req-99",
+            "fs_write_canonical_output_path",
+        );
+        // The label is bounded and does not include raw permission params.
+        assert!(!label.is_empty());
+        // Key invariant: label never contains path separators from provider data.
+        assert!(!label.contains("/Users/"), "label must not contain filesystem paths");
+        assert!(!label.contains("Bearer "), "label must not contain bearer tokens");
+    }
+
+    // SEC-P079-001 regression tests for build_p079_repair_permission_grant.
+    // These verify that during a P079 repair turn, the transport ONLY selects allow_once
+    // options and never grants allow_always, even when allow_always is offered first.
+    // This enforces the single-use posture required by the approved proposal.
+
+    #[test]
+    fn sec_p079_001_repair_grant_selects_allow_once_when_both_options_present() {
+        // SEC-P079-001: even if allow_always is listed first, build_p079_repair_permission_grant
+        // must select allow_once. Never grant persistent access during a P079 repair turn.
+        let params = serde_json::json!({
+            "toolCall": {
+                "name": "write_file",
+                "input": {"file_path": "/tmp/.chainworks/proposals/current/proposal.md"}
+            },
+            "options": [
+                {
+                    "kind": "allow_always",
+                    "optionId": "Always allow write_file",
+                    "name": "Always allow write_file"
+                },
+                {
+                    "kind": "allow_once",
+                    "optionId": "allow_once",
+                    "name": "Allow once"
+                }
+            ]
+        });
+
+        let grant = build_p079_repair_permission_grant(&serde_json::json!(5), &params)
+            .expect("grant must be Some when allow_once is available");
+
+        // Must select allow_once, never allow_always.
+        assert_eq!(grant["id"], serde_json::json!(5));
+        assert_eq!(
+            grant["result"]["outcome"]["optionId"],
+            serde_json::json!("allow_once"),
+            "SEC-P079-001: P079 repair grant must select allow_once, not allow_always"
+        );
+    }
+
+    #[test]
+    fn sec_p079_001_repair_grant_returns_none_when_only_allow_always_offered() {
+        // SEC-P079-001: if the provider offers only allow_always (no allow_once option),
+        // build_p079_repair_permission_grant must return None so the caller can fail closed.
+        // Granting allow_always during a repair turn violates the P079 posture.
+        let params = serde_json::json!({
+            "toolCall": {
+                "name": "write_file",
+                "input": {"file_path": "/tmp/.chainworks/proposals/current/proposal.md"}
+            },
+            "options": [
+                {
+                    "kind": "allow_always",
+                    "optionId": "Always allow write_file",
+                    "name": "Always allow write_file"
+                }
+            ]
+        });
+
+        let grant = build_p079_repair_permission_grant(&serde_json::json!(6), &params);
+        assert!(
+            grant.is_none(),
+            "SEC-P079-001: P079 repair grant must return None (fail closed) when no allow_once option exists"
+        );
+    }
+
+    #[test]
+    fn sec_p079_001_repair_grant_returns_none_when_no_options() {
+        // SEC-P079-001: empty options list must return None (fail closed).
+        let params = serde_json::json!({
+            "toolCall": {"name": "write_file"},
+            "options": []
+        });
+        let grant = build_p079_repair_permission_grant(&serde_json::json!(7), &params);
+        assert!(
+            grant.is_none(),
+            "SEC-P079-001: P079 repair grant must return None when options list is empty"
+        );
+    }
+
+    #[test]
+    fn sec_p079_001_repair_grant_selects_correct_allow_once_option_id() {
+        // SEC-P079-001: the optionId returned must exactly match the allow_once option's ID,
+        // not a hardcoded string. Providers may use custom allow_once optionIds.
+        let params = serde_json::json!({
+            "toolCall": {"name": "write_file"},
+            "options": [
+                {"kind": "reject_once", "optionId": "No", "name": "No"},
+                {"kind": "allow_once", "optionId": "Yes", "name": "Yes, once"}
+            ]
+        });
+        let grant = build_p079_repair_permission_grant(&serde_json::json!(8), &params)
+            .expect("grant must be Some when allow_once is available");
+        assert_eq!(
+            grant["result"]["outcome"]["optionId"],
+            serde_json::json!("Yes"),
+            "SEC-P079-001: optionId must match the provider's allow_once option, not a hardcoded string"
+        );
+    }
+
+    // SEC-P079-002 regression tests for p079_sanitize_method_name / p079_extract_decision_fields.
+    // These verify that provider-controlled tool names are sanitized before storage in
+    // permission_decisions.method, preventing log injection, newline injection, or token leakage.
+
+    #[test]
+    fn sec_p079_002_extract_decision_fields_strips_newlines_from_tool_name() {
+        // SEC-P079-002: a provider sending a tool name with embedded newlines (log injection)
+        // must have them stripped before the name reaches permission_decisions.method storage.
+        // The newline is removed, preventing a single field from spanning log lines.
+        let params = serde_json::json!({
+            "toolCall": {
+                "name": "write_file\nX-Injected-Header: evil",
+                "input": {"file_path": "/tmp/output.json"}
+            }
+        });
+        let (tool_name, _path) = p079_extract_decision_fields(&params);
+        assert!(
+            !tool_name.contains('\n'),
+            "SEC-P079-002: newlines must be stripped from provider-controlled tool name"
+        );
+        assert!(
+            !tool_name.contains('\r'),
+            "SEC-P079-002: carriage returns must be stripped from provider-controlled tool name"
+        );
+        // After stripping the newline the value is a single concatenated string —
+        // no log line break is possible.
+        assert!(
+            tool_name.starts_with("write_file"),
+            "legitimate tool name prefix must be preserved after sanitization"
+        );
+    }
+
+    #[test]
+    fn sec_p079_002_extract_decision_fields_strips_control_chars_from_tool_name() {
+        // SEC-P079-002: carriage returns, tabs, and other ASCII control characters
+        // must be stripped from the tool name.
+        let params = serde_json::json!({
+            "toolCall": {
+                "name": "write_file\r\n\t\x07crafted",
+                "input": {"file_path": "/tmp/output.json"}
+            }
+        });
+        let (tool_name, _path) = p079_extract_decision_fields(&params);
+        assert!(
+            !tool_name.chars().any(|c| c.is_ascii_control()),
+            "SEC-P079-002: all ASCII control characters must be stripped from tool name"
+        );
+    }
+
+    #[test]
+    fn sec_p079_002_extract_decision_fields_caps_tool_name_length() {
+        // SEC-P079-002: very long tool names (potential amplification attack) must be
+        // capped at MAX_METHOD_BYTES to prevent resource bloat in readback.
+        let long_name = "x".repeat(512);
+        let params = serde_json::json!({
+            "toolCall": {
+                "name": long_name,
+                "input": {"file_path": "/tmp/output.json"}
+            }
+        });
+        let (tool_name, _path) = p079_extract_decision_fields(&params);
+        assert!(
+            tool_name.len() <= 128,
+            "SEC-P079-002: tool name must be capped at 128 bytes; got {} bytes",
+            tool_name.len()
+        );
+    }
+
+    #[test]
+    fn sec_p079_002_sanitize_method_name_preserves_legitimate_tool_names() {
+        // SEC-P079-002: sanitization must not corrupt normal, clean tool names.
+        assert_eq!(p079_sanitize_method_name("write_file"), "write_file");
+        assert_eq!(p079_sanitize_method_name("str_replace_editor"), "str_replace_editor");
+        assert_eq!(p079_sanitize_method_name("create_file"), "create_file");
+        assert_eq!(p079_sanitize_method_name(""), "");
+    }
+
+    #[test]
+    fn sec_p079_002_sanitize_method_name_utf8_safe_truncation_no_panic() {
+        // SEC-P079-002: truncation at 128 bytes must not panic on multibyte UTF-8 characters.
+        // Build a string with 4-byte UTF-8 emoji (🔥 = \u{1F525}) that crosses the 128-byte boundary.
+        // 32 * 4 = 128 bytes exactly, then add one more emoji so len() > 128.
+        let emoji = "🔥";
+        let s: String = emoji.repeat(33); // 33 * 4 = 132 bytes
+        let result = p079_sanitize_method_name(&s);
+        // Must not panic and must be <= 128 bytes.
+        assert!(result.len() <= 128, "Truncation exceeded 128 bytes: {}", result.len());
+        // Must be valid UTF-8 (String guarantees this, but verify round-trip).
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn sec_p079_002_sanitize_method_name_redacts_absolute_path() {
+        // SEC-P079-002: absolute paths embedded as tool names must be redacted.
+        let result = p079_sanitize_method_name("/Users/user/.ssh/id_rsa");
+        assert_eq!(result, "[REDACTED_PATH]");
+    }
+
+    #[test]
+    fn sec_p079_002_sanitize_method_name_redacts_bearer_credential() {
+        // SEC-P079-002: bearer token patterns in tool names must be redacted.
+        let result = p079_sanitize_method_name("Bearer eyJhbGciOiJIUzI1NiJ9");
+        assert_eq!(result, "[REDACTED_CREDENTIAL]");
     }
 }

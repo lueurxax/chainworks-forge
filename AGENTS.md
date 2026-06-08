@@ -48,9 +48,9 @@ Run the daemon (GraphQL on `:4000/graphql`, MCP Streamable HTTP on `:4000/mcp`, 
 
 ```bash
 cd control-plane
-DATABASE_URL="sqlite:///Users/user/Documents/Chainworks Forge/.chainworks/control-plane.db?mode=rwc" \
-GRAPHQL_ADDR="127.0.0.1:4000" \
-RUST_LOG=info,acp=debug \
+DATABASE_URL="sqlite:///Users/user/Documents/Chainworks Forge/.chainworks/control-plane.db?mode=rwc" 
+GRAPHQL_ADDR="127.0.0.1:4000" 
+RUST_LOG=info,acp=debug 
 ./target/debug/control-plane 2>/tmp/cw.log &
 ```
 
@@ -137,3 +137,9 @@ Key entry points:
 - **ACP permission auto-grant**: the Rust transport auto-grants the first `allow_once` option for `session/request_permission` notifications. The `method` check comes **before** the terminal-response `id` match — a fix that matters because `session/request_permission` arrives with `id=0`.
 - **Agent prompts include resolved output paths**: agents receive a directive listing required outputs with their canonical filesystem paths so they write directly to the right location, eliminating post-hoc normalization.
 - **Goose is legacy**: the long-term transport is ACP (Codex/Claude Code/Gemini). Goose compatibility exists for migration, not as the canonical transport model — see proposals 026 and 030.
+
+## Agent Output Contract Handling
+
+**P079: Contract-Aware Output Repair and Provider Fallback** is partially implemented. The SQLite migration, domain types, DB repos for repair events and leases, GraphQL/MCP readback surfaces, Swift evidence DTOs, MCP runtime receipt sanitization, crash-consistent materialization, Junie plan-evidence capture/redaction, and deterministic fixture same-session repair path are wired. Production same-session repair remains fail-closed for advisory-only providers until the runtime provides enforceable sandbox/permission restrictions. Transcript/provider-envelope recovery, controlled provider fallback, macOS inspector UI, P079 metrics, and the full acceptance gate remain deferred.
+
+For more details, refer to [`docs/reference/output-contracts-failure-evidence-and-recovery.md`](docs/reference/output-contracts-failure-evidence-and-recovery.md).

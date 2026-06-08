@@ -104,6 +104,9 @@ fn validation_failure_class_to_str(class: &ValidationFailureClass) -> &'static s
         ValidationFailureClass::NoOutputProduced => "no_output_produced",
         ValidationFailureClass::EmptyOutput => "empty_output",
         ValidationFailureClass::PersistenceFailure => "persistence_failure",
+        ValidationFailureClass::MissingRequiredOutputs => "missing_required_outputs",
+        ValidationFailureClass::InvalidRequiredOutputs => "invalid_required_outputs",
+        ValidationFailureClass::ProviderModeMismatch => "provider_mode_mismatch",
     }
 }
 

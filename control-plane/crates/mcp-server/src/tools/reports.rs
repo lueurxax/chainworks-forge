@@ -6,8 +6,8 @@ use db::repos::{
     agent_execution_discovery_diagnostics, agent_execution_runtime_facts,
     agent_execution_runtime_receipts, agent_executions, artifact_contracts, artifacts, closeout,
     code_writer_completion_receipts, lead_conflict_mediations, legacy_discovery_overrides,
-    retry_payload_recovery_events, retry_stage_execution_authorities, rollout_contract_checks,
-    runs, sessions, validation, workflow_conflicts,
+    output_contract_repair, retry_payload_recovery_events, retry_stage_execution_authorities,
+    rollout_contract_checks, runs, sessions, validation, workflow_conflicts,
 };
 use db::write_class::WriteLane;
 use db::writer::class_a_operation;
@@ -33,6 +33,85 @@ fn fresh_provider_process_for_disposition(disposition: Option<&str>) -> Option<b
         | Some("fresh_session_required")
         | Some("unverifiable_session_history") => Some(true),
         Some(_) | None => None,
+    }
+}
+
+// P079-SEC-LOW-002: cap per-field JSON deserialization to prevent resource exhaustion.
+fn p079_parse_json_capped(s: &str) -> Option<serde_json::Value> {
+    const MAX_BYTES: usize = 256 * 1024;
+    if s.len() > MAX_BYTES {
+        return None;
+    }
+    serde_json::from_str(s).ok()
+}
+
+// P079-SEC-LOW-001 / SEC-MED-002: reject absolute paths and all traversal forms before
+// returning evidence_artifact_path or provider_plan_evidence paths to callers.
+// Also rejects URL-encoded traversal sequences (%2e%2e, %2f, %5c) that could bypass
+// literal ".." checks in downstream reveal/open flows (SEC-P079-LOW-001).
+fn p079_safe_relative_path(path: Option<&str>) -> Option<&str> {
+    path.filter(|p| {
+        let p_lower = p.to_lowercase();
+        !p.starts_with('/')
+            && !p.starts_with('\\')
+            && !p.contains("../")
+            && !p.contains("..\\")
+            && !p.split('/').any(|component| component == "..")
+            && !p.split('\\').any(|component| component == "..")
+            // SEC-P079-LOW-001: reject URL-encoded traversal that bypasses literal checks.
+            && !p_lower.contains("%2e%2e")
+            && !p_lower.contains("%2f")
+            && !p_lower.contains("%5c")
+    })
+}
+
+/// P079-SEC-MED-002: sanitize all path-bearing fields inside provider_plan_evidence
+/// before returning to MCP callers. Mirrors the GraphQL path sanitization.
+fn p079_sanitize_plan_evidence_paths(evidence: serde_json::Value) -> serde_json::Value {
+    match evidence {
+        serde_json::Value::Object(mut map) => {
+            if let Some(paths_val) = map.get_mut("paths") {
+                if let serde_json::Value::Array(paths) = paths_val {
+                    for path_entry in paths.iter_mut() {
+                        if let serde_json::Value::String(s) = path_entry {
+                            if p079_safe_relative_path(Some(s.as_str())).is_none() {
+                                *path_entry = serde_json::Value::String(
+                                    "[redacted:unsafe_path]".to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            for key in &["path", "file_path", "evidence_path"] {
+                if let Some(val) = map.get_mut(*key) {
+                    if let serde_json::Value::String(s) = val {
+                        if p079_safe_relative_path(Some(s.as_str())).is_none() {
+                            *val = serde_json::Value::String("[redacted:unsafe_path]".to_string());
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Object(map)
+        }
+        other => other,
+    }
+}
+
+/// SEC-P079-MED-001: remove P029 auth-boundary principal identifiers from the
+/// provider_fallback JSON for non-operator MCP callers. Mirrors the gating that
+/// GraphQL applies in p079_gql_provider_fallback.
+fn p079_redact_fallback_principal(fallback: serde_json::Value, include_operator_debug: bool) -> serde_json::Value {
+    if include_operator_debug {
+        return fallback;
+    }
+    match fallback {
+        serde_json::Value::Object(mut map) => {
+            map.remove("fallback_principal_id");
+            map.remove("fallback_principal_capability_hash");
+            serde_json::Value::Object(map)
+        }
+        other => other,
     }
 }
 
@@ -644,6 +723,19 @@ pub(crate) async fn execution_mcp_truth_json(
         .iter()
         .map(|readback| (readback.receipt.agent_execution_id.to_string(), readback))
         .collect::<HashMap<_, _>>();
+    let run_id_str = run_id.to_string();
+    let repair_events =
+        output_contract_repair::list_repair_events_for_run(pool, &run_id_str).await?;
+    let repair_events_by_execution_id: HashMap<_, _> = repair_events
+        .into_iter()
+        .map(|row| (row.agent_execution_id.clone(), row))
+        .collect::<HashMap<_, _>>();
+    let repair_leases =
+        output_contract_repair::list_leases_for_run(pool, &run_id_str).await.unwrap_or_default();
+    let repair_leases_by_key: HashMap<_, _> = repair_leases
+        .into_iter()
+        .map(|lease| (lease.lease_key.clone(), lease))
+        .collect::<HashMap<_, _>>();
     let mut items = Vec::with_capacity(executions.len());
     for execution in executions.into_iter() {
         let execution_id = execution.id.to_string();
@@ -741,6 +833,134 @@ pub(crate) async fn execution_mcp_truth_json(
             "actual_toolchain_mapping_diagnostics": toolchain_mapping_diagnostics_mcp(
                 execution.actual_toolchain_mapping_diagnostics_json.as_deref()
             ),
+            // P079: output contract repair evidence (null when not triggered or pre-P079 run).
+            "output_contract_repair": repair_events_by_execution_id
+                .get(&execution_id)
+                .map(|row| {
+                    let lease_value = row.lease_id.as_deref()
+                        .and_then(|key| repair_leases_by_key.get(key))
+                        .map(|lease| {
+                            // P079-SEC-MED-001: owner_principal_id is operator-grade diagnostics.
+                            if include_operator_debug {
+                                serde_json::json!({
+                                    "key": lease.lease_key,
+                                    "kind": lease.lease_kind.to_string(),
+                                    "state": lease.lease_state.to_string(),
+                                    "settled_result": lease.settled_result,
+                                    "reclamation_reason": lease.reclamation_reason,
+                                    "owner_principal_id": lease.lease_owner_principal_id,
+                                    "acquired_at": lease.lease_acquired_at,
+                                    "expires_at": lease.lease_expires_at,
+                                    "lease_seconds": lease.lease_seconds,
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "key": lease.lease_key,
+                                    "kind": lease.lease_kind.to_string(),
+                                    "state": lease.lease_state.to_string(),
+                                    "settled_result": lease.settled_result,
+                                    "reclamation_reason": lease.reclamation_reason,
+                                    "acquired_at": lease.lease_acquired_at,
+                                    "expires_at": lease.lease_expires_at,
+                                    "lease_seconds": lease.lease_seconds,
+                                })
+                            }
+                        })
+                        .unwrap_or(serde_json::Value::Null);
+                    // SEC-P079-MED-001: pre-compute permission_decisions with matched_canonical_path
+                    // redacted for non-operator callers. Must be pre-computed because serde_json::json!
+                    // does not support block expressions inline.
+                    let permission_decisions_value = {
+                        let raw = p079_parse_json_capped(&row.permission_decisions_json)
+                            .unwrap_or(serde_json::Value::Array(vec![]));
+                        if include_operator_debug {
+                            raw
+                        } else if let serde_json::Value::Array(entries) = raw {
+                            serde_json::Value::Array(entries.into_iter().map(|mut e| {
+                                if let Some(obj) = e.as_object_mut() {
+                                    obj.remove("matched_canonical_path");
+                                }
+                                e
+                            }).collect())
+                        } else {
+                            serde_json::Value::Array(vec![])
+                        }
+                    };
+                    serde_json::json!({
+                        "schema_version": row.schema_version,
+                        "repair_attempt_id": row.repair_attempt_id,
+                        "run_id": row.run_id,
+                        "stage_execution_id": row.stage_execution_id,
+                        "agent_execution_id": row.agent_execution_id,
+                        "session_generation_id": row.session_generation_id,
+                        "role": row.role,
+                        "provider_family": row.provider_family,
+                        "adapter_family": row.adapter_family,
+                        "required_output_mode": row.required_output_mode,
+                        "initial_failure_class": row.initial_failure_class,
+                        "initial_failure_subtype": row.initial_failure_subtype,
+                        "status": row.status,
+                        "presentation_category": row.presentation_category,
+                        "recommended_next_action": row.recommended_next_action,
+                        "final_output_settlement": row.final_output_settlement,
+                        "same_session_repair": row.same_session_repair_json.as_deref()
+                            .and_then(p079_parse_json_capped),
+                        "transcript_recovery": row.transcript_recovery_json.as_deref()
+                            .and_then(p079_parse_json_capped),
+                        // SEC-P079-MED-001: redact fallback_principal_id and
+                        // fallback_principal_capability_hash for non-operator callers.
+                        "provider_fallback": row.provider_fallback_json.as_deref()
+                            .and_then(p079_parse_json_capped)
+                            .map(|v| p079_redact_fallback_principal(v, include_operator_debug)),
+                        "provider_plan_evidence": row.provider_plan_evidence_json.as_deref()
+                            .and_then(p079_parse_json_capped)
+                            .map(p079_sanitize_plan_evidence_paths),
+                        // P079-SEC-MED-001: canonical paths in required_outputs are operator-grade.
+                        "required_outputs": if include_operator_debug {
+                            p079_parse_json_capped(&row.required_outputs_json)
+                                .unwrap_or(serde_json::Value::Array(vec![]))
+                        } else {
+                            // Non-operator view: emit output names and contract IDs only,
+                            // not canonical_path.
+                            p079_parse_json_capped(&row.required_outputs_json)
+                                .and_then(|arr| arr.as_array().cloned().map(|entries| {
+                                    serde_json::Value::Array(entries.into_iter().map(|mut e| {
+                                        if let Some(obj) = e.as_object_mut() {
+                                            obj.remove("canonical_path");
+                                        }
+                                        e
+                                    }).collect())
+                                }))
+                                .unwrap_or(serde_json::Value::Array(vec![]))
+                        },
+                        // SEC-P079-MED-001: matched_canonical_path redacted above for non-operators.
+                        "permission_decisions": permission_decisions_value,
+                        "budget": {
+                            "repair_consumed": row.repair_budget_consumed,
+                            "fallback_consumed": row.fallback_budget_consumed,
+                            "repair_max_per_invocation": 1,
+                            "fallback_max_per_invocation": 1,
+                        },
+                        "repair_prompt_template_version": row.repair_prompt_template_version,
+                        "recovery_parser_version": row.recovery_parser_version,
+                        "policy_feature_flags": p079_parse_json_capped(&row.policy_feature_flags_json)
+                            .unwrap_or(serde_json::Value::Array(vec![])),
+                        // P079-SEC-MED-001: evidence_artifact_path is operator-grade diagnostics.
+                        "evidence_artifact_path": if include_operator_debug {
+                            p079_safe_relative_path(row.evidence_artifact_path.as_deref())
+                        } else {
+                            None
+                        },
+                        "lease": lease_value,
+                        "evidence_version": row.evidence_version,
+                        "projection_integrity": row.projection_integrity,
+                        "projection_stale_since": row.projection_stale_since,
+                        "recorded_at": row.recorded_at,
+                        "created_at": row.created_at,
+                        "updated_at": row.updated_at,
+                    })
+                })
+                .unwrap_or(serde_json::Value::Null),
         }));
     }
     Ok(serde_json::Value::Array(items))
@@ -861,6 +1081,17 @@ async fn runtime_facts_json(
                 },
             )
         })
+        .map(|parsed| {
+            if include_operator_debug {
+                parsed
+            } else {
+                // SEC-P079-MCP-001: sanitize runtime_receipt for non-operator callers.
+                // ACP receipts can contain p079_normalized_path / p079_matched_canonical_path
+                // (absolute artifact paths) in permission_roundtrips, and raw provider details
+                // in event detail fields. Strip these before non-operator readback.
+                sanitize_runtime_receipt_for_non_operator(parsed)
+            }
+        })
         .unwrap_or(serde_json::Value::Null);
     Ok(serde_json::json!({
         "agent_execution_id": facts.agent_execution_id.to_string(),
@@ -886,7 +1117,9 @@ async fn runtime_facts_json(
         "session_reuse_disposition": execution.session_reuse_disposition.clone(),
         "session_reuse_reason": facts.session_reuse_reason.clone(),
         "session_reset_reason": execution.session_reset_reason.clone(),
-        "provider_session_id": provider_session_id,
+        // SEC-P079-MED-001: provider_session_id is a provider-native identifier that must not
+        // be exposed to non-operator callers; gate on operator-debug access level.
+        "provider_session_id": if include_operator_debug { provider_session_id } else { None },
         "active_session_generation_id": active_session_generation_id,
         "active_generation_matches_execution": active_generation_matches_execution,
         "generation_status": generation_status,
@@ -897,6 +1130,45 @@ async fn runtime_facts_json(
         "created_at": facts.created_at.to_rfc3339(),
         "updated_at": facts.updated_at.to_rfc3339(),
     }))
+}
+
+/// SEC-P079-MCP-001: strip fields from a parsed runtime_receipt JSON that may contain
+/// absolute artifact paths or provider-native identifiers. Retains counters, status,
+/// timing, and safe diagnostic fields that non-operator callers are permitted to see.
+fn sanitize_runtime_receipt_for_non_operator(receipt: serde_json::Value) -> serde_json::Value {
+    let mut obj = match receipt {
+        serde_json::Value::Object(m) => m,
+        other => return other,
+    };
+    obj.remove("provider_session_id");
+    if let Some(serde_json::Value::Array(roundtrips)) = obj.get_mut("permission_roundtrips") {
+        for rt in roundtrips.iter_mut() {
+            if let serde_json::Value::Object(m) = rt {
+                // Payloads can contain tool arguments with filesystem paths.
+                m.remove("request_payload");
+                m.remove("grant_payload");
+                // P079-specific path fields.
+                m.remove("p079_normalized_path");
+                m.remove("p079_matched_canonical_path");
+                m.remove("p079_decision_reason");
+                // Summary strings can contain path fragments from error messages.
+                m.remove("request_summary");
+                m.remove("grant_summary");
+                m.remove("first_post_grant_event_detail");
+            }
+        }
+    }
+    // Event detail fields can contain raw provider output including paths.
+    for key in &["first_events", "last_events"] {
+        if let Some(serde_json::Value::Array(events)) = obj.get_mut(*key) {
+            for ev in events.iter_mut() {
+                if let serde_json::Value::Object(m) = ev {
+                    m.remove("detail");
+                }
+            }
+        }
+    }
+    serde_json::Value::Object(obj)
 }
 
 fn is_release_report_artifact(name: &str) -> bool {
@@ -1233,6 +1505,15 @@ impl From<domain::validation::ValidationFailureRecord> for ValidationFailureReco
                 }
                 domain::validation::ValidationFailureClass::PersistenceFailure => {
                     "persistence_failure".to_string()
+                }
+                domain::validation::ValidationFailureClass::MissingRequiredOutputs => {
+                    "missing_required_outputs".to_string()
+                }
+                domain::validation::ValidationFailureClass::InvalidRequiredOutputs => {
+                    "invalid_required_outputs".to_string()
+                }
+                domain::validation::ValidationFailureClass::ProviderModeMismatch => {
+                    "provider_mode_mismatch".to_string()
                 }
             },
             contract_metadata: record
@@ -2837,5 +3118,93 @@ mod tests {
             !serialized.contains("should_not_be_returned"),
             "secret content must not leak through path-containment boundary"
         );
+    }
+
+    // P079-SEC-LOW-003: pin that sensitive lease fields never appear in the MCP readback.
+    #[test]
+    fn p079_mcp_lease_projection_excludes_sensitive_fields() {
+        let projected = serde_json::json!({
+            "key": "test-lease-key",
+            "kind": "repair",
+            "state": "reserved",
+            "settled_result": null,
+            "reclamation_reason": null,
+            "owner_principal_id": "principal-001",
+            "acquired_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2026-01-01T01:00:00Z",
+            "lease_seconds": 3600,
+        });
+        let obj = projected.as_object().unwrap();
+        assert!(
+            !obj.contains_key("idempotency_token"),
+            "idempotency_token must not appear in MCP lease readback"
+        );
+        assert!(
+            !obj.contains_key("lease_owner_principal_id"),
+            "lease_owner_principal_id must not appear in MCP lease readback"
+        );
+        assert!(
+            !obj.contains_key("infra_retry_count"),
+            "infra_retry_count must not appear in MCP lease readback"
+        );
+        assert!(
+            !obj.contains_key("version"),
+            "version (CAS column) must not appear in MCP lease readback"
+        );
+        assert!(obj.contains_key("owner_principal_id"), "owner_principal_id must be present");
+    }
+
+    // P079-SEC-LOW-003 parity: p079_safe_relative_path in MCP rejects absolute and traversal paths.
+    #[test]
+    fn p079_mcp_safe_relative_path_rejects_absolute_and_traversal() {
+        assert_eq!(p079_safe_relative_path(Some("/etc/passwd")), None);
+        assert_eq!(p079_safe_relative_path(Some("../../secret")), None);
+        assert_eq!(p079_safe_relative_path(Some("output_contract_repair/abc/plan.json")), Some("output_contract_repair/abc/plan.json"));
+        assert_eq!(p079_safe_relative_path(None), None);
+    }
+
+    // SEC-P079-LOW-001: server-side safe_relative_path must reject URL-encoded traversal
+    // sequences (%2e%2e, %2f, %5c) that could bypass literal ".." checks.
+    #[test]
+    fn p079_mcp_safe_relative_path_rejects_url_encoded_traversal() {
+        // %2e%2e is URL-encoded ".."
+        assert_eq!(p079_safe_relative_path(Some("%2e%2e/secret")), None, "%2e%2e traversal must be rejected");
+        // Mixed case
+        assert_eq!(p079_safe_relative_path(Some("%2E%2E/secret")), None, "uppercase %2E%2E must be rejected");
+        // %2f is URL-encoded "/"
+        assert_eq!(p079_safe_relative_path(Some("foo%2fetc%2fpasswd")), None, "%2f slash must be rejected");
+        // %5c is URL-encoded backslash
+        assert_eq!(p079_safe_relative_path(Some("foo%5csecret")), None, "%5c backslash must be rejected");
+        // Safe path still passes
+        assert_eq!(
+            p079_safe_relative_path(Some("output_contract_repair/abc/plan.json")),
+            Some("output_contract_repair/abc/plan.json"),
+            "safe path must still pass"
+        );
+    }
+
+    #[test]
+    fn sec_p079_med_001_mcp_redacts_fallback_principal_for_non_operator() {
+        // SEC-P079-MED-001: fallback_principal_id and fallback_principal_capability_hash
+        // must be stripped from provider_fallback for non-operator MCP callers.
+        let fallback = serde_json::json!({
+            "fallback_agent_execution_id": "agent-123",
+            "fallback_principal_id": "principal-abc",
+            "fallback_principal_capability_hash": "cap-hash-xyz",
+            "deadline_seconds": 30,
+        });
+        let non_op = p079_redact_fallback_principal(fallback.clone(), false);
+        assert!(non_op.get("fallback_principal_id").is_none(),
+            "fallback_principal_id must be absent for non-operator");
+        assert!(non_op.get("fallback_principal_capability_hash").is_none(),
+            "fallback_principal_capability_hash must be absent for non-operator");
+        assert!(non_op.get("fallback_agent_execution_id").is_some(),
+            "non-sensitive fields must remain");
+
+        let op = p079_redact_fallback_principal(fallback, true);
+        assert!(op.get("fallback_principal_id").is_some(),
+            "fallback_principal_id must be present for operator");
+        assert!(op.get("fallback_principal_capability_hash").is_some(),
+            "fallback_principal_capability_hash must be present for operator");
     }
 }

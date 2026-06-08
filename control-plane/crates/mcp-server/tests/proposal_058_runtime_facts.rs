@@ -916,3 +916,197 @@ async fn p058_sec001_run_resource_agent_cannot_see_snapshot_fields() {
         "Operator must receive chainworks_meta_root via run://"
     );
 }
+
+// ── SEC-P079-MCP-001: runtime_receipt p079 path fields must not reach non-operators ───────────
+
+/// SEC-P079-MCP-001: non-operator callers must not see p079_normalized_path,
+/// p079_matched_canonical_path, or permission payload fields in runtime_receipt.
+/// Operators must still see the full receipt.
+#[tokio::test]
+async fn p079_sec_mcp001_runtime_receipt_sanitized_for_non_operator() {
+    use db::repos::agent_execution_runtime_facts;
+    use db::repos::agent_execution_runtime_receipts;
+    use domain::agent::{AgentExecutionRuntimeFacts, AgentExecutionRuntimeReceiptRecord};
+
+    let pool = test_pool().await;
+    let (run_id, _stage_execution_id, agent_execution_id) = seed_execution(&pool).await;
+
+    // Insert runtime facts so runtime_facts_json is produced.
+    let now = Utc::now();
+    let facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+
+    // Insert a runtime receipt that contains P079 path fields in permission_roundtrips.
+    let receipt_json = serde_json::json!({
+        "schema_version": 1,
+        "transport_family": "acp",
+        "provider": "claude",
+        "provider_session_id": "prov-session-secret",
+        "session_generation_id": "gen-1",
+        "status": "completed",
+        "started_at": "2026-01-01T00:00:00Z",
+        "xcode_shim_injected": false,
+        "requires_xcode_host_execution": false,
+        "handshake": {},
+        "counters": {
+            "total_messages": 10,
+            "session_update_count": 2,
+            "permission_request_count": 1,
+            "permission_grant_sent_count": 1,
+            "permission_grant_failed_count": 0,
+            "agent_message_chunk_count": 5,
+            "agent_thought_chunk_count": 0,
+            "tool_call_count": 1,
+            "tool_call_update_count": 0,
+            "plan_update_count": 0,
+            "meaningful_progress_count": 3,
+            "unknown_notification_count": 0
+        },
+        "permission_roundtrips": [{
+            "request_id": "req-1",
+            "requested_at_ms": 100,
+            "request_summary": "Write to /Users/test/artifacts/output.json",
+            "request_payload": r#"{"tool":"write_file","path":"/Users/test/artifacts/output.json"}"#,
+            "grant_sent_at_ms": 110,
+            "grant_summary": "Granted write to /Users/test/artifacts",
+            "grant_payload": r#"{"granted":true,"path":"/Users/test/artifacts/output.json"}"#,
+            "first_post_grant_event_at_ms": 120,
+            "first_post_grant_event_kind": "tool_result",
+            "first_post_grant_event_detail": "wrote /Users/test/artifacts/output.json",
+            "outcome": "post_grant_activity_observed",
+            "p079_tool_name": "write_file",
+            "p079_normalized_path": "/Users/test/artifacts/output.json",
+            "p079_matched_canonical_path": "/Users/test/artifacts/output.json",
+            "p079_decision_reason": "canonical_path_allowed: /Users/test/artifacts/output.json",
+            "p079_resource_kind": "file"
+        }],
+        "first_events": [{"at_ms": 50, "kind": "initialize", "detail": "/Users/test/artifacts"}],
+        "last_events": [{"at_ms": 200, "kind": "completed", "detail": "done /Users/test/artifacts/output.json"}],
+        "p079_unsafe_continuation": false
+    })
+    .to_string();
+
+    agent_execution_runtime_receipts::upsert(
+        &pool,
+        &AgentExecutionRuntimeReceiptRecord {
+            agent_execution_id,
+            provider: "claude".into(),
+            transport_family: "acp".into(),
+            status: "completed".into(),
+            failure_phase: None,
+            event_count: 10,
+            last_event_kind: Some("completed".into()),
+            last_event_at_ms: Some(200),
+            receipt_json,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Operator sees full receipt including p079 path fields.
+    let operator_payload = mcp_server::tools::reports::execute(
+        "reports.get",
+        serde_json::json!({ "run_id": run_id.to_string() }),
+        &pool,
+        &make_command_handler(pool.clone()),
+        &auth::Principal::new("operator", auth::PrincipalClass::Operator),
+    )
+    .await
+    .unwrap();
+    let operator_exec = operator_payload
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["report_kind"] == "mcp_execution_truth")
+        .unwrap();
+    let op_receipt = &operator_exec["agent_executions"][0]["runtime_facts"]["runtime_receipt"];
+    let op_roundtrip = &op_receipt["permission_roundtrips"][0];
+    assert_eq!(
+        op_roundtrip["p079_normalized_path"],
+        "/Users/test/artifacts/output.json",
+        "Operator must see p079_normalized_path in runtime_receipt"
+    );
+    assert_eq!(
+        op_roundtrip["p079_matched_canonical_path"],
+        "/Users/test/artifacts/output.json",
+        "Operator must see p079_matched_canonical_path in runtime_receipt"
+    );
+    assert_eq!(
+        op_receipt["provider_session_id"],
+        "prov-session-secret",
+        "Operator must see provider_session_id in runtime_receipt"
+    );
+
+    // Observer must NOT see p079 path fields or payloads in runtime_receipt.
+    let observer_payload = mcp_server::tools::reports::execute(
+        "reports.get",
+        serde_json::json!({ "run_id": run_id.to_string() }),
+        &pool,
+        &make_command_handler(pool.clone()),
+        &auth::Principal::new("observer", auth::PrincipalClass::Observer),
+    )
+    .await
+    .unwrap();
+    let observer_exec = observer_payload
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["report_kind"] == "mcp_execution_truth")
+        .unwrap();
+    let obs_receipt =
+        &observer_exec["agent_executions"][0]["runtime_facts"]["runtime_receipt"];
+    let obs_roundtrip = &obs_receipt["permission_roundtrips"][0];
+    assert!(
+        obs_roundtrip.get("p079_normalized_path").is_none()
+            || obs_roundtrip["p079_normalized_path"] == serde_json::Value::Null,
+        "Observer must NOT see p079_normalized_path (SEC-P079-MCP-001); got: {obs_roundtrip:?}"
+    );
+    assert!(
+        obs_roundtrip.get("p079_matched_canonical_path").is_none()
+            || obs_roundtrip["p079_matched_canonical_path"] == serde_json::Value::Null,
+        "Observer must NOT see p079_matched_canonical_path (SEC-P079-MCP-001)"
+    );
+    assert!(
+        obs_roundtrip.get("p079_decision_reason").is_none()
+            || obs_roundtrip["p079_decision_reason"] == serde_json::Value::Null,
+        "Observer must NOT see p079_decision_reason (SEC-P079-MCP-001)"
+    );
+    assert!(
+        obs_roundtrip.get("request_payload").is_none()
+            || obs_roundtrip["request_payload"] == serde_json::Value::Null,
+        "Observer must NOT see request_payload (SEC-P079-MCP-001)"
+    );
+    assert!(
+        obs_roundtrip.get("grant_payload").is_none()
+            || obs_roundtrip["grant_payload"] == serde_json::Value::Null,
+        "Observer must NOT see grant_payload (SEC-P079-MCP-001)"
+    );
+    assert!(
+        obs_receipt.get("provider_session_id").is_none()
+            || obs_receipt["provider_session_id"] == serde_json::Value::Null,
+        "Observer must NOT see provider_session_id in runtime_receipt (SEC-P079-MCP-001)"
+    );
+    // Safe counters must still be present for observers.
+    assert!(
+        obs_receipt["counters"]["total_messages"].as_i64().is_some(),
+        "Observer must still see receipt counters"
+    );
+    // roundtrip record itself is present; only sensitive fields stripped.
+    assert!(
+        obs_receipt["permission_roundtrips"]
+            .as_array()
+            .map(|a| a.len())
+            == Some(1),
+        "Observer must see permission_roundtrips array (sanitized)"
+    );
+    // outcome is a safe field that should remain.
+    assert_eq!(
+        obs_roundtrip["outcome"],
+        "post_grant_activity_observed",
+        "Observer must still see outcome field in roundtrip"
+    );
+}

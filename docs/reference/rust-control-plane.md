@@ -84,7 +84,7 @@ The daemon is a single Rust binary built from a 9-crate workspace at `control-pl
 | Crate | Path | Role |
 |---|---|---|
 | `domain` | `crates/domain/src/lib.rs` | Value types, status enums, commands, events, and escalation ledger models. No I/O. |
-| `db` | `crates/db/src/lib.rs` | SQLite pool, migrations, repository modules (including escalation), work item types. |
+| `db` | `crates/db/src/lib.rs` | SQLite pool, migrations, repository modules (including escalation, output contract repair), work item types. |
 | `auth` | `crates/auth/src/lib.rs` | Bearer principals, principal-table loading, caller-class derivation, and shared boundary authorization helpers. |
 | `workflow` | `crates/workflow/src/lib.rs` | YAML workflow definition parsing, agent catalog loading, `RunPlan` compilation, and `PhaseBLeadResolver` compatibility mapping. |
 | `acp` | `crates/acp/src/lib.rs` | ACP runtime manager, per-provider adapters, JSON-RPC 2.0 stdio transport. |
@@ -292,7 +292,7 @@ The orchestrator at `crates/engine/src/orchestrator.rs` drives runs through the 
 
 State types:
 
-- **Compute state** -- creates a `StageExecution` with status `Running`, enqueues `InvokeAgent` work items for each task. If no explicit tasks, the owner agent runs as a single task.
+- **Compute state** -- creates a `StageExecution` with status `Running`, enqueues `InvokeAgent` work items for each task. If no explicit tasks, the owner agent runs as a single task. Upon completion of an `InvokeAgent` task, the workflow engine's output settlement process is partially enhanced by P079 (Contract-Aware Output Repair and Provider Fallback): the deterministic fixture same-session repair lane can repair eligible missing/invalid required outputs before marking the stage as `Blocked`. Production same-session repair is fail-closed for advisory-only providers until enforceable sandbox/permission restrictions exist. Transcript/provider-envelope recovery and controlled provider fallback are not yet wired and remain deferred.
 - **Manual gate** (`is_manual_gate`) -- creates a `StageExecution` with status `WaitingApproval` and an `Approval` record. The run pauses until the operator approves or rejects.
 - **End state** (`is_end`) -- marks the run `Completed`.
 
@@ -360,7 +360,7 @@ Defined in `crates/acp/src/transport.rs`:
 
 1. **`initialize`** -- establish protocol version and client identity (`chainworks-control-plane 0.1.0`).
 2. **`session/new`** -- start an agent session with provider-specific config (model, mode, extras). Returns `sessionId`.
-3. **`session/prompt`** -- submit the prompt. Stream `session/update` notifications until the terminal response arrives.
+3. **`session/prompt`** -- submit the prompt. Stream `session/update` notifications until the terminal response arrives. When output settlement detects missing/invalid required outputs, the engine may dispatch a P079 same-session repair turn over the same session; transcript/provider-envelope recovery and controlled provider fallback remain deferred.
 4. **`session/close`** -- clean shutdown request (best-effort). The runtime manager sends this even when `session/prompt` returns a transport error after `session/new`.
 5. Drop stdin (EOF) and wait up to 5 seconds for graceful exit, then signal the provider subprocess process group before falling back to direct kill.
 
@@ -423,7 +423,7 @@ Idle/progress timeouts are normalized by runtime facts before operator
 readback. When a provider times out after meaningful `session/update` progress
 and the final receipt events include streamed text or a diff update, while all
 permission requests have already been granted, the engine records a recoverable
-handoff gap instead of an ordinary provider timeout:
+handoff gap instead of an ordinary provider timeout, feeding into P079's recovery mechanisms:
 
 - `failure_kind = missing_required_outputs`
 - `output_settlement = missing_required_outputs`
@@ -630,7 +630,7 @@ queue-wait latency.
 
 The database schema is evolved through migrations located at `control-plane/crates/db/migrations/`. These migrations define the canonical domain tables, support projections for client readback, and metadata for scheduling and recovery.
 
-**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`, `062_p087_projection_freshness_healthy_window.sql`, `076_p058_escalation_schema.sql`, `077_p058_escalation_redaction_version.sql`, `078_p058_escalation_idempotency.sql`):
+**Canonical domain tables** (e.g., `001_initial.sql`, `003_workflow_state_machine.sql`, `025_p017_workflow_conflicts.sql`, `037_p066_toolchain_cache_mapping.sql`, `044_p084_rollout_contract.sql`, `045_p084_rollout_contract_readback.sql`, `046_p075_evidence_spool_refs.sql`, `047_p075_storage_write_pressure_snapshots.sql`, `048_p075_evidence_path_constraints.sql`, `049_p075_storage_write_pressure_window_key.sql`, `052_p078_side_effect_ledger.sql`, `057_p087_storage_tiering_projections.sql`, `058_p087_hot_read_refinements.sql`, `059_p087_projection_refinement.sql`, `060_p087_projection_invalidation_lifecycle.sql`, `061_p087_hot_read_promotion_budget.sql`, `062_p087_projection_freshness_healthy_window.sql`, `076_p058_escalation_schema.sql`, `077_p058_escalation_redaction_version.sql`, `078_p058_escalation_idempotency.sql`, `079_p079_output_contract_repair.sql`):
 
 | Table | Purpose |
 |---|---|
@@ -645,7 +645,9 @@ The database schema is evolved through migrations located at `control-plane/crat
 | `workflow_advisory_rejections` | Non-blocking historical records of rejected agent hints |
 | `lead_conflict_mediations` | Durable mediation lifecycle (id, run_id, conflict_id, status, lead_agent_id, settlement_result) |
 | `lead_mediation_confirmations` | Separate store for mediation confirmations (id, mediation_id, status, deadline_at, suggested_action) |
-| `workflow_conflict_metric_events` | Durable rollout metric events for workflow conflict recovery, mediation, Phase C validation, and dogfood decisions |
+| `output_contract_repair_events` | Authoritative per-(repair_attempt, parent agent execution) evidence row for P079. |
+| `output_contract_repair_leases` | Single-flight scheduling authority for P079 repair/fallback dispatch. |
+| `output_contract_repair_fallback_parent_links` | Explicit forward and reverse linkage for P079 fallback agent executions. |
 | `main_sync_attempts` | P064: Lifecycle of worktree sync attempts (status, preservation commit, merge commit, results) |
 | `main_sync_conflict_files` | P064: Files that conflicted during a sync attempt |
 | `run_knowledge_capsules` | P064: Compact cross-run knowledge capsules emitted from terminal runs |
@@ -731,7 +733,7 @@ The work queue (`crates/engine/src/work_queue.rs`) wraps the `work_items` SQLite
 
 | Kind | Behavior |
 |---|---|
-| `InvokeAgent` | Spawns ACP session via the runtime manager. Concurrent (tokio::spawn). |
+| `InvokeAgent` | Spawns ACP session via the runtime manager. Concurrent (tokio::spawn). If no explicit tasks, the owner agent runs as a single task. Upon completion of an `InvokeAgent` task, the workflow engine's output settlement process is partially enhanced by P079 (Contract-Aware Output Repair and Provider Fallback): the same-session repair lane attempts to repair eligible missing/invalid required outputs before marking the stage as `Blocked` (gated for advisory-only providers per SEC-P079-HIGH-001). Transcript/provider-envelope recovery and controlled provider fallback are deferred and not yet wired. |
 | `AdvanceRun` | Re-evaluates run state through the orchestrator. Inline. |
 | `TriggerNextStage` | Alias for AdvanceRun. Inline. |
 | `SettleStage` | Alias for AdvanceRun. Inline. |

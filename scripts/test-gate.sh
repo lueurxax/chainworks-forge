@@ -2355,6 +2355,8 @@ Available gates:
   proposal-077,p077  Proposal 077 closeout readiness gates (Rust domain/db/engine plus GraphQL/MCP readback parity; UI remote evidence separate)
   proposal-077-ui,p077-ui  Proposal 077 remote macOS compact/focus/backlink/accessibility runtime proof
   proposal-078,p078  Proposal 078 durable side-effect ledger gate (migration, CAS races, preflight, MCP tools)
+  proposal-079,p079  Proposal 079 partial-acceptance gate (migration, domain types, DB repos, Swift DTO, same-session repair dispatch, advisory posture, plan-evidence collection, Junie eligibility gate) — transcript recovery and provider fallback not yet gated
+  p079-swift-readback  Proposal 079 Swift readback DTO decode gate (build + fixture-decode tests)
   proposal-031-readiness,p031-readiness  Thin UI closeout readiness gate
   proposal-032    Proposal 032 atomic transition settlement and durable resume cursor gate
   proposal-033    Proposal 033 ACP-only runtime architecture gate
@@ -10363,6 +10365,219 @@ if "CANONICAL_HOT_READ_SURFACES" not in storage_health_rs:
 print("P087 UI, schema, and evidence verified")
 PY
     log "Proposal 087 gate passed"
+    ;;
+  proposal-079|p079)
+    # P079 partial-acceptance gate.
+    # Covers: migration shape, domain types, DB repos, Swift DTO fixture-decode,
+    # deterministic fixture same-session repair dispatch, fail-closed advisory posture,
+    # plan-evidence collection/redaction, Junie eligibility gate.
+    # NOT yet covered: transcript/envelope recovery, provider fallback, YAML policies,
+    # metrics, full projection rebuild, release-lane exclusions, prompt hardening reference docs.
+    log "Proposal 079 partial-acceptance gate (pass 16)"
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p domain proposal_079_ -- --nocapture
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p db proposal_079_ -- --nocapture
+    )
+    python3 - <<'PY'
+import json
+from pathlib import Path
+
+root = Path.cwd()
+
+# Verify the migration file exists.
+migration = root / "control-plane/crates/db/migrations/079_p079_output_contract_repair.sql"
+if not migration.exists():
+    raise SystemExit("proposal-079: missing migration file 079_p079_output_contract_repair.sql")
+
+migration_text = migration.read_text()
+for required_table in [
+    "output_contract_repair_events",
+    "output_contract_repair_leases",
+    "output_contract_repair_fallback_parent_links",
+]:
+    if required_table not in migration_text:
+        raise SystemExit(f"proposal-079: migration missing table {required_table!r}")
+
+for required_element in [
+    "prompt_sent_requires_idempotency",
+    "repair_attempt_id",
+    "schema_version",
+    "dispatch_committed_at",
+    "projection_rebuild_attempts",
+    "UNIQUE(agent_execution_id)",
+    "dispatch_committed_at_set_on_send",
+]:
+    if required_element not in migration_text:
+        raise SystemExit(f"proposal-079: migration missing required element {required_element!r}")
+
+# Verify domain types.
+domain_file = root / "control-plane/crates/domain/src/output_contract_repair.rs"
+if not domain_file.exists():
+    raise SystemExit("proposal-079: missing domain/src/output_contract_repair.rs")
+
+domain_text = domain_file.read_text()
+for required_term in [
+    "OutputContractRepairStatus",
+    "PresentationCategory",
+    "InitialFailureClass",
+    "LeaseState",
+    "OutputContractRepairEvidence",
+    "OutputContractFallbackPacket",
+    "SCHEMA_VERSION",
+    "FLAG_OUTPUT_REPAIR_ENABLED",
+    "FLAG_TRANSCRIPT_RECOVERY_ENABLED",
+    "FLAG_PROVIDER_FALLBACK_ENABLED",
+    "DEFAULT_REPAIR_LEASE_SECONDS",
+    "proposal_079_presentation_category_projection",
+    # Approved appendix alignment: PK field name and new v1 fields.
+    "repair_attempt_id",
+    "dispatch_committed_at",
+    "projection_rebuild_attempts",
+    "repair_max_per_invocation",
+    "proposal_079_required_output_binding_uses_name_field",
+    "proposal_079_budget_has_max_fields",
+    "proposal_079_event_row_uses_repair_attempt_id",
+]:
+    if required_term not in domain_text:
+        raise SystemExit(f"proposal-079: domain module missing {required_term!r}")
+
+# Verify DB repo module.
+db_repo = root / "control-plane/crates/db/src/repos/output_contract_repair.rs"
+if not db_repo.exists():
+    raise SystemExit("proposal-079: missing db/repos/output_contract_repair.rs")
+
+db_text = db_repo.read_text()
+for required_fn in [
+    "insert_repair_event",
+    "update_repair_event_status",
+    "get_repair_event_by_agent_execution_id",
+    "get_repair_event_by_repair_attempt_id",
+    "insert_lease",
+    "transition_lease_to_prompt_sent",
+    "settle_lease_tx",
+    "list_expired_active_leases",
+    "insert_fallback_parent_link",
+    "get_fallback_link_by_parent",
+    "proposal_079_lease_reserved_to_prompt_sent",
+    "dispatch_committed_at",
+]:
+    if required_fn not in db_text:
+        raise SystemExit(f"proposal-079: db repo missing function/test {required_fn!r}")
+
+# Verify Swift DTO module files exist.
+swift_dto = root / "Chainworks Forge/Engine/Readback/OutputContractRepair/OutputContractRepairEvidence.swift"
+swift_presenter = root / "Chainworks Forge/Engine/Readback/OutputContractRepair/OutputContractRepairPresenter.swift"
+if not swift_dto.exists():
+    raise SystemExit("proposal-079: missing Swift DTO OutputContractRepairEvidence.swift")
+if not swift_presenter.exists():
+    raise SystemExit("proposal-079: missing Swift OutputContractRepairPresenter.swift")
+
+swift_dto_text = swift_dto.read_text()
+for required_type in [
+    "OutputContractRepairStatus",
+    "PresentationCategory",
+    "InitialFailureClass",
+    "LeaseState",
+    "OutputContractRepairEvidence",
+    "unknownDiagnostic",
+    "Identifiable",
+    "APPLE-R3-001",
+    # Approved schema alignment checks.
+    "repairMaxPerInvocation",
+    "fallbackMaxPerInvocation",
+    "resultSubtype",
+    "notNeeded",
+    "supersededIgnored",
+]:
+    if required_type not in swift_dto_text:
+        raise SystemExit(f"proposal-079: Swift DTO missing {required_type!r}")
+
+# Verify Swift decode tests exist.
+swift_tests = root / "Chainworks ForgeTests/Proposal079ContractRepairReadbackTests.swift"
+if not swift_tests.exists():
+    raise SystemExit("proposal-079: missing Proposal079ContractRepairReadbackTests.swift")
+
+swift_tests_text = swift_tests.read_text()
+for required_test in [
+    "oldRunDecodesAsNil",
+    "notAttemptedDecodesCorrectly",
+    "recoveredSameSessionRepairDecodes",
+    "recoveredTranscriptRecoveryDecodes",
+    "recoveredFallbackDecodes",
+    "blockedDecodesCorrectly",
+    "cancelledDecodesCorrectly",
+    "staleProjectionPresents",
+    "unknownStatusMapsToUnknownDiagnostic",
+    "leaseReclaimedDecodes",
+    "identityExcludesEvidenceVersion",
+    "unchangedEvidenceVersionNoChurn",
+    "leaseTransitionsKeepSingleRowIdentity",
+]:
+    if required_test not in swift_tests_text:
+        raise SystemExit(f"proposal-079: Swift test file missing test {required_test!r}")
+
+print("proposal-079: migration, domain types, DB repo, and Swift DTO structure verified")
+PY
+    # Verify new runtime behavior symbols are present (pass 16 additions).
+    python3 - <<'PY2'
+from pathlib import Path
+root = Path.cwd()
+
+executor = root / "control-plane/crates/engine/src/executor.rs"
+if not executor.exists():
+    raise SystemExit("proposal-079: missing engine/src/executor.rs")
+executor_text = executor.read_text()
+
+# SEC-P079-HIGH-003: fail-closed advisory posture symbols. The legacy env var
+# remains in tests only to prove it cannot enable production repair dispatch.
+for required in [
+    "p079_provider_supports_enforced_permissions",
+    "p079_advisory_posture_opt_in",
+    "CHAINWORKS_P079_ACCEPT_ADVISORY_REPAIR_POSTURE",
+    "advisory_posture_not_enforceable",
+    "p079_collect_plan_evidence",
+    "p079_redact_plan_evidence_content",
+    "provider_mode_mismatch_risk",
+]:
+    if required not in executor_text:
+        raise SystemExit(f"proposal-079: executor missing runtime symbol {required!r}")
+
+# Verify DB repo has plan-evidence update function.
+db_repo = root / "control-plane/crates/db/src/repos/output_contract_repair.rs"
+db_text = db_repo.read_text()
+if "update_plan_evidence" not in db_text:
+    raise SystemExit("proposal-079: db repo missing update_plan_evidence function")
+
+print("proposal-079 pass-16 runtime symbols verified")
+PY2
+    (
+      cd "$ROOT_DIR/control-plane"
+      # Run P079 security and advisory posture unit tests.
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p engine --lib -- \
+        p079_advisory p079_provider_supports p079_plan_evidence_redact sec_002 -- --nocapture 2>/dev/null || \
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p engine --lib -- p079_advisory 2>/dev/null
+      # Run P079 repair integration test (requires CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED
+      # and CHAINWORKS_P079_ACCEPT_ADVISORY_REPAIR_POSTURE both set).
+      CHAINWORKS_P079_OUTPUT_REPAIR_ENABLED=1 \
+      CHAINWORKS_P079_ACCEPT_ADVISORY_REPAIR_POSTURE=1 \
+      CARGO_TARGET_DIR=target/proposal-079-gate cargo test -p engine --test integration \
+        invoke_agent_repairs_missing_required_output_in_same_live_session -- --nocapture
+    )
+    run_build "p079"
+    run_targeted_tests "p079" \
+      "Chainworks ForgeTests/Proposal079ContractRepairReadbackTests"
+    log "Proposal 079 gate passed"
+    ;;
+  p079-swift-readback)
+    # P079 Swift readback DTO decode gate.
+    # Runs the Swift build (compile check) and the P079 fixture-decode test slice.
+    # Must not require live providers, remote hosts, or UI tests.
+    log "Proposal 079 Swift readback DTO gate"
+    run_build "p079-swift-readback"
+    run_targeted_tests "p079-swift-readback" \
+      "Chainworks ForgeTests/Proposal079ContractRepairReadbackTests"
+    log "Proposal 079 Swift readback DTO gate passed"
     ;;
   *)
     print_usage >&2

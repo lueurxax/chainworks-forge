@@ -2,18 +2,26 @@ use std::sync::Arc;
 
 use acp::{XcodeBrokerHttpRouteState, XcodeMcpBridgePool};
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+
+/// Maximum request body size for the Xcode MCP broker endpoint.
+/// Mirrors the MCP HTTP server limit so oversized bodies are rejected before
+/// authentication and body buffering can exhaust daemon memory (SEC-XCODE-001).
+const XCODE_BROKER_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 use serde_json::json;
 
 pub fn routes(pool: Arc<XcodeMcpBridgePool>) -> Router {
     Router::new()
         .route("/xcode-mcp/health", get(handle_health))
         .route("/xcode-mcp/{lease_id}", post(handle_xcode_mcp_post))
+        // SEC-XCODE-001: reject oversized bodies before authentication and body buffering
+        // to prevent pre-auth memory pressure / DoS via unbounded body accumulation.
+        .layer(DefaultBodyLimit::max(XCODE_BROKER_BODY_LIMIT_BYTES))
         .with_state(pool)
 }
 
@@ -527,6 +535,66 @@ mod tests {
         );
     }
 
+    // SEC-XCODE-001: oversized unauthenticated body must be rejected with 413 before authentication.
+    #[tokio::test]
+    async fn xcode_mcp_route_rejects_oversized_unauthenticated_body() {
+        let pool = Arc::new(XcodeMcpBridgePool::new(XcodeMcpBridgePoolConfig {
+            base_url: "http://127.0.0.1:8123/xcode-mcp".to_string(),
+            first_connect_timeout: Duration::from_secs(60),
+            ..Default::default()
+        }));
+        let req = brokered_xcode_request();
+        let attachment = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+        let lease_id = attachment.lease_ids[0].clone();
+
+        let response = routes(pool)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/xcode-mcp/{lease_id}"))
+                    // No authorization header — unauthenticated
+                    .body(Body::from("x".repeat(XCODE_BROKER_BODY_LIMIT_BYTES + 1)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // SEC-XCODE-001: oversized authenticated body must also be rejected with 413.
+    #[tokio::test]
+    async fn xcode_mcp_route_rejects_oversized_authenticated_body() {
+        let pool = Arc::new(XcodeMcpBridgePool::new(XcodeMcpBridgePoolConfig {
+            base_url: "http://127.0.0.1:8123/xcode-mcp".to_string(),
+            first_connect_timeout: Duration::from_secs(60),
+            ..Default::default()
+        }));
+        let req = brokered_xcode_request();
+        let attachment = pool.attach_brokered_xcode_leases(&req).await.unwrap();
+        let lease_id = attachment.lease_ids[0].clone();
+        let auth_header = match &attachment.request.mcp_servers[0].transport {
+            ResolvedMcpServerTransport::Http { headers, .. } => {
+                headers.get("Authorization").cloned().unwrap()
+            }
+            _ => panic!("expected broker lease to become HTTP transport"),
+        };
+
+        let response = routes(pool)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/xcode-mcp/{lease_id}"))
+                    .header("authorization", auth_header)
+                    .body(Body::from("x".repeat(XCODE_BROKER_BODY_LIMIT_BYTES + 1)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     async fn response_json(response: Response) -> serde_json::Value {
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
@@ -582,6 +650,8 @@ mod tests {
             mediation_record_id: None,
             toolchain_home: None,
             toolchain_go_scope_enabled: false,
+
+            p079_repair_canonical_paths: None,
         }
     }
 }
