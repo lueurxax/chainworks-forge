@@ -7,12 +7,13 @@
 # next build still re-uses the hot incremental cache.
 #
 # Usage:
-#   ./scripts/clean-build-caches.sh [--dry-run] [--aggressive]
+#   ./scripts/clean-build-caches.sh [--dry-run] [--aggressive] [--protect-worktree NAME]
 #
 # Default pass removes:
 #   * `control-plane/target/proposal-*` / `target/p*-*` orphan
-#     CARGO_TARGET_DIRs from other proposals' gates, unless cargo is
-#     actively building/testing.
+#     CARGO_TARGET_DIRs from proposal gates, including the same pattern
+#     under `.chainworks/worktrees/*/control-plane/target`, unless cargo
+#     is actively building/testing.
 #   * `$TMPDIR/chainworks-test-gates` DerivedData, xcresult, and target
 #     residuals not referenced by currently running xcodebuild commands.
 #   * All but the most recently modified
@@ -28,19 +29,41 @@ set -euo pipefail
 
 DRY_RUN=0
 AGGRESSIVE=0
-for arg in "$@"; do
+PROTECTED_WORKTREES=()
+while [[ "$#" -gt 0 ]]; do
+    arg="$1"
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
         --aggressive) AGGRESSIVE=1 ;;
+        --protect-worktree=*) PROTECTED_WORKTREES+=("${arg#--protect-worktree=}") ;;
+        --protect-worktree)
+            shift
+            if [[ "$#" -eq 0 || "${1:-}" == --* ]]; then
+                echo "error: --protect-worktree requires NAME or --protect-worktree=NAME" >&2
+                exit 64
+            fi
+            PROTECTED_WORKTREES+=("$1")
+            ;;
         -h|--help)
             sed -n '2,30p' "$0"
             exit 0
             ;;
+        *)
+            echo "error: unknown argument: $arg" >&2
+            exit 64
+            ;;
     esac
+    shift
 done
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_BASE="${TMPDIR:-/tmp}/chainworks-test-gates"
+WORKTREE_ROOT="$ROOT_DIR/.chainworks/worktrees"
+
+if [[ -n "${CHAINWORKS_CLEAN_PROTECTED_WORKTREES:-}" ]]; then
+    IFS=' :' read -r -a _env_protected_worktrees <<< "${CHAINWORKS_CLEAN_PROTECTED_WORKTREES}"
+    PROTECTED_WORKTREES+=("${_env_protected_worktrees[@]}")
+fi
 
 say() {
     if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -94,23 +117,52 @@ is_active_tmp_path() {
     return 1
 }
 
+is_protected_worktree() {
+    local worktree_name="$1"
+    local protected
+    for protected in "${PROTECTED_WORKTREES[@]:-}"; do
+        [[ -n "$protected" ]] || continue
+        if [[ "$worktree_name" == "$protected" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+clean_orphan_target_dirs() {
+    local target_root="$1"
+    [[ -d "$target_root" ]] || return 0
+
+    # Collect every direct child of target/ that is neither debug,
+    # release, nor a cargo metadata file. Those are per-proposal
+    # CARGO_TARGET_DIRs used by gates and ad-hoc retry/refine passes.
+    for entry in "$target_root"/*; do
+        [[ -d "$entry" ]] || continue
+        name="$(basename "$entry")"
+        case "$name" in
+            debug|release|doc|tmp|xcode-local|xcode-shared|sccache) continue ;;
+        esac
+        say "removing orphan target dir $entry"
+        delete "$entry"
+    done
+}
+
 # ── 1. Orphan per-proposal target dirs ───────────────────────────────
 TARGET_ROOT="$ROOT_DIR/control-plane/target"
-if [[ -d "$TARGET_ROOT" ]]; then
-    if is_cargo_running; then
-        say "cargo build/test is running; skipping control-plane/target cleanup"
-    else
-        # Collect every direct child of target/ that is neither debug,
-        # release, nor a cargo metadata file. Those are per-proposal
-        # CARGO_TARGET_DIRs used by other gates.
-        for entry in "$TARGET_ROOT"/*; do
-            [[ -d "$entry" ]] || continue
-            name="$(basename "$entry")"
-            case "$name" in
-                debug|release|doc|tmp) continue ;;
-            esac
-            say "removing orphan target dir $entry"
-            delete "$entry"
+if is_cargo_running; then
+    say "cargo build/test is running; skipping Cargo target cleanup"
+else
+    clean_orphan_target_dirs "$TARGET_ROOT"
+
+    if [[ -d "$WORKTREE_ROOT" ]]; then
+        for worktree in "$WORKTREE_ROOT"/*; do
+            [[ -d "$worktree" ]] || continue
+            worktree_name="$(basename "$worktree")"
+            if is_protected_worktree "$worktree_name"; then
+                say "keeping protected worktree target caches $worktree_name"
+                continue
+            fi
+            clean_orphan_target_dirs "$worktree/control-plane/target"
         done
     fi
 fi
