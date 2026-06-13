@@ -1,0 +1,128 @@
+{
+  "fixture_purpose": "Engine materialized placeholder for a rollout_contract_v1 readback fixture declared by an approved proposal. Implementation must replace or update this fixture with concrete evidence before the proposal gate can be treated as release evidence.",
+  "parity_lanes": {
+    "graphql": {
+      "rolloutContractActionId": null,
+      "rolloutContractCutoverPolicyRevision": null,
+      "rolloutContractDecision": "hold",
+      "rolloutContractDiagnosticRedaction": "none",
+      "rolloutContractDisabledReasonCode": "placeholder_pending_implementation_evidence",
+      "rolloutContractEnabledState": "disabled",
+      "rolloutContractEnforcementMode": "enforce",
+      "rolloutContractEnforcementModeReason": "declared_fixture_placeholder",
+      "rolloutContractFailureReasons": [
+        "placeholder_pending_implementation_evidence"
+      ],
+      "rolloutContractHoldConditions": [
+        "Replace engine materialized placeholder with proposal-specific rollout evidence."
+      ],
+      "rolloutContractNextSteps": [
+        "Replace placeholder with concrete GraphQL readback evidence."
+      ],
+      "rolloutContractOperatorMessage": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
+      "rolloutContractProjectionIntegrity": "stale",
+      "rolloutContractRollbackDisposition": {
+        "dataLossRisk": "none",
+        "mode": "not_applicable"
+      },
+      "rolloutContractSourceLane": "graphql",
+      "rolloutContractStatus": "fail",
+      "rolloutContractWaiverExpiresAt": null,
+      "rolloutContractWaiverState": "none"
+    },
+    "mcp": {
+      "rollout_contract_action_id": null,
+      "rollout_contract_cutover_policy_revision": null,
+      "rollout_contract_decision": "hold",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
+      "rollout_contract_enabled_state": "disabled",
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
+      "rollout_contract_failure_reasons": [
+        "placeholder_pending_implementation_evidence"
+      ],
+      "rollout_contract_hold_conditions": [
+        "Replace engine materialized placeholder with proposal-specific rollout evidence."
+      ],
+      "rollout_contract_next_steps": [
+        "Replace placeholder with concrete MCP readback evidence."
+      ],
+      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
+      "rollout_contract_projection_integrity": "stale",
+      "rollout_contract_rollback_disposition": {
+        "data_loss_risk": "none",
+        "mode": "not_applicable"
+      },
+      "rollout_contract_source_lane": "mcp",
+      "rollout_contract_status": "fail",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_waiver_state": "none"
+    },
+    "release_receipt": {
+      "rollout_contract_action_id": null,
+      "rollout_contract_cutover_policy_revision": null,
+      "rollout_contract_decision": "hold",
+      "rollout_contract_diagnostic_redaction": "none",
+      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
+      "rollout_contract_enabled_state": "disabled",
+      "rollout_contract_enforcement_mode": "enforce",
+      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
+      "rollout_contract_failure_reasons": [
+        "placeholder_pending_implementation_evidence"
+      ],
+      "rollout_contract_hold_conditions": [
+        "Replace engine materialized placeholder with proposal-specific rollout evidence."
+      ],
+      "rollout_contract_next_steps": [
+        "Replace placeholder with concrete release receipt evidence."
+      ],
+      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
+      "rollout_contract_projection_integrity": "stale",
+      "rollout_contract_rollback_disposition": {
+        "data_loss_risk": "none",
+        "mode": "not_applicable"
+      },
+      "rollout_contract_source_lane": "release_receipt",
+      "rollout_contract_status": "fail",
+      "rollout_contract_waiver_expires_at": null,
+      "rollout_contract_waiver_state": "none"
+    }
+  },
+  "placeholder": {
+    "materialized_by": "chainworks_engine",
+    "path": "docs/evidence/rollout-contract/operator-readback/p080-full-surface.fixture.json",
+    "status": "pending_implementation_evidence"
+  },
+  "proposal_id": "unknown",
+  "proposal_revision_id": "p080-refined-2026-06-02-r28",
+  "rollout_contract_action_id": null,
+  "rollout_contract_cutover_policy_revision": null,
+  "rollout_contract_decision": "hold",
+  "rollout_contract_diagnostic_redaction": "none",
+  "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
+  "rollout_contract_enabled_state": "disabled",
+  "rollout_contract_enforcement_mode": "enforce",
+  "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
+  "rollout_contract_failure_reasons": [
+    "placeholder_pending_implementation_evidence"
+  ],
+  "rollout_contract_hold_conditions": [
+    "Replace engine materialized placeholder with proposal-specific rollout evidence."
+  ],
+  "rollout_contract_next_steps": [
+    "Replace placeholder with concrete operator readback evidence."
+  ],
+  "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
+  "rollout_contract_projection_integrity": "stale",
+  "rollout_contract_rollback_disposition": {
+    "data_loss_risk": "none",
+    "mode": "not_applicable"
+  },
+  "rollout_contract_source_lane": "run_report",
+  "rollout_contract_status": "fail",
+  "rollout_contract_waiver_expires_at": null,
+  "rollout_contract_waiver_state": "none",
+  "schema_version": "operator_readback_v1",
+  "source_lane": "run_report"
+}

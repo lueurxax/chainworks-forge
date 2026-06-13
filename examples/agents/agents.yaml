@@ -1231,13 +1231,40 @@ escalation_policies:
       - contract_output_failure
       - stale_no_output
     tiers:
+      - tier_id: codex_builder_fallback
+        kind: backend_profile
+        backend_profile_id: codex_builder_high
+        max_attempts: 1
       - tier_id: claude_builder_same_backend
         kind: backend_profile
         backend_profile_id: claude_builder_high
         max_attempts: 1
+      - tier_id: gemini_reasoning_fallback
+        kind: backend_profile
+        backend_profile_id: gemini_reasoning_pro_high
+        max_attempts: 1
+      - tier_id: human_pause
+        kind: pause
+  - policy_id: implementation_refinement_codex_quota_escalation
+    schema_version: escalation_policy_v1
+    enabled_default: true
+    applies_to:
+      stage_id: state_10_implementation_refined
+    max_chain_attempts: 3
+    max_chain_wall_clock_seconds: 7200
+    triggers:
+      - provider_quota_exhausted
+      - transport_failure
+      - contract_output_failure
+      - stale_no_output
+    tiers:
       - tier_id: codex_builder_fallback
         kind: backend_profile
         backend_profile_id: codex_builder_high
+        max_attempts: 1
+      - tier_id: claude_builder_same_backend
+        kind: backend_profile
+        backend_profile_id: claude_builder_high
         max_attempts: 1
       - tier_id: gemini_reasoning_fallback
         kind: backend_profile

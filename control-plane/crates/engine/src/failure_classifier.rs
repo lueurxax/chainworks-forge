@@ -11,6 +11,7 @@ pub enum RuntimeFailureObservation {
     ProviderTimeout {
         supervision_classification: Option<String>,
     },
+    ProviderToolSessionControlFailure,
     ProviderInternalError,
     TransportEpipe,
     TransportProtocolError,
@@ -67,6 +68,13 @@ pub fn classify_observation(
             retry_after: None,
             transport_error_code: None,
             supervision_classification,
+        },
+        ProviderToolSessionControlFailure => RuntimeFailureClassification {
+            failure_kind: AgentFailureKind::ProviderInternalError,
+            operator_action_hint: OperatorActionHint::Retry,
+            retry_after: None,
+            transport_error_code: Some("CODEX_TOOL_SESSION_CONTROL_FAILURE".into()),
+            supervision_classification: Some("codex_tool_session_control_failure".into()),
         },
         ProviderInternalError => RuntimeFailureClassification {
             failure_kind: AgentFailureKind::ProviderInternalError,
@@ -159,6 +167,9 @@ pub fn observation_from_acp_error_message(message: &str) -> RuntimeFailureObserv
         || lower.contains("retry_after")
         || lower.contains("exhausted your capacity")
         || lower.contains("capacity on this model")
+        || (lower.contains("usage credits")
+            && lower.contains("required")
+            && lower.contains("long context"))
     {
         return RuntimeFailureObservation::ProviderQuota {
             retry_after: extract_retry_after_from_message(message),
@@ -176,6 +187,13 @@ pub fn observation_from_acp_error_message(message: &str) -> RuntimeFailureObserv
         return RuntimeFailureObservation::ProviderTimeout {
             supervision_classification: Some("provider_stream_silent_no_local_activity".into()),
         };
+    }
+    if lower.contains("codex_tool_session_control_failure")
+        || lower.contains("codex_tool_stdin_closed")
+        || lower.contains("codex_unbounded_tool_output")
+        || lower.contains("codex_turn_aborted_after_open_process")
+    {
+        return RuntimeFailureObservation::ProviderToolSessionControlFailure;
     }
     if lower.contains("idle") && lower.contains("timeout") {
         return RuntimeFailureObservation::ProviderTimeout {
@@ -663,6 +681,16 @@ mod tests {
             RuntimeFailureObservation::ProviderQuota {
                 retry_after: Some(_)
             }
+        ));
+    }
+
+    #[test]
+    fn claude_long_context_usage_credits_message_is_provider_quota() {
+        assert!(matches!(
+            observation_from_acp_error_message(
+                "Usage credits are required for long context requests."
+            ),
+            RuntimeFailureObservation::ProviderQuota { retry_after: None }
         ));
     }
 

@@ -81,12 +81,20 @@ const EX_TEMPFAIL: i32 = 75;
 const DAEMON_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 fn main() -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(DAEMON_WORKER_STACK_BYTES)
         .build()
         .context("build daemon tokio runtime")?
-        .block_on(run_daemon())
+        .block_on(run_daemon());
+    if let Err(err) = &result {
+        tracing::error!(
+            err = %err,
+            pid = std::process::id(),
+            "daemon lifecycle: run_daemon returned error"
+        );
+    }
+    result
 }
 
 async fn run_daemon() -> Result<()> {
@@ -130,6 +138,7 @@ async fn run_daemon() -> Result<()> {
     // lifetime — dropping it flushes buffered logs.
     let _log_guard: Option<tracing_appender::non_blocking::WorkerGuard> =
         init_tracing_for_mode(mode, paths.log_path.as_deref());
+    install_daemon_lifecycle_panic_hook();
     // `build-sha.txt` is written after the daemon reaches `Ready` per P042
     // §9.4 so the Swift diagnostics bundle never reads a sha for a
     // process that never actually came up.
@@ -145,6 +154,14 @@ async fn run_daemon() -> Result<()> {
     let events = new_bus(1024);
     let binary_schema_version = migrate::binary_schema_version();
     let build_sha = packaging::resolved_build_sha();
+    warn!(
+        pid = std::process::id(),
+        mode = %mode,
+        build_sha = %build_sha,
+        database_url = %paths.database_url,
+        bind_addr = %paths.bind_addr,
+        "daemon lifecycle: starting"
+    );
     let reporter = LifecycleReporter::new(binary_schema_version, build_sha, events.clone());
     reporter.set_state(DaemonLifecycleState::Starting);
 
@@ -686,6 +703,12 @@ async fn run_daemon() -> Result<()> {
             );
             info!("BackgroundExecutor started");
             reporter.set_state(DaemonLifecycleState::Ready);
+            warn!(
+                pid = std::process::id(),
+                mode = %mode,
+                build_sha = %build_sha,
+                "daemon lifecycle: ready"
+            );
             if let Err(e) = packaging::write_build_sha(&paths) {
                 warn!(err = %e, "failed to write build-sha.txt (non-fatal)");
             }
@@ -786,7 +809,12 @@ async fn run_daemon() -> Result<()> {
             // GraphQL server takes the socket.
             let (listener, port) = packaging::bind_with_fallback(&paths).await?;
             packaging::write_daemon_endpoint_snapshot(&paths, std::process::id(), port, build_sha)?;
-            info!(port, "bound HTTP listener; handing off to graphql-server");
+            warn!(
+                pid = std::process::id(),
+                port,
+                build_sha = %build_sha,
+                "daemon lifecycle: listener bound"
+            );
 
             let xcode_broker_pool =
                 new_daemon_xcode_broker_pool(port, acp.xcode_runtime_observation_sink());
@@ -838,6 +866,13 @@ async fn run_daemon() -> Result<()> {
             // §5.1: Ready only AFTER HTTP bind so a client receiving
             // `state=ready` is guaranteed it can connect.
             reporter.set_state(DaemonLifecycleState::Ready);
+            warn!(
+                pid = std::process::id(),
+                port,
+                mode = %mode,
+                build_sha = %build_sha,
+                "daemon lifecycle: ready"
+            );
 
             // §9.4: write build-sha.txt after successful Ready so the
             // Swift diagnostics bundle only ever reports a sha for a
@@ -889,7 +924,11 @@ async fn run_daemon() -> Result<()> {
             let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
             let shutdown_signal = async move {
                 wait_for_shutdown_signal().await;
-                info!("shutdown signal received; transitioning to Shutdown");
+                warn!(
+                    pid = std::process::id(),
+                    deadline_secs = SHUTDOWN_DRAIN_DEADLINE.as_secs(),
+                    "daemon lifecycle: shutdown signal received; transitioning to Shutdown"
+                );
                 shutdown_reporter.set_state(DaemonLifecycleState::Shutdown);
                 match tokio::time::timeout(
                     SHUTDOWN_DRAIN_DEADLINE,
@@ -897,13 +936,13 @@ async fn run_daemon() -> Result<()> {
                 )
                 .await
                 {
-                    Ok(closed_sessions) => info!(
+                    Ok(closed_sessions) => warn!(
                         closed_sessions,
-                        "closed live ACP sessions during daemon shutdown"
+                        "daemon lifecycle: closed live ACP sessions during shutdown"
                     ),
                     Err(_) => warn!(
                         deadline_secs = SHUTDOWN_DRAIN_DEADLINE.as_secs(),
-                        "timed out closing live ACP sessions during daemon shutdown"
+                        "daemon lifecycle: timed out closing live ACP sessions during shutdown"
                     ),
                 }
                 // Notify the main task that the drain window has started.
@@ -934,16 +973,21 @@ async fn run_daemon() -> Result<()> {
 
             match drain_outcome {
                 DrainOutcome::ServeReturnedFirst => {
-                    info!("HTTP serve returned before shutdown signal; exit 0");
+                    warn!(
+                        pid = std::process::id(),
+                        "daemon lifecycle: HTTP serve returned before shutdown signal; exit 0"
+                    );
                 }
-                DrainOutcome::DrainedWithinDeadline => info!(
+                DrainOutcome::DrainedWithinDeadline => warn!(
+                    pid = std::process::id(),
                     deadline_secs = SHUTDOWN_DRAIN_DEADLINE.as_secs(),
-                    "HTTP serve drained cleanly within deadline; exit 0"
+                    "daemon lifecycle: HTTP serve drained cleanly within deadline; exit 0"
                 ),
                 DrainOutcome::DrainDeadlineExceeded => {
                     error!(
+                        pid = std::process::id(),
                         deadline_secs = SHUTDOWN_DRAIN_DEADLINE.as_secs(),
-                        "graceful shutdown did not drain within deadline; exit {EX_TEMPFAIL}"
+                        "daemon lifecycle: graceful shutdown did not drain within deadline; exit {EX_TEMPFAIL}"
                     );
                     std::process::exit(EX_TEMPFAIL);
                 }
@@ -1478,6 +1522,44 @@ fn init_tracing_for_mode(
     }
 }
 
+fn install_daemon_lifecycle_panic_hook() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let payload = panic_info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| {
+                panic_info
+                    .payload()
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+            })
+            .unwrap_or("<non-string panic payload>");
+        let location = panic_info
+            .location()
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let current_thread = std::thread::current();
+        let thread_name = current_thread.name().unwrap_or("<unnamed>");
+        tracing::error!(
+            pid = std::process::id(),
+            thread = thread_name,
+            location = %location,
+            payload = payload,
+            "daemon lifecycle: panic observed"
+        );
+        previous_hook(panic_info);
+    }));
+}
+
 /// Wait for SIGTERM (packaged supervisor) or SIGINT (developer Ctrl-C).
 /// Resolves as soon as either signal is observed.
 #[cfg(unix)]
@@ -1486,15 +1568,27 @@ async fn wait_for_shutdown_signal() {
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     tokio::select! {
-        _ = sigterm.recv() => info!("SIGTERM received"),
-        _ = sigint.recv() => info!("SIGINT received"),
+        _ = sigterm.recv() => warn!(
+            pid = std::process::id(),
+            signal = "SIGTERM",
+            "daemon lifecycle: shutdown signal observed"
+        ),
+        _ = sigint.recv() => warn!(
+            pid = std::process::id(),
+            signal = "SIGINT",
+            "daemon lifecycle: shutdown signal observed"
+        ),
     }
 }
 
 #[cfg(not(unix))]
 async fn wait_for_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-    info!("Ctrl-C received");
+    warn!(
+        pid = std::process::id(),
+        signal = "Ctrl-C",
+        "daemon lifecycle: shutdown signal observed"
+    );
 }
 
 /// Map a typed [`MigrationError`] to the `(FailureKind, detail, backup_path)`

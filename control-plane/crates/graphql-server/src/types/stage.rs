@@ -210,6 +210,8 @@ pub struct GqlRunStageTopologyNode {
     pub is_current: bool,
     pub iteration: Option<i64>,
     pub attempt_number: Option<i64>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
     pub approval_required: bool,
     pub artifact_count: i64,
     pub communication_count: i64,

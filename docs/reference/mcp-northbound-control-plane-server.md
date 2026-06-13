@@ -83,41 +83,59 @@ Implementation: `control-plane/crates/domain/src/commands.rs` (`PrincipalClass`,
 
 | `CapabilityToolId` variant | MCP tool name | Command tool? |
 |---|---|---|
-| `IdeasCreate` | `ideas.create` | no (direct) |
+| `IdeasCreate` | `ideas.create` | yes |
 | `IdeasList` | `ideas.list` | no (direct) |
 | `RunsStart` | `runs.start` | yes |
 | `RunsList` | `runs.list` | no (direct) |
 | `RunsGet` | `runs.get` | no (direct) |
-| `RunsCancel` | `runs.cancel` | yes |
-| `ApprovalsList` | `approvals.list` | no (direct) |
-| `ApprovalsResolve` | `approvals.resolve` | yes |
-| `StagesRetry` | `stages.retry` | yes |
-| `WorkflowConflictsResolve` | `workflow_conflicts.resolve` | yes |
-| `LegacyDiscoveryOverrideCreate` | `legacy_discovery_override_create` | yes |
-| `ReportsGet` | `reports.get` | no (direct) |
-| `ArtifactsOverrideContract` | `artifacts.override_contract` | yes |
-| `StewardRunAnalysis` | `steward.run_analysis` | yes |
-| `StewardListAnalyses` | `steward.list_analyses` | no (direct) |
-| `StewardGetAnalysis` | `steward.get_analysis` | no (direct) |
 | `RunsMainSyncRequest` | `runs.main_sync.request` | yes |
 | `RunsMainSyncRetry` | `runs.main_sync.retry` | yes |
 | `RunsMainSyncSetOverride` | `runs.main_sync.set_override` | yes |
 | `RunsMainSyncRepairState` | `runs.main_sync.repair_state` | yes |
 | `RunsMainSyncRecordRecoveryDecision` | `runs.main_sync.record_recovery_decision` | yes |
 | `RunsKnowledgeCapsuleIgnore` | `runs.knowledge_capsule.ignore` | yes |
+| `RunsRetrofitCatalogSnapshot` | `runs.retrofit_catalog_snapshot` | yes |
+| `RunsCancel` | `runs.cancel` | yes |
+| `ApprovalsList` | `approvals.list` | no (direct) |
+| `ApprovalsResolve` | `approvals.resolve` | yes |
+| `StagesRetry` | `stages.retry` | yes |
+| `StagesConsumeProviderQuotaHold` | `stages.consume_provider_quota_hold` | yes |
+| `WorkflowConflictsResolve` | `workflow_conflicts.resolve` | yes |
+| `WorkflowLoopBudgetExtend` | `workflow_loop_budget.extend` | yes |
+| `LegacyDiscoveryOverrideCreate` | `legacy_discovery_override_create` | yes |
+| `ReportsGet` | `reports.get` | no (direct) |
+| `ArtifactsOverrideContract` | `artifacts.override_contract` | yes |
+| `StewardRunAnalysis` | `steward.run_analysis` | yes |
+| `StewardListAnalyses` | `steward.list_analyses` | no (direct) |
+| `StewardGetAnalysis` | `steward.get_analysis` | no (direct) |
+| `RuntimeHealth` | `runtime.health`, `boundary.runtime.get` | no (direct) |
+| `OperatorAlertsList` | `operator.alerts.list` | no (direct) |
+| `StorageHealth` | `storage.health` | no (direct) |
+| `StorageWritePressure` | `storage.write_pressure` | no (direct) |
+| `StorageEvidenceSpoolSummary` | `storage.evidence_spool_summary` | no (direct) |
+| `StorageReconcileEvidenceOrphans` | `storage.reconcile_evidence_orphans` | no (direct) |
+| `StorageMaintenanceRepairSlot` | `storage.maintenance.repair_slot` | no (direct journal) |
+| `StorageProjectionsClearBacklog` | `storage.projections.clear_backlog` | no (direct journal) |
+| `StorageProjectionsClearPoison` | `storage.projections.clear_poison` | no (direct journal) |
 | `ProposalGateSettle` | `runs.settle_proposal_gate` | yes |
 | `EffectsList` | `effects.list` | no (direct) |
 | `EffectsInspect` | `effects.inspect` | no (direct) |
 | `EffectsReconcile` | `effects.reconcile` | no (direct) |
-| `EffectsMarkUnrecoverable` | `effects.mark_unrecoverable` | no (direct) |
-| `EffectsClearAfterManualVerification` | `effects.clear_after_manual_verification` | no (direct) |
+| `EffectsMarkConflict` | `effects.mark_conflict` | no (direct disposition) |
+| `EffectsMarkUnrecoverable` | `effects.mark_unrecoverable` | no (direct disposition) |
+| `EffectsClearAfterManualVerification` | `effects.clear_after_manual_verification` | no (direct disposition) |
 | `AgentsContinuationStatus` | `agents.continuation_status` | no (direct) |
 | `AgentsContinuationCandidates` | `agents.continuation_candidates` | no (direct) |
-| `AgentsContinueWork` | `agents.continue_work` | no (direct) |
+| `AgentsContinueWork` | `agents.continue_work` | no (journaled admission) |
+| `AutomationAutoRetryLatest` | `automation.auto_retry.latest` | no (direct) |
 
-Command tools build a typed `Command` enum value and call `CommandHandler::handle`; they emit a `command_journal` row and return `journal_id`. Direct tools call repo functions directly and do not produce journal rows or `journal_id`.
+This table is derived from `domain::CapabilityToolId` plus `mcp-server/src/tools/mod.rs`. It intentionally lists the current 45 capability identifiers, including the `boundary.runtime.get` tool that shares the `RuntimeHealth` capability.
 
-The Proposal 086 continuation tools (`agents.continue_work`, `agents.continuation_status`, `agents.continuation_candidates`) have typed `CapabilityToolId` variants (`AgentsContinueWork`, `AgentsContinuationStatus`, `AgentsContinuationCandidates`) so they participate in standard `tools/list` capability filtering. The read tools are exposed to `Operator` and `Observer` principals; `agents.continue_work` is exposed only to `Operator`. They are dispatched by prefix into a separate `tools::agents` namespace in `control-plane/crates/mcp-server/src/server.rs` rather than through `CommandHandler::handle`: `agents.continue_work` runs its own atomic admission transaction that persists a `command_journal_id` on the `agent_work_continuations` row alongside the canonical request fingerprint, while the read tools omit unauthorized rows without leaking existence. See [`agent-work-continuation.md`](agent-work-continuation.md) for the request/response schemas and admission semantics.
+Command tools build a typed `Command` enum value and call `CommandHandler::handle`; they emit a `command_journal` row and return `journal_id`. Direct tools call repo functions or purpose-built admission paths. Some direct tools still persist their own journal/disposition ids; the `Command tool?` column only means "routes through `CommandHandler`."
+
+The continuation tools (`agents.continue_work`, `agents.continuation_status`, `agents.continuation_candidates`) have typed `CapabilityToolId` variants (`AgentsContinueWork`, `AgentsContinuationStatus`, `AgentsContinuationCandidates`) so they participate in standard `tools/list` capability filtering. The read tools are exposed to `Operator` and `Observer` principals. `agents.continue_work` is exposed to `Operator` and `Agent` principals, but the handler accepts Agent callers only for validated `lead_auto` requests. They are dispatched by prefix into a separate `tools::agents` namespace in `control-plane/crates/mcp-server/src/server.rs` rather than through `CommandHandler::handle`: `agents.continue_work` runs its own atomic admission transaction that persists a `command_journal_id` on the `agent_work_continuations` row alongside the canonical request fingerprint, while the read tools omit unauthorized rows without leaking existence. See [`agent-work-continuation.md`](agent-work-continuation.md) for the request/response schemas and admission semantics.
+
+Storage diagnostics and maintenance tools are intentionally split between read-only snapshots (`storage.health`, `storage.write_pressure`, `storage.evidence_spool_summary`), bounded orphan reconciliation (`storage.reconcile_evidence_orphans`), and guarded maintenance writes (`storage.maintenance.repair_slot`, `storage.projections.clear_backlog`, `storage.projections.clear_poison`). Runtime boundary tools expose policy/audit health (`boundary.runtime.get`) and operator alerts (`operator.alerts.list`) without exposing raw audit rows.
 
 ### MCP tool payloads
 
@@ -327,16 +345,19 @@ Both checks are required, so a future change that wants to narrow a specific pri
 |---|:-:|:-:|:-:|
 | `ideas.create` | yes | yes | no |
 | `ideas.list` | yes | yes | yes |
-| `runs.start` | yes | no | no | (SEC-001: caller-supplied filesystem paths — Operator-only.) |
+| `runs.start` | yes | yes | no | (Caller-supplied filesystem paths still pass through boundary policy, path validation, and principal capabilities before command execution.) |
 | `runs.list` | yes | yes | yes | (SEC-003: local filesystem path fields — `workspace_root`, `artifact_root`, `chainworks_meta_root` — are redacted from each projection row for non-Operator callers.) |
 | `runs.get` | yes | yes | yes | (Escalation readback: operator-only snapshot fields (`workflow_snapshot_json`, `catalog_snapshot_json`, `delivery_*_json`, `drift_details_json`, and local filesystem paths) are stripped for non-Operator callers, and `escalation_readback` collapses to the summary projection (`chains_redacted: true`); see [escalation-policies.md](escalation-policies.md).) |
 | `runs.cancel` | yes | no | no |
+| `runs.retrofit_catalog_snapshot` | yes | no | no |
 | `approvals.list` | yes | no | yes | (Mixed inbox: stage approvals + lead mediation confirmations) |
 | `approvals.resolve` | yes | no | no | (Resolves stage approvals or lead mediation confirmations) |
 | `stages.retry` | yes | no | no |
+| `stages.consume_provider_quota_hold` | yes | no | no |
 | `workflow_conflicts.resolve` | yes | no | no |
+| `workflow_loop_budget.extend` | yes | no | no |
 | `legacy_discovery_override_create` | yes | no | no |
-| `reports.get` | yes | yes | yes | (Broad read surface; non-Operator callers receive redacted report payloads with operator-only system reports, local `file_path` values, overrides, and internal routing state omitted; P082 readback fields remain present per their lane contract but contain empty arrays.) |
+| `reports.get` | yes | no | no | (Operator-only report surface; non-Operator callers are denied before report lanes are loaded. `report://` resource reads are also Operator-only.) |
 | `artifacts.override_contract` | yes | no | no |
 | `steward.run_analysis` | yes | no | no |
 | `steward.list_analyses` | yes | no | yes |
@@ -344,14 +365,25 @@ Both checks are required, so a future change that wants to narrow a specific pri
 | `runs.main_sync.*` | yes | no | no | (Includes request, retry, set_override, repair_state, record_recovery_decision) |
 | `runs.knowledge_capsule.ignore` | yes | no | no |
 | `runs.settle_proposal_gate` | yes | no | no |
+| `runtime.health` / `boundary.runtime.get` | yes | no | no |
+| `operator.alerts.list` | yes | no | no |
+| `storage.health` | yes | no | no |
+| `storage.write_pressure` | yes | no | no |
+| `storage.evidence_spool_summary` | yes | no | no |
+| `storage.reconcile_evidence_orphans` | yes | no | no |
+| `storage.maintenance.repair_slot` | yes | no | no |
+| `storage.projections.clear_backlog` | yes | no | no |
+| `storage.projections.clear_poison` | yes | no | no |
 | `effects.list` | yes | no | no |
 | `effects.inspect` | yes | no | no |
 | `effects.reconcile` | yes | no | no |
+| `effects.mark_conflict` | yes | no | no |
 | `effects.mark_unrecoverable` | yes | no | no |
 | `effects.clear_after_manual_verification` | yes | no | no |
 | `agents.continuation_status` | yes | no | yes |
 | `agents.continuation_candidates` | yes | no | yes |
-| `agents.continue_work` | yes | no | no |
+| `agents.continue_work` | yes | yes | no | (Agent visibility is for validated `lead_auto` requests; manual continuation remains Operator-owned.) |
+| `automation.auto_retry.latest` | yes | no | yes |
 
 Rationale for the Steward trio: `run_analysis` queues compute work and drives the quality-gate pipeline, so only operators can trigger it. `list_analyses` and `get_analysis` are read-only over persisted analysis records and are visible to the operational/audit (observer) class. Agents are scoped to executing their own run and have no legitimate cross-cohort read surface, so they see none of the three.
 
@@ -518,7 +550,7 @@ Implementation: `control-plane/crates/engine/src/command_journal_redact.rs` (bot
 
 ### MCP command tools
 
-The five MCP command tools (`runs.start`, `runs.cancel`, `approvals.resolve`, `stages.retry`, `steward.run_analysis`) include `journal_id` inside their `tools/call` response. The value lives at `result.content[0].text` as stringified JSON, alongside the tool's existing result fields:
+MCP command tools marked `yes` in the registry table include `journal_id` inside their `tools/call` response. The value lives at `result.content[0].text` as stringified JSON, alongside the tool's existing result fields:
 
 ```json
 {
@@ -537,7 +569,7 @@ The server currently advertises `protocolVersion: "2024-11-05"`, which predates 
 
 ### MCP direct tools
 
-The eight direct tools (`ideas.create`, `ideas.list`, `runs.list`, `runs.get`, `approvals.list`, `reports.get`, `steward.list_analyses`, `steward.get_analysis`) call repo functions directly and bypass `CommandHandler`. They write no `command_journal` row and their response JSON does not include `journal_id`.
+Direct tools marked `no (...)` in the registry table bypass `CommandHandler`. Pure read tools call repo functions and do not return `journal_id`. Direct maintenance, disposition, and continuation-admission tools may persist their own journal/disposition ids; those ids are tool-specific and are not evidence that the request routed through `CommandHandler`.
 
 ### GraphQL approval mutation payload wrappers
 

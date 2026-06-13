@@ -23,9 +23,15 @@ SwiftUI must not use:
 - direct SQLite access,
 - local workflow mutation fallback,
 - Swift-local workflow truth,
-- broad GraphQL command mutations.
-- escalation policy drift acknowledgement.
+- broad GraphQL command mutations,
+- escalation policy drift acknowledgement,
 - tier mutation (retry, resume, cancel, or force-primary).
+
+## Local Enforcement
+
+The Swift app has a local boundary guard in addition to server authorization. `P031GraphQLReadRequest` rejects non-query/non-subscription documents for the read client and rejects forbidden mutation operation names. `P072ApprovalMutationClient` is the narrow exception: it sends only the `approveApproval` and `rejectApproval` documents through the approval mutation path.
+
+The app also resolves the daemon endpoint from the packaged endpoint/port files and reads daemon/storage diagnostics through GraphQL. Endpoint discovery and lifecycle banners are presentation/readback code; they do not create a fallback mutation channel.
 
 ## Boundary Matrix
 
@@ -53,8 +59,8 @@ Forbidden GraphQL mutation families for governed SwiftUI include:
 - runtime profile changes,
 - context strategy changes,
 - experiments,
-- recovery / repair.
-- escalation (acknowledgement, tier mutation, etc.).
+- recovery / repair,
+- escalation acknowledgement or tier mutation.
 
 ## MCP Boundary
 
@@ -69,9 +75,16 @@ Examples:
 - `effects.list`,
 - `effects.inspect`,
 - `effects.reconcile`,
+- `effects.mark_conflict`,
 - `effects.mark_unrecoverable`,
 - `effects.clear_after_manual_verification`,
+- `storage.maintenance.repair_slot`,
+- `storage.projections.clear_backlog`,
+- `storage.projections.clear_poison`,
+- `agents.continue_work`,
 - `workflow_conflicts.resolve`,
+- `workflow_loop_budget.extend`,
+- `runs.retrofit_catalog_snapshot`,
 - `legacy_discovery_override_create`,
 - `steward.run_analysis`,
 - reset / compact / clone / recover operations when present.

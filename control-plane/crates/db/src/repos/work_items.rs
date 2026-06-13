@@ -2734,10 +2734,24 @@ pub async fn complete_with_capacity(
                 {
                     sqlx::query(
                         r#"UPDATE agent_executions
-                           SET status = ?1, completed_at = COALESCE(completed_at, ?2)
-                           WHERE id = ?3 AND status = ?4"#,
+                           SET status = CASE
+                               WHEN EXISTS (
+                                   SELECT 1
+                                   FROM agent_execution_runtime_facts facts
+                                   WHERE facts.agent_execution_id = agent_executions.id
+                                     AND facts.output_settlement IN (?1, ?2)
+                                     AND COALESCE(facts.valid_required_outputs, 0) > 0
+                               )
+                               THEN ?3
+                               ELSE ?4
+                           END,
+                               completed_at = COALESCE(completed_at, ?5)
+                           WHERE id = ?6 AND status = ?7"#,
                     )
+                    .bind("valid_outputs_from_completed_execution")
+                    .bind("valid_outputs_from_failed_execution")
                     .bind(AgentStatus::Completed.to_string())
+                    .bind(AgentStatus::Failed.to_string())
                     .bind(&now)
                     .bind(agent_execution_id)
                     .bind(AgentStatus::Running.to_string())
@@ -5801,6 +5815,193 @@ mod tests {
             .unwrap()
             .expect("post-invoke advance");
         assert_eq!(advance.status, WorkItemStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn complete_running_invoke_does_not_mark_missing_output_execution_completed() {
+        let pool = test_pool().await;
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let agent_execution_id = AgentExecutionId::new();
+        let now = Utc::now();
+
+        let idea_id = domain::ids::IdeaId::new();
+        crate::repos::ideas::insert(
+            &pool,
+            &domain::idea::Idea {
+                id: idea_id,
+                title: "missing output completion backstop".to_string(),
+                body: "work item complete must not publish incomplete execution".to_string(),
+                workspace_root_path: Some("/tmp/chainworks-test".to_string()),
+                project_key: None,
+                status: domain::idea::IdeaStatus::Active,
+                created_at: now,
+                archived_at: None,
+            },
+        )
+        .await
+        .expect("insert idea");
+        crate::repos::runs::insert(
+            &pool,
+            &domain::run::Run {
+                id: run_id,
+                idea_id,
+                status: domain::run::RunStatus::Running,
+                workflow_id: "test-workflow".to_string(),
+                workflow_title: "Test Workflow".to_string(),
+                workspace_root: "/tmp/chainworks-test".to_string(),
+                artifact_root: "/tmp/chainworks-test/.chainworks".to_string(),
+                started_at: now,
+                completed_at: None,
+                cancellation_requested_at: None,
+                cancellation_settled_at: None,
+                cancellation_settlement_log: None,
+                current_state: Some("implementation_review".to_string()),
+                workflow_yaml_path: None,
+                agent_catalog_yaml_path: None,
+                worktree_root: None,
+                base_branch: None,
+                base_revision: None,
+                target_branch: None,
+                delivery_configuration_json: None,
+                delivery_preflight_json: None,
+                workflow_family: None,
+                project_key: None,
+                risk_class: None,
+                stack: None,
+                workflow_snapshot_hash: None,
+                catalog_snapshot_hash: None,
+                workflow_snapshot_json: None,
+                catalog_snapshot_json: None,
+                drift_detected_at: None,
+                drift_details_json: None,
+                chainworks_meta_root: None,
+                review_routing_json: None,
+                closeout_readiness_mode: None,
+            },
+        )
+        .await
+        .expect("insert run");
+        crate::repos::stages::insert(
+            &pool,
+            &domain::stage::StageExecution {
+                id: stage_execution_id,
+                run_id,
+                stage_id: "implementation_review".to_string(),
+                label: "Implementation Review".to_string(),
+                status: domain::stage::StageStatus::Running,
+                iteration: 1,
+                attempt_number: 1,
+                settlement_kind: None,
+                started_at: now,
+                completed_at: None,
+                owner_agent: Some("code_writer".to_string()),
+                provider: Some("claude".to_string()),
+                model: Some("sonnet".to_string()),
+                stage_type: None,
+                validation_failure_json: None,
+                evidence_packet_json: None,
+                recovery_snapshot_json: None,
+                retry_reason: None,
+            },
+        )
+        .await
+        .expect("insert stage execution");
+        crate::repos::agent_executions::insert(
+            &pool,
+            &domain::agent::AgentExecution {
+                id: agent_execution_id,
+                stage_execution_id: Some(stage_execution_id),
+                agent_id: "code_writer".to_string(),
+                provider: "claude".to_string(),
+                model: Some("sonnet".to_string()),
+                started_at: now - Duration::minutes(30),
+                completed_at: None,
+                status: AgentStatus::Running,
+                owner_execution_lineage_id: None,
+                session_lineage_id: None,
+                session_generation_id: Some("generation-missing-output".to_string()),
+                rehydrated_from_checkpoint_artifact_id: None,
+                invocation_owner_key: None,
+                session_reuse_scope: Some("same_agent_family_within_run".to_string()),
+                session_family_id: None,
+                session_reuse_disposition: Some("reused".to_string()),
+                session_reset_reason: None,
+                backend_profile_id: None,
+                requested_mcp_extensions_json: None,
+                predicted_mcp_extensions_json: None,
+                predicted_mcp_runtime_ids_json: None,
+                actual_mcp_extensions_json: None,
+                actual_mcp_runtime_ids_json: None,
+                denied_mcp_extensions_json: None,
+                mcp_blocking_issues_json: None,
+                actual_mcp_observation_json: None,
+                actual_xcode_runtime_observation_json: None,
+                mcp_session_startup_latency_ms: None,
+                owner_kind: None,
+                owner_id: None,
+                lead_mediation_record_id: None,
+                origin_stage_execution_id: None,
+                total_cost_cents: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                transcript_artifact_id: None,
+                actual_toolchain_mapping_diagnostics_json: None,
+                escalation_policy_id: None,
+                escalation_policy_hash: None,
+                escalation_tier_id: None,
+                escalation_tier_kind_raw: None,
+                escalation_trigger_raw: None,
+                escalation_digest_version: None,
+                escalation_ledger_id: None,
+            },
+        )
+        .await
+        .expect("insert running agent execution");
+        let mut facts =
+            domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+        facts.output_settlement = domain::agent::AgentOutputSettlement::MissingRequiredOutputs;
+        facts.valid_required_outputs = false;
+        crate::repos::agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .expect("insert runtime facts");
+        enqueue(
+            &pool,
+            &WorkItem {
+                id: "invoke-missing-output".to_string(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "implementation_review",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "p058_claimed": {
+                        "agent_execution_id": agent_execution_id.to_string(),
+                        "session_generation_id": "generation-missing-output"
+                    }
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: Some("implementation_review".to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .expect("insert running work item");
+
+        complete(&pool, "invoke-missing-output")
+            .await
+            .expect("complete work item");
+
+        let execution = crate::repos::agent_executions::find_by_id(&pool, agent_execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, AgentStatus::Failed);
     }
 
     #[tokio::test]

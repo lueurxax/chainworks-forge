@@ -1477,6 +1477,7 @@ tiers:
                 requires_xcode_host_execution: None,
                 routing: None,
                 toolchain_cache_policy: None,
+                continuation_capability: None,
             }]),
             escalation_policies: Some(vec![policy]),
         };
@@ -1565,6 +1566,7 @@ tiers:
                 requires_xcode_host_execution: None,
                 routing: None,
                 toolchain_cache_policy: None,
+                continuation_capability: None,
             }]),
             escalation_policies: Some(vec![policy]),
         };

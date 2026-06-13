@@ -13,6 +13,7 @@ use sqlx::{Row, SqlitePool};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
+use crate::command_handler::CommandHandler;
 use crate::release::{
     connect::ConnectPublishService,
     coordinator::ReleaseResult,
@@ -2186,6 +2187,8 @@ fn materialize_validated_output_candidate(
 fn merge_repair_captured_outputs(
     original: &[CapturedOutput],
     repair: &[CapturedOutput],
+    repair_settlement: &DeclaredOutputDiscoverySettlement,
+    original_validation: Option<&TaskValidationSummary>,
 ) -> Vec<CapturedOutput> {
     original
         .iter()
@@ -2193,22 +2196,47 @@ fn merge_repair_captured_outputs(
             let repair_output = repair.iter().find(|candidate| {
                 candidate.declared.output_name == original_output.declared.output_name
             });
+            let repair_output_accepted = repair_settlement.decisions.iter().any(|decision| {
+                decision.output_name == original_output.declared.output_name
+                    && decision.status == OutputDiscoveryStatus::Accepted
+            });
+            let original_already_valid = output_passed_validation(
+                original_validation,
+                &original_output.declared.output_name,
+            );
             CapturedOutput {
                 declared: original_output.declared.clone(),
-                machine_bytes: repair_output
-                    .and_then(|output| output.machine_bytes.clone())
+                machine_bytes: (!original_already_valid && repair_output_accepted)
+                    .then(|| repair_output.and_then(|output| output.machine_bytes.clone()))
+                    .flatten()
                     .or_else(|| original_output.machine_bytes.clone()),
-                companion_bytes: repair_output
-                    .and_then(|output| output.companion_bytes.clone())
+                companion_bytes: (!original_already_valid && repair_output_accepted)
+                    .then(|| repair_output.and_then(|output| output.companion_bytes.clone()))
+                    .flatten()
                     .or_else(|| original_output.companion_bytes.clone()),
             }
         })
         .collect()
 }
 
+fn output_passed_validation(validation: Option<&TaskValidationSummary>, output_name: &str) -> bool {
+    validation
+        .and_then(|validation| {
+            validation
+                .output_results
+                .iter()
+                .find(|result| result.output_name == output_name)
+        })
+        .is_some_and(|result| {
+            result.status == domain::validation::ValidationStatus::Passed
+                || result.status == domain::validation::ValidationStatus::NoContractDeclared
+        })
+}
+
 fn merge_repair_discovery_settlements(
     original: &DeclaredOutputDiscoverySettlement,
     repair: &DeclaredOutputDiscoverySettlement,
+    original_validation: Option<&TaskValidationSummary>,
 ) -> DeclaredOutputDiscoverySettlement {
     let mut decisions = original.decisions.clone();
     for repair_decision in &repair.decisions {
@@ -2216,7 +2244,14 @@ fn merge_repair_discovery_settlements(
             decision.output_name == repair_decision.output_name
                 && decision.output_role == repair_decision.output_role
         }) {
-            *existing = repair_decision.clone();
+            let original_already_valid =
+                output_passed_validation(original_validation, &existing.output_name);
+            if !original_already_valid
+                && (repair_decision.status == OutputDiscoveryStatus::Accepted
+                    || existing.status != OutputDiscoveryStatus::Accepted)
+            {
+                *existing = repair_decision.clone();
+            }
         } else {
             decisions.push(repair_decision.clone());
         }
@@ -2816,23 +2851,34 @@ fn read_direct_file_ref_output(
 
     let previous = pre_prompt_expected_outputs.iter().find(|metadata| {
         metadata.output_name == spec.output_name && metadata.target_path == spec.target_path
-    })?;
-    let reason = match previous.baseline_status {
-        ExpectedPathBaselineStatus::Absent => OutputDiscoveryReason::ExactPathNew,
-        ExpectedPathBaselineStatus::RegularContentCaptured => {
-            if previous.content_digest.as_deref() == Some(digest.as_str()) {
-                if manifest.digest.as_ref().is_none_or(|manifest_digest| {
-                    normalize_sha256_digest(manifest_digest) != digest
-                }) || manifest
-                    .size_bytes
-                    .is_none_or(|expected| expected != bytes.len() as u64)
-                {
-                    return None;
+    });
+    let (reason, baseline_status) = match previous {
+        Some(previous) => {
+            let reason = match previous.baseline_status {
+                ExpectedPathBaselineStatus::Absent => OutputDiscoveryReason::ExactPathNew,
+                ExpectedPathBaselineStatus::RegularContentCaptured => {
+                    if previous.content_digest.as_deref() == Some(digest.as_str()) {
+                        if manifest.digest.as_ref().is_none_or(|manifest_digest| {
+                            normalize_sha256_digest(manifest_digest) != digest
+                        }) || manifest
+                            .size_bytes
+                            .is_none_or(|expected| expected != bytes.len() as u64)
+                        {
+                            return None;
+                        }
+                    }
+                    OutputDiscoveryReason::ExactPathChanged
                 }
-            }
-            OutputDiscoveryReason::ExactPathChanged
+                _ => OutputDiscoveryReason::ExactPathChanged,
+            };
+            (reason, Some(previous.baseline_status))
         }
-        _ => OutputDiscoveryReason::ExactPathChanged,
+        None => {
+            if manifest.digest.is_none() || manifest.size_bytes.is_none() {
+                return None;
+            }
+            (OutputDiscoveryReason::ExactPathChanged, None)
+        }
     };
 
     Some((
@@ -2842,7 +2888,7 @@ fn read_direct_file_ref_output(
         exact_path_payload_ref(&spec.output_name),
         bytes,
         Some(manifest.path),
-        Some(previous.baseline_status),
+        baseline_status,
     ))
 }
 
@@ -3702,6 +3748,21 @@ fn runtime_facts_for_execution_result(
             facts.supervision_classification = classification.supervision_classification.clone();
             facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
         }
+        Some(domain::validation::ValidationFailureClass::NoOutputProduced)
+            if observed_failure_classification
+                .as_ref()
+                .is_some_and(is_codex_tool_session_control_failure_classification) =>
+        {
+            let classification = observed_failure_classification
+                .as_ref()
+                .expect("checked above");
+            facts.failure_kind = Some(classification.failure_kind.clone());
+            facts.operator_action_hint = Some(classification.operator_action_hint.clone());
+            facts.retry_after = retry_after_or_default_for_provider_quota(classification, now);
+            facts.transport_error_code = classification.transport_error_code.clone();
+            facts.supervision_classification = classification.supervision_classification.clone();
+            facts.output_settlement = AgentOutputSettlement::MissingRequiredOutputs;
+        }
         Some(domain::validation::ValidationFailureClass::NoOutputProduced) => {
             facts.failure_kind = Some(AgentFailureKind::MissingRequiredOutputs);
             facts.operator_action_hint = Some(OperatorActionHint::Retry);
@@ -3769,6 +3830,15 @@ fn runtime_facts_for_execution_result(
     }
     p090_enrich_runtime_facts_with_preflight_json(&mut facts, runtime_tool_path_preflight_json);
     facts
+}
+
+fn is_codex_tool_session_control_failure_classification(
+    classification: &RuntimeFailureClassification,
+) -> bool {
+    classification
+        .transport_error_code
+        .as_deref()
+        .is_some_and(|code| code == "CODEX_TOOL_SESSION_CONTROL_FAILURE")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4351,6 +4421,91 @@ fn output_contract_repair_skip_classification(
     }
     observed_failure_classification_for_execution_result(result_status, transcript_text)
         .filter(|classification| classification.failure_kind == AgentFailureKind::ProviderQuota)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ContinuityMode {
+    NormalFreshExecution,
+    NormalLiveReuse,
+    ProviderSessionResurrection,
+    OutputOnlyRecovery,
+    OperatorActionRequired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ContinuityModeDecision {
+    mode: ContinuityMode,
+    reason: &'static str,
+    normal_live_reuse_allowed: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ContinuityModeInput<'a> {
+    requested_live_reuse: bool,
+    provider_session_id: Option<&'a str>,
+    required_outputs_missing: bool,
+    useful_work_observed: bool,
+    source_edits_allowed: bool,
+    runtime_receipt: Option<&'a acp::AcpRuntimeReceipt>,
+}
+
+fn resolve_continuity_mode(input: ContinuityModeInput<'_>) -> ContinuityModeDecision {
+    if input.required_outputs_missing && input.useful_work_observed && !input.source_edits_allowed {
+        return ContinuityModeDecision {
+            mode: ContinuityMode::OutputOnlyRecovery,
+            reason: "useful_work_missing_outputs",
+            normal_live_reuse_allowed: false,
+        };
+    }
+
+    if continuity_boundary_is_ambiguous(input.runtime_receipt) {
+        return if input.provider_session_id.is_some() {
+            ContinuityModeDecision {
+                mode: ContinuityMode::ProviderSessionResurrection,
+                reason: "ambiguous_boundary_with_provider_session",
+                normal_live_reuse_allowed: false,
+            }
+        } else {
+            ContinuityModeDecision {
+                mode: ContinuityMode::OperatorActionRequired,
+                reason: "ambiguous_boundary_without_provider_session",
+                normal_live_reuse_allowed: false,
+            }
+        };
+    }
+
+    if input.requested_live_reuse {
+        return ContinuityModeDecision {
+            mode: ContinuityMode::NormalLiveReuse,
+            reason: "clean_live_reuse",
+            normal_live_reuse_allowed: true,
+        };
+    }
+
+    ContinuityModeDecision {
+        mode: ContinuityMode::NormalFreshExecution,
+        reason: "fresh_execution",
+        normal_live_reuse_allowed: false,
+    }
+}
+
+fn continuity_boundary_is_ambiguous(runtime_receipt: Option<&acp::AcpRuntimeReceipt>) -> bool {
+    let Some(receipt) = runtime_receipt else {
+        return false;
+    };
+    matches!(
+        receipt.failure_phase.as_deref(),
+        Some(
+            "prompt_closed_during_stream"
+                | "transport_closed"
+                | "provider_timeout"
+                | "progress_timeout"
+                | "read_poll_elapsed_without_message"
+        )
+    ) || (receipt.status == "failed"
+        && receipt.handshake.prompt_sent_at_ms.is_some()
+        && receipt.handshake.terminal_response_at_ms.is_none()
+        && receipt.counters.meaningful_progress_count > 0)
 }
 
 fn redact_runtime_message(message: &str) -> String {
@@ -5318,6 +5473,13 @@ impl BackgroundExecutor {
 
     /// Start the background loop. Returns a JoinHandle.
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let quota_auto_resume_executor = Arc::clone(&self);
+        tokio::spawn(async move {
+            quota_auto_resume_executor
+                .run_quota_ledger_auto_resume_loop()
+                .await;
+        });
+
         let housekeeping_executor = Arc::clone(&self);
         tokio::spawn(async move {
             housekeeping_executor
@@ -5342,6 +5504,54 @@ impl BackgroundExecutor {
         tokio::spawn(async move {
             self.run_loop().await;
         })
+    }
+
+    async fn run_quota_ledger_auto_resume_loop(self: Arc<Self>) {
+        let interval = Duration::from_secs(
+            std::env::var("CHAINWORKS_QUOTA_LEDGER_AUTO_RESUME_INTERVAL_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30),
+        );
+        info!(
+            interval_secs = interval.as_secs(),
+            "Quota ledger auto-resume loop started"
+        );
+        loop {
+            sleep(interval).await;
+            let handler = CommandHandler::new_with_acp_capacity_and_db_writer(
+                self.pool.clone(),
+                self.events.clone(),
+                self.work_queue.clone(),
+                Arc::clone(&self.acp),
+                self.work_queue.invoke_agent_capacity_config(),
+                Some(Arc::clone(&self.db_writer)),
+            );
+            match handler
+                .auto_resume_elapsed_quota_ledgers(chrono::Utc::now())
+                .await
+            {
+                Ok(0) => {}
+                Ok(count) => {
+                    info!(
+                        scheduled_count = count,
+                        "Quota ledger auto-resume scheduled retries"
+                    );
+                    if let Err(error) = self.work_queue.refresh_scheduler_projection().await {
+                        warn!(
+                            error = %error,
+                            "Quota ledger auto-resume failed to refresh scheduler projection"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Quota ledger auto-resume loop iteration failed"
+                    );
+                }
+            }
+        }
     }
 
     /// P086: Periodically sweep accepted/queued/starting continuation rows older than
@@ -8943,6 +9153,8 @@ You are continuing the same Chainworks agent execution through an existing live 
                     worktree_write_enabled,
                 );
 
+                let original_prompt_turn_id =
+                    format!("{agent_exec_id}:original:{stage_attempt_number}");
                 let execution_prompt = if policy_decision.is_some() || !declared_outputs.is_empty()
                 {
                     prompt_with_runtime_invocation_contract(
@@ -8954,6 +9166,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                 .map(|id| id.to_string())
                                 .unwrap_or_else(|| owner_execution_lineage_id.clone()),
                             agent_execution_id: agent_exec_id.to_string(),
+                            prompt_turn_id: original_prompt_turn_id.clone(),
                             work_item_id: item.id.clone(),
                             session_generation_id: policy_decision
                                 .as_ref()
@@ -10242,6 +10455,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                                 merge_repair_discovery_settlements(
                                                                     original_settlement,
                                                                     &repair_settlement,
+                                                                    Some(&validation),
                                                                 )
                                                             })
                                                             .unwrap_or_else(|| {
@@ -10251,6 +10465,8 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                             merge_repair_captured_outputs(
                                                                 &captured,
                                                                 &repair_captured,
+                                                                &repair_settlement,
+                                                                Some(&validation),
                                                             );
                                                         let (
                                                             repair_found_count,
@@ -10259,6 +10475,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                             repair_rejected_count,
                                                         ) = output_discovery_decision_counts(
                                                             &repair_settlement.decisions,
+                                                        );
+                                                        let (
+                                                            merged_found_count,
+                                                            merged_missing_count,
+                                                            merged_stale_count,
+                                                            merged_rejected_count,
+                                                        ) = output_discovery_decision_counts(
+                                                            &merged_repair_settlement.decisions,
                                                         );
                                                         let repair_validation = self
                                                 .validate_task_outputs_with_conflict_resolution_context(
@@ -10269,8 +10493,9 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                 )
                                                 .await?;
                                                         let staged_repair_materialization =
-                                                            if p090_staged_repair_settlement_enabled(
+                                                            if p090_staged_repair_settlement_enabled_for_settlement(
                                                                 &provider,
+                                                                &merged_repair_settlement,
                                                             ) && stage_execution_id.is_some()
                                                             {
                                                                 Some(stage_p090_repair_materialization(
@@ -10293,7 +10518,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                                     agent_exec_id
                                                                 ),
                                                                 &declared_outputs,
-                                                            &merged_repair_settlement,
+                                                                &merged_repair_settlement,
                                                                 &repair_validation,
                                                                 chrono::Utc::now(),
                                                             )?)
@@ -10336,10 +10561,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                                 agent_id = %agent_id,
                                                                 agent_execution_id = %agent_exec_id,
                                                                 session_generation_id = %session_generation_id,
-                                                                repair_found_count,
-                                                                repair_missing_count,
-                                                                repair_stale_count,
-                                                                repair_rejected_count,
+                                                                repair_turn_found_count = repair_found_count,
+                                                                repair_turn_missing_count = repair_missing_count,
+                                                                repair_turn_stale_count = repair_stale_count,
+                                                                repair_turn_rejected_count = repair_rejected_count,
+                                                                merged_found_count,
+                                                                merged_missing_count,
+                                                                merged_stale_count,
+                                                                merged_rejected_count,
                                                                 "Output contract repair turn produced valid declared outputs"
                                                             );
                                                             self.record_output_contract_repair_event(
@@ -10348,10 +10577,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                         serde_json::json!({
                                                             "agent_execution_id": agent_exec_id.to_string(),
                                                             "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
-                                                            "repair_found_count": repair_found_count,
-                                                            "repair_missing_count": repair_missing_count,
-                                                            "repair_stale_count": repair_stale_count,
-                                                            "repair_rejected_count": repair_rejected_count,
+                                                            "repair_turn_found_count": repair_found_count,
+                                                            "repair_turn_missing_count": repair_missing_count,
+                                                            "repair_turn_stale_count": repair_stale_count,
+                                                            "repair_turn_rejected_count": repair_rejected_count,
+                                                            "repair_found_count": merged_found_count,
+                                                            "repair_missing_count": merged_missing_count,
+                                                            "repair_stale_count": merged_stale_count,
+                                                            "repair_rejected_count": merged_rejected_count,
+                                                            "repair_settlement_merge_mode": "preserve_valid_original_outputs",
                                                         }),
                                                         run_id,
                                                         &stage_id,
@@ -10367,10 +10601,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                                 "stage_execution_id": stage_execution_id.map(|id| id.to_string()),
                                                                 "repair_turn_count": output_contract_repair_turn_count,
                                                                 "result": "succeeded",
-                                                                "repair_found_count": repair_found_count,
-                                                                "repair_missing_count": repair_missing_count,
-                                                                "repair_stale_count": repair_stale_count,
-                                                                "repair_rejected_count": repair_rejected_count,
+                                                                "repair_turn_found_count": repair_found_count,
+                                                                "repair_turn_missing_count": repair_missing_count,
+                                                                "repair_turn_stale_count": repair_stale_count,
+                                                                "repair_turn_rejected_count": repair_rejected_count,
+                                                                "repair_found_count": merged_found_count,
+                                                                "repair_missing_count": merged_missing_count,
+                                                                "repair_stale_count": merged_stale_count,
+                                                                "repair_rejected_count": merged_rejected_count,
+                                                                "repair_settlement_merge_mode": "preserve_valid_original_outputs",
                                                             }),
                                                             run_id,
                                                             &stage_id,
@@ -14816,6 +15055,7 @@ struct RuntimeInvocationContractInput<'a> {
     stage_id: String,
     stage_execution_id: String,
     agent_execution_id: String,
+    prompt_turn_id: String,
     work_item_id: String,
     session_generation_id: Option<String>,
     session_reuse_disposition: Option<String>,
@@ -14841,6 +15081,7 @@ fn prompt_with_runtime_invocation_contract(
         "- Agent execution id: `{}`\n",
         input.agent_execution_id
     ));
+    prompt.push_str(&format!("- Prompt turn id: `{}`\n", input.prompt_turn_id));
     prompt.push_str(&format!("- Work item id: `{}`\n", input.work_item_id));
     if let Some(session_generation_id) = input.session_generation_id.as_deref() {
         prompt.push_str(&format!(
@@ -15408,6 +15649,7 @@ async fn persist_p088_code_writer_completion_receipt(
             partial_write_reasons.push(format!("original_completion_text:{error}"));
         }
     }
+    let staged_repair_settlement_enabled = p090_staged_repair_materialization.is_some();
     let repair_text_artifacts = match repair_capture {
         Some(capture) => {
             let result = persist_p088_completion_text_artifacts(
@@ -15690,18 +15932,21 @@ async fn persist_p088_code_writer_completion_receipt(
                 p090_staged_repair_missing_strict_warning(provider),
             ),
         repair_materialization_mode: Some(
-            p090_repair_materialization_mode_for_flags(
-                provider,
-                completion_turn_attempted,
-                p090_strict_final_payload_enabled(provider),
-                p090_staged_repair_settlement_requested(provider),
-                p090_staged_repair_disabled(provider),
-            )
+            if staged_repair_settlement_enabled {
+                "staged_per_output"
+            } else {
+                p090_repair_materialization_mode_for_flags(
+                    provider,
+                    completion_turn_attempted,
+                    p090_strict_final_payload_enabled(provider),
+                    p090_staged_repair_settlement_requested(provider),
+                    p090_staged_repair_disabled(provider),
+                )
+            }
             .to_string(),
         ),
         strict_final_payload_enabled: p090_strict_final_payload_enabled(provider),
-        staged_repair_settlement_enabled: completion_turn_attempted
-            && p090_staged_repair_settlement_enabled(provider),
+        staged_repair_settlement_enabled,
         terminal_response_status,
         completion_turn_attempted,
         completion_turn_result: normalized_completion_turn_result,
@@ -15812,6 +16057,29 @@ async fn persist_p088_code_writer_completion_receipt(
         publish_p090_committed_repair_artifact_generations(pool, &settlement_rows).await?;
         receipt.repair_materialization_summary_json =
             p090_repair_materialization_summary_json(completion_turn_attempted, &settlement_rows);
+        match persist_p088_receipt_artifact(
+            workspace_root,
+            artifact_root,
+            agent_exec_id,
+            &receipt,
+            &captures,
+            &decisions,
+        )
+        .await
+        {
+            Ok(path) => receipt.receipt_artifact_path = Some(path),
+            Err(error) => {
+                receipt.failure_class = Some("completion_receipt_partial_write".to_string());
+                receipt.transcript_absence_reason = Some("storage_write_failed".to_string());
+                warn!(
+                    run_id = %run_id,
+                    stage_id = %stage_id,
+                    agent_execution_id = %agent_exec_id,
+                    error = %error,
+                    "P090 committed repair receipt artifact refresh failed"
+                );
+            }
+        }
         return code_writer_completion_receipts::upsert_with_runtime_receipts_and_settlement_rows(
             pool,
             &receipt,
@@ -16347,6 +16615,31 @@ fn p090_staged_repair_settlement_enabled(provider: &str) -> bool {
     provider == "junie"
         && p090_strict_final_payload_enabled(provider)
         && p090_staged_repair_settlement_requested(provider)
+}
+
+fn p090_staged_repair_settlement_enabled_for_settlement(
+    provider: &str,
+    settlement: &DeclaredOutputDiscoverySettlement,
+) -> bool {
+    p090_staged_repair_settlement_enabled(provider)
+        || (p090_provider_supports_direct_file_staged_repair(provider)
+            && p090_settlement_has_direct_file_ref(settlement))
+}
+
+fn p090_provider_supports_direct_file_staged_repair(provider: &str) -> bool {
+    matches!(
+        provider,
+        "claude" | "claude_acp" | "codex" | "codex_acp" | "junie"
+    )
+}
+
+fn p090_settlement_has_direct_file_ref(settlement: &DeclaredOutputDiscoverySettlement) -> bool {
+    settlement.decisions.iter().any(|decision| {
+        decision
+            .diagnostics
+            .get("output_mode")
+            .is_some_and(|mode| mode == "direct_file_ref")
+    })
 }
 
 fn p090_junie_preflight_enforce_enabled(provider: &str) -> bool {
@@ -17078,13 +17371,20 @@ fn p088_activation_source(
 ) -> String {
     if operator_retry_completion_recovery {
         "operator_retry_completion_recovery".to_string()
-    } else if missing_required_output_count > 0
-        && work_change_kind == Some("current_attempt_diff")
-        && original_runtime_receipt.is_some_and(receipt_indicates_recoverable_handoff_gap)
-    {
-        "p037_idle_terminalization".to_string()
     } else {
-        "declared_output_settlement_failed".to_string()
+        let decision = resolve_continuity_mode(ContinuityModeInput {
+            requested_live_reuse: false,
+            provider_session_id: None,
+            required_outputs_missing: missing_required_output_count > 0,
+            useful_work_observed: work_change_kind == Some("current_attempt_diff")
+                && original_runtime_receipt.is_some_and(receipt_indicates_recoverable_handoff_gap),
+            source_edits_allowed: false,
+            runtime_receipt: original_runtime_receipt,
+        });
+        match decision.mode {
+            ContinuityMode::OutputOnlyRecovery => "p037_idle_terminalization".to_string(),
+            _ => "declared_output_settlement_failed".to_string(),
+        }
     }
 }
 
@@ -17105,6 +17405,9 @@ fn p088_capture_source(source: &acp::AcpCompletionCaptureSource) -> String {
         acp::AcpCompletionCaptureSource::CappedStream => "session_update_stream".to_string(),
         acp::AcpCompletionCaptureSource::ProviderSessionStoreTaskComplete => {
             "provider_session_store_task_complete".to_string()
+        }
+        acp::AcpCompletionCaptureSource::ProviderSessionStoreFinalResponse => {
+            "provider_session_store_final_response".to_string()
         }
     }
 }
@@ -17313,36 +17616,13 @@ fn merge_contract_repair_result(
 ) {
     initial.status = repair.status;
     initial.artifact_paths.extend(repair.artifact_paths);
-    let mut discovered_artifacts = initial.discovered_artifacts.clone();
-    for artifact in repair.discovered_artifacts {
-        if let Some(existing) = discovered_artifacts.iter_mut().find(|candidate| {
-            candidate.name == artifact.name && candidate.source_path == artifact.source_path
-        }) {
-            *existing = artifact;
-        } else {
-            discovered_artifacts.push(artifact);
-        }
-    }
-    initial.discovered_artifacts = discovered_artifacts;
-
-    let mut pre_prompt_expected_outputs = initial.pre_prompt_expected_outputs.clone();
-    for metadata in repair.pre_prompt_expected_outputs {
-        if let Some(existing) = pre_prompt_expected_outputs.iter_mut().find(|candidate| {
-            candidate.output_name == metadata.output_name
-                && candidate.target_path == metadata.target_path
-        }) {
-            *existing = metadata;
-        } else {
-            pre_prompt_expected_outputs.push(metadata);
-        }
-    }
-    initial.pre_prompt_expected_outputs = pre_prompt_expected_outputs;
-    initial.artifact_paths.extend(
-        merged_settlement
-            .decisions
-            .iter()
-            .filter(|decision| decision.status == OutputDiscoveryStatus::Accepted)
-            .map(|decision| decision.target_path.clone()),
+    initial.discovered_artifacts = merge_repair_discovered_artifacts(
+        &initial.discovered_artifacts,
+        repair.discovered_artifacts,
+    );
+    initial.pre_prompt_expected_outputs = merge_repair_pre_prompt_expected_outputs(
+        &initial.pre_prompt_expected_outputs,
+        repair.pre_prompt_expected_outputs,
     );
     initial.cost_cents =
         Some(initial.cost_cents.unwrap_or_default() + repair.cost_cents.unwrap_or_default());
@@ -17394,9 +17674,161 @@ fn merge_contract_repair_result(
     };
 }
 
+fn merge_repair_discovered_artifacts(
+    original: &[acp::DiscoveredArtifact],
+    repair: Vec<acp::DiscoveredArtifact>,
+) -> Vec<acp::DiscoveredArtifact> {
+    let mut merged = original.to_vec();
+    for repair_artifact in repair {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|artifact| artifact.name == repair_artifact.name)
+        {
+            *existing = repair_artifact;
+        } else {
+            merged.push(repair_artifact);
+        }
+    }
+    merged
+}
+
+fn merge_repair_pre_prompt_expected_outputs(
+    original: &[PrePromptExpectedOutputMetadata],
+    repair: Vec<PrePromptExpectedOutputMetadata>,
+) -> Vec<PrePromptExpectedOutputMetadata> {
+    let mut merged = original.to_vec();
+    for repair_metadata in repair {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|metadata| metadata.output_name == repair_metadata.output_name)
+        {
+            *existing = repair_metadata;
+        } else {
+            merged.push(repair_metadata);
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn execution_result_for_repair_merge(
+        names: &[&str],
+        transcript_text: Option<&str>,
+    ) -> acp::ExecutionResult {
+        acp::ExecutionResult {
+            agent_execution_id: domain::ids::AgentExecutionId::new(),
+            status: AgentStatus::Completed,
+            artifact_paths: Vec::new(),
+            discovered_artifacts: names
+                .iter()
+                .map(|name| acp::DiscoveredArtifact {
+                    name: (*name).to_string(),
+                    content: format!("{name}-payload").into_bytes(),
+                    source_path: Some(format!("/tmp/{name}.json")),
+                    source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+                })
+                .collect(),
+            pre_prompt_expected_outputs: names
+                .iter()
+                .map(|name| PrePromptExpectedOutputMetadata {
+                    output_name: (*name).to_string(),
+                    target_path: format!("/tmp/{name}.json"),
+                    canonical_path: None,
+                    root_class: OutputRootClass::Workspace,
+                    existed: false,
+                    file_type: "absent".to_string(),
+                    size_bytes: None,
+                    file_count: None,
+                    content_digest: None,
+                    mtime_ns: None,
+                    baseline_status: ExpectedPathBaselineStatus::Absent,
+                    agent_execution_id: "agent-exec".to_string(),
+                    stage_execution_id: "stage-exec".to_string(),
+                    attempt_number: 1,
+                    session_generation_id: "session-gen".to_string(),
+                    prompt_turn_id: "prompt-turn".to_string(),
+                    discovery_generation_id: "discovery-gen".to_string(),
+                })
+                .collect(),
+            completion_text_capture: Default::default(),
+            transcript_text: transcript_text.map(str::to_string),
+            cost_cents: None,
+            usage: None,
+            provider_session_id: None,
+            reused_existing_session: false,
+            session_generation_id: None,
+            mcp_observation: None,
+            actual_mcp_extensions: Vec::new(),
+            actual_mcp_runtime_ids: Vec::new(),
+            mcp_session_startup_latency_ms: None,
+            xcode_shim_warning_events: Vec::new(),
+            close_diagnostic: None,
+            provider_session_store_capture: None,
+            acp_pre_initialize_local_latency_ms: None,
+            acp_initialize_latency_ms: None,
+            acp_session_new_latency_ms: None,
+            acp_prompt_duration_ms: None,
+            acp_pre_prompt_metadata_latency_ms: None,
+            acp_pre_prompt_metadata_timeout: false,
+            acp_pre_prompt_metadata_digest_bytes: 0,
+            legacy_broad_discovery_snapshot: None,
+            runtime_receipt: None,
+            runtime_tool_path_preflight_json: None,
+        }
+    }
+
+    #[test]
+    fn contract_repair_result_preserves_original_outputs_not_returned_by_partial_repair() {
+        let mut initial = execution_result_for_repair_merge(
+            &[
+                "proposal_current",
+                "proposal_revision_summary",
+                "proposal_feedback_coverage",
+            ],
+            Some("original transcript"),
+        );
+        let repair = execution_result_for_repair_merge(
+            &["proposal_current", "proposal_revision_summary"],
+            Some("repair transcript"),
+        );
+
+        merge_contract_repair_result(&mut initial, repair);
+
+        let discovered_names: Vec<_> = initial
+            .discovered_artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str())
+            .collect();
+        assert_eq!(
+            discovered_names,
+            vec![
+                "proposal_current",
+                "proposal_revision_summary",
+                "proposal_feedback_coverage",
+            ]
+        );
+        let pre_prompt_names: Vec<_> = initial
+            .pre_prompt_expected_outputs
+            .iter()
+            .map(|metadata| metadata.output_name.as_str())
+            .collect();
+        assert_eq!(
+            pre_prompt_names,
+            vec![
+                "proposal_current",
+                "proposal_revision_summary",
+                "proposal_feedback_coverage",
+            ]
+        );
+        assert!(initial
+            .transcript_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("--- output contract repair turn ---"));
+    }
 
     #[test]
     fn dbwriter_write_timeout_is_transient_persistence_contention() {
@@ -17588,6 +18020,8 @@ mod tests {
             logical_stage_id: Some("state_implementation".into()),
             stage_type: Some("implementation".into()),
             agent_status: "completed".into(),
+            provider: "claude".into(),
+            provider_family: Some("claude".into()),
             session_generation_id: Some("session-1".into()),
             provider_session_id: Some("provider-session-1".into()),
             catalog_snapshot_json: None,
@@ -17880,6 +18314,7 @@ plain progress line without gate evidence";
                 stage_id: "state_5_proposal_refined".to_string(),
                 stage_execution_id: stage_execution_id.to_string(),
                 agent_execution_id: agent_execution_id.to_string(),
+                prompt_turn_id: "prompt-turn-1".to_string(),
                 work_item_id: "p058-invoke:stage:0".to_string(),
                 session_generation_id: Some("generation-1".to_string()),
                 session_reuse_disposition: Some("reused".to_string()),
@@ -17891,6 +18326,7 @@ plain progress line without gate evidence";
         assert!(prompt.contains("### Runtime Invocation Contract"));
         assert!(prompt.contains("provider session may be reused"));
         assert!(prompt.contains(&stage_execution_id.to_string()));
+        assert!(prompt.contains("prompt-turn-1"));
         assert!(prompt.contains("p058-invoke:stage:0"));
         assert!(prompt.contains("proposal_current"));
         assert!(prompt.contains("/workspace/.chainworks/runs/run-1/proposals/current.md"));
@@ -17925,6 +18361,7 @@ plain progress line without gate evidence";
                 stage_id: "state_2_system_context_collected".to_string(),
                 stage_execution_id: domain::ids::StageExecutionId::new().to_string(),
                 agent_execution_id: domain::ids::AgentExecutionId::new().to_string(),
+                prompt_turn_id: "prompt-turn-directory".to_string(),
                 work_item_id: "work-system-context".to_string(),
                 session_generation_id: None,
                 session_reuse_disposition: None,
@@ -17966,6 +18403,7 @@ plain progress line without gate evidence";
                 stage_id: "state_9_implementation_reviewed".to_string(),
                 stage_execution_id: domain::ids::StageExecutionId::new().to_string(),
                 agent_execution_id: domain::ids::AgentExecutionId::new().to_string(),
+                prompt_turn_id: "prompt-turn-docs".to_string(),
                 work_item_id: "work-docs".to_string(),
                 session_generation_id: None,
                 session_reuse_disposition: None,
@@ -18015,6 +18453,7 @@ plain progress line without gate evidence";
                 stage_id: "state_8_implemented".to_string(),
                 stage_execution_id: domain::ids::StageExecutionId::new().to_string(),
                 agent_execution_id: domain::ids::AgentExecutionId::new().to_string(),
+                prompt_turn_id: "prompt-turn-code".to_string(),
                 work_item_id: "work-code".to_string(),
                 session_generation_id: None,
                 session_reuse_disposition: None,
@@ -18619,7 +19058,24 @@ plain progress line without gate evidence";
             },
         ];
 
-        let merged = merge_repair_captured_outputs(&original, &repair);
+        let repair_payload_ref = "repair:implementation_self_assessment".to_string();
+        let repair_settlement = DeclaredOutputDiscoverySettlement {
+            decisions: vec![p090_test_decision(
+                "implementation_self_assessment",
+                OutputDiscoveryStatus::Accepted,
+                OutputDiscoveryReason::ProviderEnvelope,
+                Some(&repair_payload_ref),
+            )],
+            accepted_payloads: HashMap::from([(
+                repair_payload_ref,
+                repair[1].machine_bytes.clone().unwrap(),
+            )]),
+            idempotency_key: None,
+            accepted_aggregate_bytes: repair[1].machine_bytes.as_ref().unwrap().len() as u64,
+            aggregate_cap_hit: false,
+        };
+
+        let merged = merge_repair_captured_outputs(&original, &repair, &repair_settlement, None);
         let validation = validate_task_outputs(&merged);
 
         assert!(validation.failure_class.is_none());
@@ -19149,6 +19605,7 @@ plain progress line without gate evidence";
                 stage_id: "state_5".to_string(),
                 stage_execution_id: "stage-exec-1".to_string(),
                 agent_execution_id: "agent-exec-1".to_string(),
+                prompt_turn_id: "prompt-turn-stable".to_string(),
                 work_item_id: "p058-invoke:stage-exec-1:0".to_string(),
                 session_generation_id: Some("generation-1".to_string()),
                 session_reuse_disposition: Some("reused".to_string()),
@@ -19551,6 +20008,48 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn codex_tool_session_control_failure_overrides_no_output_validation_failure_kind() {
+        let validation = TaskValidationSummary {
+            output_results: vec![],
+            contract_metadata: vec![],
+            raw_output_exists: false,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some("required output was not produced".into()),
+        };
+        let classification = classify_observation(
+            crate::failure_classifier::RuntimeFailureObservation::ProviderToolSessionControlFailure,
+        );
+
+        let facts = runtime_facts_for_execution_result(
+            domain::ids::AgentExecutionId::new(),
+            AgentStatus::Failed,
+            Some(&validation),
+            Some(classification),
+            chrono::Utc::now(),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            facts.failure_kind,
+            Some(AgentFailureKind::ProviderInternalError)
+        );
+        assert_eq!(
+            facts.transport_error_code.as_deref(),
+            Some("CODEX_TOOL_SESSION_CONTROL_FAILURE")
+        );
+        assert_eq!(
+            facts.supervision_classification.as_deref(),
+            Some("codex_tool_session_control_failure")
+        );
+        assert_eq!(
+            facts.output_settlement,
+            AgentOutputSettlement::MissingRequiredOutputs
+        );
+    }
+
+    #[test]
     fn provider_quota_prompt_error_skips_output_contract_repair() {
         let mut receipt = sample_runtime_receipt(
             acp::AcpRuntimeReceiptCounters {
@@ -19585,6 +20084,124 @@ plain progress line without gate evidence";
             classification.operator_action_hint,
             OperatorActionHint::WaitUntilRetryAfter
         );
+    }
+
+    #[test]
+    fn p088_capture_source_names_provider_session_store_final_response() {
+        assert_eq!(
+            p088_capture_source(
+                &acp::AcpCompletionCaptureSource::ProviderSessionStoreFinalResponse
+            ),
+            "provider_session_store_final_response"
+        );
+    }
+
+    #[test]
+    fn continuity_mode_forbids_normal_live_reuse_after_prompt_closed_during_stream() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 376,
+                session_update_count: 376,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 12,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 10,
+                tool_call_update_count: 149,
+                plan_update_count: 0,
+                meaningful_progress_count: 161,
+                unknown_notification_count: 0,
+            },
+            Some("prompt_closed_during_stream"),
+        );
+        receipt.provider = "claude".into();
+        receipt.provider_session_id = Some("claude-session-1".into());
+
+        let decision = resolve_continuity_mode(ContinuityModeInput {
+            requested_live_reuse: true,
+            provider_session_id: Some("claude-session-1"),
+            required_outputs_missing: true,
+            useful_work_observed: true,
+            source_edits_allowed: false,
+            runtime_receipt: Some(&receipt),
+        });
+
+        assert_eq!(decision.mode, ContinuityMode::OutputOnlyRecovery);
+        assert!(!decision.normal_live_reuse_allowed);
+        assert_eq!(decision.reason, "useful_work_missing_outputs");
+    }
+
+    #[test]
+    fn continuity_mode_uses_resurrection_for_ambiguous_boundary_with_provider_session() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 12,
+                session_update_count: 10,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 1,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 1,
+                tool_call_update_count: 8,
+                plan_update_count: 0,
+                meaningful_progress_count: 9,
+                unknown_notification_count: 0,
+            },
+            Some("transport_closed"),
+        );
+        receipt.provider = "claude".into();
+        receipt.provider_session_id = Some("claude-session-2".into());
+
+        let decision = resolve_continuity_mode(ContinuityModeInput {
+            requested_live_reuse: true,
+            provider_session_id: Some("claude-session-2"),
+            required_outputs_missing: false,
+            useful_work_observed: false,
+            source_edits_allowed: false,
+            runtime_receipt: Some(&receipt),
+        });
+
+        assert_eq!(decision.mode, ContinuityMode::ProviderSessionResurrection);
+        assert!(!decision.normal_live_reuse_allowed);
+        assert_eq!(decision.reason, "ambiguous_boundary_with_provider_session");
+    }
+
+    #[test]
+    fn continuity_mode_allows_live_reuse_only_for_clean_boundary() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 2,
+                session_update_count: 1,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 1,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 1,
+                unknown_notification_count: 0,
+            },
+            None,
+        );
+        receipt.status = "completed".into();
+        receipt.handshake.terminal_response_at_ms = Some(42);
+
+        let decision = resolve_continuity_mode(ContinuityModeInput {
+            requested_live_reuse: true,
+            provider_session_id: Some("provider-session-1"),
+            required_outputs_missing: false,
+            useful_work_observed: false,
+            source_edits_allowed: false,
+            runtime_receipt: Some(&receipt),
+        });
+
+        assert_eq!(decision.mode, ContinuityMode::NormalLiveReuse);
+        assert!(decision.normal_live_reuse_allowed);
+        assert_eq!(decision.reason, "clean_live_reuse");
     }
 
     #[test]
@@ -20137,23 +20754,425 @@ plain progress line without gate evidence";
         assert!(!p090_staged_repair_disabled("junie"));
         assert!(!p090_strict_final_payload_enabled("codex"));
         assert!(!p090_staged_repair_settlement_enabled("codex"));
+        assert!(!p090_staged_repair_settlement_enabled("claude"));
+        assert!(p090_provider_supports_direct_file_staged_repair("codex"));
+        assert!(p090_provider_supports_direct_file_staged_repair("claude"));
         assert!(!p090_junie_preflight_enforce_enabled("codex"));
     }
 
     #[test]
-    fn proposal_090_staged_repair_without_strict_is_explicitly_reported() {
-        let mode = p090_repair_materialization_mode_for_flags("junie", true, false, true, false);
-        assert_eq!(mode, "staged_repair_disabled_missing_strict_final_payload");
+    fn proposal_090_claude_direct_file_repair_uses_per_output_settlement_without_strict_payload() {
+        let mut direct_file_decision = p090_test_decision(
+            "implementation_progress",
+            OutputDiscoveryStatus::Accepted,
+            OutputDiscoveryReason::ExactPathChanged,
+            Some("direct-file:implementation_progress"),
+        );
+        direct_file_decision
+            .diagnostics
+            .insert("output_mode".to_string(), "direct_file_ref".to_string());
+        let settlement = DeclaredOutputDiscoverySettlement {
+            decisions: vec![direct_file_decision],
+            accepted_payloads: HashMap::from([(
+                "direct-file:implementation_progress".to_string(),
+                b"fresh progress".to_vec(),
+            )]),
+            idempotency_key: None,
+            accepted_aggregate_bytes: 14,
+            aggregate_cap_hit: false,
+        };
+
+        assert!(p090_staged_repair_settlement_enabled_for_settlement(
+            "claude",
+            &settlement
+        ));
+        assert!(p090_staged_repair_settlement_enabled_for_settlement(
+            "codex_acp",
+            &settlement
+        ));
         let summary = p090_repair_materialization_summary_json_with_config_warning(
             true,
             &[],
-            Some("staged_repair_requested_without_strict_final_payload"),
+            p090_staged_repair_missing_strict_warning("claude"),
         )
         .expect("summary json");
         let value: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(value["config_warnings"], serde_json::json!([]));
+    }
+
+    fn p090_test_decision(
+        output_name: &str,
+        status: OutputDiscoveryStatus,
+        reason: OutputDiscoveryReason,
+        payload_ref: Option<&str>,
+    ) -> OutputDiscoveryDecision {
+        OutputDiscoveryDecision {
+            output_name: output_name.to_string(),
+            output_role: domain::discovery::ExpectedOutputRole::Machine,
+            target_path: format!("/tmp/{output_name}.json"),
+            companion_of: None,
+            status,
+            reason,
+            provenance: Some(OutputDiscoveryProvenance::ExactPath),
+            canonical_path: Some(format!("/tmp/{output_name}.json")),
+            root_class: Some(OutputRootClass::ChainworksMetaRoot),
+            baseline_status: Some(ExpectedPathBaselineStatus::RegularContentCaptured),
+            size_bytes: Some(12),
+            content_digest: Some(format!("sha256:{output_name}")),
+            max_bytes_applied: Some(10 * 1024 * 1024),
+            aggregate_bytes_after_acceptance: payload_ref.map(|_| 12),
+            accepted_payload_ref: payload_ref.map(str::to_string),
+            accepted_bytes_sha256: payload_ref.map(|_| format!("sha256:{output_name}")),
+            generated_by: None,
+            diagnostics: Default::default(),
+            decision_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn proposal_090_repair_merge_preserves_original_accepted_outputs_when_repair_is_stale() {
+        let original_progress_ref = "original:implementation_progress".to_string();
+        let repair_changed_ref = "repair:changed_files_manifest".to_string();
+        let original = DeclaredOutputDiscoverySettlement {
+            decisions: vec![
+                p090_test_decision(
+                    "implementation_progress",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ExactPathChanged,
+                    Some(&original_progress_ref),
+                ),
+                p090_test_decision(
+                    "changed_files_manifest",
+                    OutputDiscoveryStatus::Missing,
+                    OutputDiscoveryReason::MissingAfterPrompt,
+                    None,
+                ),
+            ],
+            accepted_payloads: HashMap::from([(
+                original_progress_ref.clone(),
+                b"fresh progress".to_vec(),
+            )]),
+            idempotency_key: Some("original".to_string()),
+            accepted_aggregate_bytes: 14,
+            aggregate_cap_hit: false,
+        };
+        let repair = DeclaredOutputDiscoverySettlement {
+            decisions: vec![
+                p090_test_decision(
+                    "implementation_progress",
+                    OutputDiscoveryStatus::Missing,
+                    OutputDiscoveryReason::StaleExpectedOutput,
+                    None,
+                ),
+                p090_test_decision(
+                    "changed_files_manifest",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ExactPathChanged,
+                    Some(&repair_changed_ref),
+                ),
+            ],
+            accepted_payloads: HashMap::from([(
+                repair_changed_ref.clone(),
+                br#"{"files":[]}"#.to_vec(),
+            )]),
+            idempotency_key: Some("repair".to_string()),
+            accepted_aggregate_bytes: 12,
+            aggregate_cap_hit: false,
+        };
+
+        let merged = merge_repair_discovery_settlements(&original, &repair, None);
+        let progress = merged
+            .decisions
+            .iter()
+            .find(|decision| decision.output_name == "implementation_progress")
+            .unwrap();
+        let changed_files = merged
+            .decisions
+            .iter()
+            .find(|decision| decision.output_name == "changed_files_manifest")
+            .unwrap();
+
+        assert_eq!(progress.status, OutputDiscoveryStatus::Accepted);
         assert_eq!(
-            value["config_warnings"],
-            serde_json::json!(["staged_repair_requested_without_strict_final_payload"])
+            progress.accepted_payload_ref.as_deref(),
+            Some(original_progress_ref.as_str())
+        );
+        assert_eq!(changed_files.status, OutputDiscoveryStatus::Accepted);
+        assert_eq!(
+            changed_files.accepted_payload_ref.as_deref(),
+            Some(repair_changed_ref.as_str())
+        );
+    }
+
+    #[test]
+    fn proposal_090_repair_merge_does_not_replace_original_valid_output_with_repair_payload() {
+        let declared = DeclaredOutput {
+            output_name: "implementation_progress".to_string(),
+            target_path: "/tmp/implementation_progress.json".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let original_progress_ref = "original:implementation_progress".to_string();
+        let repair_progress_ref = "repair:implementation_progress".to_string();
+        let original = DeclaredOutputDiscoverySettlement {
+            decisions: vec![p090_test_decision(
+                "implementation_progress",
+                OutputDiscoveryStatus::Accepted,
+                OutputDiscoveryReason::ExactPathChanged,
+                Some(&original_progress_ref),
+            )],
+            accepted_payloads: HashMap::from([(
+                original_progress_ref.clone(),
+                b"valid original progress".to_vec(),
+            )]),
+            idempotency_key: None,
+            accepted_aggregate_bytes: 23,
+            aggregate_cap_hit: false,
+        };
+        let repair = DeclaredOutputDiscoverySettlement {
+            decisions: vec![p090_test_decision(
+                "implementation_progress",
+                OutputDiscoveryStatus::Accepted,
+                OutputDiscoveryReason::ProviderEnvelope,
+                Some(&repair_progress_ref),
+            )],
+            accepted_payloads: HashMap::from([(
+                repair_progress_ref.clone(),
+                b"malformed repair progress".to_vec(),
+            )]),
+            idempotency_key: None,
+            accepted_aggregate_bytes: 25,
+            aggregate_cap_hit: false,
+        };
+        let original_validation = TaskValidationSummary {
+            output_results: vec![domain::validation::OutputValidationResult {
+                output_name: "implementation_progress".to_string(),
+                contract_id: Some("implementation_progress".to_string()),
+                status: domain::validation::ValidationStatus::Passed,
+                missing_fields: vec![],
+                validation_error: None,
+                raw_payload_size: 23,
+            }],
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: None,
+            failure_summary: None,
+        };
+        let original_captured = vec![CapturedOutput {
+            declared: declared.clone(),
+            machine_bytes: Some(b"valid original progress".to_vec()),
+            companion_bytes: None,
+        }];
+        let repair_captured = vec![CapturedOutput {
+            declared,
+            machine_bytes: Some(b"malformed repair progress".to_vec()),
+            companion_bytes: None,
+        }];
+
+        let merged_settlement =
+            merge_repair_discovery_settlements(&original, &repair, Some(&original_validation));
+        let merged_captured = merge_repair_captured_outputs(
+            &original_captured,
+            &repair_captured,
+            &repair,
+            Some(&original_validation),
+        );
+        let progress_decision = merged_settlement
+            .decisions
+            .iter()
+            .find(|decision| decision.output_name == "implementation_progress")
+            .unwrap();
+
+        assert_eq!(
+            progress_decision.accepted_payload_ref.as_deref(),
+            Some(original_progress_ref.as_str())
+        );
+        assert_eq!(
+            merged_captured[0].machine_bytes.as_deref(),
+            Some(&b"valid original progress"[..])
+        );
+    }
+
+    #[test]
+    fn proposal_090_repair_merge_preserves_valid_proposal_feedback_coverage_when_repair_omits_it() {
+        let proposal_current = DeclaredOutput {
+            output_name: "proposal_current".to_string(),
+            target_path: "/tmp/proposal.md".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let proposal_revision_summary = DeclaredOutput {
+            output_name: "proposal_revision_summary".to_string(),
+            target_path: "/tmp/revision-summary.json".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let proposal_feedback_coverage = DeclaredOutput {
+            output_name: "proposal_feedback_coverage".to_string(),
+            target_path: "/tmp/feedback-coverage.json".to_string(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+
+        let original_current_ref = "original:proposal_current".to_string();
+        let original_summary_ref = "original:proposal_revision_summary".to_string();
+        let original_coverage_ref = "original:proposal_feedback_coverage".to_string();
+        let repair_current_ref = "repair:proposal_current".to_string();
+        let repair_summary_ref = "repair:proposal_revision_summary".to_string();
+
+        let original = DeclaredOutputDiscoverySettlement {
+            decisions: vec![
+                p090_test_decision(
+                    "proposal_current",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ProviderEnvelope,
+                    Some(&original_current_ref),
+                ),
+                p090_test_decision(
+                    "proposal_revision_summary",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ProviderEnvelope,
+                    Some(&original_summary_ref),
+                ),
+                p090_test_decision(
+                    "proposal_feedback_coverage",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ProviderEnvelope,
+                    Some(&original_coverage_ref),
+                ),
+            ],
+            accepted_payloads: HashMap::from([
+                (original_current_ref.clone(), b"invalid proposal".to_vec()),
+                (original_summary_ref.clone(), b"old summary".to_vec()),
+                (original_coverage_ref.clone(), b"valid coverage".to_vec()),
+            ]),
+            idempotency_key: Some("original".to_string()),
+            accepted_aggregate_bytes: 39,
+            aggregate_cap_hit: false,
+        };
+        let repair = DeclaredOutputDiscoverySettlement {
+            decisions: vec![
+                p090_test_decision(
+                    "proposal_current",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ProviderEnvelope,
+                    Some(&repair_current_ref),
+                ),
+                p090_test_decision(
+                    "proposal_revision_summary",
+                    OutputDiscoveryStatus::Accepted,
+                    OutputDiscoveryReason::ProviderEnvelope,
+                    Some(&repair_summary_ref),
+                ),
+            ],
+            accepted_payloads: HashMap::from([
+                (repair_current_ref.clone(), b"fixed proposal".to_vec()),
+                (repair_summary_ref.clone(), b"repair summary".to_vec()),
+            ]),
+            idempotency_key: Some("repair".to_string()),
+            accepted_aggregate_bytes: 27,
+            aggregate_cap_hit: false,
+        };
+        let original_validation = TaskValidationSummary {
+            output_results: vec![
+                domain::validation::OutputValidationResult {
+                    output_name: "proposal_current".to_string(),
+                    contract_id: Some("proposal_current_v1".to_string()),
+                    status: domain::validation::ValidationStatus::Failed,
+                    missing_fields: vec![],
+                    validation_error: Some("forbidden field cutover_policy.policy".to_string()),
+                    raw_payload_size: 16,
+                },
+                domain::validation::OutputValidationResult {
+                    output_name: "proposal_revision_summary".to_string(),
+                    contract_id: Some("proposal_revision_summary_v1".to_string()),
+                    status: domain::validation::ValidationStatus::Passed,
+                    missing_fields: vec![],
+                    validation_error: None,
+                    raw_payload_size: 11,
+                },
+                domain::validation::OutputValidationResult {
+                    output_name: "proposal_feedback_coverage".to_string(),
+                    contract_id: Some("proposal_feedback_coverage_v1".to_string()),
+                    status: domain::validation::ValidationStatus::Passed,
+                    missing_fields: vec![],
+                    validation_error: None,
+                    raw_payload_size: 14,
+                },
+            ],
+            contract_metadata: vec![],
+            raw_output_exists: true,
+            failure_class: Some(domain::validation::ValidationFailureClass::OutputContractMismatch),
+            failure_summary: Some("proposal_current contract mismatch".to_string()),
+        };
+        let original_captured = vec![
+            CapturedOutput {
+                declared: proposal_current.clone(),
+                machine_bytes: Some(b"invalid proposal".to_vec()),
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: proposal_revision_summary.clone(),
+                machine_bytes: Some(b"old summary".to_vec()),
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: proposal_feedback_coverage.clone(),
+                machine_bytes: Some(b"valid coverage".to_vec()),
+                companion_bytes: None,
+            },
+        ];
+        let repair_captured = vec![
+            CapturedOutput {
+                declared: proposal_current,
+                machine_bytes: Some(b"fixed proposal".to_vec()),
+                companion_bytes: None,
+            },
+            CapturedOutput {
+                declared: proposal_revision_summary,
+                machine_bytes: Some(b"repair summary".to_vec()),
+                companion_bytes: None,
+            },
+        ];
+
+        let merged_settlement =
+            merge_repair_discovery_settlements(&original, &repair, Some(&original_validation));
+        let merged_captured = merge_repair_captured_outputs(
+            &original_captured,
+            &repair_captured,
+            &repair,
+            Some(&original_validation),
+        );
+        let coverage_decision = merged_settlement
+            .decisions
+            .iter()
+            .find(|decision| decision.output_name == "proposal_feedback_coverage")
+            .unwrap();
+        let coverage_captured = merged_captured
+            .iter()
+            .find(|captured| captured.declared.output_name == "proposal_feedback_coverage")
+            .unwrap();
+
+        assert_eq!(coverage_decision.status, OutputDiscoveryStatus::Accepted);
+        assert_eq!(
+            coverage_decision.accepted_payload_ref.as_deref(),
+            Some(original_coverage_ref.as_str())
+        );
+        assert_eq!(
+            coverage_captured.machine_bytes.as_deref(),
+            Some(&b"valid coverage"[..])
+        );
+        assert_eq!(
+            output_discovery_decision_counts(&merged_settlement.decisions),
+            (3, 0, 0, 0)
         );
     }
 
@@ -21307,6 +22326,110 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn p079_recovered_session_store_final_accepts_changed_canonical_files_by_exact_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_root = tmp.path().join(".chainworks/runs/run-p079");
+        let implementation_dir = run_root.join("implementation");
+        std::fs::create_dir_all(&implementation_dir).unwrap();
+        let outputs = [
+            (
+                "implementation_progress",
+                "progress.json",
+                br#"{"status":"complete","current_phase":"runtime-recovery","completed_items":[],"deferred_items":[],"notes":""}"#
+                    .as_slice(),
+            ),
+            (
+                "implementation_self_assessment",
+                "self-assessment.json",
+                br#"{"implementation_complete":true,"verification_green":true,"remaining_code_tasks":[],"handoff_tasks":[],"known_risks":[],"tests_run":[],"docs_impacted":[]}"#
+                    .as_slice(),
+            ),
+            (
+                "changed_files_manifest",
+                "changed-files.json",
+                br#"{"files":[]}"#.as_slice(),
+            ),
+            (
+                "tests_result",
+                "tests.json",
+                br#"{"status":"pass","summary":"focused recovery tests"}"#.as_slice(),
+            ),
+        ];
+        let declared: Vec<DeclaredOutput> = outputs
+            .iter()
+            .map(|(name, file_name, _)| DeclaredOutput {
+                output_name: (*name).to_string(),
+                target_path: implementation_dir
+                    .join(file_name)
+                    .to_string_lossy()
+                    .into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            })
+            .collect();
+        let specs = build_expected_output_specs(
+            &declared,
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(run_root.to_str().unwrap()),
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-p079".to_string(),
+            stage_execution_id: "stage-exec-p079".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-p079".to_string(),
+            prompt_turn_id: "prompt-p079".to_string(),
+            discovery_generation_id: "discovery-p079".to_string(),
+        };
+        let pre_prompt_metadata: Vec<_> = specs
+            .iter()
+            .map(|spec| PrePromptExpectedOutputMetadata::absent(spec, &metadata_context))
+            .collect();
+        let mut discovered = Vec::new();
+        for ((name, _file_name, bytes), spec) in outputs.iter().zip(specs.iter()) {
+            std::fs::write(&spec.target_path, bytes).unwrap();
+            discovered.push(acp::DiscoveredArtifact {
+                name: (*name).to_string(),
+                content: bytes.to_vec(),
+                source_path: Some(spec.target_path.clone()),
+                source_kind: acp::DiscoveredArtifactSourceKind::ExactPath,
+            });
+        }
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+
+        assert!(settlement
+            .decisions
+            .iter()
+            .all(|decision| decision.status == OutputDiscoveryStatus::Accepted));
+        let changed_files = settlement
+            .decisions
+            .iter()
+            .find(|decision| decision.output_name == "changed_files_manifest")
+            .expect("changed files decision");
+        assert_eq!(
+            changed_files.reason,
+            OutputDiscoveryReason::ControlPlaneGenerated
+        );
+        assert!(
+            settlement.decisions.iter().all(|decision| {
+                decision.output_name == "changed_files_manifest"
+                    || matches!(
+                        decision.reason,
+                        OutputDiscoveryReason::ExactPathNew
+                            | OutputDiscoveryReason::ExactPathChanged
+                    )
+            }),
+            "unexpected decisions: {:?}",
+            settlement.decisions
+        );
+    }
+
+    #[test]
     fn direct_file_ref_manifest_accepts_compact_path_digest_size_shape() {
         let tmp = tempfile::tempdir().unwrap();
         let output_path = tmp.path().join("proposals/current/proposal.json");
@@ -21456,6 +22579,345 @@ plain progress line without gate evidence";
             Some(&output_bytes[..])
         );
         assert!(validation.failure_class.is_none());
+    }
+
+    #[test]
+    fn code_writer_multi_output_direct_file_manifests_are_accepted_by_inner_output_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let implementation_dir = tmp.path().join("implementation");
+        std::fs::create_dir_all(&implementation_dir).unwrap();
+        let outputs = [
+            (
+                "implementation_progress",
+                "progress.md",
+                b"## Progress\n\n- Direct-file settlement complete.\n".to_vec(),
+            ),
+            (
+                "implementation_self_assessment",
+                "self-assessment.json",
+                br#"{"implementation_complete":true,"verification_green":true,"remaining_code_tasks":[]}"#
+                    .to_vec(),
+            ),
+            (
+                "tests_result",
+                "tests.json",
+                br#"{"status":"pass","summary":"focused tests passed"}"#.to_vec(),
+            ),
+        ];
+        let declared = outputs
+            .iter()
+            .map(|(output_name, file_name, _)| DeclaredOutput {
+                output_name: (*output_name).to_string(),
+                target_path: implementation_dir
+                    .join(file_name)
+                    .to_string_lossy()
+                    .into_owned(),
+                schema: None,
+                reuse_policy: None,
+                companion_output_name: None,
+                companion_path: None,
+            })
+            .collect::<Vec<_>>();
+        for (output_name, file_name, bytes) in outputs {
+            let path = implementation_dir.join(file_name);
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(
+                declared
+                    .iter()
+                    .any(|declared| declared.output_name == output_name
+                        && declared.target_path == path.to_string_lossy()),
+                "{output_name} should have a declared canonical path"
+            );
+        }
+        let specs =
+            build_expected_output_specs(&declared, tmp.path().to_str().unwrap(), None, None, false);
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-1".to_string(),
+            stage_execution_id: "stage-exec-1".to_string(),
+            attempt_number: 1,
+            session_generation_id: "session-1".to_string(),
+            prompt_turn_id: "prompt-1".to_string(),
+            discovery_generation_id: "discovery-1".to_string(),
+        };
+        let pre_prompt_metadata = specs
+            .iter()
+            .map(|spec| PrePromptExpectedOutputMetadata::absent(spec, &metadata_context))
+            .collect::<Vec<_>>();
+        let discovered = declared
+            .iter()
+            .map(|declared| {
+                let bytes = std::fs::read(&declared.target_path).unwrap();
+                acp::DiscoveredArtifact {
+                    name: declared.target_path.clone(),
+                    content: serde_json::to_vec(&serde_json::json!({
+                        "mode": "direct_file",
+                        "output_name": declared.output_name,
+                        "path": declared.target_path,
+                        "digest": sha256_digest(&bytes),
+                        "size_bytes": bytes.len()
+                    }))
+                    .unwrap(),
+                    source_path: None,
+                    source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &declared,
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        for declared in &declared {
+            let decision = settlement
+                .decisions
+                .iter()
+                .find(|decision| decision.output_name == declared.output_name)
+                .unwrap();
+            assert_eq!(decision.status, OutputDiscoveryStatus::Accepted);
+            assert_eq!(
+                decision.diagnostics.get("output_mode"),
+                Some(&"direct_file_ref".to_string())
+            );
+            let captured_output = captured
+                .iter()
+                .find(|captured| captured.declared.output_name == declared.output_name)
+                .unwrap();
+            assert_eq!(
+                captured_output.machine_bytes.as_deref(),
+                Some(&std::fs::read(&declared.target_path).unwrap()[..])
+            );
+        }
+        assert!(validation.failure_class.is_none());
+    }
+
+    #[test]
+    fn code_writer_repair_direct_file_manifests_validate_canonical_file_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let implementation_dir = tmp.path().join(".chainworks/runs/run-p083/implementation");
+        std::fs::create_dir_all(&implementation_dir).unwrap();
+        let outputs = [
+            (
+                "implementation_progress",
+                "progress.md",
+                "implementation_progress_v1",
+                vec![
+                    "status",
+                    "current_phase",
+                    "completed_items",
+                    "deferred_items",
+                    "notes",
+                ],
+                br#"{"status":"complete","current_phase":"settlement","completed_items":["accepted canonical direct-file outputs"],"deferred_items":[],"notes":"strict payload lives on disk"}"#.to_vec(),
+            ),
+            (
+                "implementation_self_assessment",
+                "self-assessment.json",
+                IMPLEMENTATION_SELF_ASSESSMENT_V2_CONTRACT_ID,
+                vec![
+                    "implementation_complete",
+                    "verification_green",
+                    "remaining_code_tasks",
+                    "handoff_tasks",
+                    "known_risks",
+                    "tests_run",
+                    "docs_impacted",
+                ],
+                br#"{"implementation_complete":true,"verification_green":true,"remaining_code_tasks":[],"handoff_tasks":[],"known_risks":[],"tests_run":["cargo test -p engine p083"],"docs_impacted":[]}"#
+                    .to_vec(),
+            ),
+            (
+                "changed_files_manifest",
+                "changed-files.json",
+                "changed_files_manifest_v1",
+                vec!["files"],
+                br#"{"files":[{"path":"control-plane/crates/engine/src/executor.rs","status":"modified"}]}"#
+                    .to_vec(),
+            ),
+            (
+                "tests_result",
+                "tests.json",
+                "tests_result_v1",
+                vec!["status", "summary"],
+                br#"{"status":"green","summary":"focused settlement test"}"#.to_vec(),
+            ),
+        ];
+        let declared = outputs
+            .iter()
+            .map(
+                |(output_name, file_name, contract_id, required_fields, _)| DeclaredOutput {
+                    output_name: (*output_name).to_string(),
+                    target_path: implementation_dir
+                        .join(file_name)
+                        .to_string_lossy()
+                        .into_owned(),
+                    schema: Some(workflow::plan::OutputSchema {
+                        contract_id: (*contract_id).to_string(),
+                        format: "json".to_string(),
+                        human_format: None,
+                        machine_format: Some("json".to_string()),
+                        validation_mode: Some("strict_structured".to_string()),
+                        normalized_artifact_name: None,
+                        raw_artifact_name: None,
+                        required_fields: required_fields
+                            .iter()
+                            .map(|field| field.to_string())
+                            .collect(),
+                    }),
+                    reuse_policy: None,
+                    companion_output_name: None,
+                    companion_path: None,
+                },
+            )
+            .collect::<Vec<_>>();
+        for ((_, _, _, _, bytes), declared) in outputs.iter().zip(declared.iter()) {
+            std::fs::write(&declared.target_path, bytes).unwrap();
+        }
+        let run_root = tmp.path().join(".chainworks/runs/run-p083");
+        let specs = build_expected_output_specs(
+            &declared,
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(run_root.to_str().unwrap()),
+            false,
+        );
+        let metadata_context = PrePromptExpectedOutputContext {
+            agent_execution_id: "agent-exec-p083".to_string(),
+            stage_execution_id: "stage-exec-p083".to_string(),
+            attempt_number: 2,
+            session_generation_id: "session-p083".to_string(),
+            prompt_turn_id: "prompt-p083".to_string(),
+            discovery_generation_id: "discovery-p083".to_string(),
+        };
+        let pre_prompt_metadata = specs
+            .iter()
+            .map(|spec| PrePromptExpectedOutputMetadata::absent(spec, &metadata_context))
+            .collect::<Vec<_>>();
+        let discovered = declared
+            .iter()
+            .map(|declared| {
+                let bytes = std::fs::read(&declared.target_path).unwrap();
+                acp::DiscoveredArtifact {
+                    name: declared.output_name.clone(),
+                    content: serde_json::to_vec(&serde_json::json!({
+                        "mode": "direct_file",
+                        "output_name": declared.output_name,
+                        "path": declared.target_path,
+                        "digest": sha256_digest(&bytes),
+                        "size_bytes": bytes.len()
+                    }))
+                    .unwrap(),
+                    source_path: None,
+                    source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let settlement =
+            build_declared_output_discovery_settlement(&specs, &discovered, &pre_prompt_metadata);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &declared,
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        for declared in &declared {
+            let decision = settlement
+                .decisions
+                .iter()
+                .find(|decision| decision.output_name == declared.output_name)
+                .unwrap();
+            assert_eq!(decision.status, OutputDiscoveryStatus::Accepted);
+            assert_eq!(
+                decision.diagnostics.get("output_mode"),
+                Some(&"direct_file_ref".to_string())
+            );
+            assert_eq!(
+                captured
+                    .iter()
+                    .find(|captured| captured.declared.output_name == declared.output_name)
+                    .and_then(|captured| captured.machine_bytes.as_deref()),
+                Some(&std::fs::read(&declared.target_path).unwrap()[..]),
+                "{} should validate the canonical file, not the direct-file manifest",
+                declared.output_name
+            );
+        }
+        assert!(validation.failure_class.is_none(), "{validation:?}");
+        assert!(
+            p090_staged_repair_settlement_enabled_for_settlement("claude", &settlement),
+            "direct-file repair outputs must use per-output settlement instead of legacy all-or-nothing materialization"
+        );
+    }
+
+    #[test]
+    fn repair_direct_file_manifest_without_pre_prompt_metadata_reads_canonical_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_root = tmp.path().join(".chainworks/runs/run-p083");
+        let output_path = run_root.join("implementation/tests.json");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        let output_bytes = br#"{"status":"green","summary":"canonical file recovered without pre-prompt metadata"}"#;
+        std::fs::write(&output_path, output_bytes).unwrap();
+        let declared = DeclaredOutput {
+            output_name: "tests_result".to_string(),
+            target_path: output_path.to_string_lossy().into_owned(),
+            schema: Some(workflow::plan::OutputSchema {
+                contract_id: "tests_result_v1".to_string(),
+                format: "json".to_string(),
+                human_format: None,
+                machine_format: Some("json".to_string()),
+                validation_mode: Some("strict_structured".to_string()),
+                normalized_artifact_name: None,
+                raw_artifact_name: None,
+                required_fields: vec!["status".to_string(), "summary".to_string()],
+            }),
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            Some(run_root.to_str().unwrap()),
+            false,
+        );
+        let manifest = serde_json::json!({
+            "mode": "direct_file",
+            "output_name": "tests_result",
+            "path": output_path.to_string_lossy(),
+            "digest": sha256_digest(output_bytes),
+            "size_bytes": output_bytes.len()
+        });
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "tests_result".to_string(),
+            content: serde_json::to_vec(&manifest).unwrap(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ChainworksOutput,
+        }];
+
+        let settlement = build_declared_output_discovery_settlement(&specs, &discovered, &[]);
+        let captured = build_captured_outputs_from_discovery_decisions(
+            &[declared],
+            &settlement.decisions,
+            &settlement.accepted_payloads,
+        );
+        let validation = validate_task_outputs(&captured);
+
+        assert_eq!(
+            captured[0].machine_bytes.as_deref(),
+            Some(&output_bytes[..]),
+            "settlement must read the canonical file instead of validating the manifest"
+        );
+        assert_eq!(
+            settlement.decisions[0].diagnostics.get("output_mode"),
+            Some(&"direct_file_ref".to_string())
+        );
+        assert!(validation.failure_class.is_none(), "{validation:?}");
     }
 
     #[test]

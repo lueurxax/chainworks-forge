@@ -54,6 +54,41 @@ support exists.
 
 ## 3. Required Behavior
 
+### 3.0 Continuity Mode Architecture
+
+P086 must make the continuation modes explicit and mutually distinguishable.
+Provider-session resurrection is not ordinary retry and must not be implemented
+as a best-effort variant of live-session reuse.
+
+The runtime must classify every post-failure continuation attempt as exactly one
+of these modes:
+
+| Mode | Meaning | Allowed session source |
+|---|---|---|
+| `normal_fresh_execution` | Start a new execution attempt with no provider memory dependency. | New provider session only. |
+| `normal_live_reuse` | Send another prompt through a live ACP handle that Chainworks still owns and whose previous prompt boundary settled cleanly. | Existing live ACP handle. |
+| `provider_session_resurrection` | Start a new Chainworks-managed ACP subprocess and attach/resume a recorded provider session id after the old ACP handle is gone. | New ACP process attached to old provider session id. |
+| `output_only_recovery` | Recover missing or malformed required outputs from useful work already performed; do not redo implementation work unless explicitly allowed. | Live reuse or provider-session resurrection, with explicit recovery receipt. |
+
+A normal retry must never silently reuse an ambiguous provider session after
+`prompt_closed_during_stream`, `transport_closed`, `provider_timeout`, failed
+settlement, or cancellation. Those cases may still preserve token savings, but
+only through an explicit resurrection or output-only recovery path with durable
+proof. This preserves the session-continuity benefit without letting retry,
+reuse, and recovery collapse into an un-auditable mixed mode.
+
+The execution and report surfaces must expose the selected mode, the reason it
+was selected, and why other modes were rejected. In particular:
+
+- failed or ambiguous prompt boundaries make the current live ACP handle
+  ineligible for `normal_live_reuse`;
+- the same provider session id may still be eligible for
+  `provider_session_resurrection` if adapter and catalog gates pass;
+- output-only recovery must state whether source edits are forbidden or
+  explicitly allowed;
+- any fallback from resurrection/recovery to a fresh retry requires a separate
+  operator-visible decision and must not happen automatically.
+
 ### 3.1 Adapter Capability Contract
 
 Each ACP adapter must declare whether it supports provider-session resurrection.
@@ -161,6 +196,32 @@ If the adapter cannot observe an actual provider session id and prove it equals
 the requested id, the resurrection must fail with `identity_unverifiable` before
 any continuation prompt is sent.
 
+Claude resurrection must also support provider session-store recovery as a
+first-class evidence source. When ACP loses the terminal response or closes
+during an active prompt, Chainworks must be able to read the Claude session
+store for the requested provider session id, bind the observed transcript to the
+target run/stage/agent execution, and recover terminal work/output evidence when
+possible.
+
+Session-store recovery must record:
+
+- provider session-store root and resolved transcript path;
+- transcript read timestamp and digest;
+- latest observed provider turn/message id if available;
+- latest observed tool/background-task activity if available;
+- whether a terminal answer, `CHAINWORKS_OUTPUT`, or direct-file manifest was
+  recovered;
+- whether recovered content belongs to the target request by prompt marker,
+  request fingerprint, stage execution id, agent execution id, or another
+  documented proof source;
+- the reason recovery failed when the transcript is missing, truncated,
+  ambiguous, or belongs to another execution.
+
+The recovered transcript may be used to settle outputs only when ownership is
+machine-checkable. If ownership cannot be proven, resurrection may still ask a
+short output-only repair question in the same provider session, but must not
+pretend the transcript was canonical settlement evidence.
+
 ### 3.4 Generic Resurrection Flow
 
 `agents.continue_work` with `continuation_mode=provider_session_resurrection`
@@ -181,10 +242,24 @@ must:
 6. Start a new managed ACP process through the adapter resurrection path.
 7. Persist a provider-session attach receipt before the continuation prompt is
    sent.
-8. Send the canonical P086 mode-reset continuation prompt through the resumed
+8. Persist a prompt-turn marker that includes the continuation id, target
+   `agent_execution_id`, target `stage_execution_id`, request fingerprint, and
+   provider request/turn id when the adapter exposes one.
+9. Send the canonical P086 mode-reset continuation prompt through the resumed
    session.
-9. Settle the continuation using the existing continuation artifact/readback
+10. Correlate every terminal response or recovered transcript with the persisted
+   prompt-turn marker before settlement.
+11. Settle the continuation using the existing continuation artifact/readback
    path, never by creating a normal stage retry.
+
+Request ids are necessary but not sufficient. JSON-RPC request ids prove the
+ACP transport response while the transport is intact. After process closure or
+session-store recovery, the engine must correlate by a stronger prompt-turn
+receipt: Chainworks continuation id, request fingerprint, stage execution id,
+agent execution id, provider session id, provider request/turn id when
+available, and transcript proof source. If any required correlation field is
+missing or contradictory, settlement must fail closed instead of attributing an
+old answer to a new attempt.
 
 ### 3.5 Output Repair Use Case
 
@@ -198,6 +273,13 @@ Provider-session resurrection must support the P079/P088 output-repair shape:
 
 The repair prompt must explicitly forbid additional code edits unless the
 operator instruction allows them.
+
+Output-only recovery is a distinct continuation purpose, not a generic retry.
+It must ask only for the missing or invalid required outputs, include the
+already captured work summary when available, and avoid repeating the full
+implementation task. If canonical direct-file artifacts already exist and pass
+contract validation, the engine must preserve them and request only the missing
+pieces.
 
 Output-only repair also needs machine-checkable proof, not only prompt wording.
 For output-only resurrection requests, Chainworks must capture a pre/post
@@ -321,6 +403,14 @@ For `mode = provider_session_resurrection`, the receipt schema must require:
 - `attach_request_id` or equivalent idempotency key;
 - `managed_child_pid`;
 - `managed_process_group_id`;
+- `target_agent_execution_id`;
+- `target_stage_execution_id`;
+- `request_fingerprint_sha256`;
+- `prompt_turn_marker_id`;
+- `provider_request_id` or `provider_turn_id` when exposed by the adapter;
+- `session_store_transcript_path` when session-store recovery was attempted;
+- `session_store_transcript_digest` when session-store recovery was attempted;
+- `session_store_recovery_result`;
 - `process_started_at`;
 - `attach_started_at`;
 - `attach_completed_at`;
@@ -395,27 +485,44 @@ Required tests and evidence:
 10. Continuation worker test: resurrection is recorded as
    `provider_session_resurrection`, not retry, output repair, checkpoint
    rehydration, or normal session reuse.
-11. Output-repair test: malformed `CHAINWORKS_OUTPUT` can be corrected through a
+11. Mode classification test: `prompt_closed_during_stream`,
+    `transport_closed`, `provider_timeout`, failed settlement, and cancellation
+    are ineligible for silent `normal_live_reuse`; they may only enter
+    `provider_session_resurrection` or `output_only_recovery` after explicit
+    admission gates pass.
+12. Prompt-turn correlation test: settlement rejects recovered terminal output
+    when request fingerprint, stage execution id, agent execution id, provider
+    session id, or provider request/turn id proof is missing or contradictory.
+13. Claude session-store recovery test: a lost ACP terminal response can be
+    recovered from the Claude session transcript only when the transcript is
+    bound to the target execution by prompt marker/request fingerprint and the
+    recovered output passes contract validation.
+14. Claude session-store ambiguity test: transcript evidence from the same
+    provider session but a different target execution fails closed and cannot be
+    attributed to the current retry.
+15. Output-repair test: malformed `CHAINWORKS_OUTPUT` can be corrected through a
    resurrected provider session without changing source files when the operator
    asked for output-only repair.
-12. Output-only repair test: source snapshot evidence records
+16. Output-only repair test: source snapshot evidence records
    `changed_source_files == 0`; a deliberately allowed source-edit request must
    record the explicit operator allowance and changed file list.
-13. Crash/replay tests: crashes in `launching`, `launched`, `attaching`,
+17. Crash/replay tests: crashes in `launching`, `launched`, `attaching`,
     `attached_unprompted`, and `prompting` follow the replay rules without
     duplicate prompt send and without normal retry fallback.
-14. DB/API compatibility test: existing live-handle continuation statuses remain
+18. DB/API compatibility test: existing live-handle continuation statuses remain
     accepted by the DB and readback surfaces; provider-session resurrection rows
     persist a typed `resurrection_phase` without adding new
     `agent_work_continuations.status` values.
-15. Replay classification test: `attached_unprompted` is distinguishable from
+19. Replay classification test: `attached_unprompted` is distinguishable from
     `prompt_sent` through DB, MCP, GraphQL, reports, and receipt readback.
-16. Receipt schema test: resurrection receipts fail schema validation if they
+20. Receipt schema test: resurrection receipts fail schema validation if they
     omit requested id, actual id, proof source, adapter capability version,
-    process ownership evidence, timestamps, or typed failure class.
-17. Readback test: MCP/GraphQL/report surfaces expose attach receipt, actual
+    prompt-turn marker, target execution ids, request fingerprint, process
+    ownership evidence, session-store recovery result, timestamps, or typed
+    failure class.
+21. Readback test: MCP/GraphQL/report surfaces expose attach receipt, actual
     provider session id, resurrection phase, and resurrection result.
-18. Proposal gate: `./scripts/test-gate.sh proposal-086` covers the above or a
+22. Proposal gate: `./scripts/test-gate.sh proposal-086` covers the above or a
     focused `proposal-086-resurrection` gate is added and documented.
 
 ## Relationship to P095: Two-Phase Agent Invocation
@@ -457,12 +564,17 @@ work turn, including continuation.
 9. The output-repair use case is proven for malformed final
    `CHAINWORKS_OUTPUT`, including machine-checkable no-source-change proof for
    output-only repair.
-10. Crash/replay evidence proves no duplicate prompt send and no fresh retry
+10. Prompt-turn correlation proves recovered outputs belong to the target
+   continuation before settlement; request id alone is not treated as sufficient
+   after ACP transport loss.
+11. Claude session-store recovery can recover terminal output or fail closed
+   with explicit ambiguity/missing-transcript evidence.
+12. Crash/replay evidence proves no duplicate prompt send and no fresh retry
    fallback across resurrection phases.
-11. Existing continuation `status` values remain backward-compatible; resurrection
+13. Existing continuation `status` values remain backward-compatible; resurrection
    replay uses typed `resurrection_phase` readback instead of overloading the
    generic status lifecycle.
-12. Canonical proposal gate evidence passes on the same tree.
+14. Canonical proposal gate evidence passes on the same tree.
 
 ## 8. Non-Goals And Follow-Up Ownership
 

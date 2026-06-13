@@ -7564,7 +7564,7 @@ fn agent_execution_votes_failed(
         return true;
     }
     let Some(facts) = facts_by_execution.get(&execution.id) else {
-        return false;
+        return execution.status == AgentStatus::Completed;
     };
     facts.failure_kind.is_some()
         || matches!(
@@ -8533,7 +8533,9 @@ mod tests {
     use db::repos::{
         agent_execution_runtime_facts, agent_retry_budget_ledger, ideas, runs, stages,
     };
-    use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
+    use domain::agent::{
+        AgentExecution, AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement,
+    };
     use domain::idea::{Idea, IdeaStatus};
     use domain::ids::{AgentExecutionId, IdeaId, RunId, StageExecutionId};
     use domain::run::{Run, RunStatus};
@@ -8583,6 +8585,66 @@ mod tests {
         facts.failure_kind = Some(AgentFailureKind::MissingRequiredOutputs);
         assert!(!p058_requires_provider_force_detach(Some(&facts)));
         assert!(!p058_requires_provider_force_detach(None));
+    }
+
+    #[test]
+    fn completed_agent_without_runtime_facts_votes_failed_for_authoritative_fan_in() {
+        let execution_id = AgentExecutionId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let now = Utc::now();
+        let execution = AgentExecution {
+            id: execution_id,
+            stage_execution_id: Some(stage_execution_id),
+            agent_id: "code_writer".into(),
+            provider: "claude".into(),
+            model: Some("sonnet".into()),
+            status: AgentStatus::Completed,
+            started_at: now - Duration::minutes(10),
+            completed_at: Some(now),
+            owner_execution_lineage_id: Some(stage_execution_id.to_string()),
+            session_lineage_id: Some("lineage-1".into()),
+            session_generation_id: Some("generation-1".into()),
+            rehydrated_from_checkpoint_artifact_id: None,
+            invocation_owner_key: Some("owner-key".into()),
+            session_reuse_scope: Some("same_agent_family_within_run".into()),
+            session_family_id: Some("family-1".into()),
+            session_reuse_disposition: Some("reused".into()),
+            session_reset_reason: None,
+            backend_profile_id: None,
+            requested_mcp_extensions_json: None,
+            predicted_mcp_extensions_json: None,
+            predicted_mcp_runtime_ids_json: None,
+            actual_mcp_extensions_json: None,
+            actual_mcp_runtime_ids_json: None,
+            denied_mcp_extensions_json: None,
+            mcp_blocking_issues_json: None,
+            actual_mcp_observation_json: None,
+            actual_xcode_runtime_observation_json: None,
+            mcp_session_startup_latency_ms: None,
+            owner_kind: None,
+            owner_id: None,
+            lead_mediation_record_id: None,
+            origin_stage_execution_id: None,
+            total_cost_cents: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            transcript_artifact_id: None,
+            actual_toolchain_mapping_diagnostics_json: None,
+            escalation_policy_id: None,
+            escalation_policy_hash: None,
+            escalation_tier_id: None,
+            escalation_tier_kind_raw: None,
+            escalation_trigger_raw: None,
+            escalation_digest_version: None,
+            escalation_ledger_id: None,
+        };
+        let facts_by_execution = HashMap::new();
+
+        assert!(
+            agent_execution_votes_failed(&execution, &facts_by_execution),
+            "completed execution without runtime facts lacks settlement evidence"
+        );
     }
 
     #[test]

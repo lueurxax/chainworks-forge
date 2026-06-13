@@ -23,13 +23,15 @@ use db::repos::{
 use db::work_item::{WorkItem, WorkItemKind, WorkItemStatus};
 use db::write_class::WriteLane;
 use db::writer::{class_a_operation, DbWriter};
-use domain::agent::{AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement};
+use domain::agent::{
+    AgentExecutionRuntimeFacts, AgentFailureKind, AgentOutputSettlement, AgentStatus,
+};
 use domain::approval::ApprovalDecision;
 use domain::closeout_readiness_mode::resolve_closeout_readiness_mode;
 use domain::commands::{
     ApprovalResolutionDecision, CallerContext, Command, ConsumeProviderQuotaHoldCmd,
     ExtendWorkflowLoopBudgetCmd, ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd,
-    SettleProposalGateCmd, WorkflowLoopBudgetExtensionCmd,
+    RetryStageCmd, SettleProposalGateCmd, WorkflowLoopBudgetExtensionCmd,
 };
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
@@ -1587,7 +1589,12 @@ fn requires_effect_reconciliation_error(stage: &StageExecution) -> anyhow::Error
     )
 }
 
-fn find_source_invoke_work_item<'a>(
+fn is_implicit_targeted_retry_stage(stage_id: &str) -> bool {
+    matches!(stage_id, "state_9_implementation_reviewed")
+        || stage_id.ends_with("_implementation_reviewed")
+}
+
+pub(crate) fn find_source_invoke_work_item<'a>(
     work_items: &'a [WorkItem],
     stage_execution_id: &str,
     agent_id: &str,
@@ -3131,6 +3138,26 @@ impl CommandHandler {
                             &caller,
                         )
                         .await;
+                }
+
+                if c.legacy_discovery_override_policy.is_none() {
+                    if let Some(agent_execution_id) = self
+                        .implicit_targeted_retry_candidate(c.run_id, &c.stage_id)
+                        .await?
+                    {
+                        return self
+                            .retry_agent_execution(
+                                c.run_id,
+                                &c.stage_id,
+                                agent_execution_id,
+                                c.consume_quota_budget_now,
+                                journal_id,
+                                journal,
+                                validated_instruction.as_deref(),
+                                &caller,
+                            )
+                            .await;
+                    }
                 }
 
                 let now = Utc::now();
@@ -5476,6 +5503,240 @@ impl CommandHandler {
         })
     }
 
+    pub async fn auto_resume_elapsed_quota_ledgers(&self, now: DateTime<Utc>) -> Result<usize> {
+        let candidates =
+            agent_retry_budget_ledger::list_reset_elapsed_auto_retry_candidates(&self.pool, now)
+                .await?;
+        let mut scheduled = 0_usize;
+        for candidate in candidates {
+            let skip_reason = self
+                .quota_auto_retry_skip_reason(&candidate)
+                .await
+                .with_context(|| {
+                    format!("preflight quota ledger auto retry {}", candidate.ledger_id)
+                })?;
+            if let Some(reason) = skip_reason {
+                warn!(
+                    ledger_id = %candidate.ledger_id,
+                    run_id = %candidate.run_id,
+                    stage_execution_id = %candidate.stage_execution_id,
+                    stage_id = %candidate.stage_id,
+                    agent_execution_id = %candidate.agent_execution_id,
+                    retry_after = %candidate.retry_after,
+                    skip_reason = reason,
+                    "Quota ledger auto retry skipped"
+                );
+                continue;
+            }
+
+            let cmd = Command::RetryStage(RetryStageCmd {
+                run_id: candidate.run_id,
+                stage_id: candidate.stage_id.clone(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            });
+            let caller = CallerContext::mcp(
+                "chainworks-daemon",
+                &PrincipalClass::Operator,
+                "quota_ledger_auto_resume",
+            )
+            .with_request_id(format!("quota-ledger-auto-resume:{}", candidate.ledger_id));
+            let mut journal = CommandJournalEntry::new(&cmd, &caller);
+            journal.id = format!("quota-ledger-auto-retry-{}", candidate.ledger_id);
+            let journal_id = journal.id.clone();
+
+            match self
+                .retry_stage_latest_attempt(
+                    candidate.run_id,
+                    &candidate.stage_id,
+                    false,
+                    &journal_id,
+                    &journal,
+                    "quota_ledger_reset_elapsed_auto_retry",
+                    None,
+                    &caller,
+                    Some(&candidate.ledger_id),
+                )
+                .await
+            {
+                Ok(_) => {
+                    scheduled += 1;
+                    info!(
+                        ledger_id = %candidate.ledger_id,
+                        run_id = %candidate.run_id,
+                        stage_execution_id = %candidate.stage_execution_id,
+                        stage_id = %candidate.stage_id,
+                        agent_execution_id = %candidate.agent_execution_id,
+                        retry_after = %candidate.retry_after,
+                        journal_id = %journal_id,
+                        "Quota ledger reset elapsed; scheduled automatic stage retry"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        ledger_id = %candidate.ledger_id,
+                        run_id = %candidate.run_id,
+                        stage_execution_id = %candidate.stage_execution_id,
+                        stage_id = %candidate.stage_id,
+                        agent_execution_id = %candidate.agent_execution_id,
+                        error = %error,
+                        "Quota ledger auto retry failed pre-commit"
+                    );
+                }
+            }
+        }
+        Ok(scheduled)
+    }
+
+    async fn quota_auto_retry_skip_reason(
+        &self,
+        candidate: &agent_retry_budget_ledger::QuotaLedgerAutoRetryCandidate,
+    ) -> Result<Option<&'static str>> {
+        let Some(run) = runs::find_by_id(&self.pool, candidate.run_id).await? else {
+            return Ok(Some("run_not_blocked"));
+        };
+        if run.status != RunStatus::Blocked {
+            return Ok(Some("run_not_blocked"));
+        }
+        if run.current_state.as_deref() != Some(candidate.stage_id.as_str()) {
+            return Ok(Some("stage_not_current"));
+        }
+
+        let Some(source_stage) =
+            stages::find_by_id(&self.pool, candidate.stage_execution_id).await?
+        else {
+            return Ok(Some("stage_not_current"));
+        };
+        if source_stage.run_id != candidate.run_id || source_stage.stage_id != candidate.stage_id {
+            return Ok(Some("stage_not_current"));
+        }
+
+        let latest_stage = stages::list_by_run(&self.pool, candidate.run_id)
+            .await?
+            .into_iter()
+            .filter(|stage| stage.stage_id == candidate.stage_id)
+            .max_by_key(|stage| stage.started_at);
+        if latest_stage.as_ref().map(|stage| stage.id) != Some(candidate.stage_execution_id) {
+            return Ok(Some("stage_not_current"));
+        }
+
+        if !matches!(
+            source_stage.status,
+            StageStatus::Failed | StageStatus::Blocked | StageStatus::Completed
+        ) {
+            return Ok(Some("stage_not_retryable"));
+        }
+
+        let active_work_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM work_items
+               WHERE run_id = ?1
+                 AND status IN ('pending', 'running')"#,
+        )
+        .bind(candidate.run_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if active_work_count > 0 {
+            return Ok(Some("live_work_present"));
+        }
+
+        let running_agent_count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)
+               FROM agent_executions ae
+               LEFT JOIN stage_executions se ON se.id = ae.stage_execution_id
+               WHERE (se.run_id = ?1 OR ae.owner_id = ?1)
+                 AND ae.status = 'running'"#,
+        )
+        .bind(candidate.run_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if running_agent_count > 0 {
+            return Ok(Some("live_work_present"));
+        }
+
+        Ok(None)
+    }
+
+    async fn implicit_targeted_retry_candidate(
+        &self,
+        run_id: RunId,
+        stage_id: &str,
+    ) -> Result<Option<AgentExecutionId>> {
+        if !is_implicit_targeted_retry_stage(stage_id) {
+            return Ok(None);
+        }
+
+        let Some(run) = runs::find_by_id(&self.pool, run_id).await? else {
+            return Ok(None);
+        };
+        if run.status != RunStatus::Blocked || run.current_state.as_deref() != Some(stage_id) {
+            return Ok(None);
+        }
+
+        let latest_stage = stages::list_by_run(&self.pool, run_id)
+            .await?
+            .into_iter()
+            .filter(|stage| stage.stage_id == stage_id)
+            .max_by_key(|stage| stage.started_at);
+        let Some(latest_stage) = latest_stage else {
+            return Ok(None);
+        };
+        if !matches!(
+            latest_stage.status,
+            StageStatus::Failed | StageStatus::Blocked
+        ) {
+            return Ok(None);
+        }
+
+        let executions = agent_executions::find_by_stage(&self.pool, latest_stage.id).await?;
+        let failed = executions
+            .iter()
+            .filter(|execution| execution.status == AgentStatus::Failed)
+            .collect::<Vec<_>>();
+        if failed.len() != 1 {
+            return Ok(None);
+        }
+
+        let candidate = failed[0];
+        let run_work_items = work_items::list_by_run(&self.pool, run_id).await?;
+        let Some(source_item) = find_source_invoke_work_item(
+            &run_work_items,
+            &latest_stage.id.to_string(),
+            &candidate.agent_id,
+            &candidate.id.to_string(),
+        ) else {
+            warn!(
+                run_id = %run_id,
+                stage_id = %stage_id,
+                stage_execution_id = %latest_stage.id,
+                agent_execution_id = %candidate.id,
+                agent_id = %candidate.agent_id,
+                "Implicit targeted retry candidate skipped because source InvokeAgent work item was not found"
+            );
+            return Ok(None);
+        };
+        if matches!(
+            source_item.status,
+            WorkItemStatus::Pending | WorkItemStatus::Running
+        ) {
+            return Ok(None);
+        }
+
+        info!(
+            run_id = %run_id,
+            stage_id = %stage_id,
+            stage_execution_id = %latest_stage.id,
+            agent_execution_id = %candidate.id,
+            agent_id = %candidate.agent_id,
+            source_work_item_id = %source_item.id,
+            "RetryStage selected implicit targeted agent retry for blocked implementation review"
+        );
+        Ok(Some(candidate.id))
+    }
+
     async fn retry_stage_latest_attempt(
         &self,
         run_id: RunId,
@@ -5486,6 +5747,7 @@ impl CommandHandler {
         retry_reason: &str,
         validated_instruction: Option<&str>,
         caller: &CallerContext,
+        auto_retry_ledger_id: Option<&str>,
     ) -> Result<CommandResult> {
         let run_stages = stages::list_by_run(&self.pool, run_id).await?;
         let matching_stages = run_stages
@@ -5562,6 +5824,14 @@ impl CommandHandler {
             journal_id,
         )
         .await?;
+        if let Some(ledger_id) = auto_retry_ledger_id {
+            agent_retry_budget_ledger::mark_reset_elapsed_retry_scheduled_tx(
+                &mut retry_tx,
+                ledger_id,
+                journal_id,
+            )
+            .await?;
+        }
         stages::settle_tx(
             &mut retry_tx,
             old_stage.id,

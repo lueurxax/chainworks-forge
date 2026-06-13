@@ -124,7 +124,7 @@ for the full authentication and capability filtering reference.
 - `POST /graphql` -- queries and mutations
 - `WS /graphql/ws` -- subscriptions
 
-Queries: `ideas`, `idea`, `runs`, `run`, `stages`, `approvals`, `artifacts`, `storageHealth`.
+Representative query families: ideas, runs, approvals, artifacts, stages, workflow topology, active agent executions, raw timeline detail, queue summaries, escalation readback, Steward analyses, daemon lifecycle, boundary runtime diagnostics, operator alerts, storage health, startup recovery, toolchain-cache housekeeping, unresolved side effects, session observability, continuation status/candidates/history, and continuation metrics.
 
 **Storage Health Readback:**
 The `storageHealth` query exposes the current health state of the storage subsystem, including `DbWriter`, WAL, projections, evidence spool, and freshness details, aligning with the P087 proposal for local storage tiering and read-path liveness. Specifically, it now exposes identity-bearing `ProjectionFreshnessV1` data through additive GraphQL fields such as `projectionFreshness` and `projectionFreshnessBySource`.
@@ -162,11 +162,19 @@ Tools are namespaced:
 | Namespace | Tools |
 |---|---|
 | `ideas.*` | `ideas.create`, `ideas.list` |
-| `runs.*` | `runs.start`, `runs.list`, `runs.get`, `runs.cancel`, `runs.main_sync.request`, `runs.main_sync.retry`, `runs.main_sync.set_override`, `runs.main_sync.repair_state`, `runs.main_sync.record_recovery_decision`, `runs.knowledge_capsule.ignore`, `runs.settle_proposal_gate` |
+| `runs.*` | `runs.start`, `runs.list`, `runs.get`, `runs.cancel`, `runs.retrofit_catalog_snapshot`, `runs.main_sync.request`, `runs.main_sync.retry`, `runs.main_sync.set_override`, `runs.main_sync.repair_state`, `runs.main_sync.record_recovery_decision`, `runs.knowledge_capsule.ignore`, `runs.settle_proposal_gate` |
 | `approvals.*` | `approvals.list`, `approvals.resolve` |
-| `stages.*` | `stages.retry` |
-| `effects.*` | `effects.list`, `effects.inspect`, `effects.reconcile`, `effects.mark_unrecoverable`, `effects.clear_after_manual_verification` |
+| `stages.*` and workflow tools | `stages.retry`, `stages.consume_provider_quota_hold`, `legacy_discovery_override_create`, `workflow_conflicts.resolve`, `workflow_loop_budget.extend` |
+| `effects.*` | `effects.list`, `effects.inspect`, `effects.reconcile`, `effects.mark_conflict`, `effects.mark_unrecoverable`, `effects.clear_after_manual_verification` |
 | `reports.*` | `reports.get` |
+| `artifacts.*` | `artifacts.override_contract` |
+| `steward.*` | `steward.run_analysis`, `steward.list_analyses`, `steward.get_analysis` |
+| Runtime and boundary diagnostics | `runtime.health`, `boundary.runtime.get`, `operator.alerts.list` |
+| `storage.*` | `storage.health`, `storage.write_pressure`, `storage.evidence_spool_summary`, `storage.reconcile_evidence_orphans`, `storage.maintenance.repair_slot`, `storage.projections.clear_backlog`, `storage.projections.clear_poison` |
+| `agents.*` | `agents.continuation_status`, `agents.continuation_candidates`, `agents.continue_work` |
+| `automation.*` | `automation.auto_retry.latest` |
+
+The exhaustive capability registry is owned by [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) and enforced in `domain::CapabilityToolId` plus `mcp-server/src/tools/mod.rs`.
 
 **Implementation self-assessment detail extension:**
 `runs.get` and `runs.list` (detail view) include `implementation_self_assessment_summary` in the response payload.

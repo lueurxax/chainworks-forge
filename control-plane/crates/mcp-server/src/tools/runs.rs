@@ -132,6 +132,31 @@ pub fn tool_specs() -> Vec<McpTool> {
             }),
         },
         McpTool {
+            name: "runs.retrofit_catalog_snapshot".to_string(),
+            description: "Emergency operator repair: replace a blocked run's frozen catalog snapshot from the current catalog YAML with audit/hash guardrails".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["run_id", "expected_catalog_snapshot_hash", "reason", "idempotency_key"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "expected_catalog_snapshot_hash": {
+                        "type": "string",
+                        "description": "The current frozen catalog snapshot hash expected by the operator; mismatch fails closed."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["escalation_policy_only"],
+                        "description": "Emergency retrofit scope. Only escalation_policy_only is currently supported."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Operator audit reason for retrofitting the frozen catalog snapshot."
+                    },
+                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 for safe repair." }
+                }
+            }),
+        },
+        McpTool {
             name: "runs.main_sync.request".to_string(),
             description: "Queue or dedupe a main-sync request for a run".to_string(),
             input_schema: serde_json::json!({

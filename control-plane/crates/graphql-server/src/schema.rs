@@ -1677,6 +1677,8 @@ fn p036_topology_nodes(
                 is_current: p036_is_current_stage(run, &stage_id, latest),
                 iteration: latest.map(|row| row.iteration),
                 attempt_number: latest.map(|row| row.attempt_number),
+                started_at: latest.map(|row| row.started_at.clone()),
+                completed_at: latest.and_then(|row| row.completed_at.clone()),
                 approval_required: state.is_manual_gate
                     || latest.is_some_and(|row| row.has_pending_approval),
                 artifact_count: artifacts_by_stage_id.get(&stage_id).copied().unwrap_or(0),
