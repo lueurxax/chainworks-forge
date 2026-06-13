@@ -21,6 +21,14 @@ chainworks_default_cargo_target_dir() {
     fi
 }
 
+chainworks_default_sccache_dir() {
+    if [[ -n "${HOME:-}" ]]; then
+        printf '%s\n' "${HOME}/Library/Caches/Chainworks Forge/sccache"
+    else
+        printf '%s\n' "${chainworks_cargo_cache_repo_root}/control-plane/target/sccache"
+    fi
+}
+
 # Detect git worktrees and use a local target dir to prevent cache conflicts with the main
 # workspace. Worktrees differ in source (e.g. P058 adds escalation modules absent in main),
 # so a shared CARGO_TARGET_DIR built from main produces stale .rlib files for worktree builds,
@@ -51,6 +59,9 @@ case "${CHAINWORKS_CARGO_SCCACHE:-auto}" in
         ;;
     *)
         if [[ -z "${RUSTC_WRAPPER:-}" ]] && command -v sccache >/dev/null 2>&1; then
+            export SCCACHE_DIR="${SCCACHE_DIR:-$(chainworks_default_sccache_dir)}"
+            export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-20G}"
+            mkdir -p "${SCCACHE_DIR}"
             export RUSTC_WRAPPER="$(command -v sccache)"
         fi
         ;;
