@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 
 use db::repos::{
-    artifact_contracts, closeout, code_writer_completion_receipts, escalation,
+    artifact_contracts, closeout, code_writer_completion_receipts, escalation, ideas,
     legacy_discovery_overrides, projections, rollout_contract_checks, runs, side_effects,
 };
 use domain::commands::{
@@ -103,31 +103,6 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "properties": {
                     "run_id": { "type": "string" },
                     "idempotency_key": { "type": "string", "description": "Caller-supplied idempotency key for cancel deduplication (P082)" }
-                }
-            }),
-        },
-        McpTool {
-            name: "runs.retrofit_catalog_snapshot".to_string(),
-            description: "Emergency operator repair: replace a blocked run's frozen catalog snapshot from the current catalog YAML with audit/hash guardrails".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "required": ["run_id", "expected_catalog_snapshot_hash", "reason", "idempotency_key"],
-                "properties": {
-                    "run_id": { "type": "string" },
-                    "expected_catalog_snapshot_hash": {
-                        "type": "string",
-                        "description": "The current frozen catalog snapshot hash expected by the operator; mismatch fails closed."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["escalation_policy_only"],
-                        "description": "Emergency retrofit scope. Only escalation_policy_only is currently supported."
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Operator audit reason for retrofitting the frozen catalog snapshot."
-                    },
-                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 for safe repair." }
                 }
             }),
         },
@@ -366,15 +341,25 @@ pub async fn execute(
                 .as_str()
                 .map(String::from);
 
-            // SEC-001: validate and, when possible, canonicalize caller-supplied paths before
-            // any filesystem read. Existing workspaces are root-confined so symlinks cannot
-            // smuggle workflow/catalog/artifact paths outside the selected workspace.
+            let idea = ideas::find_by_id(pool, idea_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("runs.start: idea not found"))?;
+            let trusted_workspace_root = idea.workspace_root_path.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runs.start: idea workspace_root_path is required as the trusted filesystem boundary"
+                )
+            })?;
+
+            // SEC-001: validate and canonicalize caller-supplied paths before any filesystem
+            // read. When an idea carries a workspace root, that durable root is the confinement
+            // authority; callers cannot widen it by submitting a broader workspace_root.
             let (workspace_root, artifact_root, workflow_yaml_path, agent_catalog_yaml_path) =
                 canonicalize_run_start_paths(
                     &workspace_root,
                     &artifact_root,
                     &workflow_yaml_path,
                     &agent_catalog_yaml_path,
+                    trusted_workspace_root,
                 )?;
 
             // Propagate idempotency_key as request_id so the command journal records it
@@ -439,14 +424,19 @@ pub async fn execute(
                         // recovery diagnostics, local paths, and source IDs — Operator only.
                         if principal.class == auth::PrincipalClass::Operator {
                             if let Some(projection) =
-                                db::repos::artifact_contracts::find_run_state_projection(pool, run_id)
-                                    .await?
+                                db::repos::artifact_contracts::find_run_state_projection(
+                                    pool, run_id,
+                                )
+                                .await?
                             {
                                 obj.insert(
                                     "active_artifact_index".into(),
                                     projection.active_index_json,
                                 );
-                                obj.insert("run_state_projection".into(), projection.run_state_json);
+                                obj.insert(
+                                    "run_state_projection".into(),
+                                    projection.run_state_json,
+                                );
                                 obj.insert(
                                     "operator_overrides".into(),
                                     serde_json::to_value(
@@ -482,6 +472,15 @@ pub async fn execute(
                                 .await?,
                             );
                         }
+                        let escalation_readback =
+                            if principal.class == auth::PrincipalClass::Operator {
+                                build_operator_escalation_readback_json(pool, run_id).await?
+                            } else {
+                                serde_json::Value::Object(
+                                    build_escalation_readback_summary_json(pool, run_id).await?,
+                                )
+                            };
+                        obj.insert("escalation_readback".into(), escalation_readback);
                         obj.insert(
                             "p082_recovery_matrix_readback".into(),
                             crate::tools::reports::p082_recovery_matrix_readback_json(
@@ -520,18 +519,7 @@ pub async fn execute(
             for item in items {
                 let mut value = serde_json::to_value(item)?;
                 if !is_operator {
-                    if let Some(obj) = value.as_object_mut() {
-                        for field in &[
-                            "workspace_root",
-                            "artifact_root",
-                            "chainworks_meta_root",
-                            "implementationCompletion",
-                            "closeout_readiness_summary",
-                            "implementation_closeout_readiness_summary",
-                        ] {
-                            obj.remove(*field);
-                        }
-                    }
+                    redact_non_operator_run_projection(&mut value);
                 }
                 values.push(value);
             }
@@ -543,11 +531,11 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
                 .parse()?;
-            let idempotency_key = params["idempotency_key"].as_str().map(String::from);
-            let mut caller = mcp_caller(principal, "runs.cancel");
-            if let Some(idempotency_key) = idempotency_key {
-                caller = caller.with_request_id(idempotency_key);
-            }
+            let idempotency_key = params["idempotency_key"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
+                .to_string();
+            let caller = mcp_caller(principal, "runs.cancel").with_request_id(idempotency_key);
             let cmd = Command::CancelRun(CancelRunCmd { run_id });
             let commanded = cmd_handler.handle(cmd, caller).await?;
             Ok(serde_json::json!({
@@ -578,64 +566,6 @@ pub async fn execute(
                 .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
                 .to_string();
             let caller = mcp_caller(principal, "runs.retrofit_catalog_snapshot")
-                .with_request_id(idempotency_key);
-            let commanded = cmd_handler
-                .handle(
-                    Command::RetrofitCatalogSnapshot(RetrofitCatalogSnapshotCmd {
-                        run_id,
-                        expected_catalog_snapshot_hash,
-                        reason,
-                        scope,
-                    }),
-                    caller,
-                )
-                .await?;
-            let (previous_catalog_snapshot_hash, new_catalog_snapshot_hash, applied_policy_ids) =
-                match &commanded.result {
-                    engine::command_handler::CommandResult::CatalogSnapshotRetrofitted {
-                        previous_catalog_snapshot_hash,
-                        new_catalog_snapshot_hash,
-                        applied_policy_ids,
-                        ..
-                    } => (
-                        previous_catalog_snapshot_hash.clone(),
-                        new_catalog_snapshot_hash.clone(),
-                        applied_policy_ids.clone(),
-                    ),
-                    _ => anyhow::bail!("Unexpected command result"),
-                };
-            Ok(serde_json::json!({
-                "retrofitted": true,
-                "run_id": run_id.to_string(),
-                "previous_catalog_snapshot_hash": previous_catalog_snapshot_hash,
-                "new_catalog_snapshot_hash": new_catalog_snapshot_hash,
-                "applied_policy_ids": applied_policy_ids,
-                "journal_id": commanded.journal_id,
-            }))
-        }
-
-        "runs.retrofit_catalog_snapshot" => {
-            let run_id: RunId = params["run_id"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
-                .parse()?;
-            let expected_catalog_snapshot_hash = params["expected_catalog_snapshot_hash"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'expected_catalog_snapshot_hash'"))?
-                .to_string();
-            let reason = params["reason"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'reason'"))?
-                .to_string();
-            let scope = match params["scope"].as_str().unwrap_or("escalation_policy_only") {
-                "escalation_policy_only" => CatalogSnapshotRetrofitScope::EscalationPolicyOnly,
-                other => anyhow::bail!("unsupported catalog snapshot retrofit scope: {other}"),
-            };
-            let idempotency_key = params["idempotency_key"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
-                .to_string();
-            let caller = mcp_caller(&principal, "runs.retrofit_catalog_snapshot")
                 .with_request_id(idempotency_key);
             let commanded = cmd_handler
                 .handle(
@@ -1082,11 +1012,13 @@ fn canonicalize_run_start_paths(
     artifact_root: &str,
     workflow_yaml_path: &str,
     agent_catalog_yaml_path: &str,
+    trusted_workspace_root: &str,
 ) -> anyhow::Result<(String, String, String, String)> {
     validate_run_start_path("workspace_root", workspace_root)?;
     validate_run_start_path("artifact_root", artifact_root)?;
     validate_run_start_path("workflow_yaml_path", workflow_yaml_path)?;
     validate_run_start_path("agent_catalog_yaml_path", agent_catalog_yaml_path)?;
+    validate_run_start_path("idea.workspace_root_path", trusted_workspace_root)?;
 
     let workspace_path = Path::new(workspace_root);
     // MEDIUM-001: fail-closed when workspace_root does not exist.
@@ -1098,22 +1030,42 @@ fn canonicalize_run_start_paths(
     }
     let canonical_workspace = std::fs::canonicalize(workspace_path)
         .with_context(|| format!("runs.start: canonicalize workspace_root '{workspace_root}'"))?;
+    let trusted_path = Path::new(trusted_workspace_root);
+    if !trusted_path.exists() {
+        anyhow::bail!(
+            "runs.start: idea workspace_root_path '{}' does not exist; update the idea before starting a run",
+            trusted_workspace_root
+        );
+    }
+    let canonical_trusted_workspace = std::fs::canonicalize(trusted_path).with_context(|| {
+        format!("runs.start: canonicalize idea workspace_root_path '{trusted_workspace_root}'")
+    })?;
+    let canonical_policy_root = canonical_trusted_workspace.as_path();
+    reject_broad_run_start_workspace_root(canonical_policy_root)?;
+    if canonical_workspace != canonical_trusted_workspace {
+        anyhow::bail!(
+            "runs.start: workspace_root must match the idea workspace_root_path policy boundary"
+        );
+    }
     let artifact = canonicalize_run_start_child_path(
         "artifact_root",
         artifact_root,
-        &canonical_workspace,
+        workspace_path,
+        canonical_policy_root,
         true,
     )?;
     let workflow = canonicalize_run_start_child_path(
         "workflow_yaml_path",
         workflow_yaml_path,
-        &canonical_workspace,
+        workspace_path,
+        canonical_policy_root,
         false,
     )?;
     let catalog = canonicalize_run_start_child_path(
         "agent_catalog_yaml_path",
         agent_catalog_yaml_path,
-        &canonical_workspace,
+        workspace_path,
+        canonical_policy_root,
         false,
     )?;
     Ok((
@@ -1124,35 +1076,173 @@ fn canonicalize_run_start_paths(
     ))
 }
 
+fn reject_broad_run_start_workspace_root(canonical_workspace: &Path) -> anyhow::Result<()> {
+    let path = canonical_workspace;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| std::fs::canonicalize(home).ok());
+    let broad_literals = [
+        Path::new("/"),
+        Path::new("/Applications"),
+        Path::new("/Library"),
+        Path::new("/System"),
+        Path::new("/Volumes"),
+        Path::new("/etc"),
+        Path::new("/private"),
+        Path::new("/private/etc"),
+        Path::new("/tmp"),
+        Path::new("/private/tmp"),
+        Path::new("/var"),
+        Path::new("/private/var"),
+        Path::new("/Users"),
+        Path::new("/home"),
+    ];
+    if broad_literals.iter().any(|broad| path == *broad)
+        || path
+            .parent()
+            .is_some_and(|parent| parent == Path::new("/Volumes"))
+        || home.as_deref().is_some_and(|home| path == home)
+    {
+        anyhow::bail!(
+            "runs.start: workspace_root is too broad to use as a trusted filesystem boundary"
+        );
+    }
+    Ok(())
+}
+
 fn canonicalize_run_start_child_path(
     field: &str,
     raw: &str,
+    raw_workspace: &Path,
     canonical_workspace: &Path,
     allow_missing_leaf: bool,
 ) -> anyhow::Result<PathBuf> {
     let path = Path::new(raw);
+    if path.exists() {
+        reject_run_start_symlink_components_under(field, path, raw_workspace)?;
+    }
     let canonical = if path.exists() {
         std::fs::canonicalize(path)
             .with_context(|| format!("runs.start: canonicalize field '{field}'"))?
     } else if allow_missing_leaf {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("runs.start: field '{field}' has no parent"))?;
-        let leaf = path
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("runs.start: field '{field}' has no leaf"))?;
-        if !parent.exists() {
-            anyhow::bail!("runs.start: field '{field}' parent does not exist");
-        }
-        std::fs::canonicalize(parent)
-            .with_context(|| format!("runs.start: canonicalize parent for field '{field}'"))?
-            .join(leaf)
+        let created_path =
+            create_dir_all_no_symlink_under(field, path, raw_workspace, canonical_workspace)?;
+        reject_run_start_symlink_components_under(field, path, raw_workspace)?;
+        std::fs::canonicalize(created_path)
+            .with_context(|| format!("runs.start: canonicalize field '{field}' after create"))?
     } else {
         anyhow::bail!("runs.start: field '{field}' does not exist");
     };
 
     if !canonical.starts_with(canonical_workspace) {
         anyhow::bail!("runs.start: field '{field}' escapes canonical workspace_root");
+    }
+    Ok(canonical)
+}
+
+fn reject_run_start_symlink_components_under(
+    field: &str,
+    path: &Path,
+    raw_workspace: &Path,
+) -> anyhow::Result<()> {
+    let relative = path.strip_prefix(raw_workspace).with_context(|| {
+        format!("runs.start: field '{field}' is not under the submitted workspace_root")
+    })?;
+    let mut current = raw_workspace.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        if let Ok(metadata) = std::fs::symlink_metadata(&current) {
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!("runs.start: field '{field}' contains a symlink component");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn create_dir_all_no_symlink_under(
+    field: &str,
+    path: &Path,
+    raw_workspace: &Path,
+    canonical_workspace: &Path,
+) -> anyhow::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("runs.start: field '{field}' has no parent"))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("runs.start: field '{field}' has no leaf"))?;
+    let target_path =
+        canonicalize_missing_directory_target(field, path, parent, leaf, raw_workspace)?;
+
+    let relative = target_path.strip_prefix(canonical_workspace).map_err(|_| {
+        anyhow::anyhow!("runs.start: field '{field}' escapes canonical workspace_root")
+    })?;
+    let mut current = canonical_workspace.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("runs.start: field '{field}' contains a symlink component");
+                }
+                if !metadata.is_dir() {
+                    anyhow::bail!("runs.start: field '{field}' path component is not a directory");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).with_context(|| {
+                    format!("runs.start: create directory {}", current.display())
+                })?;
+                let metadata = std::fs::symlink_metadata(&current).with_context(|| {
+                    format!("runs.start: verify created directory {}", current.display())
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    anyhow::bail!(
+                        "runs.start: field '{field}' created path was replaced before verification"
+                    );
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("runs.start: inspect directory {}", current.display())
+                });
+            }
+        }
+    }
+    Ok(target_path)
+}
+
+fn canonicalize_missing_directory_target(
+    field: &str,
+    path: &Path,
+    parent: &Path,
+    leaf: &std::ffi::OsStr,
+    raw_workspace: &Path,
+) -> anyhow::Result<PathBuf> {
+    if parent.exists() {
+        reject_run_start_symlink_components_under(field, parent, raw_workspace)?;
+        let canonical_parent = std::fs::canonicalize(parent)
+            .with_context(|| format!("runs.start: canonicalize parent for field '{field}'"))?;
+        return Ok(canonical_parent.join(leaf));
+    }
+
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        let name = cursor.file_name().ok_or_else(|| {
+            anyhow::anyhow!("runs.start: field '{field}' has no existing ancestor")
+        })?;
+        missing.push(name.to_os_string());
+        cursor = cursor.parent().ok_or_else(|| {
+            anyhow::anyhow!("runs.start: field '{field}' has no existing ancestor")
+        })?;
+    }
+    reject_run_start_symlink_components_under(field, cursor, raw_workspace)?;
+    let mut canonical = std::fs::canonicalize(cursor)
+        .with_context(|| format!("runs.start: canonicalize ancestor for field '{field}'"))?;
+    for component in missing.into_iter().rev() {
+        canonical.push(component);
     }
     Ok(canonical)
 }
@@ -1286,6 +1376,80 @@ pub async fn build_escalation_readback_summary_json(
     Ok(map)
 }
 
+async fn build_operator_escalation_readback_json(
+    pool: &SqlitePool,
+    run_id: RunId,
+) -> Result<serde_json::Value> {
+    let ledgers = escalation::find_ledgers_by_run(pool, run_id).await?;
+    let chains_truncated = ledgers.len() > 50;
+    let mut chains = Vec::with_capacity(ledgers.len().min(50));
+    for ledger in ledgers.into_iter().take(50) {
+        let events = escalation::find_events_by_ledger(pool, &ledger.id).await?;
+        let events_total = escalation::count_events_by_ledger(pool, &ledger.id).await?;
+        let events_truncated = events.len() > 200;
+        let execution_metas =
+            escalation::find_execution_metadata_by_ledger(pool, &ledger.id).await?;
+        let execution_metas_total = escalation::count_metas_by_ledger(pool, &ledger.id).await?;
+        let execution_metas_truncated = execution_metas.len() > 100;
+        chains.push(serde_json::json!({
+            "id": ledger.id,
+            "run_id": ledger.run_id.to_string(),
+            "stage_id": ledger.stage_id,
+            "agent_id": ledger.agent_id,
+            "policy_id": ledger.policy_id,
+            "policy_hash": ledger.policy_hash,
+            "status_raw": ledger.status_raw,
+            "current_tier_id": ledger.current_tier_id,
+            "current_tier_kind_raw": ledger.current_tier_kind_raw,
+            "chain_attempt_index": ledger.chain_attempt_index,
+            "trigger_raw": ledger.trigger_raw,
+            "pause_reason_raw": ledger.pause_reason_raw,
+            "operator_action_hint": ledger.operator_action_hint,
+            "runbook_anchor": ledger.runbook_anchor,
+            "created_at": ledger.created_at.to_rfc3339(),
+            "updated_at": ledger.updated_at.to_rfc3339(),
+            "events": events.into_iter().take(200).map(|event| serde_json::json!({
+                "id": event.id,
+                "escalation_ledger_id": event.escalation_ledger_id,
+                "event_kind_raw": event.event_kind_raw,
+                "tier_id": event.tier_id,
+                "tier_kind_raw": event.tier_kind_raw,
+                "trigger_raw": event.trigger_raw,
+                "pause_reason_raw": event.pause_reason_raw,
+                "payload_json": event.payload_json,
+                "redaction_version": event.redaction_version,
+                "created_at": event.created_at.to_rfc3339()
+            })).collect::<Vec<_>>(),
+            "events_total": events_total,
+            "events_truncated": events_truncated,
+            "execution_metas": execution_metas.into_iter().take(100).map(|meta| serde_json::json!({
+                "agent_execution_id": meta.agent_execution_id.to_string(),
+                "escalation_ledger_id": meta.escalation_ledger_id,
+                "tier_id": meta.tier_id,
+                "tier_kind_raw": meta.tier_kind_raw,
+                "tier_attempt_index": meta.tier_attempt_index,
+                "trigger_raw": meta.trigger_raw,
+                "digest_version": meta.digest_version,
+                "capacity_probe_counter": meta.capacity_probe_counter,
+                "created_at": meta.created_at.to_rfc3339(),
+                "updated_at": meta.updated_at.to_rfc3339(),
+                "would_select_tier_id": meta.would_select_tier_id,
+                "would_select_trigger_raw": meta.would_select_trigger_raw,
+                "would_select_decision_json": meta.would_select_decision_json
+            })).collect::<Vec<_>>(),
+            "execution_metas_total": execution_metas_total,
+            "execution_metas_truncated": execution_metas_truncated
+        }));
+    }
+    Ok(serde_json::json!({
+        "schema_version": "p058_escalation_readback_v1",
+        "run_id": run_id.to_string(),
+        "chains": chains,
+        "chains_total": escalation::count_ledgers_by_run(pool, run_id).await?,
+        "chains_truncated": chains_truncated
+    }))
+}
+
 async fn build_side_effect_readback(pool: &SqlitePool, run_id: RunId) -> Result<serde_json::Value> {
     let unresolved = side_effects::list_unresolved_for_run(pool, &run_id.to_string()).await?;
     let items: Vec<serde_json::Value> = unresolved
@@ -1371,6 +1535,21 @@ fn side_effect_operator_next_action(
             "effects.clear_after_manual_verification"
         }
         _ => "effects.inspect",
+    }
+}
+
+pub(crate) fn redact_non_operator_run_projection(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        for field in &[
+            "workspace_root",
+            "artifact_root",
+            "chainworks_meta_root",
+            "implementationCompletion",
+            "closeout_readiness_summary",
+            "implementation_closeout_readiness_summary",
+        ] {
+            obj.remove(*field);
+        }
     }
 }
 
@@ -1531,6 +1710,195 @@ mod tests {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
     }
 
+    #[test]
+    fn runs_start_rejects_broad_workspace_root_boundary() {
+        let err = canonicalize_run_start_paths(
+            "/",
+            "/tmp/chainworks-artifact-root",
+            "/tmp/workflow.yaml",
+            "/tmp/agents.yaml",
+            "/",
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("workspace_root is too broad to use as a trusted filesystem boundary"));
+    }
+
+    #[test]
+    fn sec_med_001_runs_start_rejects_macos_system_workspace_roots() {
+        for root in [
+            "/private",
+            "/private/etc",
+            "/Library",
+            "/System",
+            "/Volumes",
+            "/Volumes/External",
+            "/Applications",
+        ] {
+            let err = reject_broad_run_start_workspace_root(Path::new(root)).unwrap_err();
+            assert!(
+                err.to_string().contains("too broad"),
+                "runs.start must reject broad root {root}; got: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p082_runs_start_rejects_workspace_symlink_to_broad_system_root() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let workspace_link = temp.path().join("workspace-link");
+        std::os::unix::fs::symlink("/private", &workspace_link).expect("workspace symlink");
+
+        let err = canonicalize_run_start_paths(
+            workspace_link.to_string_lossy().as_ref(),
+            workspace_link
+                .join(".chainworks")
+                .to_string_lossy()
+                .as_ref(),
+            workspace_link
+                .join("workflow.yaml")
+                .to_string_lossy()
+                .as_ref(),
+            workspace_link
+                .join("agents.yaml")
+                .to_string_lossy()
+                .as_ref(),
+            workspace_link.to_string_lossy().as_ref(),
+        )
+        .expect_err("workspace symlink to broad root must be rejected");
+
+        assert!(
+            err.to_string().contains("too broad"),
+            "canonicalized workspace symlink must fail broad-root guard; got: {err}"
+        );
+    }
+
+    #[test]
+    fn runs_start_rejects_workspace_root_that_widens_idea_boundary() {
+        let trusted = tempfile::tempdir().expect("trusted root");
+        let caller_root = tempfile::tempdir().expect("caller root");
+        let workflow = caller_root.path().join("workflow.yaml");
+        let catalog = caller_root.path().join("agents.yaml");
+        std::fs::write(&workflow, "states: {}\n").expect("workflow fixture");
+        std::fs::write(&catalog, "agents: []\n").expect("catalog fixture");
+
+        let err = canonicalize_run_start_paths(
+            caller_root.path().to_string_lossy().as_ref(),
+            caller_root
+                .path()
+                .join(".chainworks")
+                .to_string_lossy()
+                .as_ref(),
+            workflow.to_string_lossy().as_ref(),
+            catalog.to_string_lossy().as_ref(),
+            trusted.path().to_string_lossy().as_ref(),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("workspace_root must match the idea workspace_root_path policy boundary"));
+    }
+
+    #[test]
+    fn p082_runs_start_rejects_symlinked_artifact_root_component_even_inside_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let real_artifacts = workspace.path().join("real-artifacts");
+        std::fs::create_dir(&real_artifacts).expect("real artifacts dir");
+        let workflow = workspace.path().join("workflow.yaml");
+        let catalog = workspace.path().join("agents.yaml");
+        std::fs::write(&workflow, "states: {}\n").expect("workflow fixture");
+        std::fs::write(&catalog, "agents: []\n").expect("catalog fixture");
+
+        let artifact_symlink = workspace.path().join(".chainworks");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_artifacts, &artifact_symlink)
+            .expect("artifact symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&real_artifacts, &artifact_symlink)
+            .expect("artifact symlink fixture");
+
+        let err = canonicalize_run_start_paths(
+            workspace.path().to_string_lossy().as_ref(),
+            artifact_symlink.to_string_lossy().as_ref(),
+            workflow.to_string_lossy().as_ref(),
+            catalog.to_string_lossy().as_ref(),
+            workspace.path().to_string_lossy().as_ref(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "artifact_root symlink components must fail closed; got: {err}"
+        );
+    }
+
+    #[test]
+    fn p082_runs_start_rejects_symlinked_artifact_root_child_component() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let workflow = workspace.path().join("workflow.yaml");
+        let catalog = workspace.path().join("agents.yaml");
+        std::fs::write(&workflow, "states: {}\n").expect("workflow fixture");
+        std::fs::write(&catalog, "agents: []\n").expect("catalog fixture");
+
+        let chainworks_link = workspace.path().join(".chainworks");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &chainworks_link)
+            .expect(".chainworks symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &chainworks_link)
+            .expect(".chainworks symlink fixture");
+
+        let artifact_root = chainworks_link.join("artifacts");
+        std::fs::create_dir_all(outside.path().join("artifacts")).expect("target child");
+
+        let err = canonicalize_run_start_paths(
+            workspace.path().to_string_lossy().as_ref(),
+            artifact_root.to_string_lossy().as_ref(),
+            workflow.to_string_lossy().as_ref(),
+            catalog.to_string_lossy().as_ref(),
+            workspace.path().to_string_lossy().as_ref(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "artifact_root child below symlinked .chainworks must fail closed; got: {err}"
+        );
+    }
+
+    #[test]
+    fn p082_runs_start_creates_and_canonicalizes_artifact_root_before_persistence() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let workflow = workspace.path().join("workflow.yaml");
+        let catalog = workspace.path().join("agents.yaml");
+        std::fs::write(&workflow, "states: {}\n").expect("workflow fixture");
+        std::fs::write(&catalog, "agents: []\n").expect("catalog fixture");
+        let artifact_root = workspace.path().join(".chainworks").join("artifacts");
+
+        let (_, artifact_root_out, _, _) = canonicalize_run_start_paths(
+            workspace.path().to_string_lossy().as_ref(),
+            artifact_root.to_string_lossy().as_ref(),
+            workflow.to_string_lossy().as_ref(),
+            catalog.to_string_lossy().as_ref(),
+            workspace.path().to_string_lossy().as_ref(),
+        )
+        .expect("missing artifact_root leaf should be created safely");
+
+        assert!(
+            artifact_root.is_dir(),
+            "artifact_root must exist before StartRun"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&artifact_root).unwrap(),
+            std::path::PathBuf::from(artifact_root_out)
+        );
+    }
+
     async fn persist_blocked_implementation_summary(pool: &SqlitePool, run_id: RunId) {
         let artifact = Artifact {
             id: ArtifactId::new(),
@@ -1652,7 +2020,6 @@ mod tests {
 
         let pool = test_pool().await;
         let idea_id = IdeaId::new();
-        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
 
         let handler = make_command_handler(pool.clone());
         let repo = tempfile::tempdir().unwrap();
@@ -1675,6 +2042,9 @@ mod tests {
             .join("../../..")
             .canonicalize()
             .expect("control-plane workspace root");
+        let mut idea = make_idea(idea_id);
+        idea.workspace_root_path = Some(workspace_root.to_string_lossy().into_owned());
+        ideas::insert(&pool, &idea).await.unwrap();
         // artifact_root parent (workspace_root) must exist; leaf need not.
         let artifact_root = workspace_root.join(".test_chainworks_artifacts_tmp");
         let params = serde_json::json!({
@@ -1762,6 +2132,75 @@ mod tests {
                     "settled_at": "2026-04-15T10:00:00Z"
                 }
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn p058_runs_get_attaches_operator_escalation_readback_and_non_operator_summary() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        escalation::insert_ledger(
+            &pool,
+            &domain::escalation::EscalationLedger {
+                id: "ledger-runs-get-p058".into(),
+                run_id,
+                stage_id: "state_3".into(),
+                agent_id: "code_writer".into(),
+                policy_id: "policy-runs-get".into(),
+                policy_hash: "sha256:runs-get".into(),
+                status_raw: "paused".into(),
+                current_tier_id: None,
+                current_tier_kind_raw: None,
+                chain_attempt_index: 1,
+                trigger_raw: Some("contract_output_failure".into()),
+                pause_reason_raw: Some("escalation_chain_exhausted".into()),
+                operator_action_hint: None,
+                runbook_anchor: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+
+        let handler = make_command_handler(pool.clone());
+        let operator = execute(
+            "runs.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+            &auth::Principal::new("operator-p058", auth::PrincipalClass::Operator),
+        )
+        .await
+        .unwrap();
+        assert!(
+            operator["escalation_readback"]["chains"].is_array(),
+            "Operator runs.get must include full escalation_readback: {operator:?}"
+        );
+
+        let agent = execute(
+            "runs.get",
+            serde_json::json!({ "run_id": run_id.to_string() }),
+            &pool,
+            &handler,
+            &auth::Principal::new("agent-p058", auth::PrincipalClass::Agent),
+        )
+        .await
+        .unwrap();
+        assert_eq!(agent["escalation_readback"]["chains_redacted"], true);
+        assert_eq!(agent["escalation_readback"]["paused_chain_count"], 1);
+        assert!(
+            agent["escalation_readback"]
+                .get("dominant_pause_reason_raw")
+                .is_none(),
+            "non-Operator escalation summary must not leak raw pause reason: {agent:?}"
         );
     }
 

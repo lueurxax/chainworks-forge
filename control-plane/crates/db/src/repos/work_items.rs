@@ -1974,7 +1974,7 @@ pub async fn requeue_stale_starting_invoke_agent_sessions_tx(
         let item_id: String = row.get("id");
         let run_id_for_repair: String = row.get("run_id");
         let payload_json: String = row.get("payload_json");
-        let owner_key: String = row
+        let _owner_key: String = row
             .try_get::<Option<String>, _>("invocation_owner_key")
             .ok()
             .flatten()
@@ -2090,9 +2090,9 @@ pub async fn requeue_stale_starting_invoke_agent_sessions_tx(
         // session generation moves to 'invalidated' and the live Source 8 query
         // no longer finds the row.
         let stale_after_ms = if xcode_required {
-            12 * 60 * 1_000_i64
+            domain::recovery_matrix::XCODE_STARTUP_GRACE_SECONDS * 1_000_i64
         } else {
-            3 * 60 * 1_000_i64
+            domain::recovery_matrix::STANDARD_STARTUP_GRACE_SECONDS * 1_000_i64
         };
         let repair_id = format!("p082-stale-startup:{session_generation_id}");
         let operator_message = if xcode_required {
@@ -2707,6 +2707,13 @@ pub async fn complete_with_capacity(
             log_write_transaction("work_items.complete.terminal_noop", tx_started);
             return Ok(scheduler::RefreshQueueSummariesResult::default());
         }
+        let payload_json: String = row.get("payload_json");
+        if kind == WorkItemKind::InvokeAgent.to_string()
+            && previous_status == WorkItemStatus::Running.to_string()
+        {
+            validate_running_invoke_completion_has_valid_outputs_tx(&mut tx, id, &payload_json)
+                .await?;
+        }
         sqlx::query(r#"UPDATE work_items SET status = ?1, completed_at = ?2 WHERE id = ?3 AND status IN (?4, ?5)"#)
             .bind(&status)
             .bind(&now)
@@ -2720,7 +2727,6 @@ pub async fn complete_with_capacity(
             && previous_status == WorkItemStatus::Running.to_string()
         {
             refresh_scheduler = true;
-            let payload_json: String = row.get("payload_json");
             if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload_json) {
                 if let Some(agent_execution_id) = payload
                     .pointer("/p058_claimed/agent_execution_id")
@@ -2809,6 +2815,87 @@ pub async fn complete_with_capacity(
     tx.commit().await.context("commit complete work item")?;
     log_write_transaction("work_items.complete", tx_started);
     Ok(refresh)
+}
+
+async fn validate_running_invoke_completion_has_valid_outputs_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    payload_json: &str,
+) -> Result<()> {
+    let payload = serde_json::from_str::<serde_json::Value>(payload_json).with_context(|| {
+        format!("parse InvokeAgent work item payload before complete: {work_item_id}")
+    })?;
+    let agent_execution_id = payload
+        .pointer("/p058_claimed/agent_execution_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "refusing to complete running InvokeAgent work item {work_item_id}: missing p058_claimed.agent_execution_id"
+            )
+        })?;
+    let payload_run_id = payload
+        .get("run_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "refusing to complete running InvokeAgent work item {work_item_id}: missing run_id"
+            )
+        })?;
+    let payload_stage_execution_id = payload
+        .get("stage_execution_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "refusing to complete running InvokeAgent work item {work_item_id}: missing stage_execution_id"
+            )
+        })?;
+    let valid_outputs = sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(*)
+           FROM work_items wi
+           JOIN stage_executions se
+             ON se.id = ?3
+            AND se.run_id = wi.run_id
+           JOIN agent_executions ae
+             ON ae.id = ?1
+            AND ae.stage_execution_id = se.id
+            AND ae.status IN (?8, ?9, ?10)
+           JOIN artifact_source_generation_claims claim
+             ON claim.run_id = wi.run_id
+            AND claim.stage_execution_id = se.id
+            AND claim.agent_execution_id = ae.id
+            AND claim.source_work_item_id = wi.id
+            AND claim.claim_state = ?7
+           JOIN agent_execution_runtime_facts facts
+             ON facts.agent_execution_id = ae.id
+            AND facts.output_settlement IN (?5, ?6)
+            AND COALESCE(facts.valid_required_outputs, 0) > 0
+           WHERE wi.id = ?2
+             AND wi.run_id = ?4"#,
+    )
+    .bind(agent_execution_id)
+    .bind(work_item_id)
+    .bind(payload_stage_execution_id)
+    .bind(payload_run_id)
+    .bind(domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution.to_string())
+    .bind(domain::agent::AgentOutputSettlement::ValidOutputsFromFailedExecution.to_string())
+    .bind(ArtifactSourceClaimState::Active.to_string())
+    .bind(AgentStatus::Running.to_string())
+    .bind(AgentStatus::Completed.to_string())
+    .bind(AgentStatus::Failed.to_string())
+    .fetch_one(&mut **tx)
+    .await
+    .with_context(|| {
+        format!("load runtime facts before completing running InvokeAgent work item {work_item_id}")
+    })?;
+    if valid_outputs == 0 {
+        anyhow::bail!(
+            "refusing to complete running InvokeAgent work item {work_item_id}: runtime facts, active source claim, and agent execution do not prove the same run owner with valid required outputs"
+        );
+    }
+    Ok(())
 }
 
 pub async fn fail(
@@ -3818,6 +3905,292 @@ mod tests {
             payload["failed_invoke_work_item_id"],
             "invoke-startup-failed"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_running_invoke_requires_valid_runtime_facts_before_mutation() {
+        let pool = test_pool().await;
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let agent_execution_id = AgentExecutionId::new();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+
+        sqlx::query(
+            r#"INSERT INTO ideas (id, title, body, status, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        )
+        .bind("idea-complete-guard")
+        .bind("complete guard")
+        .bind("body")
+        .bind("active")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert idea");
+        sqlx::query(
+            r#"INSERT INTO runs
+               (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(run_id.to_string())
+        .bind("idea-complete-guard")
+        .bind("running")
+        .bind("wf")
+        .bind("Workflow")
+        .bind("/tmp/ws")
+        .bind("/tmp/artifacts")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert run");
+        sqlx::query(
+            r#"INSERT INTO stage_executions
+               (id, run_id, stage_id, label, status, iteration, attempt_number, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(stage_execution_id.to_string())
+        .bind(run_id.to_string())
+        .bind("implement")
+        .bind("Implement")
+        .bind("running")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert stage execution");
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, status, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+        )
+        .bind(agent_execution_id.to_string())
+        .bind(stage_execution_id.to_string())
+        .bind("code_writer")
+        .bind("codex")
+        .bind(AgentStatus::Running.to_string())
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert running agent execution");
+
+        let claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
+            run_id,
+            owner_kind: domain::mediation::OwnerKind::StageExecution,
+            owner_id: stage_execution_id.to_string(),
+            stage_execution_id: Some(stage_execution_id),
+            agent_execution_id,
+            source_work_item_id: "invoke-no-valid-facts".to_string(),
+        };
+        crate::repos::artifact_contracts::insert_source_generation_claim(
+            &pool,
+            domain::artifact_contracts::ArtifactSourceGenerationClaim {
+                key: claim_key.clone(),
+                current_session_generation_id: Some(uuid::Uuid::new_v4().to_string()),
+                claim_state: ArtifactSourceClaimState::Active,
+                superseding_work_item_id: None,
+                superseded_by_agent_execution_id: None,
+                supersession_journal_id: None,
+                superseded_at: None,
+                closed_at: None,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("insert active source claim");
+        enqueue(
+            &pool,
+            &WorkItem {
+                id: "invoke-no-valid-facts".to_string(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "implement",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "p058_claimed": {
+                        "agent_execution_id": agent_execution_id.to_string(),
+                        "session_generation_id": uuid::Uuid::new_v4().to_string()
+                    }
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: Some("implement".to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .expect("insert running invoke work item");
+
+        let error = complete(&pool, "invoke-no-valid-facts").await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("runtime facts do not prove valid required outputs"));
+
+        let item = find_by_id(&pool, "invoke-no-valid-facts")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.status, WorkItemStatus::Running);
+        assert!(
+            find_by_id(&pool, "advance-after-invoke:invoke-no-valid-facts")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let agent_status: String =
+            sqlx::query_scalar("SELECT status FROM agent_executions WHERE id = ?1")
+                .bind(agent_execution_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(agent_status, AgentStatus::Running.to_string());
+        let claim =
+            crate::repos::artifact_contracts::load_source_generation_claim(&pool, &claim_key)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(claim.claim_state, ArtifactSourceClaimState::Active);
+        assert!(claim.closed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn p082_complete_running_invoke_rejects_valid_facts_from_foreign_run_owner() {
+        let pool = test_pool().await;
+        let foreign_run_id = RunId::new();
+        let local_run_id = RunId::new();
+        let foreign_stage_execution_id = StageExecutionId::new();
+        let local_stage_execution_id = StageExecutionId::new();
+        let foreign_agent_execution_id = AgentExecutionId::new();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+
+        for (idea_id, run_id) in [
+            ("idea-foreign-owner", foreign_run_id),
+            ("idea-local-owner", local_run_id),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO ideas (id, title, body, status, created_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            )
+            .bind(idea_id)
+            .bind(idea_id)
+            .bind("body")
+            .bind("active")
+            .bind(&now_str)
+            .execute(&pool)
+            .await
+            .expect("insert idea");
+            sqlx::query(
+                r#"INSERT INTO runs
+                   (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            )
+            .bind(run_id.to_string())
+            .bind(idea_id)
+            .bind("running")
+            .bind("wf")
+            .bind("Workflow")
+            .bind("/tmp/ws")
+            .bind("/tmp/artifacts")
+            .bind(&now_str)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+        }
+
+        for (stage_execution_id, run_id) in [
+            (foreign_stage_execution_id, foreign_run_id),
+            (local_stage_execution_id, local_run_id),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO stage_executions
+                   (id, run_id, stage_id, label, status, iteration, attempt_number, started_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            )
+            .bind(stage_execution_id.to_string())
+            .bind(run_id.to_string())
+            .bind("implement")
+            .bind("Implement")
+            .bind("running")
+            .bind(1_i64)
+            .bind(1_i64)
+            .bind(&now_str)
+            .execute(&pool)
+            .await
+            .expect("insert stage execution");
+        }
+
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, status, started_at, completed_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+        )
+        .bind(foreign_agent_execution_id.to_string())
+        .bind(foreign_stage_execution_id.to_string())
+        .bind("code_writer")
+        .bind("codex")
+        .bind(AgentStatus::Completed.to_string())
+        .bind(&now_str)
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert foreign completed agent execution");
+
+        let mut facts = domain::agent::AgentExecutionRuntimeFacts::defaults_for(
+            foreign_agent_execution_id,
+            now,
+        );
+        facts.output_settlement =
+            domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+        facts.valid_required_outputs = true;
+        crate::repos::agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .expect("insert foreign runtime facts");
+
+        enqueue(
+            &pool,
+            &WorkItem {
+                id: "invoke-foreign-owner-spoof".to_string(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": local_run_id.to_string(),
+                    "stage_id": "implement",
+                    "stage_execution_id": local_stage_execution_id.to_string(),
+                    "p058_claimed": {
+                        "agent_execution_id": foreign_agent_execution_id.to_string()
+                    }
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(local_run_id),
+                stage_id: Some("implement".to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .expect("insert local running invoke item");
+
+        let err = complete(&pool, "invoke-foreign-owner-spoof")
+            .await
+            .expect_err("foreign execution facts must not complete local work item");
+        assert!(
+            err.to_string().contains("same run owner"),
+            "completion guard must name owner mismatch; got: {err}"
+        );
+        let item = find_by_id(&pool, "invoke-foreign-owner-spoof")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.status, WorkItemStatus::Running);
     }
 
     #[tokio::test]

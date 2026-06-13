@@ -141,6 +141,12 @@ The receipt stores runtime and forensic detail in additive fields:
 - `repair_materialization_summary_json`
 - `repair_materialization_mode`
 
+P088 completion-repair artifacts, including worktree fingerprints, redacted
+prompts, expected-output snapshots, completion captures, receipts, and
+failed-stage evidence, are written only after the executor verifies that the
+target path remains under the canonical run `workspace_root` and creates parent
+directories through a symlink-safe component walk.
+
 `runtime_preflight_phase` values such as `preflight_running`,
 `preflight_remediating`, `passed`, and `failed_no_launch` are runtime facts, not
 new `AgentStatus` values. Public preflight JSON records attempt count,
@@ -530,6 +536,16 @@ The import transaction owns these updates together:
 If the transaction rolls back, both active artifact truth and runtime facts roll back.
 This prevents late outputs, retried stages, or stale provider subprocesses from changing
 current run truth after ownership has moved on.
+
+`work_items.complete` has the same fail-closed boundary for running
+`InvokeAgent` items. A running invoke work item may be completed only when its
+payload carries the claimed `agent_execution_id` and
+`agent_execution_runtime_facts` already proves valid required outputs through
+`valid_outputs_from_completed_execution` or
+`valid_outputs_from_failed_execution` with `valid_required_outputs > 0`. If
+that proof is absent, completion is rejected before mutating the work item,
+agent execution, post-invoke advance scheduling, or active artifact
+source-generation claim.
 
 ### Failure evidence survives post-generation validation failure
 

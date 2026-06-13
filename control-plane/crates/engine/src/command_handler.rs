@@ -3,10 +3,8 @@ use anyhow::{anyhow, Context, Result};
 use auth;
 use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
-use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -35,7 +33,7 @@ use domain::commands::{
 };
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
-use domain::ids::{ApprovalId, RunId};
+use domain::ids::{AgentExecutionId, ApprovalId, RunId, StageExecutionId};
 use domain::proposal_gate_result::{
     ProposalGateFailureClassification, ProposalGateLineage, ProposalGateResult, ProposalGateStatus,
 };
@@ -64,7 +62,7 @@ use crate::event_bus::EventSender;
 use crate::preflight::{
     missing_delivery_configuration_preflight, run_delivery_preflight, DeliveryPreflightResult,
 };
-use crate::side_effects::{retry_preflight_within_tx, run_cancel_preflight_within_tx};
+use crate::side_effects::retry_preflight_within_tx;
 use crate::synthesizers::closeout_readiness::{
     synthesize_implementation_closeout_readiness_for_state9_with_runtime_guards, NoDiffConvergence,
     SynthesizerInputs, NO_DIFF_CONVERGENCE_THRESHOLD,
@@ -278,12 +276,27 @@ fn ensure_run_meta_root_exists(run: &Run) -> Result<()> {
         return Ok(());
     };
 
+    let workspace_root = Path::new(&run.workspace_root);
+    reject_command_path_symlink_components(workspace_root, "Run workspace_root")?;
+    let canonical_workspace = std::fs::canonicalize(workspace_root).with_context(|| {
+        format!(
+            "canonicalize run workspace_root {}",
+            workspace_root.display()
+        )
+    })?;
+
     let meta_root = Path::new(meta_root);
     let absolute_meta_root = if meta_root.is_absolute() {
         meta_root.to_path_buf()
     } else {
-        Path::new(&run.workspace_root).join(meta_root)
+        canonical_workspace.join(meta_root)
     };
+    if absolute_meta_root.exists() {
+        reject_command_path_symlink_components(&absolute_meta_root, "Run chainworks_meta_root")?;
+    }
+    if !absolute_meta_root.starts_with(&canonical_workspace) {
+        anyhow::bail!("Run chainworks_meta_root escapes canonical workspace_root");
+    }
 
     for child in ["", "artifacts", "context", "state", "summaries"] {
         let path = if child.is_empty() {
@@ -291,10 +304,116 @@ fn ensure_run_meta_root_exists(run: &Run) -> Result<()> {
         } else {
             absolute_meta_root.join(child)
         };
-        std::fs::create_dir_all(&path)
-            .with_context(|| format!("create run meta-root directory {}", path.display()))?;
+        create_command_dir_all_no_symlink_under(
+            &path,
+            &canonical_workspace,
+            "Run chainworks_meta_root",
+        )?;
     }
 
+    Ok(())
+}
+
+fn create_command_dir_all_no_symlink_under(
+    path: &Path,
+    canonical_root: &Path,
+    field: &str,
+) -> Result<()> {
+    let relative = path
+        .strip_prefix(canonical_root)
+        .with_context(|| format!("{field} escapes canonical root"))?;
+    let mut current = canonical_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("{field} contains a symlink component");
+                }
+                if !metadata.is_dir() {
+                    anyhow::bail!("{field} path component is not a directory");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .with_context(|| format!("create directory {}", current.display()))?;
+                let metadata = std::fs::symlink_metadata(&current)
+                    .with_context(|| format!("verify directory {}", current.display()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    anyhow::bail!("{field} created path was replaced before verification");
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_governed_workspace_root_for_idea(raw: &str) -> Result<String> {
+    if raw.contains('\0') {
+        anyhow::bail!("CreateIdea workspace_root_path contains a null byte");
+    }
+    if raw.contains('\\') {
+        anyhow::bail!("CreateIdea workspace_root_path contains a backslash separator");
+    }
+    if raw.contains("://") {
+        anyhow::bail!("CreateIdea workspace_root_path contains a URI scheme separator");
+    }
+    for component in raw.split('/') {
+        if component == ".." {
+            anyhow::bail!("CreateIdea workspace_root_path contains '..'");
+        }
+    }
+    let path = Path::new(raw);
+    if !path.exists() {
+        anyhow::bail!("CreateIdea workspace_root_path does not exist");
+    }
+    if !path.is_dir() {
+        anyhow::bail!("CreateIdea workspace_root_path must be a directory");
+    }
+    reject_command_path_symlink_components(path, "CreateIdea workspace_root_path")?;
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("canonicalize CreateIdea workspace_root_path '{raw}'"))?;
+    reject_broad_command_workspace_root(&canonical)?;
+    Ok(canonical.to_string_lossy().to_string())
+}
+
+fn reject_broad_command_workspace_root(canonical: &Path) -> Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| std::fs::canonicalize(home).ok());
+    let broad_literals = [
+        Path::new("/"),
+        Path::new("/tmp"),
+        Path::new("/private/tmp"),
+        Path::new("/var"),
+        Path::new("/private/var"),
+        Path::new("/Users"),
+        Path::new("/home"),
+    ];
+    if broad_literals.iter().any(|broad| canonical == *broad)
+        || home.as_deref().is_some_and(|home| canonical == home)
+    {
+        anyhow::bail!(
+            "CreateIdea workspace_root_path is too broad to use as a trusted filesystem boundary"
+        );
+    }
+    Ok(())
+}
+
+fn reject_command_path_symlink_components(path: &Path, field: &str) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("{field} contains a symlink component");
+        }
+    }
     Ok(())
 }
 
@@ -2025,6 +2144,16 @@ impl CommandHandler {
     }
 
     pub async fn handle(&self, cmd: Command, caller: CallerContext) -> Result<Commanded> {
+        if matches!(&cmd, Command::StartRun(_))
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: StartRun requires operator principal");
+        }
+        if matches!(&cmd, Command::CreateIdea(c) if c.workspace_root_path.is_some())
+            && caller.principal_class != PrincipalClass::Operator
+        {
+            anyhow::bail!("forbidden: CreateIdea workspace_root_path requires operator principal");
+        }
         if matches!(&cmd, Command::OverrideArtifactContract(_))
             && caller.principal_class != PrincipalClass::Operator
         {
@@ -2384,11 +2513,18 @@ impl CommandHandler {
         let journal_id = journal.id.as_str();
         match cmd {
             Command::CreateIdea(c) => {
+                let workspace_root_path = c
+                    .workspace_root_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|root| !root.is_empty())
+                    .map(canonicalize_governed_workspace_root_for_idea)
+                    .transpose()?;
                 let idea = domain::idea::Idea {
                     id: domain::ids::IdeaId::new(),
                     title: c.title,
                     body: c.body,
-                    workspace_root_path: c.workspace_root_path,
+                    workspace_root_path,
                     project_key: c.project_key,
                     status: domain::idea::IdeaStatus::Draft,
                     created_at: Utc::now(),
@@ -2975,6 +3111,7 @@ impl CommandHandler {
                 } else {
                     None
                 };
+                self.validate_retry_stage_identifier_kinds(&c).await?;
 
                 if let Some(agent_execution_id) = c.agent_execution_id {
                     if c.legacy_discovery_override_policy.is_some() {
@@ -5586,18 +5723,36 @@ impl CommandHandler {
                     agent_execution_id
                 )
             })?;
+        let run_stages = stages::list_by_run(&self.pool, run_id).await?;
+        let matching_stages = run_stages
+            .iter()
+            .filter(|s| s.stage_id == stage_id)
+            .collect::<Vec<_>>();
+        let latest_stage = matching_stages.iter().copied().max_by_key(|s| s.started_at);
+        let valid_agent_identifier_examples = match latest_stage {
+            Some(stage) => agent_executions::find_by_stage(&self.pool, stage.id)
+                .await?
+                .into_iter()
+                .map(|execution| execution.id.to_string())
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
         if old_stage.run_id != run_id || old_stage.stage_id != stage_id {
             let err_msg = format!(
                 "Targeted retry rejected: agent execution {} belongs to run {} stage {}, not run {} stage {}. No mutation was performed.",
                 agent_execution_id, old_stage.run_id, old_stage.stage_id, run_id, stage_id
             );
             let now_ts = Utc::now();
+            let valid_identifier_example_refs = valid_agent_identifier_examples
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
             let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
                 "RetryAgentExecution",
                 &agent_execution_id.to_string(),
-                "stage_execution_uuid",
-                "stage_execution_uuid",
-                &[],
+                "agent_execution_id",
+                "agent_execution_id",
+                &valid_identifier_example_refs,
             );
             let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
                 domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
@@ -5636,28 +5791,23 @@ impl CommandHandler {
             return Err(anyhow!("{err_msg}"));
         }
 
-        let run_stages = stages::list_by_run(&self.pool, run_id).await?;
-        let matching_stages = run_stages
-            .iter()
-            .filter(|s| s.stage_id == stage_id)
-            .collect::<Vec<_>>();
-        let latest_stage = matching_stages
-            .iter()
-            .copied()
-            .max_by_key(|s| s.started_at)
-            .ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
+        let latest_stage = latest_stage.ok_or_else(|| anyhow!("Stage {} not found", stage_id))?;
         if latest_stage.id != old_stage.id {
             let err_msg = format!(
                 "Targeted retry rejected: agent execution {} is on stale stage execution {}; latest for {} is {}. No mutation was performed.",
                 agent_execution_id, old_stage.id, stage_id, latest_stage.id
             );
             let now_ts = Utc::now();
+            let valid_identifier_example_refs = valid_agent_identifier_examples
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
             let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
                 "RetryAgentExecution",
-                &old_stage.id.to_string(),
-                "stage_execution_uuid",
-                "stage_execution_uuid",
-                &[&latest_stage.id.to_string()],
+                &agent_execution_id.to_string(),
+                "agent_execution_id",
+                "agent_execution_id",
+                &valid_identifier_example_refs,
             );
             let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
                 domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
@@ -5954,34 +6104,28 @@ impl CommandHandler {
             new_stage.id, agent_execution_id
         );
         let retry_authority_id = format!("p091-retry-authority:{}", new_stage.id);
+        sanitize_targeted_retry_invoke_payload(
+            &mut retry_payload,
+            &TargetedRetryPayloadIdentity {
+                run_id,
+                stage_id: stage_id.to_string(),
+                target_stage_execution_id: new_stage.id,
+                retry_authority_id: retry_authority_id.clone(),
+                source_stage_execution_id: old_stage.id,
+                source_agent_execution_id: Some(agent_execution_id.to_string()),
+                source_work_item_id: source_item.id.clone(),
+                reason: "operator_targeted_retry".to_string(),
+                journal_id: Some(journal_id.to_string()),
+            },
+        )
+        .map_err(|e| {
+            anyhow!(
+                "Source InvokeAgent work item {} cannot be sanitized for targeted retry: {}",
+                source_item.id,
+                e
+            )
+        })?;
         if let Some(object) = retry_payload.as_object_mut() {
-            object.insert("run_id".into(), serde_json::json!(run_id.to_string()));
-            object.insert("stage_id".into(), serde_json::json!(stage_id));
-            object.insert(
-                "stage_execution_id".into(),
-                serde_json::json!(new_stage.id.to_string()),
-            );
-            object.insert(
-                "target_stage_execution_id".into(),
-                serde_json::json!(new_stage.id.to_string()),
-            );
-            object.insert(
-                "retry_authority_id".into(),
-                serde_json::json!(retry_authority_id.clone()),
-            );
-            object.remove("p058_claimed");
-            object.insert(
-                "targeted_retry".into(),
-                serde_json::json!({
-                    "journal_id": journal_id,
-                    "retry_authority_id": retry_authority_id.clone(),
-                    "target_stage_execution_id": new_stage.id.to_string(),
-                    "source_stage_execution_id": old_stage.id.to_string(),
-                    "source_agent_execution_id": agent_execution_id.to_string(),
-                    "source_work_item_id": source_item.id.clone(),
-                    "reason": "operator_targeted_retry"
-                }),
-            );
             if let Some(evidence_path) = p088_completion_retry_evidence.as_deref() {
                 attach_p088_operator_retry_completion_recovery_payload(
                     object,
@@ -6158,6 +6302,62 @@ impl CommandHandler {
             legacy_discovery_override_id: None,
             retry_instruction_binding_id,
         })
+    }
+
+    async fn validate_retry_stage_identifier_kinds(
+        &self,
+        c: &domain::commands::RetryStageCmd,
+    ) -> Result<()> {
+        if let Ok(uuid) = uuid::Uuid::parse_str(&c.stage_id) {
+            let stage_execution_id = StageExecutionId::from(uuid);
+            if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
+                if stage.run_id == c.run_id {
+                    anyhow::bail!(
+                        "wrong_identifier_kind: stages.retry expected logical stage_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or set agent_execution_id to an agent_executions.id for a targeted retry.",
+                        c.stage_id,
+                        stage.stage_id
+                    );
+                }
+            }
+
+            let agent_execution_id = AgentExecutionId::from(uuid);
+            if let Some(agent_execution) =
+                agent_executions::find_by_id(&self.pool, agent_execution_id).await?
+            {
+                if let Some(stage_execution_id) = agent_execution.stage_execution_id {
+                    if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
+                        if stage.run_id == c.run_id {
+                            anyhow::bail!(
+                                "wrong_identifier_kind: stages.retry expected logical stage_id but received agent_execution_id '{}'. next_action: retry with stage_id '{}' and agent_execution_id '{}'.",
+                                c.stage_id,
+                                stage.stage_id,
+                                agent_execution.id
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(agent_execution_id) = c.agent_execution_id {
+            if agent_executions::find_by_id(&self.pool, agent_execution_id)
+                .await?
+                .is_none()
+            {
+                let stage_execution_id = StageExecutionId::from(agent_execution_id.inner());
+                if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
+                    if stage.run_id == c.run_id {
+                        anyhow::bail!(
+                            "wrong_identifier_kind: stages.retry expected agent_execution_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or choose an agent_executions.id from that stage for targeted retry.",
+                            agent_execution_id,
+                            stage.stage_id
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn record_completed_command_transaction(
@@ -6551,6 +6751,65 @@ fn validate_accepted_risk_lineage(c: &SettleProposalGateCmd) -> Result<()> {
 mod tests {
     use super::*;
     use domain::ids::{IdeaId, RunId};
+
+    #[test]
+    fn p082_ensure_run_meta_root_rejects_symlinked_chainworks_component() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let link = workspace.path().join(".chainworks");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).expect(".chainworks symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &link)
+            .expect(".chainworks symlink fixture");
+
+        let run = Run {
+            id: RunId::new(),
+            idea_id: IdeaId::new(),
+            status: RunStatus::Running,
+            workflow_id: "wf".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: workspace.path().to_string_lossy().into_owned(),
+            artifact_root: workspace
+                .path()
+                .join("artifacts")
+                .to_string_lossy()
+                .into_owned(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("state_impl".into()),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: Some(".chainworks/runs/test-run".into()),
+            review_routing_json: None,
+            closeout_readiness_mode: None,
+        };
+
+        let err = ensure_run_meta_root_exists(&run).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "P082: run meta-root creation must reject symlinked .chainworks components; got: {err}"
+        );
+    }
 
     #[test]
     fn p060_idea_body_review_mode_and_reviewer_override_are_canonicalized() {

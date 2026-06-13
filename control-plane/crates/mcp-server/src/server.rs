@@ -25,6 +25,7 @@ pub struct McpServer {
     pool: SqlitePool,
     cmd_handler: Arc<CommandHandler>,
     pub principal_table: auth::PrincipalTable,
+    principal_source: auth::LivePrincipalSource,
     events: Option<EventSender>,
     storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
     // P081 Phase 3: shared immutable boundary policy service injected at daemon startup.
@@ -42,6 +43,7 @@ async fn write_json_line<T: serde::Serialize>(stdout: &Arc<Mutex<tokio::io::Stdo
     if let Ok(json) = serde_json::to_string(value) {
         let mut stdout = stdout.lock().await;
         let _ = stdout.write_all(format!("{json}\n").as_bytes()).await;
+        let _ = stdout.flush().await;
     }
 }
 
@@ -162,10 +164,12 @@ impl McpServer {
         cmd_handler: Arc<CommandHandler>,
         principal_table: auth::PrincipalTable,
     ) -> Self {
+        let principal_source = auth::LivePrincipalSource::new(principal_table.clone());
         Self {
             pool,
             cmd_handler,
             principal_table,
+            principal_source,
             events: None,
             storage_writer_heartbeat: None,
             boundary_policy: Some(embedded_shadow_boundary_policy()),
@@ -178,10 +182,12 @@ impl McpServer {
         principal_table: auth::PrincipalTable,
         storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
     ) -> Self {
+        let principal_source = auth::LivePrincipalSource::new(principal_table.clone());
         Self {
             pool,
             cmd_handler,
             principal_table,
+            principal_source,
             events: None,
             storage_writer_heartbeat: Some(storage_writer_heartbeat),
             boundary_policy: Some(embedded_shadow_boundary_policy()),
@@ -195,10 +201,12 @@ impl McpServer {
         storage_writer_heartbeat: Arc<DbWriterHeartbeat>,
         boundary_policy: Arc<auth::boundary::BoundaryPolicy>,
     ) -> Self {
+        let principal_source = auth::LivePrincipalSource::new(principal_table.clone());
         Self {
             pool,
             cmd_handler,
             principal_table,
+            principal_source,
             events: None,
             storage_writer_heartbeat: Some(storage_writer_heartbeat),
             boundary_policy: Some(boundary_policy),
@@ -211,10 +219,12 @@ impl McpServer {
         principal_table: auth::PrincipalTable,
         events: EventSender,
     ) -> Self {
+        let principal_source = auth::LivePrincipalSource::new(principal_table.clone());
         Self {
             pool,
             cmd_handler,
             principal_table,
+            principal_source,
             events: Some(events),
             storage_writer_heartbeat: None,
             boundary_policy: Some(embedded_shadow_boundary_policy()),
@@ -227,6 +237,30 @@ impl McpServer {
         self
     }
 
+    pub fn with_live_principal_source(mut self, source: auth::LivePrincipalSource) -> Self {
+        self.principal_source = source;
+        self
+    }
+
+    pub fn live_principal_source(&self) -> auth::LivePrincipalSource {
+        self.principal_source.clone()
+    }
+
+    pub fn resolve_current_bearer(&self, token: &str) -> anyhow::Result<auth::Principal> {
+        self.principal_source
+            .resolve_bearer(token)
+            .map_err(|_| anyhow::anyhow!("unauthorized"))
+    }
+
+    pub fn resolve_current_credential(
+        &self,
+        credential: &auth::LivePrincipalCredential,
+    ) -> anyhow::Result<auth::Principal> {
+        self.principal_source
+            .resolve_credential(credential)
+            .map_err(|_| anyhow::anyhow!("unauthorized"))
+    }
+
     pub async fn run_stdio(&self) -> Result<()> {
         info!("McpServer: starting stdio JSON-RPC loop");
 
@@ -234,7 +268,7 @@ impl McpServer {
         let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
         let mut reader = BufReader::new(stdin);
         let mut line = String::new();
-        let mut session_principal: Option<auth::Principal> = None;
+        let mut session_credential: Option<auth::LivePrincipalCredential> = None;
         let mut notification_task: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
@@ -266,7 +300,7 @@ impl McpServer {
 
             // Handle initialize: bind session principal from clientInfo.principal_token
             if request.method == "initialize" {
-                if session_principal.is_some() {
+                if session_credential.is_some() {
                     // Re-initialize rejected
                     let resp = JsonRpcResponse::error(
                         request.id.clone(),
@@ -303,14 +337,15 @@ impl McpServer {
                         .await;
                         break;
                     }
-                    Some(t) => match auth::resolve_bearer(t, &self.principal_table) {
+                    Some(t) => match self.resolve_current_bearer(t) {
                         Ok(p) => {
                             let is_operator = matches!(p.class, auth::PrincipalClass::Operator);
-                            session_principal = Some(p);
+                            session_credential = Some(auth::LivePrincipalCredential {
+                                principal_id: p.id.clone(),
+                                token_fingerprint: auth::token_fingerprint(t),
+                            });
                             // Return normal initialize response
-                            let resp = self
-                                .handle_request(request, session_principal.as_ref().unwrap())
-                                .await;
+                            let resp = self.handle_request(request, &p).await;
                             if notification_task.is_none() && is_operator {
                                 if let Some(events) = &self.events {
                                     notification_task = Some(spawn_scheduler_notification_pump(
@@ -351,8 +386,19 @@ impl McpServer {
             }
 
             // For all other methods, require session_principal
-            let principal = match session_principal.as_ref() {
-                Some(p) => p,
+            let principal = match session_credential.as_ref() {
+                Some(credential) => match self.resolve_current_credential(credential) {
+                    Ok(principal) => principal,
+                    Err(_) => {
+                        let resp = JsonRpcResponse::error(
+                            request.id.clone(),
+                            -32000,
+                            "unauthorized".to_string(),
+                        );
+                        write_json_line(&stdout, &resp).await;
+                        break;
+                    }
+                },
                 None => {
                     let resp = JsonRpcResponse::error(
                         request.id.clone(),
@@ -366,9 +412,9 @@ impl McpServer {
 
             if is_notification {
                 // Fire-and-forget: process but don't reply.
-                let _ = self.handle_request(request, principal).await;
+                let _ = self.handle_request(request, &principal).await;
             } else {
-                let response = self.handle_request(request, principal).await;
+                let response = self.handle_request(request, &principal).await;
                 write_json_line(&stdout, &response).await;
             }
         }
@@ -876,7 +922,12 @@ impl McpServer {
                         idempotency_claimed_hash.clone(),
                         crate::request_context::scope_boundary_row_id(
                             policy_allowed_row_id.clone(),
-                            self.dispatch_tool(canonical_tool_name, tool_params, principal, &request_id),
+                            self.dispatch_tool(
+                                canonical_tool_name,
+                                tool_params,
+                                principal,
+                                &request_id,
+                            ),
                         ),
                     ),
                 )
@@ -1158,6 +1209,13 @@ impl McpServer {
                     }
                 }
                 let request_id = public_json_rpc_request_id(&id);
+                if matches!(
+                    principal.class,
+                    auth::PrincipalClass::Agent | auth::PrincipalClass::Observer
+                ) && (uri.starts_with("artifact://") || uri.starts_with("report://"))
+                {
+                    return JsonRpcResponse::error(id, -32002, "Resource not found".to_string());
+                }
                 if auth::match_resource_uri(principal, &uri, resource_template_id_for_uri).is_none()
                 {
                     return JsonRpcResponse::error(id, -32002, "Resource not found".to_string());
@@ -1351,8 +1409,12 @@ impl McpServer {
                 .collect();
             let run_artifacts =
                 db::repos::artifacts::list_by_run(&self.pool, run_id_parsed).await?;
-            let (mcp_rollout_readback, run_report_rollout_readback) =
-                rollout_contract_readback_lanes_json(&self.pool, run_id_parsed).await?;
+            let is_operator = principal.class == auth::PrincipalClass::Operator;
+            let (mcp_rollout_readback, run_report_rollout_readback) = if is_operator {
+                rollout_contract_readback_lanes_json(&self.pool, run_id_parsed).await?
+            } else {
+                (serde_json::Value::Null, serde_json::Value::Null)
+            };
             // Fetch p082 readbacks once and emit "report_resource" lane metrics.
             // Pass the pre-fetched value into artifact_report_json so per-artifact
             // lanes are not re-emitted for each artifact in the loop.
@@ -1380,46 +1442,96 @@ impl McpServer {
             }
             let closeout_readiness_summary =
                 tools::reports::closeout_readiness_summary_json(&self.pool, run_id_parsed).await?;
-            let code_writer_completion_receipts =
-                tools::reports::code_writer_completion_receipts_json(&self.pool, run_id_parsed)
-                    .await?;
-            let implementation_completion =
-                tools::reports::implementation_completion_json(&self.pool, run_id_parsed).await?;
-            let retry_authority_history =
-                tools::reports::retry_authority_history_json(&self.pool, run_id_parsed).await?;
-            let retry_authority =
-                tools::reports::retry_authority_current_json(&self.pool, run_id_parsed).await?;
-            let p091_orphan_repair_readback =
-                tools::reports::p091_orphan_repair_readback_json(&self.pool, run_id_parsed).await?;
-
-            return Ok(serde_json::json!({
-                "run_id": run_id,
-                "status": run_proj.status,
-                "total_stages": run_proj.total_stages,
-                "completed_stages": run_proj.completed_stages,
-                "failed_stages": run_proj.failed_stages,
-                "has_artifacts": !artifact_rows.is_empty(),
-                "stages": stage_rows,
-                "agent_executions": tools::reports::execution_mcp_truth_json(
+            let mut response = serde_json::Map::new();
+            response.insert("run_id".into(), serde_json::json!(run_id));
+            response.insert("status".into(), serde_json::json!(run_proj.status));
+            response.insert(
+                "total_stages".into(),
+                serde_json::json!(run_proj.total_stages),
+            );
+            response.insert(
+                "completed_stages".into(),
+                serde_json::json!(run_proj.completed_stages),
+            );
+            response.insert(
+                "failed_stages".into(),
+                serde_json::json!(run_proj.failed_stages),
+            );
+            response.insert(
+                "has_artifacts".into(),
+                serde_json::json!(!artifact_rows.is_empty()),
+            );
+            response.insert("stages".into(), serde_json::to_value(stage_rows)?);
+            response.insert(
+                "agent_executions".into(),
+                tools::reports::execution_mcp_truth_json(&self.pool, run_id_parsed, is_operator)
+                    .await?,
+            );
+            response.insert(
+                "p082_recovery_matrix_readbacks".into(),
+                p082_recovery_matrix_readbacks,
+            );
+            response.insert(
+                "implementation_self_assessment_summary".into(),
+                tools::reports::implementation_self_assessment_summary_json(
                     &self.pool,
                     run_id_parsed,
-                    principal.class == auth::PrincipalClass::Operator,
                 )
                 .await?,
-                "code_writer_completion_receipts": code_writer_completion_receipts,
-                "implementationCompletion": implementation_completion,
-                "workflow_conflict": tools::reports::workflow_conflict_json(&self.pool, &self.cmd_handler, run_id_parsed).await?,
-                "retryAuthority": retry_authority,
-                "retryAuthorityHistory": retry_authority_history,
-                "p091OrphanRepairReadback": p091_orphan_repair_readback,
-                "p082_recovery_matrix_readbacks": p082_recovery_matrix_readbacks,
-                "implementation_self_assessment_summary": tools::reports::implementation_self_assessment_summary_json(&self.pool, run_id_parsed).await?,
-                "rollout_contract_readback": mcp_rollout_readback,
-                "implementation_closeout_readiness_summary": closeout_readiness_summary.clone(),
-                "closeout_readiness_summary": closeout_readiness_summary,
-                "artifact_index": public_artifact_index,
-                "artifacts": artifact_payloads,
-            }));
+            );
+            response.insert(
+                "implementation_closeout_readiness_summary".into(),
+                closeout_readiness_summary.clone(),
+            );
+            response.insert(
+                "closeout_readiness_summary".into(),
+                closeout_readiness_summary,
+            );
+            response.insert(
+                "artifact_index".into(),
+                serde_json::to_value(public_artifact_index)?,
+            );
+            response.insert(
+                "artifacts".into(),
+                serde_json::Value::Array(artifact_payloads),
+            );
+            if is_operator {
+                response.insert(
+                    "code_writer_completion_receipts".into(),
+                    tools::reports::code_writer_completion_receipts_json(&self.pool, run_id_parsed)
+                        .await?,
+                );
+                response.insert(
+                    "implementationCompletion".into(),
+                    tools::reports::implementation_completion_json(&self.pool, run_id_parsed)
+                        .await?,
+                );
+                response.insert(
+                    "workflow_conflict".into(),
+                    tools::reports::workflow_conflict_json(
+                        &self.pool,
+                        &self.cmd_handler,
+                        run_id_parsed,
+                    )
+                    .await?,
+                );
+                response.insert(
+                    "retryAuthority".into(),
+                    tools::reports::retry_authority_current_json(&self.pool, run_id_parsed).await?,
+                );
+                response.insert(
+                    "retryAuthorityHistory".into(),
+                    tools::reports::retry_authority_history_json(&self.pool, run_id_parsed).await?,
+                );
+                response.insert(
+                    "p091OrphanRepairReadback".into(),
+                    tools::reports::p091_orphan_repair_readback_json(&self.pool, run_id_parsed)
+                        .await?,
+                );
+                response.insert("rollout_contract_readback".into(), mcp_rollout_readback);
+            }
+
+            return Ok(serde_json::Value::Object(response));
         }
 
         if let Some(analysis_id) = uri.strip_prefix("steward-analysis://") {
@@ -1442,13 +1554,8 @@ impl McpServer {
                 let sanitized: Vec<serde_json::Value> = rows
                     .iter()
                     .map(|row| {
-                        let mut v =
-                            serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
-                        if let Some(obj) = v.as_object_mut() {
-                            obj.remove("workspace_root");
-                            obj.remove("artifact_root");
-                            obj.remove("chainworks_meta_root");
-                        }
+                        let mut v = serde_json::to_value(row).unwrap_or(serde_json::Value::Null);
+                        tools::runs::redact_non_operator_run_projection(&mut v);
                         v
                     })
                     .collect();
@@ -1533,12 +1640,11 @@ impl McpServer {
             // active_artifact_index and run_state_projection include operator-only
             // recovery diagnostics, local paths, and source IDs — Operator only.
             if principal.class == auth::PrincipalClass::Operator {
-                if let Some(projection) =
-                    db::repos::artifact_contracts::find_run_state_projection(
-                        &self.pool,
-                        run_id_parsed,
-                    )
-                    .await?
+                if let Some(projection) = db::repos::artifact_contracts::find_run_state_projection(
+                    &self.pool,
+                    run_id_parsed,
+                )
+                .await?
                 {
                     obj.insert("active_artifact_index".into(), projection.active_index_json);
                     obj.insert("run_state_projection".into(), projection.run_state_json);
@@ -2617,21 +2723,20 @@ mod p029_capability_tests {
     fn test_mcp_tools_list_filtered_for_agent() {
         let ag = Principal::new("ag", PrincipalClass::Agent);
         let names = tools_list_names_for(&ag);
-        // Agents can create ideas and start runs but cannot approve, cancel,
-        // retry, or enter the steward/reports surface.
-        // SEC-004: reports.get is Operator-only (exposes operator diagnostics).
+        // Agents can create ideas, start runs, and read reports but cannot approve,
+        // cancel, retry, or enter the steward surface.
         for expected in [
             "ideas.create",
             "ideas.list",
             "runs.start",
             "runs.list",
             "runs.get",
+            "reports.get",
         ] {
             let expected = expected.replace('.', "_");
             assert!(names.contains(&expected), "agent missing {expected}");
         }
         for forbidden in [
-            "reports.get",
             "runs.main_sync.request",
             "runs.main_sync.retry",
             "runs.main_sync.set_override",
@@ -2659,13 +2764,13 @@ mod p029_capability_tests {
     fn test_mcp_tools_list_filtered_for_observer() {
         let ob = Principal::new("ob", PrincipalClass::Observer);
         let names = tools_list_names_for(&ob);
-        // Observer is read-only: sees list/get surfaces + approvals.list +
-        // steward readers. Must not see any command tool or operator-diagnostic tool.
-        // SEC-004: reports.get is Operator-only (exposes operator diagnostics).
+        // Observer is read-only: sees list/get/report surfaces + approvals.list +
+        // steward readers. Must not see any command tool.
         for expected in [
             "ideas.list",
             "runs.list",
             "runs.get",
+            "reports.get",
             "approvals.list",
             "steward.list_analyses",
             "steward.get_analysis",
@@ -2674,7 +2779,6 @@ mod p029_capability_tests {
             assert!(names.contains(&expected), "observer missing {expected}");
         }
         for forbidden in [
-            "reports.get",
             "ideas.create",
             "runs.start",
             "runs.cancel",
@@ -2746,13 +2850,11 @@ mod p029_capability_tests {
         // Agent CAN read run://, idea://.
         assert!(resources_read_allowed(&ag, "run://r-1"));
         assert!(resources_read_allowed(&ag, "idea://i-1"));
-        // HIGH-001: report:// is Operator-only; Agent and Observer are denied.
         assert!(!resources_read_allowed(&ag, "report://some-run-id"));
 
         // Unknown URI scheme also denied.
         assert!(!resources_read_allowed(&ag, "bogus://1"));
 
-        // Observer is also denied report://.
         let ob = Principal::new("ob", PrincipalClass::Observer);
         assert!(!resources_read_allowed(&ob, "report://some-run-id"));
 
@@ -3905,6 +4007,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn p082_mcp_stdio_session_recheck_uses_live_principal_table_after_reload() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let source = server.live_principal_source();
+        let token = "test-token-xxxxxxxxxxxxxxxxxxxxx";
+        let credential = auth::LivePrincipalCredential {
+            principal_id: "test-operator".into(),
+            token_fingerprint: auth::token_fingerprint(token),
+        };
+
+        assert!(
+            source.resolve_credential(&credential).is_ok(),
+            "stdio initialized session precondition"
+        );
+
+        source.update(auth::PrincipalTable::test_fixture_disabled_token(
+            token,
+            "test-operator",
+        ));
+        assert!(
+            source.resolve_credential(&credential).is_err(),
+            "disabled bearer must be rejected by stdio live-session recheck"
+        );
+
+        source.update(auth::PrincipalTable::test_fixture_with_class(
+            "observer-token-xxxxxxxxxxxxxxxxxx",
+            "test-operator",
+            auth::PrincipalClass::Observer,
+        ));
+        assert!(
+            source.resolve_credential(&credential).is_err(),
+            "revoked bearer fingerprint must be rejected by stdio live-session recheck"
+        );
+
+        source.update(auth::PrincipalTable::test_fixture_with_class(
+            token,
+            "test-operator",
+            auth::PrincipalClass::Observer,
+        ));
+        let current = source
+            .resolve_credential(&credential)
+            .expect("re-scoped bearer remains resolvable");
+        assert_eq!(current.class, auth::PrincipalClass::Observer);
+        assert!(
+            !current
+                .tool_capabilities
+                .contains(&domain::CapabilityToolId::ReportsGet),
+            "stdio must observe re-scoped capabilities after reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn p082_reports_get_tools_call_denies_non_operator_principals() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        for principal in [
+            auth::Principal::new("agent-report-reader", auth::PrincipalClass::Agent),
+            auth::Principal::new("observer-report-reader", auth::PrincipalClass::Observer),
+        ] {
+            let response = server
+                .handle_request(
+                    JsonRpcRequest {
+                        jsonrpc: "2.0".to_string(),
+                        id: Some(serde_json::json!(82)),
+                        method: "tools/call".to_string(),
+                        params: Some(serde_json::json!({
+                            "name": "reports.get",
+                            "arguments": {
+                                "run_id": domain::ids::RunId::new().to_string()
+                            }
+                        })),
+                    },
+                    &principal,
+                )
+                .await;
+
+            let error = response
+                .error
+                .expect("non-Operator reports.get call must be denied");
+            assert_eq!(error.code, -32004);
+            assert!(
+                response.result.is_none(),
+                "non-Operator reports.get must not return report lanes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn p082_report_resource_read_denies_non_operator_principals() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        for principal in [
+            auth::Principal::new("agent-report-resource", auth::PrincipalClass::Agent),
+            auth::Principal::new("observer-report-resource", auth::PrincipalClass::Observer),
+        ] {
+            let response = server
+                .handle_request(
+                    JsonRpcRequest {
+                        jsonrpc: "2.0".to_string(),
+                        id: Some(serde_json::json!(83)),
+                        method: "resources/read".to_string(),
+                        params: Some(serde_json::json!({
+                            "uri": format!("report://{}", domain::ids::RunId::new())
+                        })),
+                    },
+                    &principal,
+                )
+                .await;
+
+            let error = response
+                .error
+                .expect("non-Operator report:// read must be denied");
+            assert_eq!(error.code, -32002);
+            assert!(
+                response.result.is_none(),
+                "non-Operator report:// must not return report contents"
+            );
+        }
+    }
+
+    async fn read_runs_resource_json(
+        server: &McpServer,
+        principal: &auth::Principal,
+    ) -> serde_json::Value {
+        let response = server
+            .handle_request(
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(serde_json::json!(1)),
+                    method: "resources/read".to_string(),
+                    params: Some(serde_json::json!({"uri": "chainworks://runs"})),
+                },
+                principal,
+            )
+            .await;
+        let text = response.result.expect("resources/read result")["contents"][0]["text"]
+            .as_str()
+            .expect("resources/read text")
+            .to_string();
+        serde_json::from_str(&text).expect("chainworks://runs resource is JSON")
+    }
+
+    #[tokio::test]
+    async fn p082_chainworks_runs_resource_redacts_operator_only_projection_fields_for_non_operators(
+    ) {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        persist_blocked_implementation_summary(&pool, run_id).await;
+        projections::rebuild_run_summary(&pool, run_id)
+            .await
+            .unwrap();
+
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let operator_runs = read_runs_resource_json(&server, &operator_principal()).await;
+        let operator_row = operator_runs
+            .as_array()
+            .and_then(|rows| rows.first())
+            .expect("operator chainworks://runs row");
+        assert!(
+            operator_row.get("workspace_root").is_some(),
+            "operator resource read should include workspace_root before non-operator redaction"
+        );
+        assert!(
+            operator_row.get("implementationCompletion").is_some(),
+            "operator resource read should include projected implementationCompletion before non-operator redaction"
+        );
+
+        for principal_class in [auth::PrincipalClass::Observer, auth::PrincipalClass::Agent] {
+            let principal = auth::Principal::new("non-operator", principal_class);
+            let runs_json = read_runs_resource_json(&server, &principal).await;
+            let row = runs_json
+                .as_array()
+                .and_then(|rows| rows.first())
+                .expect("non-operator chainworks://runs row");
+            for field in [
+                "workspace_root",
+                "artifact_root",
+                "chainworks_meta_root",
+                "implementationCompletion",
+                "closeout_readiness_summary",
+                "implementation_closeout_readiness_summary",
+            ] {
+                assert!(
+                    row.get(field).is_none(),
+                    "non-operator chainworks://runs resource must redact {field}: {row}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn proposal_075_storage_tool_dispatch_returns_typed_unauthorized() {
         let pool = test_pool().await;
         let server = McpServer::new(
@@ -4839,18 +5155,35 @@ mod tests {
             .unwrap();
 
         // Seed a startup_repair with a valid P082 readback in notes.
-        let readback = recovery_matrix::build_readback_v1(
-            "P082-R01",
-            "repaired",
-            "retry",
-            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
-            "Startup requeue scheduled; requeue_generation=1.",
-            "startup_repairs",
-            "startup_repairs, work_items",
-            &format!("p082-requeue:cj-server-test:{run_id}:1"),
-            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-            "valid",
-            "2026-05-22T00:00:00Z",
+        let repair_id = format!("p082-requeue:cj-server-test:{run_id}:1");
+        let readback = recovery_matrix::set_readback_startup_repair(
+            recovery_matrix::build_readback_v1(
+                "P082-R01",
+                "repaired",
+                "retry",
+                recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+                "Startup requeue scheduled; requeue_generation=1.",
+                "startup_repairs, work_items, command_journal",
+                "startup_repairs, work_items",
+                &repair_id,
+                Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+                "valid",
+                "2026-05-22T00:00:00Z",
+            ),
+            recovery_matrix::build_startup_repair_summary(
+                &repair_id,
+                "wi-server-test",
+                "cj-server-test",
+                1,
+                1,
+                false,
+                60_000,
+                "2026-05-22T00:00:00Z",
+                false,
+                None,
+                "global",
+            ),
+            None,
         );
         let notes = serde_json::json!({
             "requeue_generation": 1,
@@ -5009,6 +5342,20 @@ mod tests {
                 artifact_readbacks.is_empty(),
                 "P082 SEC-HIGH-1: report:// run_report artifact readbacks must be empty for non-Operators"
             );
+            for forbidden_field in [
+                "code_writer_completion_receipts",
+                "implementationCompletion",
+                "workflow_conflict",
+                "retryAuthority",
+                "retryAuthorityHistory",
+                "p091OrphanRepairReadback",
+                "rollout_contract_readback",
+            ] {
+                assert!(
+                    value.get(forbidden_field).is_none(),
+                    "P082 SEC-HIGH-1: report:// must omit operator field {forbidden_field} for non-Operators"
+                );
+            }
         }
     }
 }

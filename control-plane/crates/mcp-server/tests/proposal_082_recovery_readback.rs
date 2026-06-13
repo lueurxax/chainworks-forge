@@ -96,6 +96,39 @@ async fn seed_run(pool: &sqlx::SqlitePool) -> RunId {
     run_id
 }
 
+fn p082_startup_repair_summary(
+    repair_id: &str,
+    source_work_item_id: &str,
+    source_command_journal_id: &str,
+) -> serde_json::Value {
+    domain::recovery_matrix::build_startup_repair_summary(
+        repair_id,
+        source_work_item_id,
+        source_command_journal_id,
+        1,
+        1,
+        false,
+        180_000,
+        "2026-05-21T10:03:00Z",
+        false,
+        None,
+        "run",
+    )
+}
+
+fn p082_attach_startup_summary(
+    readback: serde_json::Value,
+    repair_id: &str,
+    source_work_item_id: &str,
+    source_command_journal_id: &str,
+) -> serde_json::Value {
+    domain::recovery_matrix::set_readback_startup_repair(
+        readback,
+        p082_startup_repair_summary(repair_id, source_work_item_id, source_command_journal_id),
+        None,
+    )
+}
+
 async fn seed_p082_readback_for_reason(
     pool: &sqlx::SqlitePool,
     run_id: RunId,
@@ -103,18 +136,27 @@ async fn seed_p082_readback_for_reason(
     reason_code: &str,
 ) {
     let repair_id = format!("p082-reason-{index:02}-{run_id}");
-    let readback = domain::recovery_matrix::build_readback_v1(
-        "P082-R01",
-        "repaired",
-        "wait",
-        reason_code,
-        "Operator readback coverage for canonical P082 recovery reason code.",
-        "startup_repairs",
-        "startup_repairs",
+    let readback = p082_attach_startup_summary(
+        domain::recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "wait",
+            reason_code,
+            "Operator readback coverage for canonical P082 recovery reason code.",
+            "startup_repairs",
+            "startup_repairs",
+            &repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T10:03:01Z",
+        ),
         &repair_id,
-        Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-        "valid",
-        "2026-05-21T10:03:01Z",
+        &format!("wi-reason-{index:02}"),
+        &format!("cj-reason-{index:02}"),
+    );
+    assert!(
+        domain::recovery_matrix::validate_readback_v1_shape(&readback),
+        "seed reason readback must validate: {readback}"
     );
     let notes = serde_json::json!({
         "p082_recovery_matrix_readback": readback,
@@ -178,6 +220,37 @@ async fn p082_runs_get_includes_singular_and_plural_readback() {
     assert!(
         result["p082_recovery_matrix_readbacks"].is_array(),
         "P082: p082_recovery_matrix_readbacks must be an array"
+    );
+}
+
+#[tokio::test]
+async fn p082_runs_cancel_rejects_missing_idempotency_key_before_mutation() {
+    let pool = test_pool().await;
+    let run_id = seed_run(&pool).await;
+    let handler = command_handler(pool.clone());
+    let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+
+    let err = mcp_runs::execute(
+        "runs.cancel",
+        serde_json::json!({ "run_id": run_id.to_string() }),
+        &pool,
+        &handler,
+        &principal,
+    )
+    .await
+    .expect_err("runs.cancel must reject missing idempotency_key");
+
+    assert!(
+        err.to_string().contains("Missing 'idempotency_key'"),
+        "missing idempotency_key must be rejected before CancelRun mutation, got {err}"
+    );
+    let journal_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM command_journal")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        journal_count, 0,
+        "missing idempotency_key must not write a CancelRun command journal entry"
     );
 }
 
@@ -307,18 +380,24 @@ async fn p082_runs_get_returns_non_empty_readback_when_startup_repair_row_exists
     let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
 
     // Build a valid P082 readback for P082-R01 (startup_requeue_once).
-    let readback = recovery_matrix::build_readback_v1(
-        "P082-R01",
-        "repaired",
-        "retry",
-        recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
-        "Startup requeue scheduled; startup_repairs row created with requeue_generation=1.",
-        "startup_repairs",
-        "startup_repairs, work_items",
-        &format!("p082-requeue:cj-mcp-test:{run_id}:1"),
-        Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-        "valid",
-        "2026-05-21T10:03:01Z",
+    let repair_id = format!("p082-requeue:cj-mcp-test:{run_id}:1");
+    let readback = p082_attach_startup_summary(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled; startup_repairs row created with requeue_generation=1.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T10:03:01Z",
+        ),
+        &repair_id,
+        "wi-mcp-test",
+        "cj-mcp-test",
     );
 
     // Embed the readback in the startup_repair notes JSON.
@@ -329,7 +408,6 @@ async fn p082_runs_get_returns_non_empty_readback_when_startup_repair_row_exists
     })
     .to_string();
 
-    let repair_id = format!("p082-requeue:cj-mcp-test:{run_id}:1");
     startup_repairs::record(
         &pool,
         &repair_id,
@@ -477,9 +555,15 @@ async fn p082_runs_get_returns_readback_from_command_journal_rejected_envelope()
         "Stage is not in a retryable status.",
         readback,
     );
-    command_journal::fail_entry(&pool, &journal_id, now, &envelope)
-        .await
-        .expect("fail command journal entry with p082 envelope");
+    sqlx::query(
+        r#"UPDATE command_journal SET result_status = 'rejected', error = ?1, completed_at = ?2 WHERE id = ?3"#,
+    )
+    .bind(&envelope)
+    .bind(now.to_rfc3339())
+    .bind(&journal_id)
+    .execute(&pool)
+    .await
+    .expect("reject command journal entry with p082 envelope");
 
     // runs.get must return a non-null singular readback from the rejected command.
     let result = mcp_runs::execute(
@@ -635,18 +719,24 @@ async fn p082_runs_get_strips_injected_sensitive_keys_from_startup_repair_notes(
     let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
 
     // Build a readback with injected sensitive keys
-    let readback = recovery_matrix::build_readback_v1(
-        "P082-R01",
-        "repaired",
-        "retry",
-        recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
-        "Startup requeue scheduled.",
-        "startup_repairs",
-        "startup_repairs, work_items",
-        &format!("p082-requeue:cj-sec-mcp:{run_id}:1"),
-        Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-        "valid",
-        "2026-05-21T10:03:01Z",
+    let repair_id = format!("p082-requeue:cj-sec-mcp:{run_id}:1");
+    let readback = p082_attach_startup_summary(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T10:03:01Z",
+        ),
+        &repair_id,
+        "wi-sec-mcp",
+        "cj-sec-mcp",
     );
 
     let mut readback_obj = readback.as_object().cloned().unwrap();
@@ -667,7 +757,6 @@ async fn p082_runs_get_strips_injected_sensitive_keys_from_startup_repair_notes(
     })
     .to_string();
 
-    let repair_id = format!("p082-requeue:cj-sec-mcp:{run_id}:1");
     startup_repairs::record(
         &pool,
         &repair_id,
@@ -733,18 +822,24 @@ async fn p082_runs_get_and_reports_get_readbacks_parity() {
     let now = chrono::Utc::now();
 
     // R01 row via startup_repairs.notes
-    let r01_readback = recovery_matrix::build_readback_v1(
-        "P082-R01",
-        "repaired",
-        "retry",
-        recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
-        "Startup requeue scheduled.",
-        "startup_repairs",
-        "startup_repairs, work_items",
-        &format!("p082-requeue:cj-parity:{run_id}:1"),
-        Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-        "valid",
-        "2026-05-22T00:00:00Z",
+    let parity_repair_id = format!("p082-requeue:cj-parity:{run_id}:1");
+    let r01_readback = p082_attach_startup_summary(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &parity_repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-22T00:00:00Z",
+        ),
+        &parity_repair_id,
+        "wi-parity",
+        "cj-parity",
     );
     let notes = serde_json::json!({
         "requeue_generation": 1,
@@ -754,7 +849,7 @@ async fn p082_runs_get_and_reports_get_readbacks_parity() {
     .to_string();
     startup_repairs::record(
         &pool,
-        &format!("p082-requeue:cj-parity:{run_id}:1"),
+        &parity_repair_id,
         &run_id.to_string(),
         "requeue_once",
         now,
@@ -913,18 +1008,24 @@ async fn p082_runs_get_agent_principal_receives_null_and_empty_readbacks() {
     let handler = command_handler(pool.clone());
 
     // Seed a valid P082 startup repair row so Operator would see real data.
-    let readback = recovery_matrix::build_readback_v1(
-        "P082-R01",
-        "repaired",
-        "retry",
-        recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
-        "Startup requeue scheduled.",
-        "startup_repairs",
-        "startup_repairs, work_items",
-        &format!("p082-requeue:cj-agent-authz:{run_id}:1"),
-        Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-        "valid",
-        "2026-05-21T10:03:01Z",
+    let authz_repair_id = format!("p082-requeue:cj-agent-authz:{run_id}:1");
+    let readback = p082_attach_startup_summary(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &authz_repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T10:03:01Z",
+        ),
+        &authz_repair_id,
+        "wi-agent-authz",
+        "cj-agent-authz",
     );
     let notes = serde_json::json!({
         "requeue_generation": 1,
@@ -934,7 +1035,7 @@ async fn p082_runs_get_agent_principal_receives_null_and_empty_readbacks() {
     .to_string();
     startup_repairs::record(
         &pool,
-        &format!("p082-requeue:cj-agent-authz:{run_id}:1"),
+        &authz_repair_id,
         &run_id.to_string(),
         "requeue_once",
         chrono::Utc::now(),
@@ -1035,18 +1136,24 @@ async fn p082_reports_get_agent_principal_receives_empty_readbacks() {
     let handler = command_handler(pool.clone());
 
     // Seed a valid P082 startup repair row.
-    let readback = recovery_matrix::build_readback_v1(
-        "P082-R01",
-        "repaired",
-        "retry",
-        recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
-        "Startup requeue scheduled.",
-        "startup_repairs",
-        "startup_repairs, work_items",
-        &format!("p082-requeue:cj-agent-reports:{run_id}:1"),
-        Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-        "valid",
-        "2026-05-21T10:03:01Z",
+    let agent_reports_repair_id = format!("p082-requeue:cj-agent-reports:{run_id}:1");
+    let readback = p082_attach_startup_summary(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &agent_reports_repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T10:03:01Z",
+        ),
+        &agent_reports_repair_id,
+        "wi-agent-reports",
+        "cj-agent-reports",
     );
     let notes = serde_json::json!({
         "requeue_generation": 1,
@@ -1056,7 +1163,7 @@ async fn p082_reports_get_agent_principal_receives_empty_readbacks() {
     .to_string();
     startup_repairs::record(
         &pool,
-        &format!("p082-requeue:cj-agent-reports:{run_id}:1"),
+        &agent_reports_repair_id,
         &run_id.to_string(),
         "requeue_once",
         chrono::Utc::now(),
@@ -1066,7 +1173,7 @@ async fn p082_reports_get_agent_principal_receives_empty_readbacks() {
     .expect("seed startup_repair");
 
     let agent = auth::Principal::new("test-agent", auth::PrincipalClass::Agent);
-    let result = reports::execute(
+    let error = reports::execute(
         "reports.get",
         serde_json::json!({ "run_id": run_id.to_string() }),
         &pool,
@@ -1074,23 +1181,11 @@ async fn p082_reports_get_agent_principal_receives_empty_readbacks() {
         &agent,
     )
     .await
-    .expect("reports.get must succeed for Agent principal");
-
-    let reports_array = result["reports"]
-        .as_array()
-        .expect("reports.get returns array");
-    let mcp_truth = reports_array
-        .iter()
-        .find(|r| r["report_kind"] == serde_json::json!("mcp_execution_truth"))
-        .expect("mcp_execution_truth report must exist");
-
-    let readbacks = mcp_truth
-        .get("p082_recovery_matrix_readbacks")
-        .and_then(|v| v.as_array())
-        .expect("p082_recovery_matrix_readbacks must be an array");
+    .expect_err("reports.get must reject Agent principal before reading report lanes")
+    .to_string();
     assert!(
-        readbacks.is_empty(),
-        "P082 SEC-HIGH-1: Agent principal must receive empty p082_recovery_matrix_readbacks in reports.get"
+        error.contains("requires Operator"),
+        "P082 SEC-HIGH-1: Agent principal must be denied before reports.get lanes load; got {error}"
     );
 }
 
@@ -1104,18 +1199,23 @@ async fn p082_reports_get_run_report_artifact_includes_plural_readbacks() {
     let handler = command_handler(pool.clone());
     let now = chrono::Utc::now();
     let repair_id = format!("p082-requeue:cj-run-report:{run_id}:1");
-    let readback = recovery_matrix::build_readback_v1(
-        "P082-R01",
-        "repaired",
-        "retry",
-        recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
-        "Startup requeue scheduled.",
-        "startup_repairs",
-        "startup_repairs, work_items",
+    let readback = p082_attach_startup_summary(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            &now.to_rfc3339(),
+        ),
         &repair_id,
-        Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-        "valid",
-        &now.to_rfc3339(),
+        "wi-run-report",
+        "cj-run-report",
     );
     let notes = serde_json::json!({
         "p082_recovery_matrix_readback": readback,
@@ -1158,6 +1258,20 @@ async fn p082_reports_get_run_report_artifact_includes_plural_readbacks() {
     .expect("insert run_report artifact");
 
     let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+    let reports_get_metric_before = db::metrics::get_counter_with_label(
+        "p082_recovery_reason_readback_total",
+        &format!(
+            "{}:reports.get",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE
+        ),
+    );
+    let run_report_metric_before = db::metrics::get_counter_with_label(
+        "p082_recovery_reason_readback_total",
+        &format!(
+            "{}:run_report",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE
+        ),
+    );
     let result = reports::execute(
         "reports.get",
         serde_json::json!({ "run_id": run_id.to_string() }),
@@ -1189,6 +1303,26 @@ async fn p082_reports_get_run_report_artifact_includes_plural_readbacks() {
             .and_then(|value| value.as_str()),
         Some("P082-R01")
     );
+    assert!(
+        db::metrics::get_counter_with_label(
+            "p082_recovery_reason_readback_total",
+            &format!(
+                "{}:reports.get",
+                recovery_matrix::REASON_STARTUP_REQUEUE_ONCE
+            ),
+        ) > reports_get_metric_before,
+        "P082: reports.get must emit the container-level recovery reason lane metric"
+    );
+    assert!(
+        db::metrics::get_counter_with_label(
+            "p082_recovery_reason_readback_total",
+            &format!(
+                "{}:run_report",
+                recovery_matrix::REASON_STARTUP_REQUEUE_ONCE
+            ),
+        ) > run_report_metric_before,
+        "P082: embedded run_report artifact must emit its own recovery reason lane metric"
+    );
 }
 
 #[tokio::test]
@@ -1201,18 +1335,23 @@ async fn p082_reports_get_run_report_artifact_empty_for_agent_and_observer() {
     let handler = command_handler(pool.clone());
     let now = chrono::Utc::now();
     let repair_id = format!("p082-requeue:cj-run-report-authz:{run_id}:1");
-    let readback = recovery_matrix::build_readback_v1(
-        "P082-R01",
-        "repaired",
-        "retry",
-        recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
-        "Startup requeue scheduled.",
-        "startup_repairs",
-        "startup_repairs, work_items",
+    let readback = p082_attach_startup_summary(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            &now.to_rfc3339(),
+        ),
         &repair_id,
-        Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-        "valid",
-        &now.to_rfc3339(),
+        "wi-run-report-authz",
+        "cj-run-report-authz",
     );
     let notes = serde_json::json!({
         "p082_recovery_matrix_readback": readback,
@@ -1256,7 +1395,7 @@ async fn p082_reports_get_run_report_artifact_empty_for_agent_and_observer() {
 
     for principal_class in [auth::PrincipalClass::Agent, auth::PrincipalClass::Observer] {
         let principal = auth::Principal::new("test-non-operator", principal_class);
-        let result = reports::execute(
+        let error = reports::execute(
             "reports.get",
             serde_json::json!({ "run_id": run_id.to_string() }),
             &pool,
@@ -1264,21 +1403,11 @@ async fn p082_reports_get_run_report_artifact_empty_for_agent_and_observer() {
             &principal,
         )
         .await
-        .expect("reports.get must succeed");
-        let reports_array = result["reports"]
-            .as_array()
-            .expect("reports.get returns reports array");
-        let run_report = reports_array
-            .iter()
-            .find(|report| report["name"] == serde_json::json!("run_report"))
-            .expect("reports.get must include the generated run_report artifact");
-        let readbacks = run_report
-            .get("p082_recovery_matrix_readbacks")
-            .and_then(|value| value.as_array())
-            .expect("run_report artifact must include p082_recovery_matrix_readbacks");
+        .expect_err("reports.get must reject non-Operator principal before reading report lanes")
+        .to_string();
         assert!(
-            readbacks.is_empty(),
-            "P082 SEC-HIGH-1: non-Operator run_report artifacts must not expose recovery readbacks"
+            error.contains("requires Operator"),
+            "P082 SEC-HIGH-1: non-Operator run_report artifacts must not be reachable; got {error}"
         );
     }
 }
@@ -1298,19 +1427,25 @@ async fn p082_runs_get_redacts_embedded_absolute_paths_in_allowed_fields() {
 
     // Build a readback with embedded absolute paths in top-level allowed fields,
     // string arrays, and nested subcontract values.
-    let mut readback = recovery_matrix::build_readback_v1(
-        "P082-R01",
-        "repaired",
-        "retry",
-        recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
-        // Embedded path in recovery_next_action (allowed field)
-        "Inspect /Users/alice/Documents/run-output.txt for details.",
-        "startup_repairs",
-        "startup_repairs, work_items",
-        &format!("p082-requeue:cj-path-sec:{run_id}:1"),
-        Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-        "valid",
-        "2026-05-21T10:03:01Z",
+    let path_repair_id = format!("p082-requeue:cj-path-sec:{run_id}:1");
+    let mut readback = p082_attach_startup_summary(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            // Embedded path in recovery_next_action (allowed field)
+            "Inspect /Users/alice/Documents/run-output.txt for details.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &path_repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T10:03:01Z",
+        ),
+        &path_repair_id,
+        "wi-path-sec",
+        "cj-path-sec",
     )
     .as_object()
     .cloned()
@@ -1430,18 +1565,23 @@ async fn p082_release_receipt_lane_includes_readbacks_and_no_command_affordances
     let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
 
     // Seed a P082-R01 readback via startup_repairs.
-    let readback = recovery_matrix::build_readback_v1(
-        "P082-R01",
-        "repaired",
-        "retry",
-        recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
-        "Startup requeue for release_receipt lane test.",
-        "startup_repairs",
-        "startup_repairs, work_items",
+    let readback = p082_attach_startup_summary(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue for release_receipt lane test.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &format!("p082-requeue:cj-release:{run_id}:1"),
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T10:03:01Z",
+        ),
         &format!("p082-requeue:cj-release:{run_id}:1"),
-        Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-        "valid",
-        "2026-05-21T10:03:01Z",
+        "wi-release",
+        "cj-release",
     );
     let notes = serde_json::json!({
         "requeue_generation": 1,
@@ -1484,6 +1624,20 @@ async fn p082_release_receipt_lane_includes_readbacks_and_no_command_affordances
         .await
         .expect("insert delivery_receipt artifact");
 
+    let reports_get_metric_before = db::metrics::get_counter_with_label(
+        "p082_recovery_reason_readback_total",
+        &format!(
+            "{}:reports.get",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE
+        ),
+    );
+    let release_receipt_metric_before = db::metrics::get_counter_with_label(
+        "p082_recovery_reason_readback_total",
+        &format!(
+            "{}:release_receipt",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE
+        ),
+    );
     let result = reports::execute(
         "reports.get",
         serde_json::json!({ "run_id": run_id.to_string() }),
@@ -1522,6 +1676,26 @@ async fn p082_release_receipt_lane_includes_readbacks_and_no_command_affordances
             "P082: delivery_receipt must not expose recovery command affordance '{affordance}'"
         );
     }
+    assert!(
+        db::metrics::get_counter_with_label(
+            "p082_recovery_reason_readback_total",
+            &format!(
+                "{}:reports.get",
+                recovery_matrix::REASON_STARTUP_REQUEUE_ONCE
+            ),
+        ) > reports_get_metric_before,
+        "P082: reports.get must emit the container-level recovery reason lane metric for release receipt payloads"
+    );
+    assert!(
+        db::metrics::get_counter_with_label(
+            "p082_recovery_reason_readback_total",
+            &format!(
+                "{}:release_receipt",
+                recovery_matrix::REASON_STARTUP_REQUEUE_ONCE
+            ),
+        ) > release_receipt_metric_before,
+        "P082: embedded release receipt artifact must emit its own recovery reason lane metric"
+    );
 }
 
 /// SEC-HIGH-002: Agent and Observer principals must not receive sensitive Run fields
@@ -1744,7 +1918,7 @@ async fn sec_high_001_reports_get_omits_canonical_artifact_contracts_for_non_ope
 
     for class in [auth::PrincipalClass::Agent, auth::PrincipalClass::Observer] {
         let principal = auth::Principal::new("test-non-op", class.clone());
-        let result = reports::execute(
+        let error = reports::execute(
             "reports.get",
             serde_json::json!({ "run_id": run_id.to_string() }),
             &pool,
@@ -1752,35 +1926,13 @@ async fn sec_high_001_reports_get_omits_canonical_artifact_contracts_for_non_ope
             &principal,
         )
         .await
-        .expect("reports.get must remain readable for non-operators");
-
-        let reports = result
-            .get("reports")
-            .and_then(serde_json::Value::as_array)
-            .or_else(|| result.as_array())
-            .expect("reports.get must return a reports array");
+        .expect_err("reports.get must reject non-operators before sensitive report lanes load")
+        .to_string();
         assert!(
-            reports
-                .iter()
-                .all(|report| report["report_kind"] != "canonical_artifact_contracts"),
-            "SEC-P082-HIGH-001: {:?} must not receive canonical_artifact_contracts",
+            error.contains("requires Operator"),
+            "SEC-P082-HIGH-001: {:?} must be denied before canonical_artifact_contracts can load; got {error}",
             class
         );
-        let serialized = serde_json::to_string(&result).unwrap();
-        for forbidden in [
-            "operator_overrides",
-            "legacy_discovery_overrides",
-            "active_index",
-            "run_state_projection",
-            "/Users/user/private/review/prepush.json",
-            "operator verified sensitive override",
-        ] {
-            assert!(
-                !serialized.contains(forbidden),
-                "SEC-P082-HIGH-001: {:?} reports.get leaked {forbidden}",
-                class
-            );
-        }
     }
 
     let operator = auth::Principal::new("test-op", auth::PrincipalClass::Operator);

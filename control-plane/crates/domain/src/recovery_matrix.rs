@@ -3,6 +3,17 @@
 //!
 //! Reason codes are append-only. Do not rename or remove existing codes.
 
+// ── Startup recovery timing constants ────────────────────────────────────────
+
+/// Standard ACP startup grace before a provider-less startup row is stale.
+pub const STANDARD_STARTUP_GRACE_SECONDS: i64 = 3 * 60;
+/// Extended Xcode startup grace before a provider-less startup row is stale.
+pub const XCODE_STARTUP_GRACE_SECONDS: i64 = 12 * 60;
+/// Operator warning threshold for the Xcode startup grace lane.
+pub const XCODE_STARTUP_GRACE_WARN_SECONDS: u64 = 12 * 60;
+/// Operator critical threshold for the Xcode startup grace lane.
+pub const XCODE_STARTUP_GRACE_CRITICAL_SECONDS: u64 = 15 * 60;
+
 // ── Reason codes ─────────────────────────────────────────────────────────────
 
 pub const REASON_RESUME_CLAIM_STATUS: &str = "resume_claim_status";
@@ -505,15 +516,43 @@ pub fn build_readback_v1(
 }
 
 const VALID_DIAGNOSTIC_REDACTIONS: &[&str] = &["none", "partial", "full"];
+const SOURCE_KEY_COMMAND_JOURNAL_ERROR: &str =
+    "command_journal.error.p082_recovery_matrix_readback";
+const SOURCE_KEY_STARTUP_REPAIRS_NOTES: &str =
+    "startup_repairs.notes.p082_recovery_matrix_readback";
+const SOURCE_KEY_STAGE_EXECUTIONS_RECOVERY_SNAPSHOT: &str =
+    "stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback";
+const SOURCE_KEY_RUNS_CANCELLATION_SETTLEMENT_LOG: &str =
+    "runs.cancellation_settlement_log.p082_recovery_matrix_readback";
+const SOURCE_KEY_RETRY_PAYLOAD_RECOVERY_EVENTS_DIAGNOSTIC: &str =
+    "retry_payload_recovery_events.diagnostic_json.p082_recovery_matrix_readback";
+const SOURCE_KEY_SESSION_EVENTS_DETAILS: &str =
+    "session_events.details_json.p082_recovery_matrix_readback";
+const SOURCE_KEY_LEAD_CONFLICT_MEDIATIONS_VALIDATION_ERRORS: &str =
+    "lead_conflict_mediations.validation_errors_json.p082_recovery_matrix_readback";
+const SOURCE_KEY_WORKFLOW_CONFLICTS_RECORD: &str =
+    "workflow_conflicts.record_json.p082_recovery_matrix_readback";
+const APPROVED_JSON_SOURCE_KEYS: &[&str] = &[
+    SOURCE_KEY_COMMAND_JOURNAL_ERROR,
+    SOURCE_KEY_STARTUP_REPAIRS_NOTES,
+    SOURCE_KEY_STAGE_EXECUTIONS_RECOVERY_SNAPSHOT,
+    SOURCE_KEY_RUNS_CANCELLATION_SETTLEMENT_LOG,
+    SOURCE_KEY_RETRY_PAYLOAD_RECOVERY_EVENTS_DIAGNOSTIC,
+    SOURCE_KEY_SESSION_EVENTS_DETAILS,
+    SOURCE_KEY_LEAD_CONFLICT_MEDIATIONS_VALIDATION_ERRORS,
+    SOURCE_KEY_WORKFLOW_CONFLICTS_RECORD,
+];
 const VALID_IDENTIFIER_KINDS: &[&str] = &[
     "workflow_stage_id",
     "stage_execution_uuid",
+    "agent_execution_id",
     "retry_authority_id",
     "work_item_id",
 ];
 const VALID_PROVIDED_IDENTIFIER_KINDS: &[&str] = &[
     "workflow_stage_id",
     "stage_execution_uuid",
+    "agent_execution_id",
     "retry_authority_id",
     "work_item_id",
     "unknown",
@@ -555,6 +594,92 @@ fn object_string_array(obj: &serde_json::Map<String, serde_json::Value>, key: &s
     }
 }
 
+fn scenario_requires_retry_identifier_guidance(scenario_id: &str) -> bool {
+    matches!(scenario_id, "P082-R08")
+}
+
+fn scenario_requires_late_output_settlement(scenario_id: &str) -> bool {
+    matches!(scenario_id, "P082-R03" | "P082-R17")
+}
+
+fn scenario_requires_startup_repair_summary(scenario_id: &str) -> bool {
+    matches!(
+        scenario_id,
+        "P082-R01" | "P082-R05" | "P082-R14" | "P082-R15" | "P082-R16"
+    )
+}
+
+fn scenario_allows_side_effect_blocking_status(scenario_id: &str) -> bool {
+    matches!(scenario_id, "P082-R07" | "P082-R13")
+}
+
+fn required_json_source_key(
+    scenario_id: &str,
+    reason_code: &str,
+    integrity: &str,
+    source_table: &str,
+) -> Option<&'static str> {
+    match scenario_id {
+        "P082-R01" | "P082-R15" | "P082-R16" => Some(SOURCE_KEY_STARTUP_REPAIRS_NOTES),
+        "P082-R02" => {
+            let legacy_plain_text_fallback =
+                reason_code == REASON_RESUME_CLAIM_STATUS && integrity == "unavailable";
+            if legacy_plain_text_fallback {
+                None
+            } else {
+                Some(SOURCE_KEY_COMMAND_JOURNAL_ERROR)
+            }
+        }
+        "P082-R03" | "P082-R17" => Some(SOURCE_KEY_STAGE_EXECUTIONS_RECOVERY_SNAPSHOT),
+        "P082-R05" => {
+            if source_table.starts_with("startup_repairs") {
+                Some(SOURCE_KEY_STARTUP_REPAIRS_NOTES)
+            } else {
+                None
+            }
+        }
+        "P082-R07" | "P082-R08" => Some(SOURCE_KEY_COMMAND_JOURNAL_ERROR),
+        "P082-R09" => {
+            if source_table == "stage_executions" {
+                Some(SOURCE_KEY_STAGE_EXECUTIONS_RECOVERY_SNAPSHOT)
+            } else {
+                None
+            }
+        }
+        "P082-R11" | "P082-R12" | "P082-R13" | "P082-R14" => {
+            Some(SOURCE_KEY_RUNS_CANCELLATION_SETTLEMENT_LOG)
+        }
+        _ => None,
+    }
+}
+
+fn validate_source_json_key(
+    scenario_id: &str,
+    reason_code: &str,
+    integrity: &str,
+    source_table: &str,
+    value: &serde_json::Value,
+) -> bool {
+    let actual = match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) => Some(value.as_str()),
+        _ => return false,
+    };
+    if let Some(actual) = actual {
+        if !APPROVED_JSON_SOURCE_KEYS.contains(&actual) {
+            return false;
+        }
+    }
+    match required_json_source_key(scenario_id, reason_code, integrity, source_table) {
+        Some(expected) => actual == Some(expected),
+        None => true,
+    }
+}
+
+fn validate_iso8601_timestamp(value: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(value).is_ok()
+}
+
 fn validate_retry_identifier_guidance(value: &serde_json::Value) -> bool {
     if value.is_null() {
         return true;
@@ -583,6 +708,14 @@ fn validate_retry_identifier_guidance(value: &serde_json::Value) -> bool {
         return false;
     }
     if !object_string_array(obj, "valid_identifier_examples") {
+        return false;
+    }
+    if obj
+        .get("valid_identifier_examples")
+        .and_then(|value| value.as_array())
+        .map(|examples| examples.is_empty())
+        != Some(false)
+    {
         return false;
     }
     obj.get("no_mutation").and_then(|value| value.as_bool()) == Some(true)
@@ -737,34 +870,58 @@ pub fn validate_readback_v1_shape(rb: &serde_json::Value) -> bool {
     if !object_string_or_null(obj, "recovery_side_effect_blocking_status") {
         return false;
     }
-    // P082-R07 and P082-R13 in held status require a non-empty side-effect blocking status
-    // because operator decision gates on this field for held side-effect rows.
-    if status == "held"
-        && matches!(scenario_id, "P082-R07" | "P082-R13")
-        && obj
-            .get("recovery_side_effect_blocking_status")
-            .and_then(|v| v.as_str())
-            .map(str::is_empty)
-            .unwrap_or(true)
+    let side_effect_blocking_status = obj
+        .get("recovery_side_effect_blocking_status")
+        .unwrap_or(&serde_json::Value::Null);
+    if !scenario_allows_side_effect_blocking_status(scenario_id)
+        && !side_effect_blocking_status.is_null()
     {
         return false;
     }
-    if !validate_retry_identifier_guidance(
-        obj.get("recovery_retry_identifier_guidance")
-            .unwrap_or(&serde_json::Value::Null),
-    ) {
+    if scenario_allows_side_effect_blocking_status(scenario_id) && status == "held" {
+        match side_effect_blocking_status.as_str() {
+            Some(value) if !value.is_empty() => {}
+            _ => return false,
+        }
+    }
+    let retry_identifier_guidance = obj
+        .get("recovery_retry_identifier_guidance")
+        .unwrap_or(&serde_json::Value::Null);
+    if scenario_requires_retry_identifier_guidance(scenario_id)
+        && retry_identifier_guidance.is_null()
+    {
         return false;
     }
-    if !validate_late_output_settlement(
-        obj.get("recovery_late_output_settlement")
-            .unwrap_or(&serde_json::Value::Null),
-    ) {
+    if !scenario_requires_retry_identifier_guidance(scenario_id)
+        && !retry_identifier_guidance.is_null()
+    {
         return false;
     }
-    if !validate_startup_repair_summary(
-        obj.get("recovery_startup_repair_summary")
-            .unwrap_or(&serde_json::Value::Null),
-    ) {
+    if !validate_retry_identifier_guidance(retry_identifier_guidance) {
+        return false;
+    }
+    let late_output_settlement = obj
+        .get("recovery_late_output_settlement")
+        .unwrap_or(&serde_json::Value::Null);
+    if scenario_requires_late_output_settlement(scenario_id) && late_output_settlement.is_null() {
+        return false;
+    }
+    if !scenario_requires_late_output_settlement(scenario_id) && !late_output_settlement.is_null() {
+        return false;
+    }
+    if !validate_late_output_settlement(late_output_settlement) {
+        return false;
+    }
+    let startup_repair_summary = obj
+        .get("recovery_startup_repair_summary")
+        .unwrap_or(&serde_json::Value::Null);
+    if scenario_requires_startup_repair_summary(scenario_id) && startup_repair_summary.is_null() {
+        return false;
+    }
+    if !scenario_requires_startup_repair_summary(scenario_id) && !startup_repair_summary.is_null() {
+        return false;
+    }
+    if !validate_startup_repair_summary(startup_repair_summary) {
         return false;
     }
     if !object_string_or_null(obj, "recovery_operator_message") {
@@ -790,9 +947,9 @@ pub fn validate_readback_v1_shape(rb: &serde_json::Value) -> bool {
     if !VALID_PROJECTION_INTEGRITIES.contains(&integrity) {
         return false;
     }
-    if obj.get("source_table").and_then(|v| v.as_str()).is_none() {
+    let Some(source_table) = obj.get("source_table").and_then(|v| v.as_str()) else {
         return false;
-    }
+    };
     if obj
         .get("source_repository")
         .and_then(|v| v.as_str())
@@ -807,10 +964,22 @@ pub fn validate_readback_v1_shape(rb: &serde_json::Value) -> bool {
     {
         return false;
     }
-    if obj.get("updated_at").and_then(|v| v.as_str()).is_none() {
+    let Some(updated_at) = obj.get("updated_at").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if !validate_iso8601_timestamp(updated_at) {
         return false;
     }
-    if !object_string_or_null(obj, "source_json_key") {
+    let source_json_key = obj
+        .get("source_json_key")
+        .unwrap_or(&serde_json::Value::Null);
+    if !validate_source_json_key(
+        scenario_id,
+        reason_code,
+        integrity,
+        source_table,
+        source_json_key,
+    ) {
         return false;
     }
     match obj.get("diagnostic_redaction").and_then(|v| v.as_str()) {
@@ -823,6 +992,50 @@ pub fn validate_readback_v1_shape(rb: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn startup_summary() -> serde_json::Value {
+        build_startup_repair_summary(
+            "p082-requeue:cj-001:wi-001:1",
+            "wi-001",
+            "cj-001",
+            1,
+            1,
+            false,
+            60_000,
+            "2026-05-21T00:00:00Z",
+            false,
+            None,
+            "global",
+        )
+    }
+
+    fn late_output_settlement(cancelled_provider_session: bool) -> serde_json::Value {
+        build_late_output_settlement(
+            "ae-001",
+            "wi-001",
+            "sg-old",
+            "sg-active",
+            if cancelled_provider_session {
+                "closed"
+            } else {
+                "superseded"
+            },
+            "ignored",
+            1,
+            "completed",
+            cancelled_provider_session,
+        )
+    }
+
+    fn identifier_guidance() -> serde_json::Value {
+        build_retry_identifier_guidance(
+            "RetryAgentExecution",
+            "stage-abc-wrong-kind",
+            "stage_execution_uuid",
+            "stage_execution_uuid",
+            &["stage-exec-001"],
+        )
+    }
 
     #[test]
     fn all_reason_codes_present_and_unique() {
@@ -1191,18 +1404,22 @@ mod tests {
 
     #[test]
     fn validate_readback_v1_shape_accepts_valid_row() {
-        let rb = build_readback_v1(
-            "P082-R01",
-            "repaired",
-            "retry",
-            REASON_STARTUP_REQUEUE_ONCE,
-            "Startup requeue scheduled.",
-            "startup_repairs",
-            "startup_repairs, work_items",
-            "sr-001",
-            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-            "valid",
-            "2026-05-21T00:00:00Z",
+        let rb = set_readback_startup_repair(
+            build_readback_v1(
+                "P082-R01",
+                "repaired",
+                "retry",
+                REASON_STARTUP_REQUEUE_ONCE,
+                "Startup requeue scheduled.",
+                "startup_repairs",
+                "startup_repairs, work_items",
+                "sr-001",
+                Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+                "valid",
+                "2026-05-21T00:00:00Z",
+            ),
+            startup_summary(),
+            None,
         );
         assert!(
             validate_readback_v1_shape(&rb),
@@ -1255,6 +1472,367 @@ mod tests {
         assert!(
             !validate_readback_v1_shape(&rb),
             "validate_readback_v1_shape must reject row missing updated_at"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_rejects_non_iso_updated_at() {
+        let rb = set_readback_startup_repair(
+            build_readback_v1(
+                "P082-R01",
+                "repaired",
+                "retry",
+                REASON_STARTUP_REQUEUE_ONCE,
+                "Startup requeue scheduled.",
+                "startup_repairs",
+                "startup_repairs",
+                "sr-001",
+                Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+                "valid",
+                "not-a-timestamp",
+            ),
+            startup_summary(),
+            None,
+        );
+        assert!(
+            !validate_readback_v1_shape(&rb),
+            "validate_readback_v1_shape must reject non-ISO/RFC3339 updated_at values"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_rejects_missing_required_startup_summary() {
+        let rb = build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled.",
+            "startup_repairs",
+            "startup_repairs",
+            "sr-001",
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T00:00:00Z",
+        );
+        assert!(
+            !validate_readback_v1_shape(&rb),
+            "P082-R01 must fail closed when recovery_startup_repair_summary is null"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_rejects_missing_required_late_output_settlement() {
+        let rb = build_readback_v1(
+            "P082-R03",
+            "repaired",
+            "no_mutation",
+            REASON_IGNORED_LATE_OUTPUTS,
+            "Late output was ignored.",
+            "agent_execution_runtime_facts, artifact_source_generation_claims, work_items",
+            "agent_execution_runtime_facts, artifact_contracts, work_items",
+            "stage-exec-001",
+            Some("stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T00:00:00Z",
+        );
+        assert!(
+            !validate_readback_v1_shape(&rb),
+            "P082-R03 must fail closed when recovery_late_output_settlement is null"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_accepts_required_late_output_settlement() {
+        let rb = set_readback_late_output_settlement(
+            build_readback_v1(
+                "P082-R17",
+                "repaired",
+                "no_mutation",
+                REASON_CANCELLED_PROVIDER_LATE_OUTPUT_IGNORED,
+                "Late output from cancelled provider session was ignored.",
+                "agent_execution_runtime_facts, artifact_source_generation_claims, work_items",
+                "agent_execution_runtime_facts, artifact_contracts, work_items",
+                "stage-exec-001",
+                Some("stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback"),
+                "valid",
+                "2026-05-21T00:00:00Z",
+            ),
+            late_output_settlement(true),
+        );
+        assert!(
+            validate_readback_v1_shape(&rb),
+            "P082-R17 must validate when recovery_late_output_settlement is present and valid"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_rejects_cancelled_late_output_terminal_status() {
+        let settlement = build_late_output_settlement(
+            "ae-001",
+            "wi-001",
+            "sg-old",
+            "sg-active",
+            "closed",
+            "ignored",
+            1,
+            "cancelled",
+            true,
+        );
+        let rb = set_readback_late_output_settlement(
+            build_readback_v1(
+                "P082-R17",
+                "repaired",
+                "no_mutation",
+                REASON_CANCELLED_PROVIDER_LATE_OUTPUT_IGNORED,
+                "Late output from cancelled provider session was ignored.",
+                "agent_execution_runtime_facts, artifact_source_generation_claims, work_items",
+                "agent_execution_runtime_facts, artifact_contracts, work_items",
+                "stage-exec-001",
+                Some("stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback"),
+                "valid",
+                "2026-05-21T00:00:00Z",
+            ),
+            settlement,
+        );
+
+        assert!(
+            !validate_readback_v1_shape(&rb),
+            "P082-R17 settlement must use completed/failed source work item status, not cancelled"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_rejects_missing_required_identifier_guidance() {
+        let rb = build_readback_v1(
+            "P082-R08",
+            "rejected",
+            "no_mutation",
+            REASON_VALID_IDENTIFIER_GUIDANCE,
+            "Use the expected identifier kind.",
+            "command_journal",
+            "command_journal, agent_executions, stage_executions",
+            "cmd-001",
+            Some("command_journal.error.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T00:00:00Z",
+        );
+        assert!(
+            !validate_readback_v1_shape(&rb),
+            "P082-R08 must fail closed when recovery_retry_identifier_guidance is null"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_accepts_required_identifier_guidance() {
+        let rb = set_readback_identifier_guidance(
+            build_readback_v1(
+                "P082-R08",
+                "rejected",
+                "no_mutation",
+                REASON_VALID_IDENTIFIER_GUIDANCE,
+                "Use the expected identifier kind.",
+                "command_journal",
+                "command_journal, agent_executions, stage_executions",
+                "cmd-001",
+                Some("command_journal.error.p082_recovery_matrix_readback"),
+                "valid",
+                "2026-05-21T00:00:00Z",
+            ),
+            identifier_guidance(),
+        );
+        assert!(
+            validate_readback_v1_shape(&rb),
+            "P082-R08 must validate when recovery_retry_identifier_guidance is present and valid"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_rejects_side_effect_status_on_unrelated_scenario() {
+        let mut rb = set_readback_startup_repair(
+            build_readback_v1(
+                "P082-R01",
+                "repaired",
+                "retry",
+                REASON_STARTUP_REQUEUE_ONCE,
+                "Startup requeue scheduled.",
+                "startup_repairs",
+                "startup_repairs, work_items",
+                "sr-001",
+                Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+                "valid",
+                "2026-05-21T00:00:00Z",
+            ),
+            startup_summary(),
+            None,
+        );
+        rb["recovery_side_effect_blocking_status"] =
+            serde_json::json!("unresolved_side_effect_entries");
+
+        assert!(
+            !validate_readback_v1_shape(&rb),
+            "side-effect blocking status must be null outside side-effect scenarios"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_rejects_identifier_guidance_on_unrelated_scenario() {
+        let mut rb = build_readback_v1(
+            "P082-R02",
+            "rejected",
+            "no_mutation",
+            REASON_RESUME_CLAIM_STATUS,
+            "Retry command was rejected before mutation.",
+            "command_journal",
+            "command_journal",
+            "cmd-001",
+            Some("command_journal.error.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T00:00:00Z",
+        );
+        rb["recovery_retry_identifier_guidance"] = identifier_guidance();
+
+        assert!(
+            !validate_readback_v1_shape(&rb),
+            "retry identifier guidance must be null outside identifier-guidance scenarios"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_rejects_late_output_settlement_on_unrelated_scenario() {
+        let mut rb = set_readback_startup_repair(
+            build_readback_v1(
+                "P082-R01",
+                "repaired",
+                "retry",
+                REASON_STARTUP_REQUEUE_ONCE,
+                "Startup requeue scheduled.",
+                "startup_repairs",
+                "startup_repairs, work_items",
+                "sr-001",
+                Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+                "valid",
+                "2026-05-21T00:00:00Z",
+            ),
+            startup_summary(),
+            None,
+        );
+        rb["recovery_late_output_settlement"] = late_output_settlement(false);
+
+        assert!(
+            !validate_readback_v1_shape(&rb),
+            "late-output settlement must be null outside late-output scenarios"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_rejects_startup_summary_on_unrelated_scenario() {
+        let mut rb = build_readback_v1(
+            "P082-R02",
+            "rejected",
+            "no_mutation",
+            REASON_RESUME_CLAIM_STATUS,
+            "Retry command was rejected before mutation.",
+            "command_journal",
+            "command_journal",
+            "cmd-001",
+            Some("command_journal.error.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T00:00:00Z",
+        );
+        rb["recovery_startup_repair_summary"] = startup_summary();
+
+        assert!(
+            !validate_readback_v1_shape(&rb),
+            "startup repair summary must be null outside startup/crash scenarios"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_rejects_null_json_source_key_for_json_owner() {
+        let rb = build_readback_v1(
+            "P082-R02",
+            "rejected",
+            "no_mutation",
+            REASON_INVALID_STAGE_FOR_RETRY,
+            "Stage is not retryable.",
+            "command_journal",
+            "command_journal, stages",
+            "cmd-001",
+            None,
+            "valid",
+            "2026-05-21T00:00:00Z",
+        );
+        assert!(
+            !validate_readback_v1_shape(&rb),
+            "command_journal.error-backed P082-R02 rows must carry the approved source_json_key"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_rejects_wrong_json_source_key_for_json_owner() {
+        let rb = set_readback_startup_repair(
+            build_readback_v1(
+                "P082-R01",
+                "repaired",
+                "retry",
+                REASON_STARTUP_REQUEUE_ONCE,
+                "Startup requeue scheduled.",
+                "startup_repairs",
+                "startup_repairs",
+                "sr-001",
+                Some("command_journal.error.p082_recovery_matrix_readback"),
+                "valid",
+                "2026-05-21T00:00:00Z",
+            ),
+            startup_summary(),
+            None,
+        );
+        assert!(
+            !validate_readback_v1_shape(&rb),
+            "startup_repairs.notes-backed P082-R01 rows must carry the startup_repairs source_json_key"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_accepts_null_source_json_key_for_typed_column_row() {
+        let rb = build_readback_v1(
+            "P082-R09",
+            "pending",
+            "operator_approval_required",
+            REASON_APPROVAL_PENDING_OPERATOR_ACTION_REQUIRED,
+            "Pending approval was preserved across recovery.",
+            "approvals, approval_inbox, stage_executions",
+            "approvals, approval_inbox, stage_executions",
+            "approval-001",
+            None,
+            "valid",
+            "2026-05-21T00:00:00Z",
+        );
+        assert!(
+            validate_readback_v1_shape(&rb),
+            "typed-column-derived P082-R09 approval rows may keep source_json_key null"
+        );
+    }
+
+    #[test]
+    fn validate_readback_v1_shape_accepts_null_source_json_key_for_legacy_error_fallback() {
+        let rb = build_readback_v1(
+            "P082-R02",
+            "held",
+            "wait",
+            REASON_RESUME_CLAIM_STATUS,
+            "Legacy rejection record exists; no P082 typed readback is available.",
+            "command_journal",
+            "command_journal",
+            "cmd-legacy",
+            None,
+            "unavailable",
+            "2026-05-21T00:00:00Z",
+        );
+        assert!(
+            validate_readback_v1_shape(&rb),
+            "legacy plain-text command_journal.error fallback rows may keep source_json_key null"
         );
     }
 

@@ -34,6 +34,16 @@ pub fn build_failed_serve_router(
     reporter: LifecycleReporter,
     principal_table: auth::PrincipalTable,
 ) -> Router {
+    build_failed_serve_router_with_principal_source(
+        reporter,
+        auth::LivePrincipalSource::new(principal_table),
+    )
+}
+
+pub fn build_failed_serve_router_with_principal_source(
+    reporter: LifecycleReporter,
+    principal_source: auth::LivePrincipalSource,
+) -> Router {
     Router::new()
         .route("/health", get(health_fallback))
         .route("/ready", get(ready_fallback))
@@ -56,7 +66,7 @@ pub fn build_failed_serve_router(
         // (P042 §5.2 loopback probes). The principal table is threaded
         // through so `graphql_daemon_status_only` can inspect the
         // `Authorization` header before honouring a `daemonStatus` read.
-        .layer(Extension(principal_table))
+        .layer(Extension(principal_source))
 }
 
 async fn health_fallback(Extension(reporter): Extension<LifecycleReporter>) -> impl IntoResponse {
@@ -76,7 +86,7 @@ async fn ready_fallback(Extension(reporter): Extension<LifecycleReporter>) -> im
 /// avoids constructing a full async-graphql schema under a poisoned DB.
 async fn graphql_daemon_status_only(
     Extension(reporter): Extension<LifecycleReporter>,
-    Extension(principal_table): Extension<auth::PrincipalTable>,
+    Extension(principal_source): Extension<auth::LivePrincipalSource>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
@@ -89,7 +99,7 @@ async fn graphql_daemon_status_only(
         .unwrap_or("");
     let resolved = auth::extract_bearer_token(auth_header)
         .ok()
-        .and_then(|token| auth::resolve_bearer(token, &principal_table).ok());
+        .and_then(|token| principal_source.resolve_bearer(token).ok());
     if resolved.is_none() {
         return (
             StatusCode::UNAUTHORIZED,
@@ -182,7 +192,7 @@ async fn refuse_handler(Extension(reporter): Extension<LifecycleReporter>) -> im
 /// only, preventing diagnostic/file-path disclosure when startup has failed.
 async fn mcp_refuse_handler(
     Extension(reporter): Extension<LifecycleReporter>,
-    Extension(principal_table): Extension<auth::PrincipalTable>,
+    Extension(principal_source): Extension<auth::LivePrincipalSource>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
@@ -205,7 +215,7 @@ async fn mcp_refuse_handler(
     // detail. Agent and Observer tokens see the state but not filesystem paths.
     let resolved_class = auth::extract_bearer_token(auth_header)
         .ok()
-        .and_then(|token| auth::resolve_bearer(token, &principal_table).ok())
+        .and_then(|token| principal_source.resolve_bearer(token).ok())
         .map(|p| p.class);
     let is_operator = matches!(resolved_class, Some(auth::PrincipalClass::Operator));
     let is_authenticated = resolved_class.is_some();
@@ -311,8 +321,22 @@ pub async fn serve_failed_state_with_listener(
     principal_table: auth::PrincipalTable,
     listener: tokio::net::TcpListener,
 ) -> Result<()> {
+    serve_failed_state_with_live_principal_source(
+        reporter,
+        auth::LivePrincipalSource::new(principal_table),
+        listener,
+    )
+    .await
+}
+
+pub async fn serve_failed_state_with_live_principal_source(
+    reporter: LifecycleReporter,
+    principal_source: auth::LivePrincipalSource,
+    listener: tokio::net::TcpListener,
+) -> Result<()> {
     let addr = listener.local_addr().ok();
-    let router = build_failed_serve_router(reporter.clone(), principal_table);
+    let router =
+        build_failed_serve_router_with_principal_source(reporter.clone(), principal_source);
     info!(
         addr = ?addr,
         state = %reporter.snapshot().state,
@@ -352,6 +376,10 @@ mod tests {
         build_failed_serve_router(test_reporter_failed(), test_principal_table())
     }
 
+    fn test_failed_router_with_source(source: auth::LivePrincipalSource) -> Router {
+        build_failed_serve_router_with_principal_source(test_reporter_failed(), source)
+    }
+
     async fn call(router: Router, method: &str, path: &str) -> (StatusCode, serde_json::Value) {
         call_with_body(router, method, path, Body::empty()).await
     }
@@ -384,6 +412,89 @@ mod tests {
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         (code, json)
+    }
+
+    #[tokio::test]
+    async fn sec_high_001_failed_serve_observes_live_principal_revocation() {
+        let source = auth::LivePrincipalSource::new(auth::PrincipalTable::test_fixture());
+        let router = test_failed_router_with_source(source.clone());
+        let body =
+            Body::from(serde_json::json!({"query":"{ daemonStatus { state } }"}).to_string());
+        let (status, json) = call_with_body_and_headers(
+            router.clone(),
+            "POST",
+            "/graphql",
+            body,
+            &[("authorization", "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            json.get("data").is_some(),
+            "authorized diagnostic read: {json}"
+        );
+
+        source.update(auth::PrincipalTable::test_fixture_with_class(
+            "observer-token-xxxxxxxxxxxxxxxxxx",
+            "test-operator",
+            auth::PrincipalClass::Observer,
+        ));
+        let body =
+            Body::from(serde_json::json!({"query":"{ daemonStatus { state } }"}).to_string());
+        let (status, json) = call_with_body_and_headers(
+            router.clone(),
+            "POST",
+            "/graphql",
+            body,
+            &[("authorization", "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json["error"], "unauthorized");
+
+        source.update(auth::PrincipalTable::test_fixture_disabled_token(
+            "test-token-xxxxxxxxxxxxxxxxxxxxx",
+            "test-operator",
+        ));
+        let body =
+            Body::from(serde_json::json!({"query":"{ daemonStatus { state } }"}).to_string());
+        let (status, json) = call_with_body_and_headers(
+            router.clone(),
+            "POST",
+            "/graphql",
+            body,
+            &[("authorization", "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json["error"], "unauthorized");
+
+        source.update(auth::PrincipalTable::test_fixture_with_class(
+            "test-token-xxxxxxxxxxxxxxxxxxxxx",
+            "test-operator",
+            auth::PrincipalClass::Observer,
+        ));
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 82,
+            "method": "tools/list",
+            "params": {}
+        });
+        let (status, json) = call_with_body_and_headers(
+            router,
+            "POST",
+            "/mcp",
+            Body::from(request.to_string()),
+            &[("authorization", "Bearer test-token-xxxxxxxxxxxxxxxxxxxxx")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["error"]["code"], -32000);
+        assert_eq!(json["error"]["data"]["state"], "failed");
+        assert!(
+            json["error"]["data"].get("backup_path").is_none(),
+            "re-scoped Observer must not receive operator-only backup path: {json}"
+        );
     }
 
     #[tokio::test]

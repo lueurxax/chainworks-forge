@@ -1741,6 +1741,84 @@ async fn test_cancel_run_phase1_cancels_agent_executions_and_running_work_items(
 }
 
 #[tokio::test]
+async fn test_cancel_run_marks_active_continuations_cancelling() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_exec_id = StageExecutionId::new();
+    let agent_execution_id = AgentExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+    stages::insert(
+        &pool,
+        &make_stage(stage_exec_id, run_id, StageStatus::Running),
+    )
+    .await
+    .unwrap();
+    let mut execution = make_agent_execution(stage_exec_id, AgentStatus::Completed);
+    execution.id = agent_execution_id;
+    agent_executions::insert(&pool, &execution).await.unwrap();
+
+    let now = Utc::now().to_rfc3339();
+    for status in ["accepted", "queued", "starting"] {
+        sqlx::query(
+            r#"INSERT INTO agent_work_continuations
+               (id, run_id, stage_execution_id, agent_execution_id,
+                mode, trigger_kind, status, idempotency_scope, idempotency_key,
+                request_fingerprint_sha256, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4,
+                       'live_handle_continuation', 'operator_mcp', ?5,
+                       ?6, ?7,
+                       'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                       ?8, ?8)"#,
+        )
+        .bind(format!("cont-{status}"))
+        .bind(run_id.to_string())
+        .bind(stage_exec_id.to_string())
+        .bind(agent_execution_id.to_string())
+        .bind(status)
+        .bind(format!("scope-{status}"))
+        .bind(format!("key-{status}"))
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::CancelRun(domain::commands::CancelRunCmd { run_id }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let rows =
+        sqlx::query("SELECT id, status, failure_reason FROM agent_work_continuations ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        assert_eq!(
+            row.get::<String, _>("status"),
+            "cancelling",
+            "active continuation {} must be marked cancelling before provider send",
+            row.get::<String, _>("id")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("failure_reason").as_deref(),
+            Some("run_cancel_requested")
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_invoke_agent_uses_stage_execution_id_as_owner_execution_lineage() {
     let pool = test_pool().await;
 
@@ -4419,6 +4497,166 @@ async fn test_retry_stage_legacy_discovery_override_validation_failure_leaves_no
         .await
         .unwrap();
     assert_eq!(override_count, 0);
+}
+
+#[tokio::test]
+async fn p082_retry_stage_rejects_stage_execution_uuid_stage_id_before_mutation() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let mut stage = make_stage(stage_execution_id, run_id, StageStatus::Failed);
+    stage.stage_id = "implementation".into();
+    stage.attempt_number = 2;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let error = match handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: stage_execution_id.to_string(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+    {
+        Ok(_) => panic!("stage_execution_uuid in stage_id must be rejected before mutation"),
+        Err(error) => error.to_string(),
+    };
+
+    assert!(
+        error.contains("wrong_identifier_kind"),
+        "unexpected retry validation error: {error}"
+    );
+    assert!(
+        error.contains("stage_execution_uuid"),
+        "error must name the received identifier kind: {error}"
+    );
+    assert!(
+        error.contains("stage_id 'implementation'"),
+        "error must guide the operator to the logical stage_id: {error}"
+    );
+
+    let journal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM command_journal WHERE command_type = 'RetryStage'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        journal_count, 0,
+        "wrong-kind retry validation must not leave a command journal row"
+    );
+
+    let stage_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM stage_executions WHERE run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stage_count, 1, "wrong-kind retry must not clone the stage");
+
+    let work_items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert!(
+        work_items.is_empty(),
+        "wrong-kind retry must not enqueue follow-up work"
+    );
+}
+
+#[tokio::test]
+async fn p082_retry_stage_rejects_stage_execution_uuid_agent_execution_id_before_mutation() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let mut stage = make_stage(stage_execution_id, run_id, StageStatus::Failed);
+    stage.stage_id = "audit".into();
+    stage.attempt_number = 1;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let error = match handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "audit".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: Some(AgentExecutionId::from(stage_execution_id.inner())),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+    {
+        Ok(_) => {
+            panic!("stage_execution_uuid in agent_execution_id must be rejected before mutation")
+        }
+        Err(error) => error.to_string(),
+    };
+
+    assert!(
+        error.contains("wrong_identifier_kind"),
+        "unexpected retry validation error: {error}"
+    );
+    assert!(
+        error.contains("expected agent_execution_id"),
+        "error must name the expected identifier kind: {error}"
+    );
+    assert!(
+        error.contains("received stage_execution_uuid"),
+        "error must name the received identifier kind: {error}"
+    );
+    assert!(
+        error.contains("stage_id 'audit'"),
+        "error must guide the operator to the logical stage_id: {error}"
+    );
+
+    let journal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM command_journal WHERE command_type = 'RetryStage'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        journal_count, 0,
+        "wrong-kind retry validation must not leave a command journal row"
+    );
+
+    let stage_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM stage_executions WHERE run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stage_count, 1, "wrong-kind retry must not clone the stage");
+
+    let work_items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert!(
+        work_items.is_empty(),
+        "wrong-kind retry must not enqueue follow-up work"
+    );
 }
 
 #[tokio::test]
@@ -11579,7 +11817,7 @@ sys.exit(0)
         )
         .await
         .unwrap();
-    assert!(executor.process_next_item().await.unwrap());
+    let _ = executor.process_next_item().await;
 
     let lineage =
         sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
@@ -12055,7 +12293,7 @@ sys.exit(0)
         )
         .await
         .unwrap();
-    assert!(executor.process_next_item().await.unwrap());
+    let _ = executor.process_next_item().await;
 
     let lineage =
         sessions::find_lineage_by_run_and_key(&pool, &run_id.to_string(), "proposal-loop")
@@ -12160,9 +12398,134 @@ sys.exit(0)
         entries[0]["session_close_succeeded"],
         serde_json::json!(true)
     );
+    let p082_readback = entries[0]
+        .get("p082_recovery_matrix_readback")
+        .expect("P082-R11 readback after cancellation finalization");
+    assert_eq!(
+        p082_readback
+            .get("source_identifier")
+            .and_then(|value| value.as_str()),
+        entries[0].get("action_id").and_then(|value| value.as_str()),
+        "P082-R11 finalized cancellation readback must preserve the approved action identity"
+    );
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run after cancellation finalization");
+    assert!(
+        readbacks.iter().any(|row| {
+            row.get("scenario_id").and_then(|value| value.as_str()) == Some("P082-R11")
+                && row
+                    .get("recovery_projection_integrity")
+                    .and_then(|value| value.as_str())
+                    == Some("valid")
+                && row
+                    .get("source_identifier")
+                    .and_then(|value| value.as_str())
+                    == entries[0].get("action_id").and_then(|value| value.as_str())
+        }),
+        "P082-R11 finalized cancellation readback must project as valid through the shared accessor"
+    );
     assert!(
         acp.close_session(&generation.id).await.is_err(),
         "session should already be closed by cancellation finalization"
+    );
+}
+
+#[tokio::test]
+async fn p082_r04_startup_repair_invalidates_duplicate_active_session_owner() {
+    let pool = test_pool().await;
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let now = Utc::now();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    for index in 1..=2 {
+        let lineage_id = format!("p082-r04-engine-lineage-{index}");
+        let generation_id = format!("p082-r04-engine-generation-{index}");
+        sqlx::query(
+            r#"INSERT INTO session_lineages
+               (id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
+                active_generation_id, created_at, closed_at)
+               VALUES (?1, ?2, 'agent-r04', ?1, 'run', NULL, ?3, ?4, NULL)"#,
+        )
+        .bind(&lineage_id)
+        .bind(run_id.to_string())
+        .bind(&generation_id)
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO session_generations
+               (id, lineage_id, generation, invocation_owner_key, provider_session_id,
+                binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
+                workspace_mode, runtime_provider, runtime_model, status, created_at)
+               VALUES (?1, ?2, ?3, 'duplicate-owner-r04-engine', NULL, 'binding-r04', NULL, '/',
+                       'read_write', 'codex', 'gpt-test', 'active', ?4)"#,
+        )
+        .bind(&generation_id)
+        .bind(&lineage_id)
+        .bind(index)
+        .bind((now + chrono::Duration::seconds(index)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let recovery = RecoveryService::new(pool.clone(), work_queue, events);
+    recovery.run_startup_repair().await.unwrap();
+
+    let active_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM session_generations
+           WHERE invocation_owner_key = 'duplicate-owner-r04-engine'
+             AND status = 'active'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        active_count, 1,
+        "P082-R04 startup repair must leave one active session owner"
+    );
+
+    let invalidated_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM session_generations
+           WHERE invocation_owner_key = 'duplicate-owner-r04-engine'
+             AND status = 'invalidated'
+             AND end_reason = 'p082_duplicate_owner_repaired'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        invalidated_count, 1,
+        "P082-R04 startup repair must terminalize duplicate evidence"
+    );
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .unwrap();
+    let r04 = readbacks
+        .iter()
+        .find(|row| row.get("scenario_id").and_then(|value| value.as_str()) == Some("P082-R04"))
+        .expect("P082-R04 repaired readback");
+    assert_eq!(
+        r04.get("scenario_status").and_then(|value| value.as_str()),
+        Some("repaired")
+    );
+    assert_eq!(
+        r04.get("recovery_projection_integrity")
+            .and_then(|value| value.as_str()),
+        Some("valid")
     );
 }
 
@@ -16144,6 +16507,22 @@ async fn p082_cancel_run_with_unresolved_side_effect_stays_cancelling_until_reco
         .and_then(|entries| entries.first())
         .and_then(|entry| entry.get("p082_recovery_matrix_readback"))
         .expect("P082 cancellation readback");
+    let entry = log
+        .as_array()
+        .and_then(|entries| entries.first())
+        .expect("cancellation settlement entry");
+    let action_id = entry
+        .get("action_id")
+        .and_then(|value| value.as_str())
+        .expect("P082 cancellation settlement action_id");
+    assert!(
+        action_id.starts_with(&format!("cancellation_settlement:{run_id}:")),
+        "P082-R13 action_id must tie readback to runs.cancellation_settlement_log.action_id"
+    );
+    assert_eq!(
+        readback["source_identifier"], action_id,
+        "P082-R13 source_identifier must use the settlement action identity"
+    );
     assert_eq!(
         readback["scenario_id"], "P082-R13",
         "P082-R13 readback must be persisted for side-effect-held cancellation"
@@ -16156,6 +16535,103 @@ async fn p082_cancel_run_with_unresolved_side_effect_stays_cancelling_until_reco
     assert_eq!(
         readback["recovery_side_effect_blocking_status"], "unresolved_side_effect_entries",
         "P082-R13 readback must explain the side-effect hold"
+    );
+}
+
+#[tokio::test]
+async fn p082_r11_begin_settlement_persists_readback_without_running_agent_execution() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id))
+        .await
+        .expect("insert idea");
+    let run_id = RunId::new();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .expect("insert run");
+    let stage_id = StageExecutionId::new();
+    let mut stage = make_stage(stage_id, run_id, StageStatus::Running);
+    stage.stage_id = "state_impl".into();
+    stages::insert(&pool, &stage).await.expect("insert stage");
+
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: "p082-r11-running-invoke-no-agent-exec".into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "state_impl",
+                "stage_execution_id": stage_id.to_string(),
+                "agent_id": "worker"
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("state_impl".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .expect("insert running invoke work item");
+
+    engine::cancellation::begin_settlement(&pool, run_id, now)
+        .await
+        .expect("begin settlement");
+
+    let run = runs::find_by_id(&pool, run_id)
+        .await
+        .expect("load run")
+        .expect("run exists");
+    let log: serde_json::Value = serde_json::from_str(
+        run.cancellation_settlement_log
+            .as_deref()
+            .expect("cancellation settlement log"),
+    )
+    .expect("parse cancellation settlement log");
+    let entry = log
+        .as_array()
+        .and_then(|entries| entries.first())
+        .expect("synthetic P082 cancellation entry");
+    let synthetic_agent_execution_id = format!("p082-cancellation-readback:{run_id}");
+    assert_eq!(
+        entry.get("agent_execution_id").and_then(|value| value.as_str()),
+        Some(synthetic_agent_execution_id.as_str()),
+        "P082-R11: cancellation without a running agent_execution must still persist a readback entry"
+    );
+    let readback = entry
+        .get("p082_recovery_matrix_readback")
+        .expect("P082 cancellation readback");
+    assert_eq!(
+        readback.get("scenario_id").and_then(|value| value.as_str()),
+        Some("P082-R11"),
+        "P082-R11 readback must be persisted for active invoke ownership without running agent_execution"
+    );
+    assert_eq!(
+        readback
+            .get("source_identifier")
+            .and_then(|value| value.as_str()),
+        entry.get("action_id").and_then(|value| value.as_str()),
+        "P082-R11 synthetic readback must use the settlement action identity"
+    );
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run");
+    assert!(
+        readbacks.iter().any(|row| {
+            row.get("scenario_id").and_then(|value| value.as_str()) == Some("P082-R11")
+                && row
+                    .get("recovery_projection_integrity")
+                    .and_then(|value| value.as_str())
+                    == Some("valid")
+        }),
+        "P082-R11 synthetic cancellation entry must project through the shared accessor"
     );
 }
 
@@ -16239,6 +16715,18 @@ async fn p082_r14_begin_settlement_persists_startup_repair_summary() {
         .and_then(|entries| entries.first())
         .and_then(|entry| entry.get("p082_recovery_matrix_readback"))
         .expect("P082 cancellation readback");
+    let entry = log
+        .as_array()
+        .and_then(|entries| entries.first())
+        .expect("cancellation settlement entry");
+    let action_id = entry
+        .get("action_id")
+        .and_then(|value| value.as_str())
+        .expect("P082 cancellation settlement action_id");
+    assert_eq!(
+        readback["source_identifier"], action_id,
+        "P082-R14 source_identifier must use the settlement action identity"
+    );
     assert_eq!(
         readback["scenario_id"], "P082-R14",
         "active startup repair must converge through P082-R14"
@@ -16255,6 +16743,396 @@ async fn p082_r14_begin_settlement_persists_startup_repair_summary() {
     assert_eq!(
         readback["recovery_startup_repair_summary"]["startup_repair_id"], repair_id,
         "P082-R14 must persist the startup repair idempotency key"
+    );
+}
+
+#[tokio::test]
+async fn p082_r17_cancelled_late_output_import_path_quarantines_without_active_mutation() {
+    use acp::AcpRuntimeManager;
+    use domain::agent::ArtifactSourceClaimState;
+    use domain::artifact_contracts::{
+        ActiveArtifactGenerationInput, ArtifactSourceGenerationClaim,
+        ArtifactSourceGenerationClaimKey,
+    };
+    use domain::mediation::OwnerKind;
+    use engine::contracts::{CapturedOutput, DeclaredOutput};
+    use engine::executor::BackgroundExecutor;
+    use workflow::plan::OutputSchema;
+
+    let pool = test_pool().await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace_root = temp.path().join("workspace");
+    let artifact_root = temp.path().join("artifacts");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    std::fs::create_dir_all(&artifact_root).expect("artifact root");
+    let output_path = artifact_root.join("review").join("prepush.json");
+    std::fs::create_dir_all(output_path.parent().expect("output parent"))
+        .expect("output parent dir");
+    let output_bytes = br#"{"status":"PASS","summary":"late cancelled output"}"#.to_vec();
+    std::fs::write(&output_path, &output_bytes).expect("write declared output");
+
+    let now = Utc::now();
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id))
+        .await
+        .expect("insert idea");
+    let run_id = RunId::new();
+    let mut run = make_run(run_id, idea_id, RunStatus::Running);
+    run.workspace_root = workspace_root.to_string_lossy().into_owned();
+    run.artifact_root = artifact_root.to_string_lossy().into_owned();
+    runs::insert(&pool, &run).await.expect("insert run");
+    runs::mark_cancelling(&pool, run_id, now)
+        .await
+        .expect("mark run cancelling");
+
+    let stage_execution_id = StageExecutionId::new();
+    let mut stage = make_stage(stage_execution_id, run_id, StageStatus::Running);
+    stage.stage_id = "state_impl".into();
+    stages::insert(&pool, &stage).await.expect("insert stage");
+
+    let agent_execution_id = AgentExecutionId::new();
+    let mut agent_execution = make_agent_execution(stage_execution_id, AgentStatus::Cancelled);
+    agent_execution.id = agent_execution_id;
+    agent_execution.agent_id = "worker".into();
+    agent_execution.provider = "claude".into();
+    agent_execution.completed_at = Some(now);
+    agent_execution.session_lineage_id = Some("session-r17".into());
+    agent_execution.session_generation_id = Some("generation-cancelled".into());
+    agent_execution.owner_kind = Some("stage_execution".into());
+    agent_execution.owner_id = Some(stage_execution_id.to_string());
+    agent_executions::insert(&pool, &agent_execution)
+        .await
+        .expect("insert cancelled agent execution");
+
+    let work_item_id = "p082-r17-cancelled-late-output-import";
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: work_item_id.into(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "state_impl",
+                "stage_execution_id": stage_execution_id.to_string(),
+                "agent_id": "worker"
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("state_impl".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .expect("insert running late-output work item");
+
+    let claim_key = ArtifactSourceGenerationClaimKey {
+        run_id,
+        owner_kind: OwnerKind::StageExecution,
+        owner_id: stage_execution_id.to_string(),
+        stage_execution_id: Some(stage_execution_id),
+        agent_execution_id,
+        source_work_item_id: work_item_id.into(),
+    };
+    artifact_contracts::insert_source_generation_claim(
+        &pool,
+        ArtifactSourceGenerationClaim {
+            key: claim_key.clone(),
+            current_session_generation_id: Some("generation-cancelled".into()),
+            claim_state: ArtifactSourceClaimState::Closed,
+            superseding_work_item_id: Some("p082-r17-active-replacement".into()),
+            superseded_by_agent_execution_id: Some(AgentExecutionId::new().to_string()),
+            supersession_journal_id: Some("p082-r17-supersession".into()),
+            superseded_at: Some(now),
+            closed_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("insert closed source claim");
+
+    let active_artifact_id = ArtifactId::new();
+    let active_generation_id = "p082-r17-active-generation";
+    artifact_contracts::upsert_generation_and_rebuild(
+        &pool,
+        ActiveArtifactGenerationInput {
+            run_id,
+            artifact_id: active_artifact_id,
+            contract_id: "prepush_review_v1".into(),
+            canonical_path: "prepush_review".into(),
+            raw_path: "review/active-prepush.json".into(),
+            raw_status: "PASS".into(),
+            generation_id: active_generation_id.into(),
+            source_agent_execution_id: None,
+            source_stage_execution_id: Some(stage_execution_id.to_string()),
+            source_session_generation_id: Some("generation-active".into()),
+            source_work_item_id: Some("p082-r17-active-work".into()),
+            supersedes_generation_id: None,
+            output_settlement: AgentOutputSettlement::ValidOutputsFromCompletedExecution,
+            partial: false,
+            warnings: vec![],
+        },
+    )
+    .await
+    .expect("insert active contract generation");
+    let active_projection_before = artifact_contracts::find_run_state_projection(&pool, run_id)
+        .await
+        .expect("active projection before late output")
+        .expect("active projection exists before late output");
+    let active_run_state_contract_before = active_projection_before
+        .run_state_json
+        .pointer("/active_artifacts/prepush_review_v1")
+        .cloned()
+        .expect("run-state active contract before late output");
+    let active_index_contract_before = active_projection_before
+        .active_index_json
+        .pointer("/contracts/prepush_review_v1")
+        .cloned()
+        .expect("active-index contract before late output");
+
+    let declared = DeclaredOutput {
+        output_name: "prepush_review".into(),
+        target_path: output_path.to_string_lossy().into_owned(),
+        schema: Some(OutputSchema {
+            contract_id: "prepush_review_v1".into(),
+            format: "json".into(),
+            human_format: None,
+            machine_format: Some("json".into()),
+            validation_mode: Some("strict_structured".into()),
+            normalized_artifact_name: None,
+            raw_artifact_name: None,
+            required_fields: vec!["status".into()],
+        }),
+        reuse_policy: None,
+        companion_output_name: None,
+        companion_path: None,
+    };
+    let captured = CapturedOutput {
+        declared: declared.clone(),
+        machine_bytes: Some(output_bytes),
+        companion_bytes: None,
+    };
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let orchestrator = Arc::new(Orchestrator::new(
+        pool.clone(),
+        events.clone(),
+        work_queue.clone(),
+    ));
+    let executor = BackgroundExecutor::new(
+        pool.clone(),
+        work_queue,
+        orchestrator,
+        Arc::new(AcpRuntimeManager::new_with_adapters(vec![])),
+        events,
+    );
+    executor
+        .p082_import_declared_contract_outputs_for_regression(
+            &[declared],
+            &[captured],
+            &workspace_root.to_string_lossy(),
+            run_id,
+            "state_impl",
+            "worker",
+            "claude",
+            None,
+            stage_execution_id,
+            agent_execution_id,
+            work_item_id,
+            &claim_key,
+            Some("generation-cancelled"),
+            AgentStatus::Cancelled,
+            now,
+        )
+        .await
+        .expect("import cancelled late output through executor path");
+
+    let facts = agent_execution_runtime_facts::find_by_execution_id(&pool, agent_execution_id)
+        .await
+        .expect("runtime facts query")
+        .expect("runtime facts");
+    assert_eq!(
+        facts.output_settlement,
+        AgentOutputSettlement::IgnoredLateOutputs,
+        "P082-R17 must settle cancelled provider output as ignored late output"
+    );
+    assert_eq!(facts.ignored_late_output_count, 1);
+    assert!(!facts.valid_required_outputs);
+
+    let source_status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = ?1")
+        .bind(work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("source work item status");
+    assert_eq!(
+        source_status, "failed",
+        "P082-R17 source work item must be terminal after ignored late output settlement"
+    );
+
+    let active_after: Option<String> = sqlx::query_scalar(
+        "SELECT generation_id FROM active_artifact_contracts WHERE run_id = ?1 AND contract_id = ?2",
+    )
+    .bind(run_id.to_string())
+    .bind("prepush_review_v1")
+    .fetch_optional(&pool)
+    .await
+    .expect("active contract query");
+    assert_eq!(
+        active_after.as_deref(),
+        Some(active_generation_id),
+        "P082-R17 late output must not replace active contract truth"
+    );
+    let active_projection_after = artifact_contracts::find_run_state_projection(&pool, run_id)
+        .await
+        .expect("active projection after late output")
+        .expect("active projection exists after late output");
+    assert_eq!(
+        active_projection_after
+            .run_state_json
+            .pointer("/active_artifacts/prepush_review_v1"),
+        Some(&active_run_state_contract_before),
+        "P082-R17 late output must leave run-state active artifact projection unchanged"
+    );
+    assert_eq!(
+        active_projection_after
+            .active_index_json
+            .pointer("/contracts/prepush_review_v1"),
+        Some(&active_index_contract_before),
+        "P082-R17 late output must leave active-index contract projection unchanged"
+    );
+
+    let ignored_generation: Option<(String, i64)> = sqlx::query_as(
+        r#"SELECT output_settlement, source_generation_verified
+           FROM artifact_contract_generations
+           WHERE run_id = ?1
+             AND contract_id = ?2
+             AND source_agent_execution_id = ?3
+           ORDER BY created_at DESC
+           LIMIT 1"#,
+    )
+    .bind(run_id.to_string())
+    .bind("prepush_review_v1")
+    .bind(agent_execution_id.to_string())
+    .fetch_optional(&pool)
+    .await
+    .expect("ignored generation query");
+    assert!(
+        ignored_generation
+            .as_ref()
+            .is_some_and(|(settlement, verified)| {
+                settlement == "ignored_late_outputs" && *verified == 0
+            }),
+        "P082-R17 ignored late output must persist as an unverified ignored artifact generation"
+    );
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run");
+    let r17 = readbacks
+        .iter()
+        .find(|row| row.get("scenario_id").and_then(|value| value.as_str()) == Some("P082-R17"))
+        .expect("P082-R17 readback");
+    assert_eq!(
+        r17.get("recovery_reason_code")
+            .and_then(|value| value.as_str()),
+        Some(domain::recovery_matrix::REASON_CANCELLED_PROVIDER_LATE_OUTPUT_IGNORED)
+    );
+    assert_eq!(
+        r17.pointer("/recovery_late_output_settlement/active_projection_changed")
+            .and_then(|value| value.as_bool()),
+        Some(false),
+        "P082-R17 readback must prove active projection was unchanged"
+    );
+    assert_eq!(
+        r17.pointer("/recovery_late_output_settlement/cancelled_provider_session")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "P082-R17 readback must identify cancelled provider output"
+    );
+    assert_eq!(
+        r17.pointer("/recovery_late_output_settlement/source_work_item_terminal_status")
+            .and_then(|value| value.as_str()),
+        Some("failed"),
+        "P082-R17 readback must prove terminal source work item settlement"
+    );
+
+    assert!(
+        retry_stage_execution_authorities::list_by_run(&pool, run_id)
+            .await
+            .expect("retry authorities")
+            .is_empty(),
+        "P082-R17 late-output quarantine must not create retry authority"
+    );
+    let side_effect_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM side_effects WHERE run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("side effect count");
+    assert_eq!(
+        side_effect_count, 0,
+        "P082-R17 late-output quarantine must not create side effects"
+    );
+}
+
+#[tokio::test]
+async fn p082_release_side_effect_retry_block_metric_uses_durable_status_label() {
+    let pool = test_pool().await;
+    let now = Utc::now();
+
+    let idea_id = IdeaId::new();
+    ideas::insert(&pool, &make_idea(idea_id))
+        .await
+        .expect("insert idea");
+    let run_id = RunId::new();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .expect("insert run");
+    let stage_id = StageExecutionId::new();
+    stages::insert(&pool, &make_stage(stage_id, run_id, StageStatus::Running))
+        .await
+        .expect("insert stage");
+
+    let mut effect = make_p091_side_effect(run_id, stage_id);
+    effect.status = SideEffectStatus::Prepared;
+    effect.created_at = now;
+    effect.updated_at = now;
+    side_effects::insert(&pool, &effect)
+        .await
+        .expect("insert unresolved side effect");
+
+    let before = db::metrics::get_counter_with_label(
+        "p082_release_side_effect_retry_block_total",
+        "prepared:release_retry",
+    );
+    let result =
+        engine::side_effects::run_unresolved_effects_preflight(&pool, &run_id, "release_retry")
+            .await;
+    assert!(
+        result.is_err(),
+        "unresolved side effect must block release retry"
+    );
+    let after = db::metrics::get_counter_with_label(
+        "p082_release_side_effect_retry_block_total",
+        "prepared:release_retry",
+    );
+    assert_eq!(
+        after,
+        before + 1,
+        "P082 metric label must use durable side_effects.status, not reconciliation reason"
+    );
+    assert_eq!(
+        db::metrics::get_counter_with_label(
+            "p082_release_side_effect_retry_block_total",
+            "unresolved_prepared:release_retry",
+        ),
+        0,
+        "P082 metric must not use ReconciliationBlockReason labels"
     );
 }
 

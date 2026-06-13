@@ -4731,6 +4731,62 @@ impl BackgroundExecutor {
         }
     }
 
+    #[doc(hidden)]
+    pub async fn p082_import_declared_contract_outputs_for_regression(
+        &self,
+        declared_outputs: &[DeclaredOutput],
+        captured_outputs: &[CapturedOutput],
+        workspace_root: &str,
+        run_id: RunId,
+        stage_id: &str,
+        agent_id: &str,
+        provider: &str,
+        model: Option<String>,
+        stage_execution_id: domain::ids::StageExecutionId,
+        agent_exec_id: domain::ids::AgentExecutionId,
+        work_item_id: &str,
+        artifact_claim_key: &ArtifactSourceGenerationClaimKey,
+        session_generation_id: Option<&str>,
+        result_status: AgentStatus,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let mut persisted_paths = HashSet::new();
+        let declared_artifacts = self.prepare_declared_output_artifacts(
+            declared_outputs,
+            None,
+            workspace_root,
+            run_id,
+            stage_id,
+            agent_id,
+            provider,
+            model,
+            completed_at,
+            &mut persisted_paths,
+        )?;
+        self.import_declared_contract_outputs(
+            declared_outputs,
+            captured_outputs,
+            &declared_artifacts,
+            &declared_artifacts,
+            stage_execution_id,
+            agent_exec_id,
+            work_item_id,
+            artifact_claim_key,
+            session_generation_id,
+            result_status,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &workflow::plan::DegradedOutputPolicy::default(),
+            None,
+            completed_at,
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn record_output_contract_repair_event(
         &self,
         policy_decision: Option<&SessionPolicyDecision>,
@@ -9006,6 +9062,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     {
                         Ok(fingerprint) => {
                             p088_pre_original_fingerprint_path = persist_p088_worktree_fingerprint(
+                                &run.workspace_root,
                                 &run.artifact_root,
                                 agent_exec_id,
                                 &fingerprint,
@@ -9198,6 +9255,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                     Ok(fingerprint) => {
                                         p088_error_post_fingerprint_path =
                                             persist_p088_worktree_fingerprint(
+                                                &run.workspace_root,
                                                 &run.artifact_root,
                                                 agent_exec_id,
                                                 &fingerprint,
@@ -9233,6 +9291,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                 if let Err(persist_error) =
                                     persist_p088_code_writer_completion_receipt(
                                         &self.pool,
+                                        &run.workspace_root,
                                         &run.artifact_root,
                                         run_id,
                                         stage_execution_id,
@@ -9555,6 +9614,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                             Ok(fingerprint) => {
                                 p088_post_original_fingerprint_path =
                                     persist_p088_worktree_fingerprint(
+                                        &run.workspace_root,
                                         &run.artifact_root,
                                         agent_exec_id,
                                         &fingerprint,
@@ -9837,6 +9897,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                     let p088_repair_prompt_artifact_path =
                                         if p088_completion_eligible {
                                             persist_p088_prompt_artifact(
+                                                &run.workspace_root,
                                                 &run.artifact_root,
                                                 agent_exec_id,
                                                 "code_writer_completion_repair",
@@ -9851,6 +9912,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                     let p088_expected_output_snapshot = if p088_completion_eligible
                                     {
                                         persist_p088_expected_output_snapshot(
+                                            &run.workspace_root,
                                             &run.artifact_root,
                                             agent_exec_id,
                                             "code_writer_completion_repair",
@@ -9931,6 +9993,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                             {
                                                 Ok(fingerprint) => {
                                                     let _ = persist_p088_worktree_fingerprint(
+                                                        &run.workspace_root,
                                                         &run.artifact_root,
                                                         agent_exec_id,
                                                         &fingerprint,
@@ -10084,6 +10147,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                 {
                                                     Ok(fingerprint) => {
                                                         let _ = persist_p088_worktree_fingerprint(
+                                                            &run.workspace_root,
                                                             &run.artifact_root,
                                                             agent_exec_id,
                                                             &fingerprint,
@@ -10229,7 +10293,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                                     agent_exec_id
                                                                 ),
                                                                 &declared_outputs,
-                                                                &repair_settlement,
+                                                            &merged_repair_settlement,
                                                                 &repair_validation,
                                                                 chrono::Utc::now(),
                                                             )?)
@@ -10239,7 +10303,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                             {
                                                                 materialize_validated_discovery_decisions(
                                                                 &declared_outputs,
-                                                                &repair_settlement,
+                                                                &merged_repair_settlement,
                                                                 &repair_validation,
                                                             )?;
                                                                 None
@@ -10254,7 +10318,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                         p090_staged_repair_materialization =
                                                             staged_repair_materialization;
                                                         declared_output_settlement =
-                                                            Some(merged_repair_settlement);
+                                                            Some(merged_repair_settlement.clone());
                                                         if repair_validation.failure_class.is_none()
                                                         {
                                                             if p088_completion_eligible {
@@ -10264,6 +10328,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                             merge_contract_repair_result(
                                                                 &mut result,
                                                                 repair_result,
+                                                                &merged_repair_settlement,
                                                             );
                                                             info!(
                                                                 run_id = %run_id,
@@ -11140,6 +11205,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                 if p088_code_writer_completion_candidate {
                     if let Err(error) = persist_p088_code_writer_completion_receipt(
                         &self.pool,
+                        &run.workspace_root,
                         &run.artifact_root,
                         run_id,
                         stage_execution_id,
@@ -11670,7 +11736,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &manifest_artifact).await?;
-                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &commit_lease.effect_id,
                         owner_instance_id: &commit_lease.owner_instance_id,
                         settlement_attempt_id: &commit_lease.attempt_id,
@@ -11738,7 +11804,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &commit_lease.effect_id,
                         owner_instance_id: &commit_lease.owner_instance_id,
                         attempt_id: &commit_lease.attempt_id,
@@ -11895,7 +11961,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &receipt_artifact).await?;
-                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &push_lease.effect_id,
                         owner_instance_id: &push_lease.owner_instance_id,
                         settlement_attempt_id: &push_lease.attempt_id,
@@ -11981,7 +12047,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &push_lease.effect_id,
                         owner_instance_id: &push_lease.owner_instance_id,
                         attempt_id: &push_lease.attempt_id,
@@ -12150,7 +12216,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &bundle_artifact).await?;
-                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &build_lease.effect_id,
                         owner_instance_id: &build_lease.owner_instance_id,
                         settlement_attempt_id: &build_lease.attempt_id,
@@ -12218,7 +12284,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &build_lease.effect_id,
                         owner_instance_id: &build_lease.owner_instance_id,
                         attempt_id: &build_lease.attempt_id,
@@ -12415,7 +12481,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &connect_lease.effect_id,
                         owner_instance_id: &connect_lease.owner_instance_id,
                         settlement_attempt_id: &connect_lease.attempt_id,
@@ -12522,7 +12588,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &connect_lease.effect_id,
                         owner_instance_id: &connect_lease.owner_instance_id,
                         attempt_id: &connect_lease.attempt_id,
@@ -12976,8 +13042,6 @@ You are continuing the same Chainworks agent execution through an existing live 
             )
             .await?;
         artifact_contracts::close_source_generation_claim_tx(&mut tx, artifact_claim_key).await?;
-        let mut p082_late_claim_state: Option<String> = None;
-        let mut p082_late_work_item_status: Option<String> = None;
         if has_ignored_late_output {
             let now_for_terminalization = completed_at.to_rfc3339();
             sqlx::query(
@@ -12987,7 +13051,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                        completed_at = NULL,
                        last_error = COALESCE(last_error, ?3)
                    WHERE id = ?4
-                     AND status IN ('pending', 'running')"#,
+                     AND status IN ('pending', 'running', 'cancelled')"#,
             )
             .bind(WorkItemStatus::Failed.to_string())
             .bind(&now_for_terminalization)
@@ -12996,7 +13060,7 @@ You are continuing the same Chainworks agent execution through an existing live 
             .execute(&mut **tx)
             .await?;
 
-            p082_late_claim_state = sqlx::query_scalar::<_, String>(
+            let p082_late_claim_state = sqlx::query_scalar::<_, String>(
                 r#"SELECT claim_state
                    FROM artifact_source_generation_claims
                    WHERE run_id = ?1
@@ -13014,29 +13078,20 @@ You are continuing the same Chainworks agent execution through an existing live 
             .fetch_optional(&mut **tx)
             .await?;
 
-            p082_late_work_item_status =
+            let p082_late_work_item_status =
                 sqlx::query_scalar::<_, String>("SELECT status FROM work_items WHERE id = ?1")
                     .bind(work_item_id)
                     .fetch_optional(&mut **tx)
                     .await?;
-        }
-        tx.commit().await?;
-        db::pool::log_write_transaction("executor.import_declared_outputs", tx_started);
-        // P082-R03/R17: after commit, persist late output settlement readback to
-        // stage_executions.recovery_snapshot_json so the accessor can surface it.
-        if has_ignored_late_output {
-            // P082-R17 requires durable cancelled-run evidence from the DB rather than
-            // provider result_status alone, so a completed late response from a cancelled
-            // provider session is not misreported as P082-R03.
-            let run_has_durable_cancellation = db::repos::runs::find_by_id(
-                &self.pool,
-                artifact_claim_key.run_id,
-            )
-            .await
-            .ok()
-            .flatten()
-            .map(|r| r.cancellation_requested_at.is_some())
-            .unwrap_or(false);
+
+            // P082-R03/R17 readback is part of the same durable settlement as
+            // claim/work-item terminalization. Writing it before commit prevents a
+            // crash window where late output is terminalized but no matrix row exists.
+            let run_has_durable_cancellation =
+                db::repos::runs::find_by_id_tx(&mut tx, artifact_claim_key.run_id)
+                    .await?
+                    .map(|r| r.cancellation_requested_at.is_some())
+                    .unwrap_or(false);
             let cancelled_provider =
                 result_status == AgentStatus::Cancelled || run_has_durable_cancellation;
             let scenario_id = if cancelled_provider {
@@ -13058,7 +13113,9 @@ You are continuing the same Chainworks agent execution through an existing live 
                 p082_late_claim_state.as_deref().unwrap_or("superseded"),
                 "ignored",
                 runtime_facts.ignored_late_output_count,
-                p082_late_work_item_status.as_deref().unwrap_or("failed"),
+                late_output_source_terminal_status_for_readback(
+                    p082_late_work_item_status.as_deref(),
+                ),
                 cancelled_provider,
             );
             let readback = domain::recovery_matrix::set_readback_late_output_settlement(
@@ -13078,17 +13135,19 @@ You are continuing the same Chainworks agent execution through an existing live 
                 settlement,
             );
             let snapshot = serde_json::json!({ "p082_recovery_matrix_readback": readback });
-            let _ = db::repos::stages::update_recovery_snapshot_json(
-                &self.pool,
+            db::repos::stages::update_recovery_snapshot_json_tx(
+                &mut tx,
                 stage_execution_id,
                 &snapshot.to_string(),
             )
-            .await;
+            .await?;
             db::metrics::increment_counter_with_label(
                 "p082_late_output_quarantine_total",
                 &format!("ignored:{source_session_generation_id}"),
             );
         }
+        tx.commit().await?;
+        db::pool::log_write_transaction("executor.import_declared_outputs", tx_started);
         if invalidated_session_after_missing_outputs {
             if let Some(session_generation_id) = session_generation_id {
                 let _ = self.acp.close_session(session_generation_id).await;
@@ -13981,7 +14040,6 @@ You are continuing the same Chainworks agent execution through an existing live 
         let evidence_root_hash = sha256_hex(evidence_root.as_bytes());
         let evidence_root_slug = &evidence_root_hash[..16];
         let artifact_root = Path::new(&run.artifact_root);
-        tokio::fs::create_dir_all(artifact_root).await?;
         let now = chrono::Utc::now();
 
         struct SpoolInput {
@@ -14105,6 +14163,11 @@ You are continuing the same Chainworks agent execution through an existing live 
                 evidence_root_slug,
                 input.file_name
             );
+            prepare_executor_artifact_parent(
+                &run.workspace_root,
+                &artifact_root.join(&relative_path),
+                "Run artifact_root",
+            )?;
             let spool = db::evidence_spool::write_spool_file(
                 artifact_root,
                 &run.id.to_string(),
@@ -14203,6 +14266,11 @@ You are continuing the same Chainworks agent execution through an existing live 
             "evidence/runs/{}/stages/{}/agents/{}/receipt/side-effects/{}/{}/evidence-manifest.json",
             run.id, stage_execution_id, agent_id, effect_kind, evidence_root_slug
         );
+        prepare_executor_artifact_parent(
+            &run.workspace_root,
+            &artifact_root.join(&manifest_relative_path),
+            "Run artifact_root",
+        )?;
         let manifest_spool = db::evidence_spool::write_spool_file(
             artifact_root,
             &run.id.to_string(),
@@ -15053,7 +15121,84 @@ fn output_discovery_decision_counts(
     (found, missing, stale, rejected)
 }
 
+fn prepare_executor_artifact_parent(
+    workspace_root: &str,
+    artifact_path: &Path,
+    field: &str,
+) -> Result<()> {
+    let workspace_root = Path::new(workspace_root);
+    reject_executor_path_symlink_components(workspace_root, "Run workspace_root")?;
+    let canonical_workspace = std::fs::canonicalize(workspace_root).with_context(|| {
+        format!(
+            "canonicalize run workspace_root {}",
+            workspace_root.display()
+        )
+    })?;
+    if artifact_path.exists() {
+        reject_executor_path_symlink_components(artifact_path, field)?;
+    }
+    if !artifact_path.starts_with(&canonical_workspace) {
+        anyhow::bail!("{field} escapes canonical workspace_root");
+    }
+    let parent = artifact_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{field} has no parent directory"))?;
+    create_executor_dir_all_no_symlink_under(parent, &canonical_workspace, field)
+}
+
+fn create_executor_dir_all_no_symlink_under(
+    path: &Path,
+    canonical_root: &Path,
+    field: &str,
+) -> Result<()> {
+    let relative = path
+        .strip_prefix(canonical_root)
+        .with_context(|| format!("{field} escapes canonical root"))?;
+    let mut current = canonical_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("{field} contains a symlink component");
+                }
+                if !metadata.is_dir() {
+                    anyhow::bail!("{field} path component is not a directory");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .with_context(|| format!("create directory {}", current.display()))?;
+                let metadata = std::fs::symlink_metadata(&current)
+                    .with_context(|| format!("verify directory {}", current.display()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    anyhow::bail!("{field} created path was replaced before verification");
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_executor_path_symlink_components(path: &Path, field: &str) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            break;
+        };
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("{field} contains a symlink component");
+        }
+    }
+    Ok(())
+}
+
 async fn persist_p088_worktree_fingerprint(
+    workspace_root: &str,
     artifact_root: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     fingerprint: &WorktreeFingerprintV1,
@@ -15067,15 +15212,14 @@ async fn persist_p088_worktree_fingerprint(
         .join("p088")
         .join(agent_exec_id.to_string())
         .join(format!("{phase}-worktree-fingerprint.json"));
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
     let bytes = serde_json::to_vec_pretty(fingerprint)?;
     tokio::fs::write(&path, bytes).await?;
     Ok(path.to_string_lossy().into_owned())
 }
 
 async fn persist_p088_prompt_artifact(
+    workspace_root: &str,
     artifact_root: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     prompt_kind: &str,
@@ -15087,14 +15231,13 @@ async fn persist_p088_prompt_artifact(
         .join("p088")
         .join(agent_exec_id.to_string())
         .join(format!("{prompt_kind}-{turn_index}-prompt-redacted.txt"));
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
     tokio::fs::write(&path, redact_runtime_message(prompt_text)).await?;
     Ok(path.to_string_lossy().into_owned())
 }
 
 async fn persist_p088_expected_output_snapshot(
+    workspace_root: &str,
     artifact_root: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     prompt_kind: &str,
@@ -15108,9 +15251,7 @@ async fn persist_p088_expected_output_snapshot(
         .join(format!(
             "{prompt_kind}-{turn_index}-expected-output-contracts.json"
         ));
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
     let bytes = serde_json::to_vec_pretty(declared_outputs)?;
     let sha = sha256_hex(&bytes);
     tokio::fs::write(&path, bytes).await?;
@@ -15118,6 +15259,7 @@ async fn persist_p088_expected_output_snapshot(
 }
 
 async fn persist_p088_completion_text_artifacts(
+    workspace_root: &str,
     artifact_root: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     prompt_kind: &str,
@@ -15131,11 +15273,12 @@ async fn persist_p088_completion_text_artifacts(
         .join("evidence")
         .join("p088")
         .join(agent_exec_id.to_string());
-    tokio::fs::create_dir_all(&base).await?;
     let raw_path = base.join(format!("{prompt_kind}-{turn_index}-completion-raw.txt"));
     let redacted_path = base.join(format!(
         "{prompt_kind}-{turn_index}-completion-redacted.txt"
     ));
+    prepare_executor_artifact_parent(workspace_root, &raw_path, "Run artifact_root")?;
+    prepare_executor_artifact_parent(workspace_root, &redacted_path, "Run artifact_root")?;
     let raw_result = tokio::fs::write(&raw_path, text).await;
     let redacted_result = tokio::fs::write(&redacted_path, redact_runtime_message(text)).await;
     let storage_error = raw_result
@@ -15161,6 +15304,7 @@ struct P088TextArtifactPaths {
 }
 
 async fn persist_p088_receipt_artifact(
+    workspace_root: &str,
     artifact_root: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     receipt: &CodeWriterCompletionReceiptRecord,
@@ -15172,9 +15316,7 @@ async fn persist_p088_receipt_artifact(
         .join("p088")
         .join(agent_exec_id.to_string())
         .join("code-writer-completion-receipt-v1.json");
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
     let value = serde_json::json!({
         "schema_version": "code_writer_completion_receipt_v1",
         "receipt": receipt,
@@ -15186,6 +15328,7 @@ async fn persist_p088_receipt_artifact(
 }
 
 async fn persist_p088_failed_stage_evidence(
+    workspace_root: &str,
     artifact_root: &str,
     agent_exec_id: domain::ids::AgentExecutionId,
     receipt: &CodeWriterCompletionReceiptRecord,
@@ -15197,9 +15340,7 @@ async fn persist_p088_failed_stage_evidence(
         .join("p088")
         .join(agent_exec_id.to_string())
         .join("failed-stage-evidence.json");
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
     let value = serde_json::json!({
         "report_kind": "failed_stage_evidence",
         "evidence_source": "p088_code_writer_completion",
@@ -15217,6 +15358,7 @@ async fn persist_p088_failed_stage_evidence(
 
 async fn persist_p088_code_writer_completion_receipt(
     pool: &SqlitePool,
+    workspace_root: &str,
     artifact_root: &str,
     run_id: RunId,
     stage_execution_id: domain::ids::StageExecutionId,
@@ -15249,6 +15391,7 @@ async fn persist_p088_code_writer_completion_receipt(
     let receipt_id = format!("{agent_exec_id}:code_writer_completion_receipt_v1");
     let mut partial_write_reasons = Vec::new();
     let original_text_artifacts_result = persist_p088_completion_text_artifacts(
+        workspace_root,
         artifact_root,
         agent_exec_id,
         "original",
@@ -15268,6 +15411,7 @@ async fn persist_p088_code_writer_completion_receipt(
     let repair_text_artifacts = match repair_capture {
         Some(capture) => {
             let result = persist_p088_completion_text_artifacts(
+                workspace_root,
                 artifact_root,
                 agent_exec_id,
                 "code_writer_completion_repair",
@@ -15612,6 +15756,7 @@ async fn persist_p088_code_writer_completion_receipt(
         created_at,
     };
     match persist_p088_receipt_artifact(
+        workspace_root,
         artifact_root,
         agent_exec_id,
         &receipt,
@@ -15628,6 +15773,7 @@ async fn persist_p088_code_writer_completion_receipt(
     }
     if receipt.failure_class.is_some() || receipt.missing_required_output_count > 0 {
         match persist_p088_failed_stage_evidence(
+            workspace_root,
             artifact_root,
             agent_exec_id,
             &receipt,
@@ -16407,6 +16553,14 @@ fn p090_preflight_remediation_from_json(json: &str) -> Option<String> {
         })
 }
 
+fn late_output_source_terminal_status_for_readback(status: Option<&str>) -> &'static str {
+    match status {
+        Some("completed") => "completed",
+        Some("failed") => "failed",
+        _ => "failed",
+    }
+}
+
 fn p090_enrich_runtime_facts_with_preflight_json(
     facts: &mut AgentExecutionRuntimeFacts,
     runtime_tool_path_preflight_json: Option<&str>,
@@ -17152,11 +17306,44 @@ fn code_writer_completion_repair_prompt(
     prompt
 }
 
-fn merge_contract_repair_result(initial: &mut acp::ExecutionResult, repair: acp::ExecutionResult) {
+fn merge_contract_repair_result(
+    initial: &mut acp::ExecutionResult,
+    repair: acp::ExecutionResult,
+    merged_settlement: &DeclaredOutputDiscoverySettlement,
+) {
     initial.status = repair.status;
     initial.artifact_paths.extend(repair.artifact_paths);
-    initial.discovered_artifacts = repair.discovered_artifacts;
-    initial.pre_prompt_expected_outputs = repair.pre_prompt_expected_outputs;
+    let mut discovered_artifacts = initial.discovered_artifacts.clone();
+    for artifact in repair.discovered_artifacts {
+        if let Some(existing) = discovered_artifacts.iter_mut().find(|candidate| {
+            candidate.name == artifact.name && candidate.source_path == artifact.source_path
+        }) {
+            *existing = artifact;
+        } else {
+            discovered_artifacts.push(artifact);
+        }
+    }
+    initial.discovered_artifacts = discovered_artifacts;
+
+    let mut pre_prompt_expected_outputs = initial.pre_prompt_expected_outputs.clone();
+    for metadata in repair.pre_prompt_expected_outputs {
+        if let Some(existing) = pre_prompt_expected_outputs.iter_mut().find(|candidate| {
+            candidate.output_name == metadata.output_name
+                && candidate.target_path == metadata.target_path
+        }) {
+            *existing = metadata;
+        } else {
+            pre_prompt_expected_outputs.push(metadata);
+        }
+    }
+    initial.pre_prompt_expected_outputs = pre_prompt_expected_outputs;
+    initial.artifact_paths.extend(
+        merged_settlement
+            .decisions
+            .iter()
+            .filter(|decision| decision.status == OutputDiscoveryStatus::Accepted)
+            .map(|decision| decision.target_path.clone()),
+    );
     initial.cost_cents =
         Some(initial.cost_cents.unwrap_or_default() + repair.cost_cents.unwrap_or_default());
     initial.usage = repair.usage.or_else(|| initial.usage.clone());
@@ -17218,6 +17405,79 @@ mod tests {
         );
 
         assert!(is_transient_persistence_contention_error(&error));
+    }
+
+    #[test]
+    fn p082_executor_artifact_parent_rejects_symlink_swapped_artifact_root() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let artifact_root = workspace.path().join("artifacts");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &artifact_root)
+            .expect("artifact_root symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &artifact_root)
+            .expect("artifact_root symlink fixture");
+
+        let path = artifact_root
+            .join("evidence")
+            .join("p088")
+            .join("receipt.json");
+        let err = prepare_executor_artifact_parent(
+            &workspace.path().to_string_lossy(),
+            &path,
+            "Run artifact_root",
+        )
+        .expect_err("symlink-swapped artifact_root must fail closed");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "P082 executor writes must reject artifact_root symlink swaps; got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn p082_executor_artifact_parent_rejects_workspace_escape() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let workspace_root = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let path = outside.path().join("evidence").join("receipt.json");
+
+        let err = prepare_executor_artifact_parent(
+            &workspace_root.to_string_lossy(),
+            &path,
+            "Run artifact_root",
+        )
+        .expect_err("artifact path outside workspace must fail closed");
+
+        assert!(
+            err.to_string().contains("escapes canonical workspace_root"),
+            "P082 executor writes must reject paths outside workspace; got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn p082_r17_late_output_readback_normalizes_cancelled_source_status() {
+        assert_eq!(
+            late_output_source_terminal_status_for_readback(Some("completed")),
+            "completed"
+        );
+        assert_eq!(
+            late_output_source_terminal_status_for_readback(Some("failed")),
+            "failed"
+        );
+        assert_eq!(
+            late_output_source_terminal_status_for_readback(Some("cancelled")),
+            "failed",
+            "P082-R17 readback must not expose cancelled source work item status"
+        );
+        assert_eq!(
+            late_output_source_terminal_status_for_readback(None),
+            "failed"
+        );
     }
 
     #[test]
@@ -18368,6 +18628,80 @@ plain progress line without gate evidence";
             .output_results
             .iter()
             .all(|result| result.status == domain::validation::ValidationStatus::Passed));
+    }
+
+    #[test]
+    fn output_contract_repair_result_preserves_original_and_repair_discovery_metadata() {
+        fn execution_result(
+            execution_id: &str,
+            output_name: &str,
+            target_path: &str,
+        ) -> acp::ExecutionResult {
+            serde_json::from_value(serde_json::json!({
+                "agent_execution_id": execution_id,
+                "status": "completed",
+                "artifact_paths": [target_path],
+                "discovered_artifacts": [{
+                    "name": output_name,
+                    "content": [123, 125],
+                    "source_path": target_path,
+                    "source_kind": "chainworks_output"
+                }],
+                "pre_prompt_expected_outputs": [{
+                    "output_name": output_name,
+                    "target_path": target_path,
+                    "canonical_path": target_path,
+                    "root_class": "workspace",
+                    "existed": false,
+                    "file_type": "absent",
+                    "baseline_status": "absent",
+                    "agent_execution_id": execution_id,
+                    "stage_execution_id": "01900000-0000-7000-8000-000000000101",
+                    "attempt_number": 1,
+                    "session_generation_id": "session-generation-1",
+                    "prompt_turn_id": "turn-1",
+                    "discovery_generation_id": format!("discovery-{output_name}")
+                }],
+                "cost_cents": 0
+            }))
+            .expect("compact execution result fixture must deserialize")
+        }
+
+        let mut initial = execution_result(
+            "01900000-0000-7000-8000-000000000201",
+            "implementation_progress",
+            "/workspace/.chainworks/implementation/progress.json",
+        );
+        let repair = execution_result(
+            "01900000-0000-7000-8000-000000000202",
+            "implementation_self_assessment",
+            "/workspace/.chainworks/implementation/self-assessment.json",
+        );
+        let merged_settlement = DeclaredOutputDiscoverySettlement {
+            decisions: Vec::new(),
+            accepted_payloads: HashMap::new(),
+            idempotency_key: None,
+            accepted_aggregate_bytes: 0,
+            aggregate_cap_hit: false,
+        };
+
+        merge_contract_repair_result(&mut initial, repair, &merged_settlement);
+
+        let discovered_names: HashSet<_> = initial
+            .discovered_artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str())
+            .collect();
+        assert!(discovered_names.contains("implementation_progress"));
+        assert!(discovered_names.contains("implementation_self_assessment"));
+
+        let pre_prompt_names: HashSet<_> = initial
+            .pre_prompt_expected_outputs
+            .iter()
+            .map(|metadata| metadata.output_name.as_str())
+            .collect();
+        assert!(pre_prompt_names.contains("implementation_progress"));
+        assert!(pre_prompt_names.contains("implementation_self_assessment"));
     }
 
     #[test]

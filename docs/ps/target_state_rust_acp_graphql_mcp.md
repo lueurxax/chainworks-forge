@@ -698,7 +698,8 @@ The target state should be reached in phases.
 ## Phase 2 — MCP external control plane
 
 - MCP server exposes external control operations.
-- External agents and operator scripts can create ideas and start runs.
+- Operator scripts can create root-backed ideas and start runs; external agents
+  can create directory-free ideas and use their allowed MCP worker/read surfaces.
 - Reset/retry/compact/recovery are MCP-first.
 
 ## Phase 3 — GraphQL read and live subscriptions

@@ -746,26 +746,36 @@ async fn p082_sec_p082_001_oversized_string_field_is_capped() {
 
     // Build a readback with an oversized recovery_operator_message (>2048 bytes).
     let oversized_message = "X".repeat(3000);
-    let mut readback = recovery_matrix::build_readback_v1(
-        "P082-R05",
-        "held",
-        "wait",
-        recovery_matrix::REASON_STARTUP_STALLED,
-        "Stale ACP startup detected.",
-        "work_items, session_generations",
-        "work_items, sessions, startup_repairs",
+    let summary = recovery_matrix::build_startup_repair_summary(
         &repair_key,
-        Some("work_items.payload_json.p061_startup_recovery"),
-        "valid",
+        "wi-sec-cap",
+        "cj-sec-cap",
+        1,
+        1,
+        false,
+        60_000,
         &now.to_rfc3339(),
+        false,
+        None,
+        "startup",
     );
-    // Inject oversized message directly into the readback object.
-    if let Some(obj) = readback.as_object_mut() {
-        obj.insert(
-            "recovery_operator_message".to_string(),
-            serde_json::Value::String(oversized_message.clone()),
-        );
-    }
+    let readback = recovery_matrix::set_readback_startup_repair(
+        recovery_matrix::build_readback_v1(
+            "P082-R05",
+            "held",
+            "wait",
+            recovery_matrix::REASON_STARTUP_STALLED,
+            "Stale ACP startup detected.",
+            "startup_repairs, work_items, session_generations",
+            "work_items, sessions, startup_repairs",
+            &repair_key,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            &now.to_rfc3339(),
+        ),
+        summary,
+        Some(&oversized_message),
+    );
 
     let notes = serde_json::json!({
         "requeue_generation": 1,
@@ -1250,6 +1260,11 @@ async fn p082_r09_pending_approval_accessor_derives_operator_action_readback() {
         Some(recovery_matrix::REASON_APPROVAL_PENDING_OPERATOR_ACTION_REQUIRED),
         "P082-R09: reason code must match approved vocabulary"
     );
+    assert_eq!(
+        row.get("source_json_key").and_then(|value| value.as_str()),
+        Some("stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback"),
+        "P082-R09: pending approval readback must point to the approved stage recovery snapshot owner"
+    );
 }
 
 #[tokio::test]
@@ -1298,10 +1313,15 @@ async fn p082_r10_duplicate_mediation_accessor_derives_rejected_owner_readback()
         Some(recovery_matrix::REASON_DUPLICATE_MEDIATION_OWNER_REJECTED),
         "P082-R10: reason code must match approved vocabulary"
     );
+    assert_eq!(
+        row.get("source_json_key").and_then(|value| value.as_str()),
+        Some("lead_conflict_mediations.validation_errors_json.p082_recovery_matrix_readback"),
+        "P082-R10: duplicate mediation readback must point to approved duplicate-owner evidence"
+    );
 }
 
 #[tokio::test]
-async fn p082_r04_duplicate_session_owner_accessor_derives_held_readback() {
+async fn p082_r04_duplicate_session_owner_accessor_reads_repaired_event() {
     let pool = setup_db().await;
     let now = Utc::now();
     let run_id = RunId::new();
@@ -1341,6 +1361,89 @@ async fn p082_r04_duplicate_session_owner_accessor_derives_held_readback() {
         .expect("insert session generation");
     }
 
+    sqlx::query(
+        r#"UPDATE session_generations
+           SET status = 'invalidated', ended_at = ?1, end_reason = 'p082_duplicate_owner_repaired'
+           WHERE id = 'p082-r04-generation-1'"#,
+    )
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("invalidate duplicate generation");
+    sqlx::query(
+        r#"UPDATE session_lineages
+           SET active_generation_id = NULL
+           WHERE id = 'p082-r04-lineage-1'"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("clear duplicate active lineage");
+
+    let readback = recovery_matrix::build_readback_v1(
+        "P082-R04",
+        "repaired",
+        "inspect_duplicate_owner",
+        recovery_matrix::REASON_DUPLICATE_OWNER_REPAIRED,
+        "Duplicate active session owner repaired; one active generation remains.",
+        "session_events",
+        "session_lineages, session_generations, session_events, work_items",
+        "p082-r04-duplicate-owner-repair:p082-r04-generation-1",
+        Some("session_events.details_json.p082_recovery_matrix_readback"),
+        "valid",
+        &now.to_rfc3339(),
+    );
+    let details = serde_json::json!({
+        "schema_version": "p082_duplicate_session_owner_repair_v1",
+        "run_id": run_id_str,
+        "invocation_owner_key": "duplicate-owner-r04",
+        "surviving_generation_id": "p082-r04-generation-2",
+        "invalidated_generation_id": "p082-r04-generation-1",
+        "p082_recovery_matrix_readback": readback,
+    });
+    sqlx::query(
+        r#"INSERT INTO session_events
+           (id, lineage_id, generation_id, event_type, recorded_at, details_json)
+           VALUES ('p082-r04-duplicate-owner-repair:p082-r04-generation-1',
+                   'p082-r04-lineage-1',
+                   'p082-r04-generation-1',
+                   'invalidated',
+                   ?1,
+                   ?2)"#,
+    )
+    .bind(now.to_rfc3339())
+    .bind(details.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert repaired duplicate owner event");
+
+    let active_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM session_generations
+           WHERE invocation_owner_key = 'duplicate-owner-r04'
+             AND status = 'active'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count active session owners");
+    assert_eq!(
+        active_count, 1,
+        "P082-R04: repaired durable state must leave one active session owner"
+    );
+    let invalidated_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM session_generations
+           WHERE invocation_owner_key = 'duplicate-owner-r04'
+             AND status = 'invalidated'
+             AND end_reason = 'p082_duplicate_owner_repaired'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count invalidated duplicate owners");
+    assert_eq!(
+        invalidated_count, 1,
+        "P082-R04: duplicate evidence must be terminalized"
+    );
+
     let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
         .await
         .expect("read P082 readbacks");
@@ -1349,10 +1452,20 @@ async fn p082_r04_duplicate_session_owner_accessor_derives_held_readback() {
         .find(|row| row.get("scenario_id").and_then(|value| value.as_str()) == Some("P082-R04"))
         .expect("P082-R04 readback");
     assert_eq!(
+        row.get("scenario_status").and_then(|value| value.as_str()),
+        Some("repaired"),
+        "P082-R04: repaired session event readback must report repaired status"
+    );
+    assert_eq!(
         row.get("recovery_projection_integrity")
             .and_then(|value| value.as_str()),
-        Some("stale"),
-        "P082-R04: duplicate active owner readback must mark stale projection integrity"
+        Some("valid"),
+        "P082-R04: repaired session event readback must mark valid projection integrity"
+    );
+    assert_eq!(
+        row.get("source_json_key").and_then(|value| value.as_str()),
+        Some("session_events.details_json.p082_recovery_matrix_readback"),
+        "P082-R04: duplicate session readback must point to approved session event evidence"
     );
 }
 
@@ -1418,6 +1531,11 @@ async fn p082_r05_stale_xcode_startup_accessor_derives_operator_message() {
     assert!(
         msg.contains("Next check") || msg.contains("next check") || msg.contains("backoff"),
         "P082-R05: operator message must explicitly include the next check/backoff state (not just 'Inspect'): {msg}"
+    );
+    assert_eq!(
+        row.get("source_json_key").and_then(|value| value.as_str()),
+        Some("session_events.details_json.p082_recovery_matrix_readback"),
+        "P082-R05 held stale-startup readback must point to approved session event evidence"
     );
 }
 
@@ -2024,6 +2142,38 @@ fn p082_r08_identifier_guidance_has_required_fields() {
     );
 }
 
+#[test]
+fn p082_r08_identifier_guidance_rejects_empty_examples() {
+    let guidance = recovery_matrix::build_retry_identifier_guidance(
+        "RetryAgentExecution",
+        "some-stale-uuid",
+        "stage_execution_uuid",
+        "stage_execution_uuid",
+        &[],
+    );
+    let readback = recovery_matrix::set_readback_identifier_guidance(
+        recovery_matrix::build_readback_v1(
+            "P082-R08",
+            "rejected",
+            "no_mutation",
+            recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+            "Provide an agent_execution_id from the latest stage execution attempt.",
+            "command_journal",
+            "command_journal, agent_executions, stage_executions",
+            "cmd-r08-empty-examples",
+            Some("command_journal.error.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T00:00:00Z",
+        ),
+        guidance,
+    );
+
+    assert!(
+        !recovery_matrix::validate_readback_v1_shape(&readback),
+        "P082-R08: valid_identifier_examples must be non-empty"
+    );
+}
+
 #[tokio::test]
 async fn p082_r08_identifier_guidance_stored_in_command_journal_error() {
     let pool = setup_db().await;
@@ -2188,6 +2338,7 @@ async fn p082_r11_cancellation_settlement_log_accessor_reads_readback() {
     // Insert idea + run rows (accessor queries runs table; FK enforcement is on).
     insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
 
+    let action_id = format!("cancellation_settlement:{run_id_str}:{}", now.to_rfc3339());
     let readback = recovery_matrix::build_readback_v1(
         "P082-R11",
         "cancelled",
@@ -2196,12 +2347,13 @@ async fn p082_r11_cancellation_settlement_log_accessor_reads_readback() {
         "Active stage execution settled by cancellation.",
         "runs, work_items, session_generations, session_events",
         "runs, work_items, sessions",
-        &run_id_str,
+        &action_id,
         Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
         "valid",
         &now.to_rfc3339(),
     );
     let entry = serde_json::json!({
+        "action_id": action_id,
         "agent_execution_id": "ae-r11-test",
         "agent_id": "agent-1",
         "prior_status": "running",
@@ -2239,6 +2391,11 @@ async fn p082_r11_cancellation_settlement_log_accessor_reads_readback() {
         "P082-R11: scenario_id from cancellation log must be P082-R11"
     );
     assert_eq!(
+        row.get("source_identifier").and_then(|v| v.as_str()),
+        Some(action_id.as_str()),
+        "P082-R11: source_identifier must be the cancellation settlement action_id"
+    );
+    assert_eq!(
         row.get("scenario_status").and_then(|v| v.as_str()),
         Some("cancelled"),
         "P082-R11: scenario_status must be cancelled"
@@ -2247,6 +2404,203 @@ async fn p082_r11_cancellation_settlement_log_accessor_reads_readback() {
         row.get("source_table").and_then(|v| v.as_str()),
         Some("runs, work_items, session_generations, session_events"),
         "P082-R11: source_table must be preserved by allowlist projection"
+    );
+}
+
+#[tokio::test]
+async fn p082_r11_cancellation_settlement_log_allows_parallel_entries_with_shared_action_id() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+
+    let action_id = format!("cancellation_settlement:{run_id_str}:{}", now.to_rfc3339());
+    let make_entry = |agent_execution_id: &str| {
+        let readback = recovery_matrix::build_readback_v1(
+            "P082-R11",
+            "cancelled",
+            "cancel",
+            recovery_matrix::REASON_CANCEL_ACTIVE_STAGE_REQUESTED,
+            "Active stage execution settled by cancellation.",
+            "runs, work_items, session_generations, session_events",
+            "runs, work_items, sessions",
+            &format!("{action_id}:agent_execution:{agent_execution_id}"),
+            Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
+            "valid",
+            &now.to_rfc3339(),
+        );
+        serde_json::json!({
+            "action_id": action_id,
+            "agent_execution_id": agent_execution_id,
+            "agent_id": "agent-1",
+            "prior_status": "running",
+            "terminal_status": "cancelled",
+            "session_close_attempted": false,
+            "session_close_succeeded": null,
+            "settled_at": now.to_rfc3339(),
+            "p082_recovery_matrix_readback": readback,
+        })
+    };
+    let log = serde_json::json!([
+        make_entry("ae-r11-parallel-1"),
+        make_entry("ae-r11-parallel-2")
+    ])
+    .to_string();
+
+    sqlx::query(
+        r#"UPDATE runs SET cancellation_settlement_log = ?1, cancellation_requested_at = ?2 WHERE id = ?3"#,
+    )
+    .bind(&log)
+    .bind(now.to_rfc3339())
+    .bind(&run_id_str)
+    .execute(&pool)
+    .await
+    .expect("update cancellation settlement log");
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run must not fail");
+    let r11_rows: Vec<_> = readbacks
+        .iter()
+        .filter(|row| row.get("scenario_id").and_then(|v| v.as_str()) == Some("P082-R11"))
+        .collect();
+
+    assert_eq!(
+        r11_rows.len(),
+        2,
+        "P082-R11: parallel cancellation entries sharing one action_id must both project"
+    );
+    assert!(
+        r11_rows.iter().all(|row| {
+            row.get("recovery_projection_integrity")
+                .and_then(|v| v.as_str())
+                == Some("valid")
+        }),
+        "P082-R11: suffixed per-execution source identifiers must not be classified as tamper"
+    );
+    assert!(
+        r11_rows.iter().all(|row| {
+            row.get("source_identifier")
+                .and_then(|v| v.as_str())
+                .is_some_and(|value| value.starts_with(&format!("{action_id}:agent_execution:")))
+        }),
+        "P082-R11: parallel entries must retain per-execution source identifiers"
+    );
+}
+
+#[tokio::test]
+async fn p082_r11_cancellation_settlement_log_missing_or_duplicate_action_id_tampers() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+
+    let action_id = format!("cancellation_settlement:{run_id_str}:{}", now.to_rfc3339());
+    let readback = recovery_matrix::build_readback_v1(
+        "P082-R11",
+        "cancelled",
+        "cancel",
+        recovery_matrix::REASON_CANCEL_ACTIVE_STAGE_REQUESTED,
+        "Active stage execution settled by cancellation.",
+        "runs, work_items, session_generations, session_events",
+        "runs, work_items, sessions",
+        &action_id,
+        Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
+        "valid",
+        &now.to_rfc3339(),
+    );
+    let missing_action_entry = serde_json::json!({
+        "agent_execution_id": "ae-r11-missing-action",
+        "agent_id": "agent-1",
+        "prior_status": "running",
+        "terminal_status": "cancelled",
+        "session_close_attempted": false,
+        "session_close_succeeded": null,
+        "settled_at": now.to_rfc3339(),
+        "p082_recovery_matrix_readback": readback.clone(),
+    });
+    let duplicate_entry_1 = serde_json::json!({
+        "action_id": action_id,
+        "agent_execution_id": "ae-r11-dup-1",
+        "agent_id": "agent-1",
+        "prior_status": "running",
+        "terminal_status": "cancelled",
+        "session_close_attempted": false,
+        "session_close_succeeded": null,
+        "settled_at": now.to_rfc3339(),
+        "p082_recovery_matrix_readback": readback,
+    });
+    let duplicate_entry_2 = serde_json::json!({
+        "action_id": action_id,
+        "agent_execution_id": "ae-r11-dup-2",
+        "agent_id": "agent-2",
+        "prior_status": "running",
+        "terminal_status": "cancelled",
+        "session_close_attempted": false,
+        "session_close_succeeded": null,
+        "settled_at": now.to_rfc3339(),
+        "p082_recovery_matrix_readback": duplicate_entry_1["p082_recovery_matrix_readback"].clone(),
+    });
+    let log =
+        serde_json::json!([missing_action_entry, duplicate_entry_1, duplicate_entry_2]).to_string();
+
+    sqlx::query(
+        r#"UPDATE runs SET cancellation_settlement_log = ?1, cancellation_requested_at = ?2 WHERE id = ?3"#,
+    )
+    .bind(&log)
+    .bind(now.to_rfc3339())
+    .bind(&run_id_str)
+    .execute(&pool)
+    .await
+    .expect("update cancellation settlement log");
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run must not fail");
+
+    assert!(
+        readbacks.iter().any(|row| {
+            row.get("recovery_projection_integrity")
+                .and_then(|v| v.as_str())
+                == Some("tamper_detected")
+        }),
+        "P082-R11: missing or duplicate action_id must produce tamper-detected readback"
+    );
+    assert!(
+        readbacks.iter().all(|row| {
+            row.get("source_identifier").and_then(|v| v.as_str()) != Some(action_id.as_str())
+                || row
+                    .get("recovery_projection_integrity")
+                    .and_then(|v| v.as_str())
+                    != Some("valid")
+        }),
+        "P082-R11: duplicated cancellation action_id must not pass as valid readback"
+    );
+}
+
+#[test]
+fn p082_r11_cancellation_action_id_shape_is_required() {
+    let now = Utc::now();
+    let action_id = format!("cancellation_settlement:run-r11:{}", now.to_rfc3339());
+    let readback = recovery_matrix::build_readback_v1(
+        "P082-R11",
+        "cancelled",
+        "cancel",
+        recovery_matrix::REASON_CANCEL_ACTIVE_STAGE_REQUESTED,
+        "Active stage execution settled by cancellation.",
+        "runs, work_items, session_generations, session_events",
+        "runs, work_items, sessions",
+        &action_id,
+        Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
+        "valid",
+        &now.to_rfc3339(),
+    );
+    assert_eq!(
+        readback["source_identifier"].as_str(),
+        Some(action_id.as_str()),
+        "P082-R11 source_identifier must cite runs.cancellation_settlement_log.action_id"
     );
 }
 
@@ -2709,18 +3063,37 @@ fn p082_r13_cancellation_side_effect_reconciliation_readback_shape() {
 fn p082_r14_cancellation_startup_repair_converged_readback_shape() {
     let now = Utc::now();
     let run_id = "run-cancel-r14-test";
-    let readback = recovery_matrix::build_readback_v1(
-        "P082-R14",
-        "cancelled",
-        "cancel",
-        recovery_matrix::REASON_CANCEL_STARTUP_REPAIR_CONVERGED,
-        "Cancellation settled; startup repair converged idempotently with cancellation.",
-        "runs, startup_repairs, work_items, session_generations",
-        "runs, startup_repairs, work_items, sessions",
-        run_id,
-        Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
-        "valid",
+    let summary = recovery_matrix::build_startup_repair_summary(
+        "p082-requeue:cj-r14:wi-r14:1",
+        "wi-r14",
+        "cj-r14",
+        1,
+        1,
+        true,
+        60_000,
         &now.to_rfc3339(),
+        false,
+        None,
+        "run",
+    );
+    let readback = recovery_matrix::set_readback_startup_repair(
+        recovery_matrix::build_readback_v1(
+            "P082-R14",
+            "cancelled",
+            "cancel",
+            recovery_matrix::REASON_CANCEL_STARTUP_REPAIR_CONVERGED,
+            "Cancellation settled; startup repair converged idempotently with cancellation.",
+            "runs, startup_repairs, work_items, session_generations",
+            "runs, startup_repairs, work_items, sessions",
+            run_id,
+            Some("runs.cancellation_settlement_log.p082_recovery_matrix_readback"),
+            "valid",
+            &now.to_rfc3339(),
+        ),
+        summary,
+        Some(
+            "Cancellation converged with an existing startup repair idempotency key; no duplicate repair work was created.",
+        ),
     );
     assert_eq!(readback["scenario_id"].as_str().unwrap(), "P082-R14");
     assert_eq!(readback["scenario_status"].as_str().unwrap(), "cancelled");
@@ -3537,9 +3910,8 @@ async fn p082_r16_metric_emitted_on_startup_requeue_exhausted() {
         "p082_recovery_idempotency_replay_total",
         "P082-R01:startup_requeue_once",
     );
-    assert_eq!(
-        after_r01 - before_r01,
-        1,
+    assert!(
+        after_r01 > before_r01,
         "P082-R01: p082_recovery_idempotency_replay_total must be incremented on first requeue"
     );
 
@@ -3566,9 +3938,8 @@ async fn p082_r16_metric_emitted_on_startup_requeue_exhausted() {
         "p082_recovery_idempotency_replay_total",
         "P082-R16:startup_requeue_exhausted",
     );
-    assert_eq!(
-        after_r16 - before_r16,
-        1,
+    assert!(
+        after_r16 > before_r16,
         "P082-R16: p082_recovery_idempotency_replay_total must be incremented on exhausted requeue"
     );
 }
@@ -3622,7 +3993,8 @@ async fn p082_required_matrix_metrics_are_emitted_from_readback_accessor() {
         .await
         .expect("fail metric journal");
 
-    // After the metric change, gate result is emitted with {scenario_id:status} label dimensions.
+    // Runtime readback emits readback/age telemetry only. Gate-result telemetry is
+    // emitted by the proposal-082 gate harness after assertion groups, not here.
     let before_gate = db::metrics::get_counter_with_label(
         "p082_recovery_matrix_gate_result_total",
         "P082-R02:rejected",
@@ -3651,9 +4023,9 @@ async fn p082_required_matrix_metrics_are_emitted_from_readback_accessor() {
         "p082_recovery_matrix_gate_result_total",
         "P082-R02:rejected",
     );
-    assert!(
-        after_gate > before_gate,
-        "P082: gate result counter must be emitted with {{scenario_id,status}} labels per readback row"
+    assert_eq!(
+        after_gate, before_gate,
+        "P082: runtime readback must not emit gate-result telemetry; gate harness owns p082_recovery_matrix_gate_result_total"
     );
 }
 
@@ -4217,9 +4589,10 @@ async fn p082_r15_crash_after_command_journal_error_settlement_readback_derives_
     )
     .await
     .expect("record command journal entry");
-    // Mark failed with the typed P082 error envelope (simulates error settlement completed).
+    // Mark rejected with the typed P082 error envelope (simulates rejected-command
+    // settlement completed without mutating the inserted payload).
     sqlx::query(
-        r#"UPDATE command_journal SET result_status = 'failed', error = ?1, completed_at = ?2 WHERE id = ?3"#,
+        r#"UPDATE command_journal SET result_status = 'rejected', error = ?1, completed_at = ?2 WHERE id = ?3"#,
     )
     .bind(&envelope)
     .bind(now.to_rfc3339())

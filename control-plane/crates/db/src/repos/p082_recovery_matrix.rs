@@ -7,6 +7,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{Row, SqlitePool};
+use std::collections::HashMap;
 
 /// Maximum byte size per readback row to guard against unbounded JSON parsing
 /// (SEC-P082-003).
@@ -85,6 +86,45 @@ const STARTUP_REPAIR_SUMMARY_ALLOWLIST: &[&str] = &[
     "backpressure_scope",
 ];
 
+fn is_absolute_path_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(
+            byte,
+            b'=' | b':'
+                | b'"'
+                | b'\''
+                | b'`'
+                | b'('
+                | b')'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'<'
+                | b'>'
+                | b','
+                | b';'
+                | b'!'
+                | b'|'
+        )
+}
+
+fn contains_absolute_unix_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte != b'/' {
+            continue;
+        }
+        if matches!(bytes.get(idx + 1), None | Some(b'/')) {
+            continue;
+        }
+        if idx == 0 || is_absolute_path_boundary(bytes[idx - 1]) {
+            return true;
+        }
+    }
+    false
+}
+
 fn sanitize_string(value: String) -> serde_json::Value {
     let value = domain::error_sanitizer::sanitize_error_for_storage(&value, MAX_STRING_FIELD_BYTES);
     let lower = value.to_ascii_lowercase();
@@ -102,22 +142,12 @@ fn sanitize_string(value: String) -> serde_json::Value {
         return serde_json::Value::String("[redacted]".to_string());
     }
     // Absolute filesystem paths — use structural detection rather than a prefix list.
-    // Any substring that looks like an absolute Unix path (space or start-of-string
-    // followed by a slash and a non-slash character) is redacted.  This covers
-    // /Users, /home, /var, /tmp, /Volumes, /Library, /System, /Applications,
-    // /etc, /bin, /opt, and arbitrary future roots (SEC-P082-LOW-001 fix).
+    // Any substring that looks like an absolute Unix path at the start of a
+    // token is redacted. This includes quoted, parenthesized, bracketed, and
+    // punctuation-adjacent paths while avoiding URL `//` separators.
     if lower.contains("file://")
         || lower.contains("/.chainworks/runs/")
-        || {
-            let bytes = value.as_bytes();
-            bytes.windows(2).any(|w| {
-                let prev = w[0];
-                let cur = w[1];
-                cur == b'/' && prev != b'/'
-                    && (prev == b' ' || prev == b'\t' || prev == b'\n' || prev == b'='
-                        || prev == b':' || prev == b'"' || prev == b'\'')
-            }) || bytes.first() == Some(&b'/')
-        }
+        || contains_absolute_unix_path(&value)
     {
         return serde_json::Value::String("[redacted]".to_string());
     }
@@ -235,6 +265,10 @@ fn push_valid_projected_readback(
     }
 }
 
+fn remaining_readback_limit(readbacks: &[serde_json::Value]) -> i64 {
+    MAX_READBACK_ROWS.saturating_sub(readbacks.len()) as i64
+}
+
 fn parse_utc_rfc3339(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -276,7 +310,7 @@ pub async fn readbacks_for_run(
     )
     .bind(run_id.to_string())
     .bind(MAX_READBACK_ROW_BYTES as i64)
-    .bind(MAX_READBACK_ROWS as i64)
+    .bind(remaining_readback_limit(&readbacks))
     .fetch_all(pool)
     .await?;
 
@@ -331,7 +365,7 @@ pub async fn readbacks_for_run(
         r#"SELECT id, error, created_at
            FROM command_journal
            WHERE run_id = ?1
-             AND result_status = 'failed'
+             AND result_status IN ('failed', 'rejected')
              AND error IS NOT NULL
              AND LENGTH(error) <= ?2
            ORDER BY created_at ASC
@@ -339,7 +373,7 @@ pub async fn readbacks_for_run(
     )
     .bind(run_id.to_string())
     .bind(MAX_READBACK_ROW_BYTES as i64)
-    .bind(MAX_READBACK_ROWS as i64)
+    .bind(remaining_readback_limit(&readbacks))
     .fetch_all(pool)
     .await?;
 
@@ -401,10 +435,12 @@ pub async fn readbacks_for_run(
            FROM runs
            WHERE id = ?1
              AND cancellation_settlement_log IS NOT NULL
-             AND LENGTH(cancellation_settlement_log) <= ?2"#,
+             AND LENGTH(cancellation_settlement_log) <= ?2
+           LIMIT ?3"#,
     )
     .bind(run_id.to_string())
     .bind(MAX_READBACK_ROW_BYTES as i64)
+    .bind(remaining_readback_limit(&readbacks))
     .fetch_all(pool)
     .await?;
 
@@ -419,6 +455,7 @@ pub async fn readbacks_for_run(
                 continue;
             }
             if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&log_str) {
+                let source_identifier_counts = p082_cancellation_source_identifier_counts(&entries);
                 for entry in entries {
                     if readbacks.len() >= MAX_READBACK_ROWS {
                         break;
@@ -427,7 +464,15 @@ pub async fn readbacks_for_run(
                         if rb.is_null() {
                             continue;
                         }
-                        if recovery_matrix::validate_readback_v1_shape(rb) {
+                        let cancellation_action_identity_valid =
+                            p082_cancellation_action_identity_valid(
+                                &entry,
+                                rb,
+                                &source_identifier_counts,
+                            );
+                        if recovery_matrix::validate_readback_v1_shape(rb)
+                            && cancellation_action_identity_valid
+                        {
                             if let Some(obj) = rb.as_object().cloned() {
                                 readbacks.push(allowlist_project(obj));
                             }
@@ -470,7 +515,7 @@ pub async fn readbacks_for_run(
     )
     .bind(run_id.to_string())
     .bind(MAX_READBACK_ROW_BYTES as i64)
-    .bind(MAX_READBACK_ROWS as i64)
+    .bind(remaining_readback_limit(&readbacks))
     .fetch_all(pool)
     .await?;
 
@@ -532,7 +577,7 @@ pub async fn readbacks_for_run(
            LIMIT ?2"#,
     )
     .bind(run_id.to_string())
-    .bind(MAX_READBACK_ROWS as i64)
+    .bind(remaining_readback_limit(&readbacks))
     .fetch_all(pool)
     .await?;
 
@@ -551,7 +596,7 @@ pub async fn readbacks_for_run(
             "approvals, approval_inbox, stage_executions",
             "approvals, approval_inbox, stage_executions",
             &approval_id,
-            None,
+            Some("stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback"),
             "valid",
             &requested_at,
         );
@@ -577,7 +622,7 @@ pub async fn readbacks_for_run(
            LIMIT ?2"#,
     )
     .bind(run_id.to_string())
-    .bind(MAX_READBACK_ROWS as i64)
+    .bind(remaining_readback_limit(&readbacks))
     .fetch_all(pool)
     .await?;
 
@@ -596,18 +641,51 @@ pub async fn readbacks_for_run(
             "lead_conflict_mediations, lead_mediation_confirmations, workflow_conflicts",
             "lead_conflict_mediations, lead_mediation_confirmations, workflow_conflicts",
             &source_id,
-            None,
+            Some("lead_conflict_mediations.validation_errors_json.p082_recovery_matrix_readback"),
             "valid",
             &updated_at,
         );
         push_valid_projected_readback(&mut readbacks, readback);
     }
 
-    // Source 7: session_lineages/session_generations (R04).
+    // Source 7: session_events.details_json.p082_recovery_matrix_readback (R04 repaired).
+    let repaired_session_owner_rows = sqlx::query(
+        r#"SELECT se.details_json, se.recorded_at
+           FROM session_events se
+           INNER JOIN session_lineages sl ON sl.id = se.lineage_id
+           WHERE sl.run_id = ?1
+             AND se.details_json IS NOT NULL
+             AND LENGTH(se.details_json) <= ?2
+             AND json_extract(se.details_json, '$.p082_recovery_matrix_readback.scenario_id') = 'P082-R04'
+           ORDER BY se.recorded_at ASC
+           LIMIT ?3"#,
+    )
+    .bind(run_id.to_string())
+    .bind(MAX_READBACK_ROW_BYTES as i64)
+    .bind(remaining_readback_limit(&readbacks))
+    .fetch_all(pool)
+    .await?;
+
+    for row in repaired_session_owner_rows {
+        if readbacks.len() >= MAX_READBACK_ROWS {
+            break;
+        }
+        let details_raw: Option<String> = row.try_get("details_json").unwrap_or(None);
+        if let Some(details_str) = details_raw {
+            if let Ok(details_json) = serde_json::from_str::<serde_json::Value>(&details_str) {
+                if let Some(readback) = details_json.get("p082_recovery_matrix_readback") {
+                    push_valid_projected_readback(&mut readbacks, readback.clone());
+                }
+            }
+        }
+    }
+
+    // Source 8: session_lineages/session_generations (R04 unrepaired diagnostic).
     //
     // A duplicate active invocation_owner_key means more than one active session
-    // generation claims the same owner. This diagnostic row is intentionally
-    // read-only: the repair path remains the existing session terminalization flow.
+    // generation claims the same owner. Startup recovery should invalidate the
+    // duplicate generation and write the repaired session_event source above;
+    // this fallback exposes any residue as a held stale diagnostic.
     let duplicate_session_rows = sqlx::query(
         r#"SELECT sg.invocation_owner_key,
                   MIN(sg.id) AS source_id,
@@ -623,7 +701,7 @@ pub async fn readbacks_for_run(
            LIMIT ?2"#,
     )
     .bind(run_id.to_string())
-    .bind(MAX_READBACK_ROWS as i64)
+    .bind(remaining_readback_limit(&readbacks))
     .fetch_all(pool)
     .await?;
 
@@ -642,14 +720,14 @@ pub async fn readbacks_for_run(
             "session_lineages, session_generations, session_events, work_items",
             "session_lineages, session_generations, session_events, work_items",
             &source_id,
-            None,
+            Some("session_events.details_json.p082_recovery_matrix_readback"),
             "stale",
             &updated_at,
         );
         push_valid_projected_readback(&mut readbacks, readback);
     }
 
-    // Source 8: stale active session generations without a provider session (R05).
+    // Source 9: stale active session generations without a provider session (R05).
     //
     // The accessor reports stale startup evidence from existing session rows. It
     // does not perform the requeue; startup recovery remains the mutation owner.
@@ -677,7 +755,7 @@ pub async fn readbacks_for_run(
            LIMIT ?2"#,
     )
     .bind(run_id.to_string())
-    .bind(MAX_READBACK_ROWS as i64)
+    .bind(remaining_readback_limit(&readbacks))
     .fetch_all(pool)
     .await?;
 
@@ -762,7 +840,7 @@ pub async fn readbacks_for_run(
                 "work_items, session_generations, session_events, startup_recovery_readbacks",
                 "work_items, sessions, startup_repairs",
                 &generation_id,
-                None,
+                Some("session_events.details_json.p082_recovery_matrix_readback"),
                 "stale",
                 &now.to_rfc3339(),
             ),
@@ -784,7 +862,7 @@ pub async fn readbacks_for_run(
            LIMIT ?2"#,
     )
     .bind(run_id.to_string())
-    .bind(MAX_READBACK_ROWS as i64)
+    .bind(remaining_readback_limit(&readbacks))
     .fetch_all(pool)
     .await?;
 
@@ -831,7 +909,7 @@ pub async fn readbacks_for_run(
     )
     .bind(run_id.to_string())
     .bind(MAX_READBACK_ROW_BYTES as i64)
-    .bind(MAX_READBACK_ROWS as i64)
+    .bind(remaining_readback_limit(&readbacks))
     .fetch_all(pool)
     .await?;
 
@@ -914,10 +992,6 @@ pub async fn readbacks_for_run(
             .get("recovery_reason_code")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let scenario_status = row
-            .get("scenario_status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
         if let Some(updated_at) = row.get("updated_at").and_then(|value| value.as_str()) {
             if let Some(updated_at_dt) = parse_utc_rfc3339(updated_at) {
                 let age = metric_now
@@ -931,10 +1005,89 @@ pub async fn readbacks_for_run(
                 );
             }
         }
-        crate::metrics::record_p082_recovery_matrix_gate_result(scenario_id, scenario_status);
     }
 
     Ok(readbacks)
+}
+
+fn p082_cancellation_action_identity_valid(
+    entry: &serde_json::Value,
+    readback: &serde_json::Value,
+    source_identifier_counts: &HashMap<String, usize>,
+) -> bool {
+    let scenario_id = readback.get("scenario_id").and_then(|value| value.as_str());
+    if !matches!(
+        scenario_id,
+        Some("P082-R11" | "P082-R12" | "P082-R13" | "P082-R14")
+    ) {
+        return true;
+    }
+
+    let Some(action_id) = entry
+        .get("action_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return false;
+    };
+
+    let Some(source_identifier) = readback
+        .get("source_identifier")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return false;
+    };
+
+    if source_identifier_counts
+        .get(source_identifier)
+        .copied()
+        .unwrap_or(0)
+        != 1
+    {
+        return false;
+    }
+
+    if source_identifier == action_id {
+        return true;
+    }
+
+    let Some(agent_execution_id) = entry
+        .get("agent_execution_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return false;
+    };
+    source_identifier
+        .strip_prefix(&format!("{action_id}:agent_execution:"))
+        .is_some_and(|suffix| suffix == agent_execution_id)
+}
+
+fn p082_cancellation_source_identifier_counts(
+    entries: &[serde_json::Value],
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for entry in entries {
+        let Some(readback) = entry.get("p082_recovery_matrix_readback") else {
+            continue;
+        };
+        let scenario_id = readback.get("scenario_id").and_then(|value| value.as_str());
+        if !matches!(
+            scenario_id,
+            Some("P082-R11" | "P082-R12" | "P082-R13" | "P082-R14")
+        ) {
+            continue;
+        }
+        if let Some(source_identifier) = readback
+            .get("source_identifier")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+        {
+            *counts.entry(source_identifier.to_string()).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 /// Latest-row selection for the singular `p082_recovery_matrix_readback` field on
@@ -965,5 +1118,40 @@ pub fn emit_readback_lane_metrics(readbacks: &[serde_json::Value], lane: &str) {
                 &format!("{reason_code}:{lane}"),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p082_sanitize_string_redacts_absolute_paths_after_punctuation_boundaries() {
+        for input in [
+            "see (/Users/alice/project)",
+            "see )/Users/alice/project",
+            "path=[/var/tmp/run.log]",
+            "path ]/var/tmp/run.log",
+            "quoted=\"/tmp/secret\"",
+            "json:{/Library/Application Support/Chainworks}",
+            "next,/Volumes/Data/out",
+            "cmd;`/opt/tool/bin`",
+            "bang!/private/tmp/output",
+            "pipe|/etc/passwd",
+        ] {
+            assert_eq!(
+                sanitize_string(input.to_string()),
+                serde_json::Value::String("[redacted]".to_string()),
+                "expected absolute path redaction for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn p082_sanitize_string_avoids_url_separator_false_positive() {
+        assert_eq!(
+            sanitize_string("read https://example.invalid/path for docs".to_string()),
+            serde_json::Value::String("read https://example.invalid/path for docs".to_string())
+        );
     }
 }

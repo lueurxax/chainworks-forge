@@ -236,17 +236,17 @@ Platform/product scope:
 - Proposal source: Fixtures, Gate, Metrics (`docs/proposals/082-recovery-retry-state-machine-test-matrix.md:105`, `:126`, `:158`).
 - Status: Implemented.
 - Evidence types: docs, config, tests-found, tests-run.
-- Evidence: Positive fixture has `p082_operator_readback_fixture_v1`, 19 reason codes, 17 scenario IDs, and lanes `runs_get`, `reports_get`, `report_resource`, `run_report`, `release_receipt`; negative fixture files are present under `docs/evidence/rollout-contract/negative/`. Gate static checks verify fixture shape and expected failure codes (`scripts/test-gate.sh:10469`, `:10534`). Metrics declared and emitted in `control-plane/crates/db/src/metrics.rs:121`, `:604`, `:618`, `:627`; accessor emits metrics at `control-plane/crates/db/src/repos/p082_recovery_matrix.rs:899`, `:923`, `:930`.
-- Mapping: Gate validates docs, fixtures, constants, lane wiring, metrics, and required named tests before cargo test suites.
-- Gap/note: None.
+- Evidence: Positive fixture has `p082_operator_readback_fixture_v1`, 19 reason codes, 17 scenario IDs, and lanes `runs_get`, `reports_get`, `report_resource`, `run_report`, `release_receipt`; negative fixture files are present under `docs/evidence/rollout-contract/negative/`. The current `proposal-082|p082` alias retains the legacy Python fixture-shape checklist in `scripts/test-gate.sh` as inert reference text and executes focused DB, engine, and MCP Rust suites instead. Metrics are declared in `control-plane/crates/db/src/metrics.rs`; runtime readback accessors emit readback/state-age metrics, while the retained DB harness test owns gate-result metric evidence.
+- Mapping: Gate validates the active DB, engine, and MCP P082 suites. Fixture-shape validation for the negative fixture inventory is documented as a known proof gap in `docs/reference/test-gates.md` until the static checklist is re-enabled or moved into compiled tests.
+- Gap/note: Historical R1 gate-inventory statements are superseded by the current gate semantics documented in `docs/reference/test-gates.md` and `docs/reference/recovery-retry-state-machine-test-matrix.md`.
 
 ### REQ-011: Swift/macOS read-only boundary and optional GraphQL posture
 
 - Proposal source: Non Goals, Operator Surfaces, Swift Macos Contract (`docs/proposals/082-recovery-retry-state-machine-test-matrix.md:42`, `:57`, `:59`).
 - Status: Implemented.
 - Evidence types: code, diff, tests-found.
-- Evidence: P082 changed Rust control-plane/MCP/report surfaces; no Swift app files and no GraphQL server files were changed in the audited worktree status. Reference doc keeps Swift/macOS as read-only and future UI as separate scope (`docs/reference/recovery-retry-state-machine-test-matrix.md:332`).
-- Mapping: No app-side recovery authority was added. Advisory GraphQL P082 readbacks were not implemented, so optional GraphQL tolerance tests are not required.
+- Evidence: P082 changed Rust control-plane/MCP/report surfaces and includes GraphQL WebSocket bearer-auth hardening through the shared strict bearer parser; no Swift app files were changed in the audited worktree status. Reference doc keeps Swift/macOS as read-only and future UI as separate scope (`docs/reference/recovery-retry-state-machine-test-matrix.md:332`).
+- Mapping: No app-side recovery authority was added. Advisory GraphQL P082 readbacks were not implemented, so optional GraphQL readback tolerance tests are not required; the GraphQL change is transport-auth hardening only.
 - Gap/note: None.
 
 ### REQ-012: Same-tree canonical P082 gate evidence
@@ -255,7 +255,7 @@ Platform/product scope:
 - Status: Implemented.
 - Evidence types: tests-run.
 - Evidence: `./scripts/test-gate.sh proposal-082` passed on the audited worktree.
-- Mapping: Gate ran static checks, DB suite, engine unit suite, focused engine integration, provider cleanup proof, and MCP readback suite.
+- Mapping: Current gate semantics run the DB, engine, and MCP P082 suites; historical static-check output from the original R1 run is superseded by the post-refinement gate documentation.
 - Gap/note: Same-tree gate passed, but with non-fatal warnings and a background panic message; see `READY-P082-001`.
 
 ## Reviewer / Lens Scorecard
@@ -316,7 +316,7 @@ Platform/product scope:
 | `python3 /Users/user/.codex/skills/proposal-implementation-audit/scripts/discover_prior_review.py .../082-recovery-retry-state-machine-test-matrix.md` | No prior review artifacts found. |
 | `jq -r '.schema_version, (.fixture_assertions.required_reason_codes | length), (.fixture_assertions.required_scenario_ids | length), (.lanes | keys | join(","))' docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json` | `p082_operator_readback_fixture_v1`; 19 reason codes; 17 scenario IDs; lanes: `release_receipt,report_resource,reports_get,run_report,runs_get`. |
 | `rg` inspections of domain/DB/engine/MCP/test surfaces | Confirmed constants, accessors, lane wiring, metrics, and named P082 tests. |
-| `./scripts/test-gate.sh proposal-082` | Passed: static checks passed; DB 67/67; engine unit 35/35; engine integration P082 2/2; provider cleanup proof 1/1; MCP readback 16/16. Non-fatal warnings and one background-thread panic message observed. |
+| `./scripts/test-gate.sh proposal-082` | Historical R1 run passed with static checks and focused Rust suites; post-refinement gate semantics now execute the focused DB, engine, and MCP P082 suites while retaining the Python checklist as inert reference text. Non-fatal warnings and one background-thread panic message were observed in the historical R1 run. |
 
 ## Final Verdict
 

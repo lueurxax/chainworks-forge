@@ -90,13 +90,13 @@ Each matrix row must populate the following columns.
 | P082-R08 | Retry identifier mismatch | `valid_identifier_guidance` | Operator supplies the wrong identifier kind (e.g. stage execution UUID where workflow stage ID is required) | Reject with deterministic guidance before any mutation | No retry mutation, work item, retry authority, or instruction binding created; `command_journal.error` contains `p082_rejected_command_error_v1` with nested `p082_retry_identifier_guidance_v1`; `payload_json` unchanged | MCP error and report readback name the expected identifier kind and provide valid examples | `p082_retry_identifier_guidance_v1` with `no_mutation=true` | `command_journal`, `retry_payload_recovery_events` | `p082_recovery_matrix_readbacks[scenario_id=P082-R08]` | `payload_json` is never mutated | n/a |
 | P082-R09 | Pending human approval restart | `approval_pending_operator_action_required` | Daemon restarts while a human approval is pending | Restore pending approval visibility without auto-resolution | `approvals.decision=pending`; `decided_at=null`; `approval_inbox` has a pending entry | Orchestrator waits at the approval gate; no synthesized approval or rejection | `recovery_decision=operator_approval_required`; `next_action` points to the existing approval path | `approvals`, `approval_inbox`, `stage_executions` | `p082_recovery_matrix_readbacks[scenario_id=P082-R09]` | Restart restores pending state only; no fabricated decision | pending approval: warn=86400s, crit=259200s |
 | P082-R10 | Duplicate mediation attempt | `duplicate_mediation_owner_rejected` | A duplicate mediation or session attempt targets the same conflict owner | Keep one active mediation owner; preserve duplicate evidence | `lead_conflict_mediations` active fingerprint is unique; `lead_mediation_confirmations` has at most one pending entry per mediation | No duplicate lead conflict settlement | Readback names the current mediation owner | `lead_conflict_mediations`, `lead_mediation_confirmations`, `workflow_conflicts` | `p082_recovery_matrix_readbacks[scenario_id=P082-R10]` | Replay is idempotent with a single surviving owner | n/a |
-| P082-R11 | Cancel interleaved with active stage | `cancel_active_stage_requested` | Cancellation requested while an active stage, retry, invoke operation, or provider session is running | Settle cancellation; prevent new invoke work; terminalize the active provider session record | `runs.cancellation_requested_at` set; `cancellation_settlement_log` has exactly one action entry; work items settled exactly once; `session_generations` and `session_events` record terminalization; no duplicate `retry_authority` | No duplicate work, owners, side effects, or orphaned provider sessions after replay; provider subprocess cleanup proof cites ACP transport lifecycle evidence | `scenario_status=cancelled` or held with a clear held-vs-cancelled message | `runs`, `work_items`, `retry_stage_execution_authorities`, `session_generations`, `session_events` | `p082_recovery_matrix_readbacks[scenario_id=P082-R11]` | Replay in either ordering converges; provider subprocess cleanup required | n/a |
+| P082-R11 | Cancel interleaved with active stage | `cancel_active_stage_requested` | Cancellation requested while an active stage, retry, invoke operation, or provider session is running | Settle cancellation; prevent new invoke work; terminalize the active provider session record | `runs.cancellation_requested_at` set; `cancellation_settlement_log` has one non-empty `action_id`-scoped entry per settled item, including a synthetic P082 readback entry when active invoke ownership exists before a running `agent_execution` row; work items settled exactly once; `session_generations` and `session_events` record terminalization; no duplicate `retry_authority` | No duplicate work, owners, side effects, or orphaned provider sessions after replay; provider subprocess cleanup proof cites ACP transport lifecycle evidence | `scenario_status=cancelled` or held with a clear held-vs-cancelled message | `runs`, `work_items`, `retry_stage_execution_authorities`, `session_generations`, `session_events` | `p082_recovery_matrix_readbacks[scenario_id=P082-R11]` | Replay in either ordering converges; provider subprocess cleanup required | n/a |
 | P082-R12 | Cancel with pending approval | `cancel_pending_approval_preserved` | Cancellation requested while a human approval is pending | Cancel the run without converting the approval decision | `approvals.decided_at=null` unless the operator explicitly decides; `approval_inbox` changes tied to cancellation settlement only | Approval gate does not resume work after cancellation | `next_action` describes cancellation settlement, not an approval retry | `runs`, `approvals`, `approval_inbox` | `p082_recovery_matrix_readbacks[scenario_id=P082-R12]` | Idempotent convergence | n/a |
 | P082-R13 | Cancel with unresolved side effects | `cancel_side_effect_reconciliation_required` | Cancellation requested while unresolved `side_effects` rows exist | Cancel future scheduling; hold external-effect settlement for reconciliation | `side_effects.status` unchanged except through explicit reconciliation; no `side_effect_attempts` retry row; `cancellation_settlement_log` records the hold | No duplicate external side effect; cancellation does not mask reconciliation need | `recovery_decision=reconcile_side_effects`; `recovery_operator_message` non-null | `runs`, `side_effects`, `side_effect_attempts` | `p082_recovery_matrix_readbacks[scenario_id=P082-R13]` | Idempotent; no retry during hold | side-effect reconciliation hold: warn=3600s, crit=14400s |
 | P082-R14 | Cancel interleaved with startup repair | `cancel_startup_repair_converged` | Cancellation races with a startup recovery requeue | Cancellation wins for future scheduling; already-journaled repair converges idempotently | `startup_repairs` retains exactly one idempotency row; no cancelled-and-pending duplicates for the same source; `cancellation_settlement_log` records the interaction | Replay in either ordering converges without duplicate work, owners, or provider sessions | `p082_startup_repair_summary_v1` names the repair idempotency key and replay state | `runs`, `startup_repairs`, `work_items`, `session_generations` | `p082_recovery_matrix_readbacks[scenario_id=P082-R14]` | Convergence verified under both ordering scenarios | n/a |
 | P082-R15 | Daemon crash during repair | `repair_crash_resume_idempotent` | Daemon crashes after the eligibility check but before final readback settlement | Replay repair using the subsystem idempotency key; converge without duplicate mutation; crash-loop replay variant for the same key across multiple restarts | Exactly one durable repair key per affected subsystem; no duplicates across repeated crashes | Recovery service resumes from every crash point; projections remain consistent; provider subprocess cleanup evidence cited when a provider session is involved | `recovery_projection_integrity=valid`; `replayed=true` when a duplicate key is observed | Row-specific per crash boundary (`startup_repairs`, `retry_payload_recovery_events`, `side_effects`, `runs`, `command_journal`) | `p082_recovery_matrix_readbacks[scenario_id=P082-R15]` | Repeated-crash variant: same idempotency key across multiple restarts produces a single owner, single work item, and single readback row | n/a |
 | P082-R16 | Startup requeue exhausted | `startup_requeue_exhausted` | Startup recovery observes the same source work item after the allowed requeue generation has been consumed | Hold without enqueuing duplicate work, a new session generation, or any side-effect mutation; operator clearance via existing recovery inspection or cancellation paths | `startup_repairs` retains exactly one idempotency row; no second pending work item for the same `source_work_item_id`; `scenario_status=held`; `recovery_operator_message` is non-null | No duplicate generations or provider sessions; scheduler capacity not consumed | `scenario_status=held`; `reason_code=startup_requeue_exhausted`; `p082_startup_repair_summary_v1` present; operator message names the clearance path | `startup_repairs`, `work_items`, `startup_recovery_readbacks` | `p082_recovery_matrix_readbacks[scenario_id=P082-R16]` | Idempotent: a second observation of the same key produces the same held state | startup_requeue_exhausted: warn=0s, crit=300s |
-| P082-R17 | Cancel then late provider output | `cancelled_provider_late_output_ignored` | A provider session is cancelled or terminalized; output then arrives from that cancelled generation | Classify as late output; quarantine or ignore it; preserve evidence; no active projection mutation | `session_generations` and `session_events` show cancellation; `artifact_source_generation_claims=superseded` or `closed`; source work item is terminal; `agent_execution_runtime_facts.ignored_late_output_count` incremented; active artifacts, projections, and reports unchanged | Cancelled provider output cannot update active artifacts, reports, stage projections, retry authorities, or side-effect state | `p082_late_output_settlement_v1` with `cancelled_provider_session=true` and `active_projection_changed=false` | `sessions`, `artifact_contracts`, `agent_execution_runtime_facts`, `work_items` | `p082_recovery_matrix_readbacks[scenario_id=P082-R17]` | Late output after cancellation does not mutate the active projection | n/a |
+| P082-R17 | Cancel then late provider output | `cancelled_provider_late_output_ignored` | A provider session is cancelled or terminalized; output then arrives from that cancelled generation | Classify as late output; quarantine or ignore it; preserve evidence; no active projection mutation | `session_generations` and `session_events` show cancellation; `artifact_source_generation_claims=superseded` or `closed`; source work item is terminal; `agent_execution_runtime_facts.ignored_late_output_count` incremented; active artifacts, `state/run-state.json`, `artifacts/active-index.json`, and reports unchanged | Cancelled provider output cannot update active artifacts, reports, stage projections, retry authorities, or side-effect state | `p082_late_output_settlement_v1` with `cancelled_provider_session=true` and `active_projection_changed=false` | `sessions`, `artifact_contracts`, `agent_execution_runtime_facts`, `work_items` | `p082_recovery_matrix_readbacks[scenario_id=P082-R17]` | Late output after cancellation does not mutate the active run-state or active-index projection | n/a |
 
 ---
 
@@ -117,7 +117,7 @@ Both the singular and plural fields must be present:
 ### `report://{run_id}` resource
 
 - `p082_recovery_matrix_readbacks` — plural only
-- Must be byte-equivalent (snake_case) with the `reports.get` response
+- Readback rows must be byte-equivalent (snake_case) with the `reports.get` P082 payloads
 
 ### Run report JSON
 
@@ -137,7 +137,7 @@ Both the singular and plural fields must be present:
 
 ### Principal-Class Gating
 
-All P082 readback lanes are gated to operator principals. Non-operator principals (agent, observer) receive an empty `p082_recovery_matrix_readbacks` array and a null singular `p082_recovery_matrix_readback`. This applies to `runs.get`, `reports.get`, `report://{run_id}`, and the `run_report` artifact embedded inside `reports.get`. Lane field names remain present in every response shape; only the row payload is suppressed for non-operator principals.
+All P082 readback lanes are gated to operator principals. Non-operator principals (agent, observer) receive an empty `p082_recovery_matrix_readbacks` array on plural lanes; `runs.get` also keeps its singular `p082_recovery_matrix_readback` field present with a null value. This applies to `runs.get`, `reports.get`, `report://{run_id}`, and the generated `run_report` and release receipt artifacts embedded by those report surfaces. Lane field names remain present according to each lane's singular/plural contract; only the row payload is suppressed for non-operator principals.
 
 ---
 
@@ -160,16 +160,37 @@ All P082 readback lanes are gated to operator principals. Non-operator principal
 | `recovery_startup_repair_summary` | `p082_startup_repair_summary_v1` or null | Non-null for startup repair rows |
 | `recovery_operator_message` | string or null | Human-readable message; non-null when the operator must act |
 | `recovery_projection_integrity` | string | `valid`, `stale`, `tamper_detected`, `unavailable` |
-| `source_table` | string | The DB table that is the authoritative source |
-| `source_repository` | string | The Rust repository that owns this row |
-| `source_identifier` | string | Row ID or composite key |
-| `source_json_key` | string or null | JSON key within the source row when applicable |
+| `source_table` | string | The DB table, or accessor-derived owner set, that is the authoritative source |
+| `source_repository` | string | The Rust repository or owner set that owns this row |
+| `source_identifier` | string | Row ID or composite key; cancellation readbacks use the settlement `action_id`, or `action_id:agent_execution:{agent_execution_id}` when one cancellation action settles parallel agent executions |
+| `source_json_key` | string or null | Approved owner-path key for JSON/text owners; null only for typed-column-derived rows |
 | `updated_at` | string (ISO-8601) | Last modification timestamp |
 | `diagnostic_redaction` | string | `none`, `partial`, `full` |
+
+### Approved `source_json_key` Owners
+
+`source_json_key` is validated against an explicit owner-path allowlist before a
+row can leave the readback accessor. Row-specific JSON/text owners must match
+the scenario contract below; a null `source_json_key` is valid only for
+typed-column-derived rows or the legacy plain-text `command_journal.error`
+fallback for P082-R02 with `recovery_projection_integrity=unavailable`.
+
+| Owner path | Required or approved use |
+|---|---|
+| `command_journal.error.p082_recovery_matrix_readback` | Required for typed rejected-command rows, including P082-R02, P082-R07, and P082-R08 |
+| `startup_repairs.notes.p082_recovery_matrix_readback` | Required for P082-R01, P082-R15, and P082-R16; required for P082-R05 when the source table is `startup_repairs` |
+| `stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback` | Required for P082-R03 and P082-R17; approved for P082-R09 pending-approval restart readback |
+| `runs.cancellation_settlement_log.p082_recovery_matrix_readback` | Required for P082-R11 through P082-R14 cancellation settlement readbacks |
+| `retry_payload_recovery_events.diagnostic_json.p082_recovery_matrix_readback` | Approved retry-payload recovery diagnostic owner |
+| `session_events.details_json.p082_recovery_matrix_readback` | Approved for duplicate-session and stale-startup evidence, including P082-R04 and session-derived P082-R05 rows |
+| `lead_conflict_mediations.validation_errors_json.p082_recovery_matrix_readback` | Approved for P082-R10 duplicate mediation owner evidence |
+| `workflow_conflicts.record_json.p082_recovery_matrix_readback` | Approved workflow-conflict diagnostic owner |
 
 ### `p082_rejected_command_error_v1`
 
 Stored in `command_journal.error` (text column). **Never stored in `command_journal.payload_json`**.
+
+The P082 readback accessor selects typed rejected-command envelopes from `command_journal` rows whose `result_status` is `failed` or `rejected`. Both statuses are operator-safe rejection outcomes for this readback lane; `payload_json` remains the original inserted command input in either case.
 
 Backward-compatible parsing rule: validate JSON and schema before use; fall back safely for legacy plain-text errors; never expose the raw envelope JSON to operators.
 
@@ -241,6 +262,8 @@ Parsing rules:
 4. If JSON parse fails or schema is unrecognized, treat the error as a legacy plain-text error and fall back safely.
 5. Never expose the raw envelope JSON directly to operators; always use `operator_safe_summary`.
 
+Operator-facing P082 readback rows are allowlist-projected before they leave the DB accessor. Unknown keys are stripped, nested subcontracts are recursively allowlisted, and string fields are sanitized before display. Absolute Unix paths, `file://` values, run meta-root paths, provider transcripts, raw stderr, auth material, raw diagnostics, and unredacted command payloads must not pass through these lanes. URL separators such as `https://...` are not treated as filesystem paths.
+
 ---
 
 ## Fail-Closed Side-Effect Behavior
@@ -286,8 +309,10 @@ When the daemon restarts while a human approval is pending:
 
 Cancellation must be convergent. After cancellation settles:
 
+- `runs.cancel` requires an `idempotency_key`. Replaying the same key resolves to the existing cancellation command settlement. A later request with a different key after terminal cancellation is an idempotent no-op over the already-settled terminal state, not a second active cancellation mutation.
 - No duplicate work items, owners, side effects, or provider subprocess sessions may exist.
 - `cancellation_settlement_log` must contain exactly one action entry per settled item.
+- Each settlement entry must carry a non-empty `action_id`. For cancellation readbacks (P082-R11 through P082-R14), `source_identifier` must either equal that `action_id` or, when a single action settles parallel agent executions, use the unique composite form `action_id:agent_execution:{agent_execution_id}`.
 - Provider subprocess cleanup must be evidenced through `session_generations` terminalization and `session_events` records.
 - Active stage projections, artifact links, and reports must reflect the cancelled state.
 - Pending approval decisions are preserved as `pending`; they are not synthesized.
@@ -313,7 +338,7 @@ Observability threshold for the held state: warn at 0 s (immediate), critical at
 When a cancelled provider session emits a late output after cancellation is settled:
 
 1. Classify the output as a late output from a cancelled provider.
-2. Quarantine the output; do not update active artifacts, projections, or reports.
+2. Quarantine the output; do not update active artifacts, `state/run-state.json`, `artifacts/active-index.json`, or reports.
 3. Set `p082_late_output_settlement_v1.cancelled_provider_session=true`.
 4. Confirm `active_projection_changed=false`.
 5. The source `work_items` row must already be in a terminal state from cancellation settlement.
@@ -322,7 +347,7 @@ When a cancelled provider session emits a late output after cancellation is sett
 
 ## Provider Subprocess Cleanup Proof
 
-Provider subprocess cleanup evidence must be tied to durable `session_generations` terminalization records and `session_events` evidence. For scenarios that require subprocess cleanup (P082-R11, P082-R15), the readback must cite:
+Provider subprocess cleanup evidence must be tied to durable `session_generations` terminalization records and `session_events` evidence. Cancellation readback `source_identifier` remains the settlement `action_id` (or the parallel-settlement `action_id:agent_execution:{agent_execution_id}` composite); the cleanup proof is carried by the durable rows and tests. For scenarios that require subprocess cleanup (P082-R11, P082-R15), proof must cite:
 
 - The `session_generations` row showing the terminal `end_reason`.
 - The `session_events` row confirming the ACP transport lifecycle close event.
@@ -357,6 +382,14 @@ Future UI integration requires a separate proposal. Prerequisites for that propo
 | Xcode startup grace | 720 | 900 | "Xcode startup grace exceeded the 12 minute window; inspect Xcode broker/session startup." |
 | `startup_requeue_exhausted` | 0 | 300 | "Startup requeue exhausted and requires operator clearance through existing recovery inspection paths." |
 
+The code owner for the P082 startup grace values is `control-plane/crates/domain/src/recovery_matrix.rs`: `STANDARD_STARTUP_GRACE_SECONDS`, `XCODE_STARTUP_GRACE_SECONDS`, `XCODE_STARTUP_GRACE_WARN_SECONDS`, and `XCODE_STARTUP_GRACE_CRITICAL_SECONDS`.
+
+---
+
+## Dependency Audit Pinned Risk
+
+`proposal-082` records dependency-audit availability as a gate-owned concern. When `cargo audit` or `cargo deny` is available in the local Rust toolchain, operators should run it before sign-off. If those tools are unavailable in the execution environment, the accepted pinned-risk item is the workflow parser dependency chain `serde_yaml` -> `unsafe-libyaml`: it remains present because workflow and agent catalog files are YAML contracts, and replacement requires a separate parser migration slice with fixture parity. This pinned-risk acceptance must stay visible in this document until advisory monitoring or a replacement parser lands.
+
 ---
 
 ## Gate Ownership
@@ -365,13 +398,17 @@ Gate aliases: `proposal-082`, `p082`
 
 Owner: `scripts/test-gate.sh`
 
-Required tests for gate passage:
+Active tests for gate passage:
 
 - DB repository tests for each of the 17 matrix rows
-- Engine integration tests for each of the 17 matrix rows
+- Engine P082 tests for each of the 17 matrix rows
 - MCP readback test for each recovery reason code in the vocabulary
 - Regression fixture for ACP startup stale repair
 - Regression fixture for retry identifier guidance
 - Crash/replay idempotency test for P082-R15
+- Review regressions for Operator-only `runs.start`, Operator-only root-backed `ideas.create`, symlink-safe `artifact_root`/meta-root creation, `runs.get.escalation_readback`, and InvokeAgent completion ownership validation
+- Pinned-risk documentation for `serde_yaml`/`unsafe-libyaml` when dependency-audit tooling is unavailable
+- `p082_recovery_matrix_gate_result_total{scenario_id,status}` is gate-harness telemetry and must be emitted by the retained DB harness test after scenario assertion groups. Runtime readback accessors emit readback and state-age telemetry, not gate-result counts.
+- The P082 Python static checklist runs inside `scripts/test-gate.sh` before the focused Rust suites. It validates the reference matrix, positive fixture, all 16 negative fixtures, source-wiring expectations, metric ownership, and required proof-test names. Provider cleanup proof remains required by the matrix semantics and is covered by focused Rust tests.
 
 Future recovery proposals must add or update matrix rows before the behavior change lands. PRs that change recovery behavior without a corresponding matrix row update will fail the `proposal-082` gate.

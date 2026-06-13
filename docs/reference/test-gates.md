@@ -881,7 +881,7 @@ MCP + GraphQL northbound auth, capability filtering, and audit-journaling gate f
 
 Scope:
 
-- principal-table bootstrap (owner-only `0o600` file mode on Unix, one-time token log, fail-closed on empty table)
+- principal-table bootstrap (owner-only `0o600` file mode on Unix, redacted bootstrap log, fail-closed on empty table)
 - bearer auth on MCP HTTP (`POST /mcp`), MCP stdio (`initialize.params.clientInfo.principal_token`), GraphQL HTTP (`POST /graphql`), and GraphQL WebSocket (`/graphql/ws` via `on_connection_init`)
 - per-class capability filtering for MCP `tools/list`, `tools/call`, `resources/list`, `resources/read`, including the Steward trio policy (`steward.run_analysis` operator-only, `steward.list_analyses` + `steward.get_analysis` operator/observer, agent excluded)
 - GraphQL mutation class policy: UI/default principals may execute only `approveApproval` and `rejectApproval`; non-approval command mutations are MCP-only
@@ -2221,10 +2221,13 @@ Scope:
 - All canonical reason codes are documented and defined in `control-plane/crates/domain/src/recovery_matrix.rs`
 - `p082_rejected_command_error_v1` typed envelope contract and backward-compatible legacy plain-text fallback rules are documented and implemented
 - Exact readback lane placement is enforced: `runs.get` exposes both singular `p082_recovery_matrix_readback` and plural `p082_recovery_matrix_readbacks`; `reports.get` exposes plural only; singular must be absent from reports.get
-- Principal-class gating is enforced on every P082 readback lane (`runs.get`, `reports.get`, `report://{run_id}`, and the `run_report` artifact embedded in `reports.get`): non-operator principals (agent, observer) receive an empty plural readback and a null singular readback while the lane field names remain present
+- P082 readback projection strips unknown keys, recursively allowlists nested subcontracts, rejects malformed/tampered rows with safe fallback readback, and sanitizes operator-facing strings so absolute filesystem paths, including punctuation-adjacent paths, and raw diagnostics do not leak through readback lanes
+- Rejected-command readback is selected from `command_journal` rows with `result_status` `failed` or `rejected`
+- The retained DB harness test owns `p082_recovery_matrix_gate_result_total{scenario_id,status}` evidence for all 17 scenario assertion groups; runtime readback accessors must not emit this gate-result metric. The `proposal-082` shell path runs that harness as part of the DB P082 matrix suite.
+- Security/review regressions are included for Operator-only `runs.start`, Operator-only root-backed `ideas.create`, symlink-safe run filesystem boundaries, `runs.get.escalation_readback`, InvokeAgent completion ownership validation, and the documented `serde_yaml`/`unsafe-libyaml` pinned-risk fallback when dependency-audit tooling is unavailable
 - Rollout fixture `docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json` exists with schema_version `p082_operator_readback_fixture_v1`, all five readback lanes, nested subcontracts, Xcode startup grace row, startup_requeue_exhausted row, cancel-then-late-output row, and fixture assertions naming all reason codes and scenario IDs
-- All 16 negative fixtures in `docs/evidence/rollout-contract/negative/p082-*.json` exist with `schema_version=p082_negative_fixture_v1` and required fields
-- DB, engine, and MCP readback tests compile and pass under CARGO_TARGET_DIR=target/proposal-082-gate
+- The P082 static fixture/matrix checklist runs before the focused Rust suites. It validates the positive fixture shape, all 16 negative fixtures, key source-wiring expectations, metric ownership, and required proof-test names before cargo tests execute.
+- DB, engine, and MCP readback tests compile and pass under `CARGO_TARGET_DIR=target/proposal-082-gate`
 
 Use when:
 
@@ -2234,8 +2237,8 @@ Use when:
 
 Host policy:
 
-- Local Rust toolchain required; no UI target or network required
-- Python 3 required for the static check phase
+- Local Rust toolchain and Python 3 required; no UI target or network required
+- The Python static preflight runs inside the P082 alias before the focused Rust suites
 - No daemon process required
 
 Command:
@@ -2248,7 +2251,39 @@ Command:
 Important:
 
 - `p082` is accepted as an alias
-- Gate fails if any required matrix row, durable owner, readback assertion, crash/replay proof, or observability threshold is missing
+- Gate fails if the static fixture/matrix checklist or focused DB, engine, or MCP tests for required matrix rows, durable owners, readback assertions, crash/replay proof, or observability thresholds fail
 - Gate fails if GraphQL is treated as a required readback lane without a contract amendment
 - Gate fails if Swift app-facing P082 consumption paths exist without tolerant decode and MainActor tests
 - No schema migration is permitted; if required readback cannot be stored in existing owners, P082 must be amended first
+
+### `proposal-096|p096` bounded tool output and safe-search guard
+
+Retained safe-search guard that keeps reviewer and auditor discovery bounded and verifies that the P096 alias remains available alongside proposal gates.
+
+Scope:
+
+- `scripts/test-gate.sh` advertises `proposal-096|p096`
+- the gate script retains the safe-search guard text and P082 adjacency token
+- the gate is a static shell/Python check; it does not execute repo-wide searches or run the daemon
+
+Use when:
+
+- Verifying that bounded-output discovery policy remains wired into the canonical gate list
+- Checking that future gate edits did not drop the P096 safe-search alias
+
+Host policy:
+
+- Local shell and Python 3 required
+- No Rust, Swift, UI host, daemon process, or network required
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-096
+./scripts/test-gate.sh p096
+```
+
+Important:
+
+- `p096` is accepted as an alias
+- the gate fails if the alias, safe-search wording, bounded-output wording, or retained P082 adjacency marker is missing from `scripts/test-gate.sh`

@@ -10368,6 +10368,8 @@ PY
     ;;
   proposal-082|p082)
     log "Proposal 082 gate: recovery and retry state-machine matrix"
+    # Run the static fixture/matrix contract checks before the focused Rust
+    # suites so missing or malformed rollout evidence fails the active gate.
     python3 - <<'PY'
 import json
 import sys
@@ -10652,7 +10654,9 @@ if not recovery_matrix_rs.exists():
 rm_content = recovery_matrix_rs.read_text()
 for const_name in ["REASON_STARTUP_REQUEUE_ONCE", "REASON_STARTUP_REQUEUE_EXHAUSTED",
                     "REASON_INVALID_STAGE_FOR_RETRY", "ALL_REASON_CODES", "SCENARIO_IDS",
-                    "SCHEMA_READBACK_V1", "SCHEMA_REJECTED_COMMAND_ERROR_V1"]:
+                    "SCHEMA_READBACK_V1", "SCHEMA_REJECTED_COMMAND_ERROR_V1",
+                    "STANDARD_STARTUP_GRACE_SECONDS", "XCODE_STARTUP_GRACE_SECONDS",
+                    "XCODE_STARTUP_GRACE_WARN_SECONDS", "XCODE_STARTUP_GRACE_CRITICAL_SECONDS"]:
     if const_name not in rm_content:
         print(f"FAILED: recovery_matrix.rs missing required constant: {const_name}")
         sys.exit(1)
@@ -10704,7 +10708,10 @@ if not server_rs.exists():
     print("FAILED: mcp-server/src/server.rs is missing")
     sys.exit(1)
 server_content = server_rs.read_text()
-if '"p082_recovery_matrix_readbacks": p082_recovery_matrix_readbacks' not in server_content:
+if (
+    '"p082_recovery_matrix_readbacks": p082_recovery_matrix_readbacks' not in server_content
+    and '"p082_recovery_matrix_readbacks".into()' not in server_content
+):
     print("FAILED: server.rs report:// handler missing p082_recovery_matrix_readbacks wiring")
     sys.exit(1)
 
@@ -10757,8 +10764,8 @@ if "record_p082_recovery_matrix_coverage_percent" not in p082_rm_content:
 if "record_p082_recovery_state_age_seconds" not in p082_rm_content:
     print("FAILED: p082_recovery_matrix.rs must emit recovery state age seconds")
     sys.exit(1)
-if "record_p082_recovery_matrix_gate_result" not in p082_rm_content:
-    print("FAILED: p082_recovery_matrix.rs must emit gate/result counter for readback construction")
+if "record_p082_recovery_matrix_gate_result" in p082_rm_content:
+    print("FAILED: p082_recovery_matrix.rs must not emit p082_recovery_matrix_gate_result_total; gate harness owns that metric")
     sys.exit(1)
 if '"run_report"' not in reports_content or '"p082_recovery_matrix_readbacks".to_string()' not in reports_content:
     print("FAILED: reports.rs must wire p082_recovery_matrix_readbacks into generated run_report artifact lane")
@@ -10878,6 +10885,10 @@ PY
       run_p082_cargo_test -p engine --test proposal_082_recovery_retry_matrix -- --nocapture
       run_p082_cargo_test -p engine --test integration p082_ -- --nocapture
       run_p082_cargo_test -p engine --test integration test_cancel_run_finalize_closes_live_session_via_runtime_manager -- --nocapture
+      run_p082_cargo_test -p auth live_principal_source_revalidates_revoked_disabled_and_rescoped_credentials -- --nocapture
+      run_p082_cargo_test -p mcp-server p082_ -- --nocapture
+      run_p082_cargo_test -p mcp-server sec_high_001_mcp_http_observes_live_principal_revocation -- --nocapture
+      run_p082_cargo_test -p daemon sec_high_001_failed_serve_observes_live_principal_revocation -- --nocapture
       run_p082_cargo_test -p mcp-server --test proposal_082_recovery_readback -- --nocapture
     )
     log "Proposal 082 gate passed"

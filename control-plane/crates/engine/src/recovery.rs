@@ -33,6 +33,7 @@ use domain::escalation::EscalationEvent;
 use domain::provider::InvokeAgentCapacityConfig;
 use domain::retry_authority::{RetryAuthorityState, RetryPayloadRecoveryEvent};
 use domain::run::{Run, RunStatus};
+use domain::session::{SessionEvent, SessionEventType, SessionGenerationStatus};
 use domain::stage::{StageSettlementKind, StageStatus};
 use sqlx::Row;
 
@@ -785,6 +786,15 @@ impl RecoveryService {
                 "Startup recovery released stale P086 continuation workers"
             );
         }
+        let p082_duplicate_session_owner_repairs =
+            self.repair_p082_duplicate_active_session_owners().await?;
+        if p082_duplicate_session_owner_repairs > 0 {
+            warn!(
+                repaired = p082_duplicate_session_owner_repairs,
+                "Startup recovery repaired duplicate active session owners"
+            );
+        }
+        runs_repaired += p082_duplicate_session_owner_repairs;
         let mut p092_recovered = 0usize;
         for run in &active_runs {
             match self
@@ -1250,6 +1260,115 @@ impl RecoveryService {
 
             tx.commit().await?;
             projections::rebuild_all_for_run(&self.pool, run_id).await?;
+            repaired += 1;
+        }
+
+        Ok(repaired)
+    }
+
+    async fn repair_p082_duplicate_active_session_owners(&self) -> Result<usize> {
+        let rows = sqlx::query(
+            r#"SELECT sl.run_id,
+                      sg.id AS generation_id,
+                      sg.lineage_id,
+                      sg.invocation_owner_key,
+                      sg.created_at
+               FROM session_generations sg
+               INNER JOIN session_lineages sl ON sl.id = sg.lineage_id
+               WHERE sg.status = 'active'
+                 AND sg.invocation_owner_key IN (
+                     SELECT invocation_owner_key
+                     FROM session_generations
+                     WHERE status = 'active'
+                     GROUP BY invocation_owner_key
+                     HAVING COUNT(*) > 1
+                 )
+               ORDER BY sl.run_id ASC,
+                        sg.invocation_owner_key ASC,
+                        sg.created_at DESC,
+                        sg.id DESC"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("load duplicate active session owner candidates")?;
+
+        let mut repaired = 0usize;
+        let mut current_owner: Option<(String, String)> = None;
+        let mut kept_generation_id: Option<String> = None;
+        for row in rows {
+            let run_id: String = row.get("run_id");
+            let owner_key: String = row.get("invocation_owner_key");
+            let generation_id: String = row.get("generation_id");
+            let lineage_id: String = row.get("lineage_id");
+            let owner = (run_id.clone(), owner_key.clone());
+            if current_owner.as_ref() != Some(&owner) {
+                current_owner = Some(owner);
+                kept_generation_id = Some(generation_id);
+                continue;
+            }
+
+            let kept_generation_id = kept_generation_id.clone().unwrap_or_default();
+            let now = Utc::now();
+            let event_id = format!("p082-r04-duplicate-owner-repair:{generation_id}");
+            let readback = domain::recovery_matrix::build_readback_v1(
+                "P082-R04",
+                "repaired",
+                "inspect_duplicate_owner",
+                domain::recovery_matrix::REASON_DUPLICATE_OWNER_REPAIRED,
+                "Duplicate active session owner repaired; one active generation remains.",
+                "session_events",
+                "session_lineages, session_generations, session_events, work_items",
+                &event_id,
+                Some("session_events.details_json.p082_recovery_matrix_readback"),
+                "valid",
+                &now.to_rfc3339(),
+            );
+            let details = serde_json::json!({
+                "schema_version": "p082_duplicate_session_owner_repair_v1",
+                "run_id": run_id,
+                "invocation_owner_key": owner_key,
+                "surviving_generation_id": kept_generation_id,
+                "invalidated_generation_id": generation_id,
+                "p082_recovery_matrix_readback": readback,
+            });
+
+            let mut tx = self
+                .begin_transaction(
+                    "recovery.p082_duplicate_session_owner_repair",
+                    format!("recovery.p082_duplicate_session_owner_repair:{generation_id}"),
+                )
+                .await?;
+            sessions::end_generation_tx(
+                &mut tx,
+                &generation_id,
+                SessionGenerationStatus::Invalidated,
+                "p082_duplicate_owner_repaired",
+                now,
+            )
+            .await?;
+            sqlx::query(
+                r#"UPDATE session_lineages
+                   SET active_generation_id = NULL
+                   WHERE id = ?1 AND active_generation_id = ?2"#,
+            )
+            .bind(&lineage_id)
+            .bind(&generation_id)
+            .execute(&mut **tx)
+            .await
+            .context("clear duplicate session lineage active generation")?;
+            sessions::insert_event_tx(
+                &mut tx,
+                &SessionEvent {
+                    id: event_id,
+                    lineage_id,
+                    generation_id,
+                    event_type: SessionEventType::Invalidated,
+                    recorded_at: now,
+                    details_json: Some(details.to_string()),
+                },
+            )
+            .await?;
+            tx.commit().await?;
             repaired += 1;
         }
 

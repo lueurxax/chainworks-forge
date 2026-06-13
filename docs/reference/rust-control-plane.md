@@ -558,6 +558,7 @@ High-volume runtime evidence is spooled to the local filesystem instead of being
 - **`summary_json` Canonicalization**: The persisted form is the re-serialized output of the parsed JSON object (`canonicalize_summary_json`), not the raw producer string. This neutralizes duplicate-key smuggling — a payload like `{"line_count":1,"line_count":"<raw transcript>"}` would otherwise round-trip its second value through SQLite even though `serde_json::Map` parsing keeps only the last key. Both `insert_tx` and `insert_idempotent` bind the canonical form.
 - **Canonical Layout Enforcement** (P075-SEC-002): `write_spool_file` rejects any `relative_path` that does not start with `evidence/runs/` (`evidence/runs/{run_id}/stages/{stage_id}/agents/{agent_id}/{kind}/...`). Producers cannot write spool files outside this layout.
 - **Symlink-Escape Prevention** (P075-SEC-H001): `artifact_root` is canonicalized via `tokio::fs::canonicalize` before path joining, and parent directories are created by a per-segment symlink-safe walk (`create_spool_parent_safe`). Each path component is checked with `symlink_metadata` (no-follow) **before** any `mkdir`, so a symlinked intermediate directory is rejected without ever creating a directory through the symlink — filesystem state outside the canonical root is never mutated. `verify_spool_file` and `sweep_evidence_orphans` use `symlink_metadata` (no-follow) on candidates and treat any symlink as missing/skipped, so orphan recovery cannot follow a symlink to leak fingerprints of files outside the spool tree.
+- **Workspace-Root Containment**: runtime producers that create artifact/evidence parents, including side-effect receipt evidence and P088 completion-repair artifacts, first canonicalize the run `workspace_root`, reject symlink components, and require the target artifact path to remain under that canonical workspace root before writing bytes.
 - **Restrictive Permissions** (P075-SEC-H002, Unix): Spool files are created with mode `0o600` and parent directories with mode `0o700` regardless of the process umask, so spooled transcripts and tool traces are not group- or world-readable.
 - **No-Clobber Commit** (P075-SEC-002): If `final_path` already exists when `write_spool_file` is about to rename, the writer compares the existing file against the new content. Identical bytes (matching SHA-256 and size) are treated as an idempotent retry and the rename is skipped; differing content returns a hard error directing the operator to `storage.reconcile_evidence_orphans`. Committed evidence cannot be silently overwritten before the Class C metadata idempotency check runs.
 - **Verify Read Cap** (P075-SEC-004): `verify_spool_file` `stat`s the target before reading and rejects files larger than `VERIFY_SIZE_CAP_BYTES` (512 MiB) to prevent unbounded RAM allocation when the orphan sweep or another reader passes a large or attacker-influenced path. `sweep_evidence_orphans` honours the same cap when hashing recovery candidates. Streaming verification is reserved for larger artifacts.
@@ -782,7 +783,10 @@ capacity-blocked work pending.
   `scheduler_queue_summaries` and `scheduler_health_snapshots` projections.
 - **Wake-up**: `InvokeAgent` completion inserts an idempotent post-completion
   `AdvanceRun` wake-up inside `work_items.complete`, so fan-in observes the
-  completed work item before settling the stage.
+  completed work item before settling the stage. For a running `InvokeAgent`,
+  completion is accepted only after runtime facts prove valid required outputs;
+  otherwise the work item, agent execution, follow-up `AdvanceRun`, and active
+  artifact source claim remain unchanged.
 
 ### Scheduler Fairness
 

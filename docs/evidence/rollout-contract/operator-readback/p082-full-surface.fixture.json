@@ -56,7 +56,7 @@
       "source_table": "startup_repairs",
       "source_repository": "db",
       "source_identifier": "p082-requeue:cj-001:wi-001:1",
-      "source_json_key": null,
+      "source_json_key": "startup_repairs.notes.p082_recovery_matrix_readback",
       "updated_at": "2026-05-21T10:03:01Z",
       "diagnostic_redaction": "none"
     },
@@ -91,7 +91,7 @@
         "source_table": "startup_repairs",
         "source_repository": "db",
         "source_identifier": "p082-requeue:cj-001:wi-001:1",
-        "source_json_key": null,
+        "source_json_key": "startup_repairs.notes.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:03:01Z",
         "diagnostic_redaction": "none"
       },
@@ -112,7 +112,7 @@
         "source_table": "command_journal",
         "source_repository": "db",
         "source_identifier": "cj-002",
-        "source_json_key": "error",
+        "source_json_key": "command_journal.error.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:04:00Z",
         "diagnostic_redaction": "none"
       },
@@ -142,10 +142,10 @@
         "recovery_startup_repair_summary": null,
         "recovery_operator_message": null,
         "recovery_projection_integrity": "valid",
-        "source_table": "agent_execution_runtime_facts",
+        "source_table": "stage_executions",
         "source_repository": "db",
         "source_identifier": "ae-003",
-        "source_json_key": null,
+        "source_json_key": "stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:05:00Z",
         "diagnostic_redaction": "none"
       },
@@ -166,7 +166,7 @@
         "source_table": "session_lineages",
         "source_repository": "db",
         "source_identifier": "sl-004",
-        "source_json_key": null,
+        "source_json_key": "session_events.details_json.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:06:00Z",
         "diagnostic_redaction": "none"
       },
@@ -200,7 +200,7 @@
         "source_table": "session_generations",
         "source_repository": "db",
         "source_identifier": "sg-005",
-        "source_json_key": null,
+        "source_json_key": "session_events.details_json.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:07:01Z",
         "diagnostic_redaction": "none"
       },
@@ -241,10 +241,10 @@
         "recovery_startup_repair_summary": null,
         "recovery_operator_message": "Side-effect reconciliation is blocking retry or cancellation settlement.",
         "recovery_projection_integrity": "valid",
-        "source_table": "side_effects",
+        "source_table": "command_journal",
         "source_repository": "db",
-        "source_identifier": "se-007",
-        "source_json_key": null,
+        "source_identifier": "cj-007",
+        "source_json_key": "command_journal.error.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:09:00Z",
         "diagnostic_redaction": "none"
       },
@@ -263,7 +263,11 @@
           "provided_identifier": "se-abc123",
           "provided_identifier_kind": "stage_execution_uuid",
           "expected_identifier_kind": "workflow_stage_id",
-          "valid_identifier_examples": ["stage-review", "stage-compile", "stage-test"],
+          "valid_identifier_examples": [
+            "stage-review",
+            "stage-compile",
+            "stage-test"
+          ],
           "no_mutation": true
         },
         "recovery_late_output_settlement": null,
@@ -273,7 +277,7 @@
         "source_table": "command_journal",
         "source_repository": "db",
         "source_identifier": "cj-008",
-        "source_json_key": "error",
+        "source_json_key": "command_journal.error.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:10:00Z",
         "diagnostic_redaction": "none"
       },
@@ -296,7 +300,7 @@
         "source_table": "approvals",
         "source_repository": "db",
         "source_identifier": "approval-009",
-        "source_json_key": null,
+        "source_json_key": "stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:11:00Z",
         "diagnostic_redaction": "none"
       },
@@ -317,7 +321,7 @@
         "source_table": "lead_conflict_mediations",
         "source_repository": "db",
         "source_identifier": "lcm-010",
-        "source_json_key": null,
+        "source_json_key": "lead_conflict_mediations.validation_errors_json.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:12:00Z",
         "diagnostic_redaction": "none"
       },
@@ -337,8 +341,8 @@
         "recovery_projection_integrity": "valid",
         "source_table": "runs",
         "source_repository": "db",
-        "source_identifier": "run-011",
-        "source_json_key": null,
+        "source_identifier": "cancellation_settlement:run-011:2026-05-21T10:13:00Z:agent_execution:ae-011",
+        "source_json_key": "runs.cancellation_settlement_log.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:13:00Z",
         "diagnostic_redaction": "none"
       },
@@ -358,8 +362,8 @@
         "recovery_projection_integrity": "valid",
         "source_table": "runs",
         "source_repository": "db",
-        "source_identifier": "run-012",
-        "source_json_key": null,
+        "source_identifier": "cancellation_settlement:run-012:2026-05-21T10:14:00Z",
+        "source_json_key": "runs.cancellation_settlement_log.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:14:00Z",
         "diagnostic_redaction": "none"
       },
@@ -379,10 +383,10 @@
         "recovery_startup_repair_summary": null,
         "recovery_operator_message": "Side-effect reconciliation is blocking retry or cancellation settlement.",
         "recovery_projection_integrity": "valid",
-        "source_table": "side_effects",
+        "source_table": "runs",
         "source_repository": "db",
-        "source_identifier": "se-013",
-        "source_json_key": null,
+        "source_identifier": "cancellation_settlement:run-013:2026-05-21T10:15:00Z",
+        "source_json_key": "runs.cancellation_settlement_log.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:15:00Z",
         "diagnostic_redaction": "none"
       },
@@ -413,10 +417,10 @@
         },
         "recovery_operator_message": null,
         "recovery_projection_integrity": "valid",
-        "source_table": "startup_repairs",
+        "source_table": "runs",
         "source_repository": "db",
-        "source_identifier": "p082-requeue:cj-014:wi-014:1",
-        "source_json_key": null,
+        "source_identifier": "cancellation_settlement:run-014:2026-05-21T10:16:01Z",
+        "source_json_key": "runs.cancellation_settlement_log.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:16:01Z",
         "diagnostic_redaction": "none"
       },
@@ -431,13 +435,26 @@
         "recovery_side_effect_blocking_status": null,
         "recovery_retry_identifier_guidance": null,
         "recovery_late_output_settlement": null,
-        "recovery_startup_repair_summary": null,
+        "recovery_startup_repair_summary": {
+          "schema_version": "p082_startup_repair_summary_v1",
+          "startup_repair_id": "p082-requeue:cj-015:wi-015:1",
+          "source_work_item_id": "wi-015",
+          "source_command_journal_id": "cj-015",
+          "requeue_generation": 1,
+          "max_requeue_generation": 1,
+          "replayed": true,
+          "stale_after_ms": 60000,
+          "stale_cutoff": "2026-05-21T10:17:00Z",
+          "xcode_required": false,
+          "next_retry_or_backoff_time": null,
+          "backpressure_scope": "global"
+        },
         "recovery_operator_message": null,
         "recovery_projection_integrity": "valid",
         "source_table": "startup_repairs",
         "source_repository": "db",
         "source_identifier": "p082-requeue:cj-015:wi-015:1",
-        "source_json_key": null,
+        "source_json_key": "startup_repairs.notes.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:17:00Z",
         "diagnostic_redaction": "none"
       },
@@ -473,7 +490,7 @@
         "source_table": "startup_repairs",
         "source_repository": "db",
         "source_identifier": "p082-requeue:cj-016:wi-016:1",
-        "source_json_key": null,
+        "source_json_key": "startup_repairs.notes.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:18:01Z",
         "diagnostic_redaction": "none"
       },
@@ -503,10 +520,10 @@
         "recovery_startup_repair_summary": null,
         "recovery_operator_message": null,
         "recovery_projection_integrity": "valid",
-        "source_table": "agent_execution_runtime_facts",
+        "source_table": "stage_executions",
         "source_repository": "db",
         "source_identifier": "ae-017",
-        "source_json_key": null,
+        "source_json_key": "stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:19:00Z",
         "diagnostic_redaction": "none"
       }
@@ -570,7 +587,7 @@
       "source_table": "startup_repairs",
       "source_repository": "db",
       "source_identifier": "p082-requeue:cj-001:wi-001:1",
-      "source_json_key": null,
+      "source_json_key": "startup_repairs.notes.p082_recovery_matrix_readback",
       "updated_at": "2026-05-21T10:03:01Z",
       "diagnostic_redaction": "none"
     },
@@ -597,7 +614,7 @@
         "source_table": "command_journal",
         "source_repository": "db",
         "source_identifier": "cj-002",
-        "source_json_key": "error",
+        "source_json_key": "command_journal.error.p082_recovery_matrix_readback",
         "updated_at": "2026-05-21T10:04:00Z",
         "diagnostic_redaction": "none"
       }
@@ -608,7 +625,11 @@
       "provided_identifier": "se-abc123",
       "provided_identifier_kind": "stage_execution_uuid",
       "expected_identifier_kind": "workflow_stage_id",
-      "valid_identifier_examples": ["stage-review", "stage-compile", "stage-test"],
+      "valid_identifier_examples": [
+        "stage-review",
+        "stage-compile",
+        "stage-test"
+      ],
       "no_mutation": true
     },
     "p082_late_output_settlement_v1": {
@@ -644,6 +665,7 @@
     "command_journal_row": {
       "id": "cj-002",
       "command_type": "stages.retry",
+      "result_status": "rejected",
       "payload_json": "{\"stage_id\":\"stage-compile\",\"run_id\":\"run-001\"}",
       "error": "{\"schema_version\":\"p082_rejected_command_error_v1\",\"reason_code\":\"invalid_stage_for_retry\",\"command_type\":\"stages.retry\",\"redaction\":\"none\",\"operator_safe_summary\":\"Retry rejected: target stage is not in a retryable status.\",\"p082_recovery_matrix_readback\":null}",
       "payload_json_mutated": false
@@ -684,12 +706,12 @@
       "next_retry_or_backoff_time": null,
       "backpressure_scope": "run"
     },
-    "recovery_operator_message": "Xcode startup grace 12 minutes exceeded. Session did not acquire a provider session ID within the Xcode startup grace window (720s warn, 900s crit). Cutoff: 2026-05-21T10:12:00Z. Next check/backoff: none scheduled — inspect Xcode broker and session startup.",
+    "recovery_operator_message": "Xcode startup grace 12 minutes exceeded. Session did not acquire a provider session ID within the Xcode startup grace window (720s warn, 900s crit). Cutoff: 2026-05-21T10:12:00Z. Next check/backoff: none scheduled \u2014 inspect Xcode broker and session startup.",
     "recovery_projection_integrity": "valid",
     "source_table": "session_generations",
     "source_repository": "db",
     "source_identifier": "sg-xcode",
-    "source_json_key": null,
+    "source_json_key": "session_events.details_json.p082_recovery_matrix_readback",
     "updated_at": "2026-05-21T10:12:01Z",
     "diagnostic_redaction": "none"
   },
@@ -725,7 +747,7 @@
     "source_table": "startup_repairs",
     "source_repository": "db",
     "source_identifier": "p082-requeue:cj-016:wi-016:1",
-    "source_json_key": null,
+    "source_json_key": "startup_repairs.notes.p082_recovery_matrix_readback",
     "updated_at": "2026-05-21T10:18:01Z",
     "diagnostic_redaction": "none"
   },
@@ -755,10 +777,10 @@
     "recovery_startup_repair_summary": null,
     "recovery_operator_message": null,
     "recovery_projection_integrity": "valid",
-    "source_table": "agent_execution_runtime_facts",
+    "source_table": "stage_executions",
     "source_repository": "db",
     "source_identifier": "ae-017",
-    "source_json_key": null,
+    "source_json_key": "stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback",
     "updated_at": "2026-05-21T10:19:00Z",
     "diagnostic_redaction": "none"
   },

@@ -8,7 +8,7 @@
 - **Date:** 2026-05-29
 - **Owner:** macOS operator shell / control-plane release evidence
 - **Depends on:** [escalation policy contract](../reference/escalation-policies.md) and retained escalation proof-gate evidence in [test-gates.md](../reference/test-gates.md#proposal-058p058)
-- **Proposed future gate aliases:** `proposal-096`, `p096`
+- **Release-evidence gate alias status:** not assigned. The retained `proposal-096|p096` gate currently documented in [test-gates.md](../reference/test-gates.md#proposal-096p096) is the bounded-output/safe-search guard, not this release-evidence proof envelope.
 
 ## Problem
 
