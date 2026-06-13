@@ -1579,6 +1579,8 @@ else:
         "Library/Caches/Chainworks Forge/cargo-target",
         "CHAINWORKS_XCODE_CARGO_TARGET_DIR",
         "CHAINWORKS_SHARED_CARGO_TARGET_DIR",
+        "SCCACHE_DIR",
+        "SCCACHE_CACHE_SIZE",
         "RUSTC_WRAPPER",
         "sccache",
     ]
@@ -1596,6 +1598,27 @@ else:
         violations.append("embed-control-plane-daemon.sh still defaults Cargo target to TARGET_TEMP_DIR")
     if "${CARGO_TARGET_DIR}/${PROFILE_DIR}/control-plane" not in embed_text:
         violations.append("embed-control-plane-daemon.sh does not copy from CARGO_TARGET_DIR profile output")
+
+clean = root / "scripts" / "clean-build-caches.sh"
+if not clean.exists():
+    violations.append("missing scripts/clean-build-caches.sh")
+else:
+    clean_text = clean.read_text(encoding="utf-8")
+    for fragment in [
+        ".chainworks/worktrees",
+        "control-plane/target",
+        "CHAINWORKS_CLEAN_PROTECTED_WORKTREES",
+        "--protect-worktree",
+    ]:
+        if fragment not in clean_text:
+            violations.append(f"clean-build-caches.sh missing {fragment!r}")
+
+gate_text = (root / "scripts" / "test-gate.sh").read_text(encoding="utf-8")
+legacy_p082_target = "CARGO_TARGET_DIR=target/" + "proposal-082-gate"
+if legacy_p082_target in gate_text:
+    violations.append("proposal-082 gate still creates a dedicated target/proposal-082-gate cache")
+if "CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR" not in gate_text:
+    violations.append("proposal-082 gate does not expose a bounded reusable target dir override")
 
 if violations:
     print("Xcode Cargo cache policy violations:", file=sys.stderr)
@@ -10866,10 +10889,11 @@ print("P082 gate: all static checks passed")
 PY
     (
       cd "$ROOT_DIR/control-plane"
+      p082_cargo_target="${CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR:-target/proposal-082}"
       run_p082_cargo_test() {
         local output status
         set +e
-        output=$(CARGO_TARGET_DIR=target/proposal-082-gate cargo test "$@" 2>&1)
+        output=$(CARGO_TARGET_DIR="$p082_cargo_target" cargo test "$@" 2>&1)
         status=$?
         set -e
         printf '%s\n' "$output"

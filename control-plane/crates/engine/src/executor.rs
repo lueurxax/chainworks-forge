@@ -17612,7 +17612,7 @@ fn code_writer_completion_repair_prompt(
 fn merge_contract_repair_result(
     initial: &mut acp::ExecutionResult,
     repair: acp::ExecutionResult,
-    merged_settlement: &DeclaredOutputDiscoverySettlement,
+    _merged_settlement: &DeclaredOutputDiscoverySettlement,
 ) {
     initial.status = repair.status;
     initial.artifact_paths.extend(repair.artifact_paths);
