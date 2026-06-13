@@ -7,7 +7,7 @@
 # next build still re-uses the hot incremental cache.
 #
 # Usage:
-#   ./scripts/clean-build-caches.sh [--dry-run] [--aggressive] [--protect-worktree NAME] [--protect-worktree NAME]
+#   ./scripts/clean-build-caches.sh [--dry-run] [--aggressive] [--protect-worktree NAME]
 #
 # Default pass removes:
 #   * `control-plane/target/proposal-*` / `target/p*-*` orphan
