@@ -1109,19 +1109,76 @@ fn ensure_chainworks_meta_root_launch_dir(req: &ExecutionRequest) -> Result<()> 
     let Some(meta_root) = chainworks_meta_root_env_value(req) else {
         return Ok(());
     };
+    let workspace_root = Path::new(&req.workspace_root);
+    reject_path_symlink_components(workspace_root, "workspace_root")?;
+    let canonical_workspace = std::fs::canonicalize(workspace_root)
+        .with_context(|| format!("canonicalize workspace_root {}", workspace_root.display()))?;
     let meta_root = Path::new(&meta_root);
+    let absolute_meta_root = if meta_root.is_absolute() {
+        meta_root.to_path_buf()
+    } else {
+        canonical_workspace.join(meta_root)
+    };
+    if absolute_meta_root.exists() {
+        reject_path_symlink_components(&absolute_meta_root, "CHAINWORKS_META_ROOT")?;
+    }
+    if !absolute_meta_root.starts_with(&canonical_workspace) {
+        bail!("CHAINWORKS_META_ROOT escapes canonical workspace_root");
+    }
     for child in ["", "artifacts", "context", "state", "summaries"] {
         let path = if child.is_empty() {
-            meta_root.to_path_buf()
+            absolute_meta_root.clone()
         } else {
-            meta_root.join(child)
+            absolute_meta_root.join(child)
         };
-        std::fs::create_dir_all(&path).with_context(|| {
-            format!(
-                "missing_chainworks_meta_root: create launch directory {}",
-                path.display()
-            )
-        })?;
+        create_dir_all_no_symlink_under(&path, &canonical_workspace, "CHAINWORKS_META_ROOT")?;
+    }
+    Ok(())
+}
+
+fn create_dir_all_no_symlink_under(path: &Path, canonical_root: &Path, field: &str) -> Result<()> {
+    let relative = path
+        .strip_prefix(canonical_root)
+        .with_context(|| format!("{field} escapes canonical root"))?;
+    let mut current = canonical_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    bail!("{field} contains a symlink component");
+                }
+                if !metadata.is_dir() {
+                    bail!("{field} path component is not a directory");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .with_context(|| format!("create directory {}", current.display()))?;
+                let metadata = std::fs::symlink_metadata(&current)
+                    .with_context(|| format!("verify directory {}", current.display()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    bail!("{field} created path was replaced before verification");
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_path_symlink_components(path: &Path, field: &str) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            break;
+        };
+        if metadata.file_type().is_symlink() {
+            bail!("{field} contains a symlink component");
+        }
     }
     Ok(())
 }
@@ -1552,6 +1609,58 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn p082_launch_preflight_rejects_symlinked_chainworks_meta_root_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = tmp.path().join(".chainworks");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &link).unwrap();
+
+        let req = crate::ExecutionRequest {
+            agent_execution_id: None,
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "stage_meta".to_string(),
+            attempt_number: 1,
+            agent_id: "agent_meta".to_string(),
+            provider: "claude".to_string(),
+            model: None,
+            effort: None,
+            workspace_root: tmp.path().to_string_lossy().into_owned(),
+            prompt: "prompt".to_string(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: None,
+            provider_session_id: None,
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: Some(".chainworks/run-meta".to_string()),
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
+        };
+
+        let err = ensure_chainworks_meta_root_launch_dir(&req).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "ACP launch preflight must reject symlink-swapped meta roots; got: {err:#}"
+        );
     }
 
     #[test]

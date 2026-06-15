@@ -233,6 +233,108 @@ async fn proposal_058_runtime_facts_upsert_preserves_unknown_raw_debug() {
 }
 
 #[tokio::test]
+async fn proposal_058_session_reuse_update_preserves_valid_output_settlement_for_completion_guard()
+{
+    let pool = test_pool().await;
+    let (run_id, stage_execution_id, agent_execution_id, source_work_item_id) =
+        seed_execution(&pool).await;
+    let now = Utc::now();
+    let claim_key = ArtifactSourceGenerationClaimKey {
+        run_id,
+        owner_kind: OwnerKind::StageExecution,
+        owner_id: stage_execution_id.to_string(),
+        stage_execution_id: Some(stage_execution_id),
+        agent_execution_id,
+        source_work_item_id: source_work_item_id.clone(),
+    };
+    artifact_contracts::insert_source_generation_claim(
+        &pool,
+        ArtifactSourceGenerationClaim {
+            key: claim_key.clone(),
+            current_session_generation_id: Some("generation-1".into()),
+            claim_state: ArtifactSourceClaimState::Closed,
+            superseding_work_item_id: None,
+            superseded_by_agent_execution_id: None,
+            supersession_journal_id: None,
+            superseded_at: None,
+            closed_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    agent_executions::update_completed(
+        &pool,
+        agent_execution_id,
+        domain::agent::AgentStatus::Completed,
+        now,
+    )
+    .await
+    .unwrap();
+
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+    facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+    facts.valid_required_outputs = true;
+    agent_execution_runtime_facts::upsert(&pool, &facts)
+        .await
+        .unwrap();
+
+    agent_execution_runtime_facts::update_session_reuse_reason(
+        &pool,
+        agent_execution_id,
+        "same_family_within_run",
+        now + chrono::Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+
+    let read = agent_execution_runtime_facts::find_by_execution_id(&pool, agent_execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        read.output_settlement,
+        AgentOutputSettlement::ValidOutputsFromCompletedExecution
+    );
+    assert!(read.valid_required_outputs);
+    assert_eq!(
+        read.session_reuse_reason.as_deref(),
+        Some("same_family_within_run")
+    );
+
+    work_items::enqueue(
+        &pool,
+        &WorkItem {
+            id: source_work_item_id.clone(),
+            kind: WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_execution_id": stage_execution_id.to_string(),
+                "p058_claimed": {
+                    "agent_execution_id": agent_execution_id.to_string(),
+                    "artifact_claim_key": claim_key
+                }
+            })
+            .to_string(),
+            status: WorkItemStatus::Running,
+            run_id: Some(run_id),
+            stage_id: Some("state_1".into()),
+            created_at: now,
+            scheduled_at: now,
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    work_items::complete(&pool, &source_work_item_id)
+        .await
+        .expect("preserved valid runtime facts should satisfy InvokeAgent completion guard");
+}
+
+#[tokio::test]
 async fn proposal_058_counts_recent_escalation_launches_for_storm_detection() {
     let pool = test_pool().await;
     let (run_id, _stage_execution_id, agent_execution_id, _work_item_id) =

@@ -1,9 +1,7 @@
 {
   "schema_version": "p082_negative_fixture_v1",
-  "fixture_id": "p082_xcode_grace_missing_operator_message",
-  "expected_failure_code": "xcode_grace_missing_operator_message",
-  "mutated_contract_or_matrix": {
-    "mutation": "remove recovery_operator_message from xcode_startup_grace_active row"
-  },
-  "assertion": "The gate must fail when Xcode startup grace readback lacks the required 12 minute operator message."
+  "fixture_id": "p082-neg-013",
+  "expected_failure_code": "p082_xcode_grace_missing_operator_message",
+  "mutated_contract_or_matrix": "P082-R05 Xcode startup grace row has null recovery_operator_message",
+  "assertion": "Gate must fail because Xcode startup grace (xcode_required=true) requires a non-null recovery_operator_message naming the Xcode grace period, cutoff, and next check state"
 }

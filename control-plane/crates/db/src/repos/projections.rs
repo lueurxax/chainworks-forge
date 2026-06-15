@@ -35,7 +35,6 @@ where
     Fut: Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    let runtime = tokio::runtime::Handle::current();
     let start = std::time::Instant::now();
     let res = tokio::task::spawn_blocking(move || {
         let worker = std::thread::Builder::new()
@@ -43,6 +42,10 @@ where
             .stack_size(PROJECTION_REBUILD_STACK_BYTES)
             .spawn(move || {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .with_context(|| format!("build projection rebuild runtime for {name}"))?;
                     runtime.block_on(future())
                 }))
             })

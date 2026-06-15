@@ -65,12 +65,13 @@ Cancellation settles in two phases with durable evidence so operator and report 
 `begin_settlement` runs synchronously when the operator requests stop:
 
 1. `run.cancellation_requested_at` is set,
-2. all active agent executions (`Running`/`Pending`/`Ready`) transition to terminal `Cancelled`,
-3. a `CancellationSettlementEntry` is built per agent execution with `session_close_succeeded: None`,
+2. all `Running` agent executions for the run transition to terminal `Cancelled`,
+3. a `CancellationSettlementEntry` is built per running agent execution with a shared non-empty `action_id` and `session_close_succeeded: None`; when P082 cancellation readback exists without a running `agent_execution`, a synthetic entry records that readback,
 4. entries are serialized as JSON into `run.cancellation_settlement_log`,
 5. all `Running` work items are marked `Cancelled` (`WorkItemStatus::Cancelled`),
-6. all `Running` stages with terminal agent executions are marked `Failed`,
-7. `run.status` stays `Cancelling`.
+6. active `agent_work_continuations` rows for the run are marked `cancelling` with `failure_reason="run_cancel_requested"`,
+7. all `Running` stages with terminal agent executions are marked `Failed`,
+8. `run.status` stays `Cancelling`.
 
 ### Async session close
 
@@ -95,13 +96,15 @@ Only after Phase 2 does the run appear as `Cancelled` to operator and report rea
 
 `CancellationSettlementEntry` carries:
 
+- `action_id`,
 - `agent_execution_id`,
 - `agent_id`,
 - `prior_status`,
 - `terminal_status` (`"cancelled"`),
 - `session_close_attempted`,
 - `session_close_succeeded` (`None` in Phase 1, `Some` in Phase 2),
-- `settled_at`.
+- `settled_at`,
+- optional `p082_recovery_matrix_readback`.
 
 Persisted run-level fields:
 

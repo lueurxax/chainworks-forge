@@ -1,9 +1,7 @@
 {
   "schema_version": "p082_negative_fixture_v1",
-  "fixture_id": "p082_malformed_command_error_envelope",
-  "expected_failure_code": "malformed_command_error_envelope",
-  "mutated_contract_or_matrix": {
-    "mutation": "set rejected_command_error.schema_version to an unknown value"
-  },
-  "assertion": "The gate must fail when p082_rejected_command_error_v1 cannot be parsed defensively."
+  "fixture_id": "p082-neg-014",
+  "expected_failure_code": "p082_malformed_command_error_envelope",
+  "mutated_contract_or_matrix": "command_journal.error contains JSON with schema_version=p082_rejected_command_error_v1 but missing required reason_code field",
+  "assertion": "Gate must fail because malformed p082_rejected_command_error_v1 envelope (valid JSON but missing required fields) must be detected and treated as unavailable readback, not exposed as partial operator data"
 }

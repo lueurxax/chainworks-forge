@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use acp::{AcpMcpServerPayload, BrokeredXcodeMcpIntent, ResolvedMcpServerTransport};
 use serde::{Deserialize, Serialize};
@@ -527,17 +527,34 @@ fn empty_report(
     }
 }
 
+const MCP_REGISTRY_YAML_MAX_BYTES: u64 = 256 * 1024;
+
+fn read_bounded_mcp_registry_yaml(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)
+        .map_err(|err| format!("Failed to open MCP registry '{}': {err}", path.display()))?;
+    let mut reader = file.take(MCP_REGISTRY_YAML_MAX_BYTES + 1);
+    let mut content = String::new();
+    reader
+        .read_to_string(&mut content)
+        .map_err(|err| format!("Failed to read MCP registry '{}': {err}", path.display()))?;
+    if content.len() as u64 > MCP_REGISTRY_YAML_MAX_BYTES {
+        return Err(format!(
+            "MCP registry '{}' exceeds maximum size of {} bytes",
+            path.display(),
+            MCP_REGISTRY_YAML_MAX_BYTES
+        ));
+    }
+    Ok(content)
+}
+
 fn load_machine_registry() -> Result<MachineMcpRegistry, String> {
     let registry_path = registry_path().ok_or_else(|| {
         "No MCP registry path is available; set CHAINWORKS_CODEX_CONFIG_PATH or create ~/.config/mcp/config.yaml."
             .to_string()
     })?;
-    let content = std::fs::read_to_string(&registry_path).map_err(|err| {
-        format!(
-            "Failed to read MCP registry '{}': {err}",
-            registry_path.display()
-        )
-    })?;
+    let content = read_bounded_mcp_registry_yaml(&registry_path)?;
     serde_yaml::from_str(&content).map_err(|err| {
         format!(
             "Failed to parse MCP registry '{}': {err}",

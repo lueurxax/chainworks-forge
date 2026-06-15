@@ -128,11 +128,12 @@ Extensions use **camelCase**: `reasonCode`, `rowId`, `callerClass`, `requestId`,
 | Case | HTTP | extensions.code | Data |
 |---|---|---|---|
 | Missing/invalid token | 401 | `UNAUTHORIZED` | null |
+| Authenticated transport surface denied before GraphQL execution | 403 | `FORBIDDEN` with `reasonCode = CAPABILITY_OUT_OF_SCOPE` | null |
 | Authenticated resolver deny | 200 | `FORBIDDEN` | denied field null |
 | Observer field redaction | 200 | — | redacted field null; extensions.redactions present |
 | drop_resource | 200 | `FORBIDDEN` | resource field null |
 | WebSocket connection_init invalid token | — | `UNAUTHORIZED` | close 4401 |
-| WebSocket connection_init ambiguous caller | — | `FORBIDDEN` | close 4403 |
+| WebSocket connection_init ambiguous caller or subscription surface denied | — | `FORBIDDEN` | close 4403 |
 | WebSocket connection_init missing, malformed, or delayed | — | `INIT_TIMEOUT` | close 4408 |
 | Subscription denied at subscribe-start | — | `FORBIDDEN` | complete with no events |
 | Internal error from `approveApproval` / `rejectApproval` | 200 | `INTERNAL` | only `extensions.code = "INTERNAL"` and `extensions.requestId`; the full error chain is logged server-side and never returned to the client |

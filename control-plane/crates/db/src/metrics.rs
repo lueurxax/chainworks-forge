@@ -52,9 +52,10 @@ struct SystemMetrics {
     projection_backlog_rows: HashMap<String, u64>,
     projection_backlog_bytes: HashMap<String, u64>,
     counters: HashMap<String, u64>,
-    p058_metric_samples: HashMap<String, Histogram>,
     gauges: HashMap<String, u64>,
-    p082_recovery_state_age_seconds: Histogram,
+    p058_metric_samples: HashMap<String, Histogram>,
+    /// Keyed by "scenario_id:reason_code" to carry the {scenario_id,reason_code} label dimensions.
+    p082_recovery_state_age_seconds: HashMap<String, u64>,
     mcp_liveness_gate_last_recorded_at_ms: Option<i64>,
     mcp_hot_read_error_total_by_code: HashMap<String, u64>,
     p046_query_duration_ms: HashMap<String, Histogram>,
@@ -112,6 +113,20 @@ pub const P087_REQUIRED_METRICS: &[&str] = &[
     "maintenance_slot_release_cas_failed_total",
     "hot_read_circuit_would_open_total",
     "hot_read_circuit_open_total",
+];
+
+/// P082: Required metric names for the recovery/retry state-machine matrix proof gate.
+/// These names are checked by the test gate to confirm all required metrics are declared
+/// before emission wiring is added at the approved sites.
+pub const P082_REQUIRED_METRICS: &[&str] = &[
+    "p082_recovery_matrix_rows_with_db_engine_readback_coverage_percent",
+    "p082_recovery_matrix_gate_result_total",
+    "p082_recovery_reason_readback_total",
+    "p082_recovery_mutation_rejected_total",
+    "p082_release_side_effect_retry_block_total",
+    "p082_late_output_quarantine_total",
+    "p082_recovery_idempotency_replay_total",
+    "p082_recovery_state_age_seconds",
 ];
 
 pub const P081_REQUIRED_METRICS: &[&str] = &[
@@ -582,6 +597,71 @@ pub fn record_p081_approval_actionability_false(
 pub fn get_counter(name: &str) -> u64 {
     let m = metrics().lock().unwrap();
     m.counters.get(name).copied().unwrap_or(0)
+}
+
+pub fn get_counter_with_label(name: &str, label: &str) -> u64 {
+    let m = metrics().lock().unwrap();
+    let key = format!("{}:{}", name, label);
+    m.counters.get(&key).copied().unwrap_or(0)
+}
+
+pub fn set_gauge(name: &str, value: u64) {
+    let mut m = metrics().lock().unwrap();
+    m.gauges.insert(name.to_string(), value);
+}
+
+pub fn get_gauge(name: &str) -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    m.gauges.get(name).copied()
+}
+
+pub fn record_p082_recovery_matrix_coverage_percent(rows_with_readback: usize, total_rows: usize) {
+    let percent = if total_rows == 0 {
+        0
+    } else {
+        ((rows_with_readback as u64) * 100) / (total_rows as u64)
+    };
+    set_gauge(
+        "p082_recovery_matrix_rows_with_db_engine_readback_coverage_percent",
+        percent,
+    );
+}
+
+/// Emit `p082_recovery_matrix_gate_result_total{scenario_id,status}`.
+/// The compound label `"scenario_id:status"` preserves the required two label dimensions.
+pub fn record_p082_recovery_matrix_gate_result(scenario_id: &str, status: &str) {
+    increment_counter_with_label(
+        "p082_recovery_matrix_gate_result_total",
+        &format!("{scenario_id}:{status}"),
+    );
+}
+
+/// Emit `p082_recovery_state_age_seconds{scenario_id,reason_code}`.
+/// Stores the latest age per compound key so callers can query by both dimensions.
+pub fn record_p082_recovery_state_age_seconds(
+    scenario_id: &str,
+    reason_code: &str,
+    age_seconds: u64,
+) {
+    let mut m = metrics().lock().unwrap();
+    let key = format!("{scenario_id}:{reason_code}");
+    m.p082_recovery_state_age_seconds.insert(key, age_seconds);
+}
+
+/// Returns the maximum age across all labeled scenario/reason entries, or `None` when empty.
+pub fn get_p082_recovery_state_age_seconds_latest() -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    m.p082_recovery_state_age_seconds.values().copied().max()
+}
+
+/// Returns the age for a specific `{scenario_id,reason_code}` pair, or `None` if not recorded.
+pub fn get_p082_recovery_state_age_seconds_for(
+    scenario_id: &str,
+    reason_code: &str,
+) -> Option<u64> {
+    let m = metrics().lock().unwrap();
+    let key = format!("{scenario_id}:{reason_code}");
+    m.p082_recovery_state_age_seconds.get(&key).copied()
 }
 
 /// Returns the sum of all counters whose key starts with `prefix:`.

@@ -34,6 +34,7 @@ At the current baseline, the product includes:
 - runtime-owned bounded tool output and safe-search enforcement with shared policy versions, generated/build-root denylist, typed `tool_output_budget_preflight_denied` errors before provider context damage, wrapper-enforced line/byte caps, budget/unbounded-output classification before generic provider fallback, quarantine for poisoned sessions, and `runtime.health.toolOutputGuard` policy/enforcement readback,
 - Junie `code_writer` runtime hardening with strict completion-boundary subtypes, engine-synthesized failure envelopes, staged per-output repair settlement, runtime preflight/remediation, and post-preflight provider launch capacity leasing,
 - targeted retry authority with exact stage-execution retry settlement, authority-history readback, startup orphan retry repair, and retry payload recovery diagnostics,
+- P082 recovery/retry state-machine matrix readbacks for operator MCP/report/run-report/release diagnostic lanes, covering startup repair, retry rejection, stale ownership, side-effect holds, cancellation interleavings, late-output quarantine, and crash/replay proof gates,
 - observe-only auto-retry observation ledger with JSONL observations, canonical known-issue catalog, MCP readback, and rollup tooling,
 - bounded artifact discovery and engine-owned settlement pipeline,
 - provider toolchain cache mapping for isolated Xcode and Go build roots,
@@ -91,6 +92,7 @@ Use these reference docs as the current source of truth:
 | ACP runtime transport | [acp-runtime-transport.md](acp-runtime-transport.md) |
 | Bounded tool output and safe search | [bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md) |
 | Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
+| Recovery/retry matrix and proof gate | [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md) |
 | Rust control plane, scheduler, targeted retry authority, and retry payload recovery | [rust-control-plane.md](rust-control-plane.md) |
 | Escalation policy and chain management | [escalation-policies.md](escalation-policies.md) |
 | Auto-retry observation ledger | [auto-retry-observation-ledger.md](auto-retry-observation-ledger.md) |

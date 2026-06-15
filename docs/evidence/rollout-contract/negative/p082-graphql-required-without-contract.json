@@ -1,9 +1,7 @@
 {
   "schema_version": "p082_negative_fixture_v1",
-  "fixture_id": "p082_graphql_required_without_contract",
-  "expected_failure_code": "graphql_readback_required_without_contract",
-  "mutated_contract_or_matrix": {
-    "mutation": "require GraphQL P082 fields while no advisory GraphQL contract is implemented"
-  },
-  "assertion": "The gate must fail if GraphQL is made mandatory without the proposal-defined advisory contract and tolerant decode proof."
+  "fixture_id": "p082-neg-007",
+  "expected_failure_code": "p082_graphql_required_without_contract",
+  "mutated_contract_or_matrix": "GraphQL readback lane added as a required readback lane without tolerant diagnostic-only test coverage",
+  "assertion": "Gate must fail because GraphQL is advisory-only and must not be a required readback lane without explicit contract amendment and tolerant tests"
 }

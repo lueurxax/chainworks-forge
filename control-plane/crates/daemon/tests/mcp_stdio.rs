@@ -6,16 +6,36 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+fn control_plane_binary() -> PathBuf {
+    let configured = PathBuf::from(
+        std::env::var("CARGO_BIN_EXE_control-plane")
+            .expect("cargo should provide path to control-plane test binary"),
+    );
+    if configured
+        .file_name()
+        .is_some_and(|name| name == "control-plane")
+    {
+        return configured;
+    }
+    let sibling = configured
+        .parent()
+        .and_then(|deps| deps.parent())
+        .map(|debug_dir| debug_dir.join("control-plane"));
+    match sibling {
+        Some(candidate) if candidate.exists() => candidate,
+        _ => configured,
+    }
+}
+
 #[test]
 fn mcp_mode_keeps_stdout_protocol_clean_for_initialize() {
-    let binary = std::env::var("CARGO_BIN_EXE_control-plane")
-        .expect("cargo should provide path to control-plane test binary");
+    let binary = control_plane_binary();
 
     let db_path = temp_db_path("mcp-stdio");
     let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
     let principal_path = write_principal_fixture("mcp-stdio-principals");
 
-    let mut child = Command::new(binary)
+    let mut child = Command::new(&binary)
         .env("MODE", "mcp")
         .env("DATABASE_URL", database_url)
         .env("CHAINWORKS_AUTH_PRINCIPALS_PATH", &principal_path)
@@ -54,8 +74,7 @@ fn mcp_mode_keeps_stdout_protocol_clean_for_initialize() {
 
 #[test]
 fn test_mcp_stdio_rejects_first_frame_other_than_initialize() {
-    let binary = std::env::var("CARGO_BIN_EXE_control-plane")
-        .expect("cargo should provide path to control-plane test binary");
+    let binary = control_plane_binary();
 
     let db_path = temp_db_path("mcp-stdio-preinit");
     let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
@@ -98,8 +117,7 @@ fn test_mcp_stdio_rejects_first_frame_other_than_initialize() {
 
 #[test]
 fn test_mcp_stdio_rejects_initialize_without_principal_token() {
-    let binary = std::env::var("CARGO_BIN_EXE_control-plane")
-        .expect("cargo should provide path to control-plane test binary");
+    let binary = control_plane_binary();
 
     let db_path = temp_db_path("mcp-stdio-missing-token");
     let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
@@ -143,12 +161,11 @@ fn test_mcp_stdio_rejects_initialize_without_principal_token() {
 
 #[test]
 fn test_mcp_stdio_rejects_initialize_with_unknown_principal_token() {
-    let binary = std::env::var("CARGO_BIN_EXE_control-plane")
-        .expect("cargo should provide path to control-plane test binary");
+    let binary = control_plane_binary();
 
     let db_path = temp_db_path("mcp-stdio-unknown-token");
     let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
-    let principal_path = temp_db_path("mcp-stdio-principals").with_extension("json");
+    let principal_path = secure_principal_path("mcp-stdio-principals");
     fs::write(&principal_path, principal_fixture_json()).expect("write principal fixture");
     set_owner_only_permissions(&principal_path);
 
@@ -190,8 +207,7 @@ fn test_mcp_stdio_rejects_initialize_with_unknown_principal_token() {
 
 #[test]
 fn test_mcp_stdio_binds_principal_for_session_lifetime() {
-    let binary = std::env::var("CARGO_BIN_EXE_control-plane")
-        .expect("cargo should provide path to control-plane test binary");
+    let binary = control_plane_binary();
 
     let db_path = temp_db_path("mcp-stdio-session");
     let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
@@ -239,9 +255,63 @@ fn test_mcp_stdio_binds_principal_for_session_lifetime() {
 }
 
 #[test]
+fn sec_high_001_mcp_stdio_revalidates_session_after_principal_revocation() {
+    let binary = control_plane_binary();
+
+    let db_path = temp_db_path("mcp-stdio-live-revoke");
+    let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let principal_path = write_principal_fixture("mcp-stdio-live-revoke-principals");
+
+    let mut child = Command::new(binary)
+        .env("MODE", "mcp")
+        .env("DATABASE_URL", database_url)
+        .env("CHAINWORKS_AUTH_PRINCIPALS_PATH", &principal_path)
+        .env("CHAINWORKS_PRINCIPALS_RELOAD_SECS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn control-plane in mcp mode");
+
+    let mut stdin = child.stdin.take().expect("stdin should be piped");
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let mut stdout_reader = BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"principal_token\":\"known-mcp-token-xxxxxxxxxxxxxxxx\"}}}}}}"
+    )
+    .expect("write initialize request");
+    stdin.flush().expect("flush initialize request");
+    let init_response = read_json_line(&mut stdout_reader);
+    assert!(init_response["result"]["serverInfo"]["name"]
+        .as_str()
+        .is_some());
+
+    fs::write(&principal_path, revoked_principal_fixture_json()).expect("write revoked fixture");
+    set_owner_only_permissions(&principal_path);
+    std::thread::sleep(Duration::from_millis(1500));
+
+    writeln!(
+        stdin,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{{}}}}"
+    )
+    .expect("write tools/list request after revocation");
+    stdin
+        .flush()
+        .expect("flush tools/list request after revocation");
+    let response = read_json_line(&mut stdout_reader);
+    assert_eq!(response["error"]["code"], -32000);
+    assert_eq!(response["error"]["message"], "unauthorized");
+
+    assert_child_exits(&mut child, Duration::from_secs(2));
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_file(principal_path);
+}
+
+#[test]
 fn test_mcp_stdio_rejects_reinitialize_mid_session() {
-    let binary = std::env::var("CARGO_BIN_EXE_control-plane")
-        .expect("cargo should provide path to control-plane test binary");
+    let binary = control_plane_binary();
 
     let db_path = temp_db_path("mcp-stdio-reinitialize");
     let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
@@ -292,10 +362,29 @@ fn read_json_line<R: BufRead>(reader: &mut R) -> serde_json::Value {
 }
 
 fn write_principal_fixture(prefix: &str) -> PathBuf {
-    let principal_path = temp_db_path(prefix).with_extension("json");
+    let principal_path = secure_principal_path(prefix);
     fs::write(&principal_path, principal_fixture_json()).expect("write principal fixture");
     set_owner_only_permissions(&principal_path);
     principal_path
+}
+
+fn secure_principal_path(prefix: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("{prefix}-{unique}"));
+    fs::create_dir(&dir).expect("create secure principal fixture directory");
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&dir)
+            .expect("principal fixture directory metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&dir, permissions)
+            .expect("set principal fixture directory permissions");
+    }
+    dir.join("principals.json")
 }
 
 fn principal_fixture_json() -> &'static str {
@@ -318,6 +407,13 @@ fn principal_fixture_json() -> &'static str {
           }
         }
       ]
+    }"#
+}
+
+fn revoked_principal_fixture_json() -> &'static str {
+    r#"{
+      "schema_version": 2,
+      "principals": []
     }"#
 }
 

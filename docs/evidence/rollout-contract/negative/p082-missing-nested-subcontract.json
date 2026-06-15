@@ -1,9 +1,7 @@
 {
   "schema_version": "p082_negative_fixture_v1",
-  "fixture_id": "p082_missing_nested_subcontract",
-  "expected_failure_code": "missing_nested_subcontract",
-  "mutated_contract_or_matrix": {
-    "mutation": "omit p082_late_output_settlement_v1 from the late-output row"
-  },
-  "assertion": "The gate must fail when required nested P082 subcontracts are absent or malformed."
+  "fixture_id": "p082-neg-012",
+  "expected_failure_code": "p082_missing_nested_subcontract",
+  "mutated_contract_or_matrix": "p082_startup_repair_summary_v1 nested subcontract omitted from P082-R01 readback row",
+  "assertion": "Gate must fail because nested subcontract schemas (retry_identifier_guidance, late_output_settlement, startup_repair_summary, rejected_command_error) must be present and valid in their respective scenarios"
 }

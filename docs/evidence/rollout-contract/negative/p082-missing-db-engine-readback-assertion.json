@@ -1,9 +1,7 @@
 {
   "schema_version": "p082_negative_fixture_v1",
-  "fixture_id": "p082_missing_db_engine_readback_assertion",
-  "expected_failure_code": "missing_db_engine_readback_assertion",
-  "mutated_contract_or_matrix": {
-    "mutation": "drop fixture assertion tying DB/engine owners to the readback row"
-  },
-  "assertion": "The gate must fail when a matrix row cannot be traced to its durable DB/engine owner."
+  "fixture_id": "p082-neg-002",
+  "expected_failure_code": "p082_missing_db_engine_readback_assertion",
+  "mutated_contract_or_matrix": "Removed DB and engine assertion columns from P082-R03 matrix row",
+  "assertion": "Gate must fail because a matrix row lacks required DB and engine assertions"
 }

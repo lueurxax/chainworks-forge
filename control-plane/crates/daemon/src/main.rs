@@ -79,6 +79,8 @@ use sqlx::SqlitePool;
 /// transient launch conflict from a normal daemon crash.
 const EX_TEMPFAIL: i32 = 75;
 const DAEMON_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_PRINCIPALS_RELOAD_SECS: u64 = 2;
+const MIN_PRINCIPALS_RELOAD_SECS: u64 = 1;
 
 fn main() -> Result<()> {
     let result = tokio::runtime::Builder::new_multi_thread()
@@ -95,6 +97,27 @@ fn main() -> Result<()> {
         );
     }
     result
+}
+
+fn principals_reload_interval_secs_from_env_value(raw: Option<&str>) -> u64 {
+    match raw.and_then(|value| value.parse::<u64>().ok()) {
+        Some(secs) if secs >= MIN_PRINCIPALS_RELOAD_SECS => secs,
+        _ => DEFAULT_PRINCIPALS_RELOAD_SECS,
+    }
+}
+
+fn principals_reload_interval_secs() -> u64 {
+    let raw = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS").ok();
+    let secs = principals_reload_interval_secs_from_env_value(raw.as_deref());
+    if raw.is_some() && raw.as_deref().and_then(|value| value.parse::<u64>().ok()) != Some(secs) {
+        warn!(
+            configured = raw.as_deref().unwrap_or("<unset>"),
+            fallback_secs = DEFAULT_PRINCIPALS_RELOAD_SECS,
+            min_secs = MIN_PRINCIPALS_RELOAD_SECS,
+            "invalid CHAINWORKS_PRINCIPALS_RELOAD_SECS; using safe default"
+        );
+    }
+    secs
 }
 
 async fn run_daemon() -> Result<()> {
@@ -233,6 +256,7 @@ async fn run_daemon() -> Result<()> {
     // to consult and would have panicked on `Extension<PrincipalTable>`
     // extraction.
     let principal_table = auth::PrincipalTable::load_or_bootstrap(&paths.principals_path)?;
+    let live_principal_source = auth::LivePrincipalSource::new(principal_table.clone());
     info!(
         path = %paths.principals_path.display(),
         "Principal table loaded"
@@ -458,7 +482,7 @@ async fn run_daemon() -> Result<()> {
                 format!("{count} crashes; first at unix={first_crash_at}"),
                 None,
             );
-            return serve_failed(&reporter, &principal_table, &paths).await;
+            return serve_failed(&reporter, &live_principal_source, &paths).await;
         }
     }
 
@@ -484,7 +508,7 @@ async fn run_daemon() -> Result<()> {
                     "migration preflight failed — entering §8.7 failed-serve mode"
                 );
                 reporter.set_failed(kind, detail, backup_path);
-                return serve_failed(&reporter, &principal_table, &paths).await;
+                return serve_failed(&reporter, &live_principal_source, &paths).await;
             }
         };
 
@@ -717,27 +741,21 @@ async fn run_daemon() -> Result<()> {
                 principal_table.clone(),
                 db_writer.heartbeat.clone(),
                 Arc::clone(&boundary_policy),
-            );
-            let mcp_principal_handle = mcp.principal_table_handle();
-            let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2);
+            )
+            .with_live_principal_source(live_principal_source.clone());
+            let principals_reload_secs = principals_reload_interval_secs();
             let principals_path_for_reload = paths.principals_path.clone();
+            let live_principal_source_for_reload = live_principal_source.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(principals_reload_secs))
                         .await;
                     match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
-                        Ok(new_table) => {
-                            mcp_principal_handle.update(new_table);
-                            tracing::debug!("MCP principal table reloaded for live revocation");
-                        }
+                        Ok(new_table) => live_principal_source_for_reload.update(new_table),
                         Err(e) => {
-                            mcp_principal_handle.mark_unavailable();
+                            live_principal_source_for_reload.mark_unavailable();
                             tracing::warn!(
-                                "MCP principal reload failed; auth source marked unavailable \
-                                 (MCP requests will fail-closed): {e:#}"
+                                "MCP stdio principal reload failed; auth source marked unavailable: {e:#}"
                             );
                         }
                     }
@@ -755,7 +773,8 @@ async fn run_daemon() -> Result<()> {
                     principal_table.clone(),
                     db_writer.heartbeat.clone(),
                     Arc::clone(&boundary_policy),
-                ),
+                )
+                .with_live_principal_source(live_principal_source.clone()),
             );
             let mcp_principal_handle = mcp.principal_table_handle();
             let mcp_routes = mcp_server::http::routes(mcp);
@@ -774,11 +793,9 @@ async fn run_daemon() -> Result<()> {
             // P046: periodically reload principals.json so subscription auth rechecks
             // observe revocation promptly, without requiring a daemon restart.
             // Default interval is 2 seconds; override with CHAINWORKS_PRINCIPALS_RELOAD_SECS.
-            let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2);
+            let principals_reload_secs = principals_reload_interval_secs();
             let principals_path_for_reload = paths.principals_path.clone();
+            let live_principal_source_for_reload = live_principal_source.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(principals_reload_secs))
@@ -786,10 +803,8 @@ async fn run_daemon() -> Result<()> {
                     match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
                         Ok(new_table) => {
                             p046_live_handle.update(new_table.clone()).await;
-                            mcp_principal_handle.update(new_table);
-                            tracing::debug!(
-                                "principal table reloaded for GraphQL and MCP live revocation"
-                            );
+                            live_principal_source_for_reload.update(new_table);
+                            tracing::debug!("principal table reloaded for live revocation");
                         }
                         Err(e) => {
                             // Mark the auth source unavailable so running subscriptions
@@ -797,7 +812,7 @@ async fn run_daemon() -> Result<()> {
                             // than continuing under stale grants after a revocation write
                             // that we could not observe.
                             p046_live_handle.mark_unavailable().await;
-                            mcp_principal_handle.mark_unavailable();
+                            live_principal_source_for_reload.mark_unavailable();
                             tracing::warn!(
                                 "P046 principal reload failed; auth source marked unavailable \
                                  (GraphQL subscriptions and MCP requests will fail-closed): {e:#}"
@@ -957,11 +972,12 @@ async fn run_daemon() -> Result<()> {
             let serve_fut = async {
                 let extra_routes =
                     mcp_routes.merge(daemon::xcode_broker_http::routes(xcode_broker_pool.clone()));
-                graphql_server::server::serve_with_listener_until(
+                graphql_server::server::serve_with_listener_until_with_live_principal_source(
                     schema,
                     listener,
                     extra_routes,
                     principal_table,
+                    live_principal_source.clone(),
                     reporter.clone(),
                     shutdown_signal,
                 )
@@ -1659,7 +1675,7 @@ fn extract_backup_path_hint(msg: &str) -> Option<String> {
 /// is therefore uniform for Ready and Failed servers.
 async fn serve_failed(
     reporter: &LifecycleReporter,
-    principal_table: &auth::PrincipalTable,
+    live_principal_source: &auth::LivePrincipalSource,
     paths: &ModePaths,
 ) -> Result<()> {
     let (listener, port) = packaging::bind_with_fallback(paths).await?;
@@ -1674,33 +1690,29 @@ async fn serve_failed(
         bind_addr = %paths.bind_addr,
         "failed-serve: bound listener; daemon.port written so clients can discover the status surface"
     );
-    let live_principal_table = auth::LivePrincipalTable::new(principal_table.clone());
-    let reload_handle = live_principal_table.clone();
+    let principals_reload_secs = principals_reload_interval_secs();
     let principals_path_for_reload = paths.principals_path.clone();
-    let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2);
+    let live_source_for_reload = live_principal_source.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(principals_reload_secs)).await;
             match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
-                Ok(new_table) => {
-                    reload_handle.update(new_table);
-                    tracing::debug!("failed-serve principal table reloaded for live revocation");
-                }
+                Ok(new_table) => live_source_for_reload.update(new_table),
                 Err(e) => {
-                    reload_handle.mark_unavailable();
+                    live_source_for_reload.mark_unavailable();
                     tracing::warn!(
-                        "failed-serve principal reload failed; auth source marked unavailable \
-                         (failed-serve requests will fail-closed): {e:#}"
+                        "failed-serve principal reload failed; auth source marked unavailable: {e:#}"
                     );
                 }
             }
         }
     });
-    failed_serve::serve_failed_state_with_listener(reporter.clone(), live_principal_table, listener)
-        .await
+    failed_serve::serve_failed_state_with_live_principal_source(
+        reporter.clone(),
+        live_principal_source.clone(),
+        listener,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1713,6 +1725,17 @@ mod tests {
             new_daemon_xcode_broker_pool(41234, Arc::new(acp::NoopXcodeRuntimeObservationSink));
 
         assert!(pool.has_backend());
+    }
+
+    #[test]
+    fn principals_reload_interval_rejects_zero_and_invalid_values() {
+        assert_eq!(principals_reload_interval_secs_from_env_value(None), 2);
+        assert_eq!(principals_reload_interval_secs_from_env_value(Some("5")), 5);
+        assert_eq!(principals_reload_interval_secs_from_env_value(Some("0")), 2);
+        assert_eq!(
+            principals_reload_interval_secs_from_env_value(Some("not-a-number")),
+            2
+        );
     }
 
     #[test]

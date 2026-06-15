@@ -1,9 +1,7 @@
 {
   "schema_version": "p082_negative_fixture_v1",
-  "fixture_id": "p082_missing_cancel_crash_rows",
-  "expected_failure_code": "missing_cancel_crash_rows",
-  "mutated_contract_or_matrix": {
-    "mutation": "drop cancel/crash convergence rows from the recovery matrix"
-  },
-  "assertion": "The gate must fail when cancellation and crash recovery rows are not represented."
+  "fixture_id": "p082-neg-009",
+  "expected_failure_code": "p082_missing_cancel_crash_rows",
+  "mutated_contract_or_matrix": "P082-R11 and P082-R15 rows lack provider subprocess cleanup proof and crash/replay proof fields",
+  "assertion": "Gate must fail because cancellation (R11) and crash-during-repair (R15) rows must include provider subprocess cleanup proof tied to ACP transport lifecycle evidence"
 }

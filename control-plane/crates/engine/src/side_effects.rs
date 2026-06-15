@@ -943,7 +943,7 @@ pub async fn run_unresolved_effects_preflight(
 
     let effect_ids: Vec<String> = unresolved.iter().map(|e| e.id.to_string()).collect();
     let reason = classify_unresolved_reason(&unresolved);
-    let reason_label = reason.to_string();
+    let effect_status_label = p082_unresolved_effect_status_label(&unresolved);
     // Use the stage_execution_id from the first unresolved effect as the envelope anchor.
     let stage_execution_id = &unresolved[0].stage_execution_id;
 
@@ -958,7 +958,7 @@ pub async fn run_unresolved_effects_preflight(
     emit_p078_metric("side_effect_retry_block_total", None, None);
     db::metrics::increment_counter_with_label(
         "p082_release_side_effect_retry_block_total",
-        &format!("{reason_label}:{operation_label}"),
+        &format!("{effect_status_label}:{operation_label}"),
     );
     warn!(
         run_id = %run_id,
@@ -1017,7 +1017,7 @@ pub async fn run_cancel_preflight_within_tx(
 
     let effect_ids: Vec<String> = unresolved.iter().map(|e| e.id.to_string()).collect();
     let reason = classify_unresolved_reason(&unresolved);
-    let reason_label = reason.to_string();
+    let effect_status_label = p082_unresolved_effect_status_label(&unresolved);
     let stage_execution_id = &unresolved[0].stage_execution_id;
 
     let envelope = RequiresEffectReconciliationEnvelope::new(
@@ -1031,7 +1031,7 @@ pub async fn run_cancel_preflight_within_tx(
     emit_p078_metric("side_effect_retry_block_total", None, None);
     db::metrics::increment_counter_with_label(
         "p082_release_side_effect_retry_block_total",
-        &format!("{reason_label}:cancel"),
+        &format!("{effect_status_label}:cancel"),
     );
     warn!(
         run_id = %run_id,
@@ -1144,6 +1144,40 @@ fn classify_unresolved_reason(effects: &[SideEffect]) -> ReconciliationBlockReas
         return ReconciliationBlockReason::UnresolvedExecuting;
     }
     ReconciliationBlockReason::UnresolvedPrepared
+}
+
+fn p082_unresolved_effect_status_label(effects: &[SideEffect]) -> &'static str {
+    if effects
+        .iter()
+        .any(|e| e.status == SideEffectStatus::Conflict)
+    {
+        return "conflict";
+    }
+    if effects
+        .iter()
+        .any(|e| e.status == SideEffectStatus::Unrecoverable)
+    {
+        return "unrecoverable";
+    }
+    if effects
+        .iter()
+        .any(|e| e.status == SideEffectStatus::NeedsReconciliation)
+    {
+        return "needs_reconciliation";
+    }
+    if effects
+        .iter()
+        .any(|e| e.status == SideEffectStatus::ExternallyObserved)
+    {
+        return "externally_observed";
+    }
+    if effects
+        .iter()
+        .any(|e| e.status == SideEffectStatus::Executing)
+    {
+        return "executing";
+    }
+    "prepared"
 }
 
 #[cfg(test)]

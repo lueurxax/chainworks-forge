@@ -17,7 +17,7 @@
 
 ## Summary
 
-P082 creates the canonical recovery/retry state-machine matrix and proof gate for restart, retry, cancellation, stale startup, late output, side-effect, approval, session, and mediation boundaries. This revision preserves the no-migration posture, keeps rejected-command readback in command_journal.error typed envelopes, adds backward-compatible parsing rules, makes optional GraphQL and Swift consumption tolerant and diagnostic-only, adds explicit held-state and cancel-late-output coverage, defines long-held observability thresholds, and records future UI constraints without expanding P082 into UI implementation.
+P082 creates the canonical recovery/retry state-machine matrix and proof gate for restart, retry, cancellation, stale startup, late output, side-effect, approval, session, and mediation boundaries. This revision preserves the no-migration posture, keeps rejected-command readback in command_journal.error typed envelopes, adds backward-compatible parsing rules, makes optional GraphQL and Swift consumption tolerant and diagnostic-only, adds explicit held-state and cancel-late-output coverage, defines long-held observability thresholds, and records future UI constraints without expanding P082 into UI implementation. The approved implementation boundary also includes live/reloadable principal enforcement for the operator-only report/readback surfaces touched by P082, so revocation, disablement, and surface-policy narrowing take effect without restarting the daemon.
 
 ## Problem
 
@@ -29,6 +29,7 @@ Recovery and retry behavior is spread across startup repair, targeted retry, ACP
 - Add proposal-082 and p082 aliases to scripts/test-gate.sh and document them in docs/reference/test-gates.md.
 - Add DB and engine tests proving validation before mutation, unique active ownership, idempotent replay, cancellation convergence, provider cleanup evidence, late-output quarantine, and no blind automatic retry.
 - Add MCP/report/run-report tests for exact p082_recovery_matrix_readback_v1 lane placement and parity.
+- Add live-auth reload regressions for the P082 operator-only diagnostic boundary: MCP HTTP, MCP stdio, failed-serve diagnostics, and adjacent GraphQL bearer-policy guards must resolve the current principal table after reload rather than startup snapshots.
 - Keep release side-effect retry fail-closed while unresolved side-effect ledger rows exist.
 - Define shared reason-code constants and fixture-enforced nested schemas for retry identifier guidance, late-output settlement, startup repair summaries, and rejected command error envelopes.
 - Keep SwiftUI/macOS read-only and tolerant of additive/null/absent daemon fields; do not add app-side recovery authority.
@@ -43,6 +44,7 @@ Recovery and retry behavior is spread across startup repair, targeted retry, ACP
 - Do not implement new Forge recovery screens, native notifications, Dock badges, or keyboard/context-menu UI affordances in P082.
 - Do not infer recovery truth from logs or loose artifact scans when persisted stage, work-item, runtime-fact, retry-authority, approval, command-journal, mediation, session, or side-effect records exist.
 - Do not require a schema migration. If required readback cannot be stored unambiguously in existing durable owners, implementation must stop and this proposal must be amended.
+- Do not make GraphQL a required P082 readback lane. GraphQL auth/live-principal hardening is in scope only as an adjacent access-control boundary for P082-sensitive diagnostics and existing GraphQL surfaces.
 
 ## Ux Ui Notes
 
@@ -99,9 +101,14 @@ Recovery and retry behavior is spread across startup repair, targeted retry, ACP
   5. **Item**
      - **Field:** recovery_hold_conditions
      - **Owner:** row-specific JSON owner; rejected commands use command_journal.error.p082_recovery_matrix_readback.recovery_hold_conditions
-  6. **Item**
-     - **Field:** recovery_projection_integrity
-     - **Owner:** shared accessor derives from authoritative row presence, validated envelope shape, legacy fallback state, and source consistency; persisted where the owning JSON snapshot is written
+	  6. **Item**
+	     - **Field:** recovery_projection_integrity
+	     - **Owner:** shared accessor derives from authoritative row presence, validated envelope shape, legacy fallback state, and source consistency; persisted where the owning JSON snapshot is written
+### Authorization and Live Principal Boundary
+- P082 readback, report, release receipt, and runtime diagnostic lanes can contain operator-only recovery evidence. The implementation must use a reloadable `PrincipalTable`/live principal source on every touched northbound surface, not a startup snapshot.
+- Revoked, disabled, and re-scoped bearer principals must be rejected after principal-table reload on MCP HTTP, MCP stdio, failed-serve diagnostics, and existing GraphQL HTTP/WebSocket guards.
+- GraphQL P082 readback remains optional and diagnostic-only. The auth/live-principal work does not make GraphQL a recovery authority, and it does not add app-side recovery mutation authority.
+- `proposal-082|p082` is allowed to include focused auth/live-revocation tests because these tests prove that P082 operator-only diagnostics do not leak after reload.
 ### Fixtures
 - **Negative Schema:** Every negative fixture must contain schema_version=p082_negative_fixture_v1, fixture_id, expected_failure_code, mutated_contract_or_matrix, and assertion explaining which gate check must fail.
 - **Paths**
@@ -851,6 +858,7 @@ Recovery and retry behavior is spread across startup repair, targeted retry, ACP
 - Update the reference matrix document first, including corrected command_journal.error rejected-command ownership, legacy error fallback, lane field placement, nested subcontracts, Swift/macOS boundary, optional GraphQL tolerance, reliability edge cases, startup_requeue_exhausted, cancel-then-late-output, provider cleanup proof, long-held thresholds, and Xcode startup message requirements.
 - Add positive and negative rollout fixtures before tightening the gate, especially rejected-command payload mutation, malformed command error envelope, lane field-name drift, missing nested subcontract, Xcode missing-message, missing startup_requeue_exhausted, and cancel-late-output active projection mutation negatives.
 - Add proposal-082\|p082 aliases that validate matrix rows, storage owners, field schemas, exact lane names, fixture shapes, rollout contract shape, long-held thresholds, and documentation markers.
+- Include focused live-principal reload checks in the alias for MCP HTTP, MCP stdio, failed-serve diagnostics, and existing GraphQL bearer-policy guards, because P082 exposes operator-only diagnostics across these adjacent surfaces.
 - Add DB proof for all rows, including no-mutation assertions for rejected commands, backward-compatible command_journal.error parsing, idempotency replay assertions at each durable write boundary, startup_requeue_exhausted held-state proof, and cancel-late-output terminalization proof.
 - Add engine proof for startup repair, retry validation, late output quarantine, pending approval restart, duplicate ownership, cancellation interleavings, provider subprocess cleanup evidence, side-effect fail-closed retry, Xcode grace messaging, crash-loop replay, and crash-during-repair recovery.
 - Add MCP/report/run-report/release diagnostic readback proof for p082_recovery_matrix_readback_v1 parity and exact singular/plural lane placement.

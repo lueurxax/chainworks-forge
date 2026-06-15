@@ -29,6 +29,49 @@ chainworks_default_sccache_dir() {
     fi
 }
 
+chainworks_effective_sccache_dir() {
+    local candidate="${SCCACHE_DIR:-$(chainworks_default_sccache_dir)}"
+    if [[ -n "${SCCACHE_DIR:-}" ]]; then
+        printf '%s\n' "${candidate}"
+        return 0
+    fi
+
+    # sccache uses a Unix socket under SCCACHE_DIR. Provider runtimes can set a
+    # long isolated HOME path, and macOS rejects socket paths near SUN_LEN.
+    local socket_path="${candidate%/}/sccache.sock"
+    if (( ${#socket_path} < 100 )); then
+        printf '%s\n' "${candidate}"
+        return 0
+    fi
+
+    local uid
+    uid="$(id -u 2>/dev/null || printf 'unknown')"
+    printf '/tmp/chainworks-sccache-%s\n' "${uid}"
+}
+
+chainworks_sccache_compiler_path() {
+    local sysroot
+    sysroot="$(rustc --print sysroot 2>/dev/null || true)"
+    if [[ -n "${sysroot}" && -x "${sysroot}/bin/rustc" ]]; then
+        printf '%s\n' "${sysroot}/bin/rustc"
+        return 0
+    fi
+    command -v rustc 2>/dev/null || true
+}
+
+chainworks_sccache_can_wrap_rustc() {
+    local compiler_path
+    compiler_path="$(chainworks_sccache_compiler_path)"
+    if [[ -z "${compiler_path}" ]]; then
+        return 1
+    fi
+
+    # sccache on macOS also rejects very long compiler paths before Cargo can
+    # run tests. Provider-local rustup toolchains live under long temp roots, so
+    # auto mode must fail open to plain rustc instead of failing the gate.
+    (( ${#compiler_path} < 100 ))
+}
+
 chainworks_gate_cargo_target_root() {
     if [[ -n "${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-}" ]]; then
         printf '%s\n' "${CHAINWORKS_GATE_CARGO_TARGET_ROOT}"
@@ -88,32 +131,6 @@ chainworks_gate_cargo_target_dir() {
     printf '%s/%s\n' "$(chainworks_gate_cargo_target_root)" "${safe_suffix}"
 }
 
-chainworks_find_sccache() {
-    if [[ -n "${CHAINWORKS_SCCACHE_BINARY:-}" && -x "${CHAINWORKS_SCCACHE_BINARY}" ]]; then
-        printf '%s\n' "${CHAINWORKS_SCCACHE_BINARY}"
-        return 0
-    fi
-    if [[ -n "${RUSTC_WRAPPER:-}" && -x "${RUSTC_WRAPPER}" ]]; then
-        printf '%s\n' "${RUSTC_WRAPPER}"
-        return 0
-    fi
-    if command -v sccache >/dev/null 2>&1; then
-        command -v sccache
-        return 0
-    fi
-    local candidate
-    for candidate in \
-        "/opt/homebrew/bin/sccache" \
-        "/usr/local/bin/sccache" \
-        "${HOME:-}/.cargo/bin/sccache"; do
-        if [[ -n "${candidate}" && -x "${candidate}" ]]; then
-            printf '%s\n' "${candidate}"
-            return 0
-        fi
-    done
-    return 1
-}
-
 # Worktrees used to default to a local `control-plane/target`, which made
 # every active run allocate tens of GiB. The default is now shared. A local
 # target remains available as an explicit escape hatch for one-off diagnosis.
@@ -137,15 +154,19 @@ fi
 
 mkdir -p "${CARGO_TARGET_DIR}"
 
-case "${CHAINWORKS_CARGO_SCCACHE:-auto}" in
+_chainworks_sccache_mode="${CHAINWORKS_CARGO_SCCACHE:-auto}"
+case "${_chainworks_sccache_mode}" in
     0|false|FALSE|off|OFF|no|NO)
         ;;
     *)
-        if [[ -z "${RUSTC_WRAPPER:-}" ]] && sccache_binary="$(chainworks_find_sccache)"; then
-            export SCCACHE_DIR="${SCCACHE_DIR:-$(chainworks_default_sccache_dir)}"
-            export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-20G}"
-            mkdir -p "${SCCACHE_DIR}"
-            export RUSTC_WRAPPER="${sccache_binary}"
+        if [[ -z "${RUSTC_WRAPPER:-}" ]] && command -v sccache >/dev/null 2>&1; then
+            if [[ ! "${_chainworks_sccache_mode}" =~ ^(auto|AUTO)?$ ]] || chainworks_sccache_can_wrap_rustc; then
+                export SCCACHE_DIR="$(chainworks_effective_sccache_dir)"
+                export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-20G}"
+                mkdir -p "${SCCACHE_DIR}"
+                export RUSTC_WRAPPER="$(command -v sccache)"
+            fi
         fi
         ;;
 esac
+unset _chainworks_sccache_mode
