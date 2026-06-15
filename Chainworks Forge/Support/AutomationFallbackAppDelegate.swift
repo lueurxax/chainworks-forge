@@ -49,7 +49,9 @@ final class AutomationFallbackAppDelegate: AppTerminationCoordinator {
                 queue: .main
             ) { notification in
                 guard let window = notification.object as? NSWindow else { return }
-                Chainworks_ForgeApp.applyWindowRestorationPolicy(to: window)
+                Task { @MainActor in
+                    Chainworks_ForgeApp.applyWindowRestorationPolicy(to: window)
+                }
             }
             windowPolicyObservers.append(observer)
         }

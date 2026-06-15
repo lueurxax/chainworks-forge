@@ -5,7 +5,7 @@
 | Date | 2026-06-02 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | P080 Phase 1 detection-only evidence, [080-continuous-stale-execution-reconciliation.md](080-continuous-stale-execution-reconciliation.md), [068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md](068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md), [081-boundary-first-api-auth-contract-matrix.md](081-boundary-first-api-auth-contract-matrix.md) |
+| Depends on | P080 Phase 1 detection-only evidence, [080-continuous-stale-execution-reconciliation.md](080-continuous-stale-execution-reconciliation.md), [068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md](068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md), [boundary-first API/auth contract](../reference/boundary-first-api-auth-contract.md) |
 | Related | P069 bounded diagnostics UI, P077 closeout readiness UI, P088 completion diagnostics, `docs/reference/rust-control-plane.md` |
 | Scope | Add a read-only macOS diagnostics window for P080 stale execution reconciliation after P080 Phase 1 proves useful live readback. |
 | Non-goal | No repair, hold, retry, approve, cancel, or daemon-control command from SwiftUI. No implementation before P080 detection-only evidence exists. |

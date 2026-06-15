@@ -44,7 +44,7 @@ pub async fn ensure_policy(
         .clone()
         .unwrap_or_else(|| input.agent_id.clone());
 
-    let lineage =
+    let mut lineage =
         match sessions::find_lineage_by_run_and_key(pool, &input.run_id, &lineage_key).await? {
             Some(existing) => existing,
             None => {
@@ -67,6 +67,7 @@ pub async fn ensure_policy(
             }
         };
 
+    repair_duplicate_active_generations(pool, &mut lineage).await?;
     let active = sessions::find_active_generation(pool, &lineage.id).await?;
     let generations = sessions::list_generations_for_lineage(pool, &lineage.id).await?;
     if lineage.active_generation_id.is_some() && active.is_none() {
@@ -336,7 +337,7 @@ pub async fn ensure_policy_tx(
         .clone()
         .unwrap_or_else(|| input.agent_id.clone());
 
-    let lineage =
+    let mut lineage =
         match sessions::find_lineage_by_run_and_key_tx(tx, &input.run_id, &lineage_key).await? {
             Some(existing) => existing,
             None => {
@@ -359,6 +360,7 @@ pub async fn ensure_policy_tx(
             }
         };
 
+    repair_duplicate_active_generations_tx(tx, &mut lineage).await?;
     let active = sessions::find_active_generation_tx(tx, &lineage.id).await?;
     let generations = sessions::list_generations_for_lineage_tx(tx, &lineage.id).await?;
     if lineage.active_generation_id.is_some() && active.is_none() {
@@ -623,6 +625,150 @@ pub async fn ensure_policy_tx(
 const PREVIOUS_MISSING_REQUIRED_OUTPUTS_REASON: &str = "previous_missing_required_outputs";
 const CLAUDE_LONG_CONTEXT_CREDITS_REQUIRED_REASON: &str = "claude_long_context_credits_required";
 const TOOL_OUTPUT_BUDGET_EXCEEDED_REASON: &str = "tool_output_budget_exceeded";
+const DUPLICATE_ACTIVE_SESSION_OWNER_REASON: &str = "duplicate_active_session_owner_rejected";
+
+async fn repair_duplicate_active_generations(
+    pool: &SqlitePool,
+    lineage: &mut SessionLineage,
+) -> Result<()> {
+    let generations = sessions::list_generations_for_lineage(pool, &lineage.id).await?;
+    let active_generations = generations
+        .into_iter()
+        .filter(|generation| generation.status == SessionGenerationStatus::Active)
+        .collect::<Vec<_>>();
+    if active_generations.len() <= 1 {
+        return Ok(());
+    }
+
+    let survivor = select_active_generation_survivor(&active_generations, lineage);
+    if lineage.active_generation_id.as_deref() != Some(survivor.id.as_str()) {
+        sessions::set_active_generation(pool, &lineage.id, Some(&survivor.id)).await?;
+        lineage.active_generation_id = Some(survivor.id.clone());
+    }
+    for duplicate in active_generations
+        .iter()
+        .filter(|generation| generation.id != survivor.id)
+    {
+        invalidate_duplicate_active_generation(pool, lineage, duplicate, &survivor.id).await?;
+    }
+    Ok(())
+}
+
+async fn repair_duplicate_active_generations_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    lineage: &mut SessionLineage,
+) -> Result<()> {
+    let generations = sessions::list_generations_for_lineage_tx(tx, &lineage.id).await?;
+    let active_generations = generations
+        .into_iter()
+        .filter(|generation| generation.status == SessionGenerationStatus::Active)
+        .collect::<Vec<_>>();
+    if active_generations.len() <= 1 {
+        return Ok(());
+    }
+
+    let survivor = select_active_generation_survivor(&active_generations, lineage);
+    if lineage.active_generation_id.as_deref() != Some(survivor.id.as_str()) {
+        sessions::set_active_generation_tx(tx, &lineage.id, Some(&survivor.id)).await?;
+        lineage.active_generation_id = Some(survivor.id.clone());
+    }
+    for duplicate in active_generations
+        .iter()
+        .filter(|generation| generation.id != survivor.id)
+    {
+        invalidate_duplicate_active_generation_tx(tx, lineage, duplicate, &survivor.id).await?;
+    }
+    Ok(())
+}
+
+fn select_active_generation_survivor(
+    active_generations: &[SessionGeneration],
+    lineage: &SessionLineage,
+) -> SessionGeneration {
+    if let Some(active_id) = lineage.active_generation_id.as_deref() {
+        if let Some(generation) = active_generations
+            .iter()
+            .find(|generation| generation.id == active_id)
+        {
+            return generation.clone();
+        }
+    }
+    active_generations
+        .iter()
+        .max_by_key(|generation| (generation.generation, generation.created_at))
+        .expect("active_generations is non-empty")
+        .clone()
+}
+
+async fn invalidate_duplicate_active_generation(
+    pool: &SqlitePool,
+    lineage: &SessionLineage,
+    generation: &SessionGeneration,
+    surviving_generation_id: &str,
+) -> Result<()> {
+    sessions::end_generation(
+        pool,
+        &generation.id,
+        SessionGenerationStatus::Invalidated,
+        DUPLICATE_ACTIVE_SESSION_OWNER_REASON,
+        Utc::now(),
+    )
+    .await?;
+    sessions::insert_event(
+        pool,
+        &SessionEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            lineage_id: lineage.id.clone(),
+            generation_id: generation.id.clone(),
+            event_type: SessionEventType::Invalidated,
+            recorded_at: Utc::now(),
+            details_json: Some(
+                serde_json::json!({
+                    "reason": DUPLICATE_ACTIVE_SESSION_OWNER_REASON,
+                    "surviving_generation_id": surviving_generation_id,
+                })
+                .to_string(),
+            ),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+async fn invalidate_duplicate_active_generation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    lineage: &SessionLineage,
+    generation: &SessionGeneration,
+    surviving_generation_id: &str,
+) -> Result<()> {
+    sessions::end_generation_tx(
+        tx,
+        &generation.id,
+        SessionGenerationStatus::Invalidated,
+        DUPLICATE_ACTIVE_SESSION_OWNER_REASON,
+        Utc::now(),
+    )
+    .await?;
+    sessions::insert_event_tx(
+        tx,
+        &SessionEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            lineage_id: lineage.id.clone(),
+            generation_id: generation.id.clone(),
+            event_type: SessionEventType::Invalidated,
+            recorded_at: Utc::now(),
+            details_json: Some(
+                serde_json::json!({
+                    "reason": DUPLICATE_ACTIVE_SESSION_OWNER_REASON,
+                    "surviving_generation_id": surviving_generation_id,
+                })
+                .to_string(),
+            ),
+        },
+    )
+    .await?;
+    Ok(())
+}
 
 pub async fn invalidate_generation_after_missing_required_outputs(
     pool: &SqlitePool,
@@ -1179,7 +1325,8 @@ mod tests {
     use domain::ids::{AgentExecutionId, IdeaId, RunId};
     use domain::run::{Run, RunStatus};
     use domain::session::{
-        SessionGeneration, SessionGenerationStatus, SessionLineage, SessionReuseDisposition,
+        SessionEventType, SessionGeneration, SessionGenerationStatus, SessionLineage,
+        SessionReuseDisposition,
     };
 
     use super::{
@@ -1455,6 +1602,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn p082_duplicate_active_session_generations_converge_to_single_survivor() {
+        let pool = test_pool().await;
+        seed_run(&pool).await;
+        let now = chrono::Utc::now();
+        let lineage = SessionLineage {
+            id: "lineage-duplicate-active".into(),
+            run_id: "00000000-0000-0000-0000-000000000001".into(),
+            agent_id: "proposal_writer".into(),
+            lineage_id: "proposal-loop".into(),
+            session_reuse_scope: "same_agent_family_within_run".into(),
+            session_family_id: Some("proposal-loop".into()),
+            active_generation_id: Some("generation-survivor".into()),
+            created_at: now,
+            closed_at: None,
+        };
+        sessions::insert_lineage(&pool, &lineage).await.unwrap();
+        for (id, generation) in [("generation-duplicate", 1), ("generation-survivor", 2)] {
+            sessions::insert_generation(
+                &pool,
+                &SessionGeneration {
+                    id: id.into(),
+                    lineage_id: lineage.id.clone(),
+                    generation,
+                    invocation_owner_key: "owner".into(),
+                    provider_session_id: Some(format!("provider-{generation}")),
+                    binding_fingerprint: "fingerprint".into(),
+                    rehydrated_from_checkpoint_artifact_id: None,
+                    working_directory: "/tmp/ws".into(),
+                    workspace_mode: "read_only".into(),
+                    runtime_provider: "claude".into(),
+                    runtime_model: "sonnet".into(),
+                    status: SessionGenerationStatus::Active,
+                    turn_count: generation,
+                    estimated_input_tokens: 0,
+                    latest_cached_input_tokens: None,
+                    latest_output_tokens: None,
+                    latest_model_context_window: None,
+                    cumulative_prompt_tokens: 0,
+                    cumulative_cost_cents: 0,
+                    created_at: now + chrono::Duration::seconds(generation),
+                    last_activity_at: None,
+                    ended_at: None,
+                    end_reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let decision = ensure_policy(&pool, base_input()).await.unwrap();
+
+        assert_eq!(decision.disposition, SessionReuseDisposition::Reused);
+        assert_eq!(decision.generation.id, "generation-survivor");
+        let duplicate = sessions::find_generation_by_id(&pool, "generation-duplicate")
+            .await
+            .unwrap()
+            .expect("duplicate generation still exists as durable evidence");
+        assert_eq!(duplicate.status, SessionGenerationStatus::Invalidated);
+        assert_eq!(
+            duplicate.end_reason.as_deref(),
+            Some("duplicate_active_session_owner_rejected")
+        );
+        let active_count = sessions::list_generations_for_lineage(&pool, &lineage.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|generation| generation.status == SessionGenerationStatus::Active)
+            .count();
+        assert_eq!(active_count, 1);
+        assert_eq!(
+            sessions::count_generation_events(
+                &pool,
+                "generation-duplicate",
+                SessionEventType::Invalidated,
+            )
+            .await
+            .unwrap(),
+            1,
+            "duplicate rejection must leave session event evidence"
+        );
+    }
+
+    #[tokio::test]
     async fn family_scope_relaxes_owner_key_check_when_fingerprint_matches() {
         let pool = test_pool().await;
         seed_run(&pool).await;
@@ -1652,6 +1882,10 @@ mod tests {
 
         facts.failure_kind = Some(AgentFailureKind::ToolOutputBudgetExceeded);
         assert!(runtime_facts_require_session_invalidation(&facts));
+
+        facts.failure_kind = Some(AgentFailureKind::ToolOutputBudgetPreflightDenied);
+        facts.supervision_classification = Some("tool_output_budget_preflight_denied".into());
+        assert!(!runtime_facts_require_session_invalidation(&facts));
 
         facts.failure_kind = None;
         facts.supervision_classification = Some("codex_unbounded_tool_output".into());

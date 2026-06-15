@@ -37,7 +37,7 @@ use domain::commands::{
 };
 use domain::discovery::{LegacyBroadDiscoveryPolicy, LegacyDiscoveryOverrideInput};
 use domain::events::DomainEvent;
-use domain::ids::{AgentExecutionId, ApprovalId, RunId};
+use domain::ids::{AgentExecutionId, ApprovalId, RunId, StageExecutionId};
 use domain::proposal_gate_result::{
     ProposalGateFailureClassification, ProposalGateLineage, ProposalGateResult, ProposalGateStatus,
 };
@@ -2980,6 +2980,8 @@ impl CommandHandler {
                 } else {
                     None
                 };
+
+                self.validate_retry_stage_identifier_kinds(&c).await?;
 
                 if let Some(agent_execution_id) = c.agent_execution_id {
                     if c.legacy_discovery_override_policy.is_some() {
@@ -6148,6 +6150,59 @@ impl CommandHandler {
             legacy_discovery_override_id: None,
             retry_instruction_binding_id,
         })
+    }
+
+    async fn validate_retry_stage_identifier_kinds(&self, c: &RetryStageCmd) -> Result<()> {
+        if let Ok(uuid) = uuid::Uuid::parse_str(&c.stage_id) {
+            let stage_execution_id = StageExecutionId::from(uuid);
+            if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
+                if stage.run_id == c.run_id {
+                    anyhow::bail!(
+                        "wrong_identifier_kind: stages.retry expected logical stage_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or set agent_execution_id to an agent_executions.id for a targeted retry.",
+                        c.stage_id,
+                        stage.stage_id
+                    );
+                }
+            }
+
+            let agent_execution_id = AgentExecutionId::from(uuid);
+            if let Some(agent_execution) =
+                agent_executions::find_by_id(&self.pool, agent_execution_id).await?
+            {
+                if let Some(stage_execution_id) = agent_execution.stage_execution_id {
+                    if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
+                        if stage.run_id == c.run_id {
+                            anyhow::bail!(
+                                "wrong_identifier_kind: stages.retry expected logical stage_id but received agent_execution_id '{}'. next_action: retry with stage_id '{}' and agent_execution_id '{}'.",
+                                c.stage_id,
+                                stage.stage_id,
+                                agent_execution.id
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(agent_execution_id) = c.agent_execution_id {
+            if agent_executions::find_by_id(&self.pool, agent_execution_id)
+                .await?
+                .is_none()
+            {
+                let stage_execution_id = StageExecutionId::from(agent_execution_id.inner());
+                if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
+                    if stage.run_id == c.run_id {
+                        anyhow::bail!(
+                            "wrong_identifier_kind: stages.retry expected agent_execution_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or choose an agent_executions.id from that stage for targeted retry.",
+                            agent_execution_id,
+                            stage.stage_id
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn record_completed_command_transaction(

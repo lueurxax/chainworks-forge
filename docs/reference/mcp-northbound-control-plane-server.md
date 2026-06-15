@@ -11,6 +11,7 @@ Related stable docs:
 - [failed-stage-evidence-delivery-preflight-and-mcp-resolution.md](failed-stage-evidence-delivery-preflight-and-mcp-resolution.md)
 - [steward-analysis-system.md](steward-analysis-system.md)
 - [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md)
+- [bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md)
 - [test-gates.md](test-gates.md)
 - [ui-action-boundary.md](ui-action-boundary.md)
 
@@ -136,6 +137,14 @@ Command tools build a typed `Command` enum value and call `CommandHandler::handl
 The continuation tools (`agents.continue_work`, `agents.continuation_status`, `agents.continuation_candidates`) have typed `CapabilityToolId` variants (`AgentsContinueWork`, `AgentsContinuationStatus`, `AgentsContinuationCandidates`) so they participate in standard `tools/list` capability filtering. The read tools are exposed to `Operator` and `Observer` principals. `agents.continue_work` is exposed to `Operator` and `Agent` principals, but the handler accepts Agent callers only for validated `lead_auto` requests. They are dispatched by prefix into a separate `tools::agents` namespace in `control-plane/crates/mcp-server/src/server.rs` rather than through `CommandHandler::handle`: `agents.continue_work` runs its own atomic admission transaction that persists a `command_journal_id` on the `agent_work_continuations` row alongside the canonical request fingerprint, while the read tools omit unauthorized rows without leaking existence. See [`agent-work-continuation.md`](agent-work-continuation.md) for the request/response schemas and admission semantics.
 
 Storage diagnostics and maintenance tools are intentionally split between read-only snapshots (`storage.health`, `storage.write_pressure`, `storage.evidence_spool_summary`), bounded orphan reconciliation (`storage.reconcile_evidence_orphans`), and guarded maintenance writes (`storage.maintenance.repair_slot`, `storage.projections.clear_backlog`, `storage.projections.clear_poison`). Runtime boundary tools expose policy/audit health (`boundary.runtime.get`) and operator alerts (`operator.alerts.list`) without exposing raw audit rows.
+
+`runtime.health` / `boundary.runtime.get` also expose
+`toolOutputGuard`: the bounded-output policy version, guard version,
+generated-root denylist, per-output and cumulative budget defaults, static
+policy readback status, and provider-wrapper enforcement/probe state. Agents
+and operators use that readback to distinguish preflight-denied safe-search
+commands from post-output budget failures. The full contract is
+[bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md).
 
 ### MCP tool payloads
 

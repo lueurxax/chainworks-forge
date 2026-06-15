@@ -1,4 +1,6 @@
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 
 use db::repos::ideas;
@@ -66,6 +68,9 @@ pub async fn execute(
             let workspace_root_path = params["workspace_root_path"]
                 .as_str()
                 .map(|s| s.to_string());
+            if let Some(path) = workspace_root_path.as_deref() {
+                validate_workspace_root_path(path)?;
+            }
             let project_key = params["project_key"].as_str().map(|s| s.to_string());
 
             let commanded = cmd_handler
@@ -91,4 +96,38 @@ pub async fn execute(
         }
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
     }
+}
+
+fn validate_workspace_root_path(path: &str) -> Result<()> {
+    if path.contains('\0') {
+        anyhow::bail!("ideas.create: workspace_root_path contains a null byte");
+    }
+    if path.contains('\\') {
+        anyhow::bail!("ideas.create: workspace_root_path contains a backslash separator");
+    }
+    for component in path.split('/') {
+        if component == ".." {
+            anyhow::bail!(
+                "ideas.create: workspace_root_path contains a path traversal component '..'"
+            );
+        }
+    }
+    if path.contains("://") {
+        anyhow::bail!("ideas.create: workspace_root_path contains a URI scheme separator");
+    }
+    let raw = Path::new(path);
+    if !raw.exists() {
+        anyhow::bail!(
+            "ideas.create: workspace_root_path '{}' does not exist; create the directory before using it",
+            path
+        );
+    }
+    let canonical = std::fs::canonicalize(raw)
+        .with_context(|| format!("ideas.create: canonicalize workspace_root_path '{path}'"))?;
+    super::runs::reject_broad_workspace_root(&canonical).map_err(|_| {
+        anyhow::anyhow!(
+            "ideas.create: workspace_root_path '{}' is too broad; choose a project directory",
+            canonical.display()
+        )
+    })
 }

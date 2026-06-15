@@ -126,7 +126,13 @@ pub async fn find_pending_by_run_stage(
 pub async fn list_pending(pool: &SqlitePool) -> Result<Vec<Approval>> {
     let rows = sqlx::query(
         r#"SELECT id, run_id, stage_id, decision, requested_at, decided_at, comment, expires_at
-           FROM approvals WHERE decision = 'pending' OR decision = 'requested'
+           FROM approvals
+           WHERE (decision = 'pending' OR decision = 'requested')
+             AND EXISTS (
+                   SELECT 1 FROM runs r
+                    WHERE r.id = approvals.run_id
+                      AND r.status NOT IN ('completed', 'failed', 'cancelled')
+                 )
            ORDER BY requested_at ASC"#,
     )
     .fetch_all(pool)
@@ -250,6 +256,31 @@ pub async fn resolve_tx(
     .await
     .context("resolve approval")?;
     Ok(())
+}
+
+pub async fn expire_pending_by_run_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: RunId,
+    decided_at: DateTime<Utc>,
+    comment: Option<String>,
+) -> Result<u64> {
+    let run_id_str = run_id.to_string();
+    let decided_at_str = decided_at.to_rfc3339();
+    let result = sqlx::query(
+        r#"UPDATE approvals
+              SET decision = 'expired',
+                  decided_at = ?1,
+                  comment = COALESCE(?2, comment)
+            WHERE run_id = ?3
+              AND decision IN ('pending', 'requested')"#,
+    )
+    .bind(decided_at_str)
+    .bind(comment)
+    .bind(run_id_str)
+    .execute(&mut **tx)
+    .await
+    .context("expire pending approvals by run")?;
+    Ok(result.rows_affected())
 }
 
 fn parse_approval_row(

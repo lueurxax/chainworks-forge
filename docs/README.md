@@ -48,6 +48,7 @@ The canonical source of truth for implemented behavior is [`reference/`](referen
 ### ACP transport and sessions
 
 - [reference/acp-runtime-transport.md](reference/acp-runtime-transport.md) — ACP transport contract, adapter families (Claude/Gemini/Codex/Auggie/Junie), runtime selection, Junie structured-output canary proof, Junie code-writer preflight/launch gating, and capacity management
+- [reference/bounded-tool-output-and-safe-search-policy.md](reference/bounded-tool-output-and-safe-search-policy.md) — Runtime-owned safe-search policy: generated-root denylist, typed preflight denial, provider wrapper caps, output-budget classification, quarantine behavior, and `runtime.health.toolOutputGuard` readback
 - [reference/acp-runtime-transport.md#toolchain-cache-mapping](reference/acp-runtime-transport.md#toolchain-cache-mapping) — Provider toolchain cache mapping: Xcode/Go isolation, environment redirection, and exclusive serialization
 - [reference/xcode-mcp-bridge-pool.md](reference/xcode-mcp-bridge-pool.md) — Brokered Xcode MCP leases, host-user Xcode boundary, shim dispatch, runtime observations, and broker health
 - [reference/session-lineage-reuse-and-operator-reset.md](reference/session-lineage-reuse-and-operator-reset.md) — Session reuse, invocation-owner keys, binding fingerprints, context budget, checkpoint rehydration, operator reset

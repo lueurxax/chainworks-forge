@@ -225,10 +225,12 @@ pub struct StageSummaryRow {
 pub async fn list_all_projection(pool: &SqlitePool) -> Result<Vec<RunProjectionRow>> {
     let rows = sqlx::query(
         r#"WITH live_approvals AS (
-             SELECT run_id, COUNT(*) AS count
-             FROM approvals
-             WHERE decision IN ('pending', 'requested')
-             GROUP BY run_id
+             SELECT a.run_id, COUNT(*) AS count
+             FROM approvals a
+             JOIN runs ar ON ar.id = a.run_id
+             WHERE a.decision IN ('pending', 'requested')
+               AND ar.status NOT IN ('completed', 'failed', 'cancelled')
+             GROUP BY a.run_id
            )
            SELECT r.id, r.idea_id,
                   COALESCE(rs.workflow_id, r.workflow_id) AS workflow_id,
@@ -313,10 +315,12 @@ pub async fn list_all_projection(pool: &SqlitePool) -> Result<Vec<RunProjectionR
 pub async fn list_active_projection(pool: &SqlitePool) -> Result<Vec<RunProjectionRow>> {
     let rows = sqlx::query(
         r#"WITH live_approvals AS (
-             SELECT run_id, COUNT(*) AS count
-             FROM approvals
-             WHERE decision IN ('pending', 'requested')
-             GROUP BY run_id
+             SELECT a.run_id, COUNT(*) AS count
+             FROM approvals a
+             JOIN runs ar ON ar.id = a.run_id
+             WHERE a.decision IN ('pending', 'requested')
+               AND ar.status NOT IN ('completed', 'failed', 'cancelled')
+             GROUP BY a.run_id
            )
            SELECT r.id, r.idea_id,
                   COALESCE(rs.workflow_id, r.workflow_id) AS workflow_id,
@@ -401,10 +405,12 @@ pub async fn list_by_idea_projection(
 ) -> Result<Vec<RunProjectionRow>> {
     let rows = sqlx::query(
         r#"WITH live_approvals AS (
-             SELECT run_id, COUNT(*) AS count
-             FROM approvals
-             WHERE decision IN ('pending', 'requested')
-             GROUP BY run_id
+             SELECT a.run_id, COUNT(*) AS count
+             FROM approvals a
+             JOIN runs ar ON ar.id = a.run_id
+             WHERE a.decision IN ('pending', 'requested')
+               AND ar.status NOT IN ('completed', 'failed', 'cancelled')
+             GROUP BY a.run_id
            )
            SELECT r.id, r.idea_id,
                   COALESCE(rs.workflow_id, r.workflow_id) AS workflow_id,
@@ -554,10 +560,12 @@ pub async fn find_run_projection(
 ) -> Result<Option<RunProjectionRow>> {
     let row = sqlx::query(
         r#"WITH canonical_pending AS (
-             SELECT run_id, COUNT(*) AS pending_approvals
-             FROM approvals
-             WHERE decision IN ('pending','requested')
-             GROUP BY run_id
+             SELECT a.run_id, COUNT(*) AS pending_approvals
+             FROM approvals a
+             JOIN runs ar ON ar.id = a.run_id
+             WHERE a.decision IN ('pending','requested')
+               AND ar.status NOT IN ('completed', 'failed', 'cancelled')
+             GROUP BY a.run_id
            )
            SELECT r.id, r.idea_id, r.workflow_id, r.workflow_title, r.workspace_root,
                   r.artifact_root, r.started_at, r.completed_at,
@@ -649,8 +657,8 @@ async fn rebuild_run_summary_on_current_thread(pool: &SqlitePool, run_id: RunId)
             let run_id_string = run_id_string.clone();
             Box::new(move |tx| {
                 Box::pin(async move {
-                let rows = sqlx::query(
-                    r#"INSERT OR REPLACE INTO run_summaries
+                    let rows = sqlx::query(
+                        r#"INSERT OR REPLACE INTO run_summaries
                        (run_id, idea_id, workflow_id, workflow_title, status,
                         workspace_root, artifact_root, started_at, completed_at,
                         cancellation_requested_at, cancellation_settled_at,
@@ -672,20 +680,23 @@ async fn rebuild_run_summary_on_current_thread(pool: &SqlitePool, run_id: RunId)
                          COUNT(DISTINCT se.id),
                          COUNT(DISTINCT CASE WHEN se.status = 'completed' THEN se.id END),
                          COUNT(DISTINCT CASE WHEN se.status = 'failed' THEN se.id END),
-                         COUNT(DISTINCT CASE WHEN a.decision IN ('pending','requested') THEN a.id END),
+                         COUNT(DISTINCT CASE
+                           WHEN r.status NOT IN ('completed', 'failed', 'cancelled')
+                            AND a.decision IN ('pending','requested')
+                           THEN a.id END),
                          ?
                        FROM runs r
                        LEFT JOIN stage_executions se ON se.run_id = r.id
                        LEFT JOIN approvals a ON a.run_id = r.id
                        WHERE r.id = ?
                        GROUP BY r.id"#,
-                )
-                .bind(now)
-                .bind(run_id_string)
-                .execute(&mut **tx)
-                .await?
-                .rows_affected() as u32;
-                Ok(((), rows))
+                    )
+                    .bind(now)
+                    .bind(run_id_string)
+                    .execute(&mut **tx)
+                    .await?
+                    .rows_affected() as u32;
+                    Ok(((), rows))
                 })
             })
         },
@@ -1010,7 +1021,15 @@ async fn rebuild_stage_summaries_on_current_thread(pool: &SqlitePool, run_id: Ru
                          se.status,
                          se.attempt_number,
                          EXISTS(SELECT 1 FROM artifacts art WHERE art.run_id = se.run_id AND art.stage_id = se.stage_id),
-                         EXISTS(SELECT 1 FROM approvals ap WHERE ap.run_id = se.run_id AND ap.stage_id = se.stage_id AND ap.decision IN ('pending','requested')),
+                         EXISTS(
+                           SELECT 1
+                             FROM approvals ap
+                             JOIN runs ar ON ar.id = ap.run_id
+                            WHERE ap.run_id = se.run_id
+                              AND ap.stage_id = se.stage_id
+                              AND ap.decision IN ('pending','requested')
+                              AND ar.status NOT IN ('completed', 'failed', 'cancelled')
+                         ),
                          EXISTS(SELECT 1 FROM validation_failure_records vfr WHERE vfr.run_id = se.run_id AND vfr.stage_execution_id = se.id),
                          se.terminal_reason,
                          rsa.id,
@@ -1091,7 +1110,9 @@ async fn rebuild_approval_inbox_on_current_thread(pool: &SqlitePool, run_id: Run
                          ?
                        FROM approvals a
                        JOIN runs r ON r.id = a.run_id
-                       WHERE a.run_id = ? AND a.decision IN ('pending','requested')"#,
+                       WHERE a.run_id = ?
+                         AND a.decision IN ('pending','requested')
+                         AND r.status NOT IN ('completed', 'failed', 'cancelled')"#,
                 )
                 .bind(now)
                 .bind(&run_id_string)
@@ -1189,6 +1210,8 @@ pub async fn list_pending_inbox_projection(pool: &SqlitePool) -> Result<Vec<Appr
                   a.comment, a.expires_at
            FROM approval_inbox ai
            JOIN approvals a ON a.id = ai.approval_id
+           JOIN runs r ON r.id = a.run_id
+                    AND r.status NOT IN ('completed', 'failed', 'cancelled')
            ORDER BY ai.requested_at ASC"#,
     )
     .fetch_all(pool)

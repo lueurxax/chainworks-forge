@@ -42,6 +42,7 @@ pub enum AgentFailureKind {
     ProviderTimeout,
     ProviderInternalError,
     ToolOutputBudgetExceeded,
+    ToolOutputBudgetPreflightDenied,
     TransportEpipe,
     TransportProtocolError,
     TransportClosed,
@@ -771,6 +772,9 @@ impl GqlAgentExecutionRuntimeFacts {
                 }
                 domain::agent::AgentFailureKind::ToolOutputBudgetExceeded => {
                     AgentFailureKind::ToolOutputBudgetExceeded
+                }
+                domain::agent::AgentFailureKind::ToolOutputBudgetPreflightDenied => {
+                    AgentFailureKind::ToolOutputBudgetPreflightDenied
                 }
                 domain::agent::AgentFailureKind::TransportEpipe => AgentFailureKind::TransportEpipe,
                 domain::agent::AgentFailureKind::TransportProtocolError => {

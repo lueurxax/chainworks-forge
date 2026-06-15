@@ -1,5 +1,15 @@
 # Chainworks Forge Roadmap Update After Latest Main Commit
 
+## Status note (2026-06-09)
+
+This document is a historical snapshot of the 2026-05-06 planning state. Current truth is [../ROADMAP.md](../ROADMAP.md).
+
+Known-obsolete parts:
+
+- Section 5's suggested numbers are stale: **P086** and **P087** were since used by agent work continuation and local storage tiering. Limit work is now reserved as **P101** (agent limit observatory / runtime budget dashboard) and **P102** (limit-aware session pool / runtime fallback policy).
+- P081 has since reached Implemented/Ready (audit R8) and its proposal file was retired; links below point to the reference doc.
+- Several steps described as upcoming (write-budget contract, durable side-effect ledger, P046, P076, P086, P088, P058 escalation chains) have since been implemented; see the reference tree.
+
 ## Navigation
 
 - Current short roadmap: [../ROADMAP.md](../ROADMAP.md)
@@ -116,7 +126,7 @@ Related docs:
 
 - [UI action boundary](../reference/ui-action-boundary.md)
 - [P068 GraphQL UI boundary proposal](../proposals/068-agent-mcp-primary-control-plane-and-graphql-ui-boundary.md)
-- [P081 API/auth contract matrix](../proposals/081-boundary-first-api-auth-contract-matrix.md)
+- [P081 API/auth contract matrix](../reference/boundary-first-api-auth-contract.md)
 - [Session observability GraphQL readback](../reference/rust-control-plane.md#graphql)
 
 ### 2.2 SQLite write pressure is now a first-class risk
@@ -246,7 +256,7 @@ Those remain [P032](../proposals/032-polish-stabilization-and-productization-bac
 
 #### Step 4 - P081 boundary-first API/auth matrix
 
-Do [P081](../proposals/081-boundary-first-api-auth-contract-matrix.md) in parallel with boundary closeout.
+Do [P081](../reference/boundary-first-api-auth-contract.md) in parallel with boundary closeout.
 
 Purpose:
 

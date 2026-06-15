@@ -18,28 +18,10 @@
   "testTargets" : [
     {
       "selectedTests" : [
-        "AppPerformanceContractTests",
-        "ArtifactContentRendererTests",
-        "ArtifactManagerTests",
         "ArtifactPathClipboardTests",
-        "BenchmarkExportStampingTests",
-        "OrchestratorTests",
-        "PersistentStoreRepairTests",
+        "ForgeGlassTests",
         "ProcessSupportTests",
-        "Proposal024RunSurfaceTests",
-        "Proposal031ThinGraphQLReadBoundaryTests",
-        "Proposal078OperatorReadbackTests",
-        "Proposal085Tests",
-        "Proposal088OperatorReadbackTests",
-        "ProviderBindingTruthTests",
-        "ProviderPlatformTests",
-        "ResumeManagerTests",
-        "RunArtifactHierarchyBuilderTests",
-        "RunStartModePresentationTests",
-        "RunTimelineInspectorViewTests",
-        "RunTests",
-        "SourceContextBuilderTests",
-        "WorkflowMapProjectionTests"
+        "Proposal046Tests"
       ],
       "target" : {
         "containerPath" : "container:Chainworks Forge.xcodeproj",

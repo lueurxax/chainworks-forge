@@ -1,128 +1,197 @@
 {
-  "fixture_purpose": "Engine materialized placeholder for a rollout_contract_v1 readback fixture declared by an approved proposal. Implementation must replace or update this fixture with concrete evidence before the proposal gate can be treated as release evidence.",
-  "parity_lanes": {
-    "graphql": {
-      "rolloutContractActionId": null,
-      "rolloutContractCutoverPolicyRevision": null,
-      "rolloutContractDecision": "hold",
-      "rolloutContractDiagnosticRedaction": "none",
-      "rolloutContractDisabledReasonCode": "placeholder_pending_implementation_evidence",
-      "rolloutContractEnabledState": "disabled",
-      "rolloutContractEnforcementMode": "enforce",
-      "rolloutContractEnforcementModeReason": "declared_fixture_placeholder",
-      "rolloutContractFailureReasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rolloutContractHoldConditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rolloutContractNextSteps": [
-        "Replace placeholder with concrete GraphQL readback evidence."
-      ],
-      "rolloutContractOperatorMessage": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rolloutContractProjectionIntegrity": "stale",
-      "rolloutContractRollbackDisposition": {
-        "dataLossRisk": "none",
-        "mode": "not_applicable"
-      },
-      "rolloutContractSourceLane": "graphql",
-      "rolloutContractStatus": "fail",
-      "rolloutContractWaiverExpiresAt": null,
-      "rolloutContractWaiverState": "none"
+  "schema_version": "p082_operator_readback_fixture_v1",
+  "proposal_id": "P082",
+  "proposal_revision_id": "P082-r4-4d5cc83d-20260521",
+  "fixture_id": "p082_full_surface_recovery_retry_matrix",
+  "rollout_contract_readback": {
+    "schema_version": "operator_readback_v1",
+    "rollout_contract_status": "pass",
+    "rollout_contract_decision": "release",
+    "rollout_contract_failure_reasons": [],
+    "rollout_contract_waiver_state": "none",
+    "rollout_contract_waiver_expires_at": null,
+    "rollout_contract_enforcement_mode": "enforce",
+    "rollout_contract_enforcement_mode_reason": "p082_fixture_and_gate_contract_active",
+    "rollout_contract_hold_conditions": [],
+    "rollout_contract_rollback_disposition": {
+      "mode": "not_applicable",
+      "data_loss_risk": "none"
     },
-    "mcp": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
-      "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete MCP readback evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
-      "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
+    "rollout_contract_source_lane": "run_report",
+    "rollout_contract_enabled_state": "enabled",
+    "rollout_contract_disabled_reason_code": null,
+    "rollout_contract_action_id": "proposal-082",
+    "rollout_contract_operator_message": "P082 recovery/retry readback fixture covers required lanes, reason codes, rejected command error envelopes, and negative fixture validation.",
+    "rollout_contract_projection_integrity": "fresh",
+    "rollout_contract_cutover_policy_revision": "P082-r4-4d5cc83d-20260521",
+    "rollout_contract_diagnostic_redaction": "operator_safe",
+    "rollout_contract_next_steps": []
+  },
+  "lane_payloads": {
+    "runs_get": {
+      "p082_recovery_matrix_readback": {
+        "schema_version": "p082_recovery_matrix_readback_v1",
+        "scenario_id": "P082-R01",
+        "reason_code": "retry_identifier_required",
+        "recovery_decision": "hold",
+        "recovery_next_action": "request_operator_retry_with_stage_execution_id",
+        "recovery_hold_conditions": [
+          "retry_target_missing_stage_execution_id"
+        ],
+        "recovery_projection_integrity": "fresh",
+        "updated_at": "2026-06-11T00:00:00Z",
+        "retry_identifier_guidance": {
+          "schema_version": "p082_retry_identifier_guidance_v1",
+          "required_identifier": "stage_execution_id",
+          "legacy_identifier_status": "rejected",
+          "operator_message": "Retry requires the exact stage_execution_id; run_id plus stage_id is not enough."
+        }
       },
-      "rollout_contract_source_lane": "mcp",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
+      "p082_recovery_matrix_readbacks": [
+        {
+          "schema_version": "p082_recovery_matrix_readback_v1",
+          "scenario_id": "P082-R01",
+          "reason_code": "retry_identifier_required",
+          "recovery_decision": "hold",
+          "recovery_next_action": "request_operator_retry_with_stage_execution_id",
+          "recovery_hold_conditions": [
+            "retry_target_missing_stage_execution_id"
+          ],
+          "recovery_projection_integrity": "fresh",
+          "updated_at": "2026-06-11T00:00:00Z",
+          "retry_identifier_guidance": {
+            "schema_version": "p082_retry_identifier_guidance_v1",
+            "required_identifier": "stage_execution_id",
+            "legacy_identifier_status": "rejected",
+            "operator_message": "Retry requires the exact stage_execution_id; run_id plus stage_id is not enough."
+          }
+        },
+        {
+          "schema_version": "p082_recovery_matrix_readback_v1",
+          "scenario_id": "P082-R03",
+          "reason_code": "late_output_ignored_after_cancel",
+          "recovery_decision": "terminalized",
+          "recovery_next_action": "inspect_cancel_late_output_latch",
+          "recovery_hold_conditions": [],
+          "recovery_projection_integrity": "fresh",
+          "updated_at": "2026-06-11T00:01:00Z",
+          "late_output_settlement": {
+            "schema_version": "p082_late_output_settlement_v1",
+            "settlement": "ignored_after_cancel",
+            "active_projection_mutated": false,
+            "source_generation": "cancelled_generation"
+          }
+        },
+        {
+          "schema_version": "p082_recovery_matrix_readback_v1",
+          "scenario_id": "P082-R08",
+          "reason_code": "rejected_command_error_envelope",
+          "recovery_decision": "rejected",
+          "recovery_next_action": "return_typed_error_to_operator",
+          "recovery_hold_conditions": [
+            "command_validation_failed"
+          ],
+          "recovery_projection_integrity": "fresh",
+          "updated_at": "2026-06-11T00:02:00Z",
+          "rejected_command_error": {
+            "schema_version": "p082_rejected_command_error_v1",
+            "storage_owner": "command_journal.error",
+            "payload_json_mutated": false,
+            "operator_safe_summary": "retry rejected with typed recovery matrix readback"
+          }
+        }
+      ]
+    },
+    "reports_get": {
+      "p082_recovery_matrix_readbacks": [
+        {
+          "schema_version": "p082_recovery_matrix_readback_v1",
+          "scenario_id": "P082-R04",
+          "reason_code": "release_side_effect_retry_blocked",
+          "recovery_decision": "blocked",
+          "recovery_next_action": "manual_release_owner_reconciliation",
+          "recovery_hold_conditions": [
+            "release_side_effect_not_retryable"
+          ],
+          "recovery_projection_integrity": "fresh",
+          "updated_at": "2026-06-11T00:03:00Z"
+        }
+      ]
+    },
+    "report_resource": {
+      "p082_recovery_matrix_readbacks": [
+        {
+          "schema_version": "p082_recovery_matrix_readback_v1",
+          "scenario_id": "P082-R06",
+          "reason_code": "startup_requeue_exhausted",
+          "recovery_decision": "held",
+          "recovery_next_action": "operator_repair_startup_state",
+          "recovery_hold_conditions": [
+            "startup_requeue_budget_exhausted"
+          ],
+          "recovery_projection_integrity": "fresh",
+          "updated_at": "2026-06-11T00:04:00Z",
+          "startup_repair_summary": {
+            "schema_version": "p082_startup_repair_summary_v1",
+            "attempt_count": 1,
+            "max_requeue_generation": 1,
+            "terminal_state": "held"
+          }
+        }
+      ]
+    },
+    "run_report": {
+      "p082_recovery_matrix_readbacks": [
+        {
+          "schema_version": "p082_recovery_matrix_readback_v1",
+          "scenario_id": "P082-R05",
+          "reason_code": "xcode_startup_grace_active",
+          "recovery_decision": "waiting",
+          "recovery_next_action": "wait_for_xcode_startup_grace",
+          "recovery_hold_conditions": [
+            "xcode_startup_grace_window_active"
+          ],
+          "recovery_projection_integrity": "fresh",
+          "updated_at": "2026-06-11T00:05:00Z",
+          "recovery_operator_message": "Xcode startup is still inside the 12 minute grace window; next check runs before 2026-06-11T00:17:00Z."
+        },
+        {
+          "schema_version": "p082_recovery_matrix_readback_v1",
+          "scenario_id": "P082-R09",
+          "reason_code": "workflow_conflict_requires_operator",
+          "recovery_decision": "hold",
+          "recovery_next_action": "resolve_workflow_conflict",
+          "recovery_hold_conditions": [
+            "operator_transition_selection_required"
+          ],
+          "recovery_projection_integrity": "fresh",
+          "updated_at": "2026-06-11T00:06:00Z"
+        }
+      ]
     },
     "release_receipt": {
-      "rollout_contract_action_id": null,
-      "rollout_contract_cutover_policy_revision": null,
-      "rollout_contract_decision": "hold",
-      "rollout_contract_diagnostic_redaction": "none",
-      "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-      "rollout_contract_enabled_state": "disabled",
-      "rollout_contract_enforcement_mode": "enforce",
-      "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-      "rollout_contract_failure_reasons": [
-        "placeholder_pending_implementation_evidence"
-      ],
-      "rollout_contract_hold_conditions": [
-        "Replace engine materialized placeholder with proposal-specific rollout evidence."
-      ],
-      "rollout_contract_next_steps": [
-        "Replace placeholder with concrete release receipt evidence."
-      ],
-      "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-      "rollout_contract_projection_integrity": "stale",
-      "rollout_contract_rollback_disposition": {
-        "data_loss_risk": "none",
-        "mode": "not_applicable"
-      },
-      "rollout_contract_source_lane": "release_receipt",
-      "rollout_contract_status": "fail",
-      "rollout_contract_waiver_expires_at": null,
-      "rollout_contract_waiver_state": "none"
+      "p082_recovery_matrix_readbacks": [
+        {
+          "schema_version": "p082_recovery_matrix_readback_v1",
+          "scenario_id": "P082-R08-legacy",
+          "reason_code": "legacy_rejected_command_error_fallback",
+          "recovery_decision": "diagnostic_only",
+          "recovery_next_action": "show_operator_safe_legacy_summary",
+          "recovery_hold_conditions": [],
+          "recovery_projection_integrity": "unavailable",
+          "updated_at": "2026-06-11T00:07:00Z"
+        }
+      ]
     }
   },
-  "placeholder": {
-    "materialized_by": "chainworks_engine",
-    "path": "docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json",
-    "status": "pending_implementation_evidence"
-  },
-  "proposal_id": "unknown",
-  "proposal_revision_id": "P082-r4-4d5cc83d-20260521",
-  "rollout_contract_action_id": null,
-  "rollout_contract_cutover_policy_revision": null,
-  "rollout_contract_decision": "hold",
-  "rollout_contract_diagnostic_redaction": "none",
-  "rollout_contract_disabled_reason_code": "placeholder_pending_implementation_evidence",
-  "rollout_contract_enabled_state": "disabled",
-  "rollout_contract_enforcement_mode": "enforce",
-  "rollout_contract_enforcement_mode_reason": "declared_fixture_placeholder",
-  "rollout_contract_failure_reasons": [
-    "placeholder_pending_implementation_evidence"
-  ],
-  "rollout_contract_hold_conditions": [
-    "Replace engine materialized placeholder with proposal-specific rollout evidence."
-  ],
-  "rollout_contract_next_steps": [
-    "Replace placeholder with concrete operator readback evidence."
-  ],
-  "rollout_contract_operator_message": "Rollout fixture placeholder created so implementation can start; this is not release evidence.",
-  "rollout_contract_projection_integrity": "stale",
-  "rollout_contract_rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "rollout_contract_source_lane": "run_report",
-  "rollout_contract_status": "fail",
-  "rollout_contract_waiver_expires_at": null,
-  "rollout_contract_waiver_state": "none",
-  "schema_version": "operator_readback_v1",
-  "source_lane": "run_report"
+  "fixture_assertions": [
+    "runs_get exposes singular and plural p082_recovery_matrix_readback fields",
+    "reports_get exposes plural only p082_recovery_matrix_readbacks",
+    "report_resource exposes plural only p082_recovery_matrix_readbacks",
+    "run_report exposes plural only p082_recovery_matrix_readbacks",
+    "release_receipt exposes plural only p082_recovery_matrix_readbacks",
+    "rejected-command readback is stored in command_journal.error, not command_journal.payload_json",
+    "legacy plain-text command_journal.error remains operator-safe fallback input",
+    "required reason codes cover retry identifier, late output, release side effect, startup exhaustion, Xcode grace, rejected command, legacy rejected command, and workflow conflict paths"
+  ]
 }

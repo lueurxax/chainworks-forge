@@ -1,7 +1,7 @@
 # Boundary-First API and Auth Contract Matrix
 
 **Status**: Implemented as repository truth for the P081 boundary contract. The matrix doc, executable fixture, validator, embedded last-known-good fallback, `audit_log` storage, `CallerClass` enum, `CallerContext.caller_class`, and principal-table `schema_version 3` reader have landed. The daemon-injected shared `BoundaryPolicy` is wired into the `CommandHandler`, GraphQL query/subscription/mutation paths, and the MCP `initialize`/`tools/list`/`tools/call` paths with mode-aware semantics (`shadow`, `enforce`, `read_only_safe_mode`, `legacy_compat`). `approval_mutation_idempotency` backs the `approveApproval` / `rejectApproval` retry contract, and the Swift operator shell injects `P081ApprovalActionAttemptStore` so approval actions reuse UUIDv7 idempotency keys across retries and app restarts until terminal success. The `mcp_command_idempotency` table plus dispatcher enforcement is wired for state-changing MCP tools and linked to `command_journal` before successful idempotency commits. GraphQL WebSocket pre-auth rejects with P081 close codes (`4401`, `4403`, `4408`), GraphQL denial responses include bounded `extensions.redactions`, and bounded operator diagnostics expose `boundaryRuntime`/`operatorAlerts` through GraphQL and MCP without raw audit rows. Swift readback preserves redaction accessibility metadata and native-alert lifecycle fields.
-**Proposal**: P081-v6
+**Proposal**: P081-v6 (retired into this reference doc after the R8 Implemented/Ready audit; git history retains the proposal and audit trail)
 **Matrix ID**: `p081-boundary-matrix-v1`
 **Machine-readable fixture**: [`boundary-first-api-auth-contract.json`](boundary-first-api-auth-contract.json)
 
@@ -19,6 +19,23 @@ remains **MCP-owned** for operators, agents, and automations.
 
 Request paths never read this file or the JSON fixture directly. Only daemon startup validation
 uses these artifacts. Live requests consume only the injected in-memory policy instance.
+
+---
+
+## BoundaryPolicy Service Ownership
+
+The boundary decision service lives in `control-plane/crates/auth/src/boundary/`
+(`auth::boundary`). The daemon constructs exactly one immutable `BoundaryPolicy`
+instance at startup from the validated fixture (or the embedded last-known-good
+fallback) and injects it into the GraphQL server, the MCP server, and approval
+actionability resolution. Per-request evaluation is pure and in-memory: no I/O,
+no fixture reads, no database lookups. If no matrix row matches a request, the
+decision fails closed with `MATRIX_NO_ROW`; evaluation errors increment
+`boundary_policy_evaluation_error_total` and also fail closed.
+
+Principal-table parsing, token hygiene, and transport security hardening are
+owned by the MCP northbound server contract — see
+[mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md).
 
 ---
 
@@ -72,6 +89,35 @@ It is never written back to `principals.json` as a persisted identity field.
 | `SQLITE_CONTENTION_RETRY_EXHAUSTED` | 503 | SQLite busy timeout exceeded under bounded retry. |
 | `IDEMPOTENCY_CONFLICT` | 409 | Same key with different canonical request hash, or replayed by a different caller fingerprint. The conflict envelope never echoes the original `approval_id` or journal id. |
 | `IDEMPOTENCY_IN_FLIGHT` | — | MCP retry against a pending sentinel younger than 30 s; the caller must wait for the in-flight request to complete before retrying. |
+
+### Deny Side-Effect Invariant
+
+Denied calls write only matrix-declared deny side effects. A deny never appends
+`command_journal` rows, approval settlements, projection writes, or any other
+business-truth writes. Where the matrix requires durable deny audit, exactly one
+primary deny audit row is written (via a bounded standalone audit transaction);
+inability to commit a required audit row fails the request closed with
+`E_AUDIT_UNAVAILABLE`.
+
+### Operator Denial Copy
+
+Primary operator-facing copy uses human titles; raw `reason_code`, `row_id`,
+`caller_class`, `request_id`, and `redaction_id` remain available only in copied
+diagnostics. Diagnostics exclude bearer tokens, token ids by default, principal
+secrets, raw fixture contents, and route inventory for unauthenticated callers.
+
+| Reason code | Operator copy |
+|---|---|
+| `UNAUTHENTICATED` | Session Expired |
+| `AMBIGUOUS_CALLER` | Access Could Not Be Verified |
+| `CAPABILITY_OUT_OF_SCOPE` | Action Not Available |
+| `NON_APPROVAL_MUTATION` | GraphQL Action Blocked |
+| `APPROVAL_NOT_ACTIONABLE` | Approval Not Actionable |
+| `OBSERVER_SCOPE` | Read-Only Access |
+| `BREAK_GLASS_DISABLED` | Debug Access Disabled |
+| `MATRIX_NO_ROW` | Access Rule Missing |
+| `E_AUDIT_UNAVAILABLE` | Audit Storage Unavailable |
+| `SQLITE_CONTENTION_RETRY_EXHAUSTED` | Storage Busy |
 
 ---
 
@@ -135,7 +181,71 @@ P081 rollout metrics are retained by exact name for enforcement readiness:
 
 ---
 
+## Fixture Schema and Validation
+
+The machine-readable matrix is `boundary_matrix_fixture_v1`. Required top-level
+fields: `schema_version`, `matrix_id`, `generated_from`. Required row fields:
+`row_id`, `caller_class`, `transports`, `actions`, `allow`, `deny`, `redaction`,
+`authoritative_record`, `read_model_delta`, `required_tests`, `rollout_mode`,
+`deprecated_after_phase`.
+
+`row_id` must match
+`^p081\.[a-z0-9_]+\.(graphql_query|graphql_subscription|graphql_mutation|mcp_initialize|mcp_tools_list|mcp_tools_call|debug_endpoint)\.[a-z0-9_]+$`
+and be unique within the fixture. The second segment must equal `caller_class`;
+the third segment must equal the row's only transport for required rows. Rows
+that intentionally apply to more than one transport are forbidden in
+`required_rows` and must be split into single-transport rows.
+
+The startup validator fails closed with these error codes:
+
+`E_SCHEMA_VERSION`, `E_UNKNOWN_FIELD`, `E_MISSING_FIELD`, `E_DUPLICATE_ROW_ID`,
+`E_UNKNOWN_ENUM`, `E_INVALID_ROW_ID`, `E_INVALID_ACTION_GRAMMAR`,
+`E_WILDCARD_NOT_ALLOWED`, `E_REQUIRED_ROW_MISSING`,
+`E_REQUIRED_ROW_TRANSPORT_MISMATCH`, `E_DENY_SIDE_EFFECT_CONFLICT`,
+`E_NULLABILITY`, `E_FIXTURE_DIGEST_MISMATCH`.
+
+Wildcard actions (`runs.*`) are valid only when the row sets
+`allow.wildcard = true`; otherwise validation fails with
+`E_WILDCARD_NOT_ALLOWED`.
+
+---
+
+## Approval Mutation Idempotency Contract
+
+`approveApproval` / `rejectApproval` use a client-supplied `idempotencyKey`
+(UUIDv7, one per operator action attempt; the Swift
+`ApprovalActionAttemptStore` owns key reuse across retries, duplicate-tap
+suppression, and app restarts until a terminal outcome):
+
+- Same caller, `approval_id`, action, and key after committed success replays
+  the original result with no second settlement, no new `command_journal` row,
+  and no new primary audit rows. Replay vs. conflict is distinguished by
+  `request_hash`: same key + same hash replays; same key + different hash (or a
+  different caller fingerprint) returns `IDEMPOTENCY_CONFLICT`.
+- Duplicate attempts append an `approval_idempotency_duplicate` audit event when
+  audit storage is available; failure to write that duplicate-audit row must not
+  cause a second settlement.
+- An already-terminal approval with a new key returns `APPROVAL_NOT_ACTIONABLE`
+  with no settlement side effects.
+- Terminal-state precheck, idempotency lookup, `command_journal` append,
+  settlement, projection write, and required audit writes happen in one
+  transaction.
+- `approval_mutation_idempotency` rows are retained at least 7 days and at
+  least as long as `ApprovalActionAttemptStore` persistence.
+
+---
+
 ## Durable Idempotency Contract
+
+Command write units are built on `db::pool::begin_immediate_with_retry(...)`:
+`BEGIN IMMEDIATE`, policy decision recorded, `command_journal` appended (with
+`caller_class`, `row_id`, `request_id`, and idempotency key where present)
+**before** other durable domain writes in the same unit, then settlement /
+idempotency / audit rows, and success is acknowledged only after COMMIT returns
+successfully. SIGTERM or failure before COMMIT rolls back without ACK; SIGTERM
+after COMMIT but before ACK is committed-unack, and a post-restart retry returns
+the original result through the idempotency table. Post-commit projection
+rebuild is not part of the write-unit guarantee.
 
 Allowed MCP state-changing calls use a single-transaction command write-unit contract:
 
@@ -145,6 +255,40 @@ Allowed MCP state-changing calls use a single-transaction command write-unit con
 4. Committed-unack recovery checks `command_journal` for the same idempotency key. A committed journal row returns a recovery response and updates the sentinel; no command is re-executed. If no committed journal row exists, the retry fails closed with `SQLITE_CONTENTION_RETRY_EXHAUSTED` or `IDEMPOTENCY_COMMITTED_UNACK` instead of guessing.
 
 Post-commit projection rebuild may run after commit and is not part of the same write-unit guarantee. Acknowledgement of normal success occurs only after the command handler has committed and returned the journal-linked result.
+
+---
+
+## Audit Log Contract
+
+`audit_log` is an adjunct durable append-evidence table, not the business
+source of truth for approvals, stages, work items, or projections. Its
+durability rules (implemented in `control-plane/crates/db/src/repos/audit_log.rs`):
+
+- **Hash chain**: `row_hash = sha256(canonical audit row fields excluding
+  row_hash, plus prev_hash)`; `prev_hash` is the previous committed `audit_log`
+  `row_hash` in the same database. `checkpoint_hash =
+  sha256(previous_checkpoint_hash + covered row_hash sequence + checkpoint
+  metadata)`.
+- **Checkpoints**: a checkpoint row is written every 1000 audit rows and at
+  clean shutdown when the open window is non-empty. Startup verifies the latest
+  checkpoint window and reports `verified`, `degraded`, or `tamper_suspected`
+  (the latter coerces the daemon into `read_only_safe_mode`; see kill switches).
+- **Payload budget**: payloads are canonical JSON capped at 16 KiB (byte
+  length). Oversized diagnostics are stored as a truncation envelope
+  `{diagnostic_truncated: true, payload_sha256, original_size_bytes,
+  allowed_keys}` where `payload_sha256` hashes the untruncated canonical payload
+  when available.
+- **Write paths**: `append_tx` writes audit rows inside an existing caller
+  `BEGIN IMMEDIATE` transaction (allowed mutating paths); a bounded standalone
+  append path exists for deny-only durable audit rows. The repo owns row-hash,
+  prev-hash, checkpoint linkage, and truncation envelope construction, and never
+  logs bearer tokens. Duplicate audit ids, hash-chain write failures, or
+  inability to commit a required audit transaction fail the request closed.
+- **Retention**: minimum 90 days locally. Cleanup runs outside request-handling
+  transactions, deletes only complete checkpoint windows older than retention,
+  and surfaces degraded/stalled cleanup through bounded audit health readback.
+- **Readback**: bounded `audit_log_readback_v1` health/integrity/diagnostic
+  surfaces only — no broad GraphQL audit browser or raw table browser.
 
 ---
 

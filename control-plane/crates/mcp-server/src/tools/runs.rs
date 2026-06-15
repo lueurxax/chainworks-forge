@@ -7,10 +7,11 @@ use db::repos::{
     legacy_discovery_overrides, projections, rollout_contract_checks, runs, side_effects,
 };
 use domain::commands::{
-    CancelRunCmd, CatalogSnapshotRetrofitScope, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
-    MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
-    MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
-    ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd, SettleProposalGateCmd, StartRunCmd,
+    CallerContext, CancelRunCmd, CatalogSnapshotRetrofitScope, Command, KnowledgeCapsuleIgnoreCmd,
+    MainSyncMode, MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision,
+    MainSyncRepairStateCmd, MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd,
+    MainSyncTriggerReason, ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd,
+    SettleProposalGateCmd, StartRunCmd,
 };
 use domain::ids::{IdeaId, RunId};
 use domain::risk_lineage::RiskAcceptanceLineage;
@@ -18,6 +19,14 @@ use engine::command_handler::CommandHandler;
 
 use crate::protocol::McpTool;
 use crate::request_context::mcp_caller;
+
+fn mcp_caller_with_idempotency_request_id(
+    principal: &auth::Principal,
+    tool_name: &str,
+    idempotency_key: &str,
+) -> CallerContext {
+    mcp_caller(principal, tool_name).with_request_id(idempotency_key)
+}
 
 pub fn tool_specs() -> Vec<McpTool> {
     vec![
@@ -546,7 +555,11 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
                 .to_string();
-            let caller = mcp_caller(&principal, "runs.main_sync.request");
+            let caller = mcp_caller_with_idempotency_request_id(
+                principal,
+                "runs.main_sync.request",
+                &idempotency_key,
+            );
             cmd_handler
                 .handle(
                     Command::MainSyncRequest(MainSyncRequestCmd {
@@ -572,7 +585,11 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
                 .to_string();
-            let caller = mcp_caller(&principal, "runs.main_sync.retry");
+            let caller = mcp_caller_with_idempotency_request_id(
+                principal,
+                "runs.main_sync.retry",
+                &idempotency_key,
+            );
             cmd_handler
                 .handle(
                     Command::MainSyncRetry(MainSyncRetryCmd {
@@ -1377,6 +1394,7 @@ fn canonicalize_run_start_paths(
     }
     let canonical_workspace = std::fs::canonicalize(workspace_path)
         .with_context(|| format!("runs.start: canonicalize workspace_root '{workspace_root}'"))?;
+    reject_broad_workspace_root(&canonical_workspace)?;
     let artifact = canonicalize_run_start_child_path(
         "artifact_root",
         artifact_root,
@@ -1401,6 +1419,46 @@ fn canonicalize_run_start_paths(
         workflow.to_string_lossy().to_string(),
         catalog.to_string_lossy().to_string(),
     ))
+}
+
+pub(crate) fn reject_broad_workspace_root(canonical_workspace: &Path) -> anyhow::Result<()> {
+    const BROAD_ROOTS: &[&str] = &[
+        "/",
+        "/tmp",
+        "/var",
+        "/private",
+        "/private/tmp",
+        "/private/var",
+        "/private/etc",
+        "/etc",
+        "/Users",
+        "/home",
+        "/Library",
+        "/System",
+        "/Volumes",
+        "/Applications",
+    ];
+
+    if BROAD_ROOTS
+        .iter()
+        .any(|root| canonical_workspace == Path::new(root))
+    {
+        anyhow::bail!(
+            "runs.start: workspace_root '{}' is too broad; choose a project directory",
+            canonical_workspace.display()
+        );
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        if canonical_workspace == Path::new(&home) {
+            anyhow::bail!(
+                "runs.start: workspace_root '{}' is too broad; choose a project directory",
+                canonical_workspace.display()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn canonicalize_run_start_child_path(
@@ -1615,6 +1673,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn p082_workspace_root_guard_rejects_broad_system_roots() {
+        for root in [
+            "/",
+            "/tmp",
+            "/var",
+            "/private",
+            "/private/tmp",
+            "/private/var",
+            "/private/etc",
+            "/etc",
+            "/Users",
+            "/home",
+            "/Library",
+            "/System",
+            "/Volumes",
+            "/Applications",
+        ] {
+            let err = reject_broad_workspace_root(std::path::Path::new(root))
+                .expect_err("broad workspace root must be rejected");
+            assert!(
+                err.to_string().contains("too broad"),
+                "unexpected error for {root}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn p082_workspace_root_guard_allows_project_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let canonical = std::fs::canonicalize(&project).unwrap();
+
+        reject_broad_workspace_root(&canonical).expect("project directory should be allowed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p082_runs_start_rejects_workspace_symlink_to_broad_system_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_link = tmp.path().join("private-link");
+        symlink("/private", &workspace_link).unwrap();
+        let err = canonicalize_run_start_paths(
+            workspace_link.to_str().unwrap(),
+            workspace_link
+                .join("chainworks-artifacts")
+                .to_str()
+                .unwrap(),
+            workspace_link.join("workflow.yaml").to_str().unwrap(),
+            workspace_link.join("agents.yaml").to_str().unwrap(),
+        )
+        .expect_err("workspace symlink to /private must be rejected after canonicalization");
+        assert!(
+            err.to_string().contains("too broad"),
+            "unexpected symlink broad-root rejection: {err}"
+        );
+    }
+
     fn test_workflow_yaml_path() -> String {
         // Canonicalize to resolve `..` components so validate_run_start_path accepts it.
         let raw = format!(
@@ -1646,6 +1765,25 @@ mod tests {
 
     fn test_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    #[test]
+    fn p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id() {
+        let principal = test_principal();
+
+        for tool_name in ["runs.main_sync.request", "runs.main_sync.retry"] {
+            let caller = mcp_caller_with_idempotency_request_id(
+                &principal,
+                tool_name,
+                "0197f0d1-1dd2-7b7a-a2b7-2dd6d0052d57",
+            );
+
+            assert_eq!(caller.caller_tool, tool_name);
+            assert_eq!(
+                caller.request_id.as_deref(),
+                Some("0197f0d1-1dd2-7b7a-a2b7-2dd6d0052d57")
+            );
+        }
     }
 
     async fn persist_blocked_implementation_summary(pool: &SqlitePool, run_id: RunId) {

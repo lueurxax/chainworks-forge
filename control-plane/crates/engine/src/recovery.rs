@@ -1158,6 +1158,12 @@ impl RecoveryService {
                          WHERE se.run_id = r.id
                            AND ae.status = 'running'
                     )
+                 OR EXISTS (
+                        SELECT 1
+                          FROM approvals a
+                         WHERE a.run_id = r.id
+                           AND a.decision IN ('pending', 'requested')
+                    )
               )
             ORDER BY r.started_at ASC
             "#,
@@ -1247,6 +1253,20 @@ impl RecoveryService {
             .execute(&mut **tx)
             .await
             .context("terminalize retry authorities for cancelled run")?;
+            let expired_approvals = approvals::expire_pending_by_run_tx(
+                &mut tx,
+                run_id,
+                now,
+                Some("startup_repair_cancelled_run_terminal_invariant".into()),
+            )
+            .await?;
+            if expired_approvals > 0 {
+                info!(
+                    run_id = %run_id,
+                    expired_approvals = expired_approvals,
+                    "Expired pending approvals while repairing cancelled run terminal invariant"
+                );
+            }
 
             tx.commit().await?;
             projections::rebuild_all_for_run(&self.pool, run_id).await?;
@@ -2547,6 +2567,13 @@ impl RecoveryService {
                 .await?;
             requeued += 1;
         } else {
+            let blocked_stage_catchups = self
+                .recover_blocked_stages_with_terminal_work(run, &run_stages)
+                .await?;
+            if blocked_stage_catchups > 0 {
+                return Ok(requeued + blocked_stage_catchups);
+            }
+
             if self.transition_cursor_blocks_startup_catchup(run).await? {
                 let cancelled = work_items::cancel_pending_or_running_advance_by_run(
                     &self.pool,
@@ -2665,6 +2692,92 @@ impl RecoveryService {
                     .await?;
                 requeued += 1;
             }
+        }
+
+        Ok(requeued)
+    }
+
+    async fn recover_blocked_stages_with_terminal_work(
+        &self,
+        run: &Run,
+        run_stages: &[domain::stage::StageExecution],
+    ) -> Result<usize> {
+        if run_has_pending_or_running_work(&self.pool, run.id).await? {
+            return Ok(0);
+        }
+        let Some(current_state) = run.current_state.as_deref() else {
+            return Ok(0);
+        };
+
+        let mut requeued = 0usize;
+        let now = Utc::now();
+        for stage in run_stages.iter().filter(|stage| {
+            stage.status == StageStatus::Blocked
+                && stage.stage_id == current_state
+                && stage.validation_failure_json.is_none()
+        }) {
+            let latest_attempt = run_stages
+                .iter()
+                .filter(|candidate| candidate.stage_id == stage.stage_id)
+                .map(|candidate| candidate.attempt_number)
+                .max()
+                .unwrap_or(stage.attempt_number);
+            if stage.attempt_number < latest_attempt {
+                continue;
+            }
+            if stage_has_pending_or_running_invoke_work(&self.pool, run.id, stage.id).await?
+                || stage_has_pending_or_running_advance_work(&self.pool, run.id, stage.id).await?
+            {
+                continue;
+            }
+
+            let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
+            if executions.is_empty()
+                || executions
+                    .iter()
+                    .any(|execution| execution.status == AgentStatus::Running)
+                || !executions
+                    .iter()
+                    .any(|execution| execution.status == AgentStatus::Completed)
+            {
+                continue;
+            }
+
+            info!(
+                run_id = %run.id,
+                stage_id = %stage.stage_id,
+                stage_execution_id = %stage.id,
+                execution_count = %executions.len(),
+                "Startup recovery scheduling blocked-stage catchup for terminal agent work"
+            );
+            self.work_queue
+                .enqueue(
+                    WorkItemKind::AdvanceRun,
+                    Some(run.id),
+                    Some(stage.stage_id.clone()),
+                    serde_json::json!({
+                        "run_id": run.id.to_string(),
+                        "reason": "startup_blocked_stage_catchup",
+                        "stage_execution_id": stage.id.to_string(),
+                        "target_stage_execution_id": stage.id.to_string(),
+                        "stage_id": stage.stage_id.clone(),
+                    }),
+                )
+                .await?;
+            let repair_id = uuid::Uuid::new_v4().to_string();
+            let _ = startup_repairs::record(
+                &self.pool,
+                &repair_id,
+                &run.id.to_string(),
+                "blocked_stage_catchup",
+                now,
+                Some(&format!(
+                    "Blocked stage '{}' has terminal agent work and no live work; enqueued targeted AdvanceRun",
+                    stage.stage_id
+                )),
+            )
+            .await;
+            requeued += 1;
         }
 
         Ok(requeued)

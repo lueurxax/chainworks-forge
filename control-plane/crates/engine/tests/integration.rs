@@ -552,6 +552,77 @@ async fn startup_repair_kickstarts_empty_running_stage_without_blocking() {
 }
 
 #[tokio::test]
+async fn startup_repair_enqueues_blocked_stage_catchup_when_terminal_work_is_stranded() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_id = StageExecutionId::new();
+    let current_state_id = "state_review";
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some(current_state_id.into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut stage = make_stage(stage_id, run_id, StageStatus::Blocked);
+    stage.stage_id = current_state_id.into();
+    stage.validation_failure_json = None;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let mut completed = make_agent_execution(stage_id, AgentStatus::Completed);
+    completed.completed_at = Some(Utc::now());
+    completed.agent_id = "docs_guardian".into();
+    agent_executions::insert(&pool, &completed).await.unwrap();
+
+    workflow_conflicts::upsert_transition_cursor(
+        &pool,
+        &WorkflowTransitionCursorRecord {
+            schema_version: WorkflowTransitionCursorRecord::SCHEMA_VERSION.to_string(),
+            run_id: run_id.to_string(),
+            current_state_id: current_state_id.into(),
+            cursor_status: "awaiting_conflict_resolution".into(),
+            resume_policy: "await_conflict_resolution".into(),
+            selected_transition_id: None,
+            selected_next_state_id: None,
+            conflict_id: Some("conflict-fixture".into()),
+            conflict_fingerprint: Some("conflict-fixture".into()),
+            candidate_transition_hash: Some("candidate-fixture".into()),
+            terminal_failure_reason: None,
+            updated_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = event_bus::new_bus(64);
+    let work_queue = WorkQueue::new(pool.clone());
+    let recovery = RecoveryService::new(pool.clone(), work_queue, events);
+
+    let summary = recovery.run_startup_repair().await.unwrap();
+
+    assert_eq!(summary.runs_inspected, 1);
+    assert_eq!(summary.runs_repaired, 1);
+    assert_eq!(summary.work_items_requeued, 1);
+    let items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    let catchup = items
+        .iter()
+        .find(|item| {
+            item.kind == WorkItemKind::AdvanceRun
+                && item.payload_json.contains("startup_blocked_stage_catchup")
+        })
+        .expect("startup recovery must enqueue blocked-stage catchup");
+    let payload: serde_json::Value = serde_json::from_str(&catchup.payload_json).unwrap();
+    assert_eq!(payload["target_stage_execution_id"], stage_id.to_string());
+
+    let second = recovery.run_startup_repair().await.unwrap();
+    assert_eq!(
+        second.work_items_requeued, 0,
+        "pending blocked-stage catchup must make startup repair idempotent"
+    );
+}
+
+#[tokio::test]
 async fn proposal_087_projection_cache_rebuilds_after_restart() {
     let pool = test_pool().await;
 
@@ -1680,6 +1751,8 @@ async fn test_cancel_run_phase1_cancels_agent_executions_and_running_work_items(
     )
     .await
     .unwrap();
+    let approval = make_approval(run_id, "stage_test", ApprovalDecision::Requested);
+    approvals::insert(&pool, &approval).await.unwrap();
     agent_executions::insert(
         &pool,
         &make_agent_execution(stage_exec_id, AgentStatus::Running),
@@ -1739,6 +1812,14 @@ async fn test_cancel_run_phase1_cancels_agent_executions_and_running_work_items(
         .unwrap()
         .unwrap();
     assert_eq!(stage.status, StageStatus::Failed);
+
+    let approval_after = approvals::find_by_id(&pool, approval.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(approval_after.decision, ApprovalDecision::Expired);
+    assert_eq!(approval_after.comment.as_deref(), Some("run_cancelled"));
+    assert!(approvals::list_pending(&pool).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -4423,6 +4504,166 @@ async fn test_retry_stage_legacy_discovery_override_validation_failure_leaves_no
 }
 
 #[tokio::test]
+async fn p082_retry_stage_rejects_stage_execution_uuid_stage_id_before_mutation() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let mut stage = make_stage(stage_execution_id, run_id, StageStatus::Failed);
+    stage.stage_id = "implementation".into();
+    stage.attempt_number = 2;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let error = match handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: stage_execution_id.to_string(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+    {
+        Ok(_) => panic!("stage_execution_uuid in stage_id must be rejected before mutation"),
+        Err(error) => error.to_string(),
+    };
+
+    assert!(
+        error.contains("wrong_identifier_kind"),
+        "unexpected retry validation error: {error}"
+    );
+    assert!(
+        error.contains("stage_execution_uuid"),
+        "error must name the received identifier kind: {error}"
+    );
+    assert!(
+        error.contains("stage_id 'implementation'"),
+        "error must guide the operator to the logical stage_id: {error}"
+    );
+
+    let journal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM command_journal WHERE command_type = 'RetryStage'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        journal_count, 0,
+        "wrong-kind retry validation must not leave a command journal row"
+    );
+
+    let stage_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM stage_executions WHERE run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stage_count, 1, "wrong-kind retry must not clone the stage");
+
+    let work_items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert!(
+        work_items.is_empty(),
+        "wrong-kind retry must not enqueue follow-up work"
+    );
+}
+
+#[tokio::test]
+async fn p082_retry_stage_rejects_stage_execution_uuid_agent_execution_id_before_mutation() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let stage_execution_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    runs::insert(&pool, &make_run(run_id, idea_id, RunStatus::Running))
+        .await
+        .unwrap();
+
+    let mut stage = make_stage(stage_execution_id, run_id, StageStatus::Failed);
+    stage.stage_id = "audit".into();
+    stage.attempt_number = 1;
+    stages::insert(&pool, &stage).await.unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    let error = match handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "audit".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: Some(AgentExecutionId::from(stage_execution_id.inner())),
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+    {
+        Ok(_) => {
+            panic!("stage_execution_uuid in agent_execution_id must be rejected before mutation")
+        }
+        Err(error) => error.to_string(),
+    };
+
+    assert!(
+        error.contains("wrong_identifier_kind"),
+        "unexpected retry validation error: {error}"
+    );
+    assert!(
+        error.contains("expected agent_execution_id"),
+        "error must name the expected identifier kind: {error}"
+    );
+    assert!(
+        error.contains("received stage_execution_uuid"),
+        "error must name the received identifier kind: {error}"
+    );
+    assert!(
+        error.contains("stage_id 'audit'"),
+        "error must guide the operator to the logical stage_id: {error}"
+    );
+
+    let journal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM command_journal WHERE command_type = 'RetryStage'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        journal_count, 0,
+        "wrong-kind retry validation must not leave a command journal row"
+    );
+
+    let stage_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM stage_executions WHERE run_id = ?1")
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stage_count, 1, "wrong-kind retry must not clone the stage");
+
+    let work_items = work_items::list_by_run(&pool, run_id).await.unwrap();
+    assert!(
+        work_items.is_empty(),
+        "wrong-kind retry must not enqueue follow-up work"
+    );
+}
+
+#[tokio::test]
 async fn test_override_legacy_discovery_policy_rolls_back_journal_on_duplicate_failure() {
     let pool = test_pool().await;
 
@@ -5210,6 +5451,144 @@ async fn test_retry_stage_on_blocked_implementation_review_targets_single_failed
     assert_eq!(
         authority.source_agent_execution_id.as_deref(),
         Some(failed_auditor_id.to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn test_retry_stage_on_blocked_review_stage_retries_only_failed_reviewer() {
+    let pool = test_pool().await;
+
+    let idea_id = IdeaId::new();
+    let run_id = RunId::new();
+    let old_stage_exec_id = StageExecutionId::new();
+
+    ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+    let mut run = make_run(run_id, idea_id, RunStatus::Blocked);
+    run.current_state = Some("state_9_implementation_reviewed".into());
+    runs::insert(&pool, &run).await.unwrap();
+
+    let mut old_stage = make_stage(old_stage_exec_id, run_id, StageStatus::Blocked);
+    old_stage.stage_id = "state_9_implementation_reviewed".into();
+    old_stage.label = "Implementation Review".into();
+    old_stage.attempt_number = 7;
+    stages::insert(&pool, &old_stage).await.unwrap();
+
+    for agent_id in ["security_checker", "docs_guardian"] {
+        let mut completed = make_agent_execution(old_stage_exec_id, AgentStatus::Completed);
+        completed.agent_id = agent_id.into();
+        completed.completed_at = Some(Utc::now());
+        agent_executions::insert(&pool, &completed).await.unwrap();
+    }
+
+    let mut failed_prepush = make_agent_execution(old_stage_exec_id, AgentStatus::Failed);
+    failed_prepush.agent_id = "prepush_code_reviewer".into();
+    failed_prepush.provider = "codex_acp".into();
+    failed_prepush.completed_at = Some(Utc::now());
+    let failed_prepush_id = failed_prepush.id;
+    agent_executions::insert(&pool, &failed_prepush)
+        .await
+        .unwrap();
+    agent_execution_runtime_facts::upsert(
+        &pool,
+        &AgentExecutionRuntimeFacts {
+            agent_execution_id: failed_prepush_id,
+            failure_kind: Some(AgentFailureKind::ProviderTimeout),
+            output_settlement: AgentOutputSettlement::MissingRequiredOutputs,
+            ..AgentExecutionRuntimeFacts::defaults_for(failed_prepush_id, Utc::now())
+        },
+    )
+    .await
+    .unwrap();
+
+    let source_work_item_id = format!("p058-invoke:{old_stage_exec_id}:3");
+    work_items::enqueue(
+        &pool,
+        &db::work_item::WorkItem {
+            id: source_work_item_id.clone(),
+            kind: db::work_item::WorkItemKind::InvokeAgent,
+            payload_json: serde_json::json!({
+                "run_id": run_id.to_string(),
+                "stage_id": "state_9_implementation_reviewed",
+                "stage_execution_id": old_stage_exec_id.to_string(),
+                "task_name": "prepush_review",
+                "agent_id": "prepush_code_reviewer",
+                "provider": "codex_acp",
+                "model": "gpt-5.5",
+                "output_contract": "prepush_review_v1",
+                "task_index": 3,
+                "total_tasks": 4,
+                "declared_outputs": [],
+                "p058_claimed": {
+                    "agent_execution_id": failed_prepush_id.to_string()
+                }
+            })
+            .to_string(),
+            status: db::work_item::WorkItemStatus::Completed,
+            run_id: Some(run_id),
+            stage_id: Some("state_9_implementation_reviewed".into()),
+            created_at: Utc::now(),
+            scheduled_at: Utc::now(),
+            attempt_count: 1,
+            last_error: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let handler = make_command_handler(pool.clone());
+    handler
+        .handle(
+            Command::RetryStage(RetryStageCmd {
+                run_id,
+                stage_id: "state_9_implementation_reviewed".into(),
+                consume_quota_budget_now: false,
+                agent_execution_id: None,
+                legacy_discovery_override_policy: None,
+                legacy_discovery_override_reason: None,
+                operator_instruction: None,
+            }),
+            CallerContext::test_fixture(),
+        )
+        .await
+        .unwrap();
+
+    let retry_stage = stages::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|stage| {
+            stage.stage_id == "state_9_implementation_reviewed" && stage.attempt_number == 8
+        })
+        .expect("blocked review should create targeted retry stage");
+    assert_eq!(retry_stage.status, StageStatus::Running);
+    assert_eq!(
+        retry_stage.retry_reason.as_deref(),
+        Some("operator_targeted_retry:prepush_code_reviewer")
+    );
+
+    let pending_items = work_items::list_by_run(&pool, run_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.status == db::work_item::WorkItemStatus::Pending)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pending_items.len(),
+        1,
+        "blocked review retry must preserve successful reviewers and enqueue only failed reviewer"
+    );
+    let payload: serde_json::Value = serde_json::from_str(&pending_items[0].payload_json).unwrap();
+    assert_eq!(
+        payload["agent_id"],
+        serde_json::json!("prepush_code_reviewer")
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/source_agent_execution_id"),
+        Some(&serde_json::json!(failed_prepush_id.to_string()))
+    );
+    assert_eq!(
+        payload.pointer("/targeted_retry/source_work_item_id"),
+        Some(&serde_json::json!(source_work_item_id))
     );
 }
 
@@ -6711,6 +7090,12 @@ async fn startup_repair_restores_cancelled_run_terminal_invariant() {
     retry_stage.attempt_number = 2;
     retry_stage.retry_reason = Some("operator_retry".into());
     stages::insert(&pool, &retry_stage).await.unwrap();
+    approvals::insert(
+        &pool,
+        &make_approval(run_id, "flaky_stage", ApprovalDecision::Requested),
+    )
+    .await
+    .unwrap();
 
     let work_queue = WorkQueue::new(pool.clone());
     work_queue
@@ -6782,6 +7167,22 @@ async fn startup_repair_restores_cancelled_run_terminal_invariant() {
         .unwrap()
         .expect("repaired projection");
     assert_eq!(projection.run_state_json["status"], "cancelled");
+    let approvals_after = approvals::list_by_run(&pool, run_id).await.unwrap();
+    assert_eq!(approvals_after.len(), 1);
+    assert_eq!(approvals_after[0].decision, ApprovalDecision::Expired);
+    assert_eq!(
+        approvals_after[0].comment.as_deref(),
+        Some("startup_repair_cancelled_run_terminal_invariant")
+    );
+    let inbox = projections::list_pending_inbox_projection(&pool)
+        .await
+        .unwrap();
+    assert!(inbox.is_empty());
+    let run_projection = projections::find_run_projection(&pool, &run_id.to_string())
+        .await
+        .unwrap()
+        .expect("run projection");
+    assert_eq!(run_projection.pending_approvals, 0);
 }
 
 #[tokio::test]
@@ -16041,6 +16442,7 @@ fn test_execution_request_carries_chainworks_meta_root() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: vec![],
         chainworks_meta_root: Some(".chainworks/runs/test-run".into()),
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,

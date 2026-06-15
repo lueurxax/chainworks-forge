@@ -1083,6 +1083,76 @@ sys.exit(0)
         script.to_string_lossy().into_owned()
     }
 
+    /// Write a Codex-like fixture that returns a generic JSON-RPC prompt
+    /// error after recording the real credits-exhausted signal in the native
+    /// Codex session store.
+    pub fn create_codex_credits_exhausted_prompt_error_script(tmpdir: &std::path::Path) -> String {
+        let script = tmpdir.join("acp_codex_credits_exhausted_prompt_error.py");
+        let code = r#"#!/usr/bin/env python3
+import sys, json, os
+from pathlib import Path
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + '\n')
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+session_id = "codex-fixture-credits-exhausted"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": session_id}})
+
+msg = recv()
+if msg is None:
+    sys.exit(1)
+
+session_line = {
+    "timestamp": "2026-06-15T08:00:00.000Z",
+    "type": "event_msg",
+    "payload": {
+        "type": "token_count",
+        "rate_limits": {
+            "credits": {
+                "has_credits": False,
+                "balance": 0,
+                "unlimited": False,
+                "limit_id": "codex-free-tier"
+            }
+        }
+    }
+}
+session_path = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "06" / "15" / "credits.jsonl"
+session_path.parent.mkdir(parents=True, exist_ok=True)
+session_path.write_text(json.dumps(session_line) + "\n")
+
+send({"jsonrpc": "2.0", "id": msg["id"],
+      "error": {"code": -32603, "message": "Internal error"}})
+sys.exit(0)
+"#;
+        std::fs::write(&script, code).unwrap();
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
     /// Write a fixture ACP server script that keeps a single session alive
     /// across two prompt turns and exits only after `session/close`.
     pub fn create_reuse_script(tmpdir: &std::path::Path) -> String {
@@ -1550,6 +1620,7 @@ fn brokered_xcode_request(tmp: &tempfile::TempDir, provider: &str) -> acp::Execu
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: vec![acp::AcpMcpServerPayload {
             id: "xcode-broker".into(),
             extension_id: "xcode".into(),
@@ -1618,6 +1689,7 @@ async fn test_claude_adapter_executes_subprocess_and_returns_artifacts() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -1693,6 +1765,7 @@ async fn test_claude_adapter_legacy_broad_discovery_ignores_preexisting_files_on
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -1753,6 +1826,7 @@ async fn test_claude_adapter_keeps_legacy_broad_discovery_disabled_by_default() 
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1818,6 +1892,7 @@ async fn p053_manual_reference_workspace_pre_initialize_latency() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1880,6 +1955,7 @@ async fn mcp_servers_session_new_serialization_tests() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: vec![AcpMcpServerPayload {
             id: "fs-runtime".into(),
             extension_id: "filesystem".into(),
@@ -1946,6 +2022,7 @@ async fn http_mcp_servers_session_new_serialization_tests() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: vec![AcpMcpServerPayload {
             id: "xcode-broker".into(),
             extension_id: "xcode".into(),
@@ -2018,6 +2095,7 @@ async fn transport_sends_set_mode_after_session_new_when_configured() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2086,6 +2164,7 @@ async fn transport_fails_when_required_config_option_is_rejected() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2153,6 +2232,7 @@ async fn transport_resolves_required_model_alias_from_session_config_options() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2208,6 +2288,7 @@ async fn adapter_launch_and_session_specs_are_prepared_separately() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -2312,6 +2393,7 @@ async fn launch_resources_are_cleaned_when_spawn_fails() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -5326,6 +5408,7 @@ async fn test_claude_adapter_returns_failed_on_session_error() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5387,6 +5470,7 @@ async fn adapter_execute_closes_session_after_prompt_transport_error() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5470,6 +5554,7 @@ async fn test_gemini_adapter_executes_subprocess_and_returns_artifacts() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5527,6 +5612,7 @@ async fn test_claude_adapter_reports_expected_output_paths_when_overwriting_exis
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5589,6 +5675,7 @@ async fn test_claude_adapter_does_not_report_unchanged_expected_output_path() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5674,6 +5761,7 @@ async fn test_claude_adapter_prefers_typed_expected_outputs_for_baseline_capture
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5761,6 +5849,7 @@ async fn test_claude_adapter_excludes_initialize_created_file_from_prompt_artifa
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5828,6 +5917,7 @@ async fn test_claude_adapter_extracts_chainworks_output_envelopes_without_filesy
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -5891,6 +5981,7 @@ async fn test_claude_adapter_extracts_chainworks_output_from_terminal_result_out
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6013,6 +6104,7 @@ async fn p084_like_stringified_terminal_output_materializes_required_outputs() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6081,6 +6173,7 @@ async fn test_claude_adapter_extracts_json_object_chainworks_output_envelope() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6175,6 +6268,7 @@ async fn codex_task_complete_session_store_recovers_missing_acp_terminal_respons
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6210,6 +6304,80 @@ async fn codex_task_complete_session_store_recovers_missing_acp_terminal_respons
                 .and_then(|value| value.get("status").cloned())
                 == Some(serde_json::json!("needs_code_fixes"))
     }));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_prompt_error_uses_session_store_credits_signal_as_provider_quota() {
+    use acp::adapters::codex::CodexAdapter;
+    use acp::adapters::AcpAdapter;
+    use acp::ExecutionRequest;
+    use domain::agent::AgentStatus;
+    use domain::ids::RunId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let script = fixture::create_codex_credits_exhausted_prompt_error_script(tmp.path());
+    let adapter = CodexAdapter::new_with_binary(script);
+    let req = ExecutionRequest {
+        run_id: RunId::new(),
+        stage_execution_id: None,
+        stage_id: "state_9_implementation_reviewed".into(),
+        attempt_number: 1,
+        agent_execution_id: None,
+        agent_id: "proposal_implementation_auditor".into(),
+        provider: "codex".into(),
+        model: Some("gpt-5.5".into()),
+        effort: None,
+        workspace_root: tmp.path().to_string_lossy().into_owned(),
+        prompt: "audit".into(),
+        worktree_root: None,
+        worktree_write_enabled: false,
+        worktree_strategy: None,
+        expected_output_paths: Vec::new(),
+        expected_outputs: Vec::new(),
+        keep_session_alive: false,
+        reuse_existing_session: false,
+        session_generation_id: None,
+        provider_session_id: None,
+        provider_runtime_home: None,
+        mcp_servers: Vec::new(),
+        chainworks_meta_root: None,
+        legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+        xcode_shim_injection_signal: false,
+        requires_xcode_host_execution: false,
+        owner_kind: "stage_execution".to_string(),
+        owner_id: None,
+        origin_stage_id: None,
+        origin_stage_execution_id: None,
+        mediation_record_id: None,
+        toolchain_home: None,
+        toolchain_go_scope_enabled: false,
+    };
+
+    let result = adapter.execute(req).await.unwrap();
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    let receipt = result
+        .runtime_receipt
+        .as_ref()
+        .expect("prompt error must write a runtime receipt");
+    assert_eq!(receipt.failure_phase.as_deref(), Some("provider_quota"));
+    assert_eq!(receipt.jsonrpc_error_code, Some(-32603));
+    assert!(receipt
+        .provider_error_message_redacted
+        .as_deref()
+        .is_some_and(|message| message.contains("Codex credits exhausted")));
+    assert!(receipt.last_events.iter().any(|event| {
+        event.kind == "provider_failure"
+            && event
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("codex_credits_exhausted"))
+    }));
+    assert!(result
+        .transcript_text
+        .as_deref()
+        .is_some_and(|text| text.contains("Codex credits exhausted")));
 }
 
 /// AcpRuntimeManager should keep a live session handle and reuse it for a
@@ -6250,6 +6418,7 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         reuse_existing_session: false,
         session_generation_id: Some("generation-1".into()),
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6299,6 +6468,7 @@ async fn test_runtime_manager_reuses_live_session_handle() {
         reuse_existing_session: true,
         session_generation_id: Some(session_generation_id.clone()),
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6392,6 +6562,7 @@ async fn runtime_manager_reports_prompt_progress_before_terminal_response() {
         reuse_existing_session: false,
         session_generation_id: Some("generation-progress".into()),
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::WorkflowOptIn,
@@ -6490,6 +6661,7 @@ async fn test_runtime_manager_closes_inflight_one_shot_session_by_generation_id(
         reuse_existing_session: false,
         session_generation_id: Some(generation_id.into()),
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: Default::default(),
@@ -6575,6 +6747,7 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         reuse_existing_session: false,
         session_generation_id: Some("generation-1".into()),
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6625,6 +6798,7 @@ async fn test_runtime_manager_healthcheck_rejects_exited_live_session() {
         reuse_existing_session: true,
         session_generation_id: Some(session_generation_id),
         provider_session_id,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6682,6 +6856,7 @@ async fn test_claude_adapter_surfaces_usage_snapshot_from_stream_updates() {
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: Vec::new(),
         chainworks_meta_root: None,
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -6785,6 +6960,7 @@ sys.exit(0)
         reuse_existing_session: false,
         session_generation_id: None,
         provider_session_id: None,
+        provider_runtime_home: None,
         mcp_servers: vec![],
         chainworks_meta_root: Some(".chainworks/runs/env-test-run".into()),
         legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,

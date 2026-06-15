@@ -3,6 +3,7 @@ import Testing
 @testable import Chainworks_Forge
 
 @Suite("ProcessSupport", .tags(.fast))
+@MainActor
 struct ProcessSupportTests {
     @Test("Executable discovery searches fallback directories outside inherited PATH")
     func resolveExecutableFindsBinaryInAdditionalSearchDirectory() throws {

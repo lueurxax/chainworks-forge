@@ -31,7 +31,6 @@ const ACQUIRED_IMMEDIATELY_THRESHOLD_MS: i64 = 10;
 /// Guard that releases the per-run Xcode lease when dropped.
 pub struct XcodeRunLeaseGuard {
     run_id: RunId,
-    registry: XcodeRunLeaseRegistry,
     _guard: OwnedMutexGuard<()>,
 }
 
@@ -114,7 +113,6 @@ impl XcodeRunLeaseRegistry {
         Ok(XcodeLeaseAcquisition {
             guard: XcodeRunLeaseGuard {
                 run_id,
-                registry: self.clone(),
                 _guard: guard,
             },
             concurrency,

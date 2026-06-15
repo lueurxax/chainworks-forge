@@ -29,7 +29,7 @@ pub const GENERATED_ROOT_DENYLIST: &[&str] = &[
     "**/dist/**",
 ];
 
-const SAFE_SEARCH_ERROR: &str = "Broad repository search must use bounded search and exclude generated/build roots. Use a narrower query or the safe search tool. Excluded roots include control-plane/target/**, **/target/**, **/.build/**, DerivedData, node_modules.";
+const SAFE_SEARCH_ERROR: &str = "Broad repository search must use bounded search and exclude generated/build roots. Use a narrower query, for example `rg prompt_stream_failed control-plane/crates/acp/src`, or include every generated-root exclude from runtime.health.toolOutputGuard.generatedRootDenylist and cap output. Excluded roots include control-plane/target/**, **/target/**, **/.build/**, DerivedData, node_modules.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolPreflightDecision {
@@ -237,25 +237,24 @@ fn has_generated_root_excludes(tokens: &[String]) -> bool {
         || joined.contains("--exclude");
     has_exclude_syntax
         && [
-            "control-plane/target",
-            "target/**",
-            "/target",
-            ".build",
-            "deriveddata",
-            "node_modules",
-            ".git",
-            ".swiftpm",
-            ".forge-codex-acp",
-            ".junie",
-            ".claude",
-            ".codex",
-            ".xcresult",
-            ".dsym",
-            "build/**",
-            "dist/**",
+            &["control-plane/target"][..],
+            &["**/target"][..],
+            &[".build"][..],
+            &["deriveddata"][..],
+            &["node_modules"][..],
+            &[".git"][..],
+            &[".swiftpm"][..],
+            &[".forge-codex-acp"][..],
+            &[".junie"][..],
+            &[".claude"][..],
+            &[".codex"][..],
+            &[".xcresult"][..],
+            &[".dsym"][..],
+            &["**/build"][..],
+            &["**/dist"][..],
         ]
         .iter()
-        .any(|needle| joined.contains(needle))
+        .all(|needles| needles.iter().any(|needle| joined.contains(needle)))
 }
 
 fn tokenize_shell_segment(segment: &str) -> Vec<String> {
@@ -346,9 +345,25 @@ mod tests {
     fn preflight_allows_narrow_or_excluded_searches() {
         assert!(!denied("rg foo control-plane/crates/acp/src"));
         assert!(!denied("rg --files control-plane/crates/acp/src"));
-        assert!(!denied("rg --glob '!control-plane/target/**' foo ."));
-        assert!(!denied(
+        assert!(denied("rg --glob '!control-plane/target/**' foo ."));
+        assert!(denied(
             "find . -path './control-plane/target' -prune -o -type f -print"
         ));
+        assert!(!denied(&format!(
+            "rg {} foo .",
+            GENERATED_ROOT_DENYLIST
+                .iter()
+                .map(|root| format!("--glob '!{root}'"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )));
+        assert!(!denied(&format!(
+            "find . {} -type f -print",
+            GENERATED_ROOT_DENYLIST
+                .iter()
+                .map(|root| format!("-path './{}' -prune -o", root.trim_end_matches("/**")))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )));
     }
 }

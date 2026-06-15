@@ -65,6 +65,7 @@ pub struct AcpLaunchSpec {
     pub runtime_tool_path_preflight_json: Option<String>,
     pub provider_launch_gate: Option<Arc<dyn AcpProviderLaunchGate>>,
     pub xcode_shim_runtime: Option<XcodeShimLaunchRuntime>,
+    pub provider_runtime_home: Option<PathBuf>,
     expected_capability_fingerprint: Option<CapabilitySliceFingerprint>,
 }
 
@@ -85,6 +86,7 @@ impl std::fmt::Debug for AcpLaunchSpec {
                 &self.provider_launch_gate.as_ref().map(|_| "<configured>"),
             )
             .field("xcode_shim_runtime", &self.xcode_shim_runtime)
+            .field("provider_runtime_home", &self.provider_runtime_home)
             .field(
                 "expected_capability_fingerprint",
                 &self.expected_capability_fingerprint,
@@ -152,6 +154,7 @@ impl AcpLaunchSpec {
             runtime_tool_path_preflight_json: None,
             provider_launch_gate: None,
             xcode_shim_runtime: None,
+            provider_runtime_home: None,
             expected_capability_fingerprint: None,
         }
     }
@@ -164,6 +167,11 @@ impl AcpLaunchSpec {
     pub fn with_envs(mut self, env: Vec<(String, String)>) -> Self {
         self.env = env;
         ensure_default_path_env(&mut self.env);
+        self
+    }
+
+    pub fn with_provider_runtime_home(mut self, path: impl Into<PathBuf>) -> Self {
+        self.provider_runtime_home = Some(path.into());
         self
     }
 
@@ -195,6 +203,27 @@ impl AcpLaunchSpec {
             self.env.retain(|(name, _)| name != "CHAINWORKS_META_ROOT");
             self.env
                 .push(("CHAINWORKS_META_ROOT".to_string(), meta_root));
+        }
+    }
+
+    pub fn apply_chainworks_rust_cache_env(&mut self) {
+        upsert_env(
+            &mut self.env,
+            "CARGO_TARGET_DIR",
+            chainworks_shared_cargo_target_dir(),
+        );
+        if !has_env(&self.env, "SCCACHE_DIR") {
+            self.env
+                .push(("SCCACHE_DIR".to_string(), chainworks_sccache_dir()));
+        }
+        if !has_env(&self.env, "SCCACHE_CACHE_SIZE") {
+            self.env
+                .push(("SCCACHE_CACHE_SIZE".to_string(), "20G".to_string()));
+        }
+        if !has_env(&self.env, "RUSTC_WRAPPER") {
+            if let Some(sccache) = find_sccache_binary() {
+                self.env.push(("RUSTC_WRAPPER".to_string(), sccache));
+            }
         }
     }
 
@@ -882,8 +911,24 @@ pub trait AcpAdapter: Send + Sync {
         mut launch_spec: AcpLaunchSpec,
         session_new_spec: AcpSessionNewSpec,
     ) -> Result<OpenedAcpAdapterSession> {
+        let effective_req;
+        let req = if req.provider_runtime_home.is_none() {
+            if let Some(runtime_home) = launch_spec.provider_runtime_home.as_ref() {
+                effective_req = Some({
+                    let mut req = req.clone();
+                    req.provider_runtime_home = Some(runtime_home.to_string_lossy().into_owned());
+                    req
+                });
+                effective_req.as_ref().expect("effective request just set")
+            } else {
+                req
+            }
+        } else {
+            req
+        };
         let mut command = Command::new(&launch_spec.binary_path);
         launch_spec.apply_chainworks_meta_root_env(req);
+        launch_spec.apply_chainworks_rust_cache_env();
         ensure_chainworks_meta_root_launch_dir(req)?;
         self.preflight_launch(req, &mut launch_spec)?;
         if let Some(gate) = launch_spec.provider_launch_gate.as_ref() {
@@ -971,6 +1016,7 @@ pub trait AcpAdapter: Send + Sync {
         let mut resources = LaunchResourceGuard::default();
         let mut launch_spec = self.prepare_launch_spec(req, &mut resources)?;
         launch_spec.apply_chainworks_meta_root_env(req);
+        launch_spec.apply_chainworks_rust_cache_env();
         launch_spec.record_capability_fingerprint(None, None);
         self.ensure_brokered_xcode_http_capability(req, &launch_spec, capability_cache)
             .await?;
@@ -1100,6 +1146,77 @@ fn ensure_provider_execution_root(path: &Path) -> Result<()> {
             path.display()
         )
     }
+}
+
+fn has_env(env: &[(String, String)], key: &str) -> bool {
+    env.iter().any(|(name, _)| name == key)
+}
+
+fn upsert_env(env: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some((_, existing)) = env.iter_mut().find(|(name, _)| name == key) {
+        *existing = value;
+    } else {
+        env.push((key.to_string(), value));
+    }
+}
+
+pub(crate) fn chainworks_shared_cargo_target_dir() -> String {
+    env_nonempty("CHAINWORKS_AGENT_CARGO_TARGET_DIR")
+        .or_else(|| env_nonempty("CHAINWORKS_SHARED_CARGO_TARGET_DIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| chainworks_cache_root().join("cargo-target").join("agents"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub(crate) fn chainworks_sccache_dir() -> String {
+    env_nonempty("SCCACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| chainworks_cache_root().join("sccache"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub(crate) fn find_sccache_binary() -> Option<String> {
+    if matches!(
+        env_nonempty("CHAINWORKS_CARGO_SCCACHE")
+            .unwrap_or_else(|| "auto".to_string())
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off" | "no"
+    ) {
+        return None;
+    }
+    if let Some(explicit) = env_nonempty("CHAINWORKS_SCCACHE_BINARY") {
+        return Path::new(&explicit).is_file().then_some(explicit);
+    }
+    if let Some(existing) = env_nonempty("RUSTC_WRAPPER") {
+        return Some(existing);
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .chain([
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".cargo")
+                .join("bin"),
+        ])
+        .map(|dir| dir.join("sccache"))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
+fn chainworks_cache_root() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join("Library").join("Caches").join("Chainworks Forge"))
+        .unwrap_or_else(|| std::env::temp_dir().join("chainworks-forge-cache"))
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -1293,6 +1410,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: None,
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some(".chainworks/run-meta".to_string()),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1337,6 +1455,49 @@ mod tests {
     }
 
     #[test]
+    fn rust_cache_env_is_frozen_before_capability_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target_dir = tmp.path().join("agent-target");
+        let fake_sccache = tmp.path().join("sccache");
+        std::fs::write(&fake_sccache, "fixture").unwrap();
+
+        let previous_target = std::env::var_os("CHAINWORKS_SHARED_CARGO_TARGET_DIR");
+        let previous_sccache = std::env::var_os("CHAINWORKS_SCCACHE_BINARY");
+        std::env::set_var("CHAINWORKS_SHARED_CARGO_TARGET_DIR", &target_dir);
+        std::env::set_var("CHAINWORKS_SCCACHE_BINARY", &fake_sccache);
+
+        let mut spec = AcpLaunchSpec::new("provider-acp");
+        spec.apply_chainworks_rust_cache_env();
+        let expected = spec.record_capability_fingerprint(Some("profile-a"), None);
+
+        match previous_target {
+            Some(value) => std::env::set_var("CHAINWORKS_SHARED_CARGO_TARGET_DIR", value),
+            None => std::env::remove_var("CHAINWORKS_SHARED_CARGO_TARGET_DIR"),
+        }
+        match previous_sccache {
+            Some(value) => std::env::set_var("CHAINWORKS_SCCACHE_BINARY", value),
+            None => std::env::remove_var("CHAINWORKS_SCCACHE_BINARY"),
+        }
+
+        let target_value = target_dir.to_string_lossy().into_owned();
+        let sccache_value = fake_sccache.to_string_lossy().into_owned();
+        assert!(spec
+            .env
+            .iter()
+            .any(|(name, value)| name == "CARGO_TARGET_DIR" && value == &target_value));
+        assert!(spec
+            .env
+            .iter()
+            .any(|(name, value)| name == "RUSTC_WRAPPER" && value == &sccache_value));
+        assert_eq!(
+            expected,
+            spec.capability_fingerprint(Some("profile-a"), None)
+        );
+        spec.verify_capability_fingerprint()
+            .expect("cache env must be part of the recorded fingerprint");
+    }
+
+    #[test]
     fn launch_preflight_creates_missing_chainworks_meta_root_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let req = crate::ExecutionRequest {
@@ -1360,6 +1521,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: None,
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some(".chainworks/run-meta".to_string()),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
@@ -1418,6 +1580,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: None,
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: None,
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,

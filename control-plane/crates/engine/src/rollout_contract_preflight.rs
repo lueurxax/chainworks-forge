@@ -1919,9 +1919,9 @@ fn effective_cutover_decision(
         };
     };
 
-    let applies_to_post_cutover_starts =
-        lint.cutover_applicable_to.as_deref() == Some("post_cutover_implementation_starts");
-    if applies_to_post_cutover_starts && run.started_at < effective_at {
+    let applies_to_post_ready_starts =
+        lint.cutover_applicable_to.as_deref() == Some("post_ready_implementation_starts");
+    if applies_to_post_ready_starts && run.started_at < effective_at {
         return EffectiveCutoverDecision {
             enforcement_mode: policy.enforcement_mode.clone(),
             grandfathered_not_applicable: lint.cutover_grandfathered_rendering.as_deref()
@@ -4250,7 +4250,7 @@ mod tests {
         contract["cutover_policy"] = serde_json::json!({
             "revision": "p084-cutover-v1",
             "enforcement_mode_at_cutover": "enforce",
-            "applicable_to": "post_cutover_implementation_starts",
+            "applicable_to": "post_ready_implementation_starts",
             "grandfathered_rendering": "not_applicable",
             "effective_timestamp_iso8601": "2026-05-02T00:00:00Z"
         });
@@ -4324,7 +4324,7 @@ mod tests {
         contract["cutover_policy"] = serde_json::json!({
             "revision": "p084-cutover-v1",
             "enforcement_mode_at_cutover": "enforce",
-            "applicable_to": "post_cutover_implementation_starts",
+            "applicable_to": "post_ready_implementation_starts",
             "grandfathered_rendering": "not_applicable",
             "effective_timestamp_iso8601": "2026-05-02T00:00:00Z"
         });

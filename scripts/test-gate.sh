@@ -7,9 +7,22 @@ if [[ -n "${CHAINWORKS_TEST_GATE_ROOT_DIR:-}" ]]; then
 else
   ROOT_DIR="$DEFAULT_ROOT_DIR"
 fi
+if [[ -f "$ROOT_DIR/scripts/cargo-cache-env.sh" ]]; then
+  CHAINWORKS_CARGO_CACHE_REPO_ROOT="$ROOT_DIR"
+  # shellcheck source=scripts/cargo-cache-env.sh
+  source "$ROOT_DIR/scripts/cargo-cache-env.sh"
+fi
 PROJECT_PATH="$ROOT_DIR/Chainworks Forge.xcodeproj"
 SCHEME_NAME="Chainworks Forge"
-DESTINATION="platform=macOS"
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+  arm64|x86_64)
+    DESTINATION="platform=macOS,arch=$HOST_ARCH"
+    ;;
+  *)
+    DESTINATION="platform=macOS"
+    ;;
+esac
 TMP_BASE="${TMPDIR:-/tmp}/chainworks-test-gates"
 TEST_PLANS_DIR="$ROOT_DIR/TestPlans"
 UNSIGNED_BUILD_ARGS=(
@@ -191,6 +204,10 @@ PROPOSAL_093_TESTS=(
 
 PROPOSAL_086_SWIFT_TESTS=(
   "Chainworks ForgeTests/Proposal031ThinGraphQLReadBoundaryTests"
+)
+
+PROPOSAL_083_SWIFT_TESTS=(
+  "Chainworks ForgeTests/AppTerminationCoordinatorTests"
 )
 
 PROPOSAL_046_SWIFT_TESTS=(
@@ -1466,46 +1483,11 @@ check_idle_environment() {
 }
 
 guard_direct_run_insertion() {
-  log "Guard: no direct Run construction outside RunRepository"
-  python3 - "$ROOT_DIR/Chainworks Forge" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-root = Path(sys.argv[1])
-pattern = re.compile(r"(?<![A-Za-z0-9_])Run\s*\(")
-block_comments = re.compile(r"/\*.*?\*/", re.S)
-string_literals = re.compile(r'"(?:\\.|[^"\\])*"')
-exempt = {"RunRepository.swift", "Run.swift"}
-violations = []
-
-for file in root.rglob("*.swift"):
-    if file.name in exempt:
-        continue
-    content = file.read_text(encoding="utf-8")
-    has_exemption_marker = "// RunRepository-exempt" in content
-    content = block_comments.sub("", content)
-    sanitized_lines = []
-    for line in content.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("//"):
-            continue
-        sanitized_lines.append(string_literals.sub('""', line))
-    sanitized = "\n".join(sanitized_lines)
-    if (
-        pattern.search(sanitized)
-        and "RunStatus" not in sanitized
-        and "RunRepositoryError" not in sanitized
-        and not has_exemption_marker
-    ):
-        violations.append(str(file.relative_to(root.parent)))
-
-if violations:
-    print("Direct Run construction found outside RunRepository:", file=sys.stderr)
-    for violation in violations:
-        print(violation, file=sys.stderr)
-    sys.exit(1)
-PY
+  # Retired: the SwiftData `Run` model and `RunRepository` were removed when live
+  # execution/persistence moved to the Rust control-plane. The operator app is now a
+  # GraphQL read shell, so the ARCH-002 "sole Run creator" invariant no longer applies.
+  # Kept as a no-op so existing gate call sites remain valid.
+  :
 }
 
 guard_portability_paths() {
@@ -1718,6 +1700,60 @@ if errors:
     for e in errors:
         print(f"  • {e}", file=sys.stderr)
     sys.exit(1)
+PY
+}
+
+guard_proposal_number_hygiene() {
+  log "Guard: proposal number uniqueness and ROADMAP link integrity"
+  python3 - "$ROOT_DIR" <<'PY'
+"""Proposal-number hygiene guardrail.
+
+1. Proposal numbers are never reused: two different docs/proposals/NNN-*.md
+   base files (audit files excluded) must not share a numeric prefix.
+2. Relative markdown links in docs/ROADMAP.md must resolve to existing files,
+   so the roadmap cannot silently point at renamed or retired proposals.
+"""
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+proposals_dir = root / "docs/proposals"
+roadmap = root / "docs/ROADMAP.md"
+errors = []
+
+# ── 1. Duplicate proposal numbers ──────────────────────────────────
+by_number: dict[str, list[str]] = {}
+for md in sorted(proposals_dir.glob("[0-9]*.md")):
+    if "_IMPLEMENTATION_AUDIT" in md.name:
+        continue
+    m = re.match(r"^(\d+)-", md.name)
+    if not m:
+        continue
+    by_number.setdefault(m.group(1), []).append(md.name)
+
+for number, names in sorted(by_number.items()):
+    if len(names) > 1:
+        errors.append(
+            f"proposal number {number} is used by multiple files: " + ", ".join(names)
+        )
+
+# ── 2. ROADMAP relative links resolve ──────────────────────────────
+link_re = re.compile(r"\]\(([^)#]+)(#[^)]*)?\)")
+for line_no, line in enumerate(roadmap.read_text(encoding="utf-8").splitlines(), 1):
+    for m in link_re.finditer(line):
+        target = m.group(1).strip()
+        if re.match(r"^[a-z]+://", target) or target.startswith("mailto:"):
+            continue
+        if not (roadmap.parent / target).exists():
+            errors.append(f"ROADMAP.md:{line_no}: broken relative link `{target}`")
+
+if errors:
+    print("Proposal-number hygiene violations:", file=sys.stderr)
+    for e in errors:
+        print(f"  • {e}", file=sys.stderr)
+    sys.exit(1)
+print("Proposal-number hygiene guard passed")
 PY
 }
 
@@ -2424,6 +2460,8 @@ Available gates:
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
   proposal-081|p081  Proposal 081 Phase 1 boundary-first API and auth contract matrix gate
+  proposal-082|p082  Proposal 082 recovery/retry state-machine fixture and readback contract gate
+  proposal-083|p083  Proposal 083 focused code-fix regression gate (main-sync request id, rollout cutover, AppKit termination)
   proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
   proposal-086|p086|p086-continuation-preflight
                   Proposal 086 Phase 0 preflight: migration shape, MCP/artifact schemas, and Rust unit tests
@@ -2434,6 +2472,7 @@ Available gates:
   p086-continuation-operator-report
                   Proposal 086 Phase 1 operator-report gate: operator report field coverage
   proposal-087|p087  Proposal 087 read-path liveness and storage tiering gate
+  proposal-096|p096  Proposal 096 bounded tool output and safe search policy gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
   proposal-091|p091  Retained P091 targeted retry authority runtime proof gate
@@ -2475,6 +2514,7 @@ case "$GATE" in
     guard_direct_run_insertion
     guard_xcode_cargo_cache_policy
     guard_plan_tag_sync
+    guard_proposal_number_hygiene
     "$ROOT_DIR/scripts/check-boundary-coverage.sh"
     ;;
   build)
@@ -7629,7 +7669,7 @@ PY
     python3 - "$ROOT_DIR" <<'PY'
 import pathlib, sys
 root = pathlib.Path(sys.argv[1])
-proposal = (root / "docs/proposals/081-boundary-first-api-auth-contract-matrix.md").read_text()
+# P081 proposal retired into reference truth; the reference doc is the checked source.
 reference = (root / "docs/reference/swift-macos-boundary-contract.md").read_text()
 tokens = [
     "full_keyboard_access_redacted_nil_vs_ordinary_nil",
@@ -7638,8 +7678,6 @@ tokens = [
     "operator_alert_fires_and_clears_hidden_window",
 ]
 for token in tokens:
-    if token not in proposal:
-        raise SystemExit(f"P081: proposal missing macOS accessibility proof token {token}")
     if token not in reference:
         raise SystemExit(f"P081: reference missing macOS accessibility proof token {token}")
 print("P081: macOS accessibility contract source coverage valid")
@@ -9456,6 +9494,81 @@ PY
     run_targeted_tests "proposal-086-swift-readback" "${PROPOSAL_086_SWIFT_TESTS[@]}"
     log "Proposal 086 Phase 0 preflight gate passed"
     ;;
+  proposal-083|p083)
+    log "Proposal 083 focused code-fix regression gate"
+    python3 - <<'PY'
+from pathlib import Path
+
+root = Path.cwd()
+
+checks = {
+    "control-plane/crates/mcp-server/src/tools/runs.rs": [
+        "mcp_caller_with_idempotency_request_id",
+        "p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id",
+        "runs.main_sync.request",
+        "runs.main_sync.retry",
+    ],
+    "control-plane/crates/engine/src/rollout_contract_preflight.rs": [
+        "post_ready_implementation_starts",
+        "cutover_policy_grandfathers_pre_cutover_runs_as_not_applicable",
+        "inline_contract_creates_pass_record_before_enqueue",
+    ],
+    "Chainworks Forge/Engine/AppTerminationCoordinator.swift": [
+        "applicationShouldTerminate",
+        "beginGracefulTermination",
+        "terminateLater",
+        "hostTotalMilliseconds",
+    ],
+    "Chainworks ForgeTests/AppTerminationCoordinatorTests.swift": [
+        "gracefulTerminationRepliesAfterBoundedPreparation",
+        "gracefulTerminationIgnoresDuplicateCallbacks",
+    ],
+}
+
+for rel_path, terms in checks.items():
+    text = (root / rel_path).read_text()
+    for term in terms:
+        if term not in text:
+            raise SystemExit(f"proposal-083: {rel_path} missing {term!r}")
+
+for rel_path in [
+    "docs/evidence/rollout-contract/negative/p083-enforce-without-burnin.json",
+    "docs/evidence/rollout-contract/negative/p083-shutdown-deadline-config-invalid.json",
+    "docs/evidence/rollout-contract/negative/p083-command-lease-ttl-config-invalid.json",
+]:
+    text = (root / rel_path).read_text()
+    if "post_ready_implementation_starts" not in text:
+        raise SystemExit(f"proposal-083: {rel_path} missing post_ready_implementation_starts")
+    if "post_cutover_implementation_starts" in text:
+        raise SystemExit(f"proposal-083: {rel_path} still has stale post_cutover_implementation_starts")
+
+print("proposal-083 static regression checks passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      run_p083_cargo_test() {
+        local output status
+        set +e
+        output=$(CARGO_TARGET_DIR=target/proposal-083-gate cargo test "$@" 2>&1)
+        status=$?
+        set -e
+        printf '%s\n' "$output"
+        if [ "$status" -ne 0 ]; then
+          return "$status"
+        fi
+        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
+          echo "FAILED: P083 cargo test filter selected zero tests: cargo test $*" >&2
+          return 1
+        fi
+      }
+
+      run_p083_cargo_test -p mcp-server p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id -- --nocapture
+      run_p083_cargo_test -p engine inline_contract_creates_pass_record_before_enqueue -- --nocapture
+      run_p083_cargo_test -p engine cutover_policy_grandfathers_pre_cutover_runs_as_not_applicable -- --nocapture
+    )
+    run_targeted_tests "proposal-083-swift-termination" "${PROPOSAL_083_SWIFT_TESTS[@]}"
+    log "Proposal 083 focused code-fix regression gate passed"
+    ;;
   p086-continuation-readback)
     log "Proposal 086 Phase 1 readback gate: operator readback fixture field coverage"
     python3 - "$ROOT_DIR" <<'PY'
@@ -10386,6 +10499,390 @@ if "CANONICAL_HOT_READ_SURFACES" not in storage_health_rs:
 print("P087 UI, schema, and evidence verified")
 PY
     log "Proposal 087 gate passed"
+    ;;
+  proposal-082|p082)
+    log "Proposal 082 gate: recovery/retry state-machine fixture and readback contract"
+    python3 - <<'PY'
+from pathlib import Path
+import json
+import sys
+
+root = Path.cwd()
+
+def fail(message: str) -> None:
+    raise SystemExit(f"proposal-082: {message}")
+
+positive_path = root / "docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json"
+if not positive_path.exists():
+    fail("missing docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json")
+positive = json.loads(positive_path.read_text())
+if "placeholder" in positive_path.read_text().lower():
+    fail("positive fixture still contains placeholder text")
+if positive.get("schema_version") != "p082_operator_readback_fixture_v1":
+    fail("positive fixture must use schema_version=p082_operator_readback_fixture_v1")
+if positive.get("proposal_id") != "P082":
+    fail("positive fixture must declare proposal_id=P082")
+
+rollout = positive.get("rollout_contract_readback")
+if not isinstance(rollout, dict):
+    fail("positive fixture missing rollout_contract_readback object")
+required_rollout_fields = [
+    "schema_version",
+    "rollout_contract_status",
+    "rollout_contract_decision",
+    "rollout_contract_failure_reasons",
+    "rollout_contract_waiver_state",
+    "rollout_contract_waiver_expires_at",
+    "rollout_contract_enforcement_mode",
+    "rollout_contract_enforcement_mode_reason",
+    "rollout_contract_hold_conditions",
+    "rollout_contract_rollback_disposition",
+    "rollout_contract_source_lane",
+    "rollout_contract_enabled_state",
+    "rollout_contract_disabled_reason_code",
+    "rollout_contract_action_id",
+    "rollout_contract_operator_message",
+    "rollout_contract_projection_integrity",
+    "rollout_contract_cutover_policy_revision",
+    "rollout_contract_diagnostic_redaction",
+    "rollout_contract_next_steps",
+]
+for field in required_rollout_fields:
+    if field not in rollout:
+        fail(f"rollout_contract_readback missing {field}")
+if rollout["schema_version"] != "operator_readback_v1":
+    fail("rollout_contract_readback.schema_version must be operator_readback_v1")
+if rollout["rollout_contract_status"] != "pass":
+    fail("rollout_contract_readback.rollout_contract_status must be pass")
+
+lanes = positive.get("lane_payloads")
+if not isinstance(lanes, dict):
+    fail("positive fixture missing lane_payloads object")
+for lane in ["runs_get", "reports_get", "report_resource", "run_report", "release_receipt"]:
+    if lane not in lanes:
+        fail(f"positive fixture missing lane_payloads.{lane}")
+
+def readbacks_from_lane(lane: str):
+    payload = lanes[lane]
+    if not isinstance(payload, dict):
+        fail(f"lane_payloads.{lane} must be an object")
+    if lane == "runs_get":
+        if "p082_recovery_matrix_readback" not in payload:
+            fail("runs_get lane missing singular p082_recovery_matrix_readback")
+        if "p082_recovery_matrix_readbacks" not in payload:
+            fail("runs_get lane missing plural p082_recovery_matrix_readbacks")
+        return payload["p082_recovery_matrix_readbacks"]
+    if "p082_recovery_matrix_readback" in payload:
+        fail(f"{lane} lane must not expose singular p082_recovery_matrix_readback")
+    if "p082_recovery_matrix_readbacks" not in payload:
+        fail(f"{lane} lane missing plural p082_recovery_matrix_readbacks")
+    return payload["p082_recovery_matrix_readbacks"]
+
+all_rows = []
+for lane in lanes:
+    rows = readbacks_from_lane(lane)
+    if not isinstance(rows, list) or not rows:
+        fail(f"{lane} lane p082_recovery_matrix_readbacks must be a non-empty array")
+    all_rows.extend(rows)
+
+required_reason_codes = {
+    "retry_identifier_required",
+    "late_output_ignored_after_cancel",
+    "release_side_effect_retry_blocked",
+    "startup_requeue_exhausted",
+    "xcode_startup_grace_active",
+    "rejected_command_error_envelope",
+    "legacy_rejected_command_error_fallback",
+    "workflow_conflict_requires_operator",
+}
+seen_reason_codes = set()
+required_nested = {
+    "retry_identifier_guidance",
+    "late_output_settlement",
+    "startup_repair_summary",
+    "rejected_command_error",
+}
+seen_nested = set()
+for row in all_rows:
+    if not isinstance(row, dict):
+        fail("p082 readback row must be an object")
+    if row.get("schema_version") != "p082_recovery_matrix_readback_v1":
+        fail("readback row missing schema_version=p082_recovery_matrix_readback_v1")
+    for field in [
+        "scenario_id",
+        "reason_code",
+        "recovery_decision",
+        "recovery_next_action",
+        "recovery_hold_conditions",
+        "recovery_projection_integrity",
+        "updated_at",
+    ]:
+        if field not in row:
+            fail(f"readback row missing {field}")
+    seen_reason_codes.add(row["reason_code"])
+    for nested in required_nested:
+        value = row.get(nested)
+        if isinstance(value, dict):
+            schema = value.get("schema_version")
+            expected = {
+                "retry_identifier_guidance": "p082_retry_identifier_guidance_v1",
+                "late_output_settlement": "p082_late_output_settlement_v1",
+                "startup_repair_summary": "p082_startup_repair_summary_v1",
+                "rejected_command_error": "p082_rejected_command_error_v1",
+            }[nested]
+            if schema != expected:
+                fail(f"{nested} has schema_version {schema!r}; expected {expected!r}")
+            seen_nested.add(nested)
+    if row["reason_code"] == "xcode_startup_grace_active":
+        message = row.get("recovery_operator_message")
+        if not isinstance(message, str) or "12 minute" not in message or "Xcode startup" not in message:
+            fail("xcode_startup_grace_active row must include non-null 12 minute Xcode startup operator message")
+
+missing_reasons = required_reason_codes - seen_reason_codes
+if missing_reasons:
+    fail(f"positive fixture missing reason codes: {sorted(missing_reasons)}")
+missing_nested = required_nested - seen_nested
+if missing_nested:
+    fail(f"positive fixture missing nested subcontracts: {sorted(missing_nested)}")
+
+assertions = positive.get("fixture_assertions")
+if not isinstance(assertions, list) or not assertions:
+    fail("positive fixture missing fixture_assertions")
+assertion_text = "\n".join(str(item) for item in assertions)
+for term in [
+    "runs_get exposes singular and plural",
+    "reports_get exposes plural only",
+    "report_resource exposes plural only",
+    "run_report exposes plural only",
+    "release_receipt exposes plural only",
+    "command_journal.error",
+    "legacy plain-text command_journal.error",
+]:
+    if term not in assertion_text:
+        fail(f"fixture_assertions missing {term!r}")
+
+negative_dir = root / "docs/evidence/rollout-contract/negative"
+required_negative_names = [
+    "p082-missing-matrix-row.json",
+    "p082-missing-db-engine-readback-assertion.json",
+    "p082-release-side-effect-retry-not-fail-closed.json",
+    "p082-blind-automatic-retry.json",
+    "p082-missing-readback-reason.json",
+    "p082-missing-rollout-contract-operator-fields.json",
+    "p082-graphql-required-without-contract.json",
+    "p082-duplicate-requeue-without-idempotency.json",
+    "p082-missing-cancel-crash-rows.json",
+    "p082-rejected-command-payload-mutation.json",
+    "p082-lane-field-name-drift.json",
+    "p082-missing-nested-subcontract.json",
+    "p082-xcode-grace-missing-operator-message.json",
+    "p082-malformed-command-error-envelope.json",
+    "p082-missing-startup-requeue-exhausted-row.json",
+    "p082-cancel-late-output-mutates-active-projection.json",
+]
+for name in required_negative_names:
+    path = negative_dir / name
+    if not path.exists():
+        fail(f"missing negative fixture {name}")
+    text = path.read_text()
+    if "placeholder" in text.lower():
+        fail(f"negative fixture {name} still contains placeholder text")
+    payload = json.loads(text)
+    for field in [
+        "schema_version",
+        "fixture_id",
+        "expected_failure_code",
+        "mutated_contract_or_matrix",
+        "assertion",
+    ]:
+        if field not in payload:
+            fail(f"negative fixture {name} missing {field}")
+    if payload["schema_version"] != "p082_negative_fixture_v1":
+        fail(f"negative fixture {name} must use schema_version=p082_negative_fixture_v1")
+    if not str(payload["fixture_id"]).startswith("p082_"):
+        fail(f"negative fixture {name} fixture_id must start with p082_")
+
+for path in [
+    root / "docs/reference/test-gates.md",
+    root / "docs/reference/execution-truth-and-recovery.md",
+]:
+    if path.exists() and "known proof gap" in path.read_text().lower():
+        fail(f"{path.relative_to(root)} still contains known proof gap language")
+
+print("P082 positive fixture, lane contract, nested subcontracts, and negative fixtures verified")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      p082_cargo_target="${CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR:-target/proposal-082}"
+      run_p082_cargo_test() {
+        local output status
+        set +e
+        output=$(CARGO_TARGET_DIR="$p082_cargo_target" cargo test "$@" 2>&1)
+        status=$?
+        set -e
+        printf '%s\n' "$output"
+        if [ "$status" -ne 0 ]; then
+          return "$status"
+        fi
+        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
+          echo "FAILED: P082 cargo test filter selected zero tests: cargo test $*" >&2
+          return 1
+        fi
+      }
+
+      run_p082_cargo_test -p engine --test integration test_cancel_run_eventually_finalizes_to_cancelled -- --nocapture
+      run_p082_cargo_test -p engine --test integration startup_repair_restores_cancelled_run_terminal_invariant -- --nocapture
+      run_p082_cargo_test -p engine --test proposal_061_backpressure retry_stage_injected_crashes_roll_back_and_startup_repair_clears_stale_running_executions -- --nocapture
+      run_p082_cargo_test -p engine --test proposal_061_backpressure host_interruption_late_output_from_superseded_attempt_cannot_promote_over_retry_generation -- --nocapture
+      run_p082_cargo_test -p engine --test proposal_061_backpressure host_interruption_requires_runtime_cleanup_before_retry_enqueue -- --nocapture
+      run_p082_cargo_test -p engine --test integration p082_retry_stage_rejects_stage_execution_uuid_stage_id_before_mutation -- --nocapture
+      run_p082_cargo_test -p engine --test integration p082_retry_stage_rejects_stage_execution_uuid_agent_execution_id_before_mutation -- --nocapture
+      run_p082_cargo_test -p engine p082_duplicate_active_session_generations_converge_to_single_survivor -- --nocapture
+      run_p082_cargo_test -p mcp-server p082_reports_get_rejects_non_operator_before_report_lanes_are_loaded -- --nocapture
+      run_p082_cargo_test -p mcp-server p082_reports_get_tools_call_denies_non_operator_principals -- --nocapture
+      run_p082_cargo_test -p mcp-server p082_report_resource_read_denies_non_operator_principals -- --nocapture
+      run_p082_cargo_test -p mcp-server p058_sec001_runs_get_non_operator_snapshot_fields_redacted -- --nocapture
+      run_p082_cargo_test -p mcp-server p082_workspace_root_guard_rejects_broad_system_roots -- --nocapture
+      run_p082_cargo_test -p mcp-server p082_workspace_root_guard_allows_project_directory -- --nocapture
+      run_p082_cargo_test -p mcp-server p082_runs_start_rejects_workspace_symlink_to_broad_system_root -- --nocapture
+      run_p082_cargo_test -p mcp-server p082_mcp_http_uses_live_principal_table_after_reload -- --nocapture
+      run_p082_cargo_test -p mcp-server p082_mcp_stdio_session_recheck_uses_live_principal_table_after_reload -- --nocapture
+      run_p082_cargo_test -p daemon p082_failed_serve_uses_live_principal_table_after_reload -- --nocapture
+    )
+    log "Proposal 082 gate passed"
+    ;;
+  proposal-096|p096)
+    log "Proposal 096 gate: bounded tool output and safe search policy"
+    python3 - <<'PY'
+from pathlib import Path
+
+root = Path.cwd()
+
+policy = (root / "control-plane/crates/domain/src/tool_policy.rs").read_text()
+required_policy_terms = [
+    "bounded-tool-output-safe-search.v1",
+    "p096-safe-search-guard.v1",
+    "tool_output_budget_preflight_denied",
+    "control-plane/target/**",
+    "**/.forge-codex-acp/**",
+    "**/.codex/**",
+]
+for term in required_policy_terms:
+    if term not in policy:
+        raise SystemExit(f"proposal-096: tool policy missing {term!r}")
+
+runtime = (root / "control-plane/crates/mcp-server/src/tools/runtime.rs").read_text()
+for term in [
+    '"toolOutputGuard"',
+    '"policyReadback"',
+    '"enforcement"',
+    '"activeProbeStatus"',
+    "TOOL_POLICY_VERSION",
+    "TOOL_GUARD_VERSION",
+    "GENERATED_ROOT_DENYLIST",
+    "DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES",
+]:
+    if term not in runtime:
+        raise SystemExit(f"proposal-096: runtime.health missing {term!r}")
+
+classifier = (root / "control-plane/crates/engine/src/failure_classifier.rs").read_text()
+for term in [
+    "tool_output_budget_preflight_denied",
+    "tool_output_budget_exceeded",
+    "codex_unbounded_tool_output",
+]:
+    if term not in classifier:
+        raise SystemExit(f"proposal-096: failure classifier missing {term!r}")
+
+session_policy = (root / "control-plane/crates/engine/src/session/policy.rs").read_text()
+if "tool_output_budget_exceeded" not in session_policy:
+    raise SystemExit("proposal-096: session policy missing tool-output quarantine reason")
+
+transport = (root / "control-plane/crates/acp/src/transport.rs").read_text()
+if "output truncated by Chainworks safe-search guard" not in transport:
+    raise SystemExit("proposal-096: transport missing wrapper truncation marker classification")
+
+reference = (root / "docs/reference/bounded-tool-output-and-safe-search-policy.md").read_text()
+for term in [
+    "bounded-tool-output-safe-search.v1",
+    "p096-safe-search-guard.v1",
+    "tool_output_budget_preflight_denied",
+    "tool_output_budget_exceeded",
+    "codex_unbounded_tool_output",
+    "runtime.health.toolOutputGuard",
+    "generatedRootDenylist",
+    "quarantine",
+]:
+    if term not in reference:
+        raise SystemExit(f"proposal-096: reference doc missing {term!r}")
+
+for path in [
+    "docs/README.md",
+    "docs/reference/current-system-baseline.md",
+    "docs/reference/acp-runtime-transport.md",
+    "docs/reference/mcp-northbound-control-plane-server.md",
+]:
+    text = (root / path).read_text()
+    if "bounded-tool-output-and-safe-search-policy.md" not in text:
+        raise SystemExit(f"proposal-096: {path} missing reference-doc closeout link")
+
+for path in [
+    "control-plane/crates/domain/src/tool_policy.rs",
+    "control-plane/crates/acp/src/adapters/codex.rs",
+    "control-plane/crates/acp/src/transport.rs",
+]:
+    text = (root / path).read_text()
+    if "safe search tool" in text:
+        raise SystemExit(f"proposal-096: {path} still references a non-existent safe search tool")
+
+agents = (root / "examples/agents/agents.yaml").read_text()
+for agent_id in [
+    "proposal_implementation_auditor",
+    "prepush_code_reviewer",
+    "steward_auditor",
+]:
+    marker = f"id: {agent_id}"
+    start = agents.find(marker)
+    if start == -1:
+        raise SystemExit(f"proposal-096: missing prompt agent {agent_id}")
+    next_agent = agents.find("\n  - id:", start + len(marker))
+    section = agents[start:] if next_agent == -1 else agents[start:next_agent]
+    for term in ["bounded", "generated/build roots are excluded", "output is capped"]:
+        if term not in section:
+            raise SystemExit(
+                f"proposal-096: {agent_id} prompt guidance missing {term!r}"
+            )
+
+print("proposal-096 static policy, health, classifier, quarantine, and prompt checks passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      run_p096_cargo_test() {
+        local output status
+        set +e
+        output=$(CARGO_TARGET_DIR=target/proposal-096-gate cargo test "$@" 2>&1)
+        status=$?
+        set -e
+        printf '%s\n' "$output"
+        if [ "$status" -ne 0 ]; then
+          return "$status"
+        fi
+        if ! printf '%s\n' "$output" | grep -Eq '^running [1-9][0-9]* tests?$'; then
+          echo "FAILED: P096 cargo test filter selected zero tests: cargo test $*" >&2
+          return 1
+        fi
+      }
+
+      run_p096_cargo_test -p domain tool_policy -- --nocapture
+      run_p096_cargo_test -p acp permission_preflight_denies_broad_rg_with_typed_error -- --nocapture
+      run_p096_cargo_test -p acp codex_local_activity_classifies_cumulative_tool_output_budget -- --nocapture
+      run_p096_cargo_test -p acp codex_local_activity_classifies_wrapper_truncation_marker_as_budget_exceeded -- --nocapture
+      run_p096_cargo_test -p acp safe_search_wrapper -- --nocapture
+      run_p096_cargo_test -p engine bounded_tool_output_classifies_before_provider_internal_fallback -- --nocapture
+      run_p096_cargo_test -p engine tool_output_budget_failure_requires_session_invalidation -- --nocapture
+      run_p096_cargo_test -p mcp-server proposal_096_runtime_health_includes_tool_output_guard -- --nocapture
+    )
+    log "Proposal 096 gate passed"
     ;;
   *)
     print_usage >&2

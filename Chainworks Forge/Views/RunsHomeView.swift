@@ -382,6 +382,7 @@ struct RunsHomeView: View {
                         if let stageMap = workbench.stageMap {
                             P036OverviewCommandCenterCard(
                                 map: stageMap,
+                                activeAgents: workbench.activeTimelineAgents,
                                 artifacts: workbench.artifactsAndReports,
                                 recoveryEvidence: workbench.recoveryEvidence
                             )
@@ -413,7 +414,10 @@ struct RunsHomeView: View {
 
                     case .stages:
                         if let stageMap = workbench.stageMap {
-                            P036StageMapCard(map: stageMap)
+                            P036StageMapCard(
+                                map: stageMap,
+                                activeAgents: workbench.activeTimelineAgents
+                            )
                         }
                     case .artifacts:
                         P031ArtifactViewerCard(
@@ -5203,6 +5207,7 @@ private nonisolated func makeUUIDv7() -> String {
     ScrollView {
         P036OverviewCommandCenterCard(
             map: P036OverviewCommandCenterPreviewSeed.stageMap,
+            activeAgents: P036OverviewCommandCenterPreviewSeed.activeAgents,
             artifacts: P036OverviewCommandCenterPreviewSeed.artifacts,
             recoveryEvidence: P036OverviewCommandCenterPreviewSeed.recoveryEvidence
         )
@@ -5384,6 +5389,39 @@ private enum P036OverviewCommandCenterPreviewSeed {
             ]
         )
     ])
+
+    static let activeAgents = [
+        RunsWorkbenchPresentationModel.ActiveTimelineAgent(
+            id: "security_checker",
+            title: "Security Checker",
+            providerID: "codex",
+            modelID: "gpt-5",
+            stageID: "state_9_implementation_reviewed",
+            stageLabel: "Implementation reviewed",
+            taskLabel: "implementation_security",
+            status: "running",
+            sessionID: "session-security",
+            latestAt: Date(timeIntervalSince1970: 1_778_000_240),
+            eventCount: 9,
+            selectionOrder: 0,
+            selectionUnavailableReason: nil
+        ),
+        RunsWorkbenchPresentationModel.ActiveTimelineAgent(
+            id: "docs_guardian",
+            title: "Docs Guardian",
+            providerID: "gemini",
+            modelID: "2.5",
+            stageID: "state_9_implementation_reviewed",
+            stageLabel: "Implementation reviewed",
+            taskLabel: "sync_docs",
+            status: "running",
+            sessionID: "session-docs",
+            latestAt: Date(timeIntervalSince1970: 1_778_000_210),
+            eventCount: 4,
+            selectionOrder: 1,
+            selectionUnavailableReason: nil
+        ),
+    ]
 
     static let stageTopology: [P031StageTopologyPresentation] = stageMap.stages.map { stage in
         P031StageTopologyPresentation(
@@ -5637,6 +5675,7 @@ struct P093TimelineProofSurface: View {
                 id: "code_writer",
                 title: "Code Writer",
                 providerID: "codex",
+                modelID: "gpt-5",
                 stageID: "state_10_implementation_refined",
                 stageLabel: "Implementation refined",
                 taskLabel: "refine_implementation",
@@ -5651,6 +5690,7 @@ struct P093TimelineProofSurface: View {
                 id: "reviewer",
                 title: "Reviewer",
                 providerID: "claude",
+                modelID: "sonnet",
                 stageID: "state_9_implementation_reviewed",
                 stageLabel: "Implementation reviewed",
                 taskLabel: "review_implementation",
@@ -5914,6 +5954,7 @@ private struct P036RunDetailSummaryCard: View {
 
 private struct P036StageMapCard: View {
     let map: RunsWorkbenchPresentationModel.StageMap
+    let activeAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -5944,14 +5985,159 @@ private struct P036StageMapCard: View {
                     .padding(.vertical, 2)
                     .padding(.trailing, 4)
                 }
+
+                P036ActiveAgentsReadbackCard(
+                    title: "Active agents",
+                    subtitle: "Live provider sessions for this run",
+                    agents: activeAgents,
+                    stageID: nil,
+                    emptyText: "No running agent executions in latest readback."
+                )
             }
         }
         .forgePanel()
     }
 }
 
+private struct P036ActiveAgentsReadbackCard: View {
+    let title: String
+    let subtitle: String
+    let agents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent]
+    let stageID: String?
+    let emptyText: String
+
+    private var visibleAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent] {
+        let scoped = stageID.map { id in
+            agents.filter { $0.stageID == id }
+        } ?? agents
+        return scoped.sorted {
+            if let lhs = $0.selectionOrder, let rhs = $1.selectionOrder, lhs != rhs {
+                return lhs < rhs
+            }
+            if $0.latestAt != $1.latestAt {
+                return $0.latestAt > $1.latestAt
+            }
+            return $0.title.localizedStandardCompare($1.title) == .orderedAscending
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(title.uppercased())
+                    .font(ForgeTypography.micro.weight(.semibold))
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                Text(subtitle)
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .lineLimit(1)
+                Spacer()
+                if !visibleAgents.isEmpty {
+                    Text("\(visibleAgents.count) active")
+                        .font(ForgeTypography.micro.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(ForgeStatusColor.running)
+                }
+            }
+
+            if visibleAgents.isEmpty {
+                Text(emptyText)
+                    .font(ForgeTypography.supporting)
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                    .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+            } else {
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(visibleAgents) { agent in
+                        P036ActiveAgentReadbackRow(agent: agent)
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(ForgeColor.Surface.elevated.opacity(0.72), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(ForgeColor.Surface.border, lineWidth: 1)
+        }
+    }
+}
+
+private struct P036ActiveAgentReadbackRow: View {
+    let agent: RunsWorkbenchPresentationModel.ActiveTimelineAgent
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "bolt.circle.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(ForgeStatusColor.running)
+                .frame(width: 14)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(agent.title)
+                        .font(ForgeTypography.micro.weight(.semibold))
+                        .foregroundStyle(ForgeColor.Text.primary)
+                        .lineLimit(1)
+                    Text(statusLabel)
+                        .font(ForgeTypography.micro)
+                        .foregroundStyle(ForgeStatusColor.running)
+                        .lineLimit(1)
+                }
+
+                Text(detailText)
+                    .font(ForgeTypography.micro)
+                    .foregroundStyle(ForgeColor.Text.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer(minLength: 8)
+
+            if agent.eventCount > 0 {
+                Text("\(agent.eventCount) events")
+                    .font(ForgeTypography.micro.monospacedDigit())
+                    .foregroundStyle(ForgeColor.Text.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(agent.title), \(statusLabel), \(detailText), \(agent.eventCount) events")
+    }
+
+    private var statusLabel: String {
+        let status = agent.status.trimmingCharacters(in: .whitespacesAndNewlines)
+        return status.isEmpty ? "running" : status
+    }
+
+    private var providerModelLabel: String? {
+        let parts = [
+            agent.providerID,
+            agent.modelID,
+        ].compactMap { value -> String? in
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: " · ")
+    }
+
+    private var detailText: String {
+        [
+            providerModelLabel,
+            agent.stageLabel,
+            agent.taskLabel,
+            agent.sessionID.map { "session \($0)" },
+        ].compactMap { value -> String? in
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        .joined(separator: " · ")
+    }
+}
+
 private struct P036OverviewCommandCenterCard: View {
     let map: RunsWorkbenchPresentationModel.StageMap
+    let activeAgents: [RunsWorkbenchPresentationModel.ActiveTimelineAgent]
     let artifacts: [RunsWorkbenchPresentationModel.ArtifactReportRow]
     let recoveryEvidence: [RunsWorkbenchPresentationModel.RecoveryEvidenceRow]
 
@@ -6009,6 +6195,14 @@ private struct P036OverviewCommandCenterCard: View {
                     stage: currentStage,
                     fallback: "No active stage is marked in readback.",
                     emphasis: .primary
+                )
+
+                P036ActiveAgentsReadbackCard(
+                    title: "Agents in work",
+                    subtitle: currentStage.map { "Current stage · \($0.title)" } ?? "Latest active-agent readback",
+                    agents: activeAgents,
+                    stageID: currentStage?.id,
+                    emptyText: "No active agent executions for the current stage."
                 )
 
                 HStack(alignment: .top, spacing: 12) {

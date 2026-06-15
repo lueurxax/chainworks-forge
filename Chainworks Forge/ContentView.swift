@@ -361,7 +361,7 @@ struct ContentView: View {
 
 private struct P036MainShell<Content: View>: View {
     @Binding var selectedTab: ContentView.Tab
-    @AppStorage("p036.mainNavigationCollapsed") private var isNavigationCollapsed = false
+    @State private var isNavigationCollapsed = false
 
     let pendingApprovals: Int
     let blockedRuns: Int
@@ -383,7 +383,9 @@ private struct P036MainShell<Content: View>: View {
                 Divider()
                 content()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(ForgeColor.Surface.appBackground)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(ForgeColor.Surface.appBackground)
         )
     }
@@ -1056,13 +1058,18 @@ private struct P036ShellSidebar: View {
         }
         .padding(14)
         .frame(
-            minWidth: isCollapsed ? 64 : 230,
-            idealWidth: isCollapsed ? 64 : 230,
-            maxWidth: isCollapsed ? 64 : 230,
+            minWidth: isCollapsed ? 92 : 260,
+            idealWidth: isCollapsed ? 92 : 260,
+            maxWidth: isCollapsed ? 92 : 260,
             maxHeight: .infinity,
             alignment: isCollapsed ? .top : .topLeading
         )
         .background(ForgeColor.Surface.elevated)
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(ForgeColor.Surface.border)
+                .frame(width: 1)
+        }
         .accessibilityIdentifier("p036-branded-sidebar")
     }
 
@@ -1122,7 +1129,7 @@ private struct P036ShellSidebar: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(ForgeColor.Text.secondary)
-        .background(ForgeColor.Surface.muted, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .forgeGlassSurface(.toolbar, tint: ForgeColor.Surface.border, fill: ForgeColor.Surface.muted)
         .help(isCollapsed ? "Expand navigation" : "Collapse navigation")
         .accessibilityLabel(isCollapsed ? "Expand navigation" : "Collapse navigation")
         .accessibilityIdentifier("p036-main-navigation-collapse-button")
@@ -1201,4 +1208,42 @@ extension ContentView.Tab: CaseIterable {
 
 #Preview {
     ContentView(notificationService: NotificationService())
+}
+
+#Preview("P036 Shell Layout") {
+    @Previewable @State var selectedTab: ContentView.Tab = .runs
+
+    P036MainShell(
+        selectedTab: $selectedTab,
+        pendingApprovals: 2,
+        blockedRuns: 1,
+        runningRuns: 3
+    ) {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Implement Proposal 083")
+                        .font(.title2.weight(.semibold))
+                    Text("Running")
+                        .foregroundStyle(ForgeColor.Text.secondary)
+                }
+                Spacer()
+                Button("Check run readiness") {}
+                    .buttonStyle(.bordered)
+            }
+            .padding(24)
+            .background(ForgeColor.Surface.elevated, in: RoundedRectangle(cornerRadius: ForgeRadius.panel, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Run focus", systemImage: "scope")
+                    .font(.headline)
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(ForgeColor.Brand.accentMuted)
+                    .frame(height: 180)
+            }
+            .forgePanel()
+        }
+        .padding(24)
+    }
+    .frame(width: 1180, height: 720)
 }

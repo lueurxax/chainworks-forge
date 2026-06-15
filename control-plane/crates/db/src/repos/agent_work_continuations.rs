@@ -629,7 +629,13 @@ pub async fn has_unresolved_side_effects_for_stage(
 pub async fn has_pending_approval_for_run(pool: &SqlitePool, run_id: &str) -> Result<bool> {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM approvals
-         WHERE run_id = ? AND (decision = 'pending' OR decision = 'requested')",
+         WHERE run_id = ?
+           AND (decision = 'pending' OR decision = 'requested')
+           AND EXISTS (
+                 SELECT 1 FROM runs r
+                  WHERE r.id = approvals.run_id
+                    AND r.status NOT IN ('completed', 'failed', 'cancelled')
+               )",
     )
     .bind(run_id)
     .fetch_one(pool)

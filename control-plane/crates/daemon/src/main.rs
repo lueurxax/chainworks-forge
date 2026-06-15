@@ -714,10 +714,35 @@ async fn run_daemon() -> Result<()> {
             let mcp = mcp_server::server::McpServer::new_with_storage_writer_and_boundary_policy(
                 pool.clone(),
                 cmd_handler.clone(),
-                principal_table,
+                principal_table.clone(),
                 db_writer.heartbeat.clone(),
                 Arc::clone(&boundary_policy),
             );
+            let mcp_principal_handle = mcp.principal_table_handle();
+            let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2);
+            let principals_path_for_reload = paths.principals_path.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(principals_reload_secs))
+                        .await;
+                    match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
+                        Ok(new_table) => {
+                            mcp_principal_handle.update(new_table);
+                            tracing::debug!("MCP principal table reloaded for live revocation");
+                        }
+                        Err(e) => {
+                            mcp_principal_handle.mark_unavailable();
+                            tracing::warn!(
+                                "MCP principal reload failed; auth source marked unavailable \
+                                 (MCP requests will fail-closed): {e:#}"
+                            );
+                        }
+                    }
+                }
+            });
             mcp.run_stdio().await?;
         }
         _ => {
@@ -732,6 +757,7 @@ async fn run_daemon() -> Result<()> {
                     Arc::clone(&boundary_policy),
                 ),
             );
+            let mcp_principal_handle = mcp.principal_table_handle();
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");
 
@@ -759,8 +785,11 @@ async fn run_daemon() -> Result<()> {
                         .await;
                     match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
                         Ok(new_table) => {
-                            p046_live_handle.update(new_table).await;
-                            tracing::debug!("P046 principal table reloaded for live revocation");
+                            p046_live_handle.update(new_table.clone()).await;
+                            mcp_principal_handle.update(new_table);
+                            tracing::debug!(
+                                "principal table reloaded for GraphQL and MCP live revocation"
+                            );
                         }
                         Err(e) => {
                             // Mark the auth source unavailable so running subscriptions
@@ -768,9 +797,10 @@ async fn run_daemon() -> Result<()> {
                             // than continuing under stale grants after a revocation write
                             // that we could not observe.
                             p046_live_handle.mark_unavailable().await;
+                            mcp_principal_handle.mark_unavailable();
                             tracing::warn!(
                                 "P046 principal reload failed; auth source marked unavailable \
-                                 (subscriptions will fail-closed): {e:#}"
+                                 (GraphQL subscriptions and MCP requests will fail-closed): {e:#}"
                             );
                         }
                     }
@@ -1644,12 +1674,33 @@ async fn serve_failed(
         bind_addr = %paths.bind_addr,
         "failed-serve: bound listener; daemon.port written so clients can discover the status surface"
     );
-    failed_serve::serve_failed_state_with_listener(
-        reporter.clone(),
-        principal_table.clone(),
-        listener,
-    )
-    .await
+    let live_principal_table = auth::LivePrincipalTable::new(principal_table.clone());
+    let reload_handle = live_principal_table.clone();
+    let principals_path_for_reload = paths.principals_path.clone();
+    let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(principals_reload_secs)).await;
+            match auth::PrincipalTable::load_or_bootstrap(&principals_path_for_reload) {
+                Ok(new_table) => {
+                    reload_handle.update(new_table);
+                    tracing::debug!("failed-serve principal table reloaded for live revocation");
+                }
+                Err(e) => {
+                    reload_handle.mark_unavailable();
+                    tracing::warn!(
+                        "failed-serve principal reload failed; auth source marked unavailable \
+                         (failed-serve requests will fail-closed): {e:#}"
+                    );
+                }
+            }
+        }
+    });
+    failed_serve::serve_failed_state_with_listener(reporter.clone(), live_principal_table, listener)
+        .await
 }
 
 #[cfg(test)]

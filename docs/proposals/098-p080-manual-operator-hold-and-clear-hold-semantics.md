@@ -5,7 +5,7 @@
 | Date | 2026-06-02 |
 | Status | Draft |
 | Author | Codex |
-| Depends on | [080-continuous-stale-execution-reconciliation.md](080-continuous-stale-execution-reconciliation.md), [081-boundary-first-api-auth-contract-matrix.md](081-boundary-first-api-auth-contract-matrix.md), [execution truth and recovery](../reference/execution-truth-and-recovery.md) |
+| Depends on | [080-continuous-stale-execution-reconciliation.md](080-continuous-stale-execution-reconciliation.md), [boundary-first API/auth contract](../reference/boundary-first-api-auth-contract.md), [execution truth and recovery](../reference/execution-truth-and-recovery.md) |
 | Related | P037 ACP supervision, P083 execution-truth ownership invariants, durable side-effect reconciliation, `docs/reference/rust-control-plane.md` |
 | Scope | Define the governed manual hold, clear-hold, authorization, replay, readback, and audit contract for P080 stale execution reconciliation. |
 | Non-goal | No automatic human approval, no SwiftUI mutation surface, no side-effect retry, and no replacement for P080's automatic stale classification or repair phases. |

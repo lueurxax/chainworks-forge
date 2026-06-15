@@ -1510,7 +1510,7 @@ Host policy:
 
 - local Rust and macOS Swift test toolchains required
 - no live provider account, simulator, daemon process, UI target, network, or real quota exhaustion required
-- remote visual/runtime, Full Keyboard Access, contrast/reduced-motion, and live operational drill evidence is owned by [P096](../proposals/096-p058-release-evidence-and-macos-runtime-proof.md), not this implementation gate
+- remote visual/runtime, Full Keyboard Access, contrast/reduced-motion, and live operational drill evidence is owned by [P100](../proposals/100-p058-release-evidence-and-macos-runtime-proof.md), not this implementation gate
 
 Command:
 
@@ -1960,6 +1960,36 @@ Important:
 - this is a Phase 0 contract/readback gate, not proof that Git mutation or capsule prompt injection is enabled
 - later P064 phases must extend this gate before shipping repositories, sync execution, dirty preservation, conflict routing, or prompt injection
 
+### `proposal-082|p082`
+
+Recovery/retry state-machine fixture and readback contract gate.
+
+The original P082 implementation scope is retained as a proof alias for the
+recovery/retry matrix readback contract. The gate validates the durable fixture
+surface rather than running live providers.
+
+Scope:
+
+- `docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json` exists, is schema-versioned, and carries the required `operator_readback_v1` rollout-contract fields
+- `runs_get` exposes both singular `p082_recovery_matrix_readback` and plural `p082_recovery_matrix_readbacks`
+- `reports_get`, `report_resource`, `run_report`, and `release_receipt` expose only plural `p082_recovery_matrix_readbacks`
+- Required reason codes cover retry identifier guidance, cancel/late-output settlement, side-effect retry block, startup requeue exhaustion, Xcode startup grace, rejected-command typed error, legacy rejected-command fallback, and workflow conflict operator hold
+- Nested subcontracts are present for retry identifier guidance, late-output settlement, startup repair summary, and rejected-command error parsing
+- All P082 negative fixtures under `docs/evidence/rollout-contract/negative/p082-*.json` are present, schema-versioned, non-placeholder, and carry a concrete expected failure code plus mutation/assertion description
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-082
+./scripts/test-gate.sh p082
+```
+
+Important:
+
+- `proposal-082|p082` is a retained proof alias for fixture, lane, and readback-contract integrity
+- the gate fails closed if any fixture regresses to placeholder text, drops required rollout fields, drifts singular/plural lane placement, loses nested subcontract schemas, or removes a required negative case
+- P082 readbacks are diagnostic and operator-safe; release receipts may include plural diagnostic rows but do not become a recovery command lane
+
 ### `proposal-085|p085`
 
 Thin-client read-model parity and affordance contract gate.
@@ -2001,6 +2031,30 @@ Important:
 - `payload_deferred` must never collapse to `unavailable`; enforced by the Swift test slice
 - unknown GraphQL enum values must produce `.unknown` states; proved by `unknownPayloadStateFailsClosed` and `unknownFreshnessStateFailsClosed` tests
 
+### `proposal-083|p083`
+
+Focused P083 code-fix regression gate for the implementation-review fixes that can be proven locally.
+
+Scope:
+
+- verifies MCP `runs.main_sync.request` and `runs.main_sync.retry` stamp the idempotency key into caller `request_id`
+- verifies rollout cutover applicability uses `post_ready_implementation_starts` in preflight code and P083 evidence fixtures
+- verifies the macOS termination coordinator has the bounded `applicationShouldTerminate` / `terminateLater` path and duplicate-callback guard
+- runs focused Rust slices in `mcp-server` and `engine` and the Swift `AppTerminationCoordinatorTests` slice
+- fails closed if any targeted cargo filter selects zero tests
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-083
+./scripts/test-gate.sh p083
+```
+
+Important:
+
+- this is a focused regression gate for the reviewed P083 code issues, not a declaration that all broad P083 proposal scope is closeout-ready
+- broader P083 readiness still depends on the proposal-specific review workflow and release evidence
+
 ### `proposal-087|p087`
 
 Retained historical alias for the local storage tiering, read-path liveness, and SQLite exit-criteria gate. Operational truth lives in [query-projections-and-client-consumption-contract.md](query-projections-and-client-consumption-contract.md) and [rust-control-plane.md](rust-control-plane.md).
@@ -2023,6 +2077,28 @@ Important:
 - `proposal-087|p087` is retained as a historical gate alias; the retired proposal document is not the source of operational truth
 - `p087_*` remains stable rollout-readback vocabulary for this implemented contract
 - the gate is a focused proof path for storage tiering and read-path liveness, not a substitute for the full repository gate
+
+### `proposal-096|p096`
+
+Bounded tool output and safe search policy gate for ACP/provider runtime discovery.
+
+Scope:
+
+- verifies the shared runtime tool policy versions, generated/build denylist, safe-search preflight denial, output budgets, wrapper truncation marker classification, failure classification, session quarantine, runtime health policy/enforcement readback, and reviewer/auditor prompt guidance
+- runs focused Rust slices for `domain`, `acp`, `engine`, and `mcp-server`
+- fails closed if any targeted cargo filter selects zero tests
+
+Command:
+
+```bash
+./scripts/test-gate.sh proposal-096
+./scripts/test-gate.sh p096
+```
+
+Important:
+
+- prompt guidance is advisory; the ACP/runtime tool boundary remains authoritative
+- broad `rg`/`find` over repo or worktree roots must either be narrowed or explicitly exclude generated/build roots
 
 ### `proposal-088|p088`
 

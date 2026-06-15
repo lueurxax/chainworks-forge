@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 // P029: PrincipalClass is canonically defined in domain::commands.
 // Re-export here so downstream crates that use auth::PrincipalClass keep working.
@@ -254,6 +255,58 @@ pub struct PrincipalTable {
     entries: Vec<PrincipalEntry>,
 }
 
+#[derive(Clone, Debug)]
+pub struct LivePrincipalTable {
+    inner: Arc<RwLock<Option<PrincipalTable>>>,
+}
+
+impl LivePrincipalTable {
+    pub fn new(table: PrincipalTable) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Some(table))),
+        }
+    }
+
+    pub fn resolve_bearer(&self, token: &str) -> Result<Principal, AuthError> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| AuthError::TableLoadFailed("principal table lock poisoned".to_string()))?;
+        let table = guard
+            .as_ref()
+            .ok_or_else(|| AuthError::TableLoadFailed("principal table unavailable".to_string()))?;
+        resolve_bearer(token, table)
+    }
+
+    pub fn update(&self, new_table: PrincipalTable) {
+        if let Ok(mut guard) = self.inner.write() {
+            *guard = Some(new_table);
+        }
+    }
+
+    pub fn mark_unavailable(&self) {
+        if let Ok(mut guard) = self.inner.write() {
+            *guard = None;
+        }
+    }
+
+    pub fn resolve_principal_fingerprint(
+        &self,
+        principal_id: &str,
+        token_fingerprint: &str,
+    ) -> Result<Principal, AuthError> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| AuthError::TableLoadFailed("principal table lock poisoned".to_string()))?;
+        let table = guard
+            .as_ref()
+            .ok_or_else(|| AuthError::TableLoadFailed("principal table unavailable".to_string()))?;
+        find_valid_principal_by_id_and_token_fingerprint(table, principal_id, token_fingerprint)
+            .ok_or(AuthError::UnknownToken)
+    }
+}
+
 impl PrincipalTable {
     /// Test/fixture stand-in: single operator principal with a known token.
     /// Plain pub fn (not cfg(test)) because integration tests in other crates
@@ -294,6 +347,35 @@ impl PrincipalTable {
                 id: "test-observer".into(),
                 class: PrincipalClass::Observer,
                 surface_policies: None,
+                ..Default::default()
+            }],
+        }
+    }
+
+    pub fn test_fixture_with_class(
+        token: impl Into<String>,
+        id: impl Into<String>,
+        class: PrincipalClass,
+    ) -> Self {
+        PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: token.into(),
+                id: id.into(),
+                class,
+                surface_policies: None,
+                ..Default::default()
+            }],
+        }
+    }
+
+    pub fn test_fixture_disabled_token(token: impl Into<String>, id: impl Into<String>) -> Self {
+        PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: token.into(),
+                id: id.into(),
+                class: PrincipalClass::Operator,
+                surface_policies: None,
+                disabled: Some(true),
                 ..Default::default()
             }],
         }
@@ -660,6 +742,23 @@ pub fn principal_token_fingerprint_by_id(
         .iter()
         .find(|entry| entry.id == principal_id)
         .map(|entry| token_fingerprint(&entry.token))
+}
+
+pub fn find_valid_principal_by_id_and_token_fingerprint(
+    table: &PrincipalTable,
+    principal_id: &str,
+    expected_fingerprint: &str,
+) -> Option<Principal> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    table
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.id == principal_id
+                && is_entry_valid_at(entry, now_ms)
+                && token_fingerprint(&entry.token) == expected_fingerprint
+        })
+        .map(Principal::from_entry)
 }
 
 /// Extract bearer token from an Authorization header value.
@@ -1060,9 +1159,7 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
             matches!(class, PrincipalClass::Operator | PrincipalClass::Agent)
         }
         CapabilityToolId::IdeasList => true,
-        CapabilityToolId::RunsStart => {
-            matches!(class, PrincipalClass::Operator | PrincipalClass::Agent)
-        }
+        CapabilityToolId::RunsStart => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::RunsList => true,
         CapabilityToolId::RunsGet => true,
         CapabilityToolId::RunsMainSyncRequest => matches!(class, PrincipalClass::Operator),
@@ -1088,7 +1185,7 @@ fn tool_allowed_for_class(class: &PrincipalClass, id: CapabilityToolId) -> bool 
         CapabilityToolId::LegacyDiscoveryOverrideCreate => {
             matches!(class, PrincipalClass::Operator)
         }
-        CapabilityToolId::ReportsGet => true,
+        CapabilityToolId::ReportsGet => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::ArtifactsOverrideContract => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StewardRunAnalysis => matches!(class, PrincipalClass::Operator),
         CapabilityToolId::StewardListAnalyses => {
@@ -1182,8 +1279,9 @@ fn resource_allowed_for_class(class: &PrincipalClass, id: ResourceTemplateId) ->
     match id {
         ResourceTemplateId::RunEntity => true,
         ResourceTemplateId::IdeaEntity => true,
-        ResourceTemplateId::ArtifactEntity => true,
-        ResourceTemplateId::ReportEntity => true,
+        ResourceTemplateId::ArtifactEntity | ResourceTemplateId::ReportEntity => {
+            matches!(class, PrincipalClass::Operator)
+        }
         ResourceTemplateId::StewardAnalysisEntity => {
             matches!(class, PrincipalClass::Operator | PrincipalClass::Observer)
         }
@@ -1363,7 +1461,7 @@ mod tests {
     #[test]
     fn agent_cannot_approve() {
         let p = Principal::new("ag", PrincipalClass::Agent);
-        assert!(is_tool_allowed(&p, "runs.start"));
+        assert!(!is_tool_allowed(&p, "runs.start"));
         assert!(!is_tool_allowed(&p, "approvals.resolve"));
         assert!(!is_tool_allowed(&p, "stages.retry"));
         assert!(!is_tool_allowed(&p, "runs.main_sync.request"));
@@ -1374,7 +1472,7 @@ mod tests {
     fn observer_read_only() {
         let p = Principal::new("ob", PrincipalClass::Observer);
         assert!(is_tool_allowed(&p, "runs.list"));
-        assert!(is_tool_allowed(&p, "reports.get"));
+        assert!(!is_tool_allowed(&p, "reports.get"));
         assert!(!is_tool_allowed(&p, "ideas.create"));
         assert!(!is_tool_allowed(&p, "runs.start"));
     }
@@ -1394,6 +1492,41 @@ mod tests {
         assert_eq!(p.id, "test-op");
         assert_eq!(p.class, PrincipalClass::Operator);
         assert!(resolve_bearer("bad-token", &table).is_err());
+    }
+
+    #[test]
+    fn live_principal_table_observes_revocation_and_unavailable_state() {
+        let table = PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: "tok-1234567890123456789012345678".into(),
+                id: "test-op".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: None,
+                ..Default::default()
+            }],
+        };
+        let live = LivePrincipalTable::new(table);
+        let fingerprint = token_fingerprint("tok-1234567890123456789012345678");
+
+        assert!(live
+            .resolve_bearer("tok-1234567890123456789012345678")
+            .is_ok());
+        assert!(live
+            .resolve_principal_fingerprint("test-op", &fingerprint)
+            .is_ok());
+
+        live.update(PrincipalTable { entries: vec![] });
+        assert!(live
+            .resolve_bearer("tok-1234567890123456789012345678")
+            .is_err());
+        assert!(live
+            .resolve_principal_fingerprint("test-op", &fingerprint)
+            .is_err());
+
+        live.mark_unavailable();
+        assert!(live
+            .resolve_bearer("tok-1234567890123456789012345678")
+            .is_err());
     }
 
     #[test]
@@ -1479,8 +1612,11 @@ mod tests {
         let ob = Principal::new("ob", PrincipalClass::Observer);
         assert!(is_resource_allowed(&ob, ResourceTemplateId::RunEntity));
         assert!(is_resource_allowed(&ob, ResourceTemplateId::IdeaEntity));
-        assert!(is_resource_allowed(&ob, ResourceTemplateId::ArtifactEntity));
-        assert!(is_resource_allowed(&ob, ResourceTemplateId::ReportEntity));
+        assert!(!is_resource_allowed(
+            &ob,
+            ResourceTemplateId::ArtifactEntity
+        ));
+        assert!(!is_resource_allowed(&ob, ResourceTemplateId::ReportEntity));
         assert!(is_resource_allowed(
             &ob,
             ResourceTemplateId::StewardAnalysisEntity

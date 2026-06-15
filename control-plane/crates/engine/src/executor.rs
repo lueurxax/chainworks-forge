@@ -71,7 +71,8 @@ use crate::contracts::{
 };
 use crate::event_bus::EventSender;
 use crate::failure_classifier::{
-    classify_observation, observation_from_acp_error_message, RuntimeFailureClassification,
+    classify_observation, observation_from_acp_error_message,
+    observation_from_acp_error_message_at, RuntimeFailureClassification,
 };
 use crate::git_manifest::generate_changed_files_manifest_if_declared;
 use crate::housekeeping::{GeneratedStateHousekeeper, GeneratedStateHousekeepingConfig};
@@ -1703,6 +1704,7 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
                 reuse_existing_session: false,
                 session_generation_id: None,
                 provider_session_id: None,
+                provider_runtime_home: None,
                 mcp_servers: mcp_resolution.payloads,
                 chainworks_meta_root: Some(
                     invocation
@@ -1734,12 +1736,165 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
     }
 }
 
+#[cfg(unix)]
+fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
+    write_discovered_output_dirfd_unix(Path::new(path), content)
+}
+
+#[cfg(unix)]
+fn write_discovered_output_dirfd_unix(path: &Path, content: &[u8]) -> Result<()> {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    fn component_cstring(component: &std::ffi::OsStr) -> Result<CString> {
+        CString::new(component.as_bytes()).context("output path component contains NUL byte")
+    }
+
+    fn open_dir_at(parent_fd: RawFd, component: &std::ffi::OsStr) -> Result<File> {
+        let component = component_cstring(component)?;
+        let fd = unsafe {
+            libc::openat(
+                parent_fd,
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("open output directory component without following symlinks");
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn mkdir_at(parent_fd: RawFd, component: &std::ffi::OsStr) -> Result<()> {
+        let component = component_cstring(component)?;
+        let rc = unsafe { libc::mkdirat(parent_fd, component.as_ptr(), 0o755) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(());
+        }
+        Err(error).context("create output directory component without following symlinks")
+    }
+
+    let traversal_path = normalize_trusted_root_symlink_alias_unix(path);
+    let mut components = Vec::new();
+    let mut absolute = false;
+    for component in traversal_path.components() {
+        match component {
+            Component::RootDir => absolute = true,
+            Component::Normal(value) => components.push(value.to_os_string()),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                anyhow::bail!(
+                    "refusing to materialize output path with non-normal component: {}",
+                    traversal_path.display()
+                );
+            }
+        }
+    }
+
+    let Some((file_name, parent_components)) = components.split_last() else {
+        anyhow::bail!(
+            "refusing to materialize output without a file name: {}",
+            traversal_path.display()
+        );
+    };
+
+    let mut dir = File::open(if absolute { "/" } else { "." })
+        .context("open trusted output traversal root")?;
+    for component in parent_components {
+        mkdir_at(dir.as_raw_fd(), component.as_os_str())?;
+        dir = open_dir_at(dir.as_raw_fd(), component.as_os_str())?;
+    }
+
+    let file_name = component_cstring(file_name.as_os_str())?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "open output file without following symlinks: {}",
+                traversal_path.display()
+            )
+        });
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(content)
+        .with_context(|| format!("write discovered output: {}", traversal_path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn normalize_trusted_root_symlink_alias_unix(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return path.to_path_buf();
+    }
+    let Some(Component::Normal(first)) = components.next() else {
+        return path.to_path_buf();
+    };
+
+    let root_child = Path::new("/").join(first);
+    let Ok(metadata) = std::fs::symlink_metadata(&root_child) else {
+        return path.to_path_buf();
+    };
+    if !metadata.file_type().is_symlink() {
+        return path.to_path_buf();
+    }
+
+    let Ok(mut normalized) = std::fs::canonicalize(&root_child) else {
+        return path.to_path_buf();
+    };
+    for component in components {
+        normalized.push(component.as_os_str());
+    }
+    normalized
+}
+
+#[cfg(not(unix))]
 fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
     let path_obj = std::path::Path::new(path);
     if let Some(parent) = path_obj.parent() {
         std::fs::create_dir_all(parent)?;
+        reject_symlinked_parent_components(parent)?;
     }
     std::fs::write(path_obj, content)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reject_symlinked_parent_components(parent: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        if std::fs::symlink_metadata(&current)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            anyhow::bail!(
+                "refusing to materialize output through symlinked parent: {}",
+                current.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -3432,9 +3587,51 @@ fn runtime_facts_for_acp_error(
     facts.transport_error_code = classification.transport_error_code;
     facts.supervision_classification = classification.supervision_classification;
     if let Some(receipt) = acp::runtime_receipt_from_error(error) {
+        if let Some(receipt_classification) = provider_quota_classification_from_receipt(receipt) {
+            apply_runtime_failure_classification(&mut facts, &receipt_classification, now);
+        }
         enrich_runtime_facts_with_receipt(&mut facts, receipt);
     }
     facts
+}
+
+fn apply_runtime_failure_classification(
+    facts: &mut AgentExecutionRuntimeFacts,
+    classification: &RuntimeFailureClassification,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    facts.failure_kind = Some(classification.failure_kind.clone());
+    facts.operator_action_hint = Some(classification.operator_action_hint.clone());
+    facts.retry_after = retry_after_or_default_for_provider_quota(classification, now);
+    facts.transport_error_code = classification.transport_error_code.clone();
+    facts.supervision_classification = classification.supervision_classification.clone();
+}
+
+fn provider_quota_classification_from_receipt(
+    receipt: &acp::AcpRuntimeReceipt,
+) -> Option<RuntimeFailureClassification> {
+    if !matches!(
+        receipt.failure_phase.as_deref(),
+        Some("prompt_error_response" | "provider_quota")
+    ) {
+        return None;
+    }
+    let provider_error = receipt.provider_error_message_redacted.as_deref()?;
+    let observed_at = receipt_timestamp(receipt).unwrap_or_else(chrono::Utc::now);
+    let classification = classify_observation(observation_from_acp_error_message_at(
+        provider_error,
+        observed_at,
+    ));
+    (classification.failure_kind == AgentFailureKind::ProviderQuota).then_some(classification)
+}
+
+fn receipt_timestamp(receipt: &acp::AcpRuntimeReceipt) -> Option<chrono::DateTime<chrono::Utc>> {
+    receipt
+        .completed_at
+        .as_deref()
+        .or(Some(receipt.started_at.as_str()))
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
 fn runtime_receipt_record_from_receipt(
@@ -3617,18 +3814,6 @@ fn xcode_broker_required_for_invocation(
         && (explicit_xcode_broker_required
             || requires_xcode_runtime
             || requested_mcp_server_ids.iter().any(|id| id == "xcode"))
-}
-
-fn is_reused_live_session_transport_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("no live acp session registered for generation id")
-        || lower.contains("acp: send session/prompt")
-        || lower.contains("write acp message to subprocess stdin")
-        || lower.contains("broken pipe")
-        || lower.contains("epipe")
-        || lower.contains("stdout closed")
-        || lower.contains("transport closed")
-        || lower.contains("session closed during active prompt")
 }
 
 fn session_scope_can_remain_live_after_settlement(scope: &str) -> bool {
@@ -4387,9 +4572,15 @@ fn session_reuse_reason_for_policy_decision(decision: &SessionPolicyDecision) ->
 fn observed_failure_classification_for_execution_result(
     result_status: &AgentStatus,
     transcript_text: Option<&str>,
+    runtime_receipt: Option<&acp::AcpRuntimeReceipt>,
 ) -> Option<RuntimeFailureClassification> {
     if *result_status != AgentStatus::Failed {
         return None;
+    }
+    if let Some(classification) =
+        runtime_receipt.and_then(provider_quota_classification_from_receipt)
+    {
+        return Some(classification);
     }
     transcript_text.map(|text| classify_observation(observation_from_acp_error_message(text)))
 }
@@ -4402,25 +4593,12 @@ fn output_contract_repair_skip_classification(
     if *result_status != AgentStatus::Failed {
         return None;
     }
-    if runtime_receipt
-        .and_then(|receipt| receipt.failure_phase.as_deref())
-        .is_some_and(|phase| phase == "provider_quota")
-    {
-        return Some(classify_observation(
-            crate::failure_classifier::RuntimeFailureObservation::ProviderQuota {
-                retry_after: transcript_text
-                    .map(observation_from_acp_error_message)
-                    .and_then(|observation| match observation {
-                        crate::failure_classifier::RuntimeFailureObservation::ProviderQuota {
-                            retry_after,
-                        } => retry_after,
-                        _ => None,
-                    }),
-            },
-        ));
-    }
-    observed_failure_classification_for_execution_result(result_status, transcript_text)
-        .filter(|classification| classification.failure_kind == AgentFailureKind::ProviderQuota)
+    observed_failure_classification_for_execution_result(
+        result_status,
+        transcript_text,
+        runtime_receipt,
+    )
+    .filter(|classification| classification.failure_kind == AgentFailureKind::ProviderQuota)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4605,22 +4783,6 @@ fn find_discovered_artifact_for_output<'a>(
     discovered_artifacts
         .iter()
         .find(|artifact| artifact.name == output_name || artifact.name == target_path)
-}
-
-fn discovered_artifact_matches_declared_output(
-    discovered: &acp::DiscoveredArtifact,
-    declared: &DeclaredOutput,
-) -> bool {
-    discovered.name == declared.output_name
-        || discovered.name == declared.target_path
-        || declared
-            .companion_output_name
-            .as_deref()
-            .is_some_and(|name| discovered.name == name)
-        || declared
-            .companion_path
-            .as_deref()
-            .is_some_and(|path| discovered.name == path)
 }
 
 fn declared_machine_artifact_name<'a>(declared: &'a DeclaredOutput) -> &'a str {
@@ -7377,6 +7539,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                 reuse_existing_session: true,
                 session_generation_id: Some(session_generation_id.clone()),
                 provider_session_id: ctx.provider_session_id.clone(),
+                provider_runtime_home: None,
                 mcp_servers: Vec::new(),
                 chainworks_meta_root: ctx.chainworks_meta_root,
                 legacy_broad_discovery_policy:
@@ -7667,49 +7830,6 @@ You are continuing the same Chainworks agent execution through an existing live 
                         "P017 mediation expiry watchdog: failed to check for expired confirmations"
                     );
                 }
-            }
-        }
-    }
-
-    async fn mark_agent_execution_failed_if_running(
-        &self,
-        agent_execution_id: domain::ids::AgentExecutionId,
-        item_id: &str,
-        error_message: &str,
-    ) {
-        match agent_executions::find_by_id(&self.pool, agent_execution_id).await {
-            Ok(Some(execution)) if execution.status == AgentStatus::Running => {
-                if let Err(update_error) = agent_executions::update_completed(
-                    &self.pool,
-                    agent_execution_id,
-                    AgentStatus::Failed,
-                    chrono::Utc::now(),
-                )
-                .await
-                {
-                    error!(
-                        item_id = %item_id,
-                        agent_execution_id = %agent_execution_id,
-                        error = %update_error,
-                        "Failed to close running agent execution after InvokeAgent work item failure"
-                    );
-                } else {
-                    warn!(
-                        item_id = %item_id,
-                        agent_execution_id = %agent_execution_id,
-                        failure = %error_message,
-                        "Closed stale running agent execution after InvokeAgent work item failure"
-                    );
-                }
-            }
-            Ok(Some(_)) | Ok(None) => {}
-            Err(find_error) => {
-                error!(
-                    item_id = %item_id,
-                    agent_execution_id = %agent_execution_id,
-                    error = %find_error,
-                    "Failed to inspect agent execution after InvokeAgent work item failure"
-                );
             }
         }
     }
@@ -9164,6 +9284,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     provider_session_id: policy_decision
                         .as_ref()
                         .and_then(|decision| decision.generation.provider_session_id.clone()),
+                    provider_runtime_home: None,
                     mcp_servers: mcp_resolution.payloads,
                     chainworks_meta_root: run.chainworks_meta_root.clone(),
                     legacy_broad_discovery_policy: legacy_broad_discovery_policy.clone(),
@@ -11328,6 +11449,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                         observed_failure_classification_for_execution_result(
                             &result.status,
                             result.transcript_text.as_deref(),
+                            result.runtime_receipt.as_ref(),
                         ),
                         result.close_diagnostic.as_ref(),
                         result.runtime_receipt.as_ref(),
@@ -11926,6 +12048,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    let settled =
+                        db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                            .await?;
+                    if !settled {
+                        return Err(anyhow::anyhow!(
+                            "side_effect_cas_lost: settlement CAS missed for effect {}; release git_commit artifact not committed",
+                            commit_lease.effect_id
+                        ));
+                    }
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -11986,6 +12117,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                         last_error: &error_str,
                         now: chrono::Utc::now(),
                     };
+                    let transitioned =
+                        db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params)
+                            .await?;
+                    if !transitioned {
+                        warn!(
+                            effect_id = %commit_lease.effect_id,
+                            "side_effect_cas_lost: git_commit failure CAS missed; reaper may have already transitioned the row"
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -12151,6 +12291,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    let settled =
+                        db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                            .await?;
+                    if !settled {
+                        return Err(anyhow::anyhow!(
+                            "side_effect_cas_lost: settlement CAS missed for effect {}; release git_push artifact not committed",
+                            push_lease.effect_id
+                        ));
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -12229,6 +12378,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                         last_error: &error_str,
                         now,
                     };
+                    let transitioned =
+                        db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params)
+                            .await?;
+                    if !transitioned {
+                        warn!(
+                            effect_id = %push_lease.effect_id,
+                            "side_effect_cas_lost: git_push failure CAS missed; reaper may have already transitioned the row"
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -12406,6 +12564,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    let settled =
+                        db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                            .await?;
+                    if !settled {
+                        return Err(anyhow::anyhow!(
+                            "side_effect_cas_lost: settlement CAS missed for effect {}; release build_archive artifact not committed",
+                            build_lease.effect_id
+                        ));
+                    }
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -12466,6 +12633,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                         last_error: &error_str,
                         now,
                     };
+                    let transitioned =
+                        db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params)
+                            .await?;
+                    if !transitioned {
+                        warn!(
+                            effect_id = %build_lease.effect_id,
+                            "side_effect_cas_lost: build_archive failure CAS missed; reaper may have already transitioned the row"
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -12671,6 +12847,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    let settled =
+                        db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                            .await?;
+                    if !settled {
+                        return Err(anyhow::anyhow!(
+                            "side_effect_cas_lost: settlement CAS missed for effect {}; release connect_upload artifact not committed",
+                            connect_lease.effect_id
+                        ));
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -12770,6 +12955,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                         last_error: &error_str,
                         now,
                     };
+                    let transitioned =
+                        db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params)
+                            .await?;
+                    if !transitioned {
+                        warn!(
+                            effect_id = %connect_lease.effect_id,
+                            "side_effect_cas_lost: connect_upload failure CAS missed; reaper may have already transitioned the row"
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -14484,29 +14678,6 @@ You are continuing the same Chainworks agent execution through an existing live 
             attempt_count: 0,
             last_error: None,
         })
-    }
-
-    async fn persist_json_artifact<T: Serialize>(
-        &self,
-        run: &domain::run::Run,
-        stage_id: &str,
-        agent_id: &str,
-        provider: &str,
-        model: Option<String>,
-        name: &str,
-        value: &T,
-    ) -> Result<String> {
-        let artifact = self
-            .prepare_release_json_artifact(run, stage_id, agent_id, provider, model, name, value)?;
-        let path = artifact.file_path.clone();
-        artifacts::insert(&self.pool, &artifact).await?;
-        let _ = self
-            .events
-            .send(domain::events::DomainEvent::ArtifactCreated {
-                run_id: run.id,
-                artifact_id: artifact.id,
-            });
-        Ok(path)
     }
 
     async fn persist_delivery_receipt_if_absent(
@@ -19660,6 +19831,111 @@ plain progress line without gate evidence";
     }
 
     #[test]
+    fn provider_quota_prompt_error_uses_receipt_reset_for_repair_skip() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 2,
+                session_update_count: 1,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 1,
+                unknown_notification_count: 1,
+            },
+            Some("prompt_error_response"),
+        );
+        receipt.provider = "claude".into();
+        receipt.completed_at = Some("2026-06-11T22:16:16.294297+00:00".into());
+        receipt.provider_error_message_redacted = Some(
+            "ACP session/prompt returned error: Internal error: You're out of extra usage · resets 4am (Asia/Nicosia)"
+                .into(),
+        );
+
+        let classification = output_contract_repair_skip_classification(
+            &AgentStatus::Failed,
+            Some("I'll read the input artifacts to understand what refinements are needed."),
+            Some(&receipt),
+        )
+        .expect("provider quota prompt error should skip output contract repair");
+
+        assert_eq!(classification.failure_kind, AgentFailureKind::ProviderQuota);
+        assert_eq!(
+            classification.retry_after.map(|dt| dt.to_rfc3339()),
+            Some("2026-06-12T01:00:00+00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_quota_receipt_overrides_no_output_validation_failure() {
+        let mut receipt = sample_runtime_receipt(
+            acp::AcpRuntimeReceiptCounters {
+                total_messages: 2,
+                session_update_count: 1,
+                permission_request_count: 0,
+                permission_grant_sent_count: 0,
+                permission_grant_failed_count: 0,
+                agent_message_chunk_count: 0,
+                agent_thought_chunk_count: 0,
+                tool_call_count: 0,
+                tool_call_update_count: 0,
+                plan_update_count: 0,
+                meaningful_progress_count: 1,
+                unknown_notification_count: 1,
+            },
+            Some("prompt_error_response"),
+        );
+        receipt.provider = "claude".into();
+        receipt.completed_at = Some("2026-06-11T22:16:16.294297+00:00".into());
+        receipt.provider_error_message_redacted = Some(
+            "ACP session/prompt returned error: Internal error: You're out of extra usage · resets 4am (Asia/Nicosia)"
+                .into(),
+        );
+        let validation = TaskValidationSummary {
+            output_results: vec![],
+            contract_metadata: vec![],
+            raw_output_exists: false,
+            failure_class: Some(domain::validation::ValidationFailureClass::NoOutputProduced),
+            failure_summary: Some("required output was not produced".into()),
+        };
+
+        let facts = runtime_facts_for_execution_result(
+            domain::ids::AgentExecutionId::new(),
+            AgentStatus::Failed,
+            Some(&validation),
+            observed_failure_classification_for_execution_result(
+                &AgentStatus::Failed,
+                Some("I'll read the input artifacts to understand what refinements are needed."),
+                Some(&receipt),
+            ),
+            chrono::DateTime::parse_from_rfc3339("2026-06-11T22:16:16.294297Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            None,
+            Some(&receipt),
+            None,
+        );
+
+        assert_eq!(facts.failure_kind, Some(AgentFailureKind::ProviderQuota));
+        assert_eq!(
+            facts.operator_action_hint,
+            Some(OperatorActionHint::WaitUntilRetryAfter)
+        );
+        assert_eq!(
+            facts.retry_after.map(|dt| dt.to_rfc3339()),
+            Some("2026-06-12T01:00:00+00:00".to_string())
+        );
+        assert_eq!(
+            facts.output_settlement,
+            AgentOutputSettlement::MissingRequiredOutputs
+        );
+    }
+
+    #[test]
     fn p088_capture_source_names_provider_session_store_final_response() {
         assert_eq!(
             p088_capture_source(
@@ -20161,6 +20437,7 @@ plain progress line without gate evidence";
             reuse_existing_session: false,
             session_generation_id: Some("session-generation-p090".into()),
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some(meta_root.to_string_lossy().into_owned()),
             legacy_broad_discovery_policy: Default::default(),
@@ -21330,6 +21607,28 @@ plain progress line without gate evidence";
         assert_eq!(
             std::fs::read_to_string(companion_path).unwrap(),
             "# Review\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_discovered_output_rejects_parent_symlink_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_root = tmp.path().join("outputs");
+        let outside_root = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside_root).unwrap();
+        std::os::unix::fs::symlink(&outside_root, &output_root).unwrap();
+
+        let target = output_root.join("proposal_review.json");
+        let result = write_discovered_output(target.to_str().unwrap(), br#"{"status":"green"}"#);
+
+        assert!(
+            result.is_err(),
+            "materialization must reject symlinked parent components"
+        );
+        assert!(
+            !outside_root.join("proposal_review.json").exists(),
+            "materialization must not follow a parent symlink outside the output root"
         );
     }
 

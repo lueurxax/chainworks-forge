@@ -66,7 +66,7 @@ async fn handle_mcp_post(
         let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
         match auth_header {
             Some(header_value) => match auth::extract_bearer_token(header_value) {
-                Ok(token) => match auth::resolve_bearer(token, &mcp.principal_table) {
+                Ok(token) => match mcp.principal_table.resolve_bearer(token) {
                     Ok(p) => {
                         let tid = auth::derive_token_id(token, &p.id);
                         (p, Some(tid))
@@ -232,6 +232,61 @@ mod tests {
         let json = response_json(response).await;
         assert_eq!(json["error"]["code"], -32000);
         assert_eq!(json["error"]["message"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn p082_mcp_http_uses_live_principal_table_after_reload() {
+        let mcp = test_server().await;
+
+        for replacement in [
+            auth::PrincipalTable::test_fixture_with_class(
+                "observer-token-xxxxxxxxxxxxxxxxxx",
+                "observer-after-reload",
+                auth::PrincipalClass::Observer,
+            ),
+            auth::PrincipalTable::test_fixture_disabled_token(
+                "test-token-xxxxxxxxxxxxxxxxxxxxx",
+                "test-operator",
+            ),
+        ] {
+            mcp.principal_table_handle().update(replacement);
+            let response = handle_mcp_post(
+                State(mcp.clone()),
+                operator_auth_header(),
+                None,
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
+            )
+            .await;
+            let json = response_json(response).await;
+            assert_eq!(
+                json["error"]["message"], "unauthorized",
+                "revoked/disabled startup snapshot token must be rejected after live reload"
+            );
+        }
+
+        mcp.principal_table_handle()
+            .update(auth::PrincipalTable::test_fixture_with_class(
+                "test-token-xxxxxxxxxxxxxxxxxxxxx",
+                "test-operator",
+                auth::PrincipalClass::Observer,
+            ));
+        let response = handle_mcp_post(
+            State(mcp.clone()),
+            operator_auth_header(),
+            None,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#.to_string(),
+        )
+        .await;
+        let json = response_json(response).await;
+        assert!(
+            json["error"].is_null(),
+            "observer-scoped token remains authenticated: {json}"
+        );
+        let tools = json["result"]["tools"].as_array().expect("tools array");
+        assert!(
+            !tools.iter().any(|tool| tool["name"] == "reports_get"),
+            "re-scoped bearer must use current Observer capabilities, not startup Operator grants"
+        );
     }
 
     /// R12 API-001 / AC-15: every error response MUST include the

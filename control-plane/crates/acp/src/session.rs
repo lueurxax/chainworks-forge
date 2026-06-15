@@ -1439,6 +1439,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: None,
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: None,
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,

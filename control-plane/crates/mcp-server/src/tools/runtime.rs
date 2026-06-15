@@ -251,6 +251,18 @@ pub async fn execute(
         },
         "toolOutputGuard": {
             "status": "available",
+            "policyReadback": {
+                "status": "available",
+                "source": "domain::tool_policy"
+            },
+            "enforcement": {
+                "status": "configured",
+                "scope": "codex_provider_runtime",
+                "wrapperTools": ["rg", "find"],
+                "pathStrategy": "runtime_home_bin_prepend",
+                "activeProbeStatus": "not_run_by_runtime_health",
+                "activeProbeEvidence": "./scripts/test-gate.sh proposal-096"
+            },
             "policyVersion": TOOL_POLICY_VERSION,
             "guardVersion": TOOL_GUARD_VERSION,
             "generatedRootDenylist": GENERATED_ROOT_DENYLIST,

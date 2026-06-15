@@ -22,7 +22,7 @@ use domain::ResourceTemplateId;
 pub struct McpServer {
     pool: SqlitePool,
     cmd_handler: Arc<CommandHandler>,
-    pub principal_table: auth::PrincipalTable,
+    pub principal_table: auth::LivePrincipalTable,
     events: Option<EventSender>,
     storage_writer_heartbeat: Option<Arc<DbWriterHeartbeat>>,
     // P081 Phase 3: shared immutable boundary policy service injected at daemon startup.
@@ -139,7 +139,7 @@ impl McpServer {
         Self {
             pool,
             cmd_handler,
-            principal_table,
+            principal_table: auth::LivePrincipalTable::new(principal_table),
             events: None,
             storage_writer_heartbeat: None,
             boundary_policy: Some(embedded_shadow_boundary_policy()),
@@ -155,7 +155,7 @@ impl McpServer {
         Self {
             pool,
             cmd_handler,
-            principal_table,
+            principal_table: auth::LivePrincipalTable::new(principal_table),
             events: None,
             storage_writer_heartbeat: Some(storage_writer_heartbeat),
             boundary_policy: Some(embedded_shadow_boundary_policy()),
@@ -172,7 +172,7 @@ impl McpServer {
         Self {
             pool,
             cmd_handler,
-            principal_table,
+            principal_table: auth::LivePrincipalTable::new(principal_table),
             events: None,
             storage_writer_heartbeat: Some(storage_writer_heartbeat),
             boundary_policy: Some(boundary_policy),
@@ -188,7 +188,7 @@ impl McpServer {
         Self {
             pool,
             cmd_handler,
-            principal_table,
+            principal_table: auth::LivePrincipalTable::new(principal_table),
             events: Some(events),
             storage_writer_heartbeat: None,
             boundary_policy: Some(embedded_shadow_boundary_policy()),
@@ -202,6 +202,10 @@ impl McpServer {
         self
     }
 
+    pub fn principal_table_handle(&self) -> auth::LivePrincipalTable {
+        self.principal_table.clone()
+    }
+
     pub async fn run_stdio(&self) -> Result<()> {
         info!("McpServer: starting stdio JSON-RPC loop");
 
@@ -210,6 +214,7 @@ impl McpServer {
         let mut reader = BufReader::new(stdin);
         let mut line = String::new();
         let mut session_principal: Option<auth::Principal> = None;
+        let mut session_token_fingerprint: Option<String> = None;
         let mut notification_task: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
@@ -277,9 +282,10 @@ impl McpServer {
                         )
                         .await;
                     }
-                    Some(t) => match auth::resolve_bearer(t, &self.principal_table) {
+                    Some(t) => match self.principal_table.resolve_bearer(t) {
                         Ok(p) => {
                             let is_operator = matches!(p.class, auth::PrincipalClass::Operator);
+                            session_token_fingerprint = Some(auth::token_fingerprint(t));
                             session_principal = Some(p);
                             // Return normal initialize response
                             let resp = self
@@ -325,9 +331,32 @@ impl McpServer {
             }
 
             // For all other methods, require session_principal
-            let principal = match session_principal.as_ref() {
-                Some(p) => p,
-                None => {
+            let principal = match (
+                session_principal.as_ref(),
+                session_token_fingerprint.as_ref(),
+            ) {
+                (Some(p), Some(fingerprint)) => {
+                    let principal_id = p.id.clone();
+                    match self
+                        .principal_table
+                        .resolve_principal_fingerprint(&principal_id, fingerprint)
+                    {
+                        Ok(current) => {
+                            session_principal = Some(current);
+                            session_principal.as_ref().unwrap()
+                        }
+                        Err(_) => {
+                            let resp = JsonRpcResponse::error(
+                                request.id.clone(),
+                                -32000,
+                                "unauthorized".to_string(),
+                            );
+                            write_json_line(&stdout, &resp).await;
+                            break;
+                        }
+                    }
+                }
+                _ => {
                     let resp = JsonRpcResponse::error(
                         request.id.clone(),
                         -32002,
@@ -3792,6 +3821,143 @@ mod tests {
         auth::Principal::new("test-observer", auth::PrincipalClass::Observer)
     }
 
+    #[tokio::test]
+    async fn p082_mcp_stdio_session_recheck_uses_live_principal_table_after_reload() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+        let live = server.principal_table_handle();
+        let token = "test-token-xxxxxxxxxxxxxxxxxxxxx";
+        let fingerprint = auth::token_fingerprint(token);
+
+        assert!(
+            live.resolve_principal_fingerprint("test-operator", &fingerprint)
+                .is_ok(),
+            "stdio initialized session precondition"
+        );
+
+        live.update(auth::PrincipalTable::test_fixture_disabled_token(
+            token,
+            "test-operator",
+        ));
+        assert!(
+            live.resolve_principal_fingerprint("test-operator", &fingerprint)
+                .is_err(),
+            "disabled bearer must be rejected by stdio live-session recheck"
+        );
+
+        live.update(auth::PrincipalTable::test_fixture_with_class(
+            "observer-token-xxxxxxxxxxxxxxxxxx",
+            "test-operator",
+            auth::PrincipalClass::Observer,
+        ));
+        assert!(
+            live.resolve_principal_fingerprint("test-operator", &fingerprint)
+                .is_err(),
+            "revoked bearer fingerprint must be rejected by stdio live-session recheck"
+        );
+
+        live.update(auth::PrincipalTable::test_fixture_with_class(
+            token,
+            "test-operator",
+            auth::PrincipalClass::Observer,
+        ));
+        let current = live
+            .resolve_principal_fingerprint("test-operator", &fingerprint)
+            .expect("re-scoped bearer remains resolvable");
+        assert_eq!(current.class, auth::PrincipalClass::Observer);
+        assert!(
+            !current
+                .tool_capabilities
+                .contains(&domain::CapabilityToolId::ReportsGet),
+            "stdio must observe re-scoped capabilities after reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn p082_reports_get_tools_call_denies_non_operator_principals() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        for principal in [
+            auth::Principal::new("agent-report-reader", auth::PrincipalClass::Agent),
+            auth::Principal::new("observer-report-reader", auth::PrincipalClass::Observer),
+        ] {
+            let response = server
+                .handle_request(
+                    JsonRpcRequest {
+                        jsonrpc: "2.0".to_string(),
+                        id: Some(serde_json::json!(82)),
+                        method: "tools/call".to_string(),
+                        params: Some(serde_json::json!({
+                            "name": "reports.get",
+                            "arguments": {
+                                "run_id": domain::ids::RunId::new().to_string()
+                            }
+                        })),
+                    },
+                    &principal,
+                )
+                .await;
+
+            let error = response
+                .error
+                .expect("non-Operator reports.get call must be denied");
+            assert_eq!(error.code, -32004);
+            let data = error.data.expect("policy-denial data");
+            assert_eq!(data["reason_code"], "CAPABILITY_OUT_OF_SCOPE");
+            assert!(
+                response.result.is_none(),
+                "non-Operator reports.get must not return report lanes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn p082_report_resource_read_denies_non_operator_principals() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        for principal in [
+            auth::Principal::new("agent-report-resource", auth::PrincipalClass::Agent),
+            auth::Principal::new("observer-report-resource", auth::PrincipalClass::Observer),
+        ] {
+            let response = server
+                .handle_request(
+                    JsonRpcRequest {
+                        jsonrpc: "2.0".to_string(),
+                        id: Some(serde_json::json!(83)),
+                        method: "resources/read".to_string(),
+                        params: Some(serde_json::json!({
+                            "uri": format!("report://{}", domain::ids::RunId::new())
+                        })),
+                    },
+                    &principal,
+                )
+                .await;
+
+            let error = response
+                .error
+                .expect("non-Operator report:// read must be denied");
+            assert_eq!(error.code, -32002);
+            assert!(
+                response.result.is_none(),
+                "non-Operator report:// must not return report contents"
+            );
+        }
+    }
+
     async fn force_p081_audit_budget_safe_mode(pool: &sqlx::SqlitePool) {
         let now_ms = Utc::now().timestamp_millis();
         let payload = "x".repeat(16_100);
@@ -4096,6 +4262,69 @@ mod tests {
                 .as_bool()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn proposal_096_runtime_health_includes_tool_output_guard() {
+        let pool = test_pool().await;
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        let payload = call_tool_and_parse(
+            &server,
+            &operator_principal(),
+            "runtime.health",
+            serde_json::json!({}),
+        )
+        .await;
+        let guard = &payload["toolOutputGuard"];
+
+        assert_eq!(guard["status"], "available");
+        assert_eq!(guard["policyReadback"]["status"], "available");
+        assert_eq!(guard["enforcement"]["status"], "configured");
+        assert_eq!(
+            guard["enforcement"]["pathStrategy"],
+            "runtime_home_bin_prepend"
+        );
+        assert_eq!(
+            guard["enforcement"]["activeProbeStatus"],
+            "not_run_by_runtime_health"
+        );
+        assert_eq!(
+            guard["policyVersion"],
+            domain::tool_policy::TOOL_POLICY_VERSION
+        );
+        assert_eq!(
+            guard["guardVersion"],
+            domain::tool_policy::TOOL_GUARD_VERSION
+        );
+        assert_eq!(
+            guard["maxOutputBytes"].as_u64(),
+            Some(domain::tool_policy::DEFAULT_TOOL_OUTPUT_MAX_BYTES)
+        );
+        assert_eq!(
+            guard["maxOutputLines"].as_u64(),
+            Some(domain::tool_policy::DEFAULT_TOOL_OUTPUT_MAX_LINES)
+        );
+        assert_eq!(
+            guard["maxCumulativeOutputBytes"].as_u64(),
+            Some(domain::tool_policy::DEFAULT_CUMULATIVE_TOOL_OUTPUT_MAX_BYTES)
+        );
+
+        let denylist = guard["generatedRootDenylist"]
+            .as_array()
+            .expect("toolOutputGuard.generatedRootDenylist must be an array");
+        for required in domain::tool_policy::GENERATED_ROOT_DENYLIST {
+            assert!(
+                denylist
+                    .iter()
+                    .any(|value| value.as_str() == Some(required)),
+                "toolOutputGuard.generatedRootDenylist missing {required}"
+            );
+        }
     }
 
     #[tokio::test]

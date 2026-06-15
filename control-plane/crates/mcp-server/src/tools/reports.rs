@@ -59,6 +59,9 @@ pub async fn execute(
 ) -> Result<serde_json::Value> {
     match tool_name {
         "reports.get" => {
+            if !matches!(principal.class, auth::PrincipalClass::Operator) {
+                anyhow::bail!("forbidden: reports.get requires Operator principal");
+            }
             let run_id: RunId = params["run_id"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'run_id'"))?
@@ -1010,41 +1013,6 @@ fn public_artifact_ref(artifact: &Artifact, linkage: &str) -> serde_json::Value 
     })
 }
 
-pub(crate) fn public_artifact_index_row(
-    row: &db::repos::projections::ArtifactIndexRow,
-) -> serde_json::Value {
-    serde_json::json!({
-        "id": row.id,
-        "run_id": row.run_id,
-        "stage_id": row.stage_id,
-        "agent_id": row.agent_id,
-        "name": row.name,
-        "contract_id": row.contract_id,
-        "format": row.format,
-        "artifact_metadata_pointer": artifact_metadata_pointer_value(
-            &row.id,
-            row.checksum_sha256.as_deref(),
-            row.size_bytes,
-        ),
-        "checksum_sha256": row.checksum_sha256,
-        "size_bytes": row.size_bytes,
-        "provider": row.provider,
-        "model": row.model,
-        "created_at": row.created_at,
-        "is_pinned": row.is_pinned,
-        "report_kind": row.report_kind,
-        "report_version": row.report_version,
-        "artifact_generation_id": row.artifact_generation_id,
-        "source_agent_execution_id": row.source_agent_execution_id,
-        "source_stage_execution_id": row.source_stage_execution_id,
-        "source_session_generation_id": row.source_session_generation_id,
-        "source_work_item_id": row.source_work_item_id,
-        "supersedes_artifact_generation_id": row.supersedes_artifact_generation_id,
-        "output_settlement": row.output_settlement,
-        "source_generation_verified": row.source_generation_verified,
-    })
-}
-
 pub(crate) async fn artifact_report_json(
     pool: &SqlitePool,
     artifact: &Artifact,
@@ -1537,6 +1505,35 @@ mod tests {
 
     fn test_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    #[tokio::test]
+    async fn p082_reports_get_rejects_non_operator_before_report_lanes_are_loaded() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        persist_rollout_contract_readback(&pool, run_id).await;
+        let handler = make_command_handler(pool.clone());
+
+        for class in [auth::PrincipalClass::Agent, auth::PrincipalClass::Observer] {
+            let err = execute(
+                "reports.get",
+                serde_json::json!({ "run_id": run_id.to_string() }),
+                &pool,
+                &handler,
+                &auth::Principal::new("non-operator", class),
+            )
+            .await
+            .expect_err("non-Operator reports.get must fail closed");
+            assert!(
+                err.to_string().contains("requires Operator"),
+                "non-Operator report denial must be deterministic: {err}"
+            );
+        }
     }
 
     #[test]

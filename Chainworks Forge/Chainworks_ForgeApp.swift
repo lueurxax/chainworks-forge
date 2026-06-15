@@ -225,7 +225,7 @@ struct Chainworks_ForgeApp: App {
     }
 
     #if os(macOS)
-    static func launchctlKickstartArguments(
+    nonisolated static func launchctlKickstartArguments(
         label: String,
         uid: uid_t = getuid(),
         force: Bool = false
@@ -272,7 +272,7 @@ struct Chainworks_ForgeApp: App {
         }
     }
 
-    private static func runLaunchctlKickstartSync(label: String, force: Bool) throws {
+    private nonisolated static func runLaunchctlKickstartSync(label: String, force: Bool) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
         process.arguments = launchctlKickstartArguments(label: label, force: force)
@@ -417,7 +417,8 @@ private actor DebugPackagedDaemonProcess {
         var buffer = [CChar](repeating: 0, count: 4096)
         let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
         guard length > 0 else { return false }
-        let path = String(cString: buffer)
+        let bytes = buffer.prefix(Int(length)).prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        let path = String(decoding: bytes, as: UTF8.self)
         return path.hasSuffix("/chainworks-forge-daemon")
     }
 

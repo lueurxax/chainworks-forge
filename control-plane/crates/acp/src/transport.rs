@@ -458,6 +458,11 @@ struct CodexLocalActivitySummary {
     max_total_output_lines: Option<u64>,
     cumulative_function_output_bytes: u64,
     session_store_bytes_read: u64,
+    session_store_path_found: bool,
+    session_store_search_limit_hit: bool,
+    session_store_candidate_root_count: u64,
+    session_store_visited_dirs: u64,
+    session_store_visited_files: u64,
     turn_aborted_after_open_process: bool,
     last_pathology: Option<String>,
     last_event_type: Option<String>,
@@ -487,6 +492,12 @@ impl CodexLocalActivityMonitor {
             return None;
         }
         let mut candidate_roots = Vec::new();
+        if let Some(runtime_home) = req.provider_runtime_home.as_deref() {
+            push_unique_codex_session_store_candidate(
+                &mut candidate_roots,
+                Path::new(runtime_home),
+            );
+        }
         push_codex_runtime_root_candidate(&mut candidate_roots, Path::new(&req.workspace_root));
         if let Some(worktree_root) = req.worktree_root.as_deref() {
             push_codex_runtime_root_candidate(&mut candidate_roots, Path::new(worktree_root));
@@ -510,12 +521,16 @@ impl CodexLocalActivityMonitor {
         let offset = std::fs::metadata(&session_path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
+        let summary = CodexLocalActivitySummary {
+            session_store_path_found: true,
+            ..CodexLocalActivitySummary::default()
+        };
         Self {
             session_id: None,
             candidate_roots: Vec::new(),
             session_path: Some(session_path),
             offset,
-            summary: CodexLocalActivitySummary::default(),
+            summary,
             active_call_process_ids: HashMap::new(),
             open_process_ids: HashSet::new(),
         }
@@ -608,10 +623,24 @@ impl CodexLocalActivityMonitor {
 
     fn ensure_session_path(&mut self) {
         if self.session_path.is_none() {
-            self.session_path = self
-                .session_id
-                .as_deref()
-                .and_then(|session_id| find_codex_session_store(&self.candidate_roots, session_id));
+            let Some(session_id) = self.session_id.as_deref() else {
+                return;
+            };
+            let search = find_codex_session_store(&self.candidate_roots, session_id);
+            self.summary.session_store_candidate_root_count = search.candidate_root_count as u64;
+            self.summary.session_store_search_limit_hit |= search.limit_hit;
+            self.summary.session_store_visited_dirs = self
+                .summary
+                .session_store_visited_dirs
+                .max(search.visited_dirs as u64);
+            self.summary.session_store_visited_files = self
+                .summary
+                .session_store_visited_files
+                .max(search.visited_files as u64);
+            if let Some(path) = search.path {
+                self.summary.session_store_path_found = true;
+                self.session_path = Some(path);
+            }
         }
     }
 
@@ -774,6 +803,12 @@ impl CodexLocalActivityMonitor {
     }
 
     fn observe_function_output_pathology(&mut self, output: &str) {
+        if output.contains(
+            "tool_output_budget_exceeded: output truncated by Chainworks safe-search guard",
+        ) {
+            self.summary.unbounded_tool_outputs += 1;
+            self.summary.last_pathology = Some("tool_output_budget_exceeded".to_string());
+        }
         if output.contains("write_stdin failed: stdin is closed") {
             self.summary.stdin_closed_control_failures += 1;
             self.summary.last_pathology = Some("codex_tool_stdin_closed".to_string());
@@ -819,7 +854,7 @@ impl CodexLocalActivityMonitor {
 
     fn summary_for_error(&self) -> String {
         format!(
-            "local_event_count={}, function_calls={}, function_outputs={}, running_processes_started={}, running_process_outputs={}, running_processes_finished={}, open_processes={}, turn_aborted={}, turn_completed={}, stdin_closed_control_failures={}, unbounded_tool_outputs={}, max_original_token_count={}, max_total_output_lines={}, cumulative_function_output_bytes={}, session_store_bytes_read={}, turn_aborted_after_open_process={}, last_pathology={}, last_event_type={}",
+            "local_event_count={}, function_calls={}, function_outputs={}, running_processes_started={}, running_process_outputs={}, running_processes_finished={}, open_processes={}, turn_aborted={}, turn_completed={}, stdin_closed_control_failures={}, unbounded_tool_outputs={}, max_original_token_count={}, max_total_output_lines={}, cumulative_function_output_bytes={}, session_store_bytes_read={}, codex_session_store_path_found={}, codex_session_store_search_limit_hit={}, codex_session_store_candidate_root_count={}, codex_session_store_visited_dirs={}, codex_session_store_visited_files={}, turn_aborted_after_open_process={}, last_pathology={}, last_event_type={}",
             self.summary.event_count,
             self.summary.function_calls,
             self.summary.function_outputs,
@@ -841,6 +876,11 @@ impl CodexLocalActivityMonitor {
                 .unwrap_or_else(|| "none".to_string()),
             self.summary.cumulative_function_output_bytes,
             self.summary.session_store_bytes_read,
+            self.summary.session_store_path_found,
+            self.summary.session_store_search_limit_hit,
+            self.summary.session_store_candidate_root_count,
+            self.summary.session_store_visited_dirs,
+            self.summary.session_store_visited_files,
             self.summary.turn_aborted_after_open_process,
             self.summary.last_pathology.as_deref().unwrap_or("none"),
             self.summary.last_event_type.as_deref().unwrap_or("none"),
@@ -1166,29 +1206,59 @@ fn claude_project_key(cwd: &str) -> String {
         .collect()
 }
 
+fn push_unique_codex_session_store_candidate(candidates: &mut Vec<PathBuf>, path: &Path) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if !candidates.iter().any(|existing| existing == path) {
+        candidates.push(path.to_path_buf());
+    }
+}
+
 fn push_codex_runtime_root_candidate(candidates: &mut Vec<PathBuf>, base: &Path) {
     if base.as_os_str().is_empty() {
         return;
     }
-    let candidate = base.join(".forge-codex-acp");
-    if !candidates.iter().any(|existing| existing == &candidate) {
-        candidates.push(candidate);
-    }
+    push_unique_codex_session_store_candidate(candidates, &base.join(".forge-codex-acp"));
 }
 
-fn find_codex_session_store(candidate_roots: &[PathBuf], session_id: &str) -> Option<PathBuf> {
+#[derive(Debug, Default)]
+struct CodexSessionStoreSearchResult {
+    path: Option<PathBuf>,
+    limit_hit: bool,
+    candidate_root_count: usize,
+    visited_dirs: usize,
+    visited_files: usize,
+}
+
+fn find_codex_session_store(
+    candidate_roots: &[PathBuf],
+    session_id: &str,
+) -> CodexSessionStoreSearchResult {
     const MAX_DIRS: usize = 512;
     const MAX_FILES: usize = 2048;
+    let mut result = CodexSessionStoreSearchResult {
+        candidate_root_count: candidate_roots.len(),
+        ..CodexSessionStoreSearchResult::default()
+    };
     for root in candidate_roots {
         if !root.exists() {
             continue;
         }
+        let exact_runtime_home = root.join("config.toml").exists()
+            || root.join("bin").join("rg").exists()
+            || root
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == ".forge-codex-acp");
         let mut stack = vec![root.clone()];
         let mut visited_dirs = 0usize;
         let mut visited_files = 0usize;
         while let Some(dir) = stack.pop() {
             visited_dirs += 1;
             if visited_dirs > MAX_DIRS || visited_files > MAX_FILES {
+                result.limit_hit = true;
                 break;
             }
             let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1207,14 +1277,21 @@ fn find_codex_session_store(candidate_roots: &[PathBuf], session_id: &str) -> Op
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("");
-                    if file_name.ends_with(".jsonl") && file_name.contains(session_id) {
-                        return Some(path);
+                    let is_session_store = file_name.ends_with(".jsonl")
+                        && (file_name.contains(session_id) || exact_runtime_home);
+                    if is_session_store {
+                        result.visited_dirs = result.visited_dirs.saturating_add(visited_dirs);
+                        result.visited_files = result.visited_files.saturating_add(visited_files);
+                        result.path = Some(path);
+                        return result;
                     }
                 }
             }
         }
+        result.visited_dirs = result.visited_dirs.saturating_add(visited_dirs);
+        result.visited_files = result.visited_files.saturating_add(visited_files);
     }
-    None
+    result
 }
 
 fn codex_session_store_credits_exhausted_failure(path: &Path) -> Option<ProviderFailureEvent> {
@@ -1237,12 +1314,17 @@ fn codex_session_store_credits_exhausted_failure(path: &Path) -> Option<Provider
         }
         let limit_id = value
             .pointer("/payload/rate_limits/limit_id")
+            .or_else(|| credits.get("limit_id"))
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let balance = credits
             .get("balance")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
+            .map(|value| match value {
+                Value::String(value) => value.clone(),
+                Value::Number(value) => value.to_string(),
+                _ => "unknown".to_string(),
+            })
+            .unwrap_or_else(|| "unknown".to_string());
         let unlimited = credits
             .get("unlimited")
             .and_then(Value::as_bool)
@@ -1655,6 +1737,7 @@ pub(crate) fn signal_process_group(pid: u32, signal: libc::c_int) {
     }
 }
 
+#[cfg(test)]
 fn stderr_line_is_diagnostic_warning(line: &str) -> bool {
     line.contains("EPIPE") || line.contains("write EPIPE")
 }
@@ -2121,6 +2204,7 @@ impl CompletionTextCapture {
         self.provider_session_store_final_response = bounded_completion_text(sanitized);
     }
 
+    #[cfg(test)]
     fn select_extraction_input(&self) -> SelectedCompletionTextCapture {
         self.select_extraction_input_with_capped_stream(None, false)
     }
@@ -3037,7 +3121,7 @@ fn build_permission_grant(request_id: &Value, params: &Value) -> Option<Value> {
                 "code": -32096,
                 "message": denial.agent_error_text(),
                 "data": {
-                    "classification": "tool_output_budget_exceeded",
+                    "classification": denial.code,
                     "preflightCode": denial.code,
                     "matchedTool": denial.matched_tool,
                     "command": denial.command,
@@ -3257,6 +3341,7 @@ pub struct AcpTransportSession {
     closed: bool,
     provider: String,
     model: Option<String>,
+    provider_runtime_home: Option<String>,
     permission_grant_debounce: Duration,
     xcode_shim_injected: bool,
     requires_xcode_host_execution: bool,
@@ -4323,6 +4408,7 @@ impl AcpTransportSession {
             closed: false,
             provider: req.provider.clone(),
             model: req.model.clone(),
+            provider_runtime_home: req.provider_runtime_home.clone(),
             permission_grant_debounce: config.permission_grant_debounce,
             xcode_shim_injected: req.xcode_shim_injection_signal,
             requires_xcode_host_execution: req.requires_xcode_host_execution,
@@ -4528,6 +4614,17 @@ impl AcpTransportSession {
         u64,
         Option<LegacyBroadDiscoverySnapshot>,
     )> {
+        let effective_req;
+        let req = if req.provider_runtime_home.is_none() && self.provider_runtime_home.is_some() {
+            effective_req = Some({
+                let mut req = req.clone();
+                req.provider_runtime_home = self.provider_runtime_home.clone();
+                req
+            });
+            effective_req.as_ref().expect("effective request just set")
+        } else {
+            req
+        };
         let startup_offset_ms = if req.reuse_existing_session {
             0
         } else {
@@ -6053,12 +6150,16 @@ mod tests {
         );
         assert_eq!(
             grant["error"]["data"]["classification"],
-            "tool_output_budget_exceeded"
+            "tool_output_budget_preflight_denied"
         );
         assert!(grant["error"]["message"]
             .as_str()
             .unwrap()
             .contains("Broad repository search must use bounded search"));
+        assert!(grant["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("rg prompt_stream_failed control-plane/crates/acp/src"));
         assert!(summarize_permission_grant(&grant).contains("tool_output_budget_preflight_denied"));
     }
 
@@ -6590,6 +6691,80 @@ mod tests {
     }
 
     #[test]
+    fn codex_local_activity_uses_exact_runtime_home_before_bounded_parent_walk() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let workspace_root = tempdir.path();
+        let codex_root = workspace_root.join(".forge-codex-acp");
+        for index in 0..700 {
+            std::fs::create_dir_all(codex_root.join(format!("noise-{index:04}/sessions")))
+                .expect("noise runtime home");
+        }
+        let runtime_home = codex_root.join("active-runtime");
+        let session_id = "019eb588-86bf-74a2-9ac1-73967b038637";
+        let session_path = runtime_home
+            .join("sessions/2026/06/11")
+            .join(format!("rollout-2026-06-11T10-14-44-{session_id}.jsonl"));
+        std::fs::create_dir_all(session_path.parent().expect("session parent"))
+            .expect("session parent dir");
+        std::fs::write(
+            &session_path,
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_gate","output":"Process running with session ID 91234\nOutput:\n   Compiling engine v0.1.0\n"}}"#,
+        )
+        .expect("session jsonl");
+
+        let req = ExecutionRequest {
+            run_id: domain::ids::RunId::new(),
+            stage_execution_id: None,
+            stage_id: "state_9_implementation_reviewed".into(),
+            attempt_number: 1,
+            agent_execution_id: None,
+            agent_id: "proposal_implementation_auditor".into(),
+            provider: "codex".into(),
+            model: Some("gpt-5.5".into()),
+            effort: None,
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            prompt: "audit".into(),
+            worktree_root: None,
+            worktree_write_enabled: false,
+            worktree_strategy: None,
+            expected_output_paths: Vec::new(),
+            expected_outputs: Vec::new(),
+            keep_session_alive: false,
+            reuse_existing_session: false,
+            session_generation_id: None,
+            provider_session_id: None,
+            provider_runtime_home: Some(runtime_home.to_string_lossy().into_owned()),
+            mcp_servers: Vec::new(),
+            chainworks_meta_root: None,
+            legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
+            xcode_shim_injection_signal: false,
+            requires_xcode_host_execution: false,
+            owner_kind: "stage_execution".to_string(),
+            owner_id: None,
+            origin_stage_id: None,
+            origin_stage_execution_id: None,
+            mediation_record_id: None,
+            toolchain_home: None,
+            toolchain_go_scope_enabled: false,
+        };
+
+        let mut monitor =
+            CodexLocalActivityMonitor::for_request(&req, session_id).expect("codex monitor");
+        let observation = monitor.poll(Instant::now()).expect("poll");
+
+        assert!(observation.should_extend_watchdog);
+        assert_eq!(observation.new_event_count, 1);
+        assert_eq!(monitor.open_process_count(), 1);
+        let summary = monitor.summary_for_error();
+        assert!(summary.contains("codex_session_store_path_found=true"));
+        assert!(summary.contains("codex_session_store_search_limit_hit=false"));
+        assert!(
+            summary.contains("codex_session_store_candidate_root_count=2"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
     fn codex_local_activity_tracks_running_process_output_and_abort() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let session_path = tempdir.path().join("rollout-session.jsonl");
@@ -6724,6 +6899,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_local_activity_classifies_wrapper_truncation_marker_as_budget_exceeded() {
+        let mut monitor =
+            CodexLocalActivityMonitor::new_for_path(PathBuf::from("/tmp/nonexistent.jsonl"));
+        let payload = serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call_rg",
+            "output": "line-2000\ntool_output_budget_exceeded: output truncated by Chainworks safe-search guard\n",
+        });
+
+        assert!(monitor.observe_function_call_output(&payload));
+        let failure = monitor
+            .provider_failure_event_from_local_activity()
+            .expect("wrapper truncation marker should be budget evidence");
+        assert_eq!(failure.failure_phase, "tool_output_budget_exceeded");
+        assert!(failure.detail.contains("tool_output_budget_exceeded"));
+    }
+
+    #[test]
     fn codex_local_activity_classifies_unbounded_output_and_stdin_closed_abort() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let session_path = tempdir.path().join("rollout-session.jsonl");
@@ -6833,6 +7026,7 @@ mod tests {
             reuse_existing_session: false,
             session_generation_id: Some("session-1".to_string()),
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some("/tmp/run".to_string()),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,

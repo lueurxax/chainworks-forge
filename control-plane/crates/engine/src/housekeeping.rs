@@ -54,6 +54,7 @@ struct RunCleanupCandidate {
     status: String,
     workspace_root: PathBuf,
     worktree_root: Option<PathBuf>,
+    active_work_count: i64,
 }
 
 pub struct GeneratedStateHousekeeper;
@@ -178,9 +179,24 @@ pub async fn sweep_xcode_toolchain_roots(
 
 async fn load_run_cleanup_candidates(pool: &SqlitePool) -> Result<Vec<RunCleanupCandidate>> {
     let rows = sqlx::query(
-        r#"SELECT id, status, workspace_root, worktree_root
-           FROM runs
-           WHERE workspace_root IS NOT NULL"#,
+        r#"SELECT r.id,
+                  r.status,
+                  r.workspace_root,
+                  r.worktree_root,
+                  (
+                    SELECT COUNT(*)
+                    FROM work_items wi
+                    WHERE wi.run_id = r.id
+                      AND wi.status IN ('pending', 'running')
+                  ) + (
+                    SELECT COUNT(*)
+                    FROM agent_executions ae
+                    JOIN stage_executions se ON se.id = ae.stage_execution_id
+                    WHERE se.run_id = r.id
+                      AND ae.status = 'running'
+                  ) AS active_work_count
+           FROM runs r
+           WHERE r.workspace_root IS NOT NULL"#,
     )
     .fetch_all(pool)
     .await
@@ -195,6 +211,7 @@ async fn load_run_cleanup_candidates(pool: &SqlitePool) -> Result<Vec<RunCleanup
             worktree_root: row
                 .get::<Option<String>, _>("worktree_root")
                 .map(PathBuf::from),
+            active_work_count: row.get("active_work_count"),
         })
         .collect())
 }
@@ -211,7 +228,7 @@ fn prune_generated_state(
     for candidate in &candidates {
         workspace_roots.insert(candidate.workspace_root.clone());
 
-        if !is_terminal_run_status(&candidate.status) {
+        if !is_generated_state_cleanup_eligible(candidate) {
             continue;
         }
 
@@ -228,6 +245,14 @@ fn prune_generated_state(
         }
 
         for target_dir in generated_target_dirs(worktree_root) {
+            if is_path_referenced_by_live_process(&target_dir, &live_command_lines) {
+                debug!(
+                    run_id = %candidate.run_id,
+                    target_dir = %target_dir.display(),
+                    "Skipping generated target cleanup referenced by live process"
+                );
+                continue;
+            }
             if let Some(bytes) = remove_dir_if_old(&target_dir, now, config.min_age)? {
                 report.bytes_reclaimed += bytes;
                 report.worktree_target_dirs_removed += 1;
@@ -371,6 +396,11 @@ fn is_terminal_run_status(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled")
 }
 
+fn is_generated_state_cleanup_eligible(candidate: &RunCleanupCandidate) -> bool {
+    is_terminal_run_status(&candidate.status)
+        || (candidate.status == "blocked" && candidate.active_work_count == 0)
+}
+
 fn is_managed_worktree(workspace_root: &Path, worktree_root: &Path) -> bool {
     let managed_root = workspace_root.join(".chainworks").join("worktrees");
     worktree_root.starts_with(managed_root)
@@ -490,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn active_and_blocked_run_targets_are_preserved() {
+    fn active_targets_are_preserved_but_blocked_targets_are_reclaimed() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path();
         let active_target = workspace
@@ -521,6 +551,7 @@ mod tests {
                             .join("worktrees")
                             .join("active-run"),
                     ),
+                    active_work_count: 1,
                 },
                 RunCleanupCandidate {
                     run_id: "blocked-run".into(),
@@ -532,6 +563,7 @@ mod tests {
                             .join("worktrees")
                             .join("blocked-run"),
                     ),
+                    active_work_count: 0,
                 },
             ],
             GeneratedStateHousekeepingConfig {
@@ -542,9 +574,41 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.worktree_target_dirs_removed, 0);
+        assert_eq!(report.worktree_target_dirs_removed, 1);
         assert!(active_target.exists());
-        assert!(blocked_target.exists());
+        assert!(!blocked_target.exists());
+    }
+
+    #[test]
+    fn blocked_run_target_is_preserved_when_active_work_exists() {
+        let tmp = tempdir().unwrap();
+        let workspace = tmp.path();
+        let worktree = workspace
+            .join(".chainworks")
+            .join("worktrees")
+            .join("blocked-active-run");
+        let target = worktree.join("control-plane").join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("build-output"), b"blocked-active").unwrap();
+
+        let report = prune_generated_state(
+            vec![RunCleanupCandidate {
+                run_id: "blocked-active-run".into(),
+                status: "blocked".into(),
+                workspace_root: workspace.to_path_buf(),
+                worktree_root: Some(worktree),
+                active_work_count: 1,
+            }],
+            GeneratedStateHousekeepingConfig {
+                enabled: true,
+                interval: Duration::from_secs(1),
+                min_age: Duration::from_secs(0),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.worktree_target_dirs_removed, 0);
+        assert!(target.exists());
     }
 
     #[test]
@@ -578,6 +642,7 @@ mod tests {
                 status: "completed".into(),
                 workspace_root: workspace.to_path_buf(),
                 worktree_root: Some(worktree.clone()),
+                active_work_count: 0,
             }],
             GeneratedStateHousekeepingConfig {
                 enabled: true,
@@ -619,6 +684,7 @@ mod tests {
                 status: "completed".into(),
                 workspace_root: workspace.to_path_buf(),
                 worktree_root: Some(unmanaged),
+                active_work_count: 0,
             }],
             GeneratedStateHousekeepingConfig {
                 enabled: true,

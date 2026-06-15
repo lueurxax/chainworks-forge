@@ -3,6 +3,7 @@ import Testing
 @testable import Chainworks_Forge
 
 @Suite("ToolchainMappingReadAdapter")
+@MainActor
 struct ToolchainMappingReadAdapterTests {
     @Test("Toolchain cache policy decode accepts known keys")
     func policyDecodeAcceptsKnownKeys() throws {

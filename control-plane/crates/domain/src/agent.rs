@@ -134,6 +134,7 @@ pub enum AgentFailureKind {
     ProviderPermissionRejected,
     ProviderTimeout,
     ProviderInternalError,
+    ToolOutputBudgetPreflightDenied,
     ToolOutputBudgetExceeded,
     TransportEpipe,
     TransportProtocolError,
@@ -157,6 +158,9 @@ impl std::fmt::Display for AgentFailureKind {
             AgentFailureKind::ProviderPermissionRejected => "provider_permission_rejected",
             AgentFailureKind::ProviderTimeout => "provider_timeout",
             AgentFailureKind::ProviderInternalError => "provider_internal_error",
+            AgentFailureKind::ToolOutputBudgetPreflightDenied => {
+                "tool_output_budget_preflight_denied"
+            }
             AgentFailureKind::ToolOutputBudgetExceeded => "tool_output_budget_exceeded",
             AgentFailureKind::TransportEpipe => "transport_epipe",
             AgentFailureKind::TransportProtocolError => "transport_protocol_error",
@@ -184,6 +188,9 @@ impl std::str::FromStr for AgentFailureKind {
             "provider_permission_rejected" => AgentFailureKind::ProviderPermissionRejected,
             "provider_timeout" => AgentFailureKind::ProviderTimeout,
             "provider_internal_error" => AgentFailureKind::ProviderInternalError,
+            "tool_output_budget_preflight_denied" => {
+                AgentFailureKind::ToolOutputBudgetPreflightDenied
+            }
             "tool_output_budget_exceeded" => AgentFailureKind::ToolOutputBudgetExceeded,
             "transport_epipe" => AgentFailureKind::TransportEpipe,
             "transport_protocol_error" => AgentFailureKind::TransportProtocolError,

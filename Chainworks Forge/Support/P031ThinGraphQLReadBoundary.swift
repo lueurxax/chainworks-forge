@@ -685,7 +685,7 @@ struct P031GraphQLSubscriptionClient<Transport: P031GraphQLSubscriptionTransport
     return transport.subscribe(request)
   }
 
-  nonisolated func subscribe<Payload: Decodable>(
+  nonisolated func subscribe<Payload: Decodable & Sendable>(
     _ payloadType: Payload.Type,
     operationName: String,
     document: String,
@@ -939,7 +939,7 @@ nonisolated private struct P031GraphQLResponseError: Decodable {
   let message: String
 }
 
-struct P081GraphQLRedaction: Decodable, Equatable, Sendable {
+nonisolated struct P081GraphQLRedaction: Decodable, Equatable, Sendable {
   let path: [String]
   let reasonCode: String
   let rowId: String?
@@ -948,7 +948,7 @@ struct P081GraphQLRedaction: Decodable, Equatable, Sendable {
   let redactionId: String
 }
 
-struct P081GraphQLResponseExtensions: Decodable, Equatable, Sendable {
+nonisolated struct P081GraphQLResponseExtensions: Decodable, Equatable, Sendable {
   let redactions: [P081GraphQLRedaction]
 
   init(redactions: [P081GraphQLRedaction] = []) {
@@ -3097,7 +3097,7 @@ struct P031GraphQLDocumentSet: Equatable, Sendable {
 }
 
 enum P031GraphQLDocuments {
-  static let ideas = """
+  nonisolated static let ideas = """
     query P031Ideas($includeArchived: Boolean) {
       ideas(includeArchived: $includeArchived) {
         id
@@ -3112,7 +3112,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let runsHome = """
+  nonisolated static let runsHome = """
     query P031RunsHome {
       runs {
         id
@@ -3167,7 +3167,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let runDetail = """
+  nonisolated static let runDetail = """
     query P031RunDetail($runId: ID!) {
       run(id: $runId) {
         id
@@ -3426,7 +3426,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let stageDetail = """
+  nonisolated static let stageDetail = """
     query P031StageDetail($stageExecutionId: ID!) {
       stage(id: $stageExecutionId) {
         id
@@ -3450,7 +3450,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let stages = """
+  nonisolated static let stages = """
     query P031Stages($runId: ID!) {
       stages(runId: $runId) {
         id
@@ -3474,7 +3474,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let approvalInbox = """
+  nonisolated static let approvalInbox = """
     query P031ApprovalInbox {
       approvalInbox {
         id
@@ -3536,7 +3536,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let artifacts = """
+  nonisolated static let artifacts = """
     query P031Artifacts($runId: ID!) {
       artifacts(runId: $runId) {
         id
@@ -3562,7 +3562,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let artifactPayload = """
+  nonisolated static let artifactPayload = """
     query P031ArtifactPayload($artifactId: ID!) {
       artifact(id: $artifactId) {
         id
@@ -3589,7 +3589,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let timelineRawDetail = """
+  nonisolated static let timelineRawDetail = """
     query P031TimelineRawDetail($handle: ID!) {
       timelineRawDetail(handle: $handle) {
         status
@@ -3601,7 +3601,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let reportMetadata = """
+  nonisolated static let reportMetadata = """
     query P031ReportMetadata($runId: ID!) {
       artifacts(runId: $runId) {
         id
@@ -3618,7 +3618,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let runStatusChanged = """
+  nonisolated static let runStatusChanged = """
     subscription P031RunStatusChanged($runId: ID) {
       runStatusChanged(runId: $runId) {
         id
@@ -3630,7 +3630,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let runtimeStatusChanged = """
+  nonisolated static let runtimeStatusChanged = """
     subscription P031RuntimeStatusChanged($runId: ID!) {
       runtimeStatusChanged(runId: $runId) {
         id
@@ -3660,7 +3660,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let daemonStatus = """
+  nonisolated static let daemonStatus = """
     query P031DaemonStatus {
       daemonStatus {
         json
@@ -3668,7 +3668,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let ideaTitle = """
+  nonisolated static let ideaTitle = """
     query P031IdeaTitle($ideaId: ID!) {
       idea(id: $ideaId) {
         id
@@ -3683,7 +3683,7 @@ enum P031GraphQLDocuments {
     }
     """
 
-  static let daemonStatusChanged = """
+  nonisolated static let daemonStatusChanged = """
     subscription P031DaemonStatusChanged {
       daemonStatusChanged {
         json
@@ -4306,8 +4306,8 @@ extension P031InMemoryWorkflowReadStore: P046SessionStore {
   }
 }
 
-extension AsyncThrowingStream {
-  nonisolated fileprivate func map<Mapped>(
+extension AsyncThrowingStream where Element: Sendable {
+  nonisolated fileprivate func map<Mapped: Sendable>(
     _ transform: @escaping @Sendable (Element) throws -> Mapped
   ) -> AsyncThrowingStream<Mapped, Error> {
     AsyncThrowingStream<Mapped, Error> { continuation in
@@ -4325,7 +4325,7 @@ extension AsyncThrowingStream {
     }
   }
 
-  nonisolated fileprivate func compactMap<Mapped>(
+  nonisolated fileprivate func compactMap<Mapped: Sendable>(
     _ transform: @escaping @Sendable (Element) throws -> Mapped?
   ) -> AsyncThrowingStream<Mapped, Error> {
     AsyncThrowingStream<Mapped, Error> { continuation in
@@ -5608,6 +5608,7 @@ struct P031ActiveAgentTimelinePresentation: Equatable, Sendable {
   let timestamp: Date
   let stageID: String?
   let providerID: String?
+  let modelID: String?
   let stageLabel: String?
   let taskLabel: String?
   let status: String
@@ -5624,6 +5625,7 @@ struct P031ActiveAgentTimelinePresentation: Equatable, Sendable {
     timestamp: Date,
     stageID: String?,
     providerID: String? = nil,
+    modelID: String? = nil,
     stageLabel: String? = nil,
     taskLabel: String? = nil,
     status: String = "running",
@@ -5639,6 +5641,7 @@ struct P031ActiveAgentTimelinePresentation: Equatable, Sendable {
     self.timestamp = timestamp
     self.stageID = stageID
     self.providerID = providerID
+    self.modelID = modelID
     self.stageLabel = stageLabel
     self.taskLabel = taskLabel
     self.status = status
@@ -6767,6 +6770,7 @@ enum P031RunDetailPresenter {
         timestamp: timestamp,
         stageID: stage?.stageID,
         providerID: execution.provider,
+        modelID: execution.model,
         stageLabel: stageLabel?.isEmpty == false ? stageLabel : nil,
         taskLabel: execution.taskLabel,
         status: execution.status,

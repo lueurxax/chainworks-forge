@@ -8,8 +8,8 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::sync::Arc;
 
 use db::repos::{
-    agent_executions, agent_work_continuations, lead_conflict_mediations, projections, runs,
-    scheduler, sessions, stages, work_items,
+    agent_executions, agent_work_continuations, approvals, lead_conflict_mediations, projections,
+    runs, scheduler, sessions, stages, work_items,
 };
 use db::write_class::WriteLane;
 use db::writer::class_a_operation;
@@ -111,6 +111,16 @@ pub async fn begin_settlement_tx(
 
     agent_executions::cancel_running_by_run_tx(tx, run_id, requested_at).await?;
     work_items::cancel_running_by_run_tx(tx, run_id, requested_at).await?;
+    let expired_approvals =
+        approvals::expire_pending_by_run_tx(tx, run_id, requested_at, Some("run_cancelled".into()))
+            .await?;
+    if expired_approvals > 0 {
+        tracing::info!(
+            run_id = %run_id,
+            expired_approvals = expired_approvals,
+            "Expired pending approvals as part of run cancellation cascade"
+        );
+    }
     let cancelled_continuations = agent_work_continuations::mark_active_for_run_cancelling_tx(
         tx,
         &run_id.to_string(),

@@ -261,12 +261,12 @@ nonisolated struct DaemonStatus: Codable, Sendable, Equatable {
 
 func daemonJSONDecoder() -> JSONDecoder {
     let decoder = JSONDecoder()
-    let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     decoder.dateDecodingStrategy = .custom { d in
         let container = try d.singleValueContainer()
         let string = try container.decode(String.self)
-        if let date = formatter.date(from: string) {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: string) {
             return date
         }
         let plain = ISO8601DateFormatter()
@@ -404,7 +404,8 @@ nonisolated enum DaemonEndpointFile {
         var buffer = [CChar](repeating: 0, count: 4096)
         let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
         guard length > 0 else { return false }
-        let path = String(cString: buffer)
+        let bytes = buffer.prefix(Int(length)).prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        let path = String(decoding: bytes, as: UTF8.self)
         return path.hasSuffix("/chainworks-forge-daemon")
     }
 }

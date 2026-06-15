@@ -31,6 +31,7 @@ At the current baseline, the product includes:
 - catalog-owned skill resolution with frozen runtime injection and operator-visible skill truth,
 - live ACP-backed execution for real provider sessions,
 - ACP-only runtime transport with adapter-specific subprocess execution,
+- runtime-owned bounded tool output and safe-search enforcement with shared policy versions, generated/build-root denylist, typed `tool_output_budget_preflight_denied` errors before provider context damage, wrapper-enforced line/byte caps, budget/unbounded-output classification before generic provider fallback, quarantine for poisoned sessions, and `runtime.health.toolOutputGuard` policy/enforcement readback,
 - Junie `code_writer` runtime hardening with strict completion-boundary subtypes, engine-synthesized failure envelopes, staged per-output repair settlement, runtime preflight/remediation, and post-preflight provider launch capacity leasing,
 - targeted retry authority with exact stage-execution retry settlement, authority-history readback, startup orphan retry repair, and retry payload recovery diagnostics,
 - observe-only auto-retry observation ledger with JSONL observations, canonical known-issue catalog, MCP readback, and rollup tooling,
@@ -70,6 +71,7 @@ When implementation landed outside proposal closeout, the following code surface
 | Storage health, hot-read guards, evidence spool, maintenance repair, and projection maintenance | `control-plane/crates/db/src/`, `control-plane/crates/mcp-server/src/tools/storage.rs`, `control-plane/crates/graphql-server/src/types/storage.rs` | [rust-control-plane.md](rust-control-plane.md), [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) |
 | Agent continuation and lead-directed resumption | `control-plane/crates/mcp-server/src/tools/agents.rs`, `control-plane/crates/engine/src/` | [agent-work-continuation.md](agent-work-continuation.md) |
 | Boundary policy, caller class, audit log, idempotency, and operator alerts | `control-plane/crates/auth/src/`, `control-plane/crates/db/src/repos/audit_log.rs`, `control-plane/crates/graphql-server/src/schema.rs`, `control-plane/crates/mcp-server/src/tools/runtime.rs` | [boundary-first-api-auth-contract.md](boundary-first-api-auth-contract.md), [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md), [ui-action-boundary.md](ui-action-boundary.md) |
+| Bounded tool-output and safe-search guard | `control-plane/crates/domain/src/tool_policy.rs`, `control-plane/crates/acp/src/transport.rs`, `control-plane/crates/acp/src/adapters/codex.rs`, `control-plane/crates/mcp-server/src/tools/runtime.rs` | [bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md), [acp-runtime-transport.md](acp-runtime-transport.md), [mcp-northbound-control-plane-server.md](mcp-northbound-control-plane-server.md) |
 
 This inventory is intentionally code-first. If a proposal file is missing, stale, or never closed out, update the matching reference doc from these owners rather than re-promoting proposal text.
 
@@ -87,6 +89,7 @@ Use these reference docs as the current source of truth:
 | Skill resolution and runtime injection | [skill-resolution-and-runtime-integration.md](skill-resolution-and-runtime-integration.md) |
 | Per-agent MCP policy and runtime validation | [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md) |
 | ACP runtime transport | [acp-runtime-transport.md](acp-runtime-transport.md) |
+| Bounded tool output and safe search | [bounded-tool-output-and-safe-search-policy.md](bounded-tool-output-and-safe-search-policy.md) |
 | Execution truth and recovery | [execution-truth-and-recovery.md](execution-truth-and-recovery.md) |
 | Rust control plane, scheduler, targeted retry authority, and retry payload recovery | [rust-control-plane.md](rust-control-plane.md) |
 | Escalation policy and chain management | [escalation-policies.md](escalation-policies.md) |

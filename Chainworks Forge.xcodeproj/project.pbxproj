@@ -92,6 +92,11 @@
 			path = "Chainworks ForgeUITests";
 			sourceTree = "<group>";
 		};
+		CED0C5012FCB000000000001 /* docs */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = docs;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -126,6 +131,7 @@
 			isa = PBXGroup;
 			children = (
 				CE89156F2F700957006EC77C /* examples */,
+				CED0C5012FCB000000000001 /* docs */,
 				CE89133B2F6FC308006EC77C /* Chainworks Forge */,
 				CE89134B2F6FC30A006EC77C /* Chainworks ForgeTests */,
 				CE8913552F6FC30A006EC77C /* Chainworks ForgeUITests */,
@@ -551,7 +557,7 @@
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
+				SWIFT_VERSION = 6.0;
 			};
 			name = Debug;
 		};
@@ -587,7 +593,7 @@
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
+				SWIFT_VERSION = 6.0;
 			};
 			name = Release;
 		};

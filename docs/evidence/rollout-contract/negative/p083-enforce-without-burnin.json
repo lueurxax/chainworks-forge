@@ -41,7 +41,7 @@
   "cutover_policy": {
     "revision": "p083-rollout-cutover-v16-r59",
     "enforcement_mode_at_cutover": "enforce",
-    "applicable_to": "post_cutover_implementation_starts",
+    "applicable_to": "post_ready_implementation_starts",
     "grandfathered_rendering": "not_applicable",
     "effective_timestamp_iso8601": "2026-06-02T00:00:00Z"
   }

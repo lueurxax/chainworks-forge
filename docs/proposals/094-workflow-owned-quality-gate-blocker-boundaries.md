@@ -9,7 +9,7 @@
 | Depends on | P077 closeout readiness, P084 executable rollout gates, P088 code-writer completion receipts, P092 retry authority recovery, P082 recovery/retry matrix, UI action boundary |
 | Related | P095 two-phase agent invocation, `docs/reference/execution-truth-and-recovery.md`, `docs/reference/test-gates.md`, `docs/reference/rust-control-plane.md`, `docs/reference/ui-action-boundary.md`, implementation audit artifacts beside active proposals |
 | Scope | Detect when a quality gate is blocked by work that cannot or should not be solved by another implementation loop, classify the remaining tail, and route the run through workflow-declared transitions. |
-| Non-goal | No weakening of proposal gates, no automatic acceptance of incomplete code, no hidden waiver path, no replacement for implementation audits, and no human-selected ad hoc transitions. |
+| Non-goal | No code fixes, no weakening of proposal gates, no automatic acceptance of incomplete code, no hidden waiver path, no replacement for implementation audits, no replacement for output contract settlement or side-effect reconciliation, no new UI actions, no arbitrary human approval actions, no generic rule engine, and no human-selected ad hoc transitions. |
 
 ---
 
@@ -173,6 +173,34 @@ It means:
 
 If a release gate still requires external evidence, the run remains blocked/pending at the workflow-defined external-evidence state until that evidence exists.
 
+## 4.5 Lower-layer settlement preconditions
+
+P094 may only evaluate quality-gate blocker boundaries after lower-layer execution truth is settled enough to evaluate.
+
+P094 is not the first responder for broken execution settlement. If a required producer invocation is unsettled, if active contract truth is missing, or if a side-effect ledger entry is unresolved, the workflow must route to the owning settlement/recovery path before quality-gate blocker-boundary evaluation.
+
+P094 must not classify these conditions as quality-gate blocker boundaries:
+
+- required output missing for a required producer;
+- agent invocation not settled;
+- stage marked completed without required output settlement;
+- active contract row missing;
+- output freshness failure;
+- interrupted provider turn where meaningful work may have happened but output settlement did not complete;
+- side-effect ledger unresolved;
+- stale or superseded artifact being used as current proof.
+
+Those conditions route to the owning subsystem first:
+
+- output contract settlement / repair;
+- agent invocation settlement;
+- side-effect reconciliation;
+- retry authority recovery;
+- output freshness / P088;
+- provider-session resurrection or output-only recovery where applicable.
+
+Accepting a blocker boundary must not mask missing release evidence, missing output settlement, failed gates, or unresolved side effects.
+
 ---
 
 ## 5. Vocabulary
@@ -187,6 +215,9 @@ If a release gate still requires external evidence, the run remains blocked/pend
 | `split_candidate` | Proposal section or acceptance criterion that should become a separate proposal before implementation starts. |
 | `blocker_signature_id` | Stable identity for a recurring blocker class + target + evidence scope. |
 | `evidence_fingerprint` | Stable fingerprint of the evidence set used to classify a blocker. |
+| `evidence_freshness` | Freshness of the evidence set relative to the latest relevant implementation pass: `fresh`, `stale`, `unknown`, or `superseded`. |
+| `owner_class` | Workflow owner class that determines which route may handle a blocker. |
+| `is_code_writer_blocking` | Boolean showing whether this blocker may return to implementation refinement. |
 
 ---
 
@@ -277,15 +308,19 @@ When implementation review or closeout readiness reports blockers, the workflow 
 Inputs:
 
 - latest implementation audit report;
+- security/prepush/docs/review artifacts with generation metadata;
 - `implementation_self_assessment_v2`;
+- `tests_result_v1`;
 - code-writer completion receipts;
 - proposal gate output;
 - closeout readiness output;
 - side-effect ledger state;
 - active artifact index;
+- active artifact contract rows and output settlement status;
 - worktree fingerprint;
 - changed-file manifest;
 - current run/stage/agent execution state;
+- latest relevant code-writer stage/agent execution ids;
 - pre-implementation decomposition plan if present.
 
 It produces:
@@ -302,6 +337,23 @@ quality_gate_blocker_assessment_v1
   "run_id": "example",
   "stage_execution_id": "state_9_implementation_reviewed.3",
   "assessment_id": "qgba_...",
+  "blockers": [
+    {
+      "blocker_signature_id": "security:graphql-live-auth:p082",
+      "evidence_fingerprint": "sha256:security-report-generation-7",
+      "evidence_freshness": "fresh",
+      "source_artifact_generation_id": "artifact_generation.security_report.7",
+      "observed_after_stage_execution_id": "state_10_implementation_refined.6",
+      "observed_after_agent_execution_id": "agent_execution.code_writer.6",
+      "owner_class": "code_writer",
+      "is_code_writer_blocking": true,
+      "gate_command": "cargo test -p graphql-server live_principal_reload",
+      "evidence_refs": [
+        "security/report.json#SEC-HIGH-001",
+        "control-plane/crates/graphql-server/src/server.rs:445"
+      ]
+    }
+  ],
   "local_code_tail": [],
   "followup_code_tail": [
     {
@@ -331,6 +383,33 @@ quality_gate_blocker_assessment_v1
 }
 ```
 
+Every blocker item must carry:
+
+- `blocker_signature_id`;
+- `evidence_fingerprint`;
+- `evidence_freshness`;
+- `source_artifact_generation_id` or equivalent active contract generation pointer when available;
+- `observed_after_stage_execution_id`;
+- `observed_after_agent_execution_id`;
+- `owner_class`;
+- `is_code_writer_blocking`;
+- `gate_command` when applicable;
+- `evidence_refs`.
+
+`evidence_freshness` values:
+
+- `fresh`;
+- `stale`;
+- `unknown`;
+- `superseded`.
+
+Freshness rules:
+
+- stale or superseded blockers cannot keep the implementation loop alive;
+- unknown freshness fails closed into review refresh / evidence refresh, not code refinement;
+- fresh blocker evidence can reset no-progress counters only if it changes the `blocker_signature_id` or `evidence_fingerprint`;
+- stale review artifacts are not active blockers even when their status is `block` or `needs_code_fixes`.
+
 The assessment is never actionable by itself.
 
 ---
@@ -341,6 +420,7 @@ The server-owned `QualityGateBoundaryEvaluator` validates the candidate assessme
 
 It rejects the assessment if:
 
+- lower-layer settlement preconditions are not satisfied;
 - any `local_code_tail` item is unresolved and marked non-blocking without evidence;
 - an `external_blocker` lacks concrete `why_not_chainworks_solvable`;
 - a blocker says “cannot be done” while required action maps to known MCP tool or local gate;
@@ -352,6 +432,13 @@ It rejects the assessment if:
 - assessment uses stale/superseded artifacts as proof of current local work;
 - output freshness rules from P088 are not satisfied;
 - blocker signature/evidence fingerprint repeats without measurable progress.
+
+It must produce one of the lower-layer statuses instead of boundary approval when the owning subsystem has not settled:
+
+- `output_settlement_required`;
+- `side_effect_reconciliation_required`;
+- `runtime_recovery_required`;
+- `review_refresh_required`.
 
 The evaluator produces:
 
@@ -369,6 +456,20 @@ blocker_boundary_status_v1
   "followup_proposal_required": true,
   "external_blocker_count": 1,
   "invalid_claim_count": 0,
+  "blockers": [
+    {
+      "blocker_signature_id": "external:remote_ui_proof:p031",
+      "evidence_fingerprint": "sha256:...",
+      "evidence_freshness": "fresh",
+      "source_artifact_generation_id": "artifact_generation.ui_review.4",
+      "observed_after_stage_execution_id": "state_9_implementation_reviewed.3",
+      "observed_after_agent_execution_id": "agent_execution.ui_reviewer.3",
+      "owner_class": "release_evidence",
+      "is_code_writer_blocking": false,
+      "gate_command": "./scripts/test-gate.sh ui-smoke",
+      "evidence_refs": ["docs/evidence/ui-smoke/latest.json"]
+    }
+  ],
   "hard_blockers": [
     {
       "blocker_signature_id": "external:remote_ui_proof:p031",
@@ -388,6 +489,63 @@ blocker_boundary_status_v1
 
 ---
 
+## 6.4 Owner-classified blocker model
+
+Every blocker must be classified with exactly one `owner_class`:
+
+- `code_writer`;
+- `docs_guardian`;
+- `security_reviewer`;
+- `prepush_reviewer`;
+- `implementation_auditor`;
+- `operator`;
+- `release_evidence`;
+- `external_environment`;
+- `followup_proposal`;
+- `runtime_recovery`;
+- `output_settlement`;
+- `side_effect_reconciliation`;
+- `review_refresh`;
+- `unknown`.
+
+Routing rules:
+
+- only `owner_class = code_writer` with `is_code_writer_blocking = true` may route back to implementation refinement;
+- `docs_guardian` routes to the docs workflow;
+- `security_reviewer`, `prepush_reviewer`, and `implementation_auditor` normally route to fresh review/evidence refresh unless they cite concrete source/test defects;
+- `release_evidence`, `external_environment`, and `operator` route to handoff / external evidence states;
+- `followup_proposal` routes to workflow-defined follow-up proposal seed generation;
+- `output_settlement`, `side_effect_reconciliation`, and `runtime_recovery` route to their owning lower-layer recovery paths, not P094 boundary approval;
+- `unknown` fails closed and must not schedule `code_writer` without file-level evidence.
+
+If a reviewer wants to send work back to `code_writer`, the finding must include concrete source/test/doc file-level evidence. A vague gate, evidence, doc, or review-refresh finding must not become `needs_code_fixes`.
+
+---
+
+## 6.5 Review artifact freshness
+
+Security, prepush, audit, docs, and implementation-summary artifacts are active blockers only when they are fresh relative to the latest relevant implementation pass.
+
+If security/prepush/audit/implementation-summary artifacts are older than the latest relevant implementation/code-writer pass, they cannot be used as active blockers. The evaluator must emit:
+
+```text
+review_refresh_required
+```
+
+not:
+
+```text
+implementation_refine
+```
+
+Example:
+
+```text
+security/report.json is block, but artifact generation predates the latest code_writer execution that addressed security findings. Workflow must request fresh security review before returning to code_writer.
+```
+
+---
+
 ## 7. Workflow-owned transitions
 
 P094 requires workflows to declare transitions explicitly.
@@ -400,10 +558,20 @@ states:
     tasks:
       - evaluate_quality_gate_blocker_boundary
     transitions:
+      - when: blocker_boundary_status.status == "output_settlement_required"
+        to: output_settlement_recovery
+      - when: blocker_boundary_status.status == "side_effect_reconciliation_required"
+        to: side_effect_reconciliation
+      - when: blocker_boundary_status.status == "runtime_recovery_required"
+        to: runtime_recovery
+      - when: blocker_boundary_status.status == "review_refresh_required"
+        to: implementation_review_refresh
       - when: blocker_boundary_status.status == "local_code_tail_present"
         to: implementation_refine
       - when: blocker_boundary_status.status == "invalid_claim"
-        to: implementation_refine
+        to: implementation_review_refresh
+      - when: blocker_boundary_status.status == "blocked_no_progress"
+        to: blocker_boundary_approval
       - when: blocker_boundary_status.status == "awaiting_human_boundary_approval"
         to: blocker_boundary_approval
       - when: blocker_boundary_status.status == "pass"
@@ -419,7 +587,7 @@ states:
       - when: approval.decision == "accept"
         to: blocker_boundary_accepted
       - when: approval.decision == "reject"
-        to: implementation_refine
+        to: implementation_review_refresh
 
   blocker_boundary_accepted:
     tasks:
@@ -438,7 +606,7 @@ Important:
 
 - approval returns only `accept` or `reject`;
 - follow-up proposal generation is a workflow task;
-- returning to implementation is a workflow transition on rejection;
+- returning to implementation requires a workflow-declared route and fresh code-owned evidence;
 - external-evidence blocking is a workflow state;
 - no approval payload selects arbitrary route.
 
@@ -587,6 +755,17 @@ Forbidden workflow routes:
 - blind implementation refinement;
 - release/closeout as green.
 
+Complement rule:
+
+```text
+new blocker_signature_id
+or changed evidence_fingerprint
+or fresh source/test evidence
+= may allow targeted implementation/review action if owner_class permits it
+```
+
+This prevents stale loops without blocking genuinely new security, prepush, audit, or code defects.
+
 ---
 
 ## 12. Classification model
@@ -674,9 +853,73 @@ MCP `runs.get` and reports may expose:
 
 Any operational action must be an existing workflow/MCP command, not a special human approval option.
 
+Readback surfaces must expose, for every blocker:
+
+- `blocker_signature_id`;
+- `evidence_fingerprint`;
+- `evidence_freshness`;
+- `source_artifact_generation_id` or equivalent active contract generation pointer;
+- `observed_after_stage_execution_id`;
+- `observed_after_agent_execution_id`;
+- `owner_class`;
+- `is_code_writer_blocking`;
+- `gate_command`;
+- `evidence_refs`;
+- allowed workflow route.
+
 ---
 
-## 14. Rollout plan
+## 14. Reviewer and auditor blocker schema guidance
+
+Reviewer and auditor outputs should include structured blocker records that P094 can validate without relying on prose.
+
+Example:
+
+```json
+{
+  "summary": "GraphQL HTTP auth still reads a startup PrincipalTable.",
+  "owner_class": "code_writer",
+  "is_code_writer_blocking": true,
+  "freshness": "fresh",
+  "evidence_refs": ["security/report.json#SEC-HIGH-001"],
+  "gate_command": "cargo test -p graphql-server live_principal_reload",
+  "observed_after_stage_execution_id": "state_10_implementation_refined.6",
+  "observed_after_agent_execution_id": "agent_execution.code_writer.6",
+  "file_level_evidence": [
+    "control-plane/crates/graphql-server/src/server.rs:445",
+    "control-plane/crates/graphql-server/src/auth_layer.rs:45"
+  ]
+}
+```
+
+Strict guidance:
+
+- if a reviewer wants work to return to `code_writer`, it must provide concrete source/test/doc file-level evidence;
+- a vague gate/evidence/doc/review-refresh finding must not become `needs_code_fixes`;
+- reviewer outputs without owner, freshness, and evidence fail closed to `unknown` or `review_refresh_required`;
+- `security_reviewer`, `prepush_reviewer`, and `implementation_auditor` findings route to implementation only when the owner is explicitly code-owned and evidence is fresh.
+
+---
+
+## 15. Do not mask implementation settlement failures
+
+P094 must not say "blocker boundary accepted" when the real issue is an execution/output settlement problem.
+
+These are not quality-gate blocker boundaries:
+
+- `implementation_self_assessment_v2` missing;
+- `tests_result_v1` missing;
+- `implementation_review_summary_v1` stale;
+- `AgentOutputSettlement = missing_required_outputs`;
+- active artifact contract row absent;
+- stage completed without required output settlement;
+- provider turn interrupted after meaningful progress but output collection did not settle.
+
+Those must be resolved before P094 boundary evaluation. They route to output settlement, agent invocation settlement, provider-session recovery, retry authority recovery, or review refresh as appropriate.
+
+---
+
+## 16. Rollout plan
 
 ## Phase 0 — Fixtures and historical runs
 
@@ -691,7 +934,10 @@ Fixture inventory:
 - mixed code tail plus external blocker;
 - invalid blocker explanation rejected by human;
 - repeated same blocker with no progress;
-- stale artifact claim.
+- stale artifact claim;
+- stale security/prepush/audit block that predates latest code_writer work;
+- missing required output or active contract row;
+- side-effect ledger unresolved.
 
 ## Phase 1 — Proposal decomposition artifacts
 
@@ -741,23 +987,27 @@ Replace unbounded code-refine loops with workflow-declared decision routing.
 Enforce:
 
 - repeated identical blocker claims need new evidence or human acceptance;
-- local code tail routes back to implementation;
-- invalid claims route back to implementation;
+- local code tail routes back to implementation only when `owner_class = code_writer`, `is_code_writer_blocking = true`, and evidence is fresh;
+- invalid or weak claims route to review/evidence refresh unless they contain fresh file-level source/test evidence;
 - external/follow-up boundary goes to approval;
+- lower-layer settlement failures route to their owning recovery path;
 - accepted boundary follows workflow-defined closeout/follow-up/external-evidence path.
 
 ---
 
-## 15. Metrics
+## 17. Metrics
 
 Required metrics:
 
 - `quality_gate_blocker_assessments_total{status,class}`
 - `quality_gate_blocker_validation_rejections_total{reason}`
+- `quality_gate_blocker_freshness_total{freshness,owner_class}`
 - `implementation_refine_loops_avoided_total{proposal_id}`
 - `followup_proposal_seeds_created_total{tail_class}`
 - `external_blockers_accepted_total{blocker_class}`
 - `invalid_blocker_claims_total{claim_class}`
+- `review_refresh_required_total{artifact_kind}`
+- `output_settlement_required_before_boundary_total{reason}`
 - `human_boundary_approval_latency_seconds`
 - `post_boundary_reopen_total{reason}`
 - `false_external_blocker_rate`
@@ -771,7 +1021,7 @@ The feature is successful only if repeated implementation-refine loops decrease 
 
 ---
 
-## 16. Test plan
+## 18. Test plan
 
 Add retained gate:
 
@@ -794,7 +1044,24 @@ The gate must prove:
 10. macOS readback is passive except approval accept/reject;
 11. repeated identical blocker claims without new evidence fail closed;
 12. lead recommendation cannot override server validation;
-13. accepted boundary does not mark release-blocking external evidence as satisfied.
+13. accepted boundary does not mark release-blocking external evidence as satisfied;
+14. stale security/prepush/audit block artifacts emit `review_refresh_required` and do not route to `code_writer`;
+15. fresh security/prepush blockers with file-level evidence can route to targeted implementation when `owner_class = code_writer`;
+16. missing required outputs, missing `implementation_self_assessment_v2`, or missing active contract rows route to output settlement recovery and never boundary approval;
+17. reviewer findings without owner/freshness/evidence fail closed to `unknown` or `review_refresh_required`;
+18. release-evidence-only tails route to boundary/external evidence states, not implementation refinement.
+
+Required fixture cases:
+
+| Case | Fixture | Expected result |
+|---|---|---|
+| A. stale security block | `security/report.json` is `block` but predates the latest implementation pass. | `review_refresh_required`; no `code_writer` route. |
+| B. fresh security block | security report is fresh and cites source file evidence. | local code tail route allowed when owner permits. |
+| C. missing required output | `implementation_self_assessment_v2` missing. | output settlement recovery; no blocker-boundary approval. |
+| D. repeated no-progress blocker | same blocker signature and evidence fingerprint over repeated cycles with no local progress. | `blocked_no_progress`. |
+| E. handoff-only tail | implementation complete; no blocking code tasks; only release evidence remains. | boundary/external evidence route. |
+| F. invalid weak blocker | reviewer says "needs code fixes" without file-level evidence. | `unknown` or `review_refresh_required`; no `code_writer` route. |
+| G. human approval shape | approval request is generated. | allowed decisions are only `accept` and `reject`. |
 
 ---
 
@@ -817,7 +1084,7 @@ retry, and blocker-boundary acceptance.
 
 ---
 
-## 17. Acceptance criteria
+## 19. Acceptance criteria
 
 P094 is implemented only when:
 
@@ -826,17 +1093,25 @@ P094 is implemented only when:
 - proposal decomposition can identify split candidates before implementation starts;
 - implementation closeout can distinguish local code tail, follow-up code tail, external blockers, and invalid blocker claims;
 - server-owned validation rejects weak blocker claims;
+- P094 does not run boundary approval when required output settlement is missing;
+- P094 does not use stale review artifacts as current blockers;
+- fresh prepush/security blockers with file-level evidence can route to targeted implementation when `owner_class` permits it;
 - repeated no-progress blocker loops are stopped;
-- rejection returns to implementation with durable feedback;
+- repeated same blocker signature with the same evidence fingerprint and no local progress routes to `blocked_no_progress`;
+- reviewer findings without owner/freshness/evidence fail closed and do not schedule `code_writer`;
+- `review_refresh_required` is emitted when review artifacts predate the latest implementation pass;
+- rejection returns through workflow-declared routing with durable feedback and may schedule `code_writer` only when fresh code-owned evidence exists;
 - follow-up proposal seeds are generated only by workflow-declared tasks;
 - external-only blockers do not generate unnecessary new proposals;
 - accepting a boundary does not mark release-blocking evidence as satisfied;
+- lead recommendation cannot override the server-owned evaluator;
+- GraphQL/MCP/readback surfaces expose blocker freshness, `owner_class`, and allowed workflow route;
 - all readback surfaces expose the same boundary status;
 - retained `proposal-094` gate proves positive and negative cases.
 
 ---
 
-## 18. Open questions
+## 20. Open questions
 
 1. Should `proposal_decomposition_plan_v1` be mandatory for all proposals or only proposals above a risk/complexity threshold?
 2. Should follow-up proposal seeds create Ideas automatically through workflow, or remain files until a separate operator/MCP action accepts them?
@@ -846,7 +1121,23 @@ P094 is implemented only when:
 
 ---
 
-## 19. Final recommendation
+## 21. Non-goals recap
+
+P094 does not:
+
+- implement code fixes;
+- weaken gates;
+- replace implementation audit;
+- replace output contract settlement;
+- replace side-effect reconciliation;
+- add UI actions;
+- add arbitrary human approval actions;
+- create a generic rule engine;
+- make lead/orchestrator authoritative over transitions.
+
+---
+
+## 22. Final recommendation
 
 P094 should not make the lead smarter.
 

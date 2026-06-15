@@ -16,4 +16,7 @@ extension Tag {
 
     /// Provider-specific tests (Proposal 006 scope).
     @Tag static var provider: Self
+
+    /// SwiftUI/macOS platform modernization coverage, including WWDC visual updates.
+    @Tag static var uiModernization: Self
 }

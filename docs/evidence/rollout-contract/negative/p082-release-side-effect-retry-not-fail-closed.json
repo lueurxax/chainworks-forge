@@ -1,39 +1,9 @@
 {
-  "applicability": "required",
-  "commands": {
-    "allowlist": []
+  "schema_version": "p082_negative_fixture_v1",
+  "fixture_id": "p082_release_side_effect_retry_not_fail_closed",
+  "expected_failure_code": "release_side_effect_retry_not_fail_closed",
+  "mutated_contract_or_matrix": {
+    "mutation": "set release_side_effect_retry_blocked recovery_decision to retry"
   },
-  "decision_vocabulary": [
-    "pass",
-    "fail"
-  ],
-  "gate_aliases": [
-    "proposal-082",
-    "p082"
-  ],
-  "hold_conditions": [
-    "placeholder negative fixture"
-  ],
-  "metrics": {
-    "adoption_metric": "placeholder_negative_fixture_must_be_replaced"
-  },
-  "migrations": {
-    "justification": "Engine materialized negative fixture placeholder; implementation must replace it with proposal-specific failing input.",
-    "not_applicable": true
-  },
-  "operator_report_fields": [
-    "rollout_contract_status"
-  ],
-  "placeholder_fixture_kind": "negative:release_side_effect_retry_not_fail_closed",
-  "readback_fields": [
-    "rollout_contract_status"
-  ],
-  "readback_lanes": [
-    "run_report"
-  ],
-  "rollback_disposition": {
-    "data_loss_risk": "none",
-    "mode": "not_applicable"
-  },
-  "schema_version": "rollout_contract_v1"
+  "assertion": "The gate must fail when release side-effect retry is not fail-closed."
 }

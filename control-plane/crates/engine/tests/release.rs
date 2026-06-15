@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use db::pool::create_pool;
-use db::repos::{agent_executions, artifacts, ideas, runs, stages};
+use db::repos::{agent_executions, artifacts, ideas, runs, side_effects, stages};
 use db::writer::{register_shared_writer, DbWriter};
 use domain::agent::AgentStatus;
 use domain::artifact::ArtifactFormat;
@@ -515,6 +515,13 @@ async fn background_executor_routes_release_agents_natively() {
         .file_path
         .ends_with(".chainworks/release/git-push.json"));
     assert!(!after_git.iter().any(|a| a.name == "delivery_receipt"));
+    assert!(
+        side_effects::list_unresolved_for_run(&pool, &run_id.to_string())
+            .await
+            .unwrap()
+            .is_empty(),
+        "git release phase must settle durable side effects"
+    );
 
     assert!(executor.process_next_item().await.unwrap());
     assert!(executor.process_next_item().await.unwrap());
@@ -545,6 +552,13 @@ async fn background_executor_routes_release_agents_natively() {
     assert!(delivery
         .file_path
         .ends_with(".chainworks/release/delivery-receipt.json"));
+    assert!(
+        side_effects::list_unresolved_for_run(&pool, &run_id.to_string())
+            .await
+            .unwrap()
+            .is_empty(),
+        "connect release phase must settle durable side effects"
+    );
 }
 
 #[tokio::test]

@@ -398,6 +398,7 @@ async fn p086_mcp_continue_work_reuses_live_acp_session_and_materializes_termina
             reuse_existing_session: false,
             session_generation_id: Some("p086-generation".into()),
             provider_session_id: None,
+            provider_runtime_home: None,
             mcp_servers: Vec::new(),
             chainworks_meta_root: Some(format!("{workspace_root}/.chainworks/runs/{run_id}")),
             legacy_broad_discovery_policy: domain::discovery::LegacyBroadDiscoveryPolicy::Disabled,
