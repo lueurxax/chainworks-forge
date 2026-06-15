@@ -84,7 +84,7 @@ fn p082_r02_rejected_command_envelope_wellformed() {
 }
 
 #[test]
-fn p082_r08_retry_identifier_guidance_accepts_agent_execution_id_kind() {
+fn p082_r08_retry_identifier_guidance_rejects_agent_execution_id_kind() {
     let guidance = recovery_matrix::build_retry_identifier_guidance(
         "RetryAgentExecution",
         "provided-agent-execution",
@@ -110,16 +110,8 @@ fn p082_r08_retry_identifier_guidance_accepts_agent_execution_id_kind() {
     );
 
     assert!(
-        recovery_matrix::validate_readback_v1_shape(&readback),
-        "P082-R08: agent_execution_id must be approved for targeted retry guidance"
-    );
-    assert_eq!(
-        readback["recovery_retry_identifier_guidance"]["provided_identifier_kind"],
-        "agent_execution_id"
-    );
-    assert_eq!(
-        readback["recovery_retry_identifier_guidance"]["expected_identifier_kind"],
-        "agent_execution_id"
+        !recovery_matrix::validate_readback_v1_shape(&readback),
+        "P082-R08: agent_execution_id is not in the approved retry guidance vocabulary"
     );
 }
 

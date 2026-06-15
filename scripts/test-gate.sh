@@ -7,6 +7,54 @@ if [[ -n "${CHAINWORKS_TEST_GATE_ROOT_DIR:-}" ]]; then
 else
   ROOT_DIR="$DEFAULT_ROOT_DIR"
 fi
+if [[ -f "$ROOT_DIR/scripts/cargo-cache-env.sh" ]]; then
+  CHAINWORKS_CARGO_CACHE_REPO_ROOT="$ROOT_DIR"
+  # shellcheck source=scripts/cargo-cache-env.sh
+  source "$ROOT_DIR/scripts/cargo-cache-env.sh"
+fi
+
+chainworks_test_gate_cargo_target_dir() {
+  if declare -F chainworks_gate_cargo_target_dir >/dev/null 2>&1; then
+    chainworks_gate_cargo_target_dir "$1"
+    return 0
+  fi
+
+  local requested="${1:-}"
+  if [[ -z "$requested" ]]; then
+    requested="${HOME:-$ROOT_DIR}/Library/Caches/Chainworks Forge/cargo-target"
+  fi
+  case "$requested" in
+    target|target/*|control-plane/target|control-plane/target/*|*/control-plane/target|*/control-plane/target/*)
+      local suffix="${requested#*/control-plane/target/}"
+      if [[ "$suffix" == "$requested" ]]; then
+        suffix="${requested#target/}"
+      fi
+      if [[ -z "$suffix" || "$suffix" == "$requested" || "$suffix" == "." ]]; then
+        suffix="default"
+      fi
+      local safe_suffix
+      safe_suffix="$(printf '%s' "$suffix" | sed -E 's#[/[:space:]]+#-#g; s#[^A-Za-z0-9._-]#_#g; s#^[-.]+##; s#[-.]+$##')"
+      printf '%s/%s\n' "${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-${HOME:-$ROOT_DIR}/Library/Caches/Chainworks Forge/cargo-target/gates}" "${safe_suffix:-default}"
+      ;;
+    *)
+      printf '%s\n' "$requested"
+      ;;
+  esac
+}
+
+cargo() {
+  if [[ "${CHAINWORKS_TEST_GATE_REMAP_CARGO_TARGET_DIR:-1}" =~ ^(1|true|TRUE|yes|YES)$ && -n "${CARGO_TARGET_DIR:-}" ]]; then
+    local remapped_target
+    remapped_target="$(chainworks_test_gate_cargo_target_dir "$CARGO_TARGET_DIR")"
+    if [[ "$remapped_target" != "$CARGO_TARGET_DIR" ]]; then
+      mkdir -p "$remapped_target"
+      CARGO_TARGET_DIR="$remapped_target" command cargo "$@"
+      return $?
+    fi
+  fi
+  command cargo "$@"
+}
+
 PROJECT_PATH="$ROOT_DIR/Chainworks Forge.xcodeproj"
 SCHEME_NAME="Chainworks Forge"
 DESTINATION="platform=macOS"
@@ -1583,6 +1631,9 @@ else:
         "SCCACHE_CACHE_SIZE",
         "RUSTC_WRAPPER",
         "sccache",
+        "chainworks_gate_cargo_target_dir",
+        "CHAINWORKS_GATE_CARGO_TARGET_ROOT",
+        "CHAINWORKS_ALLOW_LOCAL_CARGO_TARGET_DIR",
     ]
     for fragment in required_helper_fragments:
         if fragment not in helper_text:
@@ -1619,6 +1670,13 @@ if legacy_p082_target in gate_text:
     violations.append("proposal-082 gate still creates a dedicated target/proposal-082-gate cache")
 if "CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR" not in gate_text:
     violations.append("proposal-082 gate does not expose a bounded reusable target dir override")
+for fragment in [
+    "chainworks_test_gate_cargo_target_dir",
+    "CHAINWORKS_TEST_GATE_REMAP_CARGO_TARGET_DIR",
+    "CARGO_TARGET_DIR=\"$remapped_target\" command cargo",
+]:
+    if fragment not in gate_text:
+        violations.append(f"test-gate.sh missing Cargo target remap guard {fragment!r}")
 
 if violations:
     print("Xcode Cargo cache policy violations:", file=sys.stderr)
@@ -10423,6 +10481,66 @@ PY
     ;;
   proposal-082|p082)
     log "Proposal 082 gate: recovery and retry state-machine matrix"
+    P082_GATE_SCENARIOS=(
+      P082-R01 P082-R02 P082-R03 P082-R04 P082-R05 P082-R06 P082-R07 P082-R08 P082-R09
+      P082-R10 P082-R11 P082-R12 P082-R13 P082-R14 P082-R15 P082-R16 P082-R17
+    )
+    P082_GATE_SCENARIO_RECORDED="|"
+    p082_emit_gate_result_metric() {
+      local scenario_id="$1"
+      local status="$2"
+      # P082 approved emission site: the proposal-082 gate harness emits
+      # p082_recovery_matrix_gate_result_total{scenario_id,status} after each
+      # scenario assertion group. Keep the line OpenMetrics-shaped so gate logs
+      # can be scraped without coupling runtime readback accessors to gate state.
+      printf 'p082_recovery_matrix_gate_result_total{scenario_id="%s",status="%s"} 1\n' "$scenario_id" "$status"
+      case "$P082_GATE_SCENARIO_RECORDED" in
+        *"|$scenario_id|"*) ;;
+        *) P082_GATE_SCENARIO_RECORDED="${P082_GATE_SCENARIO_RECORDED}${scenario_id}|" ;;
+      esac
+    }
+    p082_emit_gate_results_from_cargo_output() {
+      local output="$1"
+      local scenario_id metric_status
+      while IFS=$'\t' read -r scenario_id metric_status; do
+        if [[ -n "$scenario_id" && -n "$metric_status" ]]; then
+          p082_emit_gate_result_metric "$scenario_id" "$metric_status"
+        fi
+      done < <(python3 -c '
+import re
+import sys
+
+seen = set()
+for line in sys.stdin:
+    match = re.search(r"^test .*p082_r(0[1-9]|1[0-7])_[^ ]* \.\.\. (ok|FAILED|ignored)\b", line)
+    if not match:
+        continue
+    scenario_id = f"P082-R{match.group(1)}"
+    raw_status = match.group(2)
+    status = {
+        "ok": "passed",
+        "FAILED": "failed",
+        "ignored": "interrupted",
+    }[raw_status]
+    key = (scenario_id, status)
+    if key in seen:
+        continue
+    seen.add(key)
+    print(f"{scenario_id}\t{status}")
+' <<< "$output")
+    }
+    p082_emit_interrupted_gate_results() {
+      local exit_status=$?
+      if [[ "$exit_status" -ne 0 ]]; then
+        local scenario_id
+        for scenario_id in "${P082_GATE_SCENARIOS[@]}"; do
+          if [[ "$P082_GATE_SCENARIO_RECORDED" != *"|$scenario_id|"* ]]; then
+            p082_emit_gate_result_metric "$scenario_id" "interrupted"
+          fi
+        done
+      fi
+    }
+    trap p082_emit_interrupted_gate_results EXIT
     # Run the static fixture/matrix contract checks before the focused Rust
     # suites so missing or malformed rollout evidence fails the active gate.
     python3 - <<'PY'
@@ -10576,6 +10694,18 @@ def require_lane_payload(lane):
 def canonical_json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
+def latest_applicable_readback(rows):
+    applicable = [
+        row for row in rows
+        if isinstance(row, dict) and row.get("scenario_status") != "not_applicable"
+    ]
+    if not applicable:
+        return None
+    return sorted(
+        applicable,
+        key=lambda row: (row.get("updated_at", ""), row.get("scenario_id", "")),
+    )[-1]
+
 runs_get_payload = require_lane_payload("runs_get")
 reports_get_payload = require_lane_payload("reports_get")
 report_resource_payload = require_lane_payload("report_resource")
@@ -10587,6 +10717,13 @@ if "p082_recovery_matrix_readback" not in runs_get_payload:
     sys.exit(1)
 if not isinstance(runs_get_payload.get("p082_recovery_matrix_readbacks"), list):
     print("FAILED: runs_get lane payload missing plural p082_recovery_matrix_readbacks array")
+    sys.exit(1)
+runs_get_latest = latest_applicable_readback(runs_get_payload["p082_recovery_matrix_readbacks"])
+if runs_get_latest is None:
+    print("FAILED: runs_get lane payload must include at least one applicable p082_recovery_matrix_readbacks row")
+    sys.exit(1)
+if canonical_json(runs_get_payload["p082_recovery_matrix_readback"]) != canonical_json(runs_get_latest):
+    print("FAILED: runs_get singular p082_recovery_matrix_readback must equal the latest non-not_applicable plural row")
     sys.exit(1)
 if "p082_recovery_matrix_readback" in reports_get_payload:
     print("FAILED: reports_get lane payload must not expose singular p082_recovery_matrix_readback")
@@ -11002,6 +11139,20 @@ for n in range(1, 18):
 if 'record_p082_recovery_matrix_gate_result(scenario_id: &str, status: &str)' not in metrics_content:
     print("FAILED: metrics.rs record_p082_recovery_matrix_gate_result must accept (scenario_id: &str, status: &str) for {scenario_id,status} label dimensions")
     sys.exit(1)
+gate_script = root / "scripts/test-gate.sh"
+gate_content = gate_script.read_text() if gate_script.exists() else ""
+for required_gate_fragment in [
+    "p082_emit_gate_result_metric",
+    "p082_emit_gate_results_from_cargo_output",
+    "p082_emit_interrupted_gate_results",
+    'status="%s"',
+    '"passed"',
+    '"failed"',
+    '"interrupted"',
+]:
+    if required_gate_fragment not in gate_content:
+        print(f"FAILED: proposal-082 gate harness missing gate-result metric fragment: {required_gate_fragment}")
+        sys.exit(1)
 if 'record_p082_recovery_state_age_seconds(\n    scenario_id: &str,' not in metrics_content and \
    'record_p082_recovery_state_age_seconds(scenario_id: &str, reason_code: &str, age_seconds: u64)' not in metrics_content:
     print("FAILED: metrics.rs record_p082_recovery_state_age_seconds must accept (scenario_id, reason_code, age_seconds) for {scenario_id,reason_code} label dimensions")
@@ -11018,7 +11169,7 @@ print("P082 gate: all static checks passed")
 PY
     (
       cd "$ROOT_DIR/control-plane"
-      p082_cargo_target="${CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR:-target/proposal-082}"
+      p082_cargo_target="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR:-target/proposal-082}")"
       run_p082_cargo_test() {
         local output status
         set +e
@@ -11026,6 +11177,7 @@ PY
         status=$?
         set -e
         printf '%s\n' "$output"
+        p082_emit_gate_results_from_cargo_output "$output"
         if [ "$status" -ne 0 ]; then
           return "$status"
         fi

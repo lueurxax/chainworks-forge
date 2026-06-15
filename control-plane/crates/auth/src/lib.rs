@@ -118,6 +118,10 @@ pub struct Principal {
     /// None means the class is derived from PrincipalClass per the default rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_class_override: Option<CallerClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql_policy: Option<GraphqlPolicy>,
+    #[serde(default)]
+    pub has_explicit_surface_policies: bool,
 }
 
 impl Principal {
@@ -130,12 +134,19 @@ impl Principal {
             tool_capabilities,
             resource_capabilities,
             caller_class_override: None,
+            graphql_policy: None,
+            has_explicit_surface_policies: false,
         }
     }
 
     fn from_entry(entry: &PrincipalEntry) -> Self {
         let mut principal = Principal::new(entry.id.clone(), entry.class.clone());
         principal.caller_class_override = entry.caller_class_override.clone();
+        principal.has_explicit_surface_policies = entry.surface_policies.is_some();
+        principal.graphql_policy = entry
+            .surface_policies
+            .as_ref()
+            .and_then(|policies| policies.graphql.clone());
         if let Some(policies) = entry.surface_policies.as_ref() {
             // surface_policies present: the mcp stanza controls tool access.
             // Resource-template access is not yet expressible in surface_policies,
@@ -214,7 +225,7 @@ pub struct SurfacePolicies {
 }
 
 /// P072: GraphQL-specific principal policy.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GraphqlPolicy {
     #[serde(default)]
@@ -381,6 +392,28 @@ impl PrincipalTable {
                 class: PrincipalClass::Operator,
                 surface_policies: None,
                 disabled: Some(true),
+                ..Default::default()
+            }],
+        }
+    }
+
+    pub fn test_fixture_graphql_query_only(
+        token: impl Into<String>,
+        id: impl Into<String>,
+    ) -> Self {
+        PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: token.into(),
+                id: id.into(),
+                class: PrincipalClass::Operator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: Some(GraphqlPolicy {
+                        allow_queries: true,
+                        allow_subscriptions: true,
+                        allowed_mutations: Vec::new(),
+                    }),
+                    mcp: None,
+                }),
                 ..Default::default()
             }],
         }
@@ -1051,9 +1084,25 @@ pub fn is_mutation_allowed_by_surface_policy(
         .entries
         .iter()
         .find(|e| e.id == principal_id)
-        .and_then(|e| e.surface_policies.as_ref())
-        .and_then(|sp| sp.graphql.as_ref())
-        .map(|graphql| graphql.allowed_mutations.iter().any(|m| m == mutation_name))
+        .and_then(|e| {
+            e.surface_policies.as_ref().map(|sp| {
+                sp.graphql
+                    .as_ref()
+                    .map(|graphql| graphql.allowed_mutations.iter().any(|m| m == mutation_name))
+                    .unwrap_or(false)
+            })
+        })
+}
+
+pub fn is_mutation_allowed_by_principal_surface_policy(
+    principal: &Principal,
+    mutation_name: &str,
+) -> Option<bool> {
+    match principal.graphql_policy.as_ref() {
+        Some(graphql) => Some(graphql.allowed_mutations.iter().any(|m| m == mutation_name)),
+        None if principal.has_explicit_surface_policies => Some(false),
+        None => None,
+    }
 }
 
 /// P072: Check if GraphQL queries are allowed for a principal based on v2 surface_policies.
@@ -1066,9 +1115,22 @@ pub fn is_query_allowed_by_surface_policy(
         .entries
         .iter()
         .find(|e| e.id == principal_id)
-        .and_then(|e| e.surface_policies.as_ref())
-        .and_then(|sp| sp.graphql.as_ref())
-        .map(|graphql| graphql.allow_queries)
+        .and_then(|e| {
+            e.surface_policies.as_ref().map(|sp| {
+                sp.graphql
+                    .as_ref()
+                    .map(|graphql| graphql.allow_queries)
+                    .unwrap_or(false)
+            })
+        })
+}
+
+pub fn is_query_allowed_by_principal_surface_policy(principal: &Principal) -> Option<bool> {
+    match principal.graphql_policy.as_ref() {
+        Some(graphql) => Some(graphql.allow_queries),
+        None if principal.has_explicit_surface_policies => Some(false),
+        None => None,
+    }
 }
 
 /// P072: Check if GraphQL subscriptions are allowed for a principal based on v2 surface_policies.
@@ -1081,9 +1143,22 @@ pub fn is_subscription_allowed_by_surface_policy(
         .entries
         .iter()
         .find(|e| e.id == principal_id)
-        .and_then(|e| e.surface_policies.as_ref())
-        .and_then(|sp| sp.graphql.as_ref())
-        .map(|graphql| graphql.allow_subscriptions)
+        .and_then(|e| {
+            e.surface_policies.as_ref().map(|sp| {
+                sp.graphql
+                    .as_ref()
+                    .map(|graphql| graphql.allow_subscriptions)
+                    .unwrap_or(false)
+            })
+        })
+}
+
+pub fn is_subscription_allowed_by_principal_surface_policy(principal: &Principal) -> Option<bool> {
+    match principal.graphql_policy.as_ref() {
+        Some(graphql) => Some(graphql.allow_subscriptions),
+        None if principal.has_explicit_surface_policies => Some(false),
+        None => None,
+    }
 }
 
 // ── Capability filtering ────────────────────────────────────────────────
@@ -2132,6 +2207,50 @@ mod tests {
         assert_eq!(
             is_subscription_allowed_by_surface_policy(&table, "v1-operator"),
             None
+        );
+    }
+
+    #[test]
+    fn explicit_surface_policies_without_graphql_fail_closed_for_graphql() {
+        let table = PrincipalTable {
+            entries: vec![PrincipalEntry {
+                token: "tok-mcp-only".into(),
+                id: "mcp-only-operator".into(),
+                class: PrincipalClass::Operator,
+                surface_policies: Some(SurfacePolicies {
+                    graphql: None,
+                    mcp: Some(McpPolicy {
+                        allowed_tools: vec!["runs.list".into()],
+                    }),
+                }),
+                ..Default::default()
+            }],
+        };
+        let principal = find_principal_by_id(&table, "mcp-only-operator").unwrap();
+
+        assert_eq!(
+            is_query_allowed_by_surface_policy(&table, "mcp-only-operator"),
+            Some(false)
+        );
+        assert_eq!(
+            is_mutation_allowed_by_surface_policy(&table, "mcp-only-operator", "approveApproval"),
+            Some(false)
+        );
+        assert_eq!(
+            is_subscription_allowed_by_surface_policy(&table, "mcp-only-operator"),
+            Some(false)
+        );
+        assert_eq!(
+            is_query_allowed_by_principal_surface_policy(&principal),
+            Some(false)
+        );
+        assert_eq!(
+            is_mutation_allowed_by_principal_surface_policy(&principal, "approveApproval"),
+            Some(false)
+        );
+        assert_eq!(
+            is_subscription_allowed_by_principal_surface_policy(&principal),
+            Some(false)
         );
     }
 

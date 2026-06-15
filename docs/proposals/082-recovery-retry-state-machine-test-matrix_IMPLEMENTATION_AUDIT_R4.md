@@ -25,14 +25,14 @@ Reviewer-selection reuse: **Not reused**. The discovery helper found no prior pr
 
 Audit confidence: **High** for Rust control-plane, MCP, GraphQL auth, DB/engine matrix, and readback lanes. **Medium** for broad merge readiness because the branch contains non-P082 historical surfaces beyond this proposal's scope.
 
-Post-refinement docs sync note, 2026-06-09: the current `scripts/test-gate.sh` `proposal-082|p082` alias retains the Python static checklist as inert reference text and executes the focused DB, engine, and MCP readback suites. It does not currently include the GraphQL live-revocation, MCP HTTP live-auth, daemon failed-serve, workflow YAML, or background-panic detector checks claimed by this historical audit narrative. Canonical current gate semantics are in `docs/reference/test-gates.md`; treat the stale gate-inventory statements below as superseded by this note and the corrected sections. Failed-serve GraphQL/MCP still resolves bearer tokens against the startup `auth::PrincipalTable` snapshot, not `auth::LivePrincipalTable`; R3 `SEC-001` therefore remains an adjacent auth-readiness finding outside the P082 readback contract.
+Post-refinement docs sync note, 2026-06-15: the current `scripts/test-gate.sh` `proposal-082|p082` alias executes the Python static fixture/matrix checklist before the focused DB, engine, MCP, auth, MCP HTTP live-revocation, and daemon failed-serve revocation suites. It does not currently include GraphQL P082 readback tests because P082 GraphQL readback remains optional and unimplemented; workflow YAML and background-panic detector checks are not part of the alias. Canonical current gate semantics are in `docs/reference/test-gates.md`; treat stale gate-inventory statements below as superseded by this note and the corrected sections. Failed-serve GraphQL/MCP diagnostics now resolve bearer tokens through `auth::LivePrincipalSource`, so the prior R3 `SEC-001` static-auth finding is resolved in the current tree.
 
 ## Implementation Target / Compare Base
 
 - Repo root: `/Users/user/Documents/Chainworks Forge/.chainworks/worktrees/cw-implement-proposal-082-recover-a09a1918`
 - Current SHA: `fe217cb67064f1050c744c9d027e879cdbdc309a`
 - Merge base: `94ceec201b5c14aef8a1118e935004fb69234051`
-- Working tree: dirty by design for the implementation under audit. Post-refinement docs sync found no tracked `control-plane/crates/graphql-server/tests/p082_live_revocation.rs` entry, and that test is not part of the current `proposal-082|p082` alias. Prior local audit sidecars `R2` and `R3` remain untracked/non-implementation evidence and are ignored.
+- Working tree: dirty by design for the implementation under audit. Post-refinement docs sync found no tracked `control-plane/crates/graphql-server/tests/p082_live_revocation.rs` entry, and GraphQL P082 readback remains optional/unimplemented. Prior local audit sidecars `R2` and `R3` remain untracked/non-implementation evidence and are ignored.
 
 ## Prior Review Reuse
 
@@ -72,7 +72,7 @@ Primary service flows audited:
 2. Invalid retry/cancel/recovery commands reject before mutation and store typed, redacted `command_journal.error` envelopes.
 3. Cancellation, late output, provider cleanup, approvals, mediation, side effects, and crash replay preserve durable ownership and fail closed.
 4. Operator readback lanes expose exact singular/plural fields with redaction and non-operator gating.
-5. Security-sensitive live principal changes propagate to normal GraphQL HTTP/WS/subscription/mutation/query guards and MCP HTTP/stdio. Failed-serve diagnostic surfaces continue to use the startup principal-table snapshot.
+5. Security-sensitive live principal changes propagate to normal GraphQL HTTP/WS/subscription/mutation/query guards, MCP HTTP/stdio, and failed-serve diagnostic surfaces.
 
 ## Proposal Fidelity Inventory
 
@@ -89,12 +89,11 @@ Matches:
 
 Divergences:
 
-- The Python static checklist and negative-fixture shape checks are retained in `scripts/test-gate.sh` as inert reference text, not executed by the current alias.
 - `p082_recovery_matrix_gate_result_total` is exercised by a DB harness test rather than emitted by the shell gate after each scenario assertion group. Runtime readback emission is fixed, but this is weaker than the literal "proposal-082 gate harness after each scenario assertion group" wording.
 
 Ambiguities / evidence gaps:
 
-- Fixture-shape validation for the P082 negative fixture inventory is a known proof gap while the retained static checklist remains inert. Broad helper output includes unrelated branch surfaces from older proposal work; this audit scopes readiness to P082 and directly adjacent security/reliability surfaces.
+- Broad helper output includes unrelated branch surfaces from older proposal work; this audit scopes readiness to P082 and directly adjacent security/reliability surfaces.
 
 ## Residual Scope / Follow-up Ownership
 
@@ -103,7 +102,7 @@ Ambiguities / evidence gaps:
 | Future Forge UI consumption of P082 readback | Separate future UI proposal required by P082 | No | P082 explicitly excludes UI implementation. |
 | Advisory GraphQL P082 readback fields | Optional only if implementation adds them | No | No P082 GraphQL readback fields were found; GraphQL changes here are auth hardening. |
 | Swift app-facing decode/tolerance tests | Optional only if Swift path is added | No | No P082 Swift implementation was found. |
-| Static fixture-shape validation and strict per-assertion gate-result metric timing | P082 gate implementation | No, bounded risk | The current alias leaves the static checklist inert and relies on focused Rust tests; the DB harness exercises gate-result metric emission, but the shell gate does not emit it after each scenario group. |
+| Strict per-assertion gate-result metric timing | P082 gate implementation | No, bounded risk | The current alias executes the static fixture/matrix checklist and focused Rust tests; the DB harness exercises gate-result metric emission, but the shell gate does not emit it after each scenario group. |
 
 Unowned residual scope blocking conformance/readiness: **none**.
 
@@ -115,7 +114,7 @@ Unowned residual scope blocking conformance/readiness: **none**.
 | MCP/report/run-report/release/GraphQL boundary shapes | API contract | `api_contract_reviewer` | Pass. |
 | Metrics, gates, rollout fixtures, docs | Observability/rollout | `observability_rollout_reviewer` | Pass with bounded OPS-001 risk. |
 | Crate/module/runtime/auth handle ownership | Architecture | `rust_arch_reviewer` | Pass. |
-| Auth, public ingress, redaction, YAML parse, MCP/GraphQL/failed-serve boundaries | Security | `rust_security_reviewer` | Pass for P082 readback scope; adjacent failed-serve static-auth risk remains. |
+| Auth, public ingress, redaction, YAML parse, MCP/GraphQL/failed-serve boundaries | Security | `rust_security_reviewer` | Pass for P082 readback scope; prior adjacent failed-serve static-auth risk resolved. |
 | Swift/macOS UI | Apple UI/UX | Rejected | No P082 UI implementation in scope. |
 | Hot-path/benchmark performance | Performance | Rejected | No proposal performance target; resource limits reviewed under security. |
 
@@ -158,7 +157,7 @@ Status: **Implemented**.
 
 Evidence: `scripts/test-gate.sh`; `docs/reference/test-gates.md:2220`.
 
-Mapping: Both `proposal-082` and `p082` aliases resolve to the P082 gate. The current alias executes the DB, engine, and MCP P082 suites; GraphQL, daemon failed-serve, auth, workflow, and MCP HTTP live-auth checks are not part of this alias unless added by a later refinement.
+Mapping: Both `proposal-082` and `p082` aliases resolve to the P082 gate. The current alias executes the static fixture/matrix checklist, DB and engine P082 suites, engine integration P082 checks, MCP P082 readback suites, auth live-principal revalidation, MCP HTTP live-revocation, and daemon failed-serve revocation checks. GraphQL P082 readback tests remain optional because GraphQL P082 readback is not implemented.
 
 ### REQ-003 - DB/engine scenario proof
 
@@ -250,17 +249,17 @@ Evidence: DB metric tests; `control-plane/crates/db/src/repos/p082_recovery_matr
 
 Mapping: Runtime readback emits coverage, reason/readback lane, and state-age metrics, and no longer emits the gate-result metric. A DB harness test exercises `p082_recovery_matrix_gate_result_total{scenario_id,status}` for all 17 scenarios, but the current shell gate does not write a `.prom` artifact after each scenario assertion group.
 
-Gap/risk: the shell gate does not emit the gate-result metric after each scenario assertion group, and the retained static checklist is not executed. This is weaker than the proposal's literal observability and fixture-shape proof language.
+Gap/risk: the shell gate does not emit the gate-result metric after each scenario assertion group. This is weaker than the proposal's literal observability timing language.
 
 ### REQ-012 - Security/redaction/parser compensating controls introduced by implementation
 
 Proposal source: P082 readback redaction; security-sensitive implementation diff.
 
-Status: **Implemented for P082 readback; adjacent failed-serve auth risk remains**.
+Status: **Implemented for P082 readback; adjacent failed-serve auth risk resolved**.
 
-Evidence: `security_sensitive_diff.py` triggered; manual security pass; GraphQL/MCP/auth/workflow tests passed. Post-refinement docs sync inspected `control-plane/crates/daemon/src/main.rs` and `control-plane/crates/daemon/src/failed_serve.rs` and found failed-serve still uses a startup `auth::PrincipalTable` snapshot.
+Evidence: `security_sensitive_diff.py` triggered; manual security pass; GraphQL/MCP/auth/workflow tests passed. Post-refinement docs sync inspected `control-plane/crates/daemon/src/main.rs` and `control-plane/crates/daemon/src/failed_serve.rs` and found failed-serve now threads `auth::LivePrincipalSource` through GraphQL and MCP diagnostic handlers.
 
-Mapping: `LivePrincipalTable` gates normal GraphQL HTTP/WS/query/mutation/subscription paths, MCP HTTP, and MCP stdio. Failed-serve GraphQL/MCP diagnostics are authenticated against the static table snapshot loaded before entering failed-serve. YAML loaders perform bounded opened-file reads before `serde_yaml` parse. P082 readback strips unknown/sensitive keys and redacts paths/raw diagnostics. These adjacent auth/workflow checks are not part of the current `proposal-082|p082` alias unless added separately.
+Mapping: `LivePrincipalSource` gates normal GraphQL HTTP/WS/query/mutation/subscription paths, MCP HTTP, MCP stdio, and failed-serve GraphQL/MCP diagnostics. YAML loaders perform bounded opened-file reads before `serde_yaml` parse. P082 readback strips unknown/sensitive keys and redacts paths/raw diagnostics. The current `proposal-082|p082` alias includes focused auth, MCP HTTP, and failed-serve revocation checks; GraphQL P082 readback tests remain unnecessary because P082 GraphQL readback is not implemented.
 
 ## Reviewer / Lens Scorecard
 
@@ -270,7 +269,7 @@ Mapping: `LivePrincipalTable` gates normal GraphQL HTTP/WS/query/mutation/subscr
 | Reliability | Pass | Ready | Long-running reload tasks are intentionally detached; no shutdown contract claimed | High |
 | API contract | Pass | Ready | Optional GraphQL P082 readback intentionally absent | High |
 | Observability/rollout | Pass | Ready with risk | Gate-result artifact timing is pre-cargo rather than post-group | Medium |
-| Security | Pass for P082 scope | Ready with adjacent risk | Failed-serve static-auth revocation gap remains outside the P082 readback contract | High |
+| Security | Pass for P082 scope | Ready | Prior failed-serve static-auth revocation gap is covered by live-principal source wiring and tests | High |
 
 ## Security-Sensitive Diff Scan Summary
 
@@ -288,17 +287,17 @@ Helper categories:
 
 Reviewed security surfaces:
 
-- `auth::LivePrincipalTable` in `control-plane/crates/auth/src/lib.rs`.
+- `auth::LivePrincipalSource` in `control-plane/crates/auth/src/lib.rs`.
 - GraphQL HTTP auth middleware, WebSocket `connection_init`, query/mutation/subscription guards, and per-emission subscription rechecks.
 - MCP HTTP and stdio initialize/per-request auth.
-- Failed-serve `/graphql` and `/mcp` diagnostic surfaces, which currently use the startup principal-table snapshot rather than live auth.
+- Failed-serve `/graphql` and `/mcp` diagnostic surfaces, which currently use `auth::LivePrincipalSource` for bearer-principal resolution.
 - P082 MCP/report readback redaction and principal-class gating.
 - Workflow and MCP-registry YAML bounded file loaders.
 - Projection rebuild background runtime lifecycle after the prior panic.
 
-Security verdict: **Pass for P082 scope; adjacent failed-serve auth risk remains**.
+Security verdict: **Pass for P082 scope; adjacent failed-serve auth risk resolved**.
 
-The R3 `SEC-001` blocker is not resolved in the current tree: failed-serve accepts `auth::PrincipalTable` and resolves GraphQL and MCP diagnostic auth against that startup snapshot. Post-refinement docs sync also found that failed-serve live-auth tests are not included in the current `proposal-082|p082` alias.
+The R3 `SEC-001` blocker is resolved in the current tree: failed-serve exposes `build_failed_serve_router_with_principal_source`, resolves GraphQL and MCP diagnostic auth through `auth::LivePrincipalSource`, and the current `proposal-082|p082` alias includes the failed-serve revocation test.
 
 No unresolved Critical or Major security findings remain for the P082 readback contract itself.
 
@@ -319,7 +318,7 @@ Evidence type: code, tests-run, telemetry.
 Evidence references:
 
 - Proposal metric site: `docs/proposals/082-recovery-retry-state-machine-test-matrix.md:161`.
-- Current gate ownership: `scripts/test-gate.sh` retains the static checklist as inert reference text and runs focused Rust suites.
+- Current gate ownership: `scripts/test-gate.sh` executes the static fixture/matrix checklist, focused Rust suites, and focused auth/revocation checks.
 - Runtime readback no longer emits gate-result metric: `control-plane/crates/db/src/repos/p082_recovery_matrix.rs:927`.
 - DB harness test exercises `record_p082_recovery_matrix_gate_result` for all scenario IDs.
 
@@ -340,13 +339,13 @@ Acceptance criteria:
 
 | Item | Status | Evidence |
 | --- | --- | --- |
-| Canonical proposal gate on audited tree/HEAD | Historical pass; not re-run during docs sync | `./scripts/test-gate.sh proposal-082` was recorded by the original audit; current alias semantics are DB/engine/MCP only |
-| Core service flows validated | Pass for P082 active gate scope | DB, engine, and MCP P082 suites are the current gate-owned flows |
-| Security-sensitive diff pass | Pass for P082 scope | Helper triggered; manual pass completed for P082 readback, with failed-serve static auth retained as an adjacent risk |
+| Canonical proposal gate on audited tree/HEAD | Historical pass; not re-run during docs sync | `./scripts/test-gate.sh proposal-082` was recorded by the original audit; current alias semantics include static fixture/matrix checks plus DB, engine, MCP, auth, MCP HTTP, and daemon failed-serve revocation checks |
+| Core service flows validated | Pass for P082 active gate scope | Static fixture/matrix checks and DB, engine, MCP P082 suites are the core gate-owned flows |
+| Security-sensitive diff pass | Pass for P082 scope | Helper triggered; manual pass completed for P082 readback; failed-serve live auth is covered by current source wiring and a focused revocation test |
 | Specialist coverage hard gate | Pass | Required lenses selected or explicitly rejected with scope rationale |
 | UI empty/loading/error/accessibility states | Out of scope | No P082 UI implementation |
 | Privacy/redaction | Pass | Operator-only readbacks; non-operator null/empty; DB-side sanitization tests |
-| Permissions/auth | Pass for P082 scope; adjacent failed-serve risk | Live auth tests across normal GraphQL and MCP were inspected historically, but failed-serve still uses a startup principal-table snapshot and these checks are not included in the current P082 alias |
+| Permissions/auth | Pass for P082 scope | Live auth tests across normal GraphQL and MCP were inspected historically; failed-serve now uses `auth::LivePrincipalSource`, and the current P082 alias includes the focused failed-serve revocation test |
 | Localization/entitlements | Out of scope | No UI/entitlement changes in P082 scope |
 | Full regression/canonical gate evidence | Historical pass; current docs sync did not rerun | Canonical P082 gate contents changed from the broad inventory claimed below |
 
@@ -366,7 +365,7 @@ Historical gate contents recorded by this audit, now superseded for current gate
 
 - Auth live-principal invalidity-window test: 1 passed.
 - Workflow bounded YAML loader test: 1 passed.
-- Daemon failed-serve P082 live-auth tests: historical claim superseded; current docs sync found no live-auth failed-serve implementation in this tree.
+- Daemon failed-serve live-auth revocation test: included in the current `proposal-082|p082` alias.
 - GraphQL P046 same-principal invalidity-window subscription test: 1 passed.
 - DB P082 matrix: 67 passed.
 - Engine P082 matrix: 35 passed.

@@ -951,7 +951,7 @@ Additional focused gates:
 - The retained escalation proof gate documented in [test-gates.md](test-gates.md) covers ACP failure classification, runtime facts, and escalation-policy readback.
 - `./scripts/test-gate.sh proposal-061` for SQLite write serialization, executor backpressure, host-interruption recovery, scheduler-health readback, and generated-state housekeeping safety. The `proposal-061|p061` names are retained historical gate aliases for this implemented contract.
 - `./scripts/test-gate.sh proposal-084` (retained historical alias `p084`) for the rollout-contract template, linter, fixtures, run-start preflight, parity-lane operator readback, and Swift read-only presentation slice. See [executable-rollout-gate-template.md](executable-rollout-gate-template.md).
-- `./scripts/test-gate.sh proposal-082` (alias `p082`) for the recovery/retry state-machine matrix: DB and engine proof for all 17 canonical scenarios, `p082_recovery_matrix_readback_v1` lane parity on MCP/report surfaces, fixture-enforced nested subcontracts, fail-closed side-effect retry, and crash-loop replay. See [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md).
+- `./scripts/test-gate.sh proposal-082` (alias `p082`) for the recovery/retry state-machine matrix: static fixture/matrix validation, DB and engine proof for all 17 canonical scenarios, `p082_recovery_matrix_readback_v1` lane parity on MCP/report surfaces, auth and revocation regressions for live principal revalidation including failed-serve diagnostics, fixture-enforced nested subcontracts, fail-closed side-effect retry, and crash-loop replay. See [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md).
 
 ## Key design decisions
 

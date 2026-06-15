@@ -6051,7 +6051,7 @@ impl CommandHandler {
                 "RetryAgentExecution",
                 &agent_execution_id.to_string(),
                 "unknown",
-                "agent_execution_id",
+                "stage_execution_uuid",
                 &valid_identifier_example_refs,
             );
             let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
@@ -6064,7 +6064,7 @@ impl CommandHandler {
                         "rejected",
                         "no_mutation",
                         domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
-                        "Provide an agent execution from the current stage execution.",
+                        "Provide a valid targeted retry UUID from the current stage execution.",
                         "command_journal",
                         "command_journal, agent_executions, stage_executions",
                         &journal.id,
@@ -6106,7 +6106,7 @@ impl CommandHandler {
                 "RetryAgentExecution",
                 &agent_execution_id.to_string(),
                 "unknown",
-                "agent_execution_id",
+                "stage_execution_uuid",
                 &valid_identifier_example_refs,
             );
             let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
@@ -6119,7 +6119,7 @@ impl CommandHandler {
                         "rejected",
                         "no_mutation",
                         domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
-                        "Provide an agent execution from the latest stage execution attempt.",
+                        "Provide a valid targeted retry UUID from the latest stage execution attempt.",
                         "command_journal",
                         "command_journal, agent_executions, stage_executions",
                         &journal.id,
@@ -6620,7 +6620,7 @@ impl CommandHandler {
                 if stage.run_id == c.run_id {
                     return Ok(Some(RetryIdentifierKindRejection {
                         message: format!(
-                            "wrong_identifier_kind: stages.retry expected logical stage_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or set agent_execution_id to an agent_executions.id for a targeted retry.",
+                            "wrong_identifier_kind: stages.retry expected logical stage_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or choose a valid targeted retry UUID from that stage execution.",
                             c.stage_id, stage.stage_id
                         ),
                         provided_identifier: c.stage_id.clone(),
@@ -6643,7 +6643,7 @@ impl CommandHandler {
                         if stage.run_id == c.run_id {
                             return Ok(Some(RetryIdentifierKindRejection {
                                 message: format!(
-                                    "wrong_identifier_kind: stages.retry expected logical stage_id but received agent_execution_id '{}'. next_action: retry with stage_id '{}' and agent_execution_id '{}'.",
+                                    "wrong_identifier_kind: stages.retry expected logical stage_id but received targeted retry UUID '{}'. next_action: retry with stage_id '{}' and choose targeted retry UUID '{}'.",
                                     c.stage_id, stage.stage_id, agent_execution.id
                                 ),
                                 provided_identifier: c.stage_id.clone(),
@@ -6651,7 +6651,7 @@ impl CommandHandler {
                                 expected_identifier_kind: "workflow_stage_id",
                                 valid_identifier_examples: vec![stage.stage_id],
                                 operator_message:
-                                    "Retry with the logical workflow stage_id; put the agent execution UUID in agent_execution_id for targeted retry."
+                                    "Retry with the logical workflow stage_id; use the listed targeted retry UUID only for targeted retry."
                                         .to_string(),
                             }));
                         }
@@ -6676,15 +6676,15 @@ impl CommandHandler {
                                 .collect::<Vec<_>>();
                         return Ok(Some(RetryIdentifierKindRejection {
                             message: format!(
-                                "wrong_identifier_kind: stages.retry expected agent_execution_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or choose an agent_executions.id from that stage for targeted retry.",
+                                "wrong_identifier_kind: stages.retry received stage_execution_uuid '{}' in the targeted retry field. next_action: retry with workflow stage_id '{}' for a full-stage retry, or choose a listed targeted retry UUID from that stage execution.",
                                 agent_execution_id, stage.stage_id
                             ),
                             provided_identifier: agent_execution_id.to_string(),
                             provided_identifier_kind: "stage_execution_uuid",
-                            expected_identifier_kind: "agent_execution_id",
+                            expected_identifier_kind: "stage_execution_uuid",
                             valid_identifier_examples,
                             operator_message:
-                                "Retry targeted agents with an agent_execution_id, not a stage execution UUID."
+                                "For targeted retry, choose one of the listed targeted retry UUIDs; for full-stage retry, use the workflow stage_id."
                                     .to_string(),
                         }));
                     }

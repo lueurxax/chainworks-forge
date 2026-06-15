@@ -4259,7 +4259,7 @@ async fn p082_retry_agent_execution_stale_rejection_writes_valid_r08_readback() 
     );
     assert_eq!(
         guidance["expected_identifier_kind"],
-        serde_json::json!("agent_execution_id")
+        serde_json::json!("stage_execution_uuid")
     );
     assert_eq!(
         guidance["valid_identifier_examples"],
@@ -4822,8 +4822,8 @@ async fn p082_retry_stage_rejects_stage_execution_uuid_agent_execution_id_before
         "unexpected retry validation error: {error}"
     );
     assert!(
-        error.contains("expected agent_execution_id"),
-        "error must name the expected identifier kind: {error}"
+        error.contains("targeted retry field"),
+        "error must identify the rejected targeted retry field: {error}"
     );
     assert!(
         error.contains("received stage_execution_uuid"),
@@ -4871,7 +4871,7 @@ async fn p082_retry_stage_rejects_stage_execution_uuid_agent_execution_id_before
     );
     assert_eq!(
         guidance["expected_identifier_kind"],
-        serde_json::json!("agent_execution_id")
+        serde_json::json!("stage_execution_uuid")
     );
     assert_eq!(
         guidance["valid_identifier_examples"],

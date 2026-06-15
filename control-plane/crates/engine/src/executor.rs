@@ -19054,7 +19054,6 @@ mod tests {
     fn p086_continuation_prompt_uses_mode_reset_contract() {
         let record = domain::continuation::ContinuationRecord {
             id: "cont-1".to_string(),
-            command_journal_id: "cmd-1".to_string(),
             run_id: "run-1".to_string(),
             stage_execution_id: "stage-exec-1".to_string(),
             agent_execution_id: "agent-exec-1".to_string(),
@@ -19156,9 +19155,6 @@ mod tests {
             agent_execution_id: "agent-exec-1".into(),
             stage_execution_id: "stage-exec-1".into(),
             run_id: "run-1".into(),
-            workspace_root: "/tmp/workspace".into(),
-            artifact_root: "/tmp/artifacts".into(),
-            chainworks_meta_root: Some(".chainworks/runs/run-1".into()),
             logical_stage_id: Some("state_implementation".into()),
             stage_type: Some("implementation".into()),
             agent_status: "completed".into(),

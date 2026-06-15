@@ -158,7 +158,7 @@ fn sanitize_string(value: String) -> serde_json::Value {
 /// (starts with "[redacted"). Used to update `diagnostic_redaction` after projection.
 fn value_contains_redaction_marker(v: &serde_json::Value) -> bool {
     match v {
-        serde_json::Value::String(s) => s.starts_with("[redacted"),
+        serde_json::Value::String(s) => s.contains("[redacted"),
         serde_json::Value::Array(items) => items.iter().any(value_contains_redaction_marker),
         serde_json::Value::Object(m) => m.values().any(value_contains_redaction_marker),
         _ => false,
@@ -484,12 +484,18 @@ pub async fn readbacks_for_run(
     // Source 1b: work_items.payload_json.p061_startup_recovery carries the
     // approved P082-R05/R06 owner for explicit startup/stale scheduler repair.
     let startup_recovery_items = sqlx::query(
-        r#"SELECT id, payload_json, COALESCE(started_at, scheduled_at, created_at) AS updated_at
+		r#"SELECT id, payload_json, COALESCE(started_at, scheduled_at, created_at) AS updated_at
 		           FROM work_items
 		           WHERE run_id = ?1
-		             AND json_valid(payload_json)
-		             AND json_extract(payload_json, '$.p061_startup_recovery.p082_recovery_matrix_readback.scenario_id') IN ('P082-R05', 'P082-R06')
-		             AND LENGTH(payload_json) <= ?2
+		             AND (
+		               CASE
+		                 WHEN payload_json IS NOT NULL
+		                   AND LENGTH(payload_json) <= ?2
+		                   AND json_valid(payload_json)
+		                 THEN json_extract(payload_json, '$.p061_startup_recovery.p082_recovery_matrix_readback.scenario_id')
+		                 ELSE NULL
+		               END
+		             ) IN ('P082-R05', 'P082-R06')
 	           ORDER BY updated_at ASC, id ASC
 	           LIMIT ?3"#,
     )
@@ -872,12 +878,16 @@ pub async fn readbacks_for_run(
 		                  sg.created_at,
 		                  wi.id AS work_item_id,
 		                  CASE
-		                    WHEN wi.payload_json IS NOT NULL AND json_valid(wi.payload_json)
+		                    WHEN wi.payload_json IS NOT NULL
+		                      AND LENGTH(wi.payload_json) <= ?2
+		                      AND json_valid(wi.payload_json)
 		                    THEN json_extract(wi.payload_json, '$.xcode_broker_required')
 	                    ELSE NULL
 	                  END AS payload_xcode_broker_required,
 	                  CASE
-	                    WHEN wi.payload_json IS NOT NULL AND json_valid(wi.payload_json)
+	                    WHEN wi.payload_json IS NOT NULL
+	                      AND LENGTH(wi.payload_json) <= ?2
+	                      AND json_valid(wi.payload_json)
 	                    THEN json_extract(wi.payload_json, '$.requested_mcp_server_ids')
 	                    ELSE NULL
 	                  END AS payload_requested_mcp_server_ids
@@ -887,17 +897,25 @@ pub async fn readbacks_for_run(
              ON ae.session_generation_id = sg.id AND ae.status = 'running'
 	           LEFT JOIN work_items wi
 	             ON wi.kind = 'invoke_agent' AND wi.status = 'running'
-	             AND json_valid(wi.payload_json)
-	             AND ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+	             AND ae.id = (
+	               CASE
+	                 WHEN wi.payload_json IS NOT NULL
+	                   AND LENGTH(wi.payload_json) <= ?2
+	                   AND json_valid(wi.payload_json)
+	                 THEN json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+	                 ELSE NULL
+	               END
+	             )
 	           WHERE sl.run_id = ?1
 	             AND sg.status = 'active'
 	             AND sg.provider_session_id IS NULL
 	             AND sg.last_activity_at IS NULL
 	             AND wi.id IS NOT NULL
 	           ORDER BY sg.created_at ASC
-	           LIMIT ?2"#,
+	           LIMIT ?3"#,
     )
     .bind(run_id.to_string())
+    .bind(MAX_READBACK_ROW_BYTES as i64)
     .bind(remaining_readback_limit(&readbacks))
     .fetch_all(pool)
     .await?;
@@ -985,7 +1003,7 @@ pub async fn readbacks_for_run(
                 &work_item_id,
                 Some("work_items.payload_json.p061_startup_recovery"),
                 "stale",
-                &now.to_rfc3339(),
+                &created_at,
             ),
             summary,
             Some(&operator_message),
@@ -1016,7 +1034,9 @@ pub async fn readbacks_for_run(
 		             AND wi.kind = 'invoke_agent'
 		             AND wi.status = 'running'
 		             AND (CASE
-		                    WHEN json_valid(wi.payload_json)
+		                    WHEN wi.payload_json IS NOT NULL
+		                      AND LENGTH(wi.payload_json) <= ?2
+		                      AND json_valid(wi.payload_json)
 		                    THEN json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
 		                    ELSE NULL
 		                  END) IS NULL
@@ -1030,9 +1050,10 @@ pub async fn readbacks_for_run(
                       )
                  )
 	           ORDER BY COALESCE(wi.started_at, wi.created_at) ASC
-	           LIMIT ?2"#,
+	           LIMIT ?3"#,
     )
     .bind(run_id.to_string())
+    .bind(MAX_READBACK_ROW_BYTES as i64)
     .bind(remaining_readback_limit(&readbacks))
     .fetch_all(pool)
     .await?;
@@ -1062,7 +1083,7 @@ pub async fn readbacks_for_run(
             &side_effect_id,
             Some("work_items.payload_json.p061_startup_recovery"),
             "stale",
-            &now.to_rfc3339(),
+            evidence_at,
         );
         push_valid_projected_readback(&mut readbacks, readback);
     }

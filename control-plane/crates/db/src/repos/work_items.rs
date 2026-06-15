@@ -458,7 +458,7 @@ pub async fn requeue_running_preclaimed_invoke_for_stage_tx(
 	             AND json_valid(wi.payload_json)
 	             AND NOT (
                json_type(wi.payload_json, '$.targeted_retry') IS NOT NULL
-               AND ae.status = 'completed'
+	             AND ae.status IN (?3, ?4)
                AND facts.output_settlement IN (
                  'valid_outputs_from_completed_execution',
                  'valid_outputs_from_failed_execution'
@@ -471,6 +471,8 @@ pub async fn requeue_running_preclaimed_invoke_for_stage_tx(
     .bind(stage_id)
     .bind(WorkItemKind::InvokeAgent.to_string())
     .bind(WorkItemStatus::Running.to_string())
+    .bind(AgentStatus::Completed.to_string())
+    .bind(AgentStatus::Failed.to_string())
     .fetch_all(&mut **tx)
     .await
     .context("load running preclaimed InvokeAgent work items")?;
@@ -1752,7 +1754,7 @@ pub async fn complete_running_invoke_agents_with_terminal_valid_outputs_on_start
 	          ON json_valid(wi.payload_json)
 	         AND ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
          AND ae.stage_execution_id = se.id
-         AND ae.status = ?1
+	         AND ae.status IN (?1, ?8)
         JOIN artifact_source_generation_claims claim
           ON claim.run_id = wi.run_id
          AND claim.stage_execution_id = se.id
@@ -1805,6 +1807,7 @@ pub async fn complete_running_invoke_agents_with_terminal_valid_outputs_on_start
     .bind(ArtifactSourceClaimState::Closed.to_string())
     .bind(WorkItemKind::InvokeAgent.to_string())
     .bind(WorkItemStatus::Running.to_string())
+    .bind(AgentStatus::Failed.to_string())
     .fetch_all(pool)
     .await
     .context("select running InvokeAgent work items with terminal valid agent outputs")?;
@@ -1827,12 +1830,16 @@ pub async fn fail_running_invoke_agents_with_terminal_failed_outputs_on_startup(
 ) -> Result<u64> {
     let rows = sqlx::query(
         r#"
-	        SELECT wi.id
-	        FROM work_items wi
-	        JOIN agent_executions ae
-	          ON json_valid(wi.payload_json)
-	         AND ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
-         AND ae.status IN (?1, ?2)
+		        SELECT wi.id
+		        FROM work_items wi
+		        JOIN stage_executions se
+		          ON json_valid(wi.payload_json)
+		         AND se.id = json_extract(wi.payload_json, '$.stage_execution_id')
+		         AND se.run_id = wi.run_id
+		        JOIN agent_executions ae
+		          ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+		         AND ae.stage_execution_id = se.id
+	         AND ae.status IN (?1, ?2)
         LEFT JOIN agent_execution_runtime_facts facts
           ON facts.agent_execution_id = ae.id
 	        WHERE wi.kind = ?3
@@ -4859,6 +4866,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn p082_startup_failure_recovery_rejects_terminal_failed_foreign_run_owner() {
+        let pool = test_pool().await;
+        let foreign_run_id = RunId::new();
+        let local_run_id = RunId::new();
+        let foreign_stage_execution_id = StageExecutionId::new();
+        let local_stage_execution_id = StageExecutionId::new();
+        let foreign_agent_execution_id = AgentExecutionId::new();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+
+        for (idea_id, run_id) in [
+            ("idea-foreign-failed-owner", foreign_run_id),
+            ("idea-local-failed-owner", local_run_id),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO ideas (id, title, body, status, created_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            )
+            .bind(idea_id)
+            .bind(idea_id)
+            .bind("body")
+            .bind("active")
+            .bind(&now_str)
+            .execute(&pool)
+            .await
+            .expect("insert idea");
+            sqlx::query(
+                r#"INSERT INTO runs
+                   (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            )
+            .bind(run_id.to_string())
+            .bind(idea_id)
+            .bind("running")
+            .bind("wf")
+            .bind("Workflow")
+            .bind("/tmp/ws")
+            .bind("/tmp/artifacts")
+            .bind(&now_str)
+            .execute(&pool)
+            .await
+            .expect("insert run");
+        }
+
+        for (stage_execution_id, run_id) in [
+            (foreign_stage_execution_id, foreign_run_id),
+            (local_stage_execution_id, local_run_id),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO stage_executions
+                   (id, run_id, stage_id, label, status, iteration, attempt_number, started_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            )
+            .bind(stage_execution_id.to_string())
+            .bind(run_id.to_string())
+            .bind("implement")
+            .bind("Implement")
+            .bind("running")
+            .bind(1_i64)
+            .bind(1_i64)
+            .bind(&now_str)
+            .execute(&pool)
+            .await
+            .expect("insert stage execution");
+        }
+
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, status, started_at, completed_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+        )
+        .bind(foreign_agent_execution_id.to_string())
+        .bind(foreign_stage_execution_id.to_string())
+        .bind("code_writer")
+        .bind("codex")
+        .bind(AgentStatus::Failed.to_string())
+        .bind(&now_str)
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert foreign failed agent execution");
+
+        let mut facts = domain::agent::AgentExecutionRuntimeFacts::defaults_for(
+            foreign_agent_execution_id,
+            now,
+        );
+        facts.output_settlement = domain::agent::AgentOutputSettlement::MissingRequiredOutputs;
+        facts.valid_required_outputs = false;
+        crate::repos::agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .expect("insert foreign runtime facts");
+
+        enqueue(
+            &pool,
+            &WorkItem {
+                id: "invoke-foreign-failed-owner-spoof".to_string(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": local_run_id.to_string(),
+                    "stage_id": "implement",
+                    "stage_execution_id": local_stage_execution_id.to_string(),
+                    "p058_claimed": {
+                        "agent_execution_id": foreign_agent_execution_id.to_string()
+                    }
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(local_run_id),
+                stage_id: Some("implement".to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .expect("insert local running invoke item");
+
+        let failed = fail_running_invoke_agents_with_terminal_failed_outputs_on_startup(
+            &pool,
+            "startup_repair_terminal_agent_missing_outputs",
+        )
+        .await
+        .expect("startup failure recovery should ignore foreign owner");
+        assert_eq!(
+            failed, 0,
+            "P082: foreign failed agent execution must not fail local running InvokeAgent work"
+        );
+        assert!(
+            !running_invoke_agent_has_terminal_failed_outputs(
+                &pool,
+                "invoke-foreign-failed-owner-spoof"
+            )
+            .await
+            .expect("check terminal failed foreign owner"),
+            "P082: single-item terminal failed check must also reject foreign owner evidence"
+        );
+
+        let item = find_by_id(&pool, "invoke-foreign-failed-owner-spoof")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.status, WorkItemStatus::Running);
+        assert!(
+            find_by_id(
+                &pool,
+                "advance-after-invoke:invoke-foreign-failed-owner-spoof"
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "P082: ignored foreign owner evidence must not enqueue AdvanceRun"
+        );
+    }
+
+    #[tokio::test]
     async fn superseded_targeted_retry_invoke_falls_back_to_run_scoped_advance_payload() {
         let pool = test_pool().await;
         let run_id = RunId::new();
@@ -6524,6 +6687,178 @@ mod tests {
             .unwrap()
             .expect("post-invoke advance");
         assert_eq!(advance.status, WorkItemStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_completes_failed_invoke_when_failed_execution_has_valid_outputs() {
+        let pool = test_pool().await;
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let agent_execution_id = AgentExecutionId::new();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let work_item_id = "invoke-failed-with-valid-outputs";
+
+        sqlx::query(
+            r#"INSERT INTO ideas (id, title, body, status, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        )
+        .bind("idea-failed-valid-output")
+        .bind("failed valid output recovery")
+        .bind("body")
+        .bind("active")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert idea");
+        sqlx::query(
+            r#"INSERT INTO runs
+               (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(run_id.to_string())
+        .bind("idea-failed-valid-output")
+        .bind("running")
+        .bind("wf")
+        .bind("Workflow")
+        .bind("/tmp/ws")
+        .bind("/tmp/artifacts")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert run");
+        sqlx::query(
+            r#"INSERT INTO stage_executions
+               (id, run_id, stage_id, label, status, iteration, attempt_number, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(stage_execution_id.to_string())
+        .bind(run_id.to_string())
+        .bind("implementation_review")
+        .bind("Implementation Review")
+        .bind("running")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert stage execution");
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, status, started_at, completed_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)"#,
+        )
+        .bind(agent_execution_id.to_string())
+        .bind(stage_execution_id.to_string())
+        .bind("prepush_code_reviewer")
+        .bind("codex")
+        .bind(AgentStatus::Failed.to_string())
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert failed agent execution");
+
+        let mut facts =
+            domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+        facts.output_settlement =
+            domain::agent::AgentOutputSettlement::ValidOutputsFromFailedExecution;
+        facts.valid_required_outputs = true;
+        crate::repos::agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .expect("insert valid failed-output facts");
+
+        enqueue(
+            &pool,
+            &WorkItem {
+                id: work_item_id.to_string(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "implementation_review",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "p058_claimed": {
+                        "agent_execution_id": agent_execution_id.to_string(),
+                        "session_generation_id": "generation-failed-valid-output"
+                    }
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: Some("implementation_review".to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .expect("insert running failed-valid InvokeAgent work item");
+
+        let claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
+            run_id,
+            owner_kind: domain::mediation::OwnerKind::StageExecution,
+            owner_id: stage_execution_id.to_string(),
+            stage_execution_id: Some(stage_execution_id),
+            agent_execution_id,
+            source_work_item_id: work_item_id.to_string(),
+        };
+        crate::repos::artifact_contracts::insert_source_generation_claim(
+            &pool,
+            domain::artifact_contracts::ArtifactSourceGenerationClaim {
+                key: claim_key,
+                current_session_generation_id: Some("generation-failed-valid-output".to_string()),
+                claim_state: ArtifactSourceClaimState::Closed,
+                superseding_work_item_id: None,
+                superseded_by_agent_execution_id: None,
+                supersession_journal_id: None,
+                superseded_at: None,
+                closed_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("insert closed source claim for failed-valid execution");
+
+        let completed = complete_running_invoke_agents_with_terminal_valid_outputs_on_startup(
+            &pool,
+            "startup_repair_failed_agent_valid_outputs",
+        )
+        .await
+        .expect("complete failed execution with valid outputs");
+        assert_eq!(
+            completed, 1,
+            "P082: failed terminal execution with valid outputs must complete its source work item"
+        );
+
+        let failed = fail_running_invoke_agents_with_terminal_failed_outputs_on_startup(
+            &pool,
+            "startup_repair_terminal_agent_missing_outputs",
+        )
+        .await
+        .expect("failed-output recovery should have nothing left to fail");
+        assert_eq!(failed, 0);
+        let requeued = requeue_running_invoke_agent_on_startup(
+            &pool,
+            now,
+            "startup_repair_abandoned_invoke_agent",
+        )
+        .await
+        .expect("abandoned recovery should not duplicate valid failed output work");
+        assert_eq!(requeued, 0);
+
+        let item = find_by_id(&pool, work_item_id).await.unwrap().unwrap();
+        assert_eq!(item.status, WorkItemStatus::Completed);
+        assert!(
+            find_by_id(
+                &pool,
+                "advance-after-invoke:invoke-failed-with-valid-outputs"
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "P082: completion recovery must enqueue exactly the normal post-invoke AdvanceRun"
+        );
     }
 
     #[tokio::test]

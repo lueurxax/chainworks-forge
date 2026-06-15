@@ -546,14 +546,12 @@ const APPROVED_JSON_SOURCE_KEYS: &[&str] = &[
 const VALID_IDENTIFIER_KINDS: &[&str] = &[
     "workflow_stage_id",
     "stage_execution_uuid",
-    "agent_execution_id",
     "retry_authority_id",
     "work_item_id",
 ];
 const VALID_PROVIDED_IDENTIFIER_KINDS: &[&str] = &[
     "workflow_stage_id",
     "stage_execution_uuid",
-    "agent_execution_id",
     "retry_authority_id",
     "work_item_id",
     "unknown",
@@ -1069,8 +1067,8 @@ mod tests {
             "RetryAgentExecution",
             "stage-abc-wrong-kind",
             "stage_execution_uuid",
-            "agent_execution_id",
-            &["agent-exec-001"],
+            "stage_execution_uuid",
+            &["stage-exec-001"],
         )
     }
 
@@ -1140,7 +1138,7 @@ mod tests {
             "rejected",
             "no_mutation",
             REASON_INVALID_STAGE_FOR_RETRY,
-            "No mutation was performed; api_key=abc sk-test must not leak.",
+            "No mutation was performed; api_key: abc access_token xyz sk-test must not leak.",
             "command_journal",
             "command_journal",
             "cmd-002",
@@ -1151,11 +1149,15 @@ mod tests {
         let envelope = build_rejected_command_error_envelope(
             REASON_INVALID_STAGE_FOR_RETRY,
             "RetryStage",
-            "Rejected retry with token sk-test and api_key=abc",
+            "Rejected retry with password: hunter2 secret abc123 authorization: Bearer auth123",
             readback,
         );
-        assert!(!envelope.contains("sk-test"));
-        assert!(!envelope.contains("api_key=abc"));
+        for leaked in ["sk-test", "abc", "xyz", "hunter2", "abc123", "auth123"] {
+            assert!(
+                !envelope.contains(leaked),
+                "P082 rejected-command envelope leaked {leaked}: {envelope}"
+            );
+        }
         let parsed = parse_command_journal_error_envelope(&envelope)
             .expect("sanitized envelope should still parse");
         assert_eq!(

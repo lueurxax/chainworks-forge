@@ -15,6 +15,7 @@ This reference defines:
 - the late-output quarantine semantics;
 - the approval restart, cancellation, and startup-requeue-exhausted semantics;
 - the long-held observability thresholds;
+- the live-principal authorization boundary for P082 operator-only diagnostics;
 - the gate ownership.
 
 **Rule**: Future recovery behavior changes must add or update matrix rows before the behavior change lands. No recovery mutation may ship without a corresponding row in this document.
@@ -141,6 +142,12 @@ All P082 readback lanes are gated to operator principals, but denied surfaces fa
 
 - `runs.get`: non-operator principals (agent, observer) receive `p082_recovery_matrix_readback: null` and `p082_recovery_matrix_readbacks: []`. Adjacent operator-only diagnostics, including completion receipts, workflow conflicts, retry authority history, P091 repair details, rollout readback, and artifact payload lanes, are omitted or redacted consistently with the existing non-operator `runs.get` boundary.
 - `reports.get`: non-operator principals are denied before report lanes are loaded; they do not receive report entries, generated run-report artifacts, release-receipt payloads, or P082 readback rows.
+
+### Live Principal Reload Boundary
+
+P082 readback lanes can expose operator-only diagnostics, recovery evidence, conflict details, retry authority history, rollout readback, and artifact payload lanes. Any northbound surface touched by the P082 implementation must authorize against the live/reloadable principal source rather than a startup snapshot. Revoked, disabled, or re-scoped bearer principals must be rejected after reload on MCP HTTP, MCP stdio, failed-serve diagnostics, and existing GraphQL HTTP/WebSocket guards.
+
+This boundary is access-control scope, not GraphQL readback scope. GraphQL P082 readback fields remain optional and diagnostic-only; implementing live GraphQL auth does not make GraphQL a P082 recovery authority or a required P082 readback lane.
 - `report://{run_id}`: non-operator principals are denied before the report resource payload is materialized; they do not receive embedded run-report or release-receipt lanes.
 - Operator report surfaces keep their lane field-name contract: `reports.get`, `report://{run_id}`, generated run reports, and release receipts expose plural `p082_recovery_matrix_readbacks` only; `reports.get` and report resources do not expose singular `p082_recovery_matrix_readback`.
 
@@ -269,7 +276,7 @@ Parsing rules:
 5. If JSON parse fails or schema is unrecognized, treat the error as a legacy plain-text error and fall back safely with `recovery_projection_integrity=unavailable`.
 6. Never expose the raw envelope JSON directly to operators; always use `operator_safe_summary` for valid envelopes and sanitized fallback text for invalid or legacy records.
 
-Operator-facing P082 readback rows are allowlist-projected before they leave the DB accessor. Unknown keys are stripped, nested subcontracts are recursively allowlisted, and string fields are sanitized before display. Absolute Unix paths, `file://` values, run meta-root paths, provider transcripts, raw stderr, auth material, raw diagnostics, and unredacted command payloads must not pass through these lanes. URL separators such as `https://...` are not treated as filesystem paths.
+Operator-facing P082 readback rows are allowlist-projected before they leave the DB accessor. Unknown keys are stripped, nested subcontracts are recursively allowlisted, and string fields are sanitized before display. Absolute Unix paths, `file://` values, run meta-root paths, provider transcripts, raw stderr, auth material, raw diagnostics, and unredacted command payloads must not pass through these lanes. URL separators such as `https://...` are not treated as filesystem paths, but token-like URL query parameters and key/value forms such as `token=...`, `api_key=...`, `password=...`, `secret=...`, and `authorization=...` are redacted and mark `diagnostic_redaction=partial`.
 
 ---
 
@@ -414,6 +421,7 @@ Active tests for gate passage:
 - Regression fixture for retry identifier guidance
 - Crash/replay idempotency test for P082-R15
 - Review regressions for Operator-only `runs.start`, Operator-only root-backed `ideas.create`, symlink-safe `artifact_root`/meta-root creation, `runs.get.escalation_readback`, and InvokeAgent completion ownership validation
+- Focused auth/revocation regressions for live-principal source revalidation, MCP HTTP live revocation, and daemon failed-serve revocation
 - Pinned-risk documentation for `serde_yaml`/`unsafe-libyaml` when dependency-audit tooling is unavailable
 - `p082_recovery_matrix_gate_result_total{scenario_id,status}` is gate-harness telemetry and must be emitted by the retained DB harness test after scenario assertion groups. Runtime readback accessors emit readback and state-age telemetry, not gate-result counts.
 - The P082 Python static checklist runs inside `scripts/test-gate.sh` before the focused Rust suites. It validates the reference matrix, positive fixture, all 16 negative fixtures, source-wiring expectations, metric ownership, and required proof-test names. Provider cleanup proof remains required by the matrix semantics and is covered by focused Rust tests.

@@ -1146,6 +1146,79 @@ async fn p082_sec_high1_nested_subcontract_injection_is_stripped() {
 }
 
 #[tokio::test]
+async fn p082_sec_medium1_nested_allowed_strings_redact_token_query_params() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    let repair_key = format!("p082-requeue:cj-nested-query-redact:{run_id_str}:1");
+
+    let summary = recovery_matrix::build_startup_repair_summary(
+        &repair_key,
+        "wi-query-redact",
+        "cj-query-redact",
+        1,
+        1,
+        false,
+        60_000,
+        &now.to_rfc3339(),
+        false,
+        None,
+        "scope=https://example.test/retry?token=secret-token&ok=1 password=hunter2",
+    );
+    let readback = recovery_matrix::set_readback_startup_repair(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &repair_key,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            &now.to_rfc3339(),
+        ),
+        summary,
+        None,
+    );
+    let notes = serde_json::json!({
+        "requeue_generation": 1,
+        "max_requeue_generation": 1,
+        "p082_recovery_matrix_readback": readback,
+    })
+    .to_string();
+
+    startup_repairs::record(
+        &pool,
+        &repair_key,
+        &run_id_str,
+        "requeue_once",
+        now,
+        Some(&notes),
+    )
+    .await
+    .expect("record startup repair with nested token query");
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run must not fail");
+
+    let row = readbacks.first().expect("readback row");
+    let row_str = row.to_string();
+    assert!(!row_str.contains("secret-token"));
+    assert!(!row_str.contains("hunter2"));
+    assert!(row_str.contains("token=[redacted]"));
+    assert!(row_str.contains("password=[redacted]"));
+    assert_eq!(
+        row.get("diagnostic_redaction").and_then(|v| v.as_str()),
+        Some("partial"),
+        "SEC-MEDIUM-001: nested token query redaction must mark diagnostic_redaction partial"
+    );
+}
+
+#[tokio::test]
 async fn p082_sec_001_allowed_string_arrays_are_recursively_redacted() {
     let pool = setup_db().await;
     let now = Utc::now();
@@ -1710,6 +1783,11 @@ async fn p082_r05_stale_xcode_startup_accessor_derives_operator_message() {
         Some("work-item-r05"),
         "P082-R05 startup summary must use the joined work item id, not session invocation_owner_key"
     );
+    assert_eq!(
+        row.get("updated_at").and_then(|value| value.as_str()),
+        Some(stale_at.to_rfc3339().as_str()),
+        "P082-R05 held stale-startup readback must derive updated_at from durable session evidence, not read time"
+    );
 }
 
 #[tokio::test]
@@ -1878,6 +1956,11 @@ async fn p082_r06_stale_scheduler_owner_held_requires_unresolved_side_effect_evi
         row.get("source_json_key").and_then(|value| value.as_str()),
         Some("work_items.payload_json.p061_startup_recovery"),
         "P082-R06: held readback must carry an approved stale scheduler JSON owner"
+    );
+    assert_eq!(
+        row.get("updated_at").and_then(|value| value.as_str()),
+        Some(stale_at.to_rfc3339().as_str()),
+        "P082-R06 held stale scheduler readback must derive updated_at from durable work item evidence, not read time"
     );
 }
 
@@ -2665,6 +2748,102 @@ async fn p082_readback_accessor_tolerates_malformed_mutable_json_columns() {
 }
 
 #[tokio::test]
+async fn p082_readback_accessor_ignores_oversized_work_item_payload_json_claims() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let stale_started_at = now - chrono::Duration::minutes(4);
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    let lineage_id = format!("p082-json-size-lineage-{run_id_str}");
+    let generation_id = format!("p082-json-size-generation-{run_id_str}");
+    let ae_id = format!("p082-json-size-ae-{run_id_str}");
+    let wi_id = format!("p082-json-size-work-{run_id_str}");
+
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+
+    sqlx::query(
+        r#"INSERT INTO session_lineages
+           (id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
+            active_generation_id, created_at, closed_at)
+           VALUES (?1, ?2, 'agent-json-size', ?1, 'run', NULL, ?3, ?4, NULL)"#,
+    )
+    .bind(&lineage_id)
+    .bind(&run_id_str)
+    .bind(&generation_id)
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert lineage");
+
+    sqlx::query(
+        r#"INSERT INTO session_generations
+           (id, lineage_id, generation, invocation_owner_key, provider_session_id,
+            binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
+            workspace_mode, runtime_provider, runtime_model, status, created_at, last_activity_at)
+           VALUES (?1, ?2, 1, 'p082-json-size-owner', NULL, 'binding-json-size',
+                   NULL, '/', 'read_write', 'codex', 'gpt-5.5', 'active', ?3, NULL)"#,
+    )
+    .bind(&generation_id)
+    .bind(&lineage_id)
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert generation");
+
+    sqlx::query(
+        r#"INSERT INTO agent_executions
+           (id, agent_id, provider, status, started_at,
+            session_generation_id, session_lineage_id,
+            owner_kind, owner_id)
+           VALUES (?1, 'agent-json-size', 'codex', 'running', ?2,
+                   ?3, ?4, 'lead_conflict_mediation', ?1)"#,
+    )
+    .bind(&ae_id)
+    .bind(stale_started_at.to_rfc3339())
+    .bind(&generation_id)
+    .bind(&lineage_id)
+    .execute(&pool)
+    .await
+    .expect("insert agent execution");
+
+    let oversized_payload = serde_json::json!({
+        "run_id": run_id_str,
+        "p058_claimed": { "agent_execution_id": ae_id },
+        "padding": "X".repeat(70 * 1024),
+    })
+    .to_string();
+    assert!(
+        oversized_payload.len() > 64 * 1024,
+        "test payload must exceed the P082 readback row guard"
+    );
+
+    sqlx::query(
+        r#"INSERT INTO work_items
+           (id, run_id, kind, payload_json, status, created_at, scheduled_at, started_at, attempt_count)
+           VALUES (?1, ?2, 'invoke_agent', ?3, 'running', ?4, ?4, ?4, 1)"#,
+    )
+    .bind(&wi_id)
+    .bind(&run_id_str)
+    .bind(&oversized_payload)
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert oversized work item payload");
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run must not fail on oversized work_items payload_json");
+
+    assert!(
+        readbacks.iter().all(|row| {
+            row.get("scenario_id").and_then(|v| v.as_str()) != Some("P082-R05")
+                && row.get("source_identifier").and_then(|v| v.as_str()) != Some(wi_id.as_str())
+        }),
+        "P082: oversized work_items.payload_json must not be parsed into stale startup readback"
+    );
+}
+
+#[tokio::test]
 async fn p082_stale_startup_requeue_ignores_malformed_work_item_payload_json() {
     let pool = setup_db().await;
     let now = Utc::now();
@@ -2812,8 +2991,8 @@ fn p082_r08_identifier_guidance_has_required_fields() {
         "RetryAgentExecution",
         "some-stale-uuid",
         "stage_execution_uuid",
-        "agent_execution_id",
-        &["latest-agent-exec-uuid"],
+        "stage_execution_uuid",
+        &["latest-stage-exec-uuid"],
     );
     let required = [
         "schema_version",
@@ -2846,7 +3025,39 @@ fn p082_r08_identifier_guidance_has_required_fields() {
     );
     assert_eq!(
         guidance["expected_identifier_kind"].as_str().unwrap(),
-        "agent_execution_id"
+        "stage_execution_uuid"
+    );
+}
+
+#[test]
+fn p082_r08_identifier_guidance_rejects_unapproved_agent_execution_id_kind() {
+    let guidance = recovery_matrix::build_retry_identifier_guidance(
+        "RetryAgentExecution",
+        "some-stale-uuid",
+        "agent_execution_id",
+        "agent_execution_id",
+        &["latest-agent-exec-uuid"],
+    );
+    let readback = recovery_matrix::set_readback_identifier_guidance(
+        recovery_matrix::build_readback_v1(
+            "P082-R08",
+            "rejected",
+            "no_mutation",
+            recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+            "Provide an approved retry identifier.",
+            "command_journal",
+            "command_journal",
+            "cmd-r08-agent-kind",
+            Some("command_journal.error.p082_recovery_matrix_readback"),
+            "valid",
+            "2026-05-21T00:00:00Z",
+        ),
+        guidance,
+    );
+
+    assert!(
+        !recovery_matrix::validate_readback_v1_shape(&readback),
+        "P082-R08: agent_execution_id must remain outside the approved guidance vocabulary"
     );
 }
 
@@ -2856,7 +3067,7 @@ fn p082_r08_identifier_guidance_rejects_empty_examples() {
         "RetryAgentExecution",
         "some-stale-uuid",
         "stage_execution_uuid",
-        "agent_execution_id",
+        "stage_execution_uuid",
         &[],
     );
     let readback = recovery_matrix::set_readback_identifier_guidance(
@@ -2865,7 +3076,7 @@ fn p082_r08_identifier_guidance_rejects_empty_examples() {
             "rejected",
             "no_mutation",
             recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
-            "Provide an agent_execution_id from the latest stage execution attempt.",
+            "Provide a valid targeted retry UUID from the latest stage execution attempt.",
             "command_journal",
             "command_journal, agent_executions, stage_executions",
             "cmd-r08-empty-examples",
@@ -2913,8 +3124,8 @@ async fn p082_r08_identifier_guidance_stored_in_command_journal_error() {
         "RetryAgentExecution",
         "stale-ae-uuid",
         "stage_execution_uuid",
-        "agent_execution_id",
-        &["latest-agent-exec-uuid"],
+        "stage_execution_uuid",
+        &["latest-stage-exec-uuid"],
     );
     let readback = recovery_matrix::set_readback_identifier_guidance(
         recovery_matrix::build_readback_v1(
@@ -2922,7 +3133,7 @@ async fn p082_r08_identifier_guidance_stored_in_command_journal_error() {
             "rejected",
             "no_mutation",
             recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
-            "Provide an agent_execution_id from the latest stage execution attempt.",
+            "Provide a valid targeted retry UUID from the latest stage execution attempt.",
             "command_journal",
             "command_journal, agent_executions, stage_executions",
             &journal_id,
@@ -2984,7 +3195,7 @@ async fn p082_r08_identifier_guidance_stored_in_command_journal_error() {
         guidance_obj
             .get("expected_identifier_kind")
             .and_then(|v| v.as_str()),
-        Some("agent_execution_id"),
+        Some("stage_execution_uuid"),
         "P082-R08: expected_identifier_kind must stay within the approved vocabulary"
     );
 }
@@ -4935,24 +5146,45 @@ async fn p082_required_matrix_metrics_are_emitted_from_readback_accessor() {
     );
 }
 
-/// Gate-harness outcome telemetry: emit `p082_recovery_matrix_gate_result_total`
-/// explicitly after asserting each scenario group, proving the metric tracks gate
-/// assertion outcomes — not just readback construction calls.
+/// Gate-harness outcome telemetry is owned by `scripts/test-gate.sh`, not by
+/// runtime readback accessors or DB tests. This regression keeps the old unit
+/// test from becoming a false proof by verifying the actual proposal-082 gate
+/// parses libtest scenario assertion results and emits passed/failed/interrupted
+/// samples from the shell harness.
 ///
 /// The approved proposal specifies:
 /// `p082_recovery_matrix_gate_result_total{scenario_id,status}` emission site:
 /// "proposal-082 gate harness after each scenario assertion group".
 #[test]
 fn p082_gate_harness_emits_gate_result_per_scenario_assertion() {
-    for scenario_id in domain::recovery_matrix::SCENARIO_IDS {
-        db::metrics::record_p082_recovery_matrix_gate_result(scenario_id, "asserted");
-        let count = db::metrics::get_counter_with_label(
-            "p082_recovery_matrix_gate_result_total",
-            &format!("{scenario_id}:asserted"),
-        );
+    let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let gate_script = std::fs::read_to_string(repo_root.join("scripts/test-gate.sh"))
+        .expect("read scripts/test-gate.sh");
+    let p082_start = gate_script
+        .find("proposal-082|p082)")
+        .expect("proposal-082 gate block must exist");
+    let p082_block = &gate_script[p082_start..];
+
+    for required in [
+        "p082_emit_gate_result_metric",
+        "p082_emit_gate_results_from_cargo_output",
+        "p082_emit_interrupted_gate_results",
+        "p082_recovery_matrix_gate_result_total{scenario_id=\"%s\",status=\"%s\"} 1",
+        "\"ok\": \"passed\"",
+        "\"FAILED\": \"failed\"",
+        "\"ignored\": \"interrupted\"",
+        "trap p082_emit_interrupted_gate_results EXIT",
+    ] {
         assert!(
-            count > 0,
-            "P082 gate harness: gate_result must be emitted after asserting scenario {scenario_id}"
+            p082_block.contains(required),
+            "P082 gate harness must contain gate-result telemetry fragment: {required}"
+        );
+    }
+
+    for scenario_id in domain::recovery_matrix::SCENARIO_IDS {
+        assert!(
+            p082_block.contains(scenario_id),
+            "P082 gate harness must track interrupted outcome coverage for {scenario_id}"
         );
     }
 }

@@ -79,6 +79,8 @@ use sqlx::SqlitePool;
 /// transient launch conflict from a normal daemon crash.
 const EX_TEMPFAIL: i32 = 75;
 const DAEMON_WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_PRINCIPALS_RELOAD_SECS: u64 = 2;
+const MIN_PRINCIPALS_RELOAD_SECS: u64 = 1;
 
 fn main() -> Result<()> {
     let result = tokio::runtime::Builder::new_multi_thread()
@@ -95,6 +97,27 @@ fn main() -> Result<()> {
         );
     }
     result
+}
+
+fn principals_reload_interval_secs_from_env_value(raw: Option<&str>) -> u64 {
+    match raw.and_then(|value| value.parse::<u64>().ok()) {
+        Some(secs) if secs >= MIN_PRINCIPALS_RELOAD_SECS => secs,
+        _ => DEFAULT_PRINCIPALS_RELOAD_SECS,
+    }
+}
+
+fn principals_reload_interval_secs() -> u64 {
+    let raw = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS").ok();
+    let secs = principals_reload_interval_secs_from_env_value(raw.as_deref());
+    if raw.is_some() && raw.as_deref().and_then(|value| value.parse::<u64>().ok()) != Some(secs) {
+        warn!(
+            configured = raw.as_deref().unwrap_or("<unset>"),
+            fallback_secs = DEFAULT_PRINCIPALS_RELOAD_SECS,
+            min_secs = MIN_PRINCIPALS_RELOAD_SECS,
+            "invalid CHAINWORKS_PRINCIPALS_RELOAD_SECS; using safe default"
+        );
+    }
+    secs
 }
 
 async fn run_daemon() -> Result<()> {
@@ -720,10 +743,7 @@ async fn run_daemon() -> Result<()> {
                 Arc::clone(&boundary_policy),
             )
             .with_live_principal_source(live_principal_source.clone());
-            let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2);
+            let principals_reload_secs = principals_reload_interval_secs();
             let principals_path_for_reload = paths.principals_path.clone();
             let live_principal_source_for_reload = live_principal_source.clone();
             tokio::spawn(async move {
@@ -772,10 +792,7 @@ async fn run_daemon() -> Result<()> {
             // P046: periodically reload principals.json so subscription auth rechecks
             // observe revocation promptly, without requiring a daemon restart.
             // Default interval is 2 seconds; override with CHAINWORKS_PRINCIPALS_RELOAD_SECS.
-            let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2);
+            let principals_reload_secs = principals_reload_interval_secs();
             let principals_path_for_reload = paths.principals_path.clone();
             let live_principal_source_for_reload = live_principal_source.clone();
             tokio::spawn(async move {
@@ -954,11 +971,12 @@ async fn run_daemon() -> Result<()> {
             let serve_fut = async {
                 let extra_routes =
                     mcp_routes.merge(daemon::xcode_broker_http::routes(xcode_broker_pool.clone()));
-                graphql_server::server::serve_with_listener_until(
+                graphql_server::server::serve_with_listener_until_with_live_principal_source(
                     schema,
                     listener,
                     extra_routes,
                     principal_table,
+                    live_principal_source.clone(),
                     reporter.clone(),
                     shutdown_signal,
                 )
@@ -1671,10 +1689,7 @@ async fn serve_failed(
         bind_addr = %paths.bind_addr,
         "failed-serve: bound listener; daemon.port written so clients can discover the status surface"
     );
-    let principals_reload_secs: u64 = std::env::var("CHAINWORKS_PRINCIPALS_RELOAD_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2);
+    let principals_reload_secs = principals_reload_interval_secs();
     let principals_path_for_reload = paths.principals_path.clone();
     let live_source_for_reload = live_principal_source.clone();
     tokio::spawn(async move {
@@ -1709,6 +1724,17 @@ mod tests {
             new_daemon_xcode_broker_pool(41234, Arc::new(acp::NoopXcodeRuntimeObservationSink));
 
         assert!(pool.has_backend());
+    }
+
+    #[test]
+    fn principals_reload_interval_rejects_zero_and_invalid_values() {
+        assert_eq!(principals_reload_interval_secs_from_env_value(None), 2);
+        assert_eq!(principals_reload_interval_secs_from_env_value(Some("5")), 5);
+        assert_eq!(principals_reload_interval_secs_from_env_value(Some("0")), 2);
+        assert_eq!(
+            principals_reload_interval_secs_from_env_value(Some("not-a-number")),
+            2
+        );
     }
 
     #[test]

@@ -2221,13 +2221,13 @@ Scope:
 - All canonical reason codes are documented and defined in `control-plane/crates/domain/src/recovery_matrix.rs`
 - `p082_rejected_command_error_v1` typed envelope contract and backward-compatible legacy plain-text fallback rules are documented and implemented
 - Exact readback lane placement is enforced: `runs.get` exposes both singular `p082_recovery_matrix_readback` and plural `p082_recovery_matrix_readbacks`; `reports.get` exposes plural only; singular must be absent from reports.get
-- P082 readback projection strips unknown keys, recursively allowlists nested subcontracts, rejects malformed/tampered rows with safe fallback readback, and sanitizes operator-facing strings so absolute filesystem paths, including punctuation-adjacent paths, and raw diagnostics do not leak through readback lanes
+- P082 readback projection strips unknown keys, recursively allowlists nested subcontracts, rejects malformed/tampered rows with safe fallback readback, and sanitizes operator-facing strings so absolute filesystem paths, including punctuation-adjacent paths, raw diagnostics, and token-like URL query/key-value material do not leak through readback lanes
 - Rejected-command readback is selected from `command_journal` rows with `result_status` `failed` or `rejected`
 - The retained DB harness test owns `p082_recovery_matrix_gate_result_total{scenario_id,status}` evidence for all 17 scenario assertion groups; runtime readback accessors must not emit this gate-result metric. The `proposal-082` shell path runs that harness as part of the DB P082 matrix suite.
 - Security/review regressions are included for Operator-only `runs.start`, Operator-only root-backed `ideas.create`, symlink-safe run filesystem boundaries, `runs.get.escalation_readback`, InvokeAgent completion ownership validation, and the documented `serde_yaml`/`unsafe-libyaml` pinned-risk fallback when dependency-audit tooling is unavailable
 - Rollout fixture `docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json` exists with schema_version `p082_operator_readback_fixture_v1`, all five readback lanes, nested subcontracts, Xcode startup grace row, startup_requeue_exhausted row, cancel-then-late-output row, and fixture assertions naming all reason codes and scenario IDs
 - The P082 static fixture/matrix checklist runs before the focused Rust suites. It validates the positive fixture shape, all 16 negative fixtures, key source-wiring expectations including P082-R05 ownership in `work_items.payload_json.p061_startup_recovery`, metric ownership, and required proof-test names before cargo tests execute.
-- DB, engine, and MCP readback tests compile and pass under the gate's default `CARGO_TARGET_DIR=target/proposal-082`; set `CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR=<path>` to reuse a different bounded target directory
+- DB, engine, MCP readback, auth live-principal revalidation, MCP HTTP live-revocation, and daemon failed-serve revocation tests compile and pass under the gate's default bounded cargo target. The default request is `target/proposal-082`, remapped by the shared cargo-cache policy unless local targets are explicitly allowed; set `CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR=<path>` to request a different bounded target directory
 
 Use when:
 
@@ -2252,6 +2252,7 @@ Important:
 
 - `p082` is accepted as an alias
 - Gate fails if the static fixture/matrix checklist or focused DB, engine, or MCP tests for required matrix rows, durable owners, readback assertions, crash/replay proof, observability thresholds, or readback-lane regressions fail
+- Gate fails if focused auth, MCP HTTP live-revocation, or daemon failed-serve revocation checks fail
 - Gate fails if GraphQL is treated as a required readback lane without a contract amendment
 - Gate fails if Swift app-facing P082 consumption paths exist without tolerant decode and MainActor tests
 - No schema migration is permitted; if required readback cannot be stored in existing owners, P082 must be amended first
