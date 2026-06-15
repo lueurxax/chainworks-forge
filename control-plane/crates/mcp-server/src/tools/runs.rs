@@ -7,10 +7,11 @@ use db::repos::{
     legacy_discovery_overrides, projections, rollout_contract_checks, runs, side_effects,
 };
 use domain::commands::{
-    CancelRunCmd, CatalogSnapshotRetrofitScope, Command, KnowledgeCapsuleIgnoreCmd, MainSyncMode,
-    MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision, MainSyncRepairStateCmd,
-    MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd, MainSyncTriggerReason,
-    ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd, SettleProposalGateCmd, StartRunCmd,
+    CallerContext, CancelRunCmd, CatalogSnapshotRetrofitScope, Command, KnowledgeCapsuleIgnoreCmd,
+    MainSyncMode, MainSyncRecordRecoveryDecisionCmd, MainSyncRecoveryDecision,
+    MainSyncRepairStateCmd, MainSyncRequestCmd, MainSyncRetryCmd, MainSyncSetRunOverrideCmd,
+    MainSyncTriggerReason, ProposalGateSettlementAction, RetrofitCatalogSnapshotCmd,
+    SettleProposalGateCmd, StartRunCmd,
 };
 use domain::ids::{IdeaId, RunId};
 use domain::risk_lineage::RiskAcceptanceLineage;
@@ -18,6 +19,15 @@ use engine::command_handler::CommandHandler;
 
 use crate::protocol::McpTool;
 use crate::request_context::mcp_caller;
+
+fn mcp_caller_with_idempotency_request_id(
+    principal: &auth::Principal,
+    tool_name: &str,
+    idempotency_key: &str,
+) -> CallerContext {
+    // boundary-no-op: preserves existing Operator-only tool boundary while stamping request identity.
+    mcp_caller(principal, tool_name).with_request_id(idempotency_key)
+}
 
 /// SEC-HIGH-002: Remove sensitive fields from a serialized Run for non-Operator principals.
 /// Strips absolute filesystem paths, delivery/preflight configs, workflow/catalog snapshots,
@@ -103,31 +113,6 @@ pub fn tool_specs() -> Vec<McpTool> {
                 "properties": {
                     "run_id": { "type": "string" },
                     "idempotency_key": { "type": "string", "description": "Caller-supplied idempotency key for cancel deduplication (P082)" }
-                }
-            }),
-        },
-        McpTool {
-            name: "runs.retrofit_catalog_snapshot".to_string(),
-            description: "Emergency operator repair: replace a blocked run's frozen catalog snapshot from the current catalog YAML with audit/hash guardrails".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "required": ["run_id", "expected_catalog_snapshot_hash", "reason", "idempotency_key"],
-                "properties": {
-                    "run_id": { "type": "string" },
-                    "expected_catalog_snapshot_hash": {
-                        "type": "string",
-                        "description": "The current frozen catalog snapshot hash expected by the operator; mismatch fails closed."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["escalation_policy_only"],
-                        "description": "Emergency retrofit scope. Only escalation_policy_only is currently supported."
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Operator audit reason for retrofitting the frozen catalog snapshot."
-                    },
-                    "idempotency_key": { "type": "string", "description": "Required UUIDv7 for safe repair." }
                 }
             }),
         },
@@ -506,25 +491,33 @@ pub async fn execute(
                                 )
                             };
                         obj.insert("escalation_readback".into(), escalation_readback);
-                        obj.insert(
-                            "p082_recovery_matrix_readback".into(),
-                            crate::tools::reports::p082_recovery_matrix_readback_json(
-                                pool,
-                                run_id,
-                                &principal.class,
-                            )
-                            .await?,
-                        );
-                        obj.insert(
-                            "p082_recovery_matrix_readbacks".into(),
-                            crate::tools::reports::p082_recovery_matrix_readbacks_json(
-                                pool,
-                                run_id,
-                                &principal.class,
+                        if principal.class == auth::PrincipalClass::Operator {
+                            let p082_readbacks =
+                                db::repos::p082_recovery_matrix::readbacks_for_run(pool, run_id)
+                                    .await?;
+                            let p082_singular =
+                                db::repos::p082_recovery_matrix::latest_readback_from_readbacks(
+                                    &p082_readbacks,
+                                );
+                            db::repos::p082_recovery_matrix::emit_readback_lane_metrics(
+                                &p082_readbacks,
                                 "mcp",
-                            )
-                            .await?,
-                        );
+                            );
+                            obj.insert("p082_recovery_matrix_readback".into(), p082_singular);
+                            obj.insert(
+                                "p082_recovery_matrix_readbacks".into(),
+                                serde_json::Value::Array(p082_readbacks),
+                            );
+                        } else {
+                            obj.insert(
+                                "p082_recovery_matrix_readback".into(),
+                                serde_json::Value::Null,
+                            );
+                            obj.insert(
+                                "p082_recovery_matrix_readbacks".into(),
+                                serde_json::Value::Array(vec![]),
+                            );
+                        }
                     }
                     let is_operator = principal.class == auth::PrincipalClass::Operator;
                     let value =
@@ -638,7 +631,11 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
                 .to_string();
-            let caller = mcp_caller(principal, "runs.main_sync.request");
+            let caller = mcp_caller_with_idempotency_request_id(
+                principal,
+                "runs.main_sync.request",
+                &idempotency_key,
+            );
             cmd_handler
                 .handle(
                     Command::MainSyncRequest(MainSyncRequestCmd {
@@ -664,7 +661,11 @@ pub async fn execute(
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing 'idempotency_key'"))?
                 .to_string();
-            let caller = mcp_caller(principal, "runs.main_sync.retry");
+            let caller = mcp_caller_with_idempotency_request_id(
+                principal,
+                "runs.main_sync.retry",
+                &idempotency_key,
+            );
             cmd_handler
                 .handle(
                     Command::MainSyncRetry(MainSyncRetryCmd {
@@ -1733,6 +1734,25 @@ mod tests {
 
     fn test_principal() -> auth::Principal {
         auth::Principal::new("test-operator", auth::PrincipalClass::Operator)
+    }
+
+    #[test]
+    fn p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id() {
+        let principal = test_principal();
+
+        for tool_name in ["runs.main_sync.request", "runs.main_sync.retry"] {
+            let caller = mcp_caller_with_idempotency_request_id(
+                &principal,
+                tool_name,
+                "0197f0d1-1dd2-7b7a-a2b7-2dd6d0052d57",
+            );
+
+            assert_eq!(caller.caller_tool, tool_name);
+            assert_eq!(
+                caller.request_id.as_deref(),
+                Some("0197f0d1-1dd2-7b7a-a2b7-2dd6d0052d57")
+            );
+        }
     }
 
     #[test]

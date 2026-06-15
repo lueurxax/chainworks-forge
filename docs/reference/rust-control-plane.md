@@ -846,6 +846,8 @@ The recovery service at `crates/engine/src/recovery.rs` runs at daemon startup (
 
 The service returns a `RecoverySummary` with counts of inspected runs, repaired runs, and requeued work items.
 
+Recovery and retry behavior across startup repair, late output, cancellation, side-effect reconciliation, approval restart, mediation, session ownership, and crash-during-repair is governed by the P082 recovery/retry matrix. See [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md) for the 17 canonical scenarios (P082-R01..R17), the `p082_recovery_matrix_readback_v1` schema, nested subcontracts, lane placement, observability thresholds, and the shared reason-code module at `control-plane/crates/domain/src/recovery_matrix.rs`.
+
 ## Running the daemon
 
 ### Environment variables
@@ -949,6 +951,7 @@ Additional focused gates:
 - The retained escalation proof gate documented in [test-gates.md](test-gates.md) covers ACP failure classification, runtime facts, and escalation-policy readback.
 - `./scripts/test-gate.sh proposal-061` for SQLite write serialization, executor backpressure, host-interruption recovery, scheduler-health readback, and generated-state housekeeping safety. The `proposal-061|p061` names are retained historical gate aliases for this implemented contract.
 - `./scripts/test-gate.sh proposal-084` (retained historical alias `p084`) for the rollout-contract template, linter, fixtures, run-start preflight, parity-lane operator readback, and Swift read-only presentation slice. See [executable-rollout-gate-template.md](executable-rollout-gate-template.md).
+- `./scripts/test-gate.sh proposal-082` (alias `p082`) for the recovery/retry state-machine matrix: DB and engine proof for all 17 canonical scenarios, `p082_recovery_matrix_readback_v1` lane parity on MCP/report surfaces, fixture-enforced nested subcontracts, fail-closed side-effect retry, and crash-loop replay. See [recovery-retry-state-machine-test-matrix.md](recovery-retry-state-machine-test-matrix.md).
 
 ## Key design decisions
 

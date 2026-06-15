@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
@@ -1737,10 +1738,355 @@ impl crate::steward::service::StewardAgentExecutor for BackgroundStewardAgentExe
 fn write_discovered_output(path: &str, content: &[u8]) -> Result<()> {
     let path_obj = std::path::Path::new(path);
     if let Some(parent) = path_obj.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_discovered_output_parent_no_symlink(parent)?;
     }
-    std::fs::write(path_obj, content)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(path_obj) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("discovered output target contains a symlink component");
+        }
+        if metadata.is_dir() {
+            anyhow::bail!("discovered output target is a directory");
+        }
+    }
+    write_file_no_follow(path_obj, content)?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_discovered_output_parent_no_symlink(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Normal(_) => current.push(component.as_os_str()),
+            Component::CurDir => continue,
+            Component::ParentDir | Component::Prefix(_) => {
+                anyhow::bail!("discovered output target contains an unsafe path component");
+            }
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("discovered output target contains a symlink component");
+                }
+                if !metadata.is_dir() {
+                    anyhow::bail!("discovered output target parent is not a directory");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .with_context(|| format!("create output directory {}", current.display()))?;
+                let metadata = std::fs::symlink_metadata(&current)
+                    .with_context(|| format!("verify output directory {}", current.display()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    anyhow::bail!("discovered output target parent changed during creation");
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect output directory {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_file_no_follow(path: &Path, content: &[u8]) -> Result<()> {
+    use std::fs::File;
+    use std::os::fd::FromRawFd;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("output target has no parent directory"))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("output target has no file name"))?;
+    let parent_fd = open_dir_no_symlink_at(parent, true, "output target parent")
+        .with_context(|| format!("open output parent without symlinks {}", parent.display()))?;
+    let leaf_name = cstring_path_component(leaf)?;
+    let fd = unsafe {
+        libc::openat(
+            parent_fd.fd,
+            leaf_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ELOOP)) {
+            anyhow::bail!("output target contains a symlink component");
+        }
+        return Err(error)
+            .with_context(|| format!("open output without following symlinks {}", path.display()));
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(content)
+        .with_context(|| format!("write output {}", path.display()))
+}
+
+#[cfg(unix)]
+fn create_discovered_output_parent_no_symlink(path: &Path) -> Result<()> {
+    open_dir_no_symlink_at(path, true, "discovered output target parent").map(|_| ())
+}
+
+#[cfg(unix)]
+struct FdGuard {
+    fd: libc::c_int,
+}
+
+#[cfg(unix)]
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_dir_no_symlink_at(path: &Path, create_missing: bool, field: &str) -> Result<FdGuard> {
+    use std::ffi::CString;
+
+    let start = if path.is_absolute() {
+        CString::new("/")?
+    } else {
+        CString::new(".")?
+    };
+    let mut fd = unsafe {
+        libc::open(
+            start.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open traversal root");
+    }
+
+    for component in path.components() {
+        let component_name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(part) => cstring_path_component(part)?,
+            Component::ParentDir | Component::Prefix(_) => {
+                unsafe {
+                    libc::close(fd);
+                }
+                anyhow::bail!("{field} contains an unsafe path component");
+            }
+        };
+
+        let mut next_fd = unsafe {
+            libc::openat(
+                fd,
+                component_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if next_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if create_missing && error.raw_os_error() == Some(libc::ENOENT) {
+                let mkdir_result = unsafe { libc::mkdirat(fd, component_name.as_ptr(), 0o700) };
+                if mkdir_result < 0 {
+                    let mkdir_error = std::io::Error::last_os_error();
+                    if mkdir_error.raw_os_error() != Some(libc::EEXIST) {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                        return Err(mkdir_error)
+                            .with_context(|| format!("create directory component for {field}"));
+                    }
+                }
+                next_fd = unsafe {
+                    libc::openat(
+                        fd,
+                        component_name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    )
+                };
+            }
+        }
+        if next_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            let child_is_symlink = matches!(error.raw_os_error(), Some(libc::ENOTDIR))
+                && openat_child_is_symlink(fd, &component_name);
+            unsafe {
+                libc::close(fd);
+            }
+            if matches!(error.raw_os_error(), Some(libc::ELOOP)) || child_is_symlink {
+                anyhow::bail!("{field} contains a symlink component");
+            }
+            if matches!(error.raw_os_error(), Some(libc::ENOTDIR)) {
+                anyhow::bail!("{field} path component is not a directory");
+            }
+            return Err(error).with_context(|| format!("open directory component for {field}"));
+        }
+        unsafe {
+            libc::close(fd);
+        }
+        fd = next_fd;
+    }
+
+    Ok(FdGuard { fd })
+}
+
+#[cfg(unix)]
+fn openat_child_is_symlink(parent_fd: libc::c_int, name: &std::ffi::CString) -> bool {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            parent_fd,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return false;
+    }
+    let stat = unsafe { stat.assume_init() };
+    (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
+}
+
+#[cfg(unix)]
+fn cstring_path_component(component: &std::ffi::OsStr) -> Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(component.as_bytes())
+        .map_err(|_| anyhow::anyhow!("path component contains a null byte"))
+}
+
+#[cfg(not(unix))]
+fn write_file_no_follow(path: &Path, content: &[u8]) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("open output {}", path.display()))?;
+    file.write_all(content)
+        .with_context(|| format!("write output {}", path.display()))
+}
+
+fn write_p086_continuation_artifact_bytes(
+    artifact_root: &str,
+    continuation_id: &str,
+    name: &str,
+    artifact_id: domain::ids::ArtifactId,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    let artifact_root = normalize_executor_trusted_system_aliases(Path::new(artifact_root));
+    reject_executor_path_symlink_components(&artifact_root, "Run artifact_root")?;
+    let canonical_artifact_root = std::fs::canonicalize(&artifact_root)
+        .with_context(|| format!("canonicalize run artifact_root {}", artifact_root.display()))?;
+    let path = canonical_artifact_root
+        .join("continuations")
+        .join(continuation_id)
+        .join(format!("{name}-{artifact_id}.json"));
+    if let Some(parent) = path.parent() {
+        create_executor_dir_all_no_symlink_under(
+            parent,
+            &canonical_artifact_root,
+            "P086 continuation artifact",
+        )?;
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("P086 continuation artifact target contains a symlink component");
+        }
+        if metadata.is_dir() {
+            anyhow::bail!("P086 continuation artifact target is a directory");
+        }
+    }
+    write_file_no_follow(&path, bytes)
+        .with_context(|| format!("write P086 continuation artifact {}", path.display()))?;
+    Ok(path)
+}
+
+fn ensure_executor_artifact_root_no_symlink(artifact_root: &str) -> Result<PathBuf> {
+    let root = normalize_executor_trusted_system_aliases(Path::new(artifact_root));
+    reject_executor_path_symlink_components(&root, "Run artifact_root")?;
+    if !root.exists() {
+        if let Some(parent) = root.parent() {
+            create_discovered_output_parent_no_symlink(parent)?;
+        }
+        std::fs::create_dir(&root)
+            .with_context(|| format!("create run artifact_root {}", root.display()))?;
+        let metadata = std::fs::symlink_metadata(&root)
+            .with_context(|| format!("verify run artifact_root {}", root.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!("Run artifact_root changed during creation");
+        }
+    }
+    std::fs::canonicalize(&root)
+        .with_context(|| format!("canonicalize run artifact_root {}", root.display()))
+}
+
+fn write_executor_artifact_file_no_symlink(
+    artifact_root: &str,
+    path: &Path,
+    bytes: &[u8],
+    field: &str,
+) -> Result<PathBuf> {
+    let raw_root = normalize_executor_trusted_system_aliases(Path::new(artifact_root));
+    let path = normalize_executor_trusted_system_aliases(path);
+    let canonical_root = ensure_executor_artifact_root_no_symlink(artifact_root)?;
+    let relative = path
+        .strip_prefix(&raw_root)
+        .or_else(|_| path.strip_prefix(&canonical_root))
+        .with_context(|| format!("{field} escapes run artifact_root"))?;
+    for component in relative.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("{field} contains an unsafe path component");
+            }
+        }
+    }
+    let target = canonical_root.join(relative);
+    if let Some(parent) = target.parent() {
+        create_executor_dir_all_no_symlink_under(parent, &canonical_root, field)?;
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(&target) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("{field} target contains a symlink component");
+        }
+        if metadata.is_dir() {
+            anyhow::bail!("{field} target is a directory");
+        }
+    }
+    write_file_no_follow(&target, bytes)
+        .with_context(|| format!("write {field} {}", target.display()))?;
+    Ok(target)
+}
+
+fn executor_path_is_under_root(path: &Path, root: &Path) -> Result<bool> {
+    let root = normalize_executor_trusted_system_aliases(root);
+    reject_executor_path_symlink_components(&root, "Run workspace_root")?;
+    let canonical_root =
+        std::fs::canonicalize(&root).with_context(|| format!("canonicalize {}", root.display()))?;
+    let path = normalize_executor_trusted_system_aliases(path);
+    Ok(path.starts_with(&canonical_root) || path.starts_with(&root))
+}
+
+fn write_executor_workspace_file_no_symlink(
+    workspace_root: &str,
+    path: &Path,
+    bytes: &[u8],
+    field: &str,
+) -> Result<PathBuf> {
+    let path = normalize_executor_trusted_system_aliases(path);
+    prepare_executor_artifact_parent(workspace_root, &path, field)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("{field} target contains a symlink component");
+        }
+        if metadata.is_dir() {
+            anyhow::bail!("{field} target is a directory");
+        }
+    }
+    write_file_no_follow(&path, bytes)
+        .with_context(|| format!("write {field} {}", path.display()))?;
+    Ok(path)
 }
 
 fn path_looks_like_directory_target(path: &str) -> bool {
@@ -5672,20 +6018,13 @@ impl BackgroundExecutor {
     ) -> anyhow::Result<(String, String)> {
         let bytes = serde_json::to_vec_pretty(value)?;
         let checksum = sha256_digest(&bytes);
-        let path = Path::new(&run.artifact_root)
-            .join("continuations")
-            .join(continuation_id)
-            .join(format!("{name}-{artifact_id}.json"));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "create P086 continuation artifact directory {}",
-                    parent.display()
-                )
-            })?;
-        }
-        std::fs::write(&path, &bytes)
-            .with_context(|| format!("write P086 continuation artifact {}", path.display()))?;
+        let path = write_p086_continuation_artifact_bytes(
+            &run.artifact_root,
+            continuation_id,
+            name,
+            artifact_id,
+            &bytes,
+        )?;
 
         let artifact = Artifact {
             id: artifact_id,
@@ -7794,6 +8133,20 @@ You are continuing the same Chainworks agent execution through an existing live 
                                     warn!(item_id = %item_id, kind = %kind, error = %message, "Work item requeued after transient SQLite contention during completion");
                                     return Ok(true);
                                 }
+                            } else if kind == WorkItemKind::InvokeAgent {
+                                let message = format!(
+                                    "invoke_agent_terminal_failed_without_valid_outputs: {e}"
+                                );
+                                if self
+                                    .work_queue
+                                    .fail_if_terminal_failed_invoke_without_valid_outputs(
+                                        &item_id, &message,
+                                    )
+                                    .await?
+                                {
+                                    warn!(item_id = %item_id, kind = %kind, error = %message, "InvokeAgent work item failed after terminal provider execution without valid outputs");
+                                    return Ok(true);
+                                }
                             }
                             return Err(e);
                         }
@@ -8160,7 +8513,26 @@ You are continuing the same Chainworks agent execution through an existing live 
                                                 }
                                             }
                                         } else {
-                                            error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+                                            let message = format!(
+                                                "invoke_agent_terminal_failed_without_valid_outputs: {e}"
+                                            );
+                                            match executor
+                                                .work_queue
+                                                .fail_if_terminal_failed_invoke_without_valid_outputs(
+                                                    &item_id, &message,
+                                                )
+                                                .await
+                                            {
+                                                Ok(true) => {
+                                                    warn!(item_id = %item_id, kind = %kind, error = %message, "InvokeAgent work item failed after terminal provider execution without valid outputs");
+                                                }
+                                                Ok(false) => {
+                                                    error!(item_id = %item_id, error = %e, "Failed to mark work item complete");
+                                                }
+                                                Err(e2) => {
+                                                    error!(item_id = %item_id, error = %e2, completion_error = %e, "Failed to settle InvokeAgent completion error");
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -8774,11 +9146,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                     )
                     .await?;
 
-                    let mut facts =
-                        domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
-                    facts.session_reuse_reason =
-                        Some(session_reuse_reason_for_policy_decision(decision));
-                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
+                    agent_execution_runtime_facts::update_session_reuse_reason(
+                        &self.pool,
+                        agent_exec_id,
+                        &session_reuse_reason_for_policy_decision(decision),
+                        now,
+                    )
+                    .await?;
                 }
                 if let Some(decision) = policy_decision.as_ref() {
                     self.persist_session_checkpoint_artifact_if_needed(
@@ -8907,11 +9281,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                     )
                     .await?;
 
-                    let mut facts =
-                        domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, now);
-                    facts.session_reuse_reason =
-                        Some(session_reuse_reason_for_policy_decision(decision));
-                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
+                    agent_execution_runtime_facts::update_session_reuse_reason(
+                        &self.pool,
+                        agent_exec_id,
+                        &session_reuse_reason_for_policy_decision(decision),
+                        now,
+                    )
+                    .await?;
                 }
 
                 if !mcp_resolution.report.blocking_issues.is_empty() {
@@ -11801,9 +12177,17 @@ You are continuing the same Chainworks agent execution through an existing live 
         _effort: Option<String>,
         _worktree_write_enabled: bool,
         _worktree_strategy: Option<String>,
-        _payload: serde_json::Value,
+        payload: serde_json::Value,
     ) -> Result<()> {
         let now = chrono::Utc::now();
+        let artifact_claim_key: ArtifactSourceGenerationClaimKey = serde_json::from_value(
+            payload
+                .pointer("/p058_claimed/artifact_claim_key")
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Release agent execution missing p058_claimed artifact claim")
+                })?,
+        )?;
         let mut delivery_config = match self.load_delivery_configuration(&run).await {
             Ok(config) => config,
             Err(error) => {
@@ -11975,14 +12359,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &manifest_artifact).await?;
-                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let settlement_txn_id = uuid::Uuid::new_v4().to_string();
+                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &commit_lease.effect_id,
                         owner_instance_id: &commit_lease.owner_instance_id,
                         settlement_attempt_id: &commit_lease.attempt_id,
                         observed_lease_renewed_at: commit_lease.lease_renewed_at,
                         new_status: domain::side_effect::SideEffectStatus::Settled,
                         observed_evidence_summary_json: Some(evidence_summary.as_str()),
-                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
+                        settlement_txn_id: settlement_txn_id.as_str(),
                         last_error_kind: None,
                         last_error: None,
                         now: chrono::Utc::now(),
@@ -11992,6 +12377,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: settle CAS missed for effect {}; release git_commit success not committed",
+                            commit_lease.effect_id
+                        );
+                    }
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -12000,6 +12393,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                             artifact_id: manifest_artifact.id,
                         });
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    let mut facts =
+                        AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, chrono::Utc::now());
+                    facts.output_settlement =
+                        AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+                    facts.valid_required_outputs = true;
+                    facts.supervision_classification =
+                        Some("native_release_side_effects_settled".to_string());
+                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
                     info!(
                         run_id = %run_id,
                         stage_id = %stage_id,
@@ -12043,7 +12444,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &commit_lease.effect_id,
                         owner_instance_id: &commit_lease.owner_instance_id,
                         attempt_id: &commit_lease.attempt_id,
@@ -12052,6 +12453,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                         last_error: &error_str,
                         now: chrono::Utc::now(),
                     };
+                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: fail CAS missed for effect {}; release git_commit failure not committed",
+                            commit_lease.effect_id
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -12093,6 +12501,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                             status: domain::stage::StageStatus::Failed,
                         });
                     projections::rebuild_all_for_run(&self.pool, run_id).await?;
+                    let mut facts =
+                        AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, chrono::Utc::now());
+                    facts.output_settlement =
+                        AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+                    facts.valid_required_outputs = true;
+                    facts.supervision_classification =
+                        Some("native_release_side_effects_settled".to_string());
+                    agent_execution_runtime_facts::upsert(&self.pool, &facts).await?;
                     info!(
                         run_id = %run_id,
                         stage_id = %stage_id,
@@ -12200,14 +12616,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &receipt_artifact).await?;
-                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let settlement_txn_id = uuid::Uuid::new_v4().to_string();
+                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &push_lease.effect_id,
                         owner_instance_id: &push_lease.owner_instance_id,
                         settlement_attempt_id: &push_lease.attempt_id,
                         observed_lease_renewed_at: push_lease.lease_renewed_at,
                         new_status: domain::side_effect::SideEffectStatus::Settled,
                         observed_evidence_summary_json: Some(evidence_summary.as_str()),
-                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
+                        settlement_txn_id: settlement_txn_id.as_str(),
                         last_error_kind: None,
                         last_error: None,
                         now,
@@ -12217,10 +12634,25 @@ You are continuing the same Chainworks agent execution through an existing live 
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: settle CAS missed for effect {}; release git_push success not committed",
+                            push_lease.effect_id
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
                         AgentStatus::Completed,
+                        now,
+                    )
+                    .await?;
+                    mark_release_required_outputs_valid_tx(
+                        &mut tx,
+                        agent_exec_id,
+                        &artifact_claim_key,
                         now,
                     )
                     .await?;
@@ -12286,7 +12718,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &push_lease.effect_id,
                         owner_instance_id: &push_lease.owner_instance_id,
                         attempt_id: &push_lease.attempt_id,
@@ -12295,6 +12727,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                         last_error: &error_str,
                         now,
                     };
+                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: fail CAS missed for effect {}; release git_push failure not committed",
+                            push_lease.effect_id
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -12455,14 +12894,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                         )
                         .await?;
                     artifacts::insert_tx(&mut tx, &bundle_artifact).await?;
-                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let settlement_txn_id = uuid::Uuid::new_v4().to_string();
+                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &build_lease.effect_id,
                         owner_instance_id: &build_lease.owner_instance_id,
                         settlement_attempt_id: &build_lease.attempt_id,
                         observed_lease_renewed_at: build_lease.lease_renewed_at,
                         new_status: domain::side_effect::SideEffectStatus::Settled,
                         observed_evidence_summary_json: Some(evidence_summary.as_str()),
-                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
+                        settlement_txn_id: settlement_txn_id.as_str(),
                         last_error_kind: None,
                         last_error: None,
                         now: chrono::Utc::now(),
@@ -12472,6 +12912,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: settle CAS missed for effect {}; release build_archive success not committed",
+                            build_lease.effect_id
+                        );
+                    }
                     tx.commit().await?;
                     let _ = self
                         .events
@@ -12523,7 +12971,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &build_lease.effect_id,
                         owner_instance_id: &build_lease.owner_instance_id,
                         attempt_id: &build_lease.attempt_id,
@@ -12532,6 +12980,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                         last_error: &error_str,
                         now,
                     };
+                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: fail CAS missed for effect {}; release build_archive failure not committed",
+                            build_lease.effect_id
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -12720,14 +13175,15 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let _settle_params = db::repos::side_effects::ExecutorSettleCasParams {
+                    let settlement_txn_id = uuid::Uuid::new_v4().to_string();
+                    let settle_params = db::repos::side_effects::ExecutorSettleCasParams {
                         effect_id: &connect_lease.effect_id,
                         owner_instance_id: &connect_lease.owner_instance_id,
                         settlement_attempt_id: &connect_lease.attempt_id,
                         observed_lease_renewed_at: connect_lease.lease_renewed_at,
                         new_status: domain::side_effect::SideEffectStatus::Settled,
                         observed_evidence_summary_json: Some(evidence_summary.as_str()),
-                        settlement_txn_id: &uuid::Uuid::new_v4().to_string(),
+                        settlement_txn_id: settlement_txn_id.as_str(),
                         last_error_kind: None,
                         last_error: None,
                         now,
@@ -12737,6 +13193,14 @@ You are continuing the same Chainworks agent execution through an existing live 
                         decision_json_hash: None,
                         disposition_id: None,
                     };
+                    if !db::repos::side_effects::executor_settle_cas_tx(&mut tx, &settle_params)
+                        .await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: settle CAS missed for effect {}; release connect_upload success not committed",
+                            connect_lease.effect_id
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -12748,6 +13212,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                         &mut tx,
                         stage_execution_id,
                         domain::stage::StageSettlementKind::Completed,
+                        now,
+                    )
+                    .await?;
+                    mark_release_required_outputs_valid_tx(
+                        &mut tx,
+                        agent_exec_id,
+                        &artifact_claim_key,
                         now,
                     )
                     .await?;
@@ -12827,7 +13298,7 @@ You are continuing the same Chainworks agent execution through an existing live 
                     if let Some(artifact) = delivery_artifact.as_ref() {
                         artifacts::insert_tx(&mut tx, artifact).await?;
                     }
-                    let _fail_params = db::repos::side_effects::ExecutorFailCasParams {
+                    let fail_params = db::repos::side_effects::ExecutorFailCasParams {
                         effect_id: &connect_lease.effect_id,
                         owner_instance_id: &connect_lease.owner_instance_id,
                         attempt_id: &connect_lease.attempt_id,
@@ -12836,6 +13307,13 @@ You are continuing the same Chainworks agent execution through an existing live 
                         last_error: &error_str,
                         now,
                     };
+                    if !db::repos::side_effects::executor_fail_cas_tx(&mut tx, &fail_params).await?
+                    {
+                        anyhow::bail!(
+                            "side_effect_cas_lost: fail CAS missed for effect {}; release connect_upload failure not committed",
+                            connect_lease.effect_id
+                        );
+                    }
                     agent_executions::update_completed_tx(
                         &mut tx,
                         agent_exec_id,
@@ -13331,8 +13809,19 @@ You are continuing the same Chainworks agent execution through an existing live 
                     .await?
                     .map(|r| r.cancellation_requested_at.is_some())
                     .unwrap_or(false);
-            let cancelled_provider =
+            let cancelled_provider_requested =
                 result_status == AgentStatus::Cancelled || run_has_durable_cancellation;
+            let cancelled_provider = if cancelled_provider_requested {
+                ensure_cancelled_provider_session_evidence_tx(
+                    &mut tx,
+                    source_session_generation_id,
+                    &agent_exec_id.to_string(),
+                    completed_at,
+                )
+                .await?
+            } else {
+                false
+            };
             let scenario_id = if cancelled_provider {
                 "P082-R17"
             } else {
@@ -13654,22 +14143,12 @@ You are continuing the same Chainworks agent execution through an existing live 
                 .join("undeclared_envelope_outputs")
                 .join(stage_id)
                 .join(format!("{}-{}.{}", file_stem, artifact_id, extension));
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    anyhow::anyhow!(
-                        "create undeclared envelope artifact dir {}: {}",
-                        parent.display(),
-                        e
-                    )
-                })?;
-            }
-            std::fs::write(&path, &discovered.content).map_err(|e| {
-                anyhow::anyhow!(
-                    "write undeclared envelope artifact {}: {}",
-                    path.display(),
-                    e
-                )
-            })?;
+            let path = write_executor_artifact_file_no_symlink(
+                &run.artifact_root,
+                &path,
+                &discovered.content,
+                "undeclared envelope artifact",
+            )?;
 
             let artifact = domain::artifact::Artifact {
                 id: artifact_id,
@@ -14030,11 +14509,6 @@ You are continuing the same Chainworks agent execution through an existing live 
             .join("session_checkpoints")
             .join(stage_id)
             .join(format!("{checkpoint_id}.json"));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!("create session checkpoint dir {}: {}", parent.display(), e)
-            })?;
-        }
 
         let disposition = serde_json::to_value(&decision.disposition)
             .ok()
@@ -14050,13 +14524,12 @@ You are continuing the same Chainworks agent execution through an existing live 
             "created_at": created_at.to_rfc3339(),
         });
         let bytes = serde_json::to_vec_pretty(&payload)?;
-        std::fs::write(&path, &bytes).map_err(|e| {
-            anyhow::anyhow!(
-                "write session checkpoint artifact {}: {}",
-                path.display(),
-                e
-            )
-        })?;
+        let path = write_executor_artifact_file_no_symlink(
+            &run.artifact_root,
+            &path,
+            &bytes,
+            "session checkpoint artifact",
+        )?;
 
         let artifact = domain::artifact::Artifact {
             id: checkpoint_id,
@@ -14100,19 +14573,13 @@ You are continuing the same Chainworks agent execution through an existing live 
     ) -> Result<domain::artifact::Artifact> {
         let artifact_name = format!("validation_failure_{}_{}", agent_id, record.id);
         let path = std::path::Path::new(&run.artifact_root).join(format!("{artifact_name}.json"));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!("create validation artifact dir {}: {}", parent.display(), e)
-            })?;
-        }
         let encoded = serde_json::to_string_pretty(&record)?;
-        std::fs::write(&path, encoded).map_err(|e| {
-            anyhow::anyhow!(
-                "write validation failure artifact {}: {}",
-                path.display(),
-                e
-            )
-        })?;
+        let path = write_executor_artifact_file_no_symlink(
+            &run.artifact_root,
+            &path,
+            encoded.as_bytes(),
+            "validation failure artifact",
+        )?;
 
         let artifact = domain::artifact::Artifact {
             id: record.artifact_id,
@@ -14176,13 +14643,27 @@ You are continuing the same Chainworks agent execution through an existing live 
         value: &T,
     ) -> Result<Artifact> {
         let path = self.resolve_release_artifact_path(run, name);
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow::anyhow!("create artifact dir {}: {}", parent.display(), e))?;
-        }
         let json = serde_json::to_string_pretty(value)?;
-        std::fs::write(&path, &json)
-            .map_err(|e| anyhow::anyhow!("write artifact {}: {}", path, e))?;
+        let path = if executor_path_is_under_root(
+            std::path::Path::new(&path),
+            std::path::Path::new(&run.workspace_root),
+        )? {
+            write_executor_workspace_file_no_symlink(
+                &run.workspace_root,
+                std::path::Path::new(&path),
+                json.as_bytes(),
+                "release JSON artifact",
+            )?
+        } else {
+            write_executor_artifact_file_no_symlink(
+                &run.artifact_root,
+                std::path::Path::new(&path),
+                json.as_bytes(),
+                "release JSON artifact",
+            )?
+        }
+        .to_string_lossy()
+        .into_owned();
 
         Ok(Artifact {
             id: domain::ids::ArtifactId::new(),
@@ -14402,8 +14883,9 @@ You are continuing the same Chainworks agent execution through an existing live 
                 evidence_root_slug,
                 input.file_name
             );
-            prepare_executor_artifact_parent(
-                &run.workspace_root,
+            prepare_executor_parent_under_root(
+                &run.artifact_root,
+                "Run artifact_root",
                 &artifact_root.join(&relative_path),
                 "Run artifact_root",
             )?;
@@ -14505,8 +14987,9 @@ You are continuing the same Chainworks agent execution through an existing live 
             "evidence/runs/{}/stages/{}/agents/{}/receipt/side-effects/{}/{}/evidence-manifest.json",
             run.id, stage_execution_id, agent_id, effect_kind, evidence_root_slug
         );
-        prepare_executor_artifact_parent(
-            &run.workspace_root,
+        prepare_executor_parent_under_root(
+            &run.artifact_root,
+            "Run artifact_root",
             &artifact_root.join(&manifest_relative_path),
             "Run artifact_root",
         )?;
@@ -14897,6 +15380,20 @@ fn release_artifact_path(artifact_root: &str, name: &str) -> String {
         .join(format!("{name}.json"))
         .to_string_lossy()
         .into_owned()
+}
+
+async fn mark_release_required_outputs_valid_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    agent_exec_id: domain::ids::AgentExecutionId,
+    artifact_claim_key: &ArtifactSourceGenerationClaimKey,
+    completed_at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let mut facts = AgentExecutionRuntimeFacts::defaults_for(agent_exec_id, completed_at);
+    facts.output_settlement = AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+    facts.valid_required_outputs = true;
+    facts.session_reuse_reason = Some("native_release".to_string());
+    agent_execution_runtime_facts::upsert_tx(tx, &facts).await?;
+    artifact_contracts::close_source_generation_claim_tx(tx, artifact_claim_key).await
 }
 
 fn suppress_duplicate_approved_proposal_output(
@@ -15367,24 +15864,67 @@ fn prepare_executor_artifact_parent(
     artifact_path: &Path,
     field: &str,
 ) -> Result<()> {
-    let workspace_root = Path::new(workspace_root);
-    reject_executor_path_symlink_components(workspace_root, "Run workspace_root")?;
-    let canonical_workspace = std::fs::canonicalize(workspace_root).with_context(|| {
-        format!(
-            "canonicalize run workspace_root {}",
-            workspace_root.display()
-        )
-    })?;
+    prepare_executor_parent_under_root(workspace_root, "Run workspace_root", artifact_path, field)
+}
+
+fn prepare_executor_parent_under_root(
+    root: &str,
+    root_field: &str,
+    artifact_path: &Path,
+    field: &str,
+) -> Result<()> {
+    let root = normalize_executor_trusted_system_aliases(Path::new(root));
+    let artifact_path = normalize_executor_trusted_system_aliases(artifact_path);
+    reject_executor_path_symlink_components(&root, root_field)?;
+    let canonical_root = std::fs::canonicalize(&root)
+        .with_context(|| format!("canonicalize {} {}", root_field, root.display()))?;
     if artifact_path.exists() {
-        reject_executor_path_symlink_components(artifact_path, field)?;
+        reject_executor_path_symlink_components(&artifact_path, field)?;
     }
-    if !artifact_path.starts_with(&canonical_workspace) {
-        anyhow::bail!("{field} escapes canonical workspace_root");
+    if !artifact_path.starts_with(&canonical_root) {
+        let boundary = match root_field {
+            "Run workspace_root" => "workspace_root",
+            "Run artifact_root" => "artifact_root",
+            _ => root_field,
+        };
+        anyhow::bail!("{field} escapes canonical {boundary}");
     }
     let parent = artifact_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{field} has no parent directory"))?;
-    create_executor_dir_all_no_symlink_under(parent, &canonical_workspace, field)
+    create_executor_dir_all_no_symlink_under(parent, &canonical_root, field)
+}
+
+fn normalize_executor_trusted_system_aliases(path: &Path) -> PathBuf {
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    #[cfg(unix)]
+    {
+        let mut components = path.components();
+        if !matches!(components.next(), Some(Component::RootDir)) {
+            return path.to_path_buf();
+        }
+        if !matches!(components.next(), Some(Component::Normal(first)) if first == "var") {
+            return path.to_path_buf();
+        }
+
+        let mut normalized = PathBuf::from("/private/var");
+        for component in components {
+            match component {
+                Component::Normal(part) => normalized.push(part),
+                Component::CurDir => {}
+                other => normalized.push(other.as_os_str()),
+            }
+        }
+        normalized
+    }
+
+    #[cfg(not(unix))]
+    {
+        path.to_path_buf()
+    }
 }
 
 fn create_executor_dir_all_no_symlink_under(
@@ -15397,7 +15937,13 @@ fn create_executor_dir_all_no_symlink_under(
         .with_context(|| format!("{field} escapes canonical root"))?;
     let mut current = canonical_root.to_path_buf();
     for component in relative.components() {
-        current.push(component.as_os_str());
+        match component {
+            Component::Normal(part) => current.push(part),
+            Component::CurDir => continue,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("{field} contains an unsafe path component");
+            }
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
@@ -15420,6 +15966,11 @@ fn create_executor_dir_all_no_symlink_under(
                 return Err(error).with_context(|| format!("inspect {}", current.display()));
             }
         }
+    }
+    let canonical_current = std::fs::canonicalize(&current)
+        .with_context(|| format!("canonicalize directory {}", current.display()))?;
+    if !canonical_current.starts_with(canonical_root) {
+        anyhow::bail!("{field} escapes canonical root after creation");
     }
     Ok(())
 }
@@ -15455,7 +16006,12 @@ async fn persist_p088_worktree_fingerprint(
         .join(format!("{phase}-worktree-fingerprint.json"));
     prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
     let bytes = serde_json::to_vec_pretty(fingerprint)?;
-    tokio::fs::write(&path, bytes).await?;
+    let path = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &path,
+        &bytes,
+        "P088 worktree fingerprint artifact",
+    )?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -15473,7 +16029,13 @@ async fn persist_p088_prompt_artifact(
         .join(agent_exec_id.to_string())
         .join(format!("{prompt_kind}-{turn_index}-prompt-redacted.txt"));
     prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
-    tokio::fs::write(&path, redact_runtime_message(prompt_text)).await?;
+    let bytes = redact_runtime_message(prompt_text);
+    let path = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &path,
+        bytes.as_bytes(),
+        "P088 prompt artifact",
+    )?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -15495,7 +16057,12 @@ async fn persist_p088_expected_output_snapshot(
     prepare_executor_artifact_parent(workspace_root, &path, "Run artifact_root")?;
     let bytes = serde_json::to_vec_pretty(declared_outputs)?;
     let sha = sha256_hex(&bytes);
-    tokio::fs::write(&path, bytes).await?;
+    let path = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &path,
+        &bytes,
+        "P088 expected output snapshot artifact",
+    )?;
     Ok((sha, path.to_string_lossy().into_owned()))
 }
 
@@ -15520,8 +16087,19 @@ async fn persist_p088_completion_text_artifacts(
     ));
     prepare_executor_artifact_parent(workspace_root, &raw_path, "Run artifact_root")?;
     prepare_executor_artifact_parent(workspace_root, &redacted_path, "Run artifact_root")?;
-    let raw_result = tokio::fs::write(&raw_path, text).await;
-    let redacted_result = tokio::fs::write(&redacted_path, redact_runtime_message(text)).await;
+    let raw_result = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &raw_path,
+        text.as_bytes(),
+        "P088 raw completion text artifact",
+    );
+    let redacted_text = redact_runtime_message(text);
+    let redacted_result = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &redacted_path,
+        redacted_text.as_bytes(),
+        "P088 redacted completion text artifact",
+    );
     let storage_error = raw_result
         .as_ref()
         .err()
@@ -15529,11 +16107,11 @@ async fn persist_p088_completion_text_artifacts(
         .map(|error| error.to_string());
     Ok(Some(P088TextArtifactPaths {
         raw_path: raw_result
-            .is_ok()
-            .then(|| raw_path.to_string_lossy().into_owned()),
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
         redacted_path: redacted_result
-            .is_ok()
-            .then(|| redacted_path.to_string_lossy().into_owned()),
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
         storage_error,
     }))
 }
@@ -15564,7 +16142,13 @@ async fn persist_p088_receipt_artifact(
         "text_captures": captures,
         "output_decisions": decisions,
     });
-    tokio::fs::write(&path, serde_json::to_vec_pretty(&value)?).await?;
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    let path = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &path,
+        &bytes,
+        "P088 completion receipt artifact",
+    )?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -15593,7 +16177,13 @@ async fn persist_p088_failed_stage_evidence(
         "text_captures": captures,
         "output_decisions": decisions,
     });
-    tokio::fs::write(&path, serde_json::to_vec_pretty(&value)?).await?;
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    let path = write_executor_artifact_file_no_symlink(
+        artifact_root,
+        &path,
+        &bytes,
+        "P088 failed stage evidence artifact",
+    )?;
     Ok(path.to_string_lossy().into_owned())
 }
 
@@ -16854,6 +17444,77 @@ fn late_output_source_terminal_status_for_readback(status: Option<&str>) -> &'st
     }
 }
 
+async fn ensure_cancelled_provider_session_evidence_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    generation_id: &str,
+    agent_execution_id: &str,
+    recorded_at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    if generation_id.is_empty() {
+        return Ok(false);
+    }
+    let Some(lineage_id) =
+        sqlx::query_scalar::<_, String>("SELECT lineage_id FROM session_generations WHERE id = ?1")
+            .bind(generation_id)
+            .fetch_optional(&mut **tx)
+            .await?
+    else {
+        return Ok(false);
+    };
+
+    let recorded_at_rfc3339 = recorded_at.to_rfc3339();
+    sqlx::query(
+        r#"UPDATE session_generations
+           SET status = CASE
+                 WHEN status = 'active' THEN 'closed'
+                 ELSE status
+               END,
+               ended_at = COALESCE(ended_at, ?1),
+               end_reason = COALESCE(end_reason, 'cancelled_provider_late_output')
+           WHERE id = ?2"#,
+    )
+    .bind(&recorded_at_rfc3339)
+    .bind(generation_id)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        r#"INSERT INTO session_events
+           (id, lineage_id, generation_id, event_type, recorded_at, details_json)
+           VALUES (?1, ?2, ?3, 'closed', ?4, ?5)"#,
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&lineage_id)
+    .bind(generation_id)
+    .bind(&recorded_at_rfc3339)
+    .bind(
+        serde_json::json!({
+            "reason": "cancelled_provider_late_output",
+            "agent_execution_id": agent_execution_id,
+        })
+        .to_string(),
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    let evidence_count: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)
+           FROM session_generations sg
+           WHERE sg.id = ?1
+             AND sg.status IN ('closed', 'invalidated', 'reset')
+             AND EXISTS (
+               SELECT 1
+                 FROM session_events se
+                WHERE se.generation_id = sg.id
+                  AND se.event_type IN ('closed', 'invalidated', 'operator_reset')
+             )"#,
+    )
+    .bind(generation_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(evidence_count > 0)
+}
+
 fn p090_enrich_runtime_facts_with_preflight_json(
     facts: &mut AgentExecutionRuntimeFacts,
     runtime_tool_path_preflight_json: Option<&str>,
@@ -17794,8 +18455,15 @@ mod tests {
             &["proposal_current", "proposal_revision_summary"],
             Some("repair transcript"),
         );
+        let settlement = DeclaredOutputDiscoverySettlement {
+            decisions: Vec::new(),
+            accepted_payloads: HashMap::new(),
+            idempotency_key: None,
+            accepted_aggregate_bytes: 0,
+            aggregate_cap_hit: false,
+        };
 
-        merge_contract_repair_result(&mut initial, repair);
+        merge_contract_repair_result(&mut initial, repair, &settlement);
 
         let discovered_names: Vec<_> = initial
             .discovered_artifacts
@@ -17892,6 +18560,476 @@ mod tests {
     }
 
     #[test]
+    fn p082_executor_artifact_parent_rejects_parent_dir_escape() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let workspace_root = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let path = workspace_root
+            .join("artifacts")
+            .join("..")
+            .join("..")
+            .join("outside")
+            .join("receipt.json");
+
+        let err = prepare_executor_artifact_parent(
+            &workspace_root.to_string_lossy(),
+            &path,
+            "Run artifact_root",
+        )
+        .expect_err("parent-directory artifact path escape must fail closed");
+
+        assert!(
+            err.to_string().contains("unsafe path component")
+                || err.to_string().contains("escapes canonical"),
+            "P082 executor writes must reject parent-directory escapes; got: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p082_executor_artifact_parent_allows_macos_var_alias_inside_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let canonical_workspace = workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let Ok(var_suffix) = canonical_workspace.strip_prefix("/private/var") else {
+            return;
+        };
+        let alias_workspace = Path::new("/var").join(var_suffix);
+        if std::fs::symlink_metadata("/var")
+            .map(|metadata| !metadata.file_type().is_symlink())
+            .unwrap_or(true)
+            || !alias_workspace.exists()
+        {
+            return;
+        }
+
+        let path = alias_workspace
+            .join("artifacts")
+            .join("evidence")
+            .join("receipt.json");
+
+        prepare_executor_artifact_parent(
+            &alias_workspace.to_string_lossy(),
+            &path,
+            "Run artifact_root",
+        )
+        .expect("trusted macOS /var alias should normalize inside canonical workspace");
+
+        assert!(canonical_workspace
+            .join("artifacts")
+            .join("evidence")
+            .is_dir());
+    }
+
+    #[test]
+    fn p086_continuation_artifact_write_rejects_parent_symlink() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let continuations_dir = artifact_root.path().join("continuations");
+        std::fs::create_dir(&continuations_dir).expect("continuations dir");
+        let continuation_dir = continuations_dir.join("cont-1");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &continuation_dir)
+            .expect("continuation symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &continuation_dir)
+            .expect("continuation symlink fixture");
+
+        let err = write_p086_continuation_artifact_bytes(
+            &artifact_root.path().to_string_lossy(),
+            "cont-1",
+            "continuation_response_snapshot",
+            domain::ids::ArtifactId::new(),
+            br#"{"ok":true}"#,
+        )
+        .expect_err("P086 continuation artifacts must reject parent symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "parent symlink target must not receive continuation artifacts"
+        );
+    }
+
+    #[test]
+    fn p086_continuation_artifact_write_rejects_final_path_symlink() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let artifact_id = domain::ids::ArtifactId::new();
+        let parent = artifact_root.path().join("continuations").join("cont-1");
+        std::fs::create_dir_all(&parent).expect("continuation artifact parent");
+        let target = parent.join(format!("continuation_response_snapshot-{artifact_id}.json"));
+        let outside_file = outside.path().join("outside.json");
+        std::fs::write(&outside_file, b"outside").expect("outside file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_file, &target).expect("final symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside_file, &target).expect("final symlink fixture");
+
+        let err = write_p086_continuation_artifact_bytes(
+            &artifact_root.path().to_string_lossy(),
+            "cont-1",
+            "continuation_response_snapshot",
+            artifact_id,
+            br#"{"ok":true}"#,
+        )
+        .expect_err("P086 continuation artifacts must reject final-path symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_file).unwrap(),
+            "outside",
+            "final symlink target must not be overwritten"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p082_write_file_no_follow_rejects_parent_symlink_directly() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let parent = artifact_root.path().join("provider-envelope");
+        std::os::unix::fs::symlink(outside.path(), &parent).expect("parent symlink fixture");
+        let target = parent.join("artifact.json");
+
+        let err = write_file_no_follow(&target, br#"{"ok":true}"#)
+            .expect_err("descriptor-relative writer must reject parent symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "parent symlink target must not receive direct writer output"
+        );
+    }
+
+    #[test]
+    fn p082_executor_daemon_artifact_write_rejects_parent_symlink() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let output_dir = artifact_root.path().join("undeclared_envelope_outputs");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &output_dir)
+            .expect("daemon artifact parent symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &output_dir)
+            .expect("daemon artifact parent symlink fixture");
+        let target = output_dir.join("stage").join("artifact.json");
+
+        let err = write_executor_artifact_file_no_symlink(
+            &artifact_root.path().to_string_lossy(),
+            &target,
+            br#"{"ok":true}"#,
+            "daemon artifact",
+        )
+        .expect_err("daemon artifact writes must reject parent symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "parent symlink target must not receive daemon artifacts"
+        );
+    }
+
+    #[test]
+    fn p082_executor_daemon_artifact_write_rejects_final_path_symlink() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let parent = artifact_root
+            .path()
+            .join("session_checkpoints")
+            .join("stage");
+        std::fs::create_dir_all(&parent).expect("daemon artifact parent");
+        let target = parent.join("checkpoint.json");
+        let outside_file = outside.path().join("outside.json");
+        std::fs::write(&outside_file, b"outside").expect("outside file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_file, &target)
+            .expect("daemon artifact final symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside_file, &target)
+            .expect("daemon artifact final symlink fixture");
+
+        let err = write_executor_artifact_file_no_symlink(
+            &artifact_root.path().to_string_lossy(),
+            &target,
+            br#"{"ok":true}"#,
+            "daemon artifact",
+        )
+        .expect_err("daemon artifact writes must reject final-path symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_file).unwrap(),
+            "outside",
+            "final symlink target must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn p082_executor_daemon_artifact_writer_lanes_reject_final_path_symlinks() {
+        let lanes = [
+            (
+                "undeclared envelope artifact",
+                vec!["undeclared_envelope_outputs", "stage", "artifact.json"],
+            ),
+            (
+                "session checkpoint artifact",
+                vec!["session_checkpoints", "stage", "checkpoint.json"],
+            ),
+            (
+                "validation failure artifact",
+                vec!["validation_failure_agent_record.json"],
+            ),
+            (
+                "release JSON artifact",
+                vec!["release", "release-receipt.json"],
+            ),
+        ];
+
+        for (label, components) in lanes {
+            let artifact_root = tempfile::tempdir().expect("artifact root");
+            let outside = tempfile::tempdir().expect("outside target");
+            let mut target = artifact_root.path().to_path_buf();
+            for component in &components {
+                target.push(component);
+            }
+            let parent = target.parent().expect("target parent");
+            std::fs::create_dir_all(parent).expect("daemon artifact parent");
+            let outside_file = outside
+                .path()
+                .join(format!("outside-{}.json", label.replace([' ', '-'], "_")));
+            std::fs::write(&outside_file, b"outside").expect("outside file");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside_file, &target)
+                .expect("daemon artifact final symlink fixture");
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&outside_file, &target)
+                .expect("daemon artifact final symlink fixture");
+
+            let err = write_executor_artifact_file_no_symlink(
+                &artifact_root.path().to_string_lossy(),
+                &target,
+                br#"{"ok":true}"#,
+                label,
+            )
+            .expect_err("daemon artifact lane writes must reject final-path symlinks");
+
+            assert!(
+                err.to_string().contains("symlink"),
+                "{label}: expected symlink rejection, got {err:#}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(outside_file).unwrap(),
+                "outside",
+                "{label}: final symlink target must not be overwritten"
+            );
+        }
+    }
+
+    #[test]
+    fn p088_evidence_artifact_writer_lanes_reject_final_path_symlinks() {
+        let agent_exec_id = domain::ids::AgentExecutionId::new().to_string();
+        let lanes = [
+            (
+                "P088 worktree fingerprint artifact",
+                format!("pre-worktree-fingerprint.json"),
+            ),
+            (
+                "P088 prompt artifact",
+                format!("original-0-prompt-redacted.txt"),
+            ),
+            (
+                "P088 expected output snapshot artifact",
+                format!("original-0-expected-output-contracts.json"),
+            ),
+            (
+                "P088 raw completion text artifact",
+                format!("original-0-completion-raw.txt"),
+            ),
+            (
+                "P088 redacted completion text artifact",
+                format!("original-0-completion-redacted.txt"),
+            ),
+            (
+                "P088 completion receipt artifact",
+                "code-writer-completion-receipt-v1.json".to_string(),
+            ),
+            (
+                "P088 failed stage evidence artifact",
+                "failed-stage-evidence.json".to_string(),
+            ),
+        ];
+
+        for (label, filename) in lanes {
+            let artifact_root = tempfile::tempdir().expect("artifact root");
+            let outside = tempfile::tempdir().expect("outside target");
+            let target = artifact_root
+                .path()
+                .join("evidence")
+                .join("p088")
+                .join(&agent_exec_id)
+                .join(filename);
+            let parent = target.parent().expect("target parent");
+            std::fs::create_dir_all(parent).expect("P088 artifact parent");
+            let outside_file = outside
+                .path()
+                .join(format!("outside-{}.json", label.replace([' ', '-'], "_")));
+            std::fs::write(&outside_file, b"outside").expect("outside file");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside_file, &target).expect("P088 final symlink fixture");
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&outside_file, &target)
+                .expect("P088 final symlink fixture");
+
+            let err = write_executor_artifact_file_no_symlink(
+                &artifact_root.path().to_string_lossy(),
+                &target,
+                br#"{"ok":true}"#,
+                label,
+            )
+            .expect_err("P088 evidence artifacts must reject final-path symlinks");
+
+            assert!(
+                err.to_string().contains("symlink"),
+                "{label}: expected symlink rejection, got {err:#}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(outside_file).unwrap(),
+                "outside",
+                "{label}: final symlink target must not be overwritten"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p088_evidence_artifact_writer_rejects_dangling_final_symlink() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let target = artifact_root
+            .path()
+            .join("evidence")
+            .join("p088")
+            .join(domain::ids::AgentExecutionId::new().to_string())
+            .join("original-0-prompt-redacted.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).expect("P088 artifact parent");
+        let missing_target = outside.path().join("missing.txt");
+        std::os::unix::fs::symlink(&missing_target, &target)
+            .expect("dangling final symlink fixture");
+
+        let err = write_executor_artifact_file_no_symlink(
+            &artifact_root.path().to_string_lossy(),
+            &target,
+            b"redacted prompt",
+            "P088 prompt artifact",
+        )
+        .expect_err("P088 evidence artifacts must reject dangling final symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert!(
+            !missing_target.exists(),
+            "dangling symlink target must not be created"
+        );
+    }
+
+    #[test]
+    fn p088_evidence_artifact_writer_rejects_parent_symlink() {
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let p088_dir = artifact_root.path().join("evidence").join("p088");
+        std::fs::create_dir_all(p088_dir.parent().unwrap()).expect("evidence parent");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &p088_dir).expect("P088 parent symlink fixture");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &p088_dir)
+            .expect("P088 parent symlink fixture");
+        let target = p088_dir
+            .join(domain::ids::AgentExecutionId::new().to_string())
+            .join("failed-stage-evidence.json");
+
+        let err = write_executor_artifact_file_no_symlink(
+            &artifact_root.path().to_string_lossy(),
+            &target,
+            br#"{"ok":true}"#,
+            "P088 failed stage evidence artifact",
+        )
+        .expect_err("P088 evidence artifacts must reject parent symlinks");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "parent symlink target must not receive P088 artifacts"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p088_evidence_artifact_writer_rejects_final_path_swap_after_parent_validation() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let outside = tempfile::tempdir().expect("outside target");
+        let artifact_root = workspace.path().join("artifacts");
+        let target = artifact_root
+            .join("evidence")
+            .join("p088")
+            .join(domain::ids::AgentExecutionId::new().to_string())
+            .join("code-writer-completion-receipt-v1.json");
+
+        prepare_executor_artifact_parent(
+            &workspace.path().to_string_lossy(),
+            &target,
+            "Run artifact_root",
+        )
+        .expect("initial P088 parent validation should pass");
+        let outside_file = outside.path().join("outside.json");
+        std::fs::write(&outside_file, b"outside").expect("outside file");
+        std::os::unix::fs::symlink(&outside_file, &target)
+            .expect("post-validation final symlink swap fixture");
+
+        let err = write_executor_artifact_file_no_symlink(
+            &artifact_root.to_string_lossy(),
+            &target,
+            br#"{"schema_version":"code_writer_completion_receipt_v1"}"#,
+            "P088 completion receipt artifact",
+        )
+        .expect_err("P088 evidence artifacts must reject final-path swaps");
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_file).unwrap(),
+            "outside",
+            "post-validation symlink target must not be overwritten"
+        );
+    }
+
+    #[test]
     fn p082_r17_late_output_readback_normalizes_cancelled_source_status() {
         assert_eq!(
             late_output_source_terminal_status_for_readback(Some("completed")),
@@ -17916,6 +19054,7 @@ mod tests {
     fn p086_continuation_prompt_uses_mode_reset_contract() {
         let record = domain::continuation::ContinuationRecord {
             id: "cont-1".to_string(),
+            command_journal_id: "cmd-1".to_string(),
             run_id: "run-1".to_string(),
             stage_execution_id: "stage-exec-1".to_string(),
             agent_execution_id: "agent-exec-1".to_string(),
@@ -18017,6 +19156,9 @@ mod tests {
             agent_execution_id: "agent-exec-1".into(),
             stage_execution_id: "stage-exec-1".into(),
             run_id: "run-1".into(),
+            workspace_root: "/tmp/workspace".into(),
+            artifact_root: "/tmp/artifacts".into(),
+            chainworks_meta_root: Some(".chainworks/runs/run-1".into()),
             logical_stage_id: Some("state_implementation".into()),
             stage_type: Some("implementation".into()),
             agent_status: "completed".into(),
@@ -21757,6 +22899,146 @@ plain progress line without gate evidence";
         assert_eq!(
             std::fs::read_to_string(companion_path).unwrap(),
             "# Review\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p082_provider_envelope_materialization_rejects_final_path_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join("outputs");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let outside_file = outside.path().join("escaped.json");
+        std::fs::write(&outside_file, br#"{"status":"outside"}"#).unwrap();
+        let machine_path = output_dir.join("proposal_review.json");
+        std::os::unix::fs::symlink(&outside_file, &machine_path).unwrap();
+
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: machine_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_review".to_string(),
+            content: br#"{"status":"green"}"#.to_vec(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
+        }];
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+
+        let err = match settle_agent_outputs_from_discovery_decisions(
+            &[declared],
+            &specs,
+            &discovered,
+            &[],
+        ) {
+            Ok(_) => panic!("provider-envelope materialization must reject final-path symlinks"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_file).unwrap(),
+            r#"{"status":"outside"}"#
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p082_provider_envelope_materialization_rejects_parent_directory_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join("outputs");
+        std::os::unix::fs::symlink(outside.path(), &output_dir).unwrap();
+        let machine_path = output_dir.join("proposal_review.json");
+
+        let declared = DeclaredOutput {
+            output_name: "proposal_review".to_string(),
+            target_path: machine_path.to_string_lossy().into_owned(),
+            schema: None,
+            reuse_policy: None,
+            companion_output_name: None,
+            companion_path: None,
+        };
+        let discovered = vec![acp::DiscoveredArtifact {
+            name: "proposal_review".to_string(),
+            content: br#"{"status":"green"}"#.to_vec(),
+            source_path: None,
+            source_kind: acp::DiscoveredArtifactSourceKind::ProviderEnvelope,
+        }];
+        let specs = build_expected_output_specs(
+            &[declared.clone()],
+            tmp.path().to_str().unwrap(),
+            None,
+            None,
+            false,
+        );
+
+        let err = match settle_agent_outputs_from_discovery_decisions(
+            &[declared],
+            &specs,
+            &discovered,
+            &[],
+        ) {
+            Ok(_) => panic!("provider-envelope materialization must reject parent symlinks"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection, got {err:#}"
+        );
+        assert!(
+            !outside.path().join("proposal_review.json").exists(),
+            "parent symlink must not receive materialized output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p082_p090_commit_helper_rejects_final_path_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let staged_path = tmp.path().join("staged.json");
+        std::fs::write(&staged_path, br#"{"status":"green"}"#).unwrap();
+        let outside_file = outside.path().join("canonical.json");
+        std::fs::write(&outside_file, br#"{"status":"outside"}"#).unwrap();
+        let canonical_path = tmp.path().join("canonical.json");
+        std::os::unix::fs::symlink(&outside_file, &canonical_path).unwrap();
+        let now = chrono::Utc::now();
+        let staged = P090StagedRepairMaterialization {
+            rows: Vec::new(),
+            commits: vec![P090StagedRepairCommit {
+                output_name: "implementation_self_assessment".to_string(),
+                staging_path: staged_path.to_string_lossy().into_owned(),
+                canonical_path: canonical_path.to_string_lossy().into_owned(),
+            }],
+        };
+
+        let err = commit_p090_staged_repair_materialization(staged, now)
+            .expect_err("P090 commit must reject final-path symlinks");
+
+        let err_chain = format!("{err:#}");
+        assert!(
+            err_chain.contains("symlink"),
+            "expected symlink rejection, got {err_chain}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_file).unwrap(),
+            r#"{"status":"outside"}"#
         );
     }
 

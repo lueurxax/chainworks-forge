@@ -113,6 +113,18 @@ impl WorkQueue {
         Ok(())
     }
 
+    pub async fn fail_if_terminal_failed_invoke_without_valid_outputs(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<bool> {
+        if !work_items::running_invoke_agent_has_terminal_failed_outputs(&self.pool, id).await? {
+            return Ok(false);
+        }
+        self.fail(id, error).await?;
+        Ok(true)
+    }
+
     pub async fn requeue_after_transient_persistence_contention(
         &self,
         id: &str,

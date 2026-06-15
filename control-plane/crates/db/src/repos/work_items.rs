@@ -448,13 +448,15 @@ pub async fn requeue_running_preclaimed_invoke_for_stage_tx(
 ) -> Result<usize> {
     let rows = sqlx::query(
         r#"SELECT wi.id, wi.payload_json
-           FROM work_items wi
-           LEFT JOIN agent_executions ae
-             ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+	           FROM work_items wi
+	           LEFT JOIN agent_executions ae
+	             ON json_valid(wi.payload_json)
+	             AND ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
            LEFT JOIN agent_execution_runtime_facts facts
              ON facts.agent_execution_id = ae.id
-           WHERE wi.run_id = ?1 AND wi.stage_id = ?2 AND wi.kind = ?3 AND wi.status = ?4
-             AND NOT (
+	           WHERE wi.run_id = ?1 AND wi.stage_id = ?2 AND wi.kind = ?3 AND wi.status = ?4
+	             AND json_valid(wi.payload_json)
+	             AND NOT (
                json_type(wi.payload_json, '$.targeted_retry') IS NOT NULL
                AND ae.status = 'completed'
                AND facts.output_settlement IN (
@@ -1320,20 +1322,74 @@ async fn p082_latest_command_journal_id_for_run_tx(
     .context("load latest command journal id for P082 startup repair")
 }
 
+async fn p082_command_journal_run_id_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    journal_id: &str,
+) -> Result<Option<String>> {
+    if journal_id.trim().is_empty() {
+        return Ok(None);
+    }
+    sqlx::query_scalar::<_, String>(
+        r#"SELECT run_id
+           FROM command_journal
+           WHERE id = ?1
+           LIMIT 1"#,
+    )
+    .bind(journal_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("load command journal run owner for P082 startup repair")
+}
+
+async fn p082_resolve_source_command_journal_id_for_work_item_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    payload: &serde_json::Value,
+    authoritative_run_id: &str,
+) -> Result<(Option<String>, &'static str)> {
+    let mut integrity = "valid";
+    if payload
+        .get("run_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|payload_run_id| payload_run_id != authoritative_run_id)
+    {
+        integrity = "tamper_detected";
+    }
+
+    if let Some(journal_id) = p082_source_command_journal_id_from_payload(payload) {
+        match p082_command_journal_run_id_tx(tx, &journal_id).await? {
+            Some(journal_run_id) if journal_run_id == authoritative_run_id => {
+                return Ok((Some(journal_id), integrity));
+            }
+            _ => {
+                integrity = "tamper_detected";
+            }
+        }
+    }
+
+    Ok((
+        p082_latest_command_journal_id_for_run_tx(tx, authoritative_run_id).await?,
+        integrity,
+    ))
+}
+
 pub async fn requeue_running_invoke_agent_on_startup_tx(
     tx: &mut Transaction<'_, Sqlite>,
     scheduled_at: DateTime<Utc>,
     reason: &str,
 ) -> Result<u64> {
     let rows = sqlx::query(
-        r#"SELECT wi.id, wi.payload_json
-           FROM work_items wi
-           LEFT JOIN agent_executions ae
-             ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+        r#"SELECT wi.id, wi.run_id, wi.payload_json
+	           FROM work_items wi
+	           LEFT JOIN agent_executions ae
+	             ON json_valid(wi.payload_json)
+	             AND ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
            LEFT JOIN agent_execution_runtime_facts facts
              ON facts.agent_execution_id = ae.id
-           WHERE wi.kind = ?1 AND wi.status = ?2
-             AND NOT (
+	           WHERE wi.kind = ?1 AND wi.status = ?2
+	             AND json_valid(wi.payload_json)
+	             AND NOT (
                json_type(wi.payload_json, '$.targeted_retry') IS NOT NULL
                AND ae.status = 'completed'
                AND facts.output_settlement IN (
@@ -1356,20 +1412,18 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
     let mut requeued = 0_u64;
     for row in rows {
         let item_id: String = row.get("id");
+        let run_id_for_repair: String = row.get("run_id");
         let payload_json: String = row.get("payload_json");
         let mut payload = serde_json::from_str::<serde_json::Value>(&payload_json)
             .unwrap_or_else(|_| serde_json::json!({}));
         supersede_abandoned_preclaim_for_retry_tx(tx, &item_id, &payload, scheduled_at).await?;
-        let run_id_for_repair = payload
-            .get("run_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let source_command_journal_id_opt =
-            match p082_source_command_journal_id_from_payload(&payload) {
-                Some(journal_id) => Some(journal_id),
-                None => p082_latest_command_journal_id_for_run_tx(tx, &run_id_for_repair).await?,
-            };
+        let (source_command_journal_id_opt, projection_integrity) =
+            p082_resolve_source_command_journal_id_for_work_item_tx(
+                tx,
+                &payload,
+                &run_id_for_repair,
+            )
+            .await?;
         let Some(source_command_journal_id) = source_command_journal_id_opt else {
             // No command journal entry can be resolved for this work item.
             // P082-R01 requires a real command_journal.id; skip the startup repair record
@@ -1436,7 +1490,7 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
             "startup_repairs, work_items",
             &repair_id,
             Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-            "valid",
+            projection_integrity,
             &scheduled_at_rfc3339,
         );
         let p082_readback_with_summary =
@@ -1454,6 +1508,43 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
         )
         .await;
         if record_result.is_err() {
+            let existing_notes: Option<String> =
+                sqlx::query_scalar("SELECT notes FROM startup_repairs WHERE id = ?1")
+                    .bind(&repair_id)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .context("load startup repair notes for P082 crash replay")?;
+            let existing_r01_replay = existing_notes
+                .as_deref()
+                .and_then(|notes| serde_json::from_str::<serde_json::Value>(notes).ok())
+                .is_some_and(|notes_json| {
+                    notes_json
+                        .pointer("/p082_recovery_matrix_readback/scenario_id")
+                        .and_then(|value| value.as_str())
+                        == Some("P082-R01")
+                        && notes_json
+                            .pointer("/p082_recovery_matrix_readback/recovery_reason_code")
+                            .and_then(|value| value.as_str())
+                            == Some(domain::recovery_matrix::REASON_STARTUP_REQUEUE_ONCE)
+                        && notes_json
+                            .pointer(
+                                "/p082_recovery_matrix_readback/recovery_startup_repair_summary/startup_repair_id",
+                            )
+                            .and_then(|value| value.as_str())
+                            == Some(repair_id.as_str())
+                        && notes_json
+                            .pointer(
+                                "/p082_recovery_matrix_readback/recovery_startup_repair_summary/source_work_item_id",
+                            )
+                            .and_then(|value| value.as_str())
+                            == Some(item_id.as_str())
+                        && notes_json
+                            .pointer(
+                                "/p082_recovery_matrix_readback/recovery_startup_repair_summary/requeue_generation",
+                            )
+                            .and_then(|value| value.as_i64())
+                            == Some(1)
+                });
             let stamped_replay = payload
                 .pointer("/p061_startup_recovery/startup_repair_id")
                 .and_then(|value| value.as_str())
@@ -1466,13 +1557,7 @@ pub async fn requeue_running_invoke_agent_on_startup_tx(
                     .pointer("/p061_startup_recovery/source_work_item_id")
                     .and_then(|value| value.as_str())
                     == Some(item_id.as_str());
-            if stamped_replay {
-                let existing_notes: Option<String> =
-                    sqlx::query_scalar("SELECT notes FROM startup_repairs WHERE id = ?1")
-                        .bind(&repair_id)
-                        .fetch_optional(&mut **tx)
-                        .await
-                        .context("load startup repair notes for P082 crash replay")?;
+            if stamped_replay || existing_r01_replay {
                 if let Some(existing_notes) = existing_notes {
                     if let Ok(mut notes_json) =
                         serde_json::from_str::<serde_json::Value>(&existing_notes)
@@ -1657,18 +1742,44 @@ pub async fn complete_running_invoke_agents_with_terminal_valid_outputs_on_start
 ) -> Result<u64> {
     let rows = sqlx::query(
         r#"
-        SELECT wi.id
-        FROM work_items wi
-        JOIN agent_executions ae
-          ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+	        SELECT wi.id
+	        FROM work_items wi
+	        JOIN stage_executions se
+	          ON json_valid(wi.payload_json)
+	         AND se.id = json_extract(wi.payload_json, '$.stage_execution_id')
+	         AND se.run_id = wi.run_id
+	        JOIN agent_executions ae
+	          ON json_valid(wi.payload_json)
+	         AND ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+         AND ae.stage_execution_id = se.id
          AND ae.status = ?1
+        JOIN artifact_source_generation_claims claim
+          ON claim.run_id = wi.run_id
+         AND claim.stage_execution_id = se.id
+         AND claim.agent_execution_id = ae.id
+         AND claim.source_work_item_id = wi.id
+         AND claim.claim_state IN (?4, ?5)
         JOIN agent_execution_runtime_facts facts
           ON facts.agent_execution_id = ae.id
          AND facts.output_settlement IN (?2, ?3)
-         AND COALESCE(facts.valid_required_outputs, 0) > 0
-        WHERE wi.kind = ?4
-          AND wi.status = ?5
-          AND wi.id NOT LIKE 'auto-contract-output-retry:%'
+	        WHERE wi.kind = ?6
+	          AND wi.status = ?7
+	          AND json_valid(wi.payload_json)
+	          AND wi.id NOT LIKE 'auto-contract-output-retry:%'
+          AND (
+            COALESCE(facts.valid_required_outputs, 0) > 0
+            OR EXISTS (
+              SELECT 1
+              FROM artifact_contract_generations gen
+              WHERE gen.run_id = wi.run_id
+                AND gen.source_stage_execution_id = se.id
+                AND gen.source_agent_execution_id = ae.id
+                AND gen.source_work_item_id = wi.id
+                AND gen.output_settlement IN (?2, ?3)
+                AND gen.valid = 1
+                AND gen.source_generation_verified = 1
+            )
+          )
           AND (
             (
               json_type(wi.payload_json, '$.retry_authority_id') IS NULL
@@ -1690,6 +1801,8 @@ pub async fn complete_running_invoke_agents_with_terminal_valid_outputs_on_start
     .bind(AgentStatus::Completed.to_string())
     .bind("valid_outputs_from_completed_execution")
     .bind("valid_outputs_from_failed_execution")
+    .bind(ArtifactSourceClaimState::Active.to_string())
+    .bind(ArtifactSourceClaimState::Closed.to_string())
     .bind(WorkItemKind::InvokeAgent.to_string())
     .bind(WorkItemStatus::Running.to_string())
     .fetch_all(pool)
@@ -1714,16 +1827,18 @@ pub async fn fail_running_invoke_agents_with_terminal_failed_outputs_on_startup(
 ) -> Result<u64> {
     let rows = sqlx::query(
         r#"
-        SELECT wi.id
-        FROM work_items wi
-        JOIN agent_executions ae
-          ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+	        SELECT wi.id
+	        FROM work_items wi
+	        JOIN agent_executions ae
+	          ON json_valid(wi.payload_json)
+	         AND ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
          AND ae.status IN (?1, ?2)
         LEFT JOIN agent_execution_runtime_facts facts
           ON facts.agent_execution_id = ae.id
-        WHERE wi.kind = ?3
-          AND wi.status = ?4
-          AND NOT (
+	        WHERE wi.kind = ?3
+	          AND wi.status = ?4
+	          AND json_valid(wi.payload_json)
+	          AND NOT (
             facts.output_settlement IN (?5, ?6)
             AND COALESCE(facts.valid_required_outputs, 0) > 0
           )
@@ -1751,6 +1866,49 @@ pub async fn fail_running_invoke_agents_with_terminal_failed_outputs_on_startup(
     }
 
     Ok(failed)
+}
+
+pub async fn running_invoke_agent_has_terminal_failed_outputs(
+    pool: &SqlitePool,
+    work_item_id: &str,
+) -> Result<bool> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM work_items wi
+        JOIN stage_executions se
+          ON json_valid(wi.payload_json)
+         AND se.id = json_extract(wi.payload_json, '$.stage_execution_id')
+         AND se.run_id = wi.run_id
+        JOIN agent_executions ae
+          ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+         AND ae.stage_execution_id = se.id
+         AND ae.status IN (?1, ?2)
+        LEFT JOIN agent_execution_runtime_facts facts
+          ON facts.agent_execution_id = ae.id
+        WHERE wi.id = ?3
+          AND wi.kind = ?4
+          AND wi.status = ?5
+          AND json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id') IS NOT NULL
+          AND NOT (
+            facts.output_settlement IN (?6, ?7)
+            AND COALESCE(facts.valid_required_outputs, 0) > 0
+          )
+        "#,
+    )
+    .bind(AgentStatus::Failed.to_string())
+    .bind(AgentStatus::Cancelled.to_string())
+    .bind(work_item_id)
+    .bind(WorkItemKind::InvokeAgent.to_string())
+    .bind(WorkItemStatus::Running.to_string())
+    .bind("valid_outputs_from_completed_execution")
+    .bind("valid_outputs_from_failed_execution")
+    .fetch_one(pool)
+    .await
+    .with_context(|| {
+        format!("check terminal failed InvokeAgent outputs before failing work item {work_item_id}")
+    })?;
+    Ok(count > 0)
 }
 
 pub async fn requeue_stale_starting_invoke_agent_sessions(
@@ -1834,11 +1992,13 @@ pub async fn requeue_stale_pre_session_invoke_agents_tx(
 ) -> Result<u64> {
     let rows = sqlx::query(
         r#"SELECT wi.id,
+                  wi.run_id,
                   wi.payload_json,
                   COALESCE(wi.started_at, wi.scheduled_at) AS work_started_at
-           FROM work_items wi
-           INNER JOIN agent_executions ae
-             ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+	           FROM work_items wi
+	           INNER JOIN agent_executions ae
+	             ON json_valid(wi.payload_json)
+	             AND ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
            WHERE wi.kind = ?1
              AND wi.status = ?2
              AND ae.status = ?3
@@ -1861,6 +2021,7 @@ pub async fn requeue_stale_pre_session_invoke_agents_tx(
 
     for row in rows {
         let item_id: String = row.get("id");
+        let run_id_for_repair: String = row.get("run_id");
         let payload_json: String = row.get("payload_json");
         let mut payload = serde_json::from_str::<serde_json::Value>(&payload_json)
             .unwrap_or_else(|_| serde_json::json!({}));
@@ -1891,6 +2052,68 @@ pub async fn requeue_stale_pre_session_invoke_agents_tx(
         }
 
         supersede_abandoned_preclaim_for_retry_tx(tx, &item_id, &payload, scheduled_at).await?;
+        let (source_cj_id_opt, mut integrity) =
+            p082_resolve_source_command_journal_id_for_work_item_tx(
+                tx,
+                &payload,
+                &run_id_for_repair,
+            )
+            .await?;
+        let (source_cj_id, integrity) = match source_cj_id_opt {
+            Some(ref id) => (id.clone(), integrity),
+            None => {
+                if integrity != "tamper_detected" {
+                    integrity = "unavailable";
+                }
+                ("no-journal-found".to_string(), integrity)
+            }
+        };
+        let stale_after_ms = if xcode_required {
+            domain::recovery_matrix::XCODE_STARTUP_GRACE_SECONDS * 1_000_i64
+        } else {
+            domain::recovery_matrix::STANDARD_STARTUP_GRACE_SECONDS * 1_000_i64
+        };
+        let repair_id = format!("p082-stale-pre-session:{item_id}");
+        let operator_message = if xcode_required {
+            Some(format!(
+                "Xcode startup grace exceeded 12 minutes (cutoff: {}); \
+                 pre-session work item {item_id} requeued for retry. \
+                 Next check: daemon scheduler next cycle (no manual intervention required).",
+                stale_cutoff.to_rfc3339()
+            ))
+        } else {
+            None
+        };
+        let summary = domain::recovery_matrix::build_startup_repair_summary(
+            &repair_id,
+            &item_id,
+            &source_cj_id,
+            1,
+            1,
+            false,
+            stale_after_ms,
+            &stale_cutoff.to_rfc3339(),
+            xcode_required,
+            None,
+            "startup",
+        );
+        let p082_readback = domain::recovery_matrix::set_readback_startup_repair(
+            domain::recovery_matrix::build_readback_v1(
+                "P082-R05",
+                "repaired",
+                "retry",
+                domain::recovery_matrix::REASON_STARTUP_STALLED,
+                "Stale ACP pre-session startup repaired; work item requeued.",
+                "work_items, agent_executions",
+                "work_items",
+                &item_id,
+                Some("work_items.payload_json.p061_startup_recovery"),
+                integrity,
+                &scheduled_at_rfc3339,
+            ),
+            summary,
+            operator_message.as_deref(),
+        );
         if let Some(object) = payload.as_object_mut() {
             object.remove("p058_claimed");
             object.insert(
@@ -1902,6 +2125,7 @@ pub async fn requeue_stale_pre_session_invoke_agents_tx(
                     "xcode_grace_applied": xcode_required,
                     "standard_stale_cutoff": standard_stale_cutoff_rfc3339,
                     "xcode_stale_cutoff": xcode_stale_cutoff_rfc3339,
+                    "p082_recovery_matrix_readback": p082_readback,
                 }),
             );
         }
@@ -1946,8 +2170,9 @@ pub async fn requeue_stale_starting_invoke_agent_sessions_tx(
                   sg.created_at AS generation_created_at,
                   sg.invocation_owner_key AS invocation_owner_key
            FROM work_items wi
-           INNER JOIN agent_executions ae
-             ON ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+	           INNER JOIN agent_executions ae
+	             ON json_valid(wi.payload_json)
+	             AND ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
            INNER JOIN session_generations sg
              ON sg.id = ae.session_generation_id
            WHERE wi.kind = ?1
@@ -2054,6 +2279,72 @@ pub async fn requeue_stale_starting_invoke_agent_sessions_tx(
         .await
         .context("insert stale ACP startup session invalidation event")?;
 
+        let stale_after_ms = if xcode_required {
+            domain::recovery_matrix::XCODE_STARTUP_GRACE_SECONDS * 1_000_i64
+        } else {
+            domain::recovery_matrix::STANDARD_STARTUP_GRACE_SECONDS * 1_000_i64
+        };
+        let repair_id = format!("p082-stale-startup:{session_generation_id}");
+        let operator_message = if xcode_required {
+            Some(format!(
+                "Xcode startup grace exceeded 12 minutes (cutoff: {stale_cutoff_rfc3339}); \
+                 session generation {session_generation_id} invalidated and work item requeued for retry. \
+                 Next check: daemon scheduler next cycle (no manual intervention required)."
+            ))
+        } else {
+            None
+        };
+        // Resolve the source command journal id with the same ownership check
+        // used by the other P082 startup-repair paths. A payload-provided id
+        // is only valid if command_journal.run_id matches the authoritative
+        // work_items.run_id; otherwise the readback must record tamper evidence
+        // and fall back to a same-run journal id.
+        let (source_cj_id_opt, mut integrity) =
+            p082_resolve_source_command_journal_id_for_work_item_tx(
+                tx,
+                &payload,
+                &run_id_for_repair,
+            )
+            .await?;
+        let (source_cj_id, integrity) = match source_cj_id_opt {
+            Some(ref id) => (id.clone(), integrity),
+            None => {
+                if integrity != "tamper_detected" {
+                    integrity = "unavailable";
+                }
+                ("no-journal-found".to_string(), integrity)
+            }
+        };
+        let summary = domain::recovery_matrix::build_startup_repair_summary(
+            &repair_id,
+            &item_id,
+            &source_cj_id,
+            1,
+            1,
+            false,
+            stale_after_ms,
+            &stale_cutoff_rfc3339,
+            xcode_required,
+            None,
+            "startup",
+        );
+        let p082_readback = domain::recovery_matrix::set_readback_startup_repair(
+            domain::recovery_matrix::build_readback_v1(
+                "P082-R05",
+                "repaired",
+                "retry",
+                domain::recovery_matrix::REASON_STARTUP_STALLED,
+                "Stale ACP startup repaired; session generation invalidated and work item requeued.",
+                "work_items, session_generations, session_events",
+                "work_items, sessions, startup_repairs",
+                &item_id,
+                Some("work_items.payload_json.p061_startup_recovery"),
+                integrity,
+                &scheduled_at_rfc3339,
+            ),
+            summary.clone(),
+            operator_message.as_deref(),
+        );
         if let Some(object) = payload.as_object_mut() {
             object.remove("p058_claimed");
             object.insert(
@@ -2062,6 +2353,7 @@ pub async fn requeue_stale_starting_invoke_agent_sessions_tx(
                     "requeued_at": scheduled_at_rfc3339.clone(),
                     "reason": reason,
                     "stale_cutoff": stale_cutoff_rfc3339,
+                    "p082_recovery_matrix_readback": p082_readback,
                 }),
             );
         }
@@ -2086,67 +2378,8 @@ pub async fn requeue_stale_starting_invoke_agent_sessions_tx(
         .rows_affected();
         requeued += updated;
 
-        // Write a durable P082-R05 readback so the repair is visible after the
-        // session generation moves to 'invalidated' and the live Source 8 query
-        // no longer finds the row.
-        let stale_after_ms = if xcode_required {
-            domain::recovery_matrix::XCODE_STARTUP_GRACE_SECONDS * 1_000_i64
-        } else {
-            domain::recovery_matrix::STANDARD_STARTUP_GRACE_SECONDS * 1_000_i64
-        };
-        let repair_id = format!("p082-stale-startup:{session_generation_id}");
-        let operator_message = if xcode_required {
-            Some(format!(
-                "Xcode startup grace exceeded 12 minutes (cutoff: {stale_cutoff_rfc3339}); \
-                 session generation {session_generation_id} invalidated and work item requeued for retry. \
-                 Next check: daemon scheduler next cycle (no manual intervention required)."
-            ))
-        } else {
-            None
-        };
-        // Resolve the source command journal id: check payload first, then fall back to
-        // the most recent command journal entry for the run. p082_startup_repair_summary_v1
-        // requires a non-empty command_journal.id — "unavailable" violates the contract.
-        let source_cj_id_opt = match p082_source_command_journal_id_from_payload(&payload) {
-            Some(id) => Some(id),
-            None => p082_latest_command_journal_id_for_run_tx(tx, &run_id_for_repair).await?,
-        };
-        let (source_cj_id, integrity) = match source_cj_id_opt {
-            Some(ref id) => (id.clone(), "valid"),
-            None => ("no-journal-found".to_string(), "unavailable"),
-        };
-        let summary = domain::recovery_matrix::build_startup_repair_summary(
-            &repair_id,
-            &item_id,
-            &source_cj_id,
-            1,
-            1,
-            false,
-            stale_after_ms,
-            &stale_cutoff_rfc3339,
-            xcode_required,
-            None,
-            "startup",
-        );
-        let p082_readback = domain::recovery_matrix::set_readback_startup_repair(
-            domain::recovery_matrix::build_readback_v1(
-                "P082-R05",
-                "repaired",
-                "retry",
-                domain::recovery_matrix::REASON_STARTUP_STALLED,
-                "Stale ACP startup repaired; session generation invalidated and work item requeued.",
-                "startup_repairs, session_generations, session_events, work_items",
-                "work_items, sessions, startup_repairs",
-                &repair_id,
-                Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-                integrity,
-                &scheduled_at_rfc3339,
-            ),
-            summary,
-            operator_message.as_deref(),
-        );
         let notes = serde_json::json!({
-            "p082_recovery_matrix_readback": p082_readback,
+            "p082_startup_repair_summary": summary,
         });
         super::startup_repairs::record_tx(
             &mut **tx,
@@ -2875,19 +3108,32 @@ async fn validate_running_invoke_completion_has_valid_outputs_tx(
            JOIN agent_executions ae
              ON ae.id = ?1
             AND ae.stage_execution_id = se.id
-            AND ae.status IN (?8, ?9, ?10)
+            AND ae.status IN (?9, ?10, ?11)
            JOIN artifact_source_generation_claims claim
              ON claim.run_id = wi.run_id
             AND claim.stage_execution_id = se.id
             AND claim.agent_execution_id = ae.id
             AND claim.source_work_item_id = wi.id
-            AND claim.claim_state = ?7
+            AND claim.claim_state IN (?7, ?8)
            JOIN agent_execution_runtime_facts facts
              ON facts.agent_execution_id = ae.id
             AND facts.output_settlement IN (?5, ?6)
-            AND COALESCE(facts.valid_required_outputs, 0) > 0
            WHERE wi.id = ?2
-             AND wi.run_id = ?4"#,
+             AND wi.run_id = ?4
+             AND (
+               COALESCE(facts.valid_required_outputs, 0) > 0
+               OR EXISTS (
+                 SELECT 1
+                 FROM artifact_contract_generations gen
+                 WHERE gen.run_id = wi.run_id
+                   AND gen.source_stage_execution_id = se.id
+                   AND gen.source_agent_execution_id = ae.id
+                   AND gen.source_work_item_id = wi.id
+                   AND gen.output_settlement IN (?5, ?6)
+                   AND gen.valid = 1
+                   AND gen.source_generation_verified = 1
+               )
+             )"#,
     )
     .bind(agent_execution_id)
     .bind(work_item_id)
@@ -2896,6 +3142,7 @@ async fn validate_running_invoke_completion_has_valid_outputs_tx(
     .bind(domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution.to_string())
     .bind(domain::agent::AgentOutputSettlement::ValidOutputsFromFailedExecution.to_string())
     .bind(ArtifactSourceClaimState::Active.to_string())
+    .bind(ArtifactSourceClaimState::Closed.to_string())
     .bind(AgentStatus::Running.to_string())
     .bind(AgentStatus::Completed.to_string())
     .bind(AgentStatus::Failed.to_string())
@@ -2906,9 +3153,47 @@ async fn validate_running_invoke_completion_has_valid_outputs_tx(
     })?;
     if valid_outputs == 0 {
         anyhow::bail!(
-            "refusing to complete running InvokeAgent work item {work_item_id}: runtime facts, active source claim, and agent execution do not prove the same run owner with valid required outputs"
+            "refusing to complete running InvokeAgent work item {work_item_id}: runtime facts, active-or-closed source claim, and agent execution do not prove the same run owner with valid required outputs"
         );
     }
+    sqlx::query(
+        r#"UPDATE agent_execution_runtime_facts
+           SET valid_required_outputs = 1,
+               updated_at = ?2
+           WHERE agent_execution_id = ?1
+             AND COALESCE(valid_required_outputs, 0) = 0
+             AND EXISTS (
+               SELECT 1
+               FROM work_items wi
+               JOIN stage_executions se
+                 ON se.id = ?4
+                AND se.run_id = wi.run_id
+               JOIN artifact_contract_generations gen
+                 ON gen.run_id = wi.run_id
+                AND gen.source_stage_execution_id = se.id
+                AND gen.source_agent_execution_id = ?1
+                AND gen.source_work_item_id = wi.id
+                AND gen.output_settlement IN (?5, ?6)
+                AND gen.valid = 1
+                AND gen.source_generation_verified = 1
+               WHERE wi.id = ?3
+                 AND wi.run_id = ?7
+             )"#,
+    )
+    .bind(agent_execution_id)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(work_item_id)
+    .bind(payload_stage_execution_id)
+    .bind(domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution.to_string())
+    .bind(domain::agent::AgentOutputSettlement::ValidOutputsFromFailedExecution.to_string())
+    .bind(payload_run_id)
+    .execute(&mut **tx)
+    .await
+    .with_context(|| {
+        format!(
+            "repair runtime valid_required_outputs from contract generations for InvokeAgent work item {work_item_id}"
+        )
+    })?;
     Ok(())
 }
 
@@ -3439,14 +3724,17 @@ async fn target_invoke_exists_tx(
     let target = target_stage_execution_id.to_string();
     let count: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*)
-           FROM work_items
-           WHERE run_id = ?1
-             AND kind = ?2
-             AND status IN (?3, ?4, ?5, ?6)
-             AND (
-               json_extract(payload_json, '$.stage_execution_id') = ?7
-               OR json_extract(payload_json, '$.targeted_retry.target_stage_execution_id') = ?7
-             )"#,
+	           FROM work_items
+	           WHERE run_id = ?1
+	             AND kind = ?2
+	             AND status IN (?3, ?4, ?5, ?6)
+	             AND CASE
+	               WHEN json_valid(payload_json) THEN (
+	                 json_extract(payload_json, '$.stage_execution_id') = ?7
+	                 OR json_extract(payload_json, '$.targeted_retry.target_stage_execution_id') = ?7
+	               )
+	               ELSE 0
+	             END"#,
     )
     .bind(run_id)
     .bind(WorkItemKind::InvokeAgent.to_string())
@@ -4044,7 +4332,7 @@ mod tests {
         let error = complete(&pool, "invoke-no-valid-facts").await.unwrap_err();
         assert!(error
             .to_string()
-            .contains("runtime facts do not prove valid required outputs"));
+            .contains("do not prove the same run owner with valid required outputs"));
 
         let item = find_by_id(&pool, "invoke-no-valid-facts")
             .await
@@ -4071,6 +4359,369 @@ mod tests {
                 .unwrap();
         assert_eq!(claim.claim_state, ArtifactSourceClaimState::Active);
         assert!(claim.closed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_running_invoke_accepts_valid_runtime_facts_with_closed_source_claim() {
+        let pool = test_pool().await;
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let agent_execution_id = AgentExecutionId::new();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+
+        sqlx::query(
+            r#"INSERT INTO ideas (id, title, body, status, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        )
+        .bind("idea-complete-closed-claim")
+        .bind("complete closed claim")
+        .bind("body")
+        .bind("active")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert idea");
+        sqlx::query(
+            r#"INSERT INTO runs
+               (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(run_id.to_string())
+        .bind("idea-complete-closed-claim")
+        .bind("running")
+        .bind("wf")
+        .bind("Workflow")
+        .bind("/tmp/ws")
+        .bind("/tmp/artifacts")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert run");
+        sqlx::query(
+            r#"INSERT INTO stage_executions
+               (id, run_id, stage_id, label, status, iteration, attempt_number, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(stage_execution_id.to_string())
+        .bind(run_id.to_string())
+        .bind("implement")
+        .bind("Implement")
+        .bind("running")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert stage execution");
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, status, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+        )
+        .bind(agent_execution_id.to_string())
+        .bind(stage_execution_id.to_string())
+        .bind("code_writer")
+        .bind("codex")
+        .bind(AgentStatus::Running.to_string())
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert running agent execution");
+
+        let mut facts =
+            domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+        facts.output_settlement =
+            domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+        facts.valid_required_outputs = true;
+        crate::repos::agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .expect("insert runtime facts");
+
+        let claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
+            run_id,
+            owner_kind: domain::mediation::OwnerKind::StageExecution,
+            owner_id: stage_execution_id.to_string(),
+            stage_execution_id: Some(stage_execution_id),
+            agent_execution_id,
+            source_work_item_id: "invoke-valid-closed-claim".to_string(),
+        };
+        crate::repos::artifact_contracts::insert_source_generation_claim(
+            &pool,
+            domain::artifact_contracts::ArtifactSourceGenerationClaim {
+                key: claim_key.clone(),
+                current_session_generation_id: Some(uuid::Uuid::new_v4().to_string()),
+                claim_state: ArtifactSourceClaimState::Closed,
+                superseding_work_item_id: None,
+                superseded_by_agent_execution_id: None,
+                supersession_journal_id: None,
+                superseded_at: None,
+                closed_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("insert closed source claim");
+        enqueue(
+            &pool,
+            &WorkItem {
+                id: "invoke-valid-closed-claim".to_string(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "implement",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "p058_claimed": {
+                        "agent_execution_id": agent_execution_id.to_string(),
+                        "session_generation_id": uuid::Uuid::new_v4().to_string()
+                    }
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: Some("implement".to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .expect("insert running invoke work item");
+
+        complete(&pool, "invoke-valid-closed-claim")
+            .await
+            .expect("closed same-owner source claim with valid facts completes");
+
+        let item = find_by_id(&pool, "invoke-valid-closed-claim")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.status, WorkItemStatus::Completed);
+        assert!(
+            find_by_id(&pool, "advance-after-invoke:invoke-valid-closed-claim")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let agent_status: String =
+            sqlx::query_scalar("SELECT status FROM agent_executions WHERE id = ?1")
+                .bind(agent_execution_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(agent_status, AgentStatus::Completed.to_string());
+        let claim =
+            crate::repos::artifact_contracts::load_source_generation_claim(&pool, &claim_key)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(claim.claim_state, ArtifactSourceClaimState::Closed);
+        assert!(claim.closed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn complete_running_invoke_repairs_valid_required_outputs_from_verified_generation() {
+        let pool = test_pool().await;
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let agent_execution_id = AgentExecutionId::new();
+        let artifact_id = domain::ids::ArtifactId::new();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let work_item_id = "invoke-valid-generation-repairs-facts";
+
+        sqlx::query(
+            r#"INSERT INTO ideas (id, title, body, status, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        )
+        .bind("idea-valid-generation-repair")
+        .bind("valid generation repair")
+        .bind("body")
+        .bind("active")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert idea");
+        sqlx::query(
+            r#"INSERT INTO runs
+               (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(run_id.to_string())
+        .bind("idea-valid-generation-repair")
+        .bind("running")
+        .bind("wf")
+        .bind("Workflow")
+        .bind("/tmp/ws")
+        .bind("/tmp/artifacts")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert run");
+        sqlx::query(
+            r#"INSERT INTO stage_executions
+               (id, run_id, stage_id, label, status, iteration, attempt_number, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(stage_execution_id.to_string())
+        .bind(run_id.to_string())
+        .bind("implementation_review")
+        .bind("Implementation Review")
+        .bind("running")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert stage execution");
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, status, started_at, completed_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+        )
+        .bind(agent_execution_id.to_string())
+        .bind(stage_execution_id.to_string())
+        .bind("lead_orchestrator")
+        .bind("codex")
+        .bind(AgentStatus::Completed.to_string())
+        .bind(&now_str)
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert completed agent execution");
+
+        let mut facts =
+            domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+        facts.output_settlement =
+            domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution;
+        facts.valid_required_outputs = false;
+        crate::repos::agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .expect("insert contradictory runtime facts");
+
+        sqlx::query(
+            r#"INSERT INTO artifacts
+               (id, run_id, stage_id, agent_id, name, contract_id, format, file_path,
+                provider, created_at, report_kind, report_version, agent_execution_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+        )
+        .bind(artifact_id.to_string())
+        .bind(run_id.to_string())
+        .bind("implementation_review")
+        .bind("lead_orchestrator")
+        .bind("implementation_review_summary")
+        .bind("implementation_review_summary_v1")
+        .bind("json")
+        .bind("/tmp/artifacts/review/implementation-summary.json")
+        .bind("codex")
+        .bind(&now_str)
+        .bind("implementation_review_summary")
+        .bind(1_i64)
+        .bind(agent_execution_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert artifact");
+        sqlx::query(
+            r#"INSERT INTO artifact_contract_generations
+               (generation_id, run_id, artifact_id, contract_id, canonical_path, raw_path,
+                raw_status, canonical_status, source_agent_execution_id, source_stage_execution_id,
+                source_session_generation_id, source_work_item_id, output_settlement,
+                source_generation_verified, valid, partial, warnings_json,
+                validation_errors_json, canonical_dimensions_json, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"#,
+        )
+        .bind(format!("{agent_execution_id}:{artifact_id}"))
+        .bind(run_id.to_string())
+        .bind(artifact_id.to_string())
+        .bind("implementation_review_summary_v1")
+        .bind("implementation_review_summary")
+        .bind("/tmp/artifacts/review/implementation-summary.json")
+        .bind("release_evidence_blocked")
+        .bind("release_evidence_blocked")
+        .bind(agent_execution_id.to_string())
+        .bind(stage_execution_id.to_string())
+        .bind("session-generation")
+        .bind(work_item_id)
+        .bind(domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution.to_string())
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(0_i64)
+        .bind("[]")
+        .bind("[]")
+        .bind("{}")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert verified contract generation");
+
+        let claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
+            run_id,
+            owner_kind: domain::mediation::OwnerKind::StageExecution,
+            owner_id: stage_execution_id.to_string(),
+            stage_execution_id: Some(stage_execution_id),
+            agent_execution_id,
+            source_work_item_id: work_item_id.to_string(),
+        };
+        crate::repos::artifact_contracts::insert_source_generation_claim(
+            &pool,
+            domain::artifact_contracts::ArtifactSourceGenerationClaim {
+                key: claim_key,
+                current_session_generation_id: Some("session-generation".to_string()),
+                claim_state: ArtifactSourceClaimState::Closed,
+                superseding_work_item_id: None,
+                superseded_by_agent_execution_id: None,
+                supersession_journal_id: None,
+                superseded_at: None,
+                closed_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("insert closed source claim");
+        enqueue(
+            &pool,
+            &WorkItem {
+                id: work_item_id.to_string(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "implementation_review",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "p058_claimed": {
+                        "agent_execution_id": agent_execution_id.to_string(),
+                        "session_generation_id": "session-generation"
+                    }
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: Some("implementation_review".to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .expect("insert running invoke work item");
+
+        complete(&pool, work_item_id)
+            .await
+            .expect("verified generation repairs facts and completes work item");
+
+        let item = find_by_id(&pool, work_item_id).await.unwrap().unwrap();
+        assert_eq!(item.status, WorkItemStatus::Completed);
+        let valid_required_outputs: i64 = sqlx::query_scalar(
+            "SELECT valid_required_outputs FROM agent_execution_runtime_facts WHERE agent_execution_id = ?1",
+        )
+        .bind(agent_execution_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(valid_required_outputs, 1);
     }
 
     #[tokio::test]
@@ -5626,6 +6277,7 @@ mod tests {
         let run_id = RunId::new();
         let stage_execution_id = StageExecutionId::new();
         let agent_execution_id = AgentExecutionId::new();
+        let artifact_id = domain::ids::ArtifactId::new();
         let now = Utc::now();
 
         let idea_id = domain::ids::IdeaId::new();
@@ -5766,10 +6418,42 @@ mod tests {
             domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
         facts.output_settlement =
             domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution;
-        facts.valid_required_outputs = true;
+        facts.valid_required_outputs = false;
         crate::repos::agent_execution_runtime_facts::upsert(&pool, &facts)
             .await
             .expect("insert runtime facts");
+        sqlx::query(
+            r#"INSERT INTO artifact_contract_generations
+               (generation_id, run_id, artifact_id, contract_id, canonical_path, raw_path,
+                raw_status, canonical_status, source_agent_execution_id, source_stage_execution_id,
+                source_session_generation_id, source_work_item_id, output_settlement,
+                source_generation_verified, valid, partial, warnings_json,
+                validation_errors_json, canonical_dimensions_json, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"#,
+        )
+        .bind(format!("{agent_execution_id}:{artifact_id}"))
+        .bind(run_id.to_string())
+        .bind(artifact_id.to_string())
+        .bind("audit_report_v1")
+        .bind("audit_report")
+        .bind("/tmp/artifacts/audit/proposal-vs-implementation.json")
+        .bind("implemented")
+        .bind("implemented")
+        .bind(agent_execution_id.to_string())
+        .bind(stage_execution_id.to_string())
+        .bind("session-generation")
+        .bind("invoke-close-hung-after-output")
+        .bind(domain::agent::AgentOutputSettlement::ValidOutputsFromCompletedExecution.to_string())
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(0_i64)
+        .bind("[]")
+        .bind("[]")
+        .bind("{}")
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("insert verified contract generation");
         enqueue(
             &pool,
             &WorkItem {
@@ -5796,6 +6480,31 @@ mod tests {
         )
         .await
         .expect("insert targeted running work item");
+        let claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
+            run_id,
+            owner_kind: domain::mediation::OwnerKind::StageExecution,
+            owner_id: stage_execution_id.to_string(),
+            stage_execution_id: Some(stage_execution_id),
+            agent_execution_id,
+            source_work_item_id: "invoke-close-hung-after-output".to_string(),
+        };
+        crate::repos::artifact_contracts::insert_source_generation_claim(
+            &pool,
+            domain::artifact_contracts::ArtifactSourceGenerationClaim {
+                key: claim_key,
+                current_session_generation_id: Some("session-generation".to_string()),
+                claim_state: ArtifactSourceClaimState::Closed,
+                superseding_work_item_id: None,
+                superseded_by_agent_execution_id: None,
+                supersession_journal_id: None,
+                superseded_at: None,
+                closed_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("insert closed source claim");
 
         let completed = complete_running_invoke_agents_with_terminal_valid_outputs_on_startup(
             &pool,
@@ -5818,7 +6527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_running_invoke_does_not_mark_missing_output_execution_completed() {
+    async fn complete_running_invoke_rejects_missing_output_execution_without_mutation() {
         let pool = test_pool().await;
         let run_id = RunId::new();
         let stage_execution_id = StageExecutionId::new();
@@ -5993,15 +6702,163 @@ mod tests {
         .await
         .expect("insert running work item");
 
-        complete(&pool, "invoke-missing-output")
+        let error = complete(&pool, "invoke-missing-output")
             .await
-            .expect("complete work item");
+            .expect_err("missing output facts must not complete work item");
+        assert!(
+            error
+                .to_string()
+                .contains("do not prove the same run owner with valid required outputs"),
+            "completion guard must reject missing outputs before mutation; got: {error}"
+        );
+
+        let item = find_by_id(&pool, "invoke-missing-output")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.status, WorkItemStatus::Running);
 
         let execution = crate::repos::agent_executions::find_by_id(&pool, agent_execution_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(execution.status, AgentStatus::Failed);
+        assert_eq!(execution.status, AgentStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn terminal_failed_invoke_without_valid_outputs_can_fail_settle_work_item() {
+        let pool = test_pool().await;
+        let run_id = RunId::new();
+        let stage_execution_id = StageExecutionId::new();
+        let agent_execution_id = AgentExecutionId::new();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+
+        sqlx::query(
+            r#"INSERT INTO ideas (id, title, body, status, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        )
+        .bind("idea-terminal-failed-invoke")
+        .bind("terminal failed invoke")
+        .bind("body")
+        .bind("active")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert idea");
+        sqlx::query(
+            r#"INSERT INTO runs
+               (id, idea_id, status, workflow_id, workflow_title, workspace_root, artifact_root, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(run_id.to_string())
+        .bind("idea-terminal-failed-invoke")
+        .bind("running")
+        .bind("wf")
+        .bind("Workflow")
+        .bind("/tmp/ws")
+        .bind("/tmp/artifacts")
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert run");
+        sqlx::query(
+            r#"INSERT INTO stage_executions
+               (id, run_id, stage_id, label, status, iteration, attempt_number, started_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(stage_execution_id.to_string())
+        .bind(run_id.to_string())
+        .bind("implementation_review")
+        .bind("Implementation Review")
+        .bind("running")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert stage execution");
+        sqlx::query(
+            r#"INSERT INTO agent_executions
+               (id, stage_execution_id, agent_id, provider, status, started_at, completed_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)"#,
+        )
+        .bind(agent_execution_id.to_string())
+        .bind(stage_execution_id.to_string())
+        .bind("prepush_code_reviewer")
+        .bind("codex")
+        .bind(AgentStatus::Failed.to_string())
+        .bind(&now_str)
+        .execute(&pool)
+        .await
+        .expect("insert failed agent execution");
+
+        let mut facts =
+            domain::agent::AgentExecutionRuntimeFacts::defaults_for(agent_execution_id, now);
+        facts.output_settlement = domain::agent::AgentOutputSettlement::MissingRequiredOutputs;
+        facts.valid_required_outputs = false;
+        crate::repos::agent_execution_runtime_facts::upsert(&pool, &facts)
+            .await
+            .expect("insert runtime facts");
+        enqueue(
+            &pool,
+            &WorkItem {
+                id: "invoke-terminal-failed-no-outputs".to_string(),
+                kind: WorkItemKind::InvokeAgent,
+                payload_json: serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "stage_id": "implementation_review",
+                    "stage_execution_id": stage_execution_id.to_string(),
+                    "p058_claimed": {
+                        "agent_execution_id": agent_execution_id.to_string(),
+                        "session_generation_id": "generation-terminal-failed"
+                    }
+                })
+                .to_string(),
+                status: WorkItemStatus::Running,
+                run_id: Some(run_id),
+                stage_id: Some("implementation_review".to_string()),
+                created_at: now,
+                scheduled_at: now,
+                attempt_count: 1,
+                last_error: None,
+            },
+        )
+        .await
+        .expect("insert running work item");
+
+        assert!(running_invoke_agent_has_terminal_failed_outputs(
+            &pool,
+            "invoke-terminal-failed-no-outputs"
+        )
+        .await
+        .expect("detect terminal failed invoke"));
+        fail(
+            &pool,
+            "invoke-terminal-failed-no-outputs",
+            "terminal_failed_without_valid_outputs",
+        )
+        .await
+        .expect("fail terminal failed invoke work item");
+
+        let item = find_by_id(&pool, "invoke-terminal-failed-no-outputs")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.status, WorkItemStatus::Failed);
+        assert_eq!(
+            item.last_error.as_deref(),
+            Some("terminal_failed_without_valid_outputs")
+        );
+        let advance = find_by_id(
+            &pool,
+            "advance-after-invoke:invoke-terminal-failed-no-outputs",
+        )
+        .await
+        .unwrap()
+        .expect("post-failure advance");
+        assert_eq!(advance.kind, WorkItemKind::AdvanceRun);
+        assert_eq!(advance.status, WorkItemStatus::Pending);
     }
 
     #[tokio::test]
@@ -6209,6 +7066,31 @@ mod tests {
         )
         .await
         .expect("insert running targeted work item");
+        let claim_key = domain::artifact_contracts::ArtifactSourceGenerationClaimKey {
+            run_id,
+            owner_kind: domain::mediation::OwnerKind::StageExecution,
+            owner_id: stage_execution_id.to_string(),
+            stage_execution_id: Some(stage_execution_id),
+            agent_execution_id,
+            source_work_item_id: "targeted-invoke-close-hung-after-output".to_string(),
+        };
+        crate::repos::artifact_contracts::insert_source_generation_claim(
+            &pool,
+            domain::artifact_contracts::ArtifactSourceGenerationClaim {
+                key: claim_key,
+                current_session_generation_id: Some(uuid::Uuid::new_v4().to_string()),
+                claim_state: ArtifactSourceClaimState::Closed,
+                superseding_work_item_id: None,
+                superseded_by_agent_execution_id: None,
+                supersession_journal_id: None,
+                superseded_at: None,
+                closed_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("insert closed source claim");
 
         let completed = complete_running_invoke_agents_with_terminal_valid_outputs_on_startup(
             &pool,

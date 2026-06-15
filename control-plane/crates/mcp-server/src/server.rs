@@ -1342,6 +1342,15 @@ impl McpServer {
         uri: &str,
         principal: &auth::Principal,
     ) -> anyhow::Result<serde_json::Value> {
+        if matches!(
+            principal.class,
+            auth::PrincipalClass::Agent | auth::PrincipalClass::Observer
+        ) && (uri.starts_with("artifact://") || uri.starts_with("report://"))
+        {
+            // matrix_row: p081.agent_operator.resources_read.report
+            anyhow::bail!("Resource not found");
+        }
+
         if let Some(run_id) = uri.strip_prefix("run://") {
             return self.read_canonical_run_resource(run_id, principal).await;
         }
@@ -1672,29 +1681,36 @@ impl McpServer {
                     serde_json::json!(row.pending_approvals),
                 );
             }
-            obj.insert(
-                "implementation_self_assessment_summary".into(),
-                tools::reports::implementation_self_assessment_summary_json(
-                    &self.pool,
-                    run_id_parsed,
-                )
-                .await?,
-            );
-            obj.insert(
-                "rollout_contract_readback".into(),
-                rollout_contract_readback_json(&self.pool, run_id_parsed).await?,
-            );
-            let stage_rows = stages::list_by_run(&self.pool, run_id_parsed).await?;
-            let mut stage_values = Vec::new();
-            for stage in stage_rows {
-                let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
-                let mut stage_value = serde_json::to_value(&stage)?;
-                if let Some(stage_obj) = stage_value.as_object_mut() {
-                    stage_obj.insert("agent_executions".into(), serde_json::to_value(executions)?);
+            // Detail run resources are readable by Agent/Observer, but operator
+            // diagnostics and execution internals are not. Keep the same base
+            // run/projection redaction above and attach rich recovery/readback
+            // lanes only for Operators.
+            if principal.class == auth::PrincipalClass::Operator {
+                obj.insert(
+                    "implementation_self_assessment_summary".into(),
+                    tools::reports::implementation_self_assessment_summary_json(
+                        &self.pool,
+                        run_id_parsed,
+                    )
+                    .await?,
+                );
+                obj.insert(
+                    "rollout_contract_readback".into(),
+                    rollout_contract_readback_json(&self.pool, run_id_parsed).await?,
+                );
+                let stage_rows = stages::list_by_run(&self.pool, run_id_parsed).await?;
+                let mut stage_values = Vec::new();
+                for stage in stage_rows {
+                    let executions = agent_executions::find_by_stage(&self.pool, stage.id).await?;
+                    let mut stage_value = serde_json::to_value(&stage)?;
+                    if let Some(stage_obj) = stage_value.as_object_mut() {
+                        stage_obj
+                            .insert("agent_executions".into(), serde_json::to_value(executions)?);
+                    }
+                    stage_values.push(stage_value);
                 }
-                stage_values.push(stage_value);
+                obj.insert("stages".into(), serde_json::Value::Array(stage_values));
             }
-            obj.insert("stages".into(), serde_json::Value::Array(stage_values));
         }
         Ok(value)
     }
@@ -4156,11 +4172,44 @@ mod tests {
                 principal,
             )
             .await;
+        assert!(
+            response.error.is_none(),
+            "resources/read chainworks://runs returned error: {:?}",
+            response.error
+        );
         let text = response.result.expect("resources/read result")["contents"][0]["text"]
             .as_str()
             .expect("resources/read text")
             .to_string();
         serde_json::from_str(&text).expect("chainworks://runs resource is JSON")
+    }
+
+    async fn read_resource_json(
+        server: &McpServer,
+        principal: &auth::Principal,
+        uri: &str,
+    ) -> serde_json::Value {
+        let response = server
+            .handle_request(
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(serde_json::json!(1)),
+                    method: "resources/read".to_string(),
+                    params: Some(serde_json::json!({ "uri": uri })),
+                },
+                principal,
+            )
+            .await;
+        assert!(
+            response.error.is_none(),
+            "resources/read {uri} returned error: {:?}",
+            response.error
+        );
+        let text = response.result.expect("resources/read result")["contents"][0]["text"]
+            .as_str()
+            .expect("resources/read text")
+            .to_string();
+        serde_json::from_str(&text).expect("resource payload is JSON")
     }
 
     #[tokio::test]
@@ -4215,6 +4264,80 @@ mod tests {
                 assert!(
                     row.get(field).is_none(),
                     "non-operator chainworks://runs resource must redact {field}: {row}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn p082_run_detail_resources_redact_operator_only_diagnostics_for_non_operators() {
+        let pool = test_pool().await;
+        let idea_id = IdeaId::new();
+        let run_id = RunId::new();
+        ideas::insert(&pool, &make_idea(idea_id)).await.unwrap();
+        runs::insert(&pool, &make_run(run_id, idea_id))
+            .await
+            .unwrap();
+        persist_blocked_implementation_summary(&pool, run_id).await;
+        persist_rollout_contract_readback(&pool, run_id).await;
+        seed_validation_attempt(&pool, run_id).await;
+        projections::rebuild_run_summary(&pool, run_id)
+            .await
+            .unwrap();
+
+        let server = McpServer::new(
+            pool.clone(),
+            make_command_handler(pool.clone()),
+            auth::PrincipalTable::test_fixture(),
+        );
+
+        let operator = operator_principal();
+        let operator_run = read_resource_json(&server, &operator, &format!("run://{run_id}")).await;
+        assert!(
+            operator_run
+                .get("implementation_self_assessment_summary")
+                .is_some(),
+            "operator run:// must retain implementation summary"
+        );
+        assert!(
+            operator_run.get("rollout_contract_readback").is_some(),
+            "operator run:// must retain rollout readback"
+        );
+        assert!(
+            operator_run["stages"][0].get("agent_executions").is_some(),
+            "operator run:// must retain execution details"
+        );
+
+        for principal_class in [auth::PrincipalClass::Observer, auth::PrincipalClass::Agent] {
+            let principal = auth::Principal::new("non-operator-run-detail", principal_class);
+            let public_payload =
+                read_resource_json(&server, &principal, &format!("run://{run_id}")).await;
+            let direct_chainworks_payload = server
+                .read_resource_for_principal(&format!("chainworks://runs/{run_id}"), &principal)
+                .await
+                .expect("direct chainworks run detail resource should resolve");
+            for (uri, payload) in [
+                (format!("run://{run_id}"), public_payload),
+                (
+                    format!("chainworks://runs/{run_id}"),
+                    direct_chainworks_payload,
+                ),
+            ] {
+                for field in [
+                    "implementation_self_assessment_summary",
+                    "rollout_contract_readback",
+                    "active_artifact_index",
+                    "run_state_projection",
+                    "operator_overrides",
+                ] {
+                    assert!(
+                        payload.get(field).is_none(),
+                        "non-Operator {uri} must redact {field}: {payload}"
+                    );
+                }
+                assert!(
+                    payload.get("stages").is_none(),
+                    "non-Operator {uri} must not receive raw stage/agent execution internals: {payload}"
                 );
             }
         }
@@ -5318,44 +5441,14 @@ mod tests {
 
         for principal_class in [auth::PrincipalClass::Agent, auth::PrincipalClass::Observer] {
             let principal = auth::Principal::new("non-operator", principal_class);
-            let value = server
+            let err = server
                 .read_resource_for_principal(&format!("report://{run_id}"), &principal)
                 .await
-                .unwrap();
-            let top_level = value["p082_recovery_matrix_readbacks"]
-                .as_array()
-                .expect("report:// p082_recovery_matrix_readbacks must be an array");
+                .expect_err("non-operator report:// helper must deny before materialization");
             assert!(
-                top_level.is_empty(),
-                "P082 SEC-HIGH-1: report:// top-level readbacks must be empty for non-Operators"
+                err.to_string().contains("Resource not found"),
+                "P082 SEC-HIGH-1: report:// must deny non-Operators before payload materialization"
             );
-
-            let artifacts = value["artifacts"].as_array().expect("artifacts array");
-            let run_report = artifacts
-                .iter()
-                .find(|artifact| artifact["name"] == serde_json::json!("run_report"))
-                .expect("run_report artifact present");
-            let artifact_readbacks = run_report["p082_recovery_matrix_readbacks"]
-                .as_array()
-                .expect("run_report artifact p082_recovery_matrix_readbacks must be an array");
-            assert!(
-                artifact_readbacks.is_empty(),
-                "P082 SEC-HIGH-1: report:// run_report artifact readbacks must be empty for non-Operators"
-            );
-            for forbidden_field in [
-                "code_writer_completion_receipts",
-                "implementationCompletion",
-                "workflow_conflict",
-                "retryAuthority",
-                "retryAuthorityHistory",
-                "p091OrphanRepairReadback",
-                "rollout_contract_readback",
-            ] {
-                assert!(
-                    value.get(forbidden_field).is_none(),
-                    "P082 SEC-HIGH-1: report:// must omit operator field {forbidden_field} for non-Operators"
-                );
-            }
         }
     }
 }

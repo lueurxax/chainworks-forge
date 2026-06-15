@@ -4,7 +4,7 @@ use auth;
 use chrono::{DateTime, Utc};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -268,6 +268,15 @@ struct CommandJournalEntry {
     boundary_row_id: Option<String>,
 }
 
+struct RetryIdentifierKindRejection {
+    message: String,
+    provided_identifier: String,
+    provided_identifier_kind: &'static str,
+    expected_identifier_kind: &'static str,
+    valid_identifier_examples: Vec<String>,
+    operator_message: String,
+}
+
 fn ensure_run_meta_root_exists(run: &Run) -> Result<()> {
     let Some(meta_root) = run
         .chainworks_meta_root
@@ -326,7 +335,13 @@ fn create_command_dir_all_no_symlink_under(
         .with_context(|| format!("{field} escapes canonical root"))?;
     let mut current = canonical_root.to_path_buf();
     for component in relative.components() {
-        current.push(component.as_os_str());
+        match component {
+            Component::Normal(part) => current.push(part),
+            Component::CurDir => continue,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("{field} contains an unsafe path component");
+            }
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
@@ -349,6 +364,11 @@ fn create_command_dir_all_no_symlink_under(
                 return Err(error).with_context(|| format!("inspect {}", current.display()));
             }
         }
+    }
+    let canonical_current = std::fs::canonicalize(&current)
+        .with_context(|| format!("canonicalize directory {}", current.display()))?;
+    if !canonical_current.starts_with(canonical_root) {
+        anyhow::bail!("{field} escapes canonical root after creation");
     }
     Ok(())
 }
@@ -3118,7 +3138,18 @@ impl CommandHandler {
                 } else {
                     None
                 };
-                self.validate_retry_stage_identifier_kinds(&c).await?;
+                if let Some(rejection) = self.retry_stage_identifier_kind_rejection(&c).await? {
+                    self.record_retry_stage_identifier_rejection(journal, &rejection)
+                        .await?;
+                    db::metrics::increment_counter_with_label(
+                        "p082_recovery_mutation_rejected_total",
+                        &format!(
+                            "{}:RetryStage",
+                            domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE
+                        ),
+                    );
+                    return Err(anyhow!(rejection.message));
+                }
 
                 if let Some(agent_execution_id) = c.agent_execution_id {
                     if c.legacy_discovery_override_policy.is_some() {
@@ -5999,28 +6030,27 @@ impl CommandHandler {
             .filter(|s| s.stage_id == stage_id)
             .collect::<Vec<_>>();
         let latest_stage = matching_stages.iter().copied().max_by_key(|s| s.started_at);
-        let valid_agent_identifier_examples = match latest_stage {
-            Some(stage) => agent_executions::find_by_stage(&self.pool, stage.id)
+        let example_stage_execution_id = latest_stage.map(|stage| stage.id).unwrap_or(old_stage.id);
+        let valid_agent_execution_examples =
+            agent_executions::find_by_stage(&self.pool, example_stage_execution_id)
                 .await?
                 .into_iter()
                 .map(|execution| execution.id.to_string())
-                .collect::<Vec<_>>(),
-            None => Vec::new(),
-        };
+                .collect::<Vec<_>>();
         if old_stage.run_id != run_id || old_stage.stage_id != stage_id {
             let err_msg = format!(
                 "Targeted retry rejected: agent execution {} belongs to run {} stage {}, not run {} stage {}. No mutation was performed.",
                 agent_execution_id, old_stage.run_id, old_stage.stage_id, run_id, stage_id
             );
             let now_ts = Utc::now();
-            let valid_identifier_example_refs = valid_agent_identifier_examples
+            let valid_identifier_example_refs = valid_agent_execution_examples
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
             let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
                 "RetryAgentExecution",
                 &agent_execution_id.to_string(),
-                "agent_execution_id",
+                "unknown",
                 "agent_execution_id",
                 &valid_identifier_example_refs,
             );
@@ -6034,7 +6064,7 @@ impl CommandHandler {
                         "rejected",
                         "no_mutation",
                         domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
-                        "Provide an agent_execution_id that belongs to the targeted run and stage.",
+                        "Provide an agent execution from the current stage execution.",
                         "command_journal",
                         "command_journal, agent_executions, stage_executions",
                         &journal.id,
@@ -6068,14 +6098,14 @@ impl CommandHandler {
                 agent_execution_id, old_stage.id, stage_id, latest_stage.id
             );
             let now_ts = Utc::now();
-            let valid_identifier_example_refs = valid_agent_identifier_examples
+            let valid_identifier_example_refs = valid_agent_execution_examples
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
             let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
                 "RetryAgentExecution",
                 &agent_execution_id.to_string(),
-                "agent_execution_id",
+                "unknown",
                 "agent_execution_id",
                 &valid_identifier_example_refs,
             );
@@ -6089,7 +6119,7 @@ impl CommandHandler {
                         "rejected",
                         "no_mutation",
                         domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
-                        "Provide an agent_execution_id from the latest stage execution attempt.",
+                        "Provide an agent execution from the latest stage execution attempt.",
                         "command_journal",
                         "command_journal, agent_executions, stage_executions",
                         &journal.id,
@@ -6165,55 +6195,6 @@ impl CommandHandler {
             return Err(error);
         }
 
-        // Ledger-backed preflight: check actual unresolved side effects for this stage.
-        // SEC-P082-02: RetryAgentExecution now fails closed on unresolved side effects,
-        // matching the RetryStage ledger preflight. Uses a short-lived transaction so we
-        // fail closed without starting the main mutation transaction.
-        {
-            let mut preflight_tx = self.pool.begin().await?;
-            if let Err(ledger_err) = retry_preflight_within_tx(
-                &mut preflight_tx,
-                &run_id,
-                &old_stage.id,
-                Some(&agent_execution_id),
-            )
-            .await
-            {
-                let _ = preflight_tx.rollback().await;
-                let now_ts = Utc::now();
-                let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
-                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
-                    "RetryAgentExecution",
-                    "Retry blocked: unresolved side-effect ledger entries exist. No mutation was performed.",
-                    domain::recovery_matrix::set_readback_side_effect_hold(
-                        domain::recovery_matrix::build_readback_v1(
-                            "P082-R07",
-                            "held",
-                            "reconcile_side_effects",
-                            domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
-                            "Reconcile unresolved side effects before retrying this agent execution.",
-                            "side_effects, command_journal",
-                            "side_effects, command_journal",
-                            &journal.id,
-                            Some("command_journal.error.p082_recovery_matrix_readback"),
-                            "valid",
-                            &now_ts.to_rfc3339(),
-                        ),
-                        "unresolved_side_effect_entries",
-                        "Retry blocked: unresolved side-effect ledger entries exist. Reconcile side effects before retrying.",
-                    ),
-                );
-                self.record_failed_command_transaction(
-                    journal,
-                    "command.RetryAgentExecution",
-                    &p082_envelope,
-                )
-                .await?;
-                return Err(ledger_err);
-            }
-            let _ = preflight_tx.rollback().await;
-        }
-
         let has_release_post_approval_tasks = match retry_state_has_release_post_approval_tasks(
             &run,
             &old_stage.stage_id,
@@ -6267,6 +6248,13 @@ impl CommandHandler {
                 &p082_envelope,
             )
             .await?;
+            db::metrics::increment_counter_with_label(
+                "p082_recovery_mutation_rejected_total",
+                &format!(
+                    "{}:RetryAgentExecution",
+                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
+                ),
+            );
             return Err(error);
         }
 
@@ -6450,6 +6438,54 @@ impl CommandHandler {
             .begin_command_transaction("command.RetryAgentExecution", journal.id.clone())
             .await?;
         record_command_journal_tx(&mut retry_tx, journal).await?;
+        // Ledger-backed preflight: check unresolved side effects inside the
+        // same BEGIN IMMEDIATE write unit that records the command journal and
+        // performs retry mutations. This mirrors RetryStage and closes the
+        // preflight/mutation TOCTOU window.
+        if let Err(ledger_err) = retry_preflight_within_tx(
+            &mut retry_tx,
+            &run_id,
+            &old_stage.id,
+            Some(&agent_execution_id),
+        )
+        .await
+        {
+            let now_ts = Utc::now();
+            let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
+                domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                "RetryAgentExecution",
+                "Retry blocked: unresolved side-effect ledger entries exist. No mutation was performed.",
+                domain::recovery_matrix::set_readback_side_effect_hold(
+                    domain::recovery_matrix::build_readback_v1(
+                        "P082-R07",
+                        "held",
+                        "reconcile_side_effects",
+                        domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION,
+                        "Reconcile unresolved side effects before retrying this agent execution.",
+                        "side_effects, command_journal",
+                        "side_effects, command_journal",
+                        &journal.id,
+                        Some("command_journal.error.p082_recovery_matrix_readback"),
+                        "valid",
+                        &now_ts.to_rfc3339(),
+                    ),
+                    "unresolved_side_effect_entries",
+                    "Retry blocked: unresolved side-effect ledger entries exist. Reconcile side effects before retrying.",
+                ),
+            );
+            command_journal::fail_entry_tx(&mut retry_tx, &journal.id, now_ts, &p082_envelope)
+                .await?;
+            retry_tx.commit().await?;
+            db::pool::log_write_transaction("command.RetryAgentExecution", retry_tx_started);
+            db::metrics::increment_counter_with_label(
+                "p082_recovery_mutation_rejected_total",
+                &format!(
+                    "{}:RetryAgentExecution",
+                    domain::recovery_matrix::REASON_REQUIRES_EFFECT_RECONCILIATION
+                ),
+            );
+            return Err(ledger_err);
+        }
         apply_quota_retry_budget_for_stage_tx(
             &mut retry_tx,
             run_id,
@@ -6574,19 +6610,27 @@ impl CommandHandler {
         })
     }
 
-    async fn validate_retry_stage_identifier_kinds(
+    async fn retry_stage_identifier_kind_rejection(
         &self,
         c: &domain::commands::RetryStageCmd,
-    ) -> Result<()> {
+    ) -> Result<Option<RetryIdentifierKindRejection>> {
         if let Ok(uuid) = uuid::Uuid::parse_str(&c.stage_id) {
             let stage_execution_id = StageExecutionId::from(uuid);
             if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
                 if stage.run_id == c.run_id {
-                    anyhow::bail!(
-                        "wrong_identifier_kind: stages.retry expected logical stage_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or set agent_execution_id to an agent_executions.id for a targeted retry.",
-                        c.stage_id,
-                        stage.stage_id
-                    );
+                    return Ok(Some(RetryIdentifierKindRejection {
+                        message: format!(
+                            "wrong_identifier_kind: stages.retry expected logical stage_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or set agent_execution_id to an agent_executions.id for a targeted retry.",
+                            c.stage_id, stage.stage_id
+                        ),
+                        provided_identifier: c.stage_id.clone(),
+                        provided_identifier_kind: "stage_execution_uuid",
+                        expected_identifier_kind: "workflow_stage_id",
+                        valid_identifier_examples: vec![stage.stage_id],
+                        operator_message:
+                            "Retry with the logical workflow stage_id, not a stage execution UUID."
+                                .to_string(),
+                    }));
                 }
             }
 
@@ -6597,12 +6641,19 @@ impl CommandHandler {
                 if let Some(stage_execution_id) = agent_execution.stage_execution_id {
                     if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
                         if stage.run_id == c.run_id {
-                            anyhow::bail!(
-                                "wrong_identifier_kind: stages.retry expected logical stage_id but received agent_execution_id '{}'. next_action: retry with stage_id '{}' and agent_execution_id '{}'.",
-                                c.stage_id,
-                                stage.stage_id,
-                                agent_execution.id
-                            );
+                            return Ok(Some(RetryIdentifierKindRejection {
+                                message: format!(
+                                    "wrong_identifier_kind: stages.retry expected logical stage_id but received agent_execution_id '{}'. next_action: retry with stage_id '{}' and agent_execution_id '{}'.",
+                                    c.stage_id, stage.stage_id, agent_execution.id
+                                ),
+                                provided_identifier: c.stage_id.clone(),
+                                provided_identifier_kind: "unknown",
+                                expected_identifier_kind: "workflow_stage_id",
+                                valid_identifier_examples: vec![stage.stage_id],
+                                operator_message:
+                                    "Retry with the logical workflow stage_id; put the agent execution UUID in agent_execution_id for targeted retry."
+                                        .to_string(),
+                            }));
                         }
                     }
                 }
@@ -6617,17 +6668,74 @@ impl CommandHandler {
                 let stage_execution_id = StageExecutionId::from(agent_execution_id.inner());
                 if let Some(stage) = stages::find_by_id(&self.pool, stage_execution_id).await? {
                     if stage.run_id == c.run_id {
-                        anyhow::bail!(
-                            "wrong_identifier_kind: stages.retry expected agent_execution_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or choose an agent_executions.id from that stage for targeted retry.",
-                            agent_execution_id,
-                            stage.stage_id
-                        );
+                        let valid_identifier_examples =
+                            agent_executions::find_by_stage(&self.pool, stage_execution_id)
+                                .await?
+                                .into_iter()
+                                .map(|execution| execution.id.to_string())
+                                .collect::<Vec<_>>();
+                        return Ok(Some(RetryIdentifierKindRejection {
+                            message: format!(
+                                "wrong_identifier_kind: stages.retry expected agent_execution_id but received stage_execution_uuid '{}'. next_action: retry with stage_id '{}' for a full-stage retry, or choose an agent_executions.id from that stage for targeted retry.",
+                                agent_execution_id, stage.stage_id
+                            ),
+                            provided_identifier: agent_execution_id.to_string(),
+                            provided_identifier_kind: "stage_execution_uuid",
+                            expected_identifier_kind: "agent_execution_id",
+                            valid_identifier_examples,
+                            operator_message:
+                                "Retry targeted agents with an agent_execution_id, not a stage execution UUID."
+                                    .to_string(),
+                        }));
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok(None)
+    }
+
+    async fn record_retry_stage_identifier_rejection(
+        &self,
+        journal: &CommandJournalEntry,
+        rejection: &RetryIdentifierKindRejection,
+    ) -> Result<()> {
+        let now_ts = Utc::now();
+        let example_refs = rejection
+            .valid_identifier_examples
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let guidance = domain::recovery_matrix::build_retry_identifier_guidance(
+            "RetryStage",
+            &rejection.provided_identifier,
+            rejection.provided_identifier_kind,
+            rejection.expected_identifier_kind,
+            &example_refs,
+        );
+        let p082_envelope = domain::recovery_matrix::build_rejected_command_error_envelope(
+            domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+            "RetryStage",
+            "Retry rejected: identifier kind does not match the command field. No mutation was performed.",
+            domain::recovery_matrix::set_readback_identifier_guidance(
+                domain::recovery_matrix::build_readback_v1(
+                    "P082-R08",
+                    "rejected",
+                    "no_mutation",
+                    domain::recovery_matrix::REASON_VALID_IDENTIFIER_GUIDANCE,
+                    &rejection.operator_message,
+                    "command_journal",
+                    "command_journal, agent_executions, stage_executions",
+                    &journal.id,
+                    Some("command_journal.error.p082_recovery_matrix_readback"),
+                    "valid",
+                    &now_ts.to_rfc3339(),
+                ),
+                guidance,
+            ),
+        );
+        self.record_failed_command_transaction(journal, "command.RetryStage", &p082_envelope)
+            .await
     }
 
     async fn record_completed_command_transaction(
@@ -7039,7 +7147,12 @@ mod tests {
             status: RunStatus::Running,
             workflow_id: "wf".into(),
             workflow_title: "Workflow".into(),
-            workspace_root: workspace.path().to_string_lossy().into_owned(),
+            workspace_root: workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .to_string_lossy()
+                .into_owned(),
             artifact_root: workspace
                 .path()
                 .join("artifacts")
@@ -7078,6 +7191,64 @@ mod tests {
         assert!(
             err.to_string().contains("symlink"),
             "P082: run meta-root creation must reject symlinked .chainworks components; got: {err}"
+        );
+    }
+
+    #[test]
+    fn p082_ensure_run_meta_root_rejects_parent_dir_escape() {
+        let workspace = tempfile::tempdir().expect("workspace root");
+
+        let run = Run {
+            id: RunId::new(),
+            idea_id: IdeaId::new(),
+            status: RunStatus::Running,
+            workflow_id: "wf".into(),
+            workflow_title: "Workflow".into(),
+            workspace_root: workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .to_string_lossy()
+                .into_owned(),
+            artifact_root: workspace
+                .path()
+                .join("artifacts")
+                .to_string_lossy()
+                .into_owned(),
+            started_at: Utc::now(),
+            completed_at: None,
+            cancellation_requested_at: None,
+            cancellation_settled_at: None,
+            cancellation_settlement_log: None,
+            current_state: Some("state_impl".into()),
+            workflow_yaml_path: None,
+            agent_catalog_yaml_path: None,
+            worktree_root: None,
+            base_branch: None,
+            base_revision: None,
+            target_branch: None,
+            delivery_configuration_json: None,
+            delivery_preflight_json: None,
+            workflow_family: None,
+            project_key: None,
+            risk_class: None,
+            stack: None,
+            workflow_snapshot_hash: None,
+            catalog_snapshot_hash: None,
+            workflow_snapshot_json: None,
+            catalog_snapshot_json: None,
+            drift_detected_at: None,
+            drift_details_json: None,
+            chainworks_meta_root: Some(".chainworks/../outside/run-meta".into()),
+            review_routing_json: None,
+            closeout_readiness_mode: None,
+        };
+
+        let err = ensure_run_meta_root_exists(&run).unwrap_err();
+        assert!(
+            err.to_string().contains("unsafe path component")
+                || err.to_string().contains("escapes canonical"),
+            "P082: run meta-root creation must reject parent-directory escapes; got: {err}"
         );
     }
 

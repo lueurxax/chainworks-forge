@@ -2424,6 +2424,8 @@ Available gates:
                   Proposal 054 release-cut check for zero active non-terminal v1-only runs
   proposal-084|p084  Proposal 084 executable rollout gates and observability contract gate
   proposal-081|p081  Proposal 081 Phase 1 boundary-first API and auth contract matrix gate
+  proposal-082|p082  Proposal 082 recovery and retry state-machine matrix proof gate
+  proposal-083|p083  Proposal 083 focused code-fix regression gate (main-sync request id)
   proposal-085|p085  Proposal 085 thin-client read-model parity and affordance contract gate
   proposal-086|p086|p086-continuation-preflight
                   Proposal 086 Phase 0 preflight: migration shape, MCP/artifact schemas, and Rust unit tests
@@ -2434,8 +2436,7 @@ Available gates:
   p086-continuation-operator-report
                   Proposal 086 Phase 1 operator-report gate: operator report field coverage
   proposal-087|p087  Proposal 087 read-path liveness and storage tiering gate
-  proposal-081|p081  Proposal 081 boundary policy enforcement and coverage gate
-  proposal-082|p082  Proposal 082 recovery and retry state-machine matrix proof gate
+  proposal-096|p096  Proposal 096 bounded tool output and safe-search guard retained alias gate
   proposal-089|p089  Proposal 089 Junie structured-output proof and ACP canary evidence gate
   proposal-090|p090  Proposal 090 Junie runtime-hardening evidence inventory gate
   proposal-091|p091  Retained P091 targeted retry authority runtime proof gate
@@ -9651,6 +9652,37 @@ print("p086-continuation-operator-report passed")
 PY
     log "Proposal 086 Phase 1 operator report gate passed"
     ;;
+  proposal-083|p083)
+    log "Proposal 083 focused code-fix regression gate"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+runs_rs = (root / "control-plane/crates/mcp-server/src/tools/runs.rs").read_text()
+for term in [
+    "mcp_caller_with_idempotency_request_id",
+    "p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id",
+    "runs.main_sync.request",
+    "runs.main_sync.retry",
+    ".with_request_id(idempotency_key)",
+]:
+    if term not in runs_rs:
+        raise SystemExit(f"proposal-083: runs.rs missing {term!r}")
+
+gate = (root / "scripts/test-gate.sh").read_text()
+for term in ["proposal-083|p083", "p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id"]:
+    if term not in gate:
+        raise SystemExit(f"proposal-083: test-gate.sh missing {term!r}")
+
+print("proposal-083 static regression checks passed")
+PY
+    (
+      cd "$ROOT_DIR/control-plane"
+      CARGO_TARGET_DIR=target/proposal-083-gate cargo test -p mcp-server p083_main_sync_mcp_callers_stamp_idempotency_key_as_request_id -- --nocapture
+    )
+    log "Proposal 083 focused code-fix regression gate passed"
+    ;;
   proposal-085|p085)
     log "Proposal 085 gate: thin-client read-model parity and affordance contract"
     python3 - <<'PY'
@@ -10476,6 +10508,21 @@ for term in required_lane_terms:
         print(f"FAILED: canonical matrix missing lane placement term: {term}")
         sys.exit(1)
 
+# 6b. Verify principal-class gating wording matches implemented behavior.
+principal_gating_required_terms = [
+    "reports.get`: non-operator principals are denied before report lanes are loaded",
+    "report://{run_id}`: non-operator principals are denied before the report resource payload is materialized",
+    "p082_recovery_matrix_readback: null",
+    "p082_recovery_matrix_readbacks: []",
+]
+for term in principal_gating_required_terms:
+    if term not in matrix_text:
+        print(f"FAILED: canonical matrix missing implemented principal gating term: {term}")
+        sys.exit(1)
+if "This applies to `runs.get`, `reports.get`, `report://{run_id}`" in matrix_text:
+    print("FAILED: canonical matrix still implies non-operator report surfaces return empty readback lanes instead of denying")
+    sys.exit(1)
+
 # 7. Verify startup_requeue_exhausted held state is documented
 if "startup_requeue_exhausted" not in matrix_text:
     print("FAILED: canonical matrix missing startup_requeue_exhausted held-state coverage")
@@ -10516,6 +10563,69 @@ for lane in ["runs_get", "reports_get", "report_resource", "run_report", "releas
     if lane not in positive_fixture.get("lanes", {}):
         print(f"FAILED: p082-full-surface.fixture.json missing lane: {lane}")
         sys.exit(1)
+
+lanes = positive_fixture.get("lanes", {})
+
+def require_lane_payload(lane):
+    payload = lanes.get(lane, {}).get("payload")
+    if not isinstance(payload, dict):
+        print(f"FAILED: p082-full-surface.fixture.json lane {lane} must contain a representative payload object, not metadata-only assertions")
+        sys.exit(1)
+    return payload
+
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+runs_get_payload = require_lane_payload("runs_get")
+reports_get_payload = require_lane_payload("reports_get")
+report_resource_payload = require_lane_payload("report_resource")
+run_report_payload = require_lane_payload("run_report")
+release_receipt_payload = require_lane_payload("release_receipt")
+
+if "p082_recovery_matrix_readback" not in runs_get_payload:
+    print("FAILED: runs_get lane payload missing singular p082_recovery_matrix_readback")
+    sys.exit(1)
+if not isinstance(runs_get_payload.get("p082_recovery_matrix_readbacks"), list):
+    print("FAILED: runs_get lane payload missing plural p082_recovery_matrix_readbacks array")
+    sys.exit(1)
+if "p082_recovery_matrix_readback" in reports_get_payload:
+    print("FAILED: reports_get lane payload must not expose singular p082_recovery_matrix_readback")
+    sys.exit(1)
+if not isinstance(reports_get_payload.get("p082_recovery_matrix_readbacks"), list):
+    print("FAILED: reports_get lane payload missing plural p082_recovery_matrix_readbacks array")
+    sys.exit(1)
+for report in reports_get_payload.get("reports", []):
+    if "p082_recovery_matrix_readback" in report:
+        print("FAILED: reports_get report entries must not expose singular p082_recovery_matrix_readback")
+        sys.exit(1)
+    if not isinstance(report.get("p082_recovery_matrix_readbacks"), list):
+        print("FAILED: reports_get report entries with P082 data must expose plural p082_recovery_matrix_readbacks")
+        sys.exit(1)
+for lane_name, payload in [
+    ("report_resource", report_resource_payload),
+    ("run_report", run_report_payload),
+    ("release_receipt", release_receipt_payload),
+]:
+    if "p082_recovery_matrix_readback" in payload:
+        print(f"FAILED: {lane_name} lane payload must not expose singular p082_recovery_matrix_readback")
+        sys.exit(1)
+    if not isinstance(payload.get("p082_recovery_matrix_readbacks"), list):
+        print(f"FAILED: {lane_name} lane payload missing plural p082_recovery_matrix_readbacks array")
+        sys.exit(1)
+reports_plural = reports_get_payload["p082_recovery_matrix_readbacks"]
+for lane_name, payload in [
+    ("report_resource", report_resource_payload),
+    ("run_report", run_report_payload),
+]:
+    if canonical_json(payload["p082_recovery_matrix_readbacks"]) != canonical_json(reports_plural):
+        print(f"FAILED: {lane_name} p082_recovery_matrix_readbacks must match reports_get payload")
+        sys.exit(1)
+if "rollout_contract_readback" not in release_receipt_payload:
+    print("FAILED: release_receipt lane payload missing rollout_contract_readback")
+    sys.exit(1)
+if any(key in release_receipt_payload for key in ["recovery_commands", "retry_stage", "cancel_stage"]):
+    print("FAILED: release_receipt lane payload must not expose recovery command affordances")
+    sys.exit(1)
 
 # Check fixture_assertions
 assertions = positive_fixture.get("fixture_assertions", {})
@@ -10653,6 +10763,8 @@ if db_test_file.exists():
         "p082_neg_non_canonical_scenario_id_in_envelope_is_rejected",
         "p082_sec_high1_nested_subcontract_injection_is_stripped",
         "p082_sec_medium1_tampered_startup_repair_readback_produces_tamper_detected_row",
+        "p082_omitted_optional_subcontract_keys_do_not_reach_readback_lanes",
+        "p082_r05_stale_xcode_startup_accessor_derives_operator_message",
     ]:
         if required_test not in db_test_content:
             print(f"FAILED: DB test file missing required behavioral rejection test: {required_test}")
@@ -10852,6 +10964,23 @@ if p082_rm_rs.exists():
         print("FAILED: p082_recovery_matrix.rs must not read R16 readback from work_items.payload_json.p082_r16_held (approved owner is startup_repairs.notes.p082_recovery_matrix_readback)")
         sys.exit(1)
 
+# 16b. Verify R05 approved storage owner: stale ACP startup and pre-session startup
+# readback must be sourced from work_items.payload_json.p061_startup_recovery.
+if p082_rm_rs.exists():
+    if "work_items.payload_json.p061_startup_recovery" not in p082_rm_content:
+        print("FAILED: p082_recovery_matrix.rs must read P082-R05 from work_items.payload_json.p061_startup_recovery")
+        sys.exit(1)
+if work_items_rs.exists():
+    if "work_items.payload_json.p061_startup_recovery" not in wi_content:
+        print("FAILED: work_items.rs must stamp P082-R05 source_json_key as work_items.payload_json.p061_startup_recovery")
+        sys.exit(1)
+if "p082_r05_pre_session_repair_uses_work_item_payload_owner" not in db_test_content:
+    print("FAILED: DB test file missing P082-R05 pre-session work item payload owner proof")
+    sys.exit(1)
+if '"P082-R05" => Some(&[SOURCE_KEY_WORK_ITEMS_STARTUP_RECOVERY])' not in rm_content:
+    print("FAILED: recovery_matrix.rs must require work_items.payload_json.p061_startup_recovery for P082-R05")
+    sys.exit(1)
+
 # 17. Verify all 17 P082 scenario IDs (P082-R01 through P082-R17) have named tests
 # in the engine test files (unit or integration). The approved gate contract requires
 # row-by-row proof for every scenario in the matrix.
@@ -10917,15 +11046,35 @@ PY
     )
     log "Proposal 082 gate passed"
     ;;
-  proposal-081|p081)
-    log "Proposal 081 gate: boundary policy enforcement and coverage"
-    "$ROOT_DIR/scripts/check-boundary-coverage.sh"
-    (
-      cd "$ROOT_DIR/control-plane"
-      CARGO_TARGET_DIR=target/proposal-081-gate cargo test -p auth boundary -- --nocapture
-      CARGO_TARGET_DIR=target/proposal-081-gate cargo test -p mcp-server proposal_081_ -- --nocapture 2>/dev/null || true
-    )
-    log "Proposal 081 gate passed"
+  proposal-096|p096)
+    log "Proposal 096 gate: bounded tool output and safe-search guard retained alias"
+    python3 - "$ROOT_DIR" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+gate = (root / "scripts/test-gate.sh").read_text()
+for term in [
+    "proposal-096|p096",
+    "bounded tool output",
+    "safe-search guard",
+    "Proposal 082",
+]:
+    if term not in gate:
+        raise SystemExit(f"proposal-096: test-gate.sh missing retained alias/guard term {term!r}")
+
+reference = (root / "docs/reference/test-gates.md").read_text()
+for term in [
+    "proposal-096|p096",
+    "bounded tool output",
+    "safe-search guard",
+]:
+    if term not in reference:
+        raise SystemExit(f"proposal-096: docs/reference/test-gates.md missing {term!r}")
+
+print("proposal-096 retained alias static checks passed")
+PY
+    log "Proposal 096 gate passed"
     ;;
   *)
     print_usage >&2

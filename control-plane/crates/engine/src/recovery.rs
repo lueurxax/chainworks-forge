@@ -2600,6 +2600,35 @@ impl RecoveryService {
                 continue;
             }
 
+            if executions
+                .iter()
+                .all(|execution| execution.status != AgentStatus::Running)
+            {
+                if !stage_has_pending_or_running_advance_work(&self.pool, run.id, stage.id).await? {
+                    info!(
+                        run_id = %run.id,
+                        stage_id = %stage.stage_id,
+                        stage_execution_id = %stage.id,
+                        "Startup repair kickstarting terminal running stage without blocking"
+                    );
+                    self.work_queue
+                        .enqueue(
+                            WorkItemKind::AdvanceRun,
+                            Some(run.id),
+                            None,
+                            serde_json::json!({
+                                "run_id": run.id.to_string(),
+                                "reason": "startup_terminal_running_stage_kickstart",
+                                "stage_execution_id": stage.id.to_string(),
+                                "stage_id": stage.stage_id,
+                            }),
+                        )
+                        .await?;
+                    requeued += 1;
+                }
+                continue;
+            }
+
             let provenance_suffix = self
                 .latest_execution_provenance_suffix(stage.id)
                 .await

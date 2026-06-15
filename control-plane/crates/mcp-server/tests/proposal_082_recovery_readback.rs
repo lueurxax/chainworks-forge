@@ -224,6 +224,83 @@ async fn p082_runs_get_includes_singular_and_plural_readback() {
 }
 
 #[tokio::test]
+async fn p082_runs_get_singular_matches_latest_plural_dynamic_readback() {
+    let pool = test_pool().await;
+    let run_id = seed_run(&pool).await;
+    let handler = command_handler(pool.clone());
+    let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+    let stale_at = Utc::now() - chrono::Duration::minutes(5);
+    let work_item_id = format!("wi-p082-dynamic-r06-{run_id}");
+    let side_effect_id = format!("se-p082-dynamic-r06-{run_id}");
+    let stage_execution_id = uuid::Uuid::new_v4().to_string();
+
+    sqlx::query(
+        r#"INSERT INTO work_items
+           (id, run_id, kind, payload_json, status, created_at, scheduled_at, started_at, attempt_count)
+           VALUES (?1, ?2, 'invoke_agent', ?3, 'running', ?4, ?4, ?4, 1)"#,
+    )
+    .bind(&work_item_id)
+    .bind(run_id.to_string())
+    .bind(serde_json::json!({"run_id": run_id.to_string()}).to_string())
+    .bind(stale_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert stale running InvokeAgent work item");
+    sqlx::query(
+        r#"INSERT INTO side_effects
+           (id, run_id, stage_execution_id, effect_kind, target_key,
+            idempotency_key, idempotency_key_version, request_fingerprint,
+            request_fingerprint_version, status, external_write_attempted,
+            attempt_budget_remaining, created_at, updated_at)
+           VALUES (?1, ?2, ?3, 'git_commit', 'p082-dynamic-r06',
+                   ?4, 1, 'fp-p082-dynamic-r06', 1, 'prepared', 0, 3, ?5, ?5)"#,
+    )
+    .bind(&side_effect_id)
+    .bind(run_id.to_string())
+    .bind(stage_execution_id)
+    .bind(format!("idem-p082-dynamic-r06-{run_id}"))
+    .bind(Utc::now().to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert unresolved side-effect evidence for held R06");
+
+    let result = mcp_runs::execute(
+        "runs.get",
+        serde_json::json!({ "run_id": run_id.to_string() }),
+        &pool,
+        &handler,
+        &principal,
+    )
+    .await
+    .expect("runs.get must succeed");
+
+    let singular = result
+        .get("p082_recovery_matrix_readback")
+        .expect("runs.get must include singular p082 readback");
+    let plural = result
+        .get("p082_recovery_matrix_readbacks")
+        .and_then(|value| value.as_array())
+        .expect("runs.get must include plural p082 readbacks");
+    let latest = plural
+        .iter()
+        .filter(|row| {
+            row.get("scenario_status").and_then(|value| value.as_str()) != Some("not_applicable")
+        })
+        .last()
+        .expect("dynamic stale work item must produce a latest P082 row");
+
+    assert_eq!(
+        latest.get("scenario_id").and_then(|value| value.as_str()),
+        Some("P082-R06"),
+        "P082 dynamic setup must produce the stale-work R06 readback"
+    );
+    assert_eq!(
+        singular, latest,
+        "P082 runs.get singular readback must be selected from the same plural readback snapshot"
+    );
+}
+
+#[tokio::test]
 async fn p082_runs_cancel_rejects_missing_idempotency_key_before_mutation() {
     let pool = test_pool().await;
     let run_id = seed_run(&pool).await;
@@ -499,6 +576,119 @@ async fn p082_runs_get_returns_non_empty_readback_when_startup_repair_row_exists
         report_readbacks.len(),
         1,
         "P082: reports.get mcp_execution_truth p082_recovery_matrix_readbacks must be non-empty"
+    );
+}
+
+#[tokio::test]
+async fn p082_runs_get_singular_is_latest_row_from_same_plural_snapshot() {
+    let pool = test_pool().await;
+    let run_id = seed_run(&pool).await;
+    let handler = command_handler(pool.clone());
+    let principal = auth::Principal::new("test-operator", auth::PrincipalClass::Operator);
+    let now = Utc::now();
+    let stale_started_at = now - chrono::Duration::minutes(4);
+    let lineage_id = format!("p082-mcp-r05-lineage-{run_id}");
+    let generation_id = format!("p082-mcp-r05-generation-{run_id}");
+    let owner_key = format!("p082-mcp-r05-owner-{run_id}");
+
+    sqlx::query(
+        r#"INSERT INTO session_lineages
+           (id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
+            active_generation_id, created_at, closed_at)
+           VALUES (?1, ?2, 'agent-r05-mcp', ?1, 'run', NULL, ?3, ?4, NULL)"#,
+    )
+    .bind(&lineage_id)
+    .bind(run_id.to_string())
+    .bind(&generation_id)
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert session lineage");
+
+    sqlx::query(
+        r#"INSERT INTO session_generations
+           (id, lineage_id, generation, invocation_owner_key, provider_session_id,
+            binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
+            workspace_mode, runtime_provider, runtime_model, status, created_at, last_activity_at)
+           VALUES (?1, ?2, 1, ?3, NULL, 'binding-r05-mcp', NULL, '/', 'read_write',
+                   'codex', 'gpt-5.5', 'active', ?4, NULL)"#,
+    )
+    .bind(&generation_id)
+    .bind(&lineage_id)
+    .bind(&owner_key)
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert stale session generation");
+
+    sqlx::query(
+        r#"INSERT INTO agent_executions
+           (id, agent_id, provider, status, started_at,
+            session_generation_id, session_lineage_id,
+            owner_kind, owner_id)
+           VALUES ('p082-mcp-r05-ae', 'agent-r05-mcp', 'codex', 'running', ?1,
+                   ?2, ?3, 'lead_conflict_mediation', 'p082-mcp-r05-ae')"#,
+    )
+    .bind(stale_started_at.to_rfc3339())
+    .bind(&generation_id)
+    .bind(&lineage_id)
+    .execute(&pool)
+    .await
+    .expect("insert stale startup agent execution");
+
+    sqlx::query(
+        r#"INSERT INTO work_items
+           (id, run_id, kind, payload_json, status, created_at, scheduled_at, started_at, attempt_count)
+           VALUES (?1, ?2, 'invoke_agent', ?3, 'running', ?4, ?4, ?4, 1)"#,
+    )
+    .bind(&owner_key)
+    .bind(run_id.to_string())
+    .bind(
+        serde_json::json!({
+            "run_id": run_id.to_string(),
+            "p061_startup_recovery": { "reason": "startup_stalled" },
+            "p058_claimed": { "agent_execution_id": "p082-mcp-r05-ae" }
+        })
+        .to_string(),
+    )
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert stale startup work item owner");
+
+    let result = mcp_runs::execute(
+        "runs.get",
+        serde_json::json!({ "run_id": run_id.to_string() }),
+        &pool,
+        &handler,
+        &principal,
+    )
+    .await
+    .expect("runs.get must succeed");
+
+    let singular = result
+        .get("p082_recovery_matrix_readback")
+        .expect("runs.get must include singular p082 readback");
+    let plural = result
+        .get("p082_recovery_matrix_readbacks")
+        .and_then(|value| value.as_array())
+        .expect("runs.get must include plural p082 readbacks");
+    let latest = plural
+        .iter()
+        .filter(|row| {
+            row.get("scenario_status").and_then(|value| value.as_str()) != Some("not_applicable")
+        })
+        .last()
+        .expect("dynamic stale startup row must be present");
+
+    assert_eq!(
+        singular, latest,
+        "P082: runs.get singular readback must be selected from the same plural snapshot"
+    );
+    assert_eq!(
+        singular.get("scenario_id").and_then(|value| value.as_str()),
+        Some("P082-R05"),
+        "P082: dynamic stale startup fixture must exercise R05"
     );
 }
 

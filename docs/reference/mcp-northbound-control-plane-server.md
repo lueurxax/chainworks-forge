@@ -56,7 +56,7 @@ This reference covers:
 It does not cover:
 
 - southbound per-agent MCP policy (covered by [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md))
-- token rotation, revocation, or delegation (daemon reads the principal table at startup for MCP transports; changes require a restart)
+- token delegation or external lifecycle management beyond the daemon's live principal-table reload path
 - YAML-driven or per-subscription capability policy (first-wave uses static class tables)
 
 ## Crate graph
@@ -216,6 +216,18 @@ Readback rules:
 
 Implementation: `control-plane/crates/domain/src/capabilities.rs`, `control-plane/crates/mcp-server/src/tools/mod.rs` (`capability_id_for`, `mcp_tool_for`, `all_capability_tool_ids`), `control-plane/crates/mcp-server/src/server.rs` (`resource_template_id_for_uri`).
 
+### P082 recovery-matrix readback lanes
+
+`p082_recovery_matrix_readback_v1` rows are exposed with strict singular/plural placement per the [recovery/retry state-machine matrix](recovery-retry-state-machine-test-matrix.md):
+
+- `runs.get` result exposes **both** `p082_recovery_matrix_readback` (singular: latest non-`not_applicable` row by `updated_at`, ties broken by `scenario_id` ascending) and `p082_recovery_matrix_readbacks` (plural array).
+- `reports.get` result exposes `p082_recovery_matrix_readbacks` only; the singular field is absent. Per-report entries may carry their own `p082_recovery_matrix_readbacks` array.
+- `report://{run_id}` and generated run-report JSON expose `p082_recovery_matrix_readbacks` only and must remain byte-equivalent to `reports.get` snake_case payloads.
+- Release receipts include `rollout_contract_readback` plus an optional additive `p082_recovery_matrix_readbacks` diagnostic; release receipts are not a recovery-command lane.
+- Advisory GraphQL fields (`p082RecoveryMatrixReadbackJson`, `p082RecoveryMatrixReadbacksJson`) remain diagnostic-only camelCase projections and are not a required readback lane.
+
+Operator displays render sanitized summaries only; raw `command_journal.error` envelope JSON (`p082_rejected_command_error_v1`) must never reach operator surfaces unredacted. The shared accessor and full-surface fixture live at `control-plane/crates/db/src/repos/p082_recovery_matrix.rs` and `docs/evidence/rollout-contract/operator-readback/p082-full-surface.fixture.json`.
+
 ## Principal table
 
 ### File shape
@@ -257,6 +269,7 @@ stays in-process and is never logged or emitted on the wire.
 - **Missing file:** on first start the daemon generates a random 256-bit base64url bearer token, writes a single-entry table with `class = operator` and `id = default-operator` to the discovered path, and logs the path with a redacted note. The raw token is never logged.
 - **File mode:** on Unix, bootstrap opens the file with `OpenOptions::mode(0o600)` before writing, so only the owning user can read it. On non-Unix platforms the mode is not enforced and the corresponding test is `cfg(unix)`-gated.
 - **TOCTOU-safe read:** on Unix, `load_or_bootstrap` runs `symlink_metadata` first (rejecting symlinks), then opens the file once and verifies mode against the opened descriptor's `fstat`, closing the window between the symlink check and the read. Any mode other than `0o600` aborts startup.
+- **Size cap:** principal-table reads fail closed before JSON parsing when `principals.json` exceeds 1 MiB.
 - **Strict surface policies in `schema_version: 2`:** every entry — not only the default operator — must declare `surface_policies` explicitly. An entry that omits `surface_policies` is rejected at load time, so a misconfigured custom principal cannot silently inherit class-default MCP/resource access. When `surface_policies` is present, `Principal::from_entry` overrides both capability sets: an absent or empty `mcp.allowed_tools` stanza maps to an empty `tool_capabilities` set, and `resource_capabilities` is always zeroed (no v2 field yet allowlists MCP resources, so the v2 default is deny-all resources). The GraphQL surface follows the same fail-closed rule: when an entry carries `surface_policies` but omits the `graphql` stanza, `is_query_allowed_by_surface_policy` and `is_subscription_allowed_by_surface_policy` return `Some(false)` so queries and subscriptions are denied rather than falling through to class defaults.
 - **Empty table:** if the file parses successfully but contains zero principals, the daemon refuses to start with `AuthError::TableLoadFailed("principal table contains zero entries")`. There is no silent auth-disabled mode.
 
@@ -266,21 +279,23 @@ stays in-process and is never logged or emitted on the wire.
 
 Token comparison is constant-time: `resolve_bearer` scans every entry without early exit and folds bytes with a non-short-circuiting XOR, so neither match position nor entry count leaks through timing.
 
-### Rotation
+### Rotation And Revocation
 
-Token rotation, revocation, and delegation are out of scope for the current implementation on MCP transports. The principal table consumed by MCP HTTP and stdio is loaded at daemon startup; to rotate or revoke an MCP token, edit `principals.json` and restart the daemon.
+The daemon starts from the principal table loaded at bootstrap, then shares a `LivePrincipalSource` across MCP HTTP, MCP stdio, GraphQL HTTP, and GraphQL WebSocket authentication. A background reload task rereads `principals.json` every 2 seconds by default, overrideable with `CHAINWORKS_PRINCIPALS_RELOAD_SECS`; values below 1 second are clamped to 1 second.
 
-P046 GraphQL session observability subscriptions are the exception: the daemon spawns a periodic `principals.json` reloader (default interval 2 s, override with `CHAINWORKS_PRINCIPALS_RELOAD_SECS`) that updates the dedicated P046 live auth source used by per-emission authorization recheck. A revocation written to the file is observed by `sessionStatusChanged` within roughly one reload interval and the affected stream terminates fail-closed; reload failures mark the source unavailable so subscriptions terminate with `authorization_recheck_failed` rather than continuing under stale grants. MCP token resolution is not affected by this reloader.
+A revocation written to the file is observed by new MCP HTTP requests, GraphQL HTTP requests, and GraphQL WebSocket `connection_init` handshakes within roughly one reload interval. MCP stdio sessions bind a live credential at `initialize` and recheck that credential before later requests, so rescoped or revoked capabilities are observed without restarting the session. P046 GraphQL session observability subscriptions also use their dedicated live auth handle for per-emission authorization recheck; affected streams terminate fail-closed with `authorization_recheck_failed` rather than continuing under stale grants.
+
+If the reload fails, the live auth source is marked unavailable. The reload path does not bootstrap a replacement table when `principals.json` is missing; new bearer resolutions fail closed, and running subscription rechecks terminate fail-closed until a later reload succeeds.
 
 Bearer-token equality on every lookup uses a constant-time byte comparison so timing side channels cannot probe the principal table.
 
-Implementation: `control-plane/crates/auth/src/lib.rs` (`PrincipalTable::load_or_bootstrap`, `resolve_bearer`, `extract_bearer_token`, `validate_raw_token`, `token_fingerprint`), `control-plane/crates/daemon/src/main.rs` (`principals_path_from_env`, P046 principals reload loop).
+Implementation: `control-plane/crates/auth/src/lib.rs` (`PrincipalTable::load_or_bootstrap`, `LivePrincipalSource`, `resolve_bearer`, `extract_bearer_token`, `validate_raw_token`, `token_fingerprint`), `control-plane/crates/daemon/src/main.rs` (`principals_path_from_env`, principal reload loop).
 
 ## Bearer auth on transports
 
 ### MCP HTTP (`POST /mcp`)
 
-`handle_mcp_post` parses `Authorization: Bearer <token>` on every request, resolves it through `auth::resolve_bearer`, and returns a JSON-RPC error with `code = -32000` and `message = "unauthorized"` (HTTP 200 body) on any of: missing header, malformed header, unknown token. Valid requests carry the resolved `Principal` into `McpServer::handle_request`. `Mcp-Session-Id` correlation is preserved; the principal is re-resolved per request rather than cached by session.
+`handle_mcp_post` parses `Authorization: Bearer <token>` on every request, resolves it through the daemon's live principal source, and returns a JSON-RPC error with `code = -32000` and `message = "unauthorized"` (HTTP 200 body) on any of: missing header, malformed header, unknown token, or unavailable live auth source. Valid requests carry the resolved `Principal` into `McpServer::handle_request`. `Mcp-Session-Id` correlation is preserved; the principal is re-resolved per request rather than cached by session.
 
 Implementation: `control-plane/crates/mcp-server/src/http.rs`.
 
@@ -296,10 +311,11 @@ Authentication piggybacks on the MCP `initialize` method:
 Contract (see `McpServer::run_stdio`):
 
 1. Any first frame whose method is not `initialize` receives `-32002 "server not initialized"` and closes the session.
-2. `initialize` without `params.clientInfo.principal_token` receives `-32000 "unauthorized: principal_token required on initialize"` and closes.
-3. `initialize` with an unresolvable token receives `-32000 "unauthorized: unknown token"` and closes.
-4. On success the `Principal` is bound to the stdio session for its lifetime.
-5. A mid-session second `initialize` is rejected with `-32600 "Session already initialized"`; the bound principal is not replaced (session-lifetime immutability).
+2. `initialize` without `params.clientInfo.principal_token`, with a malformed token, or with an unresolvable token receives opaque `-32000 "unauthorized"` and closes.
+3. Token validation uses the same visible-ASCII length bounds as HTTP bearer parsing before resolution.
+4. On success a live principal credential is bound to the stdio session.
+5. Later requests recheck that credential against the live principal source before dispatch, so revocation or capability rescope is observed without restarting the session.
+6. A mid-session second `initialize` is rejected with `-32600 "Session already initialized"`; the bound credential is not replaced.
 
 Implementation: `control-plane/crates/mcp-server/src/server.rs` (`run_stdio`), `control-plane/crates/mcp-server/src/protocol.rs`.
 
@@ -308,24 +324,24 @@ Implementation: `control-plane/crates/mcp-server/src/server.rs` (`run_stdio`), `
 The `/graphql` HTTP route is wrapped in an axum middleware (`auth_layer::require_auth`) that:
 
 - parses `Authorization: Bearer <token>`,
-- resolves through `auth::resolve_bearer`,
+- resolves through the daemon's live principal source,
 - on success inserts the `Principal` into the request's `http::Extensions` so `async_graphql::Context::data::<auth::Principal>()` can retrieve it in resolvers,
 - on failure responds with HTTP 401 and a GraphQL-shaped error body: `{ "errors": [{ "message": "unauthorized", "extensions": { "code": "UNAUTHORIZED" } }] }`.
 
 The GET playground is exempt from auth only when `CHAINWORKS_PLAYGROUND_AUTH=skip` is set at daemon startup.
 
-Implementation: `control-plane/crates/graphql-server/src/auth_layer.rs`, `control-plane/crates/graphql-server/src/server.rs` (`build_router`).
+Implementation: `control-plane/crates/graphql-server/src/auth_layer.rs`, `control-plane/crates/graphql-server/src/server.rs` (`build_router_with_live_principal_source`).
 
 ### GraphQL WebSocket (`/graphql/ws`)
 
 WebSocket subscriptions are mounted outside the HTTP auth middleware because the middleware cannot reject a WebSocket upgrade while still allowing a `connection_init` handshake to fire. P081 therefore pre-validates the first WebSocket frame before handing the socket to async-graphql:
 
 - the `connection_init` payload must include `{ "Authorization": "Bearer <token>" }`,
-- `connection_init_data` extracts the bearer token with the same strict `auth::extract_bearer_token` grammar used by HTTP GraphQL and then calls `auth::resolve_bearer`,
+- `connection_init_data` extracts the bearer token with the same strict `auth::extract_bearer_token` grammar used by HTTP GraphQL and resolves it through the daemon's live principal source,
 - on success the resolved `Principal` is injected into the subscription's `async_graphql::Data` and subscription resolvers can read it,
 - missing or malformed `Authorization`, or an unresolvable token, closes the socket with `4401`,
 - authenticated callers that are not allowed to use the UI GraphQL subscription surface close with `4403`,
-- missing, malformed, delayed, or non-`connection_init` first frames close with `4408`,
+- missing, malformed, oversized, delayed, or non-`connection_init` first frames close with `4408`; oversized frames are rejected before JSON parsing,
 - policy reload remains `4408` with reason `POLICY_RELOAD`; the Swift shell reconnects and restores operator window state.
 
 Implementation: `control-plane/crates/graphql-server/src/server.rs` (`graphql_ws_handler`, `connection_init_data`).
@@ -394,7 +410,7 @@ Rationale for the Steward trio: `run_analysis` queues compute work and drives th
 | `run://{run_id}` | yes | yes | yes |
 | `idea://{idea_id}` | yes | yes | yes |
 | `artifact://{artifact_id}` | yes | yes | yes | (Returns artifact metadata plus an `artifact_metadata_pointer`; payload path and raw filesystem fields are redacted.) |
-| `report://{run_id}` | yes | yes | yes | (Broad read resource; non-Operator callers receive the same redacted report payload boundary as `reports.get`, including empty P082 readback arrays.) |
+| `report://{run_id}` | yes | no | no | (Operator-only report resource; non-Operator callers are denied before report payload lanes are materialized.) |
 | `steward-analysis://{analysis_id}` | yes | no | yes |
 | `chainworks://runs` | yes | yes | yes | (Operator sees the full active-run projection; non-Operator callers receive rows with local filesystem paths, implementation-completion details, and closeout readiness summaries redacted.) |
 | `chainworks://ideas` | yes | yes | yes |
@@ -433,7 +449,7 @@ Current Rust schema compatibility note: older non-approval GraphQL mutation reso
 - `McpServer::handle_request` filters `tools/list` through `visible_tool_specs` (which calls `auth::filter_tools`), evaluates the injected P081 `BoundaryPolicy` for known `tools/call` requests, and then applies the caller token capability set. Unknown tools and feature-gated tools return `-32601 "Method not found: <name>"`; known-but-denied tools return `-32004 "tool denied"` with `error.data.reason_code`, `caller_class`, `row_id`, and `boundary_policy_version`. Storage diagnostics tools keep their typed success-envelope error protocol after the required deny audit row commits.
 - `resources/list` is filtered by `auth::filter_resources` over `auth::all_resource_templates()`.
 - `resources/read` parses the concrete URI into a `ResourceTemplateId` via `resource_template_id_for_uri`, then calls `auth::match_resource_uri`. A denied read returns `-32002 "Resource not found"`.
-- GraphQL approval mutation resolvers read `Principal` from `async_graphql::Context`, evaluate the same injected `BoundaryPolicy`, and return the P081 denial envelope before command side effects on denial.
+- GraphQL query, subscription, and approval mutation paths read `Principal` from `async_graphql::Context`, evaluate the same injected `BoundaryPolicy`, then recheck the live principal source for surface-policy revocation or rescope. Approval mutation denials occur before command side effects.
 
 Implementation: `control-plane/crates/auth/src/lib.rs` (`filter_tools`, `filter_resources`, `match_resource_uri`, `tool_allowed_for_class`, `resource_allowed_for_class`), `control-plane/crates/mcp-server/src/server.rs` (`handle_request`, `visible_tool_specs`), `control-plane/crates/graphql-server/src/schema.rs` (approval mutation resolvers and explicitly quarantined legacy compatibility resolvers).
 
@@ -606,9 +622,9 @@ operator home directory. The submitted `workspace_root` must canonicalize to the
 same path. `artifact_root`, `workflow_yaml_path`, and `agent_catalog_yaml_path`
 must remain under that root. A missing `artifact_root` is created and
 canonicalized before `StartRun` persistence, using a component-by-component
-walk that rejects symlink replacements. Per-run meta-root directories are
-created under the canonical workspace root with the same no-symlink component
-checks.
+walk that rejects parent-directory, root, prefix, and symlink-replacement
+components. Per-run meta-root directories are created under the canonical
+workspace root with the same component checks.
 Failures at this argument-validation layer return an MCP error without
 `journal_id`, because no `CommandHandler` command has been recorded.
 
@@ -673,9 +689,9 @@ Gate ownership and the inventory source of truth are documented in [test-gates.m
 The following items are explicitly out of scope for this reference:
 
 - **Southbound per-agent MCP policy.** Covered by [per-agent-mcp-policy-and-runtime-validation.md](per-agent-mcp-policy-and-runtime-validation.md). Northbound and southbound are different layers and do not share code.
-- **Token rotation, revocation, delegation.** The table is read at startup for MCP transports; editing requires a restart. A future auth-lifecycle slice owns rotation.
+- **Token delegation and external lifecycle management.** The daemon observes principal-table revocation and capability rescope through live reload; delegated token issuance, operator-facing rotation workflows, and external auth lifecycle integrations remain future scope.
 - **YAML-driven capability policy.** First-wave uses static class tables in `auth::tool_allowed_for_class` and `auth::resource_allowed_for_class`.
-- **Per-subscription capability filtering.** All authenticated principals can subscribe to all subscriptions; narrowing is a future slice.
+- **Per-subscription capability filtering.** Subscription access is enforced at the GraphQL surface-policy boundary; narrowing individual subscription fields beyond that surface policy remains a future slice.
 - **Internal `CallerSurface` variant.** Executor and recovery do not route through `CommandHandler` today. The internal-caller audit lane is reserved for a future command-path consolidation slice.
 - **MCP `structuredContent` typed-output channel.** The server advertises `protocolVersion: "2024-11-05"`; a future protocol-uplift slice adds the typed `structuredContent.journal_id` mirror.
 - **Immediate physical deletion of legacy non-approval GraphQL mutation resolvers.** The resolvers remain compatibility surface only, not a product or SwiftUI action-routing contract. Production-style principals fail closed unless they carry explicit approval-only GraphQL surface policy.

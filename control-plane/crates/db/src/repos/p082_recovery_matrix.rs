@@ -185,19 +185,24 @@ fn sanitize_value(value: serde_json::Value) -> serde_json::Value {
 /// Non-object, non-null values are replaced with null (tamper fallback).
 /// This is the fix for SEC-P082-001: nested subcontracts must be recursively
 /// sanitized, not passed through unchanged.
-fn sanitize_nested_subcontract(val: serde_json::Value, allowlist: &[&str]) -> serde_json::Value {
+fn sanitize_nested_subcontract(
+    val: serde_json::Value,
+    allowlist: &[&str],
+) -> (serde_json::Value, bool) {
     match val {
-        serde_json::Value::Null => serde_json::Value::Null,
+        serde_json::Value::Null => (serde_json::Value::Null, false),
         serde_json::Value::Object(map) => {
-            let projected = map
+            let original_key_count = map.len();
+            let projected: serde_json::Map<String, serde_json::Value> = map
                 .into_iter()
                 .filter(|(k, _)| allowlist.contains(&k.as_str()))
                 .map(|(k, v)| (k, sanitize_value(v)))
                 .collect();
-            serde_json::Value::Object(projected)
+            let stripped = projected.len() < original_key_count;
+            (serde_json::Value::Object(projected), stripped)
         }
         // Non-object, non-null value for a subcontract field: tamper fallback — replace with null.
-        _ => serde_json::Value::Null,
+        _ => (serde_json::Value::Null, true),
     }
 }
 
@@ -214,32 +219,49 @@ fn sanitize_nested_subcontract(val: serde_json::Value, allowlist: &[&str]) -> se
 /// redaction marker or when injected unknown keys were stripped from the top-level object.
 fn allowlist_project(obj: serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
     let original_key_count = obj.len();
-    let mut projected: serde_json::Map<String, serde_json::Value> = obj
+    let mut nested_keys_stripped = false;
+    let mut projected: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for (k, v) in obj
         .into_iter()
         .filter(|(k, _)| READBACK_ALLOWLIST.contains(&k.as_str()))
-        .map(|(k, v)| {
-            let v = match k.as_str() {
-                "recovery_retry_identifier_guidance" => {
-                    sanitize_nested_subcontract(v, RETRY_IDENTIFIER_GUIDANCE_ALLOWLIST)
-                }
-                "recovery_late_output_settlement" => {
-                    sanitize_nested_subcontract(v, LATE_OUTPUT_SETTLEMENT_ALLOWLIST)
-                }
-                "recovery_startup_repair_summary" => {
-                    sanitize_nested_subcontract(v, STARTUP_REPAIR_SUMMARY_ALLOWLIST)
-                }
-                _ => sanitize_value(v),
-            };
-            (k, v)
-        })
-        .collect();
+    {
+        let v = match k.as_str() {
+            "recovery_retry_identifier_guidance" => {
+                let (sanitized, stripped) =
+                    sanitize_nested_subcontract(v, RETRY_IDENTIFIER_GUIDANCE_ALLOWLIST);
+                nested_keys_stripped |= stripped;
+                sanitized
+            }
+            "recovery_late_output_settlement" => {
+                let (sanitized, stripped) =
+                    sanitize_nested_subcontract(v, LATE_OUTPUT_SETTLEMENT_ALLOWLIST);
+                nested_keys_stripped |= stripped;
+                sanitized
+            }
+            "recovery_startup_repair_summary" => {
+                let (sanitized, stripped) =
+                    sanitize_nested_subcontract(v, STARTUP_REPAIR_SUMMARY_ALLOWLIST);
+                nested_keys_stripped |= stripped;
+                sanitized
+            }
+            _ => sanitize_value(v),
+        };
+        projected.insert(k, v);
+    }
+
+    let top_level_keys_stripped = projected.len() < original_key_count;
+
+    for key in READBACK_ALLOWLIST {
+        projected
+            .entry((*key).to_string())
+            .or_insert(serde_json::Value::Null);
+    }
 
     // Upgrade diagnostic_redaction to "partial" when:
     // - Unknown keys were stripped from the top-level object (injected fields), or
     // - Any string value was replaced with a [redacted...] marker.
-    let keys_stripped = projected.len() < original_key_count;
     let string_redacted = projected.values().any(value_contains_redaction_marker);
-    if (keys_stripped || string_redacted)
+    if (top_level_keys_stripped || nested_keys_stripped || string_redacted)
         && projected
             .get("diagnostic_redaction")
             .and_then(|v| v.as_str())
@@ -263,6 +285,124 @@ fn push_valid_projected_readback(
             readbacks.push(allowlist_project(obj));
         }
     }
+}
+
+fn push_tamper_startup_repair_fallback(
+    readbacks: &mut Vec<serde_json::Value>,
+    run_id: domain::ids::RunId,
+    repaired_at: &str,
+) {
+    use domain::recovery_matrix;
+
+    let repair_id = format!("startup-repair-tampered-shape:{run_id}");
+    let summary = recovery_matrix::build_startup_repair_summary(
+        &repair_id,
+        "unavailable",
+        "unavailable",
+        0,
+        1,
+        false,
+        0,
+        repaired_at,
+        false,
+        None,
+        "startup_repairs",
+    );
+    let fallback = recovery_matrix::set_readback_startup_repair(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "held",
+            "wait",
+            recovery_matrix::REASON_RESUME_CLAIM_STATUS,
+            "Startup repair readback shape validation failed; tamper or schema drift detected.",
+            "startup_repairs",
+            "startup_repairs",
+            &repair_id,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "tamper_detected",
+            repaired_at,
+        ),
+        summary,
+        None,
+    );
+    push_valid_projected_readback(readbacks, fallback);
+}
+
+fn push_command_error_fallback(
+    readbacks: &mut Vec<serde_json::Value>,
+    journal_id: &str,
+    created_at: &str,
+    projection_integrity: &str,
+) {
+    use domain::recovery_matrix;
+
+    let source_json_key = if projection_integrity == "tamper_detected" {
+        Some("command_journal.error.p082_recovery_matrix_readback")
+    } else {
+        None
+    };
+    let fallback = recovery_matrix::build_readback_v1(
+        "P082-R02",
+        "held",
+        "wait",
+        recovery_matrix::REASON_RESUME_CLAIM_STATUS,
+        "Legacy rejection record exists. Inspect command journal for recovery details; no P082 typed readback is available.",
+        "command_journal",
+        "command_journal",
+        journal_id,
+        source_json_key,
+        projection_integrity,
+        created_at,
+    );
+    push_valid_projected_readback(readbacks, fallback);
+}
+
+fn push_stage_snapshot_tamper_fallback(
+    readbacks: &mut Vec<serde_json::Value>,
+    stage_id: &str,
+    started_at: &str,
+) {
+    use domain::recovery_matrix;
+
+    let settlement = recovery_matrix::build_late_output_settlement(
+        "unavailable",
+        "unavailable",
+        "unavailable",
+        "unavailable",
+        "ignored",
+        "ignored",
+        0,
+        "failed",
+        false,
+    );
+    let fallback = recovery_matrix::set_readback_late_output_settlement(
+        recovery_matrix::build_readback_v1(
+            "P082-R03",
+            "held",
+            "wait",
+            recovery_matrix::REASON_IGNORED_LATE_OUTPUTS,
+            "Stage recovery snapshot readback shape validation failed; tamper or schema drift detected.",
+            "stage_executions",
+            "stage_executions",
+            stage_id,
+            Some("stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback"),
+            "tamper_detected",
+            started_at,
+        ),
+        settlement,
+    );
+    push_valid_projected_readback(readbacks, fallback);
+}
+
+/// Select the singular `runs.get` P082 readback from an already-materialized
+/// plural readback snapshot so dynamic rows cannot drift within one response.
+pub fn latest_readback_from_readbacks(readbacks: &[serde_json::Value]) -> serde_json::Value {
+    readbacks
+        .iter()
+        .filter(|rb| rb.get("scenario_status").and_then(|v| v.as_str()) != Some("not_applicable"))
+        .last()
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn remaining_readback_limit(readbacks: &[serde_json::Value]) -> i64 {
@@ -334,26 +474,43 @@ pub async fn readbacks_for_run(
                             readbacks.push(allowlist_project(obj));
                         }
                     } else {
-                        // Shape validation failed — emit a sanitized tamper_detected row.
-                        let fallback = recovery_matrix::build_readback_v1(
-                            "P082-R01",
-                            "held",
-                            "wait",
-                            recovery_matrix::REASON_RESUME_CLAIM_STATUS,
-                            "Startup repair readback shape validation failed; tamper or schema drift detected.",
-                            "startup_repairs",
-                            "startup_repairs",
-                            &format!("startup-repair-tampered-shape:{run_id}"),
-                            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-                            "tamper_detected",
-                            &repaired_at,
-                        );
-                        if let Some(obj) = fallback.as_object().cloned() {
-                            readbacks.push(allowlist_project(obj));
-                        }
+                        push_tamper_startup_repair_fallback(&mut readbacks, run_id, &repaired_at);
                     }
                 }
             }
+        }
+    }
+
+    // Source 1b: work_items.payload_json.p061_startup_recovery carries the
+    // approved P082-R05/R06 owner for explicit startup/stale scheduler repair.
+    let startup_recovery_items = sqlx::query(
+        r#"SELECT id, payload_json, COALESCE(started_at, scheduled_at, created_at) AS updated_at
+		           FROM work_items
+		           WHERE run_id = ?1
+		             AND json_valid(payload_json)
+		             AND json_extract(payload_json, '$.p061_startup_recovery.p082_recovery_matrix_readback.scenario_id') IN ('P082-R05', 'P082-R06')
+		             AND LENGTH(payload_json) <= ?2
+	           ORDER BY updated_at ASC, id ASC
+	           LIMIT ?3"#,
+    )
+    .bind(run_id.to_string())
+    .bind(MAX_READBACK_ROW_BYTES as i64)
+    .bind(remaining_readback_limit(&readbacks))
+    .fetch_all(pool)
+    .await?;
+
+    for row in startup_recovery_items {
+        if readbacks.len() >= MAX_READBACK_ROWS {
+            break;
+        }
+        let payload_raw: String = row.try_get("payload_json").unwrap_or_default();
+        let Ok(payload_json) = serde_json::from_str::<serde_json::Value>(&payload_raw) else {
+            continue;
+        };
+        if let Some(readback) =
+            payload_json.pointer("/p061_startup_recovery/p082_recovery_matrix_readback")
+        {
+            push_valid_projected_readback(&mut readbacks, readback.clone());
         }
     }
 
@@ -407,22 +564,13 @@ pub async fn readbacks_for_run(
                 // scenario_id uses P082-R02 (rejected command context) as the closest
                 // canonical fit; recovery_projection_integrity=unavailable signals that the
                 // typed readback envelope is absent. This preserves the canonical vocabulary.
-                let fallback = recovery_matrix::build_readback_v1(
-                    "P082-R02",
-                    "held",
-                    "wait",
-                    recovery_matrix::REASON_RESUME_CLAIM_STATUS,
-                    "Legacy rejection record exists. Inspect command journal for recovery details; no P082 typed readback is available.",
-                    "command_journal",
-                    "command_journal",
+                let projection_integrity = command_error_fallback_projection_integrity(&error_str);
+                push_command_error_fallback(
+                    &mut readbacks,
                     &journal_id,
-                    None,
-                    "unavailable",
                     &created_at,
+                    projection_integrity,
                 );
-                if let Some(obj) = fallback.as_object().cloned() {
-                    readbacks.push(allowlist_project(obj));
-                }
             }
         }
     }
@@ -491,9 +639,7 @@ pub async fn readbacks_for_run(
                                 "tamper_detected",
                                 ts,
                             );
-                            if let Some(obj) = fallback.as_object().cloned() {
-                                readbacks.push(allowlist_project(obj));
-                            }
+                            push_valid_projected_readback(&mut readbacks, fallback);
                         }
                     }
                 }
@@ -540,22 +686,7 @@ pub async fn readbacks_for_run(
                             readbacks.push(allowlist_project(obj));
                         }
                     } else {
-                        let fallback = recovery_matrix::build_readback_v1(
-                            "P082-R03",
-                            "held",
-                            "wait",
-                            recovery_matrix::REASON_IGNORED_LATE_OUTPUTS,
-                            "Stage recovery snapshot readback shape validation failed; tamper or schema drift detected.",
-                            "stage_executions",
-                            "stage_executions",
-                            &stage_id,
-                            Some("stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback"),
-                            "tamper_detected",
-                            &started_at,
-                        );
-                        if let Some(obj) = fallback.as_object().cloned() {
-                            readbacks.push(allowlist_project(obj));
-                        }
+                        push_stage_snapshot_tamper_fallback(&mut readbacks, &stage_id, &started_at);
                     }
                 }
             }
@@ -653,10 +784,11 @@ pub async fn readbacks_for_run(
         r#"SELECT se.details_json, se.recorded_at
            FROM session_events se
            INNER JOIN session_lineages sl ON sl.id = se.lineage_id
-           WHERE sl.run_id = ?1
-             AND se.details_json IS NOT NULL
-             AND LENGTH(se.details_json) <= ?2
-             AND json_extract(se.details_json, '$.p082_recovery_matrix_readback.scenario_id') = 'P082-R04'
+	           WHERE sl.run_id = ?1
+	             AND se.details_json IS NOT NULL
+	             AND LENGTH(se.details_json) <= ?2
+	             AND json_valid(se.details_json)
+	             AND json_extract(se.details_json, '$.p082_recovery_matrix_readback.scenario_id') = 'P082-R04'
            ORDER BY se.recorded_at ASC
            LIMIT ?3"#,
     )
@@ -737,22 +869,33 @@ pub async fn readbacks_for_run(
     // for sessions where a Claude Code agent requests Xcode without an xcode runtime.
     let startup_rows = sqlx::query(
         r#"SELECT sg.id, sg.invocation_owner_key, sg.runtime_provider, sg.runtime_model,
-                  sg.created_at,
-                  json_extract(wi.payload_json, '$.xcode_broker_required') AS payload_xcode_broker_required,
-                  json_extract(wi.payload_json, '$.requested_mcp_server_ids') AS payload_requested_mcp_server_ids
+		                  sg.created_at,
+		                  wi.id AS work_item_id,
+		                  CASE
+		                    WHEN wi.payload_json IS NOT NULL AND json_valid(wi.payload_json)
+		                    THEN json_extract(wi.payload_json, '$.xcode_broker_required')
+	                    ELSE NULL
+	                  END AS payload_xcode_broker_required,
+	                  CASE
+	                    WHEN wi.payload_json IS NOT NULL AND json_valid(wi.payload_json)
+	                    THEN json_extract(wi.payload_json, '$.requested_mcp_server_ids')
+	                    ELSE NULL
+	                  END AS payload_requested_mcp_server_ids
            FROM session_generations sg
            INNER JOIN session_lineages sl ON sl.id = sg.lineage_id
            LEFT JOIN agent_executions ae
              ON ae.session_generation_id = sg.id AND ae.status = 'running'
-           LEFT JOIN work_items wi
-             ON wi.kind = 'invoke_agent' AND wi.status = 'running'
-             AND ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
-           WHERE sl.run_id = ?1
-             AND sg.status = 'active'
-             AND sg.provider_session_id IS NULL
-             AND sg.last_activity_at IS NULL
-           ORDER BY sg.created_at ASC
-           LIMIT ?2"#,
+	           LEFT JOIN work_items wi
+	             ON wi.kind = 'invoke_agent' AND wi.status = 'running'
+	             AND json_valid(wi.payload_json)
+	             AND ae.id = json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+	           WHERE sl.run_id = ?1
+	             AND sg.status = 'active'
+	             AND sg.provider_session_id IS NULL
+	             AND sg.last_activity_at IS NULL
+	             AND wi.id IS NOT NULL
+	           ORDER BY sg.created_at ASC
+	           LIMIT ?2"#,
     )
     .bind(run_id.to_string())
     .bind(remaining_readback_limit(&readbacks))
@@ -765,7 +908,7 @@ pub async fn readbacks_for_run(
             break;
         }
         let generation_id: String = row.try_get("id").unwrap_or_default();
-        let owner_key: String = row.try_get("invocation_owner_key").unwrap_or_default();
+        let work_item_id: String = row.try_get("work_item_id").unwrap_or_default();
         let runtime_provider: String = row.try_get("runtime_provider").unwrap_or_default();
         let runtime_model: String = row.try_get("runtime_model").unwrap_or_default();
         let created_at: String = row.try_get("created_at").unwrap_or_default();
@@ -810,7 +953,7 @@ pub async fn readbacks_for_run(
         let repair_id = format!("p082-stale-startup:{generation_id}");
         let summary = recovery_matrix::build_startup_repair_summary(
             &repair_id,
-            &owner_key,
+            &work_item_id,
             "unavailable",
             0,
             1,
@@ -837,10 +980,10 @@ pub async fn readbacks_for_run(
                 "wait",
                 recovery_matrix::REASON_STARTUP_STALLED,
                 "Stale ACP startup detected; startup recovery owns any requeue decision.",
-                "work_items, session_generations, session_events, startup_recovery_readbacks",
+                "work_items, session_generations, session_events",
                 "work_items, sessions, startup_repairs",
-                &generation_id,
-                Some("session_events.details_json.p082_recovery_matrix_readback"),
+                &work_item_id,
+                Some("work_items.payload_json.p061_startup_recovery"),
                 "stale",
                 &now.to_rfc3339(),
             ),
@@ -851,15 +994,43 @@ pub async fn readbacks_for_run(
     }
 
     // Source 9: running InvokeAgent work without a durable executor claim (R06).
+    // This path is only a held reconciliation readback when a real unresolved
+    // side-effect row exists. Repaired R06 rows must come from Source 1b's
+    // p061_startup_recovery owner; do not infer a generic hold from stale work
+    // alone.
     let stale_work_rows = sqlx::query(
-        r#"SELECT id, created_at, started_at
-           FROM work_items
-           WHERE run_id = ?1
-             AND kind = 'invoke_agent'
-             AND status = 'running'
-             AND json_extract(payload_json, '$.p058_claimed.agent_execution_id') IS NULL
-           ORDER BY COALESCE(started_at, created_at) ASC
-           LIMIT ?2"#,
+        r#"SELECT wi.id,
+                  wi.created_at,
+                  wi.started_at,
+                  (SELECT se.id
+                     FROM side_effects se
+                    WHERE se.run_id = wi.run_id
+                      AND se.status IN (
+                        'prepared','executing','externally_observed',
+                        'needs_reconciliation','conflict','unrecoverable'
+                      )
+                    ORDER BY se.created_at ASC
+                    LIMIT 1) AS side_effect_id
+	           FROM work_items wi
+	           WHERE wi.run_id = ?1
+		             AND wi.kind = 'invoke_agent'
+		             AND wi.status = 'running'
+		             AND (CASE
+		                    WHEN json_valid(wi.payload_json)
+		                    THEN json_extract(wi.payload_json, '$.p058_claimed.agent_execution_id')
+		                    ELSE NULL
+		                  END) IS NULL
+                 AND EXISTS (
+                   SELECT 1
+                     FROM side_effects se
+                    WHERE se.run_id = wi.run_id
+                      AND se.status IN (
+                        'prepared','executing','externally_observed',
+                        'needs_reconciliation','conflict','unrecoverable'
+                      )
+                 )
+	           ORDER BY COALESCE(wi.started_at, wi.created_at) ASC
+	           LIMIT ?2"#,
     )
     .bind(run_id.to_string())
     .bind(remaining_readback_limit(&readbacks))
@@ -870,7 +1041,7 @@ pub async fn readbacks_for_run(
         if readbacks.len() >= MAX_READBACK_ROWS {
             break;
         }
-        let work_item_id: String = row.try_get("id").unwrap_or_default();
+        let side_effect_id: String = row.try_get("side_effect_id").unwrap_or_default();
         let created_at: String = row.try_get("created_at").unwrap_or_default();
         let started_at: Option<String> = row.try_get("started_at").unwrap_or(None);
         let evidence_at = started_at.as_deref().unwrap_or(&created_at);
@@ -888,8 +1059,8 @@ pub async fn readbacks_for_run(
             "Running InvokeAgent work item has no durable executor owner; hold until an explicit recorded transition or reconciliation repairs it.",
             "work_items, startup_repairs, side_effects",
             "work_items, startup_repairs, side_effects",
-            &work_item_id,
-            None,
+            &side_effect_id,
+            Some("work_items.payload_json.p061_startup_recovery"),
             "stale",
             &now.to_rfc3339(),
         );
@@ -1010,6 +1181,21 @@ pub async fn readbacks_for_run(
     Ok(readbacks)
 }
 
+fn command_error_fallback_projection_integrity(error: &str) -> &'static str {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(error) else {
+        return "unavailable";
+    };
+    if value
+        .get("schema_version")
+        .and_then(|schema| schema.as_str())
+        == Some(domain::recovery_matrix::SCHEMA_REJECTED_COMMAND_ERROR_V1)
+    {
+        "tamper_detected"
+    } else {
+        "unavailable"
+    }
+}
+
 fn p082_cancellation_action_identity_valid(
     entry: &serde_json::Value,
     readback: &serde_json::Value,
@@ -1099,12 +1285,7 @@ pub async fn latest_readback_for_run(
     run_id: domain::ids::RunId,
 ) -> Result<serde_json::Value> {
     let readbacks = readbacks_for_run(pool, run_id).await?;
-    let singular = readbacks
-        .iter()
-        .filter(|rb| rb.get("scenario_status").and_then(|v| v.as_str()) != Some("not_applicable"))
-        .last()
-        .cloned();
-    Ok(singular.unwrap_or(serde_json::Value::Null))
+    Ok(latest_readback_from_readbacks(&readbacks))
 }
 
 /// Emits `p082_recovery_reason_readback_total{reason_code:lane}` for each readback row.

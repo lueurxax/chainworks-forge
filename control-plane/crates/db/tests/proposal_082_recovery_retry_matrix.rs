@@ -655,18 +655,35 @@ async fn p082_allowlist_strips_injected_keys_from_startup_repair_notes() {
     let repair_key = format!("p082-requeue:cj-sec:{run_id_str}:1");
 
     // Build a valid readback but inject sensitive keys into the readback object.
-    let readback = recovery_matrix::build_readback_v1(
-        "P082-R01",
-        "repaired",
-        "retry",
-        recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
-        "Startup requeue scheduled.",
-        "startup_repairs",
-        "startup_repairs, work_items",
+    let summary = recovery_matrix::build_startup_repair_summary(
         &repair_key,
-        Some("startup_repairs.notes.p082_recovery_matrix_readback"),
-        "valid",
+        "wi-sec",
+        "cj-sec",
+        1,
+        1,
+        false,
+        60_000,
         &now.to_rfc3339(),
+        false,
+        None,
+        "startup",
+    );
+    let readback = recovery_matrix::set_readback_startup_repair(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &repair_key,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            &now.to_rfc3339(),
+        ),
+        summary,
+        None,
     );
 
     let mut readback_obj = readback.as_object().cloned().unwrap();
@@ -732,6 +749,104 @@ async fn p082_allowlist_strips_injected_keys_from_startup_repair_notes() {
         Some("P082-R01"),
         "P082: scenario_id must survive allowlist projection"
     );
+    assert_eq!(
+        row.get("diagnostic_redaction").and_then(|v| v.as_str()),
+        Some("partial"),
+        "SEC-P082-LOW-001: stripping injected top-level keys must mark diagnostic_redaction partial"
+    );
+}
+
+#[tokio::test]
+async fn p082_omitted_optional_subcontract_keys_do_not_reach_readback_lanes() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    let repair_key = format!("p082-requeue:cj-missing-subcontracts:{run_id_str}:1");
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+
+    let summary = recovery_matrix::build_startup_repair_summary(
+        &repair_key,
+        "wi-missing-subcontracts",
+        "cj-missing-subcontracts",
+        1,
+        1,
+        false,
+        60_000,
+        &now.to_rfc3339(),
+        false,
+        None,
+        "startup",
+    );
+    let mut readback = recovery_matrix::set_readback_startup_repair(
+        recovery_matrix::build_readback_v1(
+            "P082-R01",
+            "repaired",
+            "retry",
+            recovery_matrix::REASON_STARTUP_REQUEUE_ONCE,
+            "Startup requeue scheduled.",
+            "startup_repairs",
+            "startup_repairs, work_items",
+            &repair_key,
+            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            "valid",
+            &now.to_rfc3339(),
+        ),
+        summary,
+        None,
+    );
+    readback
+        .as_object_mut()
+        .expect("readback object")
+        .remove("recovery_retry_identifier_guidance");
+    assert!(
+        !recovery_matrix::validate_readback_v1_shape(&readback),
+        "test setup must omit a required top-level optional-subcontract field"
+    );
+
+    let notes = serde_json::json!({
+        "p082_recovery_matrix_readback": readback
+    })
+    .to_string();
+
+    startup_repairs::record(
+        &pool,
+        &repair_key,
+        &run_id_str,
+        "requeue_once",
+        now,
+        Some(&notes),
+    )
+    .await
+    .expect("record startup repair with malformed readback");
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run must not fail");
+    assert_eq!(
+        readbacks.len(),
+        1,
+        "malformed startup repair readback must produce one tamper fallback row"
+    );
+    let row = &readbacks[0];
+    for field in [
+        "recovery_retry_identifier_guidance",
+        "recovery_late_output_settlement",
+        "recovery_startup_repair_summary",
+        "source_json_key",
+    ] {
+        assert!(
+            row.as_object()
+                .is_some_and(|object| object.contains_key(field)),
+            "P082 lane row must include explicit top-level field {field}: {row}"
+        );
+    }
+    assert_eq!(
+        row.get("recovery_projection_integrity")
+            .and_then(|value| value.as_str()),
+        Some("tamper_detected"),
+        "malformed readback must not leak; accessor should return tamper fallback"
+    );
 }
 
 // ── P082 SEC-P082-001: String field length cap ─────────────────────────────
@@ -769,7 +884,7 @@ async fn p082_sec_p082_001_oversized_string_field_is_capped() {
             "startup_repairs, work_items, session_generations",
             "work_items, sessions, startup_repairs",
             &repair_key,
-            Some("startup_repairs.notes.p082_recovery_matrix_readback"),
+            Some("work_items.payload_json.p061_startup_recovery"),
             "valid",
             &now.to_rfc3339(),
         ),
@@ -1023,6 +1138,11 @@ async fn p082_sec_high1_nested_subcontract_injection_is_stripped() {
         guidance_str.contains("stage_execution_uuid"),
         "P082 SEC-HIGH-1: expected_identifier_kind must survive nested sanitization"
     );
+    assert_eq!(
+        row.get("diagnostic_redaction").and_then(|v| v.as_str()),
+        Some("partial"),
+        "SEC-P082-LOW-001: stripping injected nested subcontract keys must mark diagnostic_redaction partial"
+    );
 }
 
 #[tokio::test]
@@ -1213,6 +1333,15 @@ async fn p082_sec_medium1_tampered_startup_repair_readback_produces_tamper_detec
         row.get("recovery_projection_integrity").and_then(|v| v.as_str()),
         Some("tamper_detected"),
         "P082 SEC-MEDIUM-1: tampered startup_repair row must produce recovery_projection_integrity=tamper_detected"
+    );
+    assert!(
+        recovery_matrix::validate_readback_v1_shape(row),
+        "P082 SEC-MEDIUM-1: tampered startup_repair fallback must validate against p082_recovery_matrix_readback_v1: {row}"
+    );
+    assert!(
+        row.get("recovery_startup_repair_summary")
+            .is_some_and(|value| !value.is_null()),
+        "P082 SEC-MEDIUM-1: P082-R01 tamper fallback must include recovery_startup_repair_summary"
     );
     // The tampered scenario_id must NOT appear in the output.
     let row_str = row.to_string();
@@ -1495,13 +1624,44 @@ async fn p082_r05_stale_xcode_startup_accessor_derives_operator_message() {
            (id, lineage_id, generation, invocation_owner_key, provider_session_id,
             binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
             workspace_mode, runtime_provider, runtime_model, status, created_at)
-           VALUES ('p082-r05-generation', 'p082-r05-lineage', 1, 'work-item-r05', NULL,
+           VALUES ('p082-r05-generation', 'p082-r05-lineage', 1, 'invocation-owner-r05', NULL,
                    'binding-r05', NULL, '/', 'read_write', 'xcode', 'xcode-test', 'active', ?1)"#,
     )
     .bind(stale_at.to_rfc3339())
     .execute(&pool)
     .await
     .expect("insert stale generation");
+    sqlx::query(
+        r#"INSERT INTO agent_executions
+           (id, agent_id, provider, status, started_at,
+            session_generation_id, session_lineage_id,
+            owner_kind, owner_id)
+           VALUES ('p082-r05-ae', 'agent-r05', 'xcode', 'running', ?1,
+                   'p082-r05-generation', 'p082-r05-lineage', 'lead_conflict_mediation', 'p082-r05-ae')"#,
+    )
+    .bind(stale_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert running agent execution");
+    sqlx::query(
+        r#"INSERT INTO work_items
+           (id, run_id, kind, payload_json, status, created_at, scheduled_at, started_at, attempt_count)
+           VALUES ('work-item-r05', ?1, 'invoke_agent', ?2, 'running', ?3, ?3, ?3, 1)"#,
+    )
+    .bind(&run_id_str)
+    .bind(
+        serde_json::json!({
+            "run_id": run_id_str,
+            "xcode_broker_required": true,
+            "p061_startup_recovery": { "reason": "startup_stalled" },
+            "p058_claimed": { "agent_execution_id": "p082-r05-ae" }
+        })
+        .to_string(),
+    )
+    .bind(stale_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert running work item owner");
 
     let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
         .await
@@ -1534,13 +1694,26 @@ async fn p082_r05_stale_xcode_startup_accessor_derives_operator_message() {
     );
     assert_eq!(
         row.get("source_json_key").and_then(|value| value.as_str()),
-        Some("session_events.details_json.p082_recovery_matrix_readback"),
-        "P082-R05 held stale-startup readback must point to approved session event evidence"
+        Some("work_items.payload_json.p061_startup_recovery"),
+        "P082-R05 held stale-startup readback must point to the approved work item payload owner"
+    );
+    assert_eq!(
+        row.get("source_identifier")
+            .and_then(|value| value.as_str()),
+        Some("work-item-r05"),
+        "P082-R05 held stale-startup readback must identify the joined work item owner"
+    );
+    assert_eq!(
+        row.get("recovery_startup_repair_summary")
+            .and_then(|value| value.get("source_work_item_id"))
+            .and_then(|value| value.as_str()),
+        Some("work-item-r05"),
+        "P082-R05 startup summary must use the joined work item id, not session invocation_owner_key"
     );
 }
 
 #[tokio::test]
-async fn p082_r06_stale_scheduler_owner_accessor_derives_held_readback() {
+async fn p082_r06_stale_scheduler_without_side_effect_evidence_does_not_infer_hold() {
     let pool = setup_db().await;
     let now = Utc::now();
     let stale_at = now - chrono::Duration::minutes(4);
@@ -1564,20 +1737,147 @@ async fn p082_r06_stale_scheduler_owner_accessor_derives_held_readback() {
     let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
         .await
         .expect("read P082 readbacks");
+    assert!(
+        !readbacks
+            .iter()
+            .any(|row| row.get("scenario_id").and_then(|value| value.as_str())
+                == Some("P082-R06")),
+        "P082-R06: stale scheduler ownership must not infer a held row without side_effect evidence or explicit repair"
+    );
+}
+
+#[tokio::test]
+async fn p082_r06_stale_scheduler_owner_accessor_derives_repaired_readback_from_work_item_owner() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+
+    let readback = recovery_matrix::build_readback_v1(
+        "P082-R06",
+        "repaired",
+        "retry",
+        recovery_matrix::REASON_STALE_REPAIRED,
+        "Stale scheduler ownership repaired through explicit work item transition.",
+        "work_items",
+        "work_items",
+        "p082-r06-repaired-work",
+        Some("work_items.payload_json.p061_startup_recovery"),
+        "valid",
+        &now.to_rfc3339(),
+    );
+    sqlx::query(
+        r#"INSERT INTO work_items
+           (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at,
+            attempt_count, last_error)
+           VALUES ('p082-r06-repaired-work', 'invoke_agent', ?1, 'pending', ?2, 'stage-r06',
+                   ?3, ?3, 1, NULL)"#,
+    )
+    .bind(
+        serde_json::json!({
+            "p061_startup_recovery": {
+                "reason": "stale_scheduler_owner_repaired",
+                "p082_recovery_matrix_readback": readback
+            }
+        })
+        .to_string(),
+    )
+    .bind(&run_id_str)
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert repaired stale scheduler work item");
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("read P082 readbacks");
     let row = readbacks
         .iter()
         .find(|row| row.get("scenario_id").and_then(|value| value.as_str()) == Some("P082-R06"))
-        .expect("P082-R06 readback");
+        .expect("P082-R06 repaired readback");
+    assert_eq!(
+        row.get("recovery_reason_code")
+            .and_then(|value| value.as_str()),
+        Some(recovery_matrix::REASON_STALE_REPAIRED),
+        "P082-R06: repaired stale scheduler ownership must use stale_repaired"
+    );
+    assert_eq!(
+        row.get("scenario_status").and_then(|value| value.as_str()),
+        Some("repaired"),
+        "P082-R06: explicit transition must report repaired"
+    );
+    assert_eq!(
+        row.get("source_json_key").and_then(|value| value.as_str()),
+        Some("work_items.payload_json.p061_startup_recovery"),
+        "P082-R06: repaired stale scheduler readback must use the approved work item JSON owner"
+    );
+}
+
+#[tokio::test]
+async fn p082_r06_stale_scheduler_owner_held_requires_unresolved_side_effect_evidence() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let stale_at = now - chrono::Duration::minutes(4);
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    let effect_id = format!("se-r06-hold-{run_id_str}");
+    let stage_execution_id = uuid::Uuid::new_v4().to_string();
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+
+    sqlx::query(
+        r#"INSERT INTO work_items
+           (id, kind, payload_json, status, run_id, stage_id, created_at, scheduled_at, started_at,
+            attempt_count, last_error)
+           VALUES ('p082-r06-held-work', 'invoke_agent', '{}', 'running', ?1, 'stage-r06',
+                   ?2, ?2, ?2, 1, NULL)"#,
+    )
+    .bind(&run_id_str)
+    .bind(stale_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert stale running work item");
+    sqlx::query(
+        r#"INSERT INTO side_effects
+           (id, run_id, stage_execution_id, effect_kind, target_key,
+            idempotency_key, idempotency_key_version, request_fingerprint,
+            request_fingerprint_version, status, external_write_attempted,
+            attempt_budget_remaining, created_at, updated_at)
+           VALUES (?1, ?2, ?3, 'git_commit', 'main',
+                   ?4, 1, 'fp-r06-hold', 1, 'prepared', 0, 3, ?5, ?5)"#,
+    )
+    .bind(&effect_id)
+    .bind(&run_id_str)
+    .bind(&stage_execution_id)
+    .bind(format!("idem-key-r06-hold-{run_id_str}"))
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert side effect evidence");
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("read P082 readbacks");
+    let row = readbacks
+        .iter()
+        .find(|row| row.get("scenario_id").and_then(|value| value.as_str()) == Some("P082-R06"))
+        .expect("P082-R06 held readback");
     assert_eq!(
         row.get("recovery_reason_code")
             .and_then(|value| value.as_str()),
         Some(recovery_matrix::REASON_NEEDS_EFFECT_RECONCILIATION),
-        "P082-R06: held stale scheduler ownership must use needs_effect_reconciliation until an explicit transition repairs it"
+        "P082-R06: held stale scheduler ownership requires needs_effect_reconciliation"
     );
     assert_eq!(
-        row.get("scenario_status").and_then(|value| value.as_str()),
-        Some("held"),
-        "P082-R06: stale scheduler ownership must be held until an explicit transition repairs it"
+        row.get("source_identifier")
+            .and_then(|value| value.as_str()),
+        Some(effect_id.as_str()),
+        "P082-R06: held readback must cite the unresolved side_effect row"
+    );
+    assert_eq!(
+        row.get("source_json_key").and_then(|value| value.as_str()),
+        Some("work_items.payload_json.p061_startup_recovery"),
+        "P082-R06: held readback must carry an approved stale scheduler JSON owner"
     );
 }
 
@@ -1767,7 +2067,9 @@ async fn p082_r15_crash_after_idempotency_row_insert_replays_idempotently() {
         "Pre-crash: work_item must still be running (crash happened before status update)"
     );
 
-    // Daemon restart: re-run the startup requeue. The idempotency key already exists (R16/R15).
+    // Daemon restart: re-run the startup requeue. The idempotency key already
+    // exists, but the existing startup_repairs.notes row proves R01 was written
+    // before the work_item mutation. This is an unapplied R01 replay, not R16.
     let requeued = work_items::requeue_running_invoke_agent_on_startup(
         &pool,
         now + chrono::Duration::seconds(5),
@@ -1776,10 +2078,42 @@ async fn p082_r15_crash_after_idempotency_row_insert_replays_idempotently() {
     .await
     .expect("restart: requeue_running_invoke_agent_on_startup");
 
-    // No new work item must be enqueued (idempotent: the key already exists).
     assert_eq!(
-        requeued, 0,
-        "P082-R15: restart must not create duplicate pending work when idempotency key exists"
+        requeued, 1,
+        "P082-R15: restart must requeue the unapplied R01 generation when the idempotency row exists but the source work item is still running and unstamped"
+    );
+
+    let replay_status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE id = ?1")
+        .bind(&work_item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch replayed work item status");
+    assert_eq!(
+        replay_status, "pending",
+        "P082-R15: unapplied R01 replay must return the source work item to pending"
+    );
+
+    let replay_payload_raw: String =
+        sqlx::query_scalar("SELECT payload_json FROM work_items WHERE id = ?1")
+            .bind(&work_item_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch replayed work item payload");
+    let replay_payload: serde_json::Value =
+        serde_json::from_str(&replay_payload_raw).expect("payload json");
+    assert_eq!(
+        replay_payload
+            .pointer("/p061_startup_recovery/startup_repair_id")
+            .and_then(|value| value.as_str()),
+        Some(repair_id.as_str()),
+        "P082-R15: replay must stamp the source payload with the existing repair id"
+    );
+    assert_eq!(
+        replay_payload
+            .pointer("/p061_startup_recovery/replayed")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "P082-R15: replay payload must mark replayed=true"
     );
 
     // startup_repairs must have exactly one row for this key.
@@ -1794,21 +2128,24 @@ async fn p082_r15_crash_after_idempotency_row_insert_replays_idempotently() {
         "P082-R15: exactly one startup_repairs row must exist (no duplicate idempotency keys)"
     );
 
-    // The accessor must surface a readback for this run (either R16 or the existing R01 row).
     let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
         .await
         .expect("readbacks_for_run after restart");
-    assert!(
-        !readbacks.is_empty(),
-        "P082-R15: readbacks_for_run must return at least one row after crash-boundary replay"
-    );
-    // The source_identifier for any returned row must match the known repair idempotency key.
-    let has_matching_id = readbacks
+    let r01_row = readbacks
         .iter()
-        .any(|rb| rb.get("source_identifier").and_then(|v| v.as_str()) == Some(&repair_id));
+        .find(|rb| rb.get("source_identifier").and_then(|v| v.as_str()) == Some(&repair_id))
+        .expect("P082-R15: readback row must reference the repair idempotency key");
+    assert_eq!(
+        r01_row.get("scenario_id").and_then(|value| value.as_str()),
+        Some("P082-R01"),
+        "P082-R15: unapplied R01 replay must preserve R01 readback instead of overwriting it with R16"
+    );
     assert!(
-        has_matching_id,
-        "P082-R15: at least one readback row must reference the repair idempotency key"
+        !readbacks.iter().any(
+            |row| row.get("recovery_reason_code").and_then(|v| v.as_str())
+                == Some(recovery_matrix::REASON_STARTUP_REQUEUE_EXHAUSTED)
+        ),
+        "P082-R15: unapplied R01 replay must not emit startup_requeue_exhausted"
     );
 }
 
@@ -2040,6 +2377,377 @@ fn p082_neg_malformed_envelope_missing_reason_code_is_rejected() {
     );
 }
 
+#[test]
+fn p082_null_nested_rejected_command_readback_is_rejected() {
+    let malformed = serde_json::json!({
+        "schema_version": recovery_matrix::SCHEMA_REJECTED_COMMAND_ERROR_V1,
+        "reason_code": recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
+        "command_type": "RetryStage",
+        "redaction": "partial",
+        "operator_safe_summary": "Stage not retryable.",
+        "p082_recovery_matrix_readback": null,
+    })
+    .to_string();
+
+    assert!(
+        recovery_matrix::parse_command_journal_error_envelope(&malformed).is_none(),
+        "P082: typed rejected-command envelopes require a valid non-null nested readback"
+    );
+}
+
+#[tokio::test]
+async fn p082_malformed_typed_command_error_produces_tamper_fallback_row() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    let journal_id = format!("p082-malformed-typed-{run_id_str}");
+
+    command_journal::record(
+        &pool,
+        &journal_id,
+        "RetryStage",
+        &format!(r#"{{"run_id":"{run_id_str}","stage_id":"deploy"}}"#),
+        Some(&run_id_str),
+        now,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("record command journal");
+
+    let malformed = serde_json::json!({
+        "schema_version": recovery_matrix::SCHEMA_REJECTED_COMMAND_ERROR_V1,
+        "reason_code": recovery_matrix::REASON_INVALID_STAGE_FOR_RETRY,
+        "command_type": "RetryStage",
+        "redaction": "partial",
+        "operator_safe_summary": "Stage not retryable.",
+        "p082_recovery_matrix_readback": null,
+    })
+    .to_string();
+    command_journal::fail_entry(&pool, &journal_id, now, &malformed)
+        .await
+        .expect("fail with malformed typed envelope");
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run must fail closed for malformed typed envelopes");
+
+    assert_eq!(readbacks.len(), 1);
+    assert_eq!(
+        readbacks[0]
+            .get("recovery_projection_integrity")
+            .and_then(|value| value.as_str()),
+        Some("tamper_detected"),
+        "P082: malformed typed rejected-command envelopes produce a safe tamper fallback row"
+    );
+    assert!(
+        recovery_matrix::validate_readback_v1_shape(&readbacks[0]),
+        "P082: malformed typed rejected-command fallback must validate against p082_recovery_matrix_readback_v1: {}",
+        readbacks[0]
+    );
+    assert_eq!(
+        readbacks[0]
+            .get("source_json_key")
+            .and_then(|value| value.as_str()),
+        Some("command_journal.error.p082_recovery_matrix_readback"),
+        "P082: tamper_detected command_journal fallback must retain the approved source_json_key"
+    );
+    assert!(
+        !readbacks[0]
+            .to_string()
+            .contains("p082_rejected_command_error_v1"),
+        "P082: fallback readback must not expose the raw command_journal.error envelope"
+    );
+}
+
+#[tokio::test]
+async fn p082_tampered_stage_snapshot_fallback_row_validates_readback_shape() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    let stage_exec_id = format!("se-r03-tampered-{run_id_str}");
+
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+
+    let mut readback = recovery_matrix::set_readback_late_output_settlement(
+        recovery_matrix::build_readback_v1(
+            "P082-R03",
+            "repaired",
+            "no_mutation",
+            recovery_matrix::REASON_IGNORED_LATE_OUTPUTS,
+            "Late output from superseded source ignored; active projection unchanged.",
+            "agent_execution_runtime_facts, artifact_source_generation_claims, work_items",
+            "agent_execution_runtime_facts, artifact_contracts, work_items",
+            &stage_exec_id,
+            Some("stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback"),
+            "valid",
+            &now.to_rfc3339(),
+        ),
+        recovery_matrix::build_late_output_settlement(
+            "ae-r03-test",
+            "wi-r03-test",
+            "sg-gen1",
+            "sg-gen2",
+            "superseded",
+            "ignored",
+            1,
+            "completed",
+            false,
+        ),
+    );
+    if let Some(obj) = readback.as_object_mut() {
+        obj.insert("scenario_id".into(), serde_json::json!("P082-TAMPERED-ID"));
+    }
+    let snapshot = serde_json::json!({
+        "p082_recovery_matrix_readback": readback,
+    });
+
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO stage_executions
+           (id, run_id, stage_id, label, status, iteration, attempt_number,
+            started_at, owner_agent, provider, model, stage_type,
+            recovery_snapshot_json)
+           VALUES (?1, ?2, 'implement', 'impl', 'completed', 1, 1,
+                   ?3, 'agent-1', 'provider-1', 'model-1', 'standard',
+                   ?4)"#,
+    )
+    .bind(&stage_exec_id)
+    .bind(&run_id_str)
+    .bind(now.to_rfc3339())
+    .bind(snapshot.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert stage_execution with tampered recovery_snapshot_json");
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run must not fail for tampered stage snapshot");
+
+    assert_eq!(readbacks.len(), 1);
+    let row = &readbacks[0];
+    assert_eq!(
+        row.get("recovery_projection_integrity")
+            .and_then(|value| value.as_str()),
+        Some("tamper_detected"),
+        "P082: tampered stage snapshot must produce a tamper fallback row"
+    );
+    assert!(
+        recovery_matrix::validate_readback_v1_shape(row),
+        "P082: tampered stage snapshot fallback must validate against readback_v1 shape: {row}"
+    );
+    assert!(
+        row.get("recovery_late_output_settlement")
+            .is_some_and(|value| !value.is_null()),
+        "P082: P082-R03 tamper fallback must include recovery_late_output_settlement"
+    );
+}
+
+#[tokio::test]
+async fn p082_readback_accessor_tolerates_malformed_mutable_json_columns() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let stale_started_at = now - chrono::Duration::minutes(4);
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    let lineage_id = format!("p082-json-valid-lineage-{run_id_str}");
+    let generation_id = format!("p082-json-valid-generation-{run_id_str}");
+
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+
+    sqlx::query(
+        r#"INSERT INTO session_lineages
+           (id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
+            active_generation_id, created_at, closed_at)
+           VALUES (?1, ?2, 'agent-json-valid', ?1, 'run', NULL, ?3, ?4, NULL)"#,
+    )
+    .bind(&lineage_id)
+    .bind(&run_id_str)
+    .bind(&generation_id)
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert lineage");
+
+    sqlx::query(
+        r#"INSERT INTO session_generations
+           (id, lineage_id, generation, invocation_owner_key, provider_session_id,
+            binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
+            workspace_mode, runtime_provider, runtime_model, status, created_at, last_activity_at)
+	           VALUES (?1, ?2, 1, 'p082-json-valid-owner-work', NULL, 'binding-json-valid', NULL, '/',
+	                   'read_write', 'codex', 'gpt-5.5', 'active', ?3, NULL)"#,
+    )
+    .bind(&generation_id)
+    .bind(&lineage_id)
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert generation");
+
+    sqlx::query(
+        r#"INSERT INTO agent_executions
+           (id, agent_id, provider, status, started_at,
+            session_generation_id, session_lineage_id,
+            owner_kind, owner_id)
+           VALUES ('p082-json-valid-ae', 'agent-json-valid', 'codex', 'running', ?1,
+                   ?2, ?3, 'lead_conflict_mediation', 'p082-json-valid-ae')"#,
+    )
+    .bind(stale_started_at.to_rfc3339())
+    .bind(&generation_id)
+    .bind(&lineage_id)
+    .execute(&pool)
+    .await
+    .expect("insert valid agent execution for stale startup evidence");
+
+    sqlx::query(
+        r#"INSERT INTO work_items
+           (id, run_id, kind, payload_json, status, created_at, scheduled_at, started_at, attempt_count)
+           VALUES ('p082-json-valid-owner-work', ?1, 'invoke_agent', ?2, 'running', ?3, ?3, ?3, 1)"#,
+    )
+    .bind(&run_id_str)
+    .bind(
+        serde_json::json!({
+            "run_id": run_id_str,
+            "p061_startup_recovery": { "reason": "startup_stalled" },
+            "p058_claimed": { "agent_execution_id": "p082-json-valid-ae" }
+        })
+        .to_string(),
+    )
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert valid work item for stale startup evidence");
+
+    sqlx::query(
+        r#"INSERT INTO session_events
+           (id, lineage_id, generation_id, event_type, recorded_at, details_json)
+           VALUES ('p082-json-valid-event', ?1, ?2, 'created', ?3, '{')"#,
+    )
+    .bind(&lineage_id)
+    .bind(&generation_id)
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert malformed session event details");
+
+    sqlx::query(
+        r#"INSERT INTO work_items
+           (id, run_id, kind, payload_json, status, created_at, scheduled_at, started_at, attempt_count)
+           VALUES ('p082-json-valid-work', ?1, 'invoke_agent', '{', 'running', ?2, ?2, ?2, 1)"#,
+    )
+    .bind(&run_id_str)
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert malformed work item payload");
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run must not abort on malformed mutable JSON");
+
+    assert!(
+        !readbacks.is_empty(),
+        "valid non-JSON-derived stale session evidence should still be reported"
+    );
+    for row in &readbacks {
+        assert!(
+            recovery_matrix::validate_readback_v1_shape(row),
+            "malformed JSON fallback/accessor row must still validate: {row}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn p082_stale_startup_requeue_ignores_malformed_work_item_payload_json() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let stale_started_at = now - chrono::Duration::minutes(13);
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    let lineage_id = format!("p082-json-valid-requeue-lineage-{run_id_str}");
+    let generation_id = format!("p082-json-valid-requeue-generation-{run_id_str}");
+    let ae_id = format!("p082-json-valid-requeue-ae-{run_id_str}");
+
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+
+    sqlx::query(
+        r#"INSERT INTO session_lineages
+           (id, run_id, agent_id, lineage_id, session_reuse_scope, session_family_id,
+            active_generation_id, created_at, closed_at)
+           VALUES (?1, ?2, 'agent-json-valid-requeue', ?1, 'run', NULL, ?3, ?4, NULL)"#,
+    )
+    .bind(&lineage_id)
+    .bind(&run_id_str)
+    .bind(&generation_id)
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert lineage");
+
+    sqlx::query(
+        r#"INSERT INTO session_generations
+           (id, lineage_id, generation, invocation_owner_key, provider_session_id,
+            binding_fingerprint, rehydrated_from_checkpoint_artifact_id, working_directory,
+            workspace_mode, runtime_provider, runtime_model, status, created_at, last_activity_at)
+           VALUES (?1, ?2, 1, 'json-valid-requeue-owner', NULL, 'binding-json-valid-requeue',
+                   NULL, '/', 'read_write', 'codex', 'gpt-5.5', 'active', ?3, NULL)"#,
+    )
+    .bind(&generation_id)
+    .bind(&lineage_id)
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert generation");
+
+    sqlx::query(
+        r#"INSERT INTO agent_executions
+           (id, agent_id, provider, status, started_at,
+            session_generation_id, session_lineage_id, owner_kind, owner_id)
+           VALUES (?1, 'agent-json-valid-requeue', 'codex', 'running', ?2,
+                   ?3, ?4, 'lead_conflict_mediation', ?1)"#,
+    )
+    .bind(&ae_id)
+    .bind(stale_started_at.to_rfc3339())
+    .bind(&generation_id)
+    .bind(&lineage_id)
+    .execute(&pool)
+    .await
+    .expect("insert agent execution");
+
+    sqlx::query(
+        r#"INSERT INTO work_items
+           (id, run_id, kind, payload_json, status, created_at, scheduled_at, started_at, attempt_count)
+           VALUES ('p082-json-valid-requeue-work', ?1, 'invoke_agent', '{', 'running', ?2, ?2, ?2, 1)"#,
+    )
+    .bind(&run_id_str)
+    .bind(stale_started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert malformed work item payload");
+
+    let requeued = work_items::requeue_stale_starting_invoke_agent_sessions(
+        &pool,
+        now,
+        now - chrono::Duration::minutes(3),
+        now - chrono::Duration::minutes(12),
+        "p082_json_valid_requeue_test",
+    )
+    .await
+    .expect("stale startup requeue must not abort on malformed payload_json");
+
+    assert_eq!(
+        requeued, 0,
+        "malformed payload_json cannot prove the p058 claimed owner and must be skipped"
+    );
+}
+
 // ── P082 NEG: validate_readback_v1_shape rejects non-canonical scenario_id ────
 
 #[test]
@@ -2104,8 +2812,8 @@ fn p082_r08_identifier_guidance_has_required_fields() {
         "RetryAgentExecution",
         "some-stale-uuid",
         "stage_execution_uuid",
-        "stage_execution_uuid",
-        &["latest-stage-exec-uuid"],
+        "agent_execution_id",
+        &["latest-agent-exec-uuid"],
     );
     let required = [
         "schema_version",
@@ -2138,7 +2846,7 @@ fn p082_r08_identifier_guidance_has_required_fields() {
     );
     assert_eq!(
         guidance["expected_identifier_kind"].as_str().unwrap(),
-        "stage_execution_uuid"
+        "agent_execution_id"
     );
 }
 
@@ -2148,7 +2856,7 @@ fn p082_r08_identifier_guidance_rejects_empty_examples() {
         "RetryAgentExecution",
         "some-stale-uuid",
         "stage_execution_uuid",
-        "stage_execution_uuid",
+        "agent_execution_id",
         &[],
     );
     let readback = recovery_matrix::set_readback_identifier_guidance(
@@ -2205,8 +2913,8 @@ async fn p082_r08_identifier_guidance_stored_in_command_journal_error() {
         "RetryAgentExecution",
         "stale-ae-uuid",
         "stage_execution_uuid",
-        "stage_execution_uuid",
-        &["latest-ae-uuid"],
+        "agent_execution_id",
+        &["latest-agent-exec-uuid"],
     );
     let readback = recovery_matrix::set_readback_identifier_guidance(
         recovery_matrix::build_readback_v1(
@@ -2276,8 +2984,8 @@ async fn p082_r08_identifier_guidance_stored_in_command_journal_error() {
         guidance_obj
             .get("expected_identifier_kind")
             .and_then(|v| v.as_str()),
-        Some("stage_execution_uuid"),
-        "P082-R08: expected_identifier_kind must be stage_execution_uuid"
+        Some("agent_execution_id"),
+        "P082-R08: expected_identifier_kind must stay within the approved vocabulary"
     );
 }
 
@@ -2708,6 +3416,81 @@ async fn p082_r03_stage_recovery_snapshot_json_accessor_reads_readback() {
     );
 }
 
+#[tokio::test]
+async fn p082_r03_tampered_stage_recovery_snapshot_produces_valid_tamper_fallback() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    let stage_exec_id = format!("se-r03-tampered-{run_id_str}");
+
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+
+    let tampered_readback = recovery_matrix::build_readback_v1(
+        "P082-R03",
+        "repaired",
+        "no_mutation",
+        recovery_matrix::REASON_IGNORED_LATE_OUTPUTS,
+        "Late output from superseded source ignored; active projection unchanged.",
+        "agent_execution_runtime_facts, artifact_source_generation_claims, work_items",
+        "agent_execution_runtime_facts, artifact_contracts, work_items",
+        &stage_exec_id,
+        Some("stage_executions.recovery_snapshot_json.p082_recovery_matrix_readback"),
+        "valid",
+        &now.to_rfc3339(),
+    );
+    assert!(
+        !recovery_matrix::validate_readback_v1_shape(&tampered_readback),
+        "P082-R03 test setup must omit required late-output settlement"
+    );
+    let snapshot = serde_json::json!({
+        "p082_recovery_matrix_readback": tampered_readback,
+    });
+
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO stage_executions
+           (id, run_id, stage_id, label, status, iteration, attempt_number,
+            started_at, owner_agent, provider, model, stage_type,
+            recovery_snapshot_json)
+           VALUES (?1, ?2, 'implement', 'impl', 'completed', 1, 1,
+                   ?3, 'agent-1', 'provider-1', 'model-1', 'standard',
+                   ?4)"#,
+    )
+    .bind(&stage_exec_id)
+    .bind(&run_id_str)
+    .bind(now.to_rfc3339())
+    .bind(snapshot.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert stage_execution with tampered recovery_snapshot_json");
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run must not fail for tampered stage snapshot");
+
+    assert_eq!(
+        readbacks.len(),
+        1,
+        "P082-R03: tampered stage snapshot must produce exactly one fallback row"
+    );
+    let row = &readbacks[0];
+    assert_eq!(
+        row.get("recovery_projection_integrity")
+            .and_then(|value| value.as_str()),
+        Some("tamper_detected"),
+        "P082-R03: tampered stage snapshot fallback must report tamper_detected"
+    );
+    assert!(
+        recovery_matrix::validate_readback_v1_shape(row),
+        "P082-R03: tampered stage snapshot fallback must validate against p082_recovery_matrix_readback_v1: {row}"
+    );
+    assert!(
+        row.get("recovery_late_output_settlement")
+            .is_some_and(|value| !value.is_null()),
+        "P082-R03: tampered fallback must include required late-output settlement"
+    );
+}
+
 // ── P082-R01: Production startup repair writes p082_startup_repair_summary_v1 ──
 
 #[test]
@@ -2960,6 +3743,7 @@ fn p082_r08_identifier_guidance_no_mutation_invariant() {
     for kind in &[
         "workflow_stage_id",
         "stage_execution_uuid",
+        "agent_execution_id",
         "retry_authority_id",
         "work_item_id",
         "unknown",
@@ -3619,6 +4403,120 @@ async fn p082_r01_startup_requeue_integration_creates_idempotency_row() {
     );
 }
 
+#[tokio::test]
+async fn p082_startup_requeue_uses_work_item_run_id_when_payload_run_id_is_tampered() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let owner_run_id = RunId::new();
+    let owner_run_id_str = owner_run_id.to_string();
+    let payload_run_id = RunId::new();
+    let payload_run_id_str = payload_run_id.to_string();
+    let owner_journal_id = format!("cj-owner-{owner_run_id_str}");
+    let payload_journal_id = format!("cj-payload-{payload_run_id_str}");
+
+    insert_test_run(&pool, &owner_run_id_str, &now.to_rfc3339()).await;
+    insert_test_run(&pool, &payload_run_id_str, &now.to_rfc3339()).await;
+    command_journal::record(
+        &pool,
+        &owner_journal_id,
+        "InvokeAgent",
+        &serde_json::json!({"run_id": owner_run_id_str}).to_string(),
+        Some(&owner_run_id_str),
+        now,
+        Some("engine"),
+        None,
+        Some("operator"),
+        Some("engine.invoke"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("record owner command journal");
+    command_journal::record(
+        &pool,
+        &payload_journal_id,
+        "InvokeAgent",
+        &serde_json::json!({"run_id": payload_run_id_str}).to_string(),
+        Some(&payload_run_id_str),
+        now,
+        Some("engine"),
+        None,
+        Some("operator"),
+        Some("engine.invoke"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("record payload command journal");
+
+    let work_item_id = format!("wi-owner-{owner_run_id_str}");
+    sqlx::query(
+        r#"INSERT INTO work_items (id, run_id, kind, payload_json, status, created_at, scheduled_at, attempt_count)
+           VALUES (?1, ?2, 'invoke_agent', ?3, 'running', ?4, ?4, 1)"#,
+    )
+    .bind(&work_item_id)
+    .bind(&owner_run_id_str)
+    .bind(serde_json::json!({"run_id": payload_run_id_str}).to_string())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert tampered running InvokeAgent work item");
+
+    let requeued = work_items::requeue_running_invoke_agent_on_startup(
+        &pool,
+        now,
+        "startup_requeue_tampered_payload_run_id",
+    )
+    .await
+    .expect("startup requeue must not fail");
+    assert_eq!(requeued, 1);
+
+    let owner_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM startup_repairs WHERE run_id = ?1")
+            .bind(&owner_run_id_str)
+            .fetch_one(&pool)
+            .await
+            .expect("count owner startup repairs");
+    let payload_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM startup_repairs WHERE run_id = ?1")
+            .bind(&payload_run_id_str)
+            .fetch_one(&pool)
+            .await
+            .expect("count payload startup repairs");
+    assert_eq!(
+        owner_count, 1,
+        "SEC-P082-MEDIUM-001: startup repair must be owned by work_items.run_id"
+    );
+    assert_eq!(
+        payload_count, 0,
+        "SEC-P082-MEDIUM-001: tampered payload run_id must not receive startup repair diagnostics"
+    );
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, owner_run_id)
+        .await
+        .expect("readbacks_for_run");
+    let r01 = readbacks
+        .iter()
+        .find(|row| row.get("scenario_id").and_then(|v| v.as_str()) == Some("P082-R01"))
+        .expect("P082-R01 readback for owner run");
+    assert_eq!(
+        r01.get("recovery_projection_integrity")
+            .and_then(|v| v.as_str()),
+        Some("tamper_detected"),
+        "SEC-P082-MEDIUM-001: mismatched payload run_id must mark readback tamper_detected"
+    );
+    assert_eq!(
+        r01.pointer("/recovery_startup_repair_summary/source_command_journal_id")
+            .and_then(|v| v.as_str()),
+        Some(owner_journal_id.as_str()),
+        "SEC-P082-MEDIUM-001: fallback command journal must be selected from work_items.run_id"
+    );
+}
+
 // ── P082-R01/R15/R16: Integration startup replay and exhaustion ──────────────
 
 /// Integration test: calls the production `requeue_running_invoke_agent_on_startup`
@@ -3915,15 +4813,23 @@ async fn p082_r16_metric_emitted_on_startup_requeue_exhausted() {
         "P082-R01: p082_recovery_idempotency_replay_total must be incremented on first requeue"
     );
 
-    // Reset to running without the stamped p061_startup_recovery marker. This
-    // is the non-replay duplicate-key case that must hold as R16; preserving the
-    // marker would be a valid crash replay and would emit R15 instead.
+    // Reset to running without the stamped p061_startup_recovery marker and
+    // replace startup_repairs.notes with a generation-consumed marker that does
+    // not contain a valid R01 readback. A duplicate key with valid R01 notes is
+    // an unapplied crash replay; this setup is the actual non-replay R16 case.
     sqlx::query("UPDATE work_items SET status = 'running', payload_json = ?1 WHERE id = ?2")
         .bind(serde_json::json!({"run_id": run_id_str, "journal_id": journal_id}).to_string())
         .bind(&work_item_id)
         .execute(&pool)
         .await
         .expect("reset work item");
+    let repair_id = format!("p082-requeue:{journal_id}:{work_item_id}:1");
+    sqlx::query("UPDATE startup_repairs SET notes = ?1 WHERE id = ?2")
+        .bind(r#"{"requeue_generation":1,"max_requeue_generation":1}"#)
+        .bind(&repair_id)
+        .execute(&pool)
+        .await
+        .expect("replace startup repair notes with consumed-generation marker");
 
     let before_r16 = db::metrics::get_counter_with_label(
         "p082_recovery_idempotency_replay_total",
@@ -4254,41 +5160,45 @@ async fn p082_r05_durable_readback_persists_after_stale_startup_repair() {
         "P082-R05: exactly one work item must be requeued"
     );
 
-    // Verify the startup_repairs row was created with the R05 readback.
-    let repair_id = format!("p082-stale-startup:{generation_id}");
-    let notes_raw: Option<String> =
-        sqlx::query_scalar("SELECT notes FROM startup_repairs WHERE id = ?1")
-            .bind(&repair_id)
-            .fetch_optional(&pool)
+    // Verify the approved work_items.payload_json.p061_startup_recovery owner carries R05.
+    let payload_raw: String =
+        sqlx::query_scalar("SELECT payload_json FROM work_items WHERE id = ?1")
+            .bind(&wi_id)
+            .fetch_one(&pool)
             .await
-            .expect("query startup_repairs");
-    let notes_str =
-        notes_raw.expect("P082-R05: startup_repairs row must exist after stale startup repair");
-    let notes_json: serde_json::Value =
-        serde_json::from_str(&notes_str).expect("startup_repairs.notes must be valid JSON");
-    let readback_in_notes = notes_json
-        .get("p082_recovery_matrix_readback")
-        .expect("P082-R05: notes must contain p082_recovery_matrix_readback");
+            .expect("query repaired work item payload");
+    let payload_json: serde_json::Value =
+        serde_json::from_str(&payload_raw).expect("work_items.payload_json must be valid JSON");
+    let readback_in_payload = payload_json
+        .pointer("/p061_startup_recovery/p082_recovery_matrix_readback")
+        .expect("P082-R05: payload startup recovery must contain p082_recovery_matrix_readback");
     assert_eq!(
-        readback_in_notes
+        readback_in_payload
             .get("scenario_id")
             .and_then(|v| v.as_str()),
         Some("P082-R05"),
-        "P082-R05: startup_repairs readback must have scenario_id=P082-R05"
+        "P082-R05: payload readback must have scenario_id=P082-R05"
     );
     assert_eq!(
-        readback_in_notes
+        readback_in_payload
             .get("scenario_status")
             .and_then(|v| v.as_str()),
         Some("repaired"),
-        "P082-R05: startup_repairs readback must have scenario_status=repaired"
+        "P082-R05: payload readback must have scenario_status=repaired"
+    );
+    assert_eq!(
+        readback_in_payload
+            .get("source_json_key")
+            .and_then(|v| v.as_str()),
+        Some("work_items.payload_json.p061_startup_recovery"),
+        "P082-R05: readback must use the approved work_items payload source key"
     );
     assert!(
-        recovery_matrix::validate_readback_v1_shape(readback_in_notes),
-        "P082-R05: startup_repairs readback must pass validate_readback_v1_shape"
+        recovery_matrix::validate_readback_v1_shape(readback_in_payload),
+        "P082-R05: payload readback must pass validate_readback_v1_shape"
     );
 
-    // The accessor must surface the P082-R05 row from startup_repairs after repair.
+    // The accessor must surface the P082-R05 row from work_items payload after repair.
     let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
         .await
         .expect("readbacks_for_run must not fail");
@@ -4322,6 +5232,258 @@ async fn p082_r05_durable_readback_persists_after_stale_startup_repair() {
     assert!(
         msg.contains("Next check") || msg.contains("next check") || msg.contains("backoff"),
         "P082-R05: operator message must explicitly include the next check/backoff state (not just 'Inspect'): {msg}"
+    );
+}
+
+#[tokio::test]
+async fn p082_r05_pre_session_repair_uses_work_item_payload_owner() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let started_at = now - chrono::Duration::minutes(5);
+    let run_id = RunId::new();
+    let run_id_str = run_id.to_string();
+    insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+
+    let journal_id = format!("cj-r05-pre-session-{run_id_str}");
+    command_journal::record(
+        &pool,
+        &journal_id,
+        "InvokeAgent",
+        &serde_json::json!({"run_id": run_id_str}).to_string(),
+        Some(&run_id_str),
+        now,
+        Some("mcp"),
+        Some("operator-1"),
+        Some("operator"),
+        Some("runs.start"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("record command journal entry");
+
+    let ae_id = format!("ae-r05-pre-session-{run_id_str}");
+    let wi_id = format!("wi-r05-pre-session-{run_id_str}");
+    sqlx::query(
+        r#"INSERT INTO agent_executions
+           (id, agent_id, provider, status, started_at,
+            session_generation_id, session_lineage_id,
+            owner_kind, owner_id)
+           VALUES (?1, 'agent-r05-pre-session', 'claude', 'running', ?2,
+                   NULL, NULL, 'lead_conflict_mediation', ?1)"#,
+    )
+    .bind(&ae_id)
+    .bind(started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert pre-session agent execution");
+
+    let payload = serde_json::json!({
+        "run_id": run_id_str,
+        "stage_id": "implement",
+        "journal_id": journal_id,
+        "p058_claimed": { "agent_execution_id": ae_id },
+    });
+    sqlx::query(
+        r#"INSERT INTO work_items
+           (id, run_id, kind, payload_json, status, created_at, scheduled_at, started_at, attempt_count)
+           VALUES (?1, ?2, 'invoke_agent', ?3, 'running', ?4, ?4, ?4, 1)"#,
+    )
+    .bind(&wi_id)
+    .bind(&run_id_str)
+    .bind(payload.to_string())
+    .bind(started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert running pre-session work item");
+
+    let requeued = work_items::requeue_stale_pre_session_invoke_agents(
+        &pool,
+        now,
+        now - chrono::Duration::minutes(3),
+        now - chrono::Duration::minutes(12),
+        "startup_repair_stale_acp_pre_session_startup",
+    )
+    .await
+    .expect("pre-session repair must succeed");
+    assert_eq!(
+        requeued, 1,
+        "P082-R05: pre-session stale startup must requeue exactly one item"
+    );
+
+    let payload_raw: String =
+        sqlx::query_scalar("SELECT payload_json FROM work_items WHERE id = ?1")
+            .bind(&wi_id)
+            .fetch_one(&pool)
+            .await
+            .expect("query repaired pre-session work item payload");
+    let payload_json: serde_json::Value =
+        serde_json::from_str(&payload_raw).expect("payload must be valid JSON");
+    assert_eq!(
+        payload_json
+            .pointer("/p061_startup_recovery/reason")
+            .and_then(|v| v.as_str()),
+        Some("startup_repair_stale_acp_pre_session_startup"),
+        "P082-R05: payload must preserve the pre-session startup repair reason"
+    );
+    let readback = payload_json
+        .pointer("/p061_startup_recovery/p082_recovery_matrix_readback")
+        .expect("P082-R05: pre-session payload must contain readback");
+    assert_eq!(readback["scenario_id"], serde_json::json!("P082-R05"));
+    assert_eq!(
+        readback["source_json_key"],
+        serde_json::json!("work_items.payload_json.p061_startup_recovery")
+    );
+    assert!(
+        recovery_matrix::validate_readback_v1_shape(readback),
+        "P082-R05: pre-session readback must validate"
+    );
+
+    let readbacks = db::repos::p082_recovery_matrix::readbacks_for_run(&pool, run_id)
+        .await
+        .expect("readbacks_for_run must not fail");
+    assert!(
+        readbacks.iter().any(|row| {
+            row.get("scenario_id").and_then(|v| v.as_str()) == Some("P082-R05")
+                && row.get("source_identifier").and_then(|v| v.as_str()) == Some(wi_id.as_str())
+        }),
+        "P082-R05: accessor must surface pre-session work_items payload owner"
+    );
+}
+
+#[tokio::test]
+async fn p082_stale_pre_session_requeue_uses_work_item_run_id_when_payload_run_id_is_tampered() {
+    let pool = setup_db().await;
+    let now = Utc::now();
+    let started_at = now - chrono::Duration::minutes(15);
+    let owner_run_id = RunId::new();
+    let owner_run_id_str = owner_run_id.to_string();
+    let payload_run_id = RunId::new();
+    let payload_run_id_str = payload_run_id.to_string();
+    let owner_journal_id = format!("cj-r05-owner-{owner_run_id_str}");
+    let payload_journal_id = format!("cj-r05-payload-{payload_run_id_str}");
+
+    insert_test_run(&pool, &owner_run_id_str, &now.to_rfc3339()).await;
+    insert_test_run(&pool, &payload_run_id_str, &now.to_rfc3339()).await;
+    command_journal::record(
+        &pool,
+        &owner_journal_id,
+        "InvokeAgent",
+        &serde_json::json!({"run_id": owner_run_id_str}).to_string(),
+        Some(&owner_run_id_str),
+        now,
+        Some("engine"),
+        None,
+        Some("operator"),
+        Some("engine.invoke"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("record owner command journal");
+    command_journal::record(
+        &pool,
+        &payload_journal_id,
+        "InvokeAgent",
+        &serde_json::json!({"run_id": payload_run_id_str}).to_string(),
+        Some(&payload_run_id_str),
+        now,
+        Some("engine"),
+        None,
+        Some("operator"),
+        Some("engine.invoke"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("record payload command journal");
+
+    let ae_id = format!("ae-r05-owner-{owner_run_id_str}");
+    let wi_id = format!("wi-r05-owner-{owner_run_id_str}");
+    sqlx::query(
+        r#"INSERT INTO agent_executions
+           (id, agent_id, provider, status, started_at,
+            session_generation_id, session_lineage_id,
+            owner_kind, owner_id)
+           VALUES (?1, 'agent-r05-owner', 'claude', 'running', ?2,
+                   NULL, NULL, 'lead_conflict_mediation', ?1)"#,
+    )
+    .bind(&ae_id)
+    .bind(started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert pre-session agent execution");
+
+    sqlx::query(
+        r#"INSERT INTO work_items
+           (id, run_id, kind, payload_json, status, created_at, scheduled_at, started_at, attempt_count)
+           VALUES (?1, ?2, 'invoke_agent', ?3, 'running', ?4, ?4, ?4, 1)"#,
+    )
+    .bind(&wi_id)
+    .bind(&owner_run_id_str)
+    .bind(
+        serde_json::json!({
+            "run_id": payload_run_id_str,
+            "p058_claimed": { "agent_execution_id": ae_id },
+        })
+        .to_string(),
+    )
+    .bind(started_at.to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("insert tampered pre-session work item");
+
+    let requeued = work_items::requeue_stale_pre_session_invoke_agents(
+        &pool,
+        now,
+        now - chrono::Duration::minutes(3),
+        now - chrono::Duration::minutes(12),
+        "startup_repair_stale_acp_pre_session_startup",
+    )
+    .await
+    .expect("pre-session repair must succeed");
+    assert_eq!(requeued, 1);
+
+    let payload_raw: String =
+        sqlx::query_scalar("SELECT payload_json FROM work_items WHERE id = ?1")
+            .bind(&wi_id)
+            .fetch_one(&pool)
+            .await
+            .expect("query repaired pre-session work item payload");
+    let payload_json: serde_json::Value =
+        serde_json::from_str(&payload_raw).expect("payload must be valid JSON");
+    let readback = payload_json
+        .pointer("/p061_startup_recovery/p082_recovery_matrix_readback")
+        .expect("P082-R05 readback");
+    assert_eq!(
+        readback
+            .get("recovery_projection_integrity")
+            .and_then(|v| v.as_str()),
+        Some("tamper_detected"),
+        "SEC-P082-MEDIUM-001: mismatched payload run_id must mark pre-session readback tamper_detected"
+    );
+    assert_eq!(
+        readback
+            .pointer("/recovery_startup_repair_summary/source_command_journal_id")
+            .and_then(|v| v.as_str()),
+        Some(owner_journal_id.as_str()),
+        "SEC-P082-MEDIUM-001: pre-session fallback journal must be selected from work_items.run_id"
+    );
+    let payload_readbacks =
+        db::repos::p082_recovery_matrix::readbacks_for_run(&pool, payload_run_id)
+            .await
+            .expect("readbacks_for_run for tampered payload run");
+    assert!(
+        payload_readbacks.iter().all(|row| {
+            row.get("source_identifier").and_then(|v| v.as_str()) != Some(wi_id.as_str())
+        }),
+        "SEC-P082-MEDIUM-001: tampered payload run must not surface owner work item readback"
     );
 }
 
@@ -4929,6 +6091,8 @@ async fn p082_r05_repair_writes_real_source_command_journal_id_and_requeue_gener
     let run_id = RunId::new();
     let run_id_str = run_id.to_string();
     insert_test_run(&pool, &run_id_str, &now.to_rfc3339()).await;
+    let foreign_run_id = RunId::new().to_string();
+    insert_test_run(&pool, &foreign_run_id, &now.to_rfc3339()).await;
 
     let journal_id = format!("cj-r05-real-{run_id_str}");
     command_journal::record(
@@ -4949,6 +6113,25 @@ async fn p082_r05_repair_writes_real_source_command_journal_id_and_requeue_gener
     )
     .await
     .expect("record command journal entry");
+    let foreign_journal_id = format!("cj-r05-foreign-{foreign_run_id}");
+    command_journal::record(
+        &pool,
+        &foreign_journal_id,
+        "InvokeAgent",
+        &serde_json::json!({"run_id": foreign_run_id.clone()}).to_string(),
+        Some(&foreign_run_id),
+        now,
+        Some("mcp"),
+        Some("operator-1"),
+        Some("operator"),
+        Some("runs.start"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("record foreign command journal entry");
 
     let lineage_id = format!("lineage-r05-real-{run_id_str}");
     let generation_id = format!("gen-r05-real-{run_id_str}");
@@ -5003,6 +6186,7 @@ async fn p082_r05_repair_writes_real_source_command_journal_id_and_requeue_gener
 
     let payload = serde_json::json!({
         "run_id": run_id_str,
+        "source_command_journal_id": foreign_journal_id,
         "stage_id": "implement",
         "p058_claimed": { "agent_execution_id": ae_id },
     });
@@ -5035,22 +6219,22 @@ async fn p082_r05_repair_writes_real_source_command_journal_id_and_requeue_gener
         "P082-R05: exactly one work item must be requeued"
     );
 
-    // The startup_repairs row must have been written (non-best-effort).
-    let repair_id = format!("p082-stale-startup:{generation_id}");
-    let notes_raw: Option<String> =
-        sqlx::query_scalar("SELECT notes FROM startup_repairs WHERE id = ?1")
-            .bind(&repair_id)
-            .fetch_optional(&pool)
+    let payload_raw: String =
+        sqlx::query_scalar("SELECT payload_json FROM work_items WHERE id = ?1")
+            .bind(&wi_id)
+            .fetch_one(&pool)
             .await
-            .expect("query startup_repairs");
-    let notes_str = notes_raw
-        .expect("P082-R05 regression: startup_repairs row must be written (non-best-effort)");
-    let notes_json: serde_json::Value =
-        serde_json::from_str(&notes_str).expect("startup_repairs.notes must be valid JSON");
+            .expect("query repaired work item payload");
+    let payload_json: serde_json::Value =
+        serde_json::from_str(&payload_raw).expect("work_items.payload_json must be valid JSON");
 
-    let summary = notes_json
+    let summary = payload_json
         .pointer("/p082_recovery_matrix_readback/recovery_startup_repair_summary")
-        .expect("P082-R05 regression: summary must be present in startup_repairs.notes");
+        .or_else(|| {
+            payload_json
+                .pointer("/p061_startup_recovery/p082_recovery_matrix_readback/recovery_startup_repair_summary")
+        })
+        .expect("P082-R05 regression: summary must be present in work_items payload readback");
 
     // Verify source_command_journal_id is a real ID, not "unavailable".
     let scji = summary
@@ -5059,7 +6243,16 @@ async fn p082_r05_repair_writes_real_source_command_journal_id_and_requeue_gener
         .expect("P082-R05 regression: source_command_journal_id must be present");
     assert_eq!(
         scji, &journal_id,
-        "P082-R05 regression: source_command_journal_id must be the actual command journal ID, not 'unavailable'"
+        "P082-R05 regression: source_command_journal_id must fall back to the same-run command journal ID, not the tampered cross-run payload ID"
+    );
+    assert_eq!(
+        payload_json
+            .pointer(
+                "/p061_startup_recovery/p082_recovery_matrix_readback/recovery_projection_integrity",
+            )
+            .and_then(|v| v.as_str()),
+        Some("tamper_detected"),
+        "P082-R05 regression: cross-run source_command_journal_id must be marked tamper_detected"
     );
 
     // Verify requeue_generation is 1, not 0.
