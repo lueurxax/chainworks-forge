@@ -29,6 +29,65 @@ chainworks_default_sccache_dir() {
     fi
 }
 
+chainworks_gate_cargo_target_root() {
+    if [[ -n "${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-}" ]]; then
+        printf '%s\n' "${CHAINWORKS_GATE_CARGO_TARGET_ROOT}"
+    elif [[ -n "${CHAINWORKS_SHARED_CARGO_TARGET_DIR:-}" ]]; then
+        printf '%s\n' "${CHAINWORKS_SHARED_CARGO_TARGET_DIR}/gates"
+    else
+        printf '%s\n' "$(chainworks_default_cargo_target_dir)/gates"
+    fi
+}
+
+chainworks_gate_cargo_target_dir() {
+    local requested="${1:-}"
+    if [[ -z "${requested}" ]]; then
+        chainworks_default_cargo_target_dir
+        return 0
+    fi
+    if [[ "${CHAINWORKS_ALLOW_LOCAL_CARGO_TARGET_DIR:-0}" =~ ^(1|true|TRUE|yes|YES)$ ]]; then
+        printf '%s\n' "${requested}"
+        return 0
+    fi
+
+    local suffix=""
+    case "${requested}" in
+        target)
+            suffix="default"
+            ;;
+        target/*)
+            suffix="${requested#target/}"
+            ;;
+        control-plane/target)
+            suffix="default"
+            ;;
+        control-plane/target/*)
+            suffix="${requested#control-plane/target/}"
+            ;;
+        */control-plane/target)
+            suffix="default"
+            ;;
+        */control-plane/target/*)
+            suffix="${requested#*/control-plane/target/}"
+            ;;
+        *)
+            printf '%s\n' "${requested}"
+            return 0
+            ;;
+    esac
+
+    if [[ -z "${suffix}" || "${suffix}" == "." ]]; then
+        suffix="default"
+    fi
+
+    local safe_suffix
+    safe_suffix="$(printf '%s' "${suffix}" | sed -E 's#[/[:space:]]+#-#g; s#[^A-Za-z0-9._-]#_#g; s#^[-.]+##; s#[-.]+$##')"
+    if [[ -z "${safe_suffix}" ]]; then
+        safe_suffix="default"
+    fi
+    printf '%s/%s\n' "$(chainworks_gate_cargo_target_root)" "${safe_suffix}"
+}
+
 chainworks_find_sccache() {
     if [[ -n "${CHAINWORKS_SCCACHE_BINARY:-}" && -x "${CHAINWORKS_SCCACHE_BINARY}" ]]; then
         printf '%s\n' "${CHAINWORKS_SCCACHE_BINARY}"

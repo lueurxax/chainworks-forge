@@ -12,6 +12,49 @@ if [[ -f "$ROOT_DIR/scripts/cargo-cache-env.sh" ]]; then
   # shellcheck source=scripts/cargo-cache-env.sh
   source "$ROOT_DIR/scripts/cargo-cache-env.sh"
 fi
+
+chainworks_test_gate_cargo_target_dir() {
+  if declare -F chainworks_gate_cargo_target_dir >/dev/null 2>&1; then
+    chainworks_gate_cargo_target_dir "$1"
+    return 0
+  fi
+
+  local requested="${1:-}"
+  if [[ -z "$requested" ]]; then
+    requested="${HOME:-$ROOT_DIR}/Library/Caches/Chainworks Forge/cargo-target"
+  fi
+  case "$requested" in
+    target|target/*|control-plane/target|control-plane/target/*|*/control-plane/target|*/control-plane/target/*)
+      local suffix="${requested#*/control-plane/target/}"
+      if [[ "$suffix" == "$requested" ]]; then
+        suffix="${requested#target/}"
+      fi
+      if [[ -z "$suffix" || "$suffix" == "$requested" || "$suffix" == "." ]]; then
+        suffix="default"
+      fi
+      local safe_suffix
+      safe_suffix="$(printf '%s' "$suffix" | sed -E 's#[/[:space:]]+#-#g; s#[^A-Za-z0-9._-]#_#g; s#^[-.]+##; s#[-.]+$##')"
+      printf '%s/%s\n' "${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-${HOME:-$ROOT_DIR}/Library/Caches/Chainworks Forge/cargo-target/gates}" "${safe_suffix:-default}"
+      ;;
+    *)
+      printf '%s\n' "$requested"
+      ;;
+  esac
+}
+
+cargo() {
+  if [[ "${CHAINWORKS_TEST_GATE_REMAP_CARGO_TARGET_DIR:-1}" =~ ^(1|true|TRUE|yes|YES)$ && -n "${CARGO_TARGET_DIR:-}" ]]; then
+    local remapped_target
+    remapped_target="$(chainworks_test_gate_cargo_target_dir "$CARGO_TARGET_DIR")"
+    if [[ "$remapped_target" != "$CARGO_TARGET_DIR" ]]; then
+      mkdir -p "$remapped_target"
+      CARGO_TARGET_DIR="$remapped_target" command cargo "$@"
+      return $?
+    fi
+  fi
+  command cargo "$@"
+}
+
 PROJECT_PATH="$ROOT_DIR/Chainworks Forge.xcodeproj"
 SCHEME_NAME="Chainworks Forge"
 HOST_ARCH="$(uname -m)"
@@ -1565,6 +1608,9 @@ else:
         "SCCACHE_CACHE_SIZE",
         "RUSTC_WRAPPER",
         "sccache",
+        "chainworks_gate_cargo_target_dir",
+        "CHAINWORKS_GATE_CARGO_TARGET_ROOT",
+        "CHAINWORKS_ALLOW_LOCAL_CARGO_TARGET_DIR",
     ]
     for fragment in required_helper_fragments:
         if fragment not in helper_text:
@@ -1601,6 +1647,13 @@ if legacy_p082_target in gate_text:
     violations.append("proposal-082 gate still creates a dedicated target/proposal-082-gate cache")
 if "CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR" not in gate_text:
     violations.append("proposal-082 gate does not expose a bounded reusable target dir override")
+for fragment in [
+    "chainworks_test_gate_cargo_target_dir",
+    "CHAINWORKS_TEST_GATE_REMAP_CARGO_TARGET_DIR",
+    "CARGO_TARGET_DIR=\"$remapped_target\" command cargo",
+]:
+    if fragment not in gate_text:
+        violations.append(f"test-gate.sh missing Cargo target remap guard {fragment!r}")
 
 if violations:
     print("Xcode Cargo cache policy violations:", file=sys.stderr)
@@ -10713,7 +10766,7 @@ print("P082 positive fixture, lane contract, nested subcontracts, and negative f
 PY
     (
       cd "$ROOT_DIR/control-plane"
-      p082_cargo_target="${CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR:-target/proposal-082}"
+      p082_cargo_target="$(chainworks_test_gate_cargo_target_dir "${CHAINWORKS_PROPOSAL_082_CARGO_TARGET_DIR:-target/proposal-082}")"
       run_p082_cargo_test() {
         local output status
         set +e

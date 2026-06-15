@@ -14,6 +14,9 @@
 #     CARGO_TARGET_DIRs from proposal gates, including the same pattern
 #     under `.chainworks/worktrees/*/control-plane/target`, unless cargo
 #     is actively building/testing.
+#   * Shared gate CARGO_TARGET_DIRs under
+#     `~/Library/Caches/Chainworks Forge/cargo-target/gates/*`, also only
+#     when cargo is not actively building/testing.
 #   * `$TMPDIR/chainworks-test-gates` DerivedData, xcresult, and target
 #     residuals not referenced by currently running xcodebuild commands.
 #   * All but the most recently modified
@@ -59,6 +62,13 @@ done
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_BASE="${TMPDIR:-/tmp}/chainworks-test-gates"
 WORKTREE_ROOT="$ROOT_DIR/.chainworks/worktrees"
+if [[ -f "$ROOT_DIR/scripts/cargo-cache-env.sh" ]]; then
+    CHAINWORKS_CARGO_CACHE_REPO_ROOT="$ROOT_DIR"
+    # shellcheck source=scripts/cargo-cache-env.sh
+    source "$ROOT_DIR/scripts/cargo-cache-env.sh"
+fi
+SHARED_CARGO_TARGET_DIR="${CHAINWORKS_SHARED_CARGO_TARGET_DIR:-$(chainworks_default_cargo_target_dir)}"
+SHARED_GATE_TARGET_ROOT="${CHAINWORKS_GATE_CARGO_TARGET_ROOT:-$SHARED_CARGO_TARGET_DIR/gates}"
 
 if [[ -n "${CHAINWORKS_CLEAN_PROTECTED_WORKTREES:-}" ]]; then
     IFS=' :' read -r -a _env_protected_worktrees <<< "${CHAINWORKS_CLEAN_PROTECTED_WORKTREES}"
@@ -147,11 +157,23 @@ clean_orphan_target_dirs() {
     done
 }
 
+clean_shared_gate_target_dirs() {
+    local gate_root="$1"
+    [[ -d "$gate_root" ]] || return 0
+
+    for entry in "$gate_root"/*; do
+        [[ -d "$entry" ]] || continue
+        say "removing shared gate target dir $entry"
+        delete "$entry"
+    done
+}
+
 # ── 1. Orphan per-proposal target dirs ───────────────────────────────
 TARGET_ROOT="$ROOT_DIR/control-plane/target"
 if is_cargo_running; then
     say "cargo build/test is running; skipping Cargo target cleanup"
 else
+    clean_shared_gate_target_dirs "$SHARED_GATE_TARGET_ROOT"
     clean_orphan_target_dirs "$TARGET_ROOT"
 
     if [[ -d "$WORKTREE_ROOT" ]]; then
@@ -218,6 +240,14 @@ if [[ -d "$TARGET_ROOT" ]]; then
     echo ""
     echo "control-plane/target final size:"
     du -sh "$TARGET_ROOT" 2>/dev/null || true
+fi
+if [[ -d "$SHARED_CARGO_TARGET_DIR" ]]; then
+    echo "shared Cargo target final size:"
+    du -sh "$SHARED_CARGO_TARGET_DIR" 2>/dev/null || true
+fi
+if [[ -d "$SHARED_GATE_TARGET_ROOT" ]]; then
+    echo "shared gate Cargo targets final size:"
+    du -sh "$SHARED_GATE_TARGET_ROOT" 2>/dev/null || true
 fi
 if [[ -d "$TMP_BASE" ]]; then
     echo "chainworks-test-gates final size:"
