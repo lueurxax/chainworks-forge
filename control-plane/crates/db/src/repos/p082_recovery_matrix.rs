@@ -1246,6 +1246,25 @@ fn p082_cancellation_action_identity_valid(
         return false;
     };
 
+    if source_identifier == action_id {
+        let source_count = source_identifier_counts
+            .get(source_identifier)
+            .copied()
+            .unwrap_or(0);
+        if source_count <= 1 {
+            return true;
+        }
+        let session_close_attempted = entry
+            .get("session_close_attempted")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let has_agent_execution_id = entry
+            .get("agent_execution_id")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty());
+        return session_close_attempted && has_agent_execution_id;
+    }
+
     if source_identifier_counts
         .get(source_identifier)
         .copied()
@@ -1253,10 +1272,6 @@ fn p082_cancellation_action_identity_valid(
         != 1
     {
         return false;
-    }
-
-    if source_identifier == action_id {
-        return true;
     }
 
     let Some(agent_execution_id) = entry

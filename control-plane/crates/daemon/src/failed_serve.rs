@@ -34,10 +34,7 @@ pub fn build_failed_serve_router(
     reporter: LifecycleReporter,
     principal_table: auth::LivePrincipalTable,
 ) -> Router {
-    build_failed_serve_router_with_principal_source(
-        reporter,
-        auth::LivePrincipalSource::new(principal_table),
-    )
+    build_failed_serve_router_with_principal_source(reporter, principal_table)
 }
 
 pub fn build_failed_serve_router_with_principal_source(
@@ -326,12 +323,7 @@ pub async fn serve_failed_state_with_listener(
     principal_table: auth::LivePrincipalTable,
     listener: tokio::net::TcpListener,
 ) -> Result<()> {
-    serve_failed_state_with_live_principal_source(
-        reporter,
-        auth::LivePrincipalSource::new(principal_table),
-        listener,
-    )
-    .await
+    serve_failed_state_with_live_principal_source(reporter, principal_table, listener).await
 }
 
 pub async fn serve_failed_state_with_live_principal_source(

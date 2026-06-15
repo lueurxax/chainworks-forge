@@ -269,6 +269,8 @@ pub struct PrincipalTable {
 #[derive(Clone, Debug)]
 pub struct LivePrincipalSource(Arc<RwLock<Option<PrincipalTable>>>);
 
+pub type LivePrincipalTable = LivePrincipalSource;
+
 #[derive(Clone, Debug)]
 pub struct LivePrincipalCredential {
     pub principal_id: String,
@@ -313,6 +315,18 @@ impl LivePrincipalSource {
             &credential.principal_id,
             &credential.token_fingerprint,
         )
+    }
+
+    pub fn resolve_principal_fingerprint(
+        &self,
+        principal_id: &str,
+        token_fingerprint: &str,
+    ) -> Result<Principal, AuthError> {
+        let guard = self.0.read().map_err(|_| {
+            AuthError::TableLoadFailed("principal source lock poisoned".to_string())
+        })?;
+        let table = guard.as_ref().ok_or(AuthError::UnknownToken)?;
+        resolve_principal_by_fingerprint(table, principal_id, token_fingerprint)
     }
 }
 
@@ -428,35 +442,6 @@ impl PrincipalTable {
                 id: "test-observer".into(),
                 class: PrincipalClass::Observer,
                 surface_policies: None,
-                ..Default::default()
-            }],
-        }
-    }
-
-    pub fn test_fixture_with_class(
-        token: impl Into<String>,
-        id: impl Into<String>,
-        class: PrincipalClass,
-    ) -> Self {
-        PrincipalTable {
-            entries: vec![PrincipalEntry {
-                token: token.into(),
-                id: id.into(),
-                class,
-                surface_policies: None,
-                ..Default::default()
-            }],
-        }
-    }
-
-    pub fn test_fixture_disabled_token(token: impl Into<String>, id: impl Into<String>) -> Self {
-        PrincipalTable {
-            entries: vec![PrincipalEntry {
-                token: token.into(),
-                id: id.into(),
-                class: PrincipalClass::Operator,
-                surface_policies: None,
-                disabled: Some(true),
                 ..Default::default()
             }],
         }

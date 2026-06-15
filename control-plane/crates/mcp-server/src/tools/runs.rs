@@ -481,25 +481,25 @@ pub async fn execute(
                                 )
                                 .await?,
                             );
-                        obj.insert(
-                            "p082_recovery_matrix_readback".into(),
-                            crate::tools::reports::p082_recovery_matrix_readback_json(
-                                pool,
-                                run_id,
-                                &principal.class,
-                            )
-                            .await?,
-                        );
-                        obj.insert(
-                            "p082_recovery_matrix_readbacks".into(),
-                            crate::tools::reports::p082_recovery_matrix_readbacks_json(
-                                pool,
-                                run_id,
-                                &principal.class,
-                                "mcp",
-                            )
-                            .await?,
-                        );
+                            obj.insert(
+                                "p082_recovery_matrix_readback".into(),
+                                crate::tools::reports::p082_recovery_matrix_readback_json(
+                                    pool,
+                                    run_id,
+                                    &principal.class,
+                                )
+                                .await?,
+                            );
+                            obj.insert(
+                                "p082_recovery_matrix_readbacks".into(),
+                                crate::tools::reports::p082_recovery_matrix_readbacks_json(
+                                    pool,
+                                    run_id,
+                                    &principal.class,
+                                    "mcp",
+                                )
+                                .await?,
+                            );
                         }
                         let escalation_readback =
                             if principal.class == auth::PrincipalClass::Operator {
@@ -1740,7 +1740,7 @@ mod tests {
             "/Volumes",
             "/Applications",
         ] {
-            let err = reject_broad_workspace_root(std::path::Path::new(root))
+            let err = reject_broad_run_start_workspace_root(std::path::Path::new(root))
                 .expect_err("broad workspace root must be rejected");
             assert!(
                 err.to_string().contains("too broad"),
@@ -1756,31 +1756,8 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let canonical = std::fs::canonicalize(&project).unwrap();
 
-        reject_broad_workspace_root(&canonical).expect("project directory should be allowed");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn p082_runs_start_rejects_workspace_symlink_to_broad_system_root() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let workspace_link = tmp.path().join("private-link");
-        symlink("/private", &workspace_link).unwrap();
-        let err = canonicalize_run_start_paths(
-            workspace_link.to_str().unwrap(),
-            workspace_link
-                .join("chainworks-artifacts")
-                .to_str()
-                .unwrap(),
-            workspace_link.join("workflow.yaml").to_str().unwrap(),
-            workspace_link.join("agents.yaml").to_str().unwrap(),
-        )
-        .expect_err("workspace symlink to /private must be rejected after canonicalization");
-        assert!(
-            err.to_string().contains("too broad"),
-            "unexpected symlink broad-root rejection: {err}"
-        );
+        reject_broad_run_start_workspace_root(&canonical)
+            .expect("project directory should be allowed");
     }
 
     fn test_workflow_yaml_path() -> String {

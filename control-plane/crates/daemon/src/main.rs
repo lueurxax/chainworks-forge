@@ -776,7 +776,6 @@ async fn run_daemon() -> Result<()> {
                 )
                 .with_live_principal_source(live_principal_source.clone()),
             );
-            let mcp_principal_handle = mcp.principal_table_handle();
             let mcp_routes = mcp_server::http::routes(mcp);
             info!("MCP HTTP transport mounted at /mcp");
 

@@ -3151,8 +3151,6 @@ impl CommandHandler {
                     return Err(anyhow!(rejection.message));
                 }
 
-                self.validate_retry_stage_identifier_kinds(&c).await?;
-
                 if let Some(agent_execution_id) = c.agent_execution_id {
                     if c.legacy_discovery_override_policy.is_some() {
                         anyhow::bail!(

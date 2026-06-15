@@ -246,6 +246,10 @@ impl McpServer {
         self.principal_source.clone()
     }
 
+    pub fn principal_table_handle(&self) -> auth::LivePrincipalSource {
+        self.live_principal_source()
+    }
+
     pub fn resolve_current_bearer(&self, token: &str) -> anyhow::Result<auth::Principal> {
         self.principal_source
             .resolve_bearer(token)

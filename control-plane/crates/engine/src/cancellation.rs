@@ -73,22 +73,11 @@ fn p082_cancellation_entry_from_readback(
 
 fn p082_readback_for_cancellation_entry(
     readback: &serde_json::Value,
-    action_id: &str,
-    agent_execution_id: &AgentExecutionId,
-    running_execution_count: usize,
+    _action_id: &str,
+    _agent_execution_id: &AgentExecutionId,
+    _running_execution_count: usize,
 ) -> serde_json::Value {
-    let mut entry_readback = readback.clone();
-    if running_execution_count > 1 {
-        if let Some(obj) = entry_readback.as_object_mut() {
-            obj.insert(
-                "source_identifier".to_string(),
-                serde_json::Value::String(format!(
-                    "{action_id}:agent_execution:{agent_execution_id}"
-                )),
-            );
-        }
-    }
-    entry_readback
+    readback.clone()
 }
 
 pub fn p082_cancel_side_effect_reconciliation_readback(
@@ -701,26 +690,6 @@ async fn finalize_settlement(
                                 },
                             )
                             .await?;
-                        }
-                    }
-                    // Update R11 readback source_identifier to cite the concrete
-                    // session_generations row written above so operators can verify
-                    // provider cleanup from the readback.
-                    if let Some(rb) = entry.p082_recovery_matrix_readback.as_mut() {
-                        if rb.get("scenario_id").and_then(|v| v.as_str()) == Some("P082-R11") {
-                            if let Some(obj) = rb.as_object_mut() {
-                                let run_part = obj
-                                    .get("source_identifier")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                obj.insert(
-                                    "source_identifier".to_string(),
-                                    serde_json::Value::String(format!(
-                                        "{run_part}:session_generations:{generation_id}"
-                                    )),
-                                );
-                            }
                         }
                     }
                 }
